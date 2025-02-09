@@ -1,4 +1,12 @@
 #!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.6"
+# dependencies = [
+#     "argparse",
+#     "xxhash",
+#     "multiCMD>1.19",
+# ]
+# ///
 import os
 import sys
 import time
