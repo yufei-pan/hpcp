@@ -163,7 +163,7 @@ except ImportError:
 	hasher = hashlib.blake2b()
 	xxhash_available = False
 
-version = '8.98'
+version = '9.00'
 __version__ = version
 
 # ---- Helper Functions ----
@@ -266,11 +266,11 @@ def check_path(program_name):
 	return False
 
 _binCalled = ['lsblk', 'losetup', 'sgdisk', 'blkid', 'umount', 'mount','dd','cp', 'xcopy',
-			  'fallocate','truncate', 'mkfs',
-			  'mkswap', 'mkfs.vfat', 'tune2fs', 'btrfstune', 'xfs_admin', 'ntfslabel', 'fatlabel', 
-			  'exfatlabel', 'newfs_hfs', 'jfs_tune', 'reiserfstune', 'newfs', 'mkfs.xfs', 'mkfs.ext4', 
-			  'e2fsck', 'btrfs', 'xfs_repair', 'ntfsfix', 'fsck.fat', 
-			  'fsck.exfat', 'fsck.hfsplus', 'fsck.hfs', 'fsck.jfs', 'fsck.reiserfs', 'zpool', 'fsck.ufs',]
+			  'fallocate','truncate', 
+			  'mkfs', 'mkfs.btrfs', 'mkfs.xfs', 'mkfs.ntfs', 'mkfs.vfat', 'mkfs.exfat', 'mkfs.hfsplus', 
+			  'mkudffs', 'mkfs.jfs', 'mkfs.reiserfs', 'newfs', 'mkfs.bfs', 'mkfs.minix', 'mkswap'
+			  'e2fsck', 'btrfs', 'xfs_repair', 'ntfsfix', 'fsck.fat', 'fsck.exfat', 'fsck.hfsplus', 
+			  'fsck.hfs', 'fsck.jfs', 'fsck.reiserfs', 'fsck.ufs', 'fsck.minix']
 [check_path(program) for program in _binCalled]
 
 def run_command_in_multicmd_with_path_check(command, timeout=0,max_threads=1,quiet=False,dry_run=False,strict=True):
@@ -424,10 +424,14 @@ def fix_fs(target_partition, fs_type=None):
 			run_command_in_multicmd_with_path_check(f"fsck.jfs -y {target_partition}",strict=False)
 		elif fs_type == 'reiserfs':
 			run_command_in_multicmd_with_path_check(f"fsck.reiserfs -y {target_partition}",strict=False)
-		elif fs_type == 'zfs':
-			run_command_in_multicmd_with_path_check(f"zpool clear {target_partition}",strict=False)
+		elif fs_type == 'udf':
+			print(f"Warning: Cannot fix udf file system. Skipping.")
 		elif fs_type == 'ufs':
 			run_command_in_multicmd_with_path_check(f"fsck.ufs -y {target_partition}",strict=False)
+		elif fs_type == 'bfs':
+			print(f"Warning: Cannot fix bfs file system. Skipping.")
+		elif fs_type == 'minix':
+			run_command_in_multicmd_with_path_check(f"fsck.minix -a {target_partition}",strict=False)
 		else:
 			print(f"File system {fs_type} not supported.")
 			return False
@@ -464,17 +468,17 @@ def get_partition_details(device, partition,sector_size=512):
 	"""Get the partition details of the partition."""
 	# Get the partition info from the source
 	result = run_command_in_multicmd_with_path_check(f"sgdisk --info={partition} {device}")
-	rtnDic = {'partition_guid_code': '', 'unique_partition_guid': '', 'partition_name': '', 'partition_attrs': '', 'fs_type': '', 'fs_uuid': '', 'size': 0}
+	rtnDic = {'partition_guid_code': '', 'unique_partition_guid': '', 'partition_name': '', 'partition_attrs': '', 'fs_type': '', 'fs_uuid': '', 'fs_label': '', 'size': 0}
 	for line in result:
-		if "GUID code:" in line:
+		if "guid code:" in line.lower():
 			rtnDic['partition_guid_code'] = line.split(":")[1].split()[0].strip()
-		elif "unique GUID:" in line:
+		elif "unique guid:" in line.lower():
 			rtnDic['unique_partition_guid'] = line.split(":")[1].strip()
-		elif "Partition name:" in line:
+		elif "partition name:" in line.lower():
 			rtnDic['partition_name'] = line.split("'")[1].strip()
-		elif "Attribute flags:" in line:
+		elif "attribute flags:" in line.lower():
 			rtnDic['partition_attrs'] = line.split(":")[1].strip()
-		elif 'Partition size:' in line:
+		elif 'partition size:' in line.lower():
 			rtnDic['size'] = int(line.split(':')[1].split()[0].strip()) * int(sector_size)
 	# Also get the fs type, use parted
 	# result = run_command_in_multicmd_with_path_check(f"parted --machine --script {device} print")
@@ -486,10 +490,12 @@ def get_partition_details(device, partition,sector_size=512):
 	target_partition, loop_device = get_target_partition(device, partition)
 	result = run_command_in_multicmd_with_path_check(f"blkid -o export {target_partition}")
 	for line in result:
-		if 'TYPE' in line:
+		if 'TYPE' in line.upper():
 			rtnDic['fs_type'] = line.split('=')[1].strip()
-		elif 'UUID' in line and 'PARTUUID' not in line:
+		elif 'UUID' in line.upper() and 'PARTUUID' not in line.upper():
 			rtnDic['fs_uuid'] = line.split('=')[1].strip()
+		elif 'LABEL' in line.upper() and 'PARTLABEL' not in line.upper():
+			rtnDic['fs_label'] = line.split('=')[1].strip()
 	if loop_device:
 		run_command_in_multicmd_with_path_check(f"losetup --detach {loop_device}")
 	return rtnDic
@@ -504,20 +510,20 @@ def get_partition_infos(device):
 	partition_info = {}
 	disk_size_sector = 0
 	disk_identifier = ''
-	sector_size = 0
+	sector_size = 512
 	disk_name = ''
-	while not line.startswith('Number'):
-		if line.startswith('Disk') and not line.startswith('Disk identifier') and 'sectors' in line:
+	while not line.lower().startswith('number'):
+		if line.lower().startswith('disk') and not line.lower().startswith('disk identifier') and 'sectors' in line:
 			disk_size_sector = int(line.rpartition(':')[2].split()[0])
 			disk_name = line.split()[1].strip(':')
-		elif 'sector size:' in line:
-			sector_size = int(line.rpartition(':')[2].split()[0])
-		elif 'Disk identifier' in line:
+		elif 'sector size' in line.lower():
+			sector_size = int(line.rpartition(':')[2].split()[0].partition('/')[0])
+		elif 'disk identifier' in line.lower():
 			disk_identifier = line.rpartition(':')[2].strip()
 		line = partitions.pop(0)
 	partition_info[disk_name] = {'size': disk_size_sector*sector_size, 'disk_identifier': disk_identifier, 'sector_size': sector_size}
 	for part in partitions:
-		if not part or not part.strip() or len(part.split()) < 4 or part.startswith('Error'):
+		if not part or not part.strip() or len(part.split()) < 4 or part.lower().startswith('error'):
 			continue
 		part = part.split()
 		partition_info[part[0]] = get_partition_details(device, part[0],sector_size)
@@ -546,56 +552,139 @@ def write_partition_info(image, partition_infos, partition_name):
 			if not target_partition:
 				print(f"Error: Cannot find partition {partition_name} in {image}.")
 				return
-			if partition_infos[partition_name]['fs_type'] == 'swap':
-				run_command_in_multicmd_with_path_check(f"mkswap {target_partition}",strict=False)
-			elif partition_infos[partition_name]['fs_type'] == 'fat32':
-				run_command_in_multicmd_with_path_check(f"mkfs.vfat {target_partition}",strict=False)
-			elif partition_infos[partition_name]['fs_type'] == 'fat16':
-				run_command_in_multicmd_with_path_check(f"mkfs.vfat -F 16 {target_partition}",strict=False)
-			elif partition_infos[partition_name]['fs_type'] == 'fat12':
-				run_command_in_multicmd_with_path_check(f"mkfs.vfat -F 12 {target_partition}",strict=False)
-			elif partition_infos[partition_name]['fs_type'] == 'gpt':
-				print(f"Partition is GPT padding, skipping...")
+			fs_type = partition_infos[partition_name]['fs_type']
+			fs_label = partition_infos[partition_name]['fs_label']
+			fs_uuid = partition_infos[partition_name]['fs_uuid']
+			if fs_type == 'ext4' or fs_type == 'ext3' or fs_type == 'ext2':
+				command = f"mkfs -t {fs_type}"
+				if fs_label:
+					command += f" -L {fs_label}"
+				if fs_uuid:
+					command += f" -U {fs_uuid}"
+				command += f" {target_partition}"
+				run_command_in_multicmd_with_path_check(command,strict=False)
+			elif fs_type == 'btrfs':
+				command = f"mkfs.btrfs"
+				if fs_label:
+					command += f" -L {fs_label}"
+				if fs_uuid:
+					command += f" -U {fs_uuid}"
+				command += f" {target_partition}"
+				run_command_in_multicmd_with_path_check(command,strict=False)
+			elif fs_type == 'xfs':
+				command = f"mkfs.xfs"
+				if fs_label:
+					command += f" -L {fs_label}"
+				if fs_uuid:
+					command += f" -m uuid={fs_uuid}"
+				command += f" {target_partition}"
+			elif fs_type == 'ntfs':
+				command = f"mkfs.ntfs"
+				if fs_label:
+					command += f" -L {fs_label}"
+				command += f" {target_partition}"
+				if fs_uuid:
+					print(f"Warning: Cannot set fs uuid for ntfs. Skipping.")
+			elif fs_type == 'fat32' or fs_type == 'fat16' or fs_type == 'fat12' or fs_type == 'fat' or fs_type == 'vfat' or fs_type == 'msdos':
+				command = f"mkfs.vfat"
+				if fs_type == 'fat16':
+					command += " -F 16"
+				elif fs_type == 'fat12':
+					command += " -F 12"
+				if fs_label:
+					command += f" -n {fs_label}"
+				if fs_uuid:
+					command += f" -i {fs_uuid.lower().replace('-','')}"
+				command += f" {target_partition}"
+				run_command_in_multicmd_with_path_check(command,strict=False)
+			elif fs_type == 'exfat':
+				command = f"mkfs.exfat"
+				if fs_label:
+					command += f" -L {fs_label}"
+				command += f" {target_partition}"
+				run_command_in_multicmd_with_path_check(command,strict=False)
+				if fs_uuid:
+					run_command_in_multicmd_with_path_check(f"exfatlabel -i {target_partition} {fs_uuid}",strict=False)
+			elif fs_type == 'hfsplus' or fs_type == 'hfs':
+				command = f"mkfs.{fs_type}"
+				if fs_label:
+					command += f" -v {fs_label}"
+				command += f" {target_partition}"
+				run_command_in_multicmd_with_path_check(command,strict=False)
+				if fs_uuid:
+					print(f"Warning: Cannot set fs uuid for {fs_type}. Skipping.")
+			elif fs_type == 'udf':
+				command = f"mkudffs --media-type=hd"
+				if fs_label:
+					command += f" --label {fs_label}"
+				if fs_uuid:
+					command += f" --uuid {fs_uuid}"
+				command += f" {target_partition}"
+				run_command_in_multicmd_with_path_check(command,strict=False)
+			elif fs_type == 'jfs':
+				command = f"mkfs.jfs"
+				if fs_label:
+					command += f" -L {fs_label}"
+				command += f" {target_partition}"
+				run_command_in_multicmd_with_path_check(command,strict=False)
+				if fs_uuid:
+					run_command_in_multicmd_with_path_check(f"jfs_tune -U {fs_uuid} {target_partition}",strict=False)
+			elif fs_type == 'reiserfs':
+				command = f"mkfs.reiserfs"
+				if fs_label:
+					command += f" -l {fs_label}"
+				if fs_uuid:
+					command += f" -u {fs_uuid}"
+				command += f" {target_partition}"
+			elif fs_type == 'zfs':
+				print(f"Skip creating zfs file system. ZFS file system should be created using zpool command.")
+			elif fs_type == 'ufs':
+				command = f"newfs -t"
+				if fs_label:
+					command += f" -L {fs_uuid}"
+				command += f" {target_partition}"
+				run_command_in_multicmd_with_path_check(command,strict=False)
+				if fs_uuid:
+					print(f"Warning: Cannot set fs uuid for ufs. Skipping.")
+			elif fs_type == 'bfs':
+				command = f"mkfs.bfs"
+				if fs_label:
+					command += f" -F {fs_label} -V {fs_label}"
+				command += f" {target_partition}"
+				run_command_in_multicmd_with_path_check(command,strict=False)
+				if fs_uuid:
+					print(f"Warning: Cannot set fs uuid for bfs. Skipping.")
+			elif fs_type == 'cramfs':
+				print(f"Warning: cramfs is read-only file system. You should create one with mkfs.cramfs.")
+			elif fs_type == 'minix':
+				command = f"mkfs.minix"
+				command += f" {target_partition}"
+				run_command_in_multicmd_with_path_check(command,strict=False)
+				if fs_label:
+					print(f"Warning: Cannot set fs label for minix. Skipping.")
+				if fs_uuid:
+					print(f"Warning: Cannot set fs uuid for minix. Skipping.")
+			elif fs_type == 'iso9660':
+				print(f"Warning: iso9660 is read-only file system. You should create one with mkfs.iso9660.")
+			elif fs_type == 'swap':
+				command = f"mkswap"
+				if fs_label:
+					command += f" -L {fs_label}"
+				if fs_uuid:
+					command += f" -U {fs_uuid}"
+				command += f" {target_partition}"
+				run_command_in_multicmd_with_path_check(command,strict=False)
+			elif fs_type == 'gpt':
+				print(f"Skip creating gpt padding.")
 			else:
-				run_command_in_multicmd_with_path_check(f"mkfs -t {partition_infos[partition_name]['fs_type']} {target_partition}",strict=False)
-
-			if partition_infos[partition_name]['fs_uuid']:
-				# try to change the fs uuid using fs specific tools
-				fs_type = partition_infos[partition_name]['fs_type']
-				if fs_type == 'ext4' or fs_type == 'ext3' or fs_type == 'ext2':
-					run_command_in_multicmd_with_path_check(f"tune2fs -U {partition_infos[partition_name]['fs_uuid']} {target_partition}",strict=False)
-				elif fs_type == 'btrfs':
-					run_command_in_multicmd_with_path_check(f"btrfstune -U {partition_infos[partition_name]['fs_uuid']} {target_partition}",strict=False)
-				elif fs_type == 'xfs':
-					run_command_in_multicmd_with_path_check(f"xfs_admin -U {partition_infos[partition_name]['fs_uuid']} {target_partition}",strict=False)
-				elif fs_type == 'ntfs':
-					run_command_in_multicmd_with_path_check(f"ntfslabel -U {partition_infos[partition_name]['fs_uuid']} {target_partition}",strict=False)
-				elif fs_type == 'fat32' or fs_type == 'fat16' or fs_type == 'fat12' or fs_type == 'fat' or fs_type == 'vfat':
-					run_command_in_multicmd_with_path_check(f"fatlabel {target_partition} {partition_infos[partition_name]['fs_uuid']}",strict=False)
-				elif fs_type == 'exfat':
-					run_command_in_multicmd_with_path_check(f"exfatlabel {target_partition} {partition_infos[partition_name]['fs_uuid']}",strict=False)
-				elif fs_type == 'hfsplus':
-					run_command_in_multicmd_with_path_check(f"newfs_hfs -v {partition_infos[partition_name]['fs_uuid']} {target_partition}",strict=False)
-				elif fs_type == 'hfs':
-					run_command_in_multicmd_with_path_check(f"newfs_hfs -v {partition_infos[partition_name]['fs_uuid']} {target_partition}",strict=False)
-				elif fs_type == 'jfs':
-					run_command_in_multicmd_with_path_check(f"jfs_tune -U {partition_infos[partition_name]['fs_uuid']} {target_partition}",strict=False)
-				elif fs_type == 'reiserfs':
-					run_command_in_multicmd_with_path_check(f"reiserfstune -u {partition_infos[partition_name]['fs_uuid']} {target_partition}",strict=False)
-				elif fs_type == 'zfs':
-					print(f"Error: Cannot change fs uuid for zfs.")
-					return
-				elif fs_type == 'ufs':
-					run_command_in_multicmd_with_path_check(f"newfs -U {partition_infos[partition_name]['fs_uuid']} {target_partition}",strict=False)
-				elif fs_type == 'swap':
-					print(f"Skip changing fs uuid for swap.")
-					return
-				elif fs_type == 'gpt':
-					print(f"Skip changing fs uuid for gpt padding.")
-					return
-				else:
-					print(f"Error: File system {fs_type} not supported for changing fs uuid.")
-					return
+				print(f"Warning: File system {fs_type} not currently supported by hpcp. Trying mkfs -t {fs_type} anyway...")
+				command = f"mkfs -t {fs_type}"
+				if fs_label:
+					command += f" -L {fs_label}"
+				if fs_uuid:
+					command += f" -U {fs_uuid}"
+				command += f" {target_partition}"
+				run_command_in_multicmd_with_path_check(command,strict=False)
 			if loop_device:
 				run_command_in_multicmd_with_path_check(f"losetup --detach {loop_device}")
 		if partition_infos[partition_name]['partition_name']:
@@ -624,7 +713,7 @@ def create_partition_table(image, partition_infos,sorted_partitions):
 		# Create the partition
 		run_command_in_multicmd_with_path_check(f"sgdisk --new={partition}:{start_sector}:{end_sector} {image}")
 		# Copy the partition information
-		write_partition_info(loop_device, partition_infos,partition)
+		write_partition_info(image, partition_infos,partition)
 	# Fix the partition table
 	run_command_in_multicmd_with_path_check(f"sgdisk --verify {image}")
 	if loop_device:
@@ -1167,7 +1256,7 @@ def copy_file(src_path, dest_path, full_hash=False, verbose=False):
 			# if verbose:
 			#     print(f'\nSkipped {src_path}')
 			st = os.stat(src_path,follow_symlinks=False)
-			# src_size = st.st_rsize if 'st_rsize' in st else st.st_blocks * 512
+			# src_size = stis_file.st_rsize if 'st_rsize' in st else st.st_blocks * 512
 			shutil.copystat(src_path, dest_path,follow_symlinks=False)
 			if os.name == 'posix':
 				os.chown(dest_path, st.st_uid, st.st_gid)
@@ -2230,6 +2319,7 @@ def createDDDestPartTable(dd_src,dd_resize = [],src_path = None, dest_path = Non
 		print(f"Source device {dd_src} is not partitioned, exiting.")
 		return
 	# sort the partitions by size
+	disk_info = partition_infos.pop(disk_name)
 	sorted_partitions = sorted(partition_infos.keys(), key=lambda x: partition_infos[x]['size'])
 	# change the partitions sizes if provided
 	if dd_resize:
@@ -2239,8 +2329,6 @@ def createDDDestPartTable(dd_src,dd_resize = [],src_path = None, dest_path = Non
 		# we resize the partitions according to the dd_resize list, 
 		# we use as much info from the dd_resize list as possible, assuming it specifies the sizes of the partitions from the largest to the smallest
 		# which means if it specified two sizes, we resize the two largest partitions to the specified sizes
-		disk_info = partition_infos.pop(disk_name)
-		sorted_partitions.pop()
 		# largest_partition = sorted_partitions[-2]
 		# partition_infos[largest_partition]['size'] = format_bytes(dd_resize,to_int=True)
 		for i in range(min(len(dd_resize),len(sorted_partitions))):
@@ -2248,8 +2336,8 @@ def createDDDestPartTable(dd_src,dd_resize = [],src_path = None, dest_path = Non
 
 		# recaclulate the disk size, also include 1M extra for each partition 
 		disk_info['size'] = sum([partition_infos[partition]['size'] for partition in partition_infos]) + 1024*1024*len(partition_infos)
-		partition_infos[disk_name] = disk_info
-		sorted_partitions.append(disk_name)
+	partition_infos[disk_name] = disk_info
+	sorted_partitions.append(disk_name)
 	
 	# if dest_path exit, print a confirmation message
 	if os.path.exists(dest_path):
