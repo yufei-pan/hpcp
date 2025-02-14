@@ -163,7 +163,7 @@ except ImportError:
 	hasher = hashlib.blake2b()
 	xxhash_available = False
 
-version = '9.00'
+version = '9.01'
 __version__ = version
 
 # ---- Helper Functions ----
@@ -450,7 +450,7 @@ def create_loop_device(image_path,read_only=False):
 
 def get_target_partition(image, partition_name):
 	loop_device = None
-	if not image.startswith("/dev/"):
+	if not pathlib.Path(image).resolve().is_block_device():
 		loop_device = create_loop_device(image)
 		image = loop_device
 	# Need to get a partition path for mkfs
@@ -703,7 +703,7 @@ def create_partition_table(image, partition_infos,sorted_partitions):
 	run_command_in_multicmd_with_path_check(f"sgdisk --disk-guid={partition_infos[src_disk_path]['disk_identifier']} {image}")
 	# Create the filesystem, need to mount the image first if it is a image
 	loop_device = None
-	if not image.startswith("/dev/"):
+	if not pathlib.Path(image).resolve().is_block_device():
 		loop_device = create_loop_device(image)
 		image = loop_device
 	# Create the partitions
@@ -721,7 +721,9 @@ def create_partition_table(image, partition_infos,sorted_partitions):
 
 def resize_image(image, total_size):
 	"""Resize the image file to the calculated size."""
-	run_command_in_multicmd_with_path_check(f"truncate --size={format_bytes(total_size,to_int=True)} {image}")
+	# use truncate to create a file if the image is not a block device
+	if not pathlib.Path(image).resolve().is_block_device():
+		run_command_in_multicmd_with_path_check(f"truncate --size={format_bytes(total_size,to_int=True)} {image}")
 
 def creatSymLinks(symLinks,exclude=None,no_link_tracking=False):
 	if len(symLinks) == 0:
