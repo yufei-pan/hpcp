@@ -163,7 +163,7 @@ except ImportError:
 	hasher = hashlib.blake2b()
 	xxhash_available = False
 
-version = '9.02'
+version = '9.03'
 __version__ = version
 
 # ---- Helper Functions ----
@@ -1217,7 +1217,7 @@ def delete_file_list_parallel(file_list, max_workers, verbose=False,files_per_jo
 	return apb.item_counter, apb.size_counter
 
 def delete_files_parallel(paths, max_workers, verbose=False,files_per_job=1,exclude=None,batch=False):
-	if not batch and type(paths) == str:
+	if not batch and isinstance(paths, str):
 		paths = [paths]
 	startTime = time.perf_counter()
 	all_files = set()
