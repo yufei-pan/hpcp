@@ -163,7 +163,7 @@ except ImportError:
 	hasher = hashlib.blake2b()
 	xxhash_available = False
 
-version = '9.03'
+version = '9.05'
 __version__ = version
 
 # ---- Helper Functions ----
@@ -453,8 +453,10 @@ def fix_fs(target_partition, fs_type=None):
 
 def create_loop_device(image_path,read_only=False):
 	"""Create a loop device for the image file."""
-	ro = '--read-only' if read_only else ''
-	loop_device_dest = run_command_in_multicmd_with_path_check(["losetup", '--partscan', '--find', '--show', ro, image_path])[0].strip()
+	if read_only:
+		loop_device_dest = run_command_in_multicmd_with_path_check(["losetup", '--partscan', '--find', '--show', '--read-only', image_path])[0].strip()
+	else:
+		loop_device_dest = run_command_in_multicmd_with_path_check(["losetup", '--partscan', '--find', '--show', image_path])[0].strip()
 	#run_command_in_multicmd_with_path_check(f'partprobe {loop_device_dest}')
 	print(f"Loop device {loop_device_dest} created.")
 	return loop_device_dest
@@ -737,7 +739,8 @@ def resize_image(image, total_size):
 	"""Resize the image file to the calculated size."""
 	# use truncate to create a file if the image is not a block device
 	if not pathlib.Path(image).resolve().is_block_device():
-		run_command_in_multicmd_with_path_check(["truncate", '--size='+format_bytes(total_size,to_int=True), image])
+		run_command_in_multicmd_with_path_check(["truncate", f'--size={format_bytes(total_size,to_int=True)}', image])
+
 def creatSymLinks(symLinks,exclude=None,no_link_tracking=False):
 	if len(symLinks) == 0:
 		return
