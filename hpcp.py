@@ -35,6 +35,8 @@ except:
 	class multiCMD:
 		version = 'build_in_0.09'
 		def run_commands(commands,timeout = 0,max_threads=1,quiet=False,dry_run=False):
+			_ = timeout
+			_ = max_threads
 			_rtnList_ = []
 			for command in commands:
 				if not isinstance(command,str):
