@@ -35,11 +35,9 @@ except:
 	class multiCMD:
 		version = 'build_in_0.09'
 		def run_commands(commands,timeout = 0,max_threads=1,quiet=False,dry_run=False):
-			rtnList = []
+			_rtnList_ = []
 			for command in commands:
-				if isinstance(command,str):
-					command = command
-				else:
+				if not isinstance(command,str):
 					# escape the spaces in the command
 					command = [arg.encode(errors='backslashreplace').decode('utf-8').replace(' ','\\ ') for arg in command]
 					command = ' '.join(command)
@@ -48,15 +46,15 @@ except:
 					print('> ' , command)
 				try:
 					if not dry_run:
-						rtnList.append(os.popen(command).read().strip().split('\n'))
+						_rtnList_.append(os.popen(command).read().strip().split('\n'))
 					else:
-						rtnList.append([f'Dry run: {command}'])
+						_rtnList_.append([f'Dry run: {command}'])
 				except Exception as e:
-					rtnList.append([f'Error: {e}'])
+					_rtnList_.append([f'Error: {e}'])
 				if not quiet:
-					print('\n'.join(rtnList[-1]))
+					print('\n'.join(_rtnList_[-1]))
 					print('*' * 80)
-			return rtnList
+			return _rtnList_
 		def run_command(command,timeout=0,quiet=False,dry_run=False):
 			return multiCMD.run_commands([command],timeout=timeout,quiet=quiet,dry_run=dry_run)[0]
 		def genrate_progress_bar(iteration, total, prefix='', suffix='',columns=120):
@@ -163,7 +161,7 @@ except ImportError:
 	hasher = hashlib.blake2b()
 	xxhash_available = False
 
-version = '9.05'
+version = '9.06'
 __version__ = version
 
 # ---- Helper Functions ----
@@ -177,11 +175,11 @@ class Adaptive_Progress_Bar:
 		self.scheduled_jobs = 0
 		self.stop_flag = False
 		self.process_word = process_word
-		self.startTime = time.perf_counter()
+		self.start_time = time.perf_counter()
 		self.last_n_jobs = deque(maxlen=last_num_job_for_stats)
 		self.custom_prefix = custom_prefix
 		self.custom_suffix = custom_suffix
-		self.lastCallArgs = None
+		self.last_call_args = None
 		self.use_print_thread = use_print_thread
 		if use_print_thread:
 			...
@@ -209,7 +207,7 @@ class Adaptive_Progress_Bar:
 				last_n_time = last_n_time_sum / job_count
 				last_n_file_speed = last_n_files_sum / last_n_time if last_n_time_sum > 0 else 0
 				last_n_size_speed = last_n_size_sum / last_n_time if last_n_time_sum > 0 else 0
-			total_time = time.perf_counter() - self.startTime
+			total_time = time.perf_counter() - self.start_time
 			total_file_speed = self.item_counter / total_time
 			total_size_speed = self.size_counter / total_time
 			if total_file_speed:
@@ -234,8 +232,8 @@ class Adaptive_Progress_Bar:
 				suffix += f' {last_n_time:.1f}s: {format_bytes(last_n_size_speed)}B/s {format_bytes(last_n_file_speed,use_1024_bytes=False,to_str=True)}F/s |'
 			suffix += f' {format_time(remaining_time)}'
 		callArgs = (self.item_counter, self.total_count, prefix, suffix)
-		if callArgs != self.lastCallArgs:
-			self.lastCallArgs = callArgs
+		if callArgs != self.last_call_args:
+			self.last_call_args = callArgs
 			multiCMD.print_progress_bar(*callArgs)
 	def stop(self):
 		self.stop_flag = True
@@ -297,10 +295,10 @@ def run_command_in_multicmd_with_path_check(command, timeout=0,max_threads=1,qui
 		sys.exit(1)
 	if not isinstance(command[0],str):
 		command[0] = str(command[0])
-	if not command[0] in _binPaths:
-		if not check_path(command[0]):
-			print(f"Error: Command '{command[0]}' not found. Please consider installing it then retry.", file=sys.stderr, flush=True)
-			if strict: sys.exit(127)
+	if command[0] not in _binPaths and not check_path(command[0]):
+		print(f"Error: Command '{command[0]}' not found. Please consider installing it then retry.", file=sys.stderr, flush=True)
+		if strict: 
+			sys.exit(127)
 	# Run the command
 	return multiCMD.run_commands([command], timeout=timeout, max_threads=max_threads, quiet=quiet, dry_run=dry_run)[0]
 
@@ -323,7 +321,7 @@ def is_excluded(path, exclude=None):
 			return True
 	return False
 
-def formatExclude(exclude = None,exclude_file = None) -> frozenset:
+def format_exclude(exclude = None,exclude_file = None) -> frozenset:
 	if not exclude:
 		exclude = set()
 	else:
@@ -577,7 +575,7 @@ def write_partition_info(image, partition_infos, partition_name):
 				command.append(target_partition)
 				run_command_in_multicmd_with_path_check(command,strict=False)
 			elif fs_type == 'btrfs':
-				commad = ['mkfs.btrfs']
+				command = ['mkfs.btrfs']
 				if fs_label:
 					command.extend(['-L', fs_label])
 				if fs_uuid:
@@ -654,7 +652,7 @@ def write_partition_info(image, partition_infos, partition_name):
 				command.append(target_partition)
 				run_command_in_multicmd_with_path_check(command,strict=False)
 			elif fs_type == 'zfs':
-				print(f"Skip creating zfs file system. ZFS file system should be created using zpool command.")
+				print("Skip creating zfs file system. ZFS file system should be created using zpool command.")
 			elif fs_type == 'ufs':
 				command = ['newfs', '-t']
 				if fs_label:
@@ -741,7 +739,7 @@ def resize_image(image, total_size):
 	if not pathlib.Path(image).resolve().is_block_device():
 		run_command_in_multicmd_with_path_check(["truncate", f'--size={format_bytes(total_size,to_int=True)}', image])
 
-def creatSymLinks(symLinks,exclude=None,no_link_tracking=False):
+def create_sym_links(symLinks,exclude=None,no_link_tracking=False):
 	if len(symLinks) == 0:
 		return
 	nestedSymLinks = {}
@@ -750,7 +748,7 @@ def creatSymLinks(symLinks,exclude=None,no_link_tracking=False):
 	if no_link_tracking:
 		print(f"Skipping copying file as no_link_tracking ...\n")
 	#print(symLinks)
-	startTime = time.perf_counter()
+	start_time = time.perf_counter()
 	for src, dest in symLinks.items():
 		try:
 			src = os.path.normpath(src)
@@ -777,10 +775,8 @@ def creatSymLinks(symLinks,exclude=None,no_link_tracking=False):
 				# we also copy the pointed file if the file doesn't exist
 				destLinkedFile = os.path.join(os.path.dirname(dest), linkedTargetFile)
 				#print(f"sourcelinkedfile: {sourceLinkedFile} -> destlinkedfile: {destLinkedFile}")
-				if not os.path.exists(destLinkedFile):
-					if no_link_tracking:
-						pass
-					elif not os.path.exists(sourceLinkedFile):
+				if not os.path.exists(destLinkedFile) and not no_link_tracking:
+					if not os.path.exists(sourceLinkedFile):
 						print(f"\nFile {sourceLinkedFile} which is linked by {src} doesn't exist! \nSkipping copying original file...")
 					else:
 						# if os.path.islink(sourceLinkedFile):
@@ -812,7 +808,7 @@ def creatSymLinks(symLinks,exclude=None,no_link_tracking=False):
 
 			# print the progress bar with the total count and the speed in F/s
 			prefix = f'{counter} Symbolic Links Created'
-			suffix = f'{counter / (time.perf_counter() - startTime):.2f} F/s'
+			suffix = f'{counter / (time.perf_counter() - start_time):.2f} F/s'
 			multiCMD.print_progress_bar(counter, len(symLinks), prefix=prefix, suffix=suffix)
 			# we catch the file name too long exception
 		except OSError as e:
@@ -830,10 +826,10 @@ def creatSymLinks(symLinks,exclude=None,no_link_tracking=False):
 
 
 	endTime = time.perf_counter()
-	print(f"Time taken:             {endTime-startTime:0.4f} seconds")
+	print(f"Time taken:             {endTime-start_time:0.4f} seconds")
 	if len(nestedSymLinks) > 0:
 		print(f"\nNested Symbolic Links:   {len(nestedSymLinks)}")
-		creatSymLinks(nestedSymLinks,exclude=exclude,no_link_tracking=no_link_tracking)
+		create_sym_links(nestedSymLinks,exclude=exclude,no_link_tracking=no_link_tracking)
 
 # -- File list --
 def natural_sort(l): 
@@ -847,7 +843,7 @@ def natural_sort(l):
 		list: The sorted list of strings.
 	"""
 	convert = lambda text: int(text) if text.isdigit() else text.lower() 
-	alphanum_key = lambda key: [convert(c) for c in re.split('([0-9]+)', key)] 
+	alphanum_key = lambda key: [convert(c) for c in re.split('(\d+)', key)] 
 	return sorted(l, key=alphanum_key)
 
 # -- Format --
@@ -1014,7 +1010,7 @@ def get_file_repr(filename,append_hash=False,full_hash=False):
 	return filename
 
 # -- Path --
-def trimPaths(paths,baseDir):
+def trim_paths(paths,baseDir):
 	return set([os.path.relpath(path,os.path.dirname(baseDir)) for path in paths])
 # ---- Generate File List ----
 @functools.lru_cache(maxsize=None)
@@ -1029,22 +1025,27 @@ def get_file_list_serial(root,exclude=None,append_hash=False,full_hash=False):
 		return frozenset() ,frozenset([get_file_repr(root,append_hash,full_hash)]),0,frozenset()
 	if os.path.isfile(root):
 		st = os.stat(root, follow_symlinks=False)
-		realSize = st.st_rsize if 'st_rsize' in st else st.st_blocks * 512 if 'st_blocks' in st else st.st_size
+		if 'st_rsize' in st:
+			realSize = st.st_rsize
+		elif 'st_blocks' in st:
+			realSize = st.st_blocks * 512
+		else:
+			realSize = st.st_size
 		return frozenset([get_file_repr(root,append_hash,full_hash)]) ,frozenset(), realSize,frozenset()
 	file_list = set()
 	links = set()
 	folders = set()
 	size = 0
 	iteration = 0
-	startTime = time.perf_counter()
-	globalStartTIme = startTime
+	start_time = time.perf_counter()
+	globalStartTIme = start_time
 	if os.path.isdir(root):
 		folders.add(root)
 		for entry in os.scandir(root):
 			# update the progress bar every 0.5 seconds
 			currentTime = time.perf_counter()
-			if currentTime - startTime > 0.5:
-				startTime = currentTime
+			if currentTime - start_time > 0.5:
+				start_time = currentTime
 				# use the time passed as the iteration number
 				iteration = int(currentTime - globalStartTIme)
 				# if the root is longer than 50 characters, we only show the last 50 characters
@@ -1055,7 +1056,12 @@ def get_file_list_serial(root,exclude=None,append_hash=False,full_hash=False):
 				links.add(get_file_repr(entry.path,append_hash,full_hash))
 				try:
 					st = entry.stat(follow_symlinks=False)
-					realSize = st.st_rsize if 'st_rsize' in st else st.st_blocks * 512 if 'st_blocks' in st else st.st_size
+					if 'st_rsize' in st:
+						realSize = st.st_rsize
+					elif 'st_blocks' in st:
+						realSize = st.st_blocks * 512
+					else:
+						realSize = st.st_size
 				except:
 					realSize = os.path.getsize(entry.path)
 				size += realSize
@@ -1063,7 +1069,13 @@ def get_file_list_serial(root,exclude=None,append_hash=False,full_hash=False):
 				file_list.add(get_file_repr(entry.path,append_hash,full_hash))
 				try:
 					st = entry.stat(follow_symlinks=False)
-					realSize = st.st_rsize if 'st_rsize' in st else st.st_blocks * 512 if 'st_blocks' in st else st.st_size
+					# Extract nested conditional into separate statement
+					if 'st_rsize' in st:
+						realSize = st.st_rsize
+					elif 'st_blocks' in st:
+						realSize = st.st_blocks * 512
+					else:
+						realSize = st.st_size
 				except:
 					try:
 						realSize = os.path.getsize(entry.path)
@@ -1093,7 +1105,12 @@ def get_file_list_parallel(path,max_workers=56,exclude=None,append_hash=False,fu
 		return frozenset() ,frozenset([get_file_repr(path,append_hash,full_hash)]),0,frozenset()
 	if os.path.isfile(path):
 		st = os.stat(path, follow_symlinks=False)
-		realSize = st.st_rsize if 'st_rsize' in st else st.st_blocks * 512 if 'st_blocks' in st else st.st_size
+		if 'st_rsize' in st:
+			realSize = st.st_rsize
+		elif 'st_blocks' in st:
+			realSize = st.st_blocks * 512
+		else:
+			realSize = st.st_size
 		return frozenset([get_file_repr(path,append_hash,full_hash)]) ,frozenset(), realSize,frozenset()
 
 	
@@ -1135,7 +1152,7 @@ def get_file_list_parallel(path,max_workers=56,exclude=None,append_hash=False,fu
 # ---- Delete Files ----
 def delete_file_bulk(paths):
 	total_size = 0
-	startTime = time.perf_counter()
+	start_time = time.perf_counter()
 	for path in paths:
 		if os.path.exists(path):
 			try:
@@ -1149,13 +1166,13 @@ def delete_file_bulk(paths):
 			except Exception as exc:
 				print(f'\nDeleting {path} generated an exception: {exc}')
 	endTime = time.perf_counter()
-	return total_size, endTime - startTime
+	return total_size, endTime - start_time
 
 def delete_file_list_parallel(file_list, max_workers, verbose=False,files_per_job=1,init_size=0):
 	total_files = len(file_list)
 	file_list_iterator = iter(file_list)
-	startTime = time.perf_counter()
-	last_refresh_time = startTime
+	start_time = time.perf_counter()
+	last_refresh_time = start_time
 	futures = {}
 	files_per_job = max(1,files_per_job)
 	apb = Adaptive_Progress_Bar(total_count=total_files,total_size=init_size,last_num_job_for_stats=max(1,max_workers // 2),process_word='Deleted',use_print_thread = True)
@@ -1214,24 +1231,24 @@ def delete_file_list_parallel(file_list, max_workers, verbose=False,files_per_jo
 			last_refresh_time = time.perf_counter()
 	endTime = time.perf_counter()
 	apb.stop()
-	print(f"\nTime taken:             {endTime-startTime:0.4f} seconds")
-	print(f"Average speed:          {format_bytes(apb.size_counter / (endTime-startTime))}B/s")
-	print(f"                        {apb.item_counter / (endTime-startTime):.2f} file/s")
+	print(f"\nTime taken:             {endTime-start_time:0.4f} seconds")
+	print(f"Average speed:          {format_bytes(apb.size_counter / (endTime-start_time))}B/s")
+	print(f"                        {apb.item_counter / (endTime-start_time):.2f} file/s")
 	return apb.item_counter, apb.size_counter
 
 def delete_files_parallel(paths, max_workers, verbose=False,files_per_job=1,exclude=None,batch=False):
 	if not batch and isinstance(paths, str):
 		paths = [paths]
-	startTime = time.perf_counter()
+	start_time = time.perf_counter()
 	all_files = set()
 	init_size_all = 0
 	for path in paths:
-		file_list, links,init_size, folders = get_file_list_serial(path,exclude=exclude)
+		file_list, links,init_size, _ = get_file_list_serial(path,exclude=exclude)
 		#file_list, links,init_size, folders = get_file_list_parallel(path, max_workers,exclude=exclude)
 		all_files.update(set(file_list) | set(links))
 		init_size_all += init_size
 	endTime = time.perf_counter()
-	print(f"Time taken to get file list: {endTime-startTime:0.4f} seconds")
+	print(f"Time taken to get file list: {endTime-start_time:0.4f} seconds")
 	total_files = len(all_files)
 	print(f"Number of files: {total_files}")
 	if total_files == 0:
@@ -1265,7 +1282,7 @@ def copy_file(src_path, dest_path, full_hash=False, verbose=False):
 	if len(dest_path) > 4096:
 		print(f'\nSkipped {dest_path} because path is too long')
 		return 0, 0, symLinks #, task_to_run
-	startTime = time.perf_counter()
+	start_time = time.perf_counter()
 	try:
 		src_size = os.path.getsize(src_path)
 		copiedSize = 0
@@ -1282,7 +1299,7 @@ def copy_file(src_path, dest_path, full_hash=False, verbose=False):
 				os.chmod(dest_path, st.st_mode)
 			os.utime(dest_path, (st.st_atime, st.st_mtime),follow_symlinks=False)
 			endTime = time.perf_counter()
-			return 0, endTime - startTime , symLinks #, task_to_run
+			return 0, endTime - start_time , symLinks #, task_to_run
 		if os.path.islink(src_path):
 			symLinks[src_path] = dest_path
 		else:
@@ -1308,11 +1325,11 @@ def copy_file(src_path, dest_path, full_hash=False, verbose=False):
 					#task_to_run = ["xcopy", "/I", "/E", "/Y", "/c", "/q", "/k", "/r", "/h", "/x", src_path, dest_path]
 	except Exception as e:
 		print(f'\nError copying {src_path} to {dest_path}: {e}')
-		return 0, time.perf_counter() - startTime, symLinks #, task_to_run
+		return 0, time.perf_counter() - start_time, symLinks #, task_to_run
 	if not copiedSize:
 		copiedSize = src_size
 	endTime = time.perf_counter()
-	return copiedSize, endTime - startTime , symLinks #, task_to_run
+	return copiedSize, endTime - start_time , symLinks #, task_to_run
 
 def copy_files_bulk(src_files, dst_files, full_hash=False, verbose=False):
 	"""
@@ -1340,11 +1357,11 @@ def copy_files_bulk(src_files, dst_files, full_hash=False, verbose=False):
 		total_size += size
 		total_time += cpTime
 		symLinks.update(rtnSymLinks)
-	# startTime = time.perf_counter()
+	# start_time = time.perf_counter()
 	# if tasks_to_run:
 	#     multiCMD.run_commands(tasks_to_run, timeout=0,max_threads=3, quiet=True)
 	# endTime = time.perf_counter()
-	# total_time += endTime - startTime
+	# total_time += endTime - start_time
 	return total_size , total_time, symLinks
 
 def copy_file_list_parallel(file_list, links, src_path, dest_path, max_workers, full_hash=False, verbose=False, files_per_job=1,estimated_size = 0):
@@ -1375,8 +1392,8 @@ def copy_file_list_parallel(file_list, links, src_path, dest_path, max_workers, 
 		print(f'\nSkipped {dest_path} because path is too long')
 		return 0, 0, {}, frozenset()
 	file_list_iterator = iter(file_list)
-	startTime = time.perf_counter()
-	lastRefreshTime = startTime
+	start_time = time.perf_counter()
+	lastRefreshTime = start_time
 	total_files = len(file_list)
 	futures = {}
 	files_per_job = max(1,files_per_job)
@@ -1447,10 +1464,10 @@ def copy_file_list_parallel(file_list, links, src_path, dest_path, max_workers, 
 			lastRefreshTime = time.perf_counter()
 	endTime = time.perf_counter()
 	apb.stop()
-	print(f"\nTime taken:             {endTime-startTime:0.4f} seconds")
-	print(f"Average speed:          {format_bytes(apb.size_counter / (endTime-startTime))}B/s")
-	print(f"                        {apb.item_counter / (endTime-startTime):.2f} file/s")
-	print(f"Average bandwidth:      {format_bytes(apb.size_counter / (endTime-startTime) * 8,use_1024_bytes=False)}bps")
+	print(f"\nTime taken:             {endTime-start_time:0.4f} seconds")
+	print(f"Average speed:          {format_bytes(apb.size_counter / (endTime-start_time))}B/s")
+	print(f"                        {apb.item_counter / (endTime-start_time):.2f} file/s")
+	print(f"Average bandwidth:      {format_bytes(apb.size_counter / (endTime-start_time) * 8,use_1024_bytes=False)}bps")
 
 	return apb.item_counter, apb.size_counter , symLinks ,file_list
 
@@ -1469,14 +1486,14 @@ def copy_files_parallel(src_path, dest_path, max_workers, full_hash=False, verbo
 	if not os.path.isdir(src_path):
 		src_size, _ , symLinks = copy_file(src_path, dest_path,full_hash=full_hash, verbose=verbose)
 		return 1, src_size , symLinks , frozenset([src_path])
-	startTime = time.perf_counter()
+	start_time = time.perf_counter()
 	if parallel_file_listing:
 		file_list , links,init_size,folders  = get_file_list_parallel(src_path, max_workers,exclude=exclude)
 	else:
 		file_list,links,init_size,folders = get_file_list_serial(src_path,exclude=exclude)
 		
 	endTime = time.perf_counter()
-	print(f"Time taken to get file list: {endTime-startTime:0.4f} seconds")
+	print(f"Time taken to get file list: {endTime-start_time:0.4f} seconds")
 	total_files = len(file_list)
 	print(f"Number of files: {total_files}")
 	print(f"Number of links: {len(links)}")
@@ -1498,15 +1515,15 @@ def copy_files_serial(src_path, dest_path, full_hash=False, verbose=False,exclud
 		src_size, _ , symLinks = copy_file(src_path, dest_path,full_hash=full_hash, verbose=verbose)
 		return 1, src_size , symLinks , frozenset([src_path])
 	print(f'Getting file list for {src_path}')
-	file_list,links,init_size,folders = get_file_list_serial(src_path,exclude=exclude)
+	file_list,links,init_size,_ = get_file_list_serial(src_path,exclude=exclude)
 	links = set(links)
 	total_files = len(file_list)
 	print(f"Number of files: {total_files}")
-	startTime = time.perf_counter()
+	start_time = time.perf_counter()
 	apb = Adaptive_Progress_Bar(total_count=total_files,total_size=init_size,last_num_job_for_stats=1,process_word='Copied')
 	for file in file_list:
 		size, cpTime ,rtnSymLinks = copy_file(file, os.path.join(dest_path, os.path.relpath(file, src_path)),full_hash = full_hash, verbose=verbose)
-		#update_progress_bar(copy_counter, copy_size_counter, total_files, startTime)
+		#update_progress_bar(copy_counter, copy_size_counter, total_files, start_time)
 		apb.update(num_files=1,cpSize=size,cpTime=cpTime,files_per_job=1)
 		links.update(rtnSymLinks)
 	symLinks = {}
@@ -1514,10 +1531,10 @@ def copy_files_serial(src_path, dest_path, full_hash=False, verbose=False,exclud
 		symLinks[link] = os.path.join(dest_path, os.path.relpath(link, src_path))
 	endTime = time.perf_counter()
 	apb.stop()
-	print(f"\nTime taken:             {endTime-startTime:0.4f} seconds")
-	print(f"Average speed:          {format_bytes(apb.size_counter / (endTime-startTime))}B/s")
-	print(f"                        {apb.item_counter / (endTime-startTime):.2f} file/s")
-	print(f"Average bandwidth:      {format_bytes(apb.size_counter / (endTime-startTime) * 8,use_1024_bytes=False)}bps")
+	print(f"\nTime taken:             {endTime-start_time:0.4f} seconds")
+	print(f"Average speed:          {format_bytes(apb.size_counter / (endTime-start_time))}B/s")
+	print(f"                        {apb.item_counter / (endTime-start_time):.2f} file/s")
+	print(f"Average bandwidth:      {format_bytes(apb.size_counter / (endTime-start_time) * 8,use_1024_bytes=False)}bps")
 	return apb.item_counter, apb.size_counter , symLinks , frozenset(file_list)
 
 # ---- Copy Directories ----
@@ -1529,16 +1546,16 @@ def sync_directory_metadata(src_path, dest_path):
 	if len(dest_path) > 4096:
 		print(f'Skipping: {dest_path} is too long')
 		return 0, 0 , set(), frozenset()
-	startTime = time.perf_counter()
+	start_time = time.perf_counter()
 	if os.path.islink(src_path):
-		return 0,time.perf_counter()-startTime,{src_path: dest_path}
+		return 0,time.perf_counter()-start_time,{src_path: dest_path}
 	if not os.path.isdir(src_path):
 		return copy_file(src_path, dest_path)
 	# Create the directory if it does not exist
 	try:
 		if not (os.path.exists(dest_path) or os.path.ismount(dest_path)):
 			os.makedirs(dest_path, exist_ok=True)
-	except FileExistsError as e:
+	except FileExistsError:
 		print(f"Destination path {dest_path} maybe a mounted dir, known issue with os.path.exists\nContinuing without creating dest folder...")
 
 	# Sync the metadata
@@ -1548,7 +1565,7 @@ def sync_directory_metadata(src_path, dest_path):
 	if os.name == 'posix':
 		os.chown(dest_path, st.st_uid, st.st_gid)
 	os.utime(dest_path, (st.st_atime, st.st_mtime))
-	return 1,time.perf_counter()-startTime,frozenset()
+	return 1,time.perf_counter()-start_time,frozenset()
 
 def sync_directory_metadata_bulk(src_paths, dest_paths):
 	total_count = 0
@@ -1598,11 +1615,11 @@ def sync_directories_serial(src, dest,exclude=None):
 		return symLinks
 	#sync_directory_metadata(src, dest)
 	print(f'Getting file list for {src}')
-	file_list,links,init_size,folders = get_file_list_serial(src,exclude=exclude)
+	_,_,_,folders = get_file_list_serial(src,exclude=exclude)
 	print(f"Syncing Dir from {src} to {dest} in single thread")
 	apb = Adaptive_Progress_Bar(total_count=len(folders),total_size=len(folders))
 	for folder in folders:
-		count , cpTime , rtnSymLinks = sync_directory_metadata(folder, os.path.join(dest, os.path.relpath(folder, src)))
+		count , cpTime , _ = sync_directory_metadata(folder, os.path.join(dest, os.path.relpath(folder, src)))
 		apb.update(num_files=1, cpSize=count, cpTime=cpTime , files_per_job=1)
 	apb.stop()
 	# try:
@@ -1620,7 +1637,7 @@ def sync_directories_serial(src, dest,exclude=None):
 	# 		count += 1
 	# 		copiedFolderCount += returnCount
 	# 		# print the count and speed in Directory/s
-	# 		outStr = f"\r{count} ({format_bytes(copiedFolderCount)}B) directories synced, {count / (time.perf_counter() - startTime):.2f} directories/s Copied {dir}"
+	# 		outStr = f"\r{count} ({format_bytes(copiedFolderCount)}B) directories synced, {count / (time.perf_counter() - start_time):.2f} directories/s Copied {dir}"
 	# 		# we fill and truncate the string to prevent artifacts from previous prints
 	# 		sys.stdout.write(outStr.ljust(columns)[:columns])
 	# 		sys.stdout.flush()
@@ -1656,11 +1673,11 @@ def sync_directories_parallel(src, dest, max_workers, verbose=False,folder_per_j
 		return symLinks
 	sync_directory_metadata(src, dest)
 	print(f'Getting file list for {src}')
-	file_list,links,init_size,folders = get_file_list_serial(src,exclude=exclude)
+	_,_,_,folders = get_file_list_serial(src,exclude=exclude)
 	folder_list_iterator = iter(folders)
 	futures = {}
-	startTime = time.perf_counter()
-	last_refresh_time = startTime
+	start_time = time.perf_counter()
+	last_refresh_time = start_time
 	max_workers = max(2,int(max_workers / 4))
 
 	folder_per_job = max(1,folder_per_job)
@@ -1722,14 +1739,14 @@ def sync_directories_parallel(src, dest, max_workers, verbose=False,folder_per_j
 
 	endTime = time.perf_counter()
 	apb.stop()
-	print(f"\nTime taken:             {endTime-startTime:0.4f} seconds")
-	print(f"Average speed:          {format_bytes(apb.size_counter / (endTime-startTime))}B/s")
-	print(f"                        {apb.item_counter / (endTime-startTime):.2f} folder/s")
-	print(f"Average bandwidth:      {format_bytes(apb.size_counter / (endTime-startTime) * 8,use_1024_bytes=False)}bps")
+	print(f"\nTime taken:             {endTime-start_time:0.4f} seconds")
+	print(f"Average speed:          {format_bytes(apb.size_counter / (endTime-start_time))}B/s")
+	print(f"                        {apb.item_counter / (endTime-start_time):.2f} folder/s")
+	print(f"Average bandwidth:      {format_bytes(apb.size_counter / (endTime-start_time) * 8,use_1024_bytes=False)}bps")
 	return symLinks
 
 # ---- Compare Files ----
-def compareFileList(file_list, file_list2,diff_file_list=None,tar_diff_file_list = False):
+def compare_file_list(file_list, file_list2,diff_file_list=None,tar_diff_file_list = False):
 	print('-'*80)
 	print(f"Number of files in src: {len(file_list)}")
 	print(f"Number of files in dest: {len(file_list2)}")
@@ -1797,11 +1814,11 @@ def remove_extra_files(total_file_list, dest,max_workers,verbose,files_per_job,s
 		print(f"Removing extra files from {dest} with {max_workers} workers")
 		# we first get a file list of the dest dir
 		if single_thread:
-			dest_file_list,links,init_size, folders = get_file_list_serial(dest,exclude=exclude)
+			dest_file_list,links,_, _ = get_file_list_serial(dest,exclude=exclude)
 		else:
-			dest_file_list,links,init_size ,folders = get_file_list_parallel(dest, max_workers,exclude=exclude)
-		dest_file_list = trimPaths(dest_file_list,dest)
-		dest_file_list.update(trimPaths(links,dest))
+			dest_file_list,links,_ ,_ = get_file_list_parallel(dest, max_workers,exclude=exclude)
+		dest_file_list = trim_paths(dest_file_list,dest)
+		dest_file_list.update(trim_paths(links,dest))
 		# we then get the list of all extra files
 		inDestNotInSrc = dest_file_list - total_file_list
 		inDestNotInSrc = [os.path.join(dest,file) for file in inDestNotInSrc]
@@ -1817,7 +1834,7 @@ def remove_extra_files(total_file_list, dest,max_workers,verbose,files_per_job,s
 			print(f"Do you want to delete them? (y/n)")
 			if not input().lower().startswith('y'):
 				exit(0)
-			startTime = time.perf_counter()
+			start_time = time.perf_counter()
 			if single_thread:
 				for file in inDestNotInSrc:
 					if os.path.isfile(file) or os.path.islink(file):
@@ -1827,12 +1844,12 @@ def remove_extra_files(total_file_list, dest,max_workers,verbose,files_per_job,s
 			else:
 				delete_file_list_parallel(inDestNotInSrc, max_workers, verbose,files_per_job)
 			endTime = time.perf_counter()
-			print(f"Time taken to remove extra files: {endTime-startTime:0.4f} seconds")
+			print(f"Time taken to remove extra files: {endTime-start_time:0.4f} seconds")
 
 # ---- Main Helper Functions ----
-def mountSrcImage(src_image,src_images: list,src_paths: list,mount_points: list,loop_devices: list):
+def mount_src_image(src_image,src_images: list,src_paths: list,mount_points: list,loop_devices: list):
 	for src_image_pattern in src_image:
-		if not os.name == 'nt':
+		if os.name != 'nt':
 			try:
 				src_images.extend(glob.glob(src_image_pattern,include_hidden=True,recursive=True))
 			except:
@@ -1888,11 +1905,11 @@ def mountSrcImage(src_image,src_images: list,src_paths: list,mount_points: list,
 				continue
 	return src_str.strip('-')
 
-def verifySrcPath(src_path,src_paths: list):
+def verify_src_path(src_path,src_paths: list):
 	if src_path:
 		for src_path_pattern in src_path:
 			#print(src_path_pattern)
-			if not os.name == 'nt':
+			if os.name != 'nt':
 				try:
 					src_paths.extend(glob.glob(src_path_pattern,include_hidden=True,recursive=True))
 				except:
@@ -1911,7 +1928,7 @@ def verifySrcPath(src_path,src_paths: list):
 		print(f"No source paths specified, exiting")
 		exit(0)
 
-def loadFileList(file_list):
+def load_file_list(file_list):
 	if not os.path.exists(file_list):
 		print(f"File list {file_list} does not exist")
 		return frozenset()
@@ -1919,7 +1936,7 @@ def loadFileList(file_list):
 		fileList = frozenset([entry.strip() for entry in f.read().splitlines() if entry.strip()])
 	return fileList
 
-def storeFileList(file_list, src_paths: list, single_thread=False, max_workers=4 * multiprocessing.cpu_count(), verbose=False,
+def store_file_list(file_list, src_paths: list, single_thread=False, max_workers=4 * multiprocessing.cpu_count(), verbose=False,
 					files_per_job=1, compare_file_list=False, remove_extra=False, parallel_file_listing=False, exclude=None,
 					diff_file_list=None,tar_diff_file_list = False, src_str=None,append_hash=True,full_hash=False):
 	"""
@@ -1946,7 +1963,7 @@ def storeFileList(file_list, src_paths: list, single_thread=False, max_workers=4
 		file_list += '_file_list.txt'
 	if remove_extra:
 		print('-' * 80)
-		file_list_file = loadFileList(file_list)
+		file_list_file = load_file_list(file_list)
 		if len(src_paths) == 1:
 			remove_extra_files(file_list_file, src_paths[0], max_workers, verbose, files_per_job, single_thread, exclude=exclude)
 			print('-' * 80)
@@ -1956,16 +1973,16 @@ def storeFileList(file_list, src_paths: list, single_thread=False, max_workers=4
 	fileList = set()
 	for src in src_paths:
 		print(f"Getting file list from {src}")
-		startTime = time.perf_counter()
+		start_time = time.perf_counter()
 		if not parallel_file_listing:
-			files, links, init_size,folders = get_file_list_serial(src, exclude=exclude,append_hash=append_hash,full_hash=full_hash)
+			files, links, _,folders = get_file_list_serial(src, exclude=exclude,append_hash=append_hash,full_hash=full_hash)
 		else:
-			files, links, init_size,folders  = get_file_list_parallel(src, max_workers, exclude=exclude,append_hash=append_hash,full_hash=full_hash)
-		fileList.update(trimPaths(files, src))
-		fileList.update(trimPaths(links, src))
-		fileList.update([folder_path + os.path.sep for folder_path in trimPaths(folders, src)])
+			files, links, _,folders  = get_file_list_parallel(src, max_workers, exclude=exclude,append_hash=append_hash,full_hash=full_hash)
+		fileList.update(trim_paths(files, src))
+		fileList.update(trim_paths(links, src))
+		fileList.update([folder_path + os.path.sep for folder_path in trim_paths(folders, src)])
 		endTime = time.perf_counter()
-		print(f"Time taken to get file list: {endTime - startTime:0.4f} seconds")
+		print(f"Time taken to get file list: {endTime - start_time:0.4f} seconds")
 	if compare_file_list:
 		# This means we have a file_list and a src_path so we compare them
 		print(f"Comparing file list from {src_paths} with {file_list}")
@@ -1973,8 +1990,8 @@ def storeFileList(file_list, src_paths: list, single_thread=False, max_workers=4
 			if not src_str:
 				src_str = '-'.join([os.path.basename(os.path.realpath(src)) for src in src_paths])
 			diff_file_list = f'DIFF_{src_str}_TO_{os.path.basename(os.path.realpath(file_list))}_{int(time.time())}_{"tar_" if tar_diff_file_list else ""}file_list.txt'
-		fileList2 = loadFileList(file_list)
-		compareFileList(fileList, fileList2,diff_file_list,tar_diff_file_list = tar_diff_file_list)
+		fileList2 = load_file_list(file_list)
+		compare_file_list(fileList, fileList2,diff_file_list,tar_diff_file_list = tar_diff_file_list)
 	else:
 		print(f"Number of files: {len(fileList)}")
 		print(f"Writing file list to {fileList}")
@@ -1986,7 +2003,7 @@ def storeFileList(file_list, src_paths: list, single_thread=False, max_workers=4
 	# cleanUp(mount_points,loop_devices)
 	# exit(0)
 
-def processRemove(src_paths: list,single_thread = False, max_workers = 4 * multiprocessing.cpu_count(),verbose = False,
+def process_remove(src_paths: list,single_thread = False, max_workers = 4 * multiprocessing.cpu_count(),verbose = False,
 				  files_per_job = 1, remove_force = False,exclude=None,batch = False):
 	print(f"Removing files from {src_paths} with {max_workers if not single_thread else '1'} workers")
 	#src = os.path.abspath(src +os.path.sep)
@@ -2002,18 +2019,18 @@ def processRemove(src_paths: list,single_thread = False, max_workers = 4 * multi
 		processedPaths.append(path)
 	for path in processedPaths:
 		print('-'*80)
-		startTime = time.perf_counter()
+		start_time = time.perf_counter()
 		if single_thread:
 			shutil.rmtree(path)
 		else:
 			delete_files_parallel(processedPaths if batch else path, max_workers, verbose=verbose,files_per_job=files_per_job,exclude=exclude,batch=batch)
 		endTime = time.perf_counter()
-		print(f"Time taken to remove files: {endTime-startTime:0.4f} seconds")
+		print(f"Time taken to remove files: {endTime-start_time:0.4f} seconds")
 		print('-'*80)
 		if batch and not single_thread:
 			break
 
-def getDestFromImage(dest_image,mount_points: list,loop_devices: list):
+def get_dest_from_image(dest_image,mount_points: list,loop_devices: list):
 	dest = ''
 	target_mount_point = tempfile.mkdtemp()
 	mount_points.append(target_mount_point)
@@ -2064,7 +2081,7 @@ def getDestFromImage(dest_image,mount_points: list,loop_devices: list):
 		dest = None
 	return dest , target_mount_point
 
-def getDestFromPath(dest_path,src_paths: list,src_path,can_be_none = False):
+def get_dest_from_path(dest_path,src_paths: list,src_path,can_be_none = False):
 	dest = ''
 	src_path = list(src_path)
 	if not dest_path:
@@ -2123,9 +2140,9 @@ def getDestFromPath(dest_path,src_paths: list,src_path,can_be_none = False):
 		dest += os.path.sep
 	return dest
 
-def processCompareFileList(src_paths: list, dest, max_workers = 4 * multiprocessing.cpu_count(),
-						   file_list = "",parallel_file_listing = False,exclude=None,dest_image = None,diff_file_list = None,tar_diff_file_list = False,
-						   append_hash = True,full_hash = False):
+def process_compare_file_list(src_paths: list, dest, max_workers = 4 * multiprocessing.cpu_count(),
+							  parallel_file_listing = False,exclude=None,dest_image = None,diff_file_list = None,tar_diff_file_list = False,
+							  append_hash = True,full_hash = False):
 	# while os.path.basename(dest) == '':
 	#     dest = os.path.dirname(dest)
 	if not dest or not os.path.exists(dest) or not os.path.isdir(dest):
@@ -2136,35 +2153,35 @@ def processCompareFileList(src_paths: list, dest, max_workers = 4 * multiprocess
 	for src in src_paths:
 		print('-'*80)
 		print(f"Getting file list from {src}")
-		startTime = time.perf_counter()
+		start_time = time.perf_counter()
 		if not parallel_file_listing:
-			files,links,init_size,folders = get_file_list_serial(src,exclude=exclude,append_hash=append_hash,full_hash=full_hash)
+			files,links,_,folders = get_file_list_serial(src,exclude=exclude,append_hash=append_hash,full_hash=full_hash)
 		else:
-			files,links,init_size,folders  = get_file_list_parallel(src, max_workers,exclude=exclude,append_hash=append_hash,full_hash=full_hash)
+			files,links,_,folders  = get_file_list_parallel(src, max_workers,exclude=exclude,append_hash=append_hash,full_hash=full_hash)
 		if dest_image:
 			# we use full path for src when comparing file list with dest image
-			file_list.update(trimPaths([os.path.abspath(file) for file in files],'/'))
-			file_list.update(trimPaths([os.path.abspath(link) for link in links],'/'))
-			file_list.update([folder_path + os.path.sep for folder_path in trimPaths([os.path.abspath(folder) for folder in folders],'/')])
+			file_list.update(trim_paths([os.path.abspath(file) for file in files],'/'))
+			file_list.update(trim_paths([os.path.abspath(link) for link in links],'/'))
+			file_list.update([folder_path + os.path.sep for folder_path in trim_paths([os.path.abspath(folder) for folder in folders],'/')])
 		else:
-			file_list.update(trimPaths(files,src))
-			file_list.update(trimPaths(links,src))
-			file_list.update([folder_path + os.path.sep for folder_path in trimPaths(folders, src)])
+			file_list.update(trim_paths(files,src))
+			file_list.update(trim_paths(links,src))
+			file_list.update([folder_path + os.path.sep for folder_path in trim_paths(folders, src)])
 		endTime = time.perf_counter()
-		print(f"Time taken to get file list: {endTime-startTime:0.4f} seconds")
-	startTime = time.perf_counter()
+		print(f"Time taken to get file list: {endTime-start_time:0.4f} seconds")
+	start_time = time.perf_counter()
 	if not parallel_file_listing:
-		files,links,init_size,folders = get_file_list_serial(dest,exclude=exclude,append_hash=append_hash,full_hash=full_hash)
+		files,links,_,folders = get_file_list_serial(dest,exclude=exclude,append_hash=append_hash,full_hash=full_hash)
 	else:
-		files,links,init_size,folders  = get_file_list_parallel(dest, max_workers,exclude=exclude,append_hash=append_hash,full_hash=full_hash)
-	file_list2 = set(trimPaths(files,dest))
-	file_list2.update(trimPaths(links,dest))
-	file_list2.update([folder_path + os.path.sep for folder_path in trimPaths(folders, dest)])
+		files,links,_,folders  = get_file_list_parallel(dest, max_workers,exclude=exclude,append_hash=append_hash,full_hash=full_hash)
+	file_list2 = set(trim_paths(files,dest))
+	file_list2.update(trim_paths(links,dest))
+	file_list2.update([folder_path + os.path.sep for folder_path in trim_paths(folders, dest)])
 	endTime = time.perf_counter()
-	print(f"Time taken to get file list: {endTime-startTime:0.4f} seconds")
-	compareFileList(file_list, file_list2, diff_file_list,tar_diff_file_list = tar_diff_file_list)
+	print(f"Time taken to get file list: {endTime-start_time:0.4f} seconds")
+	compare_file_list(file_list, file_list2, diff_file_list,tar_diff_file_list = tar_diff_file_list)
 
-def createImage(dest_image,target_mount_point,loop_devices: list,src_paths: list, max_workers = 4 * multiprocessing.cpu_count(),
+def create_image(dest_image,target_mount_point,loop_devices: list,src_paths: list, max_workers = 4 * multiprocessing.cpu_count(),
 				parallel_file_listing = False,exclude=None):
 	if target_mount_point and dest_image:
 		# This means we were supplied a dest_image that does not exist, we need to create it and initialize it
@@ -2224,7 +2241,7 @@ def createImage(dest_image,target_mount_point,loop_devices: list,src_paths: list
 		print(f"Destination path not specified, exiting.")
 		exit(0)
 
-def processCopy(src_paths: list, dest = "", single_thread = False, max_workers = 4 * multiprocessing.cpu_count(),verbose = False, 
+def process_copy(src_paths: list, dest = "", single_thread = False, max_workers = 4 * multiprocessing.cpu_count(),verbose = False, 
 				directory_only = False,no_directory_sync = False, full_hash = False, files_per_job = 1, parallel_file_listing = False,
 				exclude=None,dest_image = None,batch = False):
 	total_file_list = set()
@@ -2250,7 +2267,7 @@ def processCopy(src_paths: list, dest = "", single_thread = False, max_workers =
 			destParentDirs = [ os.path.abspath(dest + srcParentDir + os.path.sep) for srcParentDir in srcParentDirs]
 			sync_directory_metadata_bulk(srcParentDirs,destParentDirs)
 			dest = os.path.abspath(dest + src + os.path.sep)
-		elif os.path.basename(dest) == '' and not os.path.basename(src) == '':
+		elif os.path.basename(dest) == '' and os.path.basename(src) != '':
 			dest = os.path.join(dest,os.path.basename(src))
 			dest += os.path.sep
 			src += os.path.sep
@@ -2274,13 +2291,13 @@ def processCopy(src_paths: list, dest = "", single_thread = False, max_workers =
 			print("Skipping directory sync")
 			sync_directory_metadata(src, dest)
 		else:
-			startTime = time.perf_counter()
+			start_time = time.perf_counter()
 			if single_thread:
 				total_sym_links.update(sync_directories_serial(src, dest,exclude=exclude))
 			else:
 				total_sym_links.update(sync_directories_parallel(src, dest, max_workers,verbose=verbose,exclude=exclude))
 			endTime = time.perf_counter()
-			print(f"\nTime taken to sync directory: {endTime-startTime:0.4f} seconds")
+			print(f"\nTime taken to sync directory: {endTime-start_time:0.4f} seconds")
 		if not directory_only:
 			global HASH_SIZE
 			if HASH_SIZE == 0:
@@ -2293,16 +2310,18 @@ def processCopy(src_paths: list, dest = "", single_thread = False, max_workers =
 				copy_counter, copy_size_counter , rtnSymLinks , file_list = copy_files_serial(src, dest, full_hash = full_hash,verbose=verbose,exclude=exclude)
 			else:
 				copy_counter, copy_size_counter , rtnSymLinks , file_list = copy_files_parallel(src, dest, max_workers,full_hash = full_hash,verbose=verbose,files_per_job=files_per_job,parallel_file_listing=parallel_file_listing,exclude=exclude)
-			total_file_list.update(trimPaths(file_list,src))
+			total_file_list.update(trim_paths(file_list,src))
 			print(f'Total files copied:     {copy_counter}')
 			print(f'Total size copied:      {format_bytes(copy_size_counter)}B')
 			print(f'Total files discovered: {len(total_file_list)}')
 			total_sym_links.update(rtnSymLinks)
-			total_file_list.update(trimPaths(rtnSymLinks.keys(),src))
+			total_file_list.update(trim_paths(rtnSymLinks.keys(),src))
 		print('-'*80)
 	return total_file_list, total_sym_links
 
-def verifyDDSrcPath(src_path,loop_devices: list = []):
+def validate_dd_source_path(src_path,loop_devices = None):
+	if not loop_devices:
+		loop_devices = []
 	dd_src = src_path
 	if not dd_src:
 		print("DD Source not specified, exiting.")
@@ -2326,7 +2345,7 @@ def verifyDDSrcPath(src_path,loop_devices: list = []):
 		loop_devices.append(dd_src)
 	return dd_src
 
-def createDDDestPartTable(dd_src,dd_resize = [],src_path = None, dest_path = None):
+def create_dd_dest_part_table(dd_src,dd_resize = [],src_path = None, dest_path = None):
 	src_path = src_path if src_path else dd_src
 	if not dest_path:
 		print(f"Destination path not specified.")
@@ -2372,7 +2391,7 @@ def createDDDestPartTable(dd_src,dd_resize = [],src_path = None, dest_path = Non
 	print("Image created successfully.")
 	return partition_infos
 
-def ddPartition(src_partition_path,dest_partition_path,partition,dd_src,dd_dest):
+def dd_partition(src_partition_path,dest_partition_path,partition,dd_src,dd_dest):
 	# First verify the two partition size is the same
 	src_part_info = get_partition_infos(dd_src)
 	dest_part_info = get_partition_infos(dd_dest)
@@ -2382,7 +2401,7 @@ def ddPartition(src_partition_path,dest_partition_path,partition,dd_src,dd_dest)
 		exit(1)
 	run_command_in_multicmd_with_path_check(['dd','if='+src_partition_path,'of='+dest_partition_path,'bs=1024M'])
 
-def cleanUp(mount_points: list,loop_devices: list):
+def clean_up(mount_points: list,loop_devices: list):
 	# clean up loop devices and mount points if we are using a image
 	for mount_point in mount_points:
 		print(f"Unmounting {mount_point}")
@@ -2434,7 +2453,7 @@ def get_args(args = None):
 	#args = parser.parse_args(args)
 	try:
 		args = parser.parse_intermixed_args(args)
-	except Exception as e:
+	except Exception:
 		#eprint(f"Error while parsing arguments: {e!r}")
 		# try to parse the arguments using parse_known_args
 		args, unknown = parser.parse_known_args()
@@ -2487,7 +2506,7 @@ def hpcp(src_path, dest_path = "", single_thread = False, max_workers = 4 * mult
 	src_str = ''
 	dest_str = ''
 	programStartTime = time.perf_counter()
-	exclude = formatExclude(exclude,exclude_file)
+	exclude = format_exclude(exclude,exclude_file)
 	if max_workers == 0:
 		max_workers = round(0.5 * multiprocessing.cpu_count())
 	elif max_workers < 0:
@@ -2502,17 +2521,16 @@ def hpcp(src_path, dest_path = "", single_thread = False, max_workers = 4 * mult
 		dest_path = dest_path if dest_path else dest_image
 		src_path = src_path if src_path else src_image
 
-		if not dest_path:
-			if src_path:
-				print(f"Destination path not specified, using {src_path[-1]} as destination")
-				dest_path = src_path.pop()
+		if not dest_path and src_path:
+			print(f"Destination path not specified, using {src_path[-1]} as destination")
+			dest_path = src_path.pop()
 
 		# check write permission on dest_path
 		if not os.access(os.path.dirname(os.path.abspath(dest_path)), os.W_OK):
 			print(f"Destination path {dest_path} is not writable, continuing with high probability of failure.")
 			#exit(1)
-		dd_src = verifyDDSrcPath(src_path,loop_devices = loop_devices)
-		partition_infos = createDDDestPartTable(dd_src,dd_resize=dd_resize,src_path=src_path, dest_path=dest_path)
+		dd_src = validate_dd_source_path(src_path,loop_devices = loop_devices)
+		partition_infos = create_dd_dest_part_table(dd_src,dd_resize=dd_resize,src_path=src_path, dest_path=dest_path)
 		if not partition_infos:
 			return 1
 		
@@ -2525,7 +2543,7 @@ def hpcp(src_path, dest_path = "", single_thread = False, max_workers = 4 * mult
 				dd_dest = create_loop_device(dd_dest)
 				loop_devices.append(dd_dest)
 		
-		disk_info = partition_infos.pop(dd_src)
+		_ = partition_infos.pop(dd_src)
 		# need to check if partion info is empty and fix partition table if necessary
 		src_partition_paths = get_partitions(dd_src)
 		dest_partition_paths = get_partitions(dd_dest)
@@ -2543,14 +2561,14 @@ def hpcp(src_path, dest_path = "", single_thread = False, max_workers = 4 * mult
 			# check if the mount is successful
 			if not any(os.scandir(src_mount_point)) and not os.path.ismount(src_mount_point):
 				print(f"Error mounting {src_partition_path}, usig dd for copying.")
-				ddPartition(src_partition_path,dest_partition_path,partition,dd_src,dd_dest)
+				dd_partition(src_partition_path,dest_partition_path,partition,dd_src,dd_dest)
 				continue
 			print(f"Mounting {dest_partition_path} at {dest_mount_point}")
 			run_command_in_multicmd_with_path_check(['mount',dest_partition_path,dest_mount_point])
 			# check if the mount is successful
 			if not any(os.scandir(dest_mount_point)) and not os.path.ismount(dest_mount_point):
 				print(f"Error mounting {dest_partition_path}, usig dd for copying.")
-				ddPartition(src_partition_path,dest_partition_path,partition,dd_src,dd_dest)
+				dd_partition(src_partition_path,dest_partition_path,partition,dd_src,dd_dest)
 				continue
 			# copy the partition files
 			print(f"Copying partition {partition} files from {src_mount_point} to {dest_mount_point}")
@@ -2558,7 +2576,7 @@ def hpcp(src_path, dest_path = "", single_thread = False, max_workers = 4 * mult
 																verbose=verbose, directory_only=directory_only,no_directory_sync=no_directory_sync,
 																full_hash=full_hash, files_per_job=files_per_job, parallel_file_listing=parallel_file_listing,
 																exclude=exclude,no_link_tracking = True)
-		cleanUp(mount_points,loop_devices)
+		clean_up(mount_points,loop_devices)
 		# sort the output partitions
 		#run_command_in_multicmd_with_path_check(f"sgdisk --sort {dest_path}")
 		print(f"Done disk dumping {src_path} to {dest_path}.")
@@ -2578,29 +2596,29 @@ def hpcp(src_path, dest_path = "", single_thread = False, max_workers = 4 * mult
 	# if not dest_path:
 	#     dest_path = src_path.pop()
 	if src_image:
-		src_str = mountSrcImage(src_image,src_images,src_paths,mount_points,loop_devices)
+		src_str = mount_src_image(src_image,src_images,src_paths,mount_points,loop_devices)
 
 	if source_file_list:
-		src_paths.extend(loadFileList(source_file_list))
+		src_paths.extend(load_file_list(source_file_list))
 
-	verifySrcPath(src_path,src_paths)
+	verify_src_path(src_path,src_paths)
 	if not src_str:
 		src_str = "-".join([os.path.basename(src) for src in src_paths])
 
 	if target_file_list:
-		storeFileList(target_file_list,src_paths,single_thread=single_thread, max_workers=max_workers,verbose=verbose, 
+		store_file_list(target_file_list,src_paths,single_thread=single_thread, max_workers=max_workers,verbose=verbose, 
 						files_per_job=files_per_job,compare_file_list=compare_file_list, remove_extra=remove_extra,
 						parallel_file_listing=parallel_file_listing,exclude=exclude,diff_file_list=diff_file_list,tar_diff_file_list=tar_diff_file_list,src_str = src_str,
 						append_hash=append_hash_to_file_list,full_hash=full_hash)
-		cleanUp(mount_points,loop_devices)
+		clean_up(mount_points,loop_devices)
 		return 0
 
 
 	if dest_image:
-		dest , target_mount_point = getDestFromImage(dest_image,mount_points,loop_devices)
+		dest , target_mount_point = get_dest_from_image(dest_image,mount_points,loop_devices)
 		dest_str = dest_image
 	else:
-		dest = getDestFromPath(dest_path,src_paths,src_path,can_be_none=remove)
+		dest = get_dest_from_path(dest_path,src_paths,src_path,can_be_none=remove)
 		dest_str = dest
 
 
@@ -2609,15 +2627,15 @@ def hpcp(src_path, dest_path = "", single_thread = False, max_workers = 4 * mult
 			if not src_str:
 				src_str = '-'.join([os.path.basename(os.path.realpath(src)) for src in src_paths])
 			diff_file_list = f'DIFF_{src_str}_TO_{os.path.basename(os.path.realpath(dest_str))}_{int(time.time())}_{"tar_" if tar_diff_file_list else ""}file_list.txt'
-		processCompareFileList(src_paths, dest, max_workers=max_workers, file_list=target_file_list,parallel_file_listing=parallel_file_listing,
+		process_compare_file_list(src_paths, dest, max_workers=max_workers,parallel_file_listing=parallel_file_listing,
 						 exclude=exclude,dest_image=dest_image,diff_file_list=diff_file_list,tar_diff_file_list=tar_diff_file_list,append_hash=append_hash_to_file_list,full_hash=full_hash)
-		cleanUp(mount_points,loop_devices)
+		clean_up(mount_points,loop_devices)
 		return 0
 	
 	try:
 		if dest and dest != ... and dest.endswith(os.path.sep) and (not (os.path.exists(dest) or os.path.ismount(dest))):
 			os.makedirs(dest, exist_ok=True)
-	except FileExistsError as e:
+	except FileExistsError :
 		print(f"Destination path {dest} maybe a mounted dir, known issue with os.path.exists\nContinuing without creating dest folder...")
 
 	if not dest:
@@ -2625,11 +2643,11 @@ def hpcp(src_path, dest_path = "", single_thread = False, max_workers = 4 * mult
 			dest = ...
 			dest_str = dest_path
 		else:
-			dest = createImage(dest_image,target_mount_point,loop_devices,src_paths,max_workers=max_workers,parallel_file_listing=parallel_file_listing,exclude=exclude)
+			dest = create_image(dest_image,target_mount_point,loop_devices,src_paths,max_workers=max_workers,parallel_file_listing=parallel_file_listing,exclude=exclude)
 
 	#TODO: support dest_image_size
 	if dest != ...:
-		total_file_list, total_sym_links = processCopy(src_paths, dest, single_thread=single_thread, max_workers=max_workers,
+		total_file_list, total_sym_links = process_copy(src_paths, dest, single_thread=single_thread, max_workers=max_workers,
 																		verbose=verbose, directory_only=directory_only,no_directory_sync=no_directory_sync,
 																		full_hash=full_hash, files_per_job=files_per_job, parallel_file_listing=parallel_file_listing,
 																		exclude=exclude,dest_image=dest_image,batch = batch)
@@ -2639,7 +2657,7 @@ def hpcp(src_path, dest_path = "", single_thread = False, max_workers = 4 * mult
 				print(f"Copied File: {file}")
 			for link in total_sym_links:
 				print(f"Link: {link} -> {total_sym_links[link]}")
-		creatSymLinks(total_sym_links,exclude=exclude,no_link_tracking=no_link_tracking)
+		create_sym_links(total_sym_links,exclude=exclude,no_link_tracking=no_link_tracking)
 		if remove_extra:
 			print('-'*80)
 			remove_extra_files(total_file_list, dest,max_workers,verbose,files_per_job,single_thread,exclude=exclude)
@@ -2653,9 +2671,9 @@ def hpcp(src_path, dest_path = "", single_thread = False, max_workers = 4 * mult
 			print(f"Number of links: {len(total_sym_links)}")
 			print(f"Total time taken: {time.perf_counter()-programStartTime:0.4f} seconds")
 	if remove:
-		processRemove(src_paths,single_thread=single_thread, max_workers=max_workers,verbose=verbose,
+		process_remove(src_paths,single_thread=single_thread, max_workers=max_workers,verbose=verbose,
 					  files_per_job=files_per_job, remove_force=remove_force,exclude=exclude,batch=batch)
-	cleanUp(mount_points,loop_devices)
+	clean_up(mount_points,loop_devices)
 	print(f"Done.")
 	# we exit if we are not involved with a gui
 		
