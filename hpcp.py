@@ -163,7 +163,7 @@ except ImportError:
 	hasher = hashlib.blake2b()
 	xxhash_available = False
 
-version = '9.06'
+version = '9.07'
 __version__ = version
 
 # ---- Helper Functions ----
@@ -845,7 +845,7 @@ def natural_sort(l):
 		list: The sorted list of strings.
 	"""
 	convert = lambda text: int(text) if text.isdigit() else text.lower() 
-	alphanum_key = lambda key: [convert(c) for c in re.split('(\d+)', key)] 
+	alphanum_key = lambda key: [convert(c) for c in re.split('([0-9]+)', key)] 
 	return sorted(l, key=alphanum_key)
 
 # -- Format --
