@@ -166,7 +166,7 @@ except ImportError:
 version = '9.07'
 __version__ = version
 
-# ---- Helper Functions ----
+#%% ---- Helper Functions ----
 class Adaptive_Progress_Bar:
 	def __init__(self, total_count = 0, total_size = 0,refresh_interval = 0.1,last_num_job_for_stats = 5,custom_prefix = None,custom_suffix = None,process_word = 'Processed',use_print_thread = False):
 		self.total_count = total_count
@@ -304,7 +304,7 @@ def run_command_in_multicmd_with_path_check(command, timeout=0,max_threads=1,qui
 	# Run the command
 	return multiCMD.run_commands([command], timeout=timeout, max_threads=max_threads, quiet=quiet, dry_run=dry_run)[0]
 
-# -- Exclude --
+#%% -- Exclude --
 def is_excluded(path, exclude=None):
 	"""
 	Check if a given path is excluded based on a list of patterns.
@@ -342,7 +342,7 @@ def format_exclude(exclude = None,exclude_file = None) -> frozenset:
 	# freeze frozenset
 	return frozenset(exclude)
 
-# -- DD --
+#%% -- DD --
 def get_largest_partition(disk):
 	"""
 	Get the largest partition on the disk.
@@ -833,7 +833,7 @@ def create_sym_links(symLinks,exclude=None,no_link_tracking=False):
 		print(f"\nNested Symbolic Links:   {len(nestedSymLinks)}")
 		create_sym_links(nestedSymLinks,exclude=exclude,no_link_tracking=no_link_tracking)
 
-# -- File list --
+#%% -- File list --
 def natural_sort(l): 
 	"""
 	Sorts a list of strings naturally, considering both numeric and alphabetic characters.
@@ -848,7 +848,7 @@ def natural_sort(l):
 	alphanum_key = lambda key: [convert(c) for c in re.split('([0-9]+)', key)] 
 	return sorted(l, key=alphanum_key)
 
-# -- Format --
+#%% -- Format --
 def format_bytes(size, use_1024_bytes=None, to_int=False, to_str=False,str_format='.2f'):
 	"""
 	Format the size in bytes to a human-readable format or vice versa.
@@ -972,7 +972,7 @@ def format_time(seconds):
 	]
 	return "".join(parts)
 
-# -- Hash --
+#%% -- Hash --
 @functools.lru_cache(maxsize=None)
 def hash_file(path,size = ...,full_hash=False):
 	global xxhash_available
@@ -1011,10 +1011,10 @@ def get_file_repr(filename,append_hash=False,full_hash=False):
 		return f'{filename}:{hash_file(filename,os.path.getsize(filename),full_hash)}'
 	return filename
 
-# -- Path --
+#%% -- Path --
 def trim_paths(paths,baseDir):
 	return set([os.path.relpath(path,os.path.dirname(baseDir)) for path in paths])
-# ---- Generate File List ----
+#%% ---- Generate File List ----
 @functools.lru_cache(maxsize=None)
 def get_file_list_serial(root,exclude=None,append_hash=False,full_hash=False):
 	# skip if path is longer than 4096 characters
@@ -1151,7 +1151,7 @@ def get_file_list_parallel(path,max_workers=56,exclude=None,append_hash=False,fu
 		return frozenset([path]) ,frozenset(), 0,frozenset()
 	return frozenset(file_list), frozenset(link_list) ,size, frozenset(folder_list - set(['.', '..']))
 
-# ---- Delete Files ----
+#%% ---- Delete Files ----
 def delete_file_bulk(paths):
 	total_size = 0
 	start_time = time.perf_counter()
@@ -1261,7 +1261,7 @@ def delete_files_parallel(paths, max_workers, verbose=False,files_per_job=1,excl
 	print(f"Initial estimated size: {format_bytes(init_size_all)}B, Final size: {format_bytes(delete_size_counter)}B")
 	return delete_counter + 1, delete_size_counter
 
-# ---- Copy Files ----
+#%% ---- Copy Files ----
 def copy_file(src_path, dest_path, full_hash=False, verbose=False):
 	"""
 	Copy a file from the source path to the destination path.
@@ -1539,7 +1539,7 @@ def copy_files_serial(src_path, dest_path, full_hash=False, verbose=False,exclud
 	print(f"Average bandwidth:      {format_bytes(apb.size_counter / (endTime-start_time) * 8,use_1024_bytes=False)}bps")
 	return apb.item_counter, apb.size_counter , symLinks , frozenset(file_list)
 
-# ---- Copy Directories ----
+#%% ---- Copy Directories ----
 def sync_directory_metadata(src_path, dest_path):
 	# skip if src path or dest path is longer than 4096 characters
 	if len(src_path) > 4096:
@@ -1747,7 +1747,7 @@ def sync_directories_parallel(src, dest, max_workers, verbose=False,folder_per_j
 	print(f"Average bandwidth:      {format_bytes(apb.size_counter / (endTime-start_time) * 8,use_1024_bytes=False)}bps")
 	return symLinks
 
-# ---- Compare Files ----
+#%% ---- Compare Files ----
 def compare_file_list(file_list, file_list2,diff_file_list=None,tar_diff_file_list = False):
 	print('-'*80)
 	print(f"Number of files in src: {len(file_list)}")
@@ -1777,7 +1777,7 @@ def compare_file_list(file_list, file_list2,diff_file_list=None,tar_diff_file_li
 					f.write('-\0'+(file.rpartition(':')[0] if ':' in file else file)+'\n')
 		print(f"Diff file list written to {diff_file_list}")
 
-# ---- Remove Extra ----
+#%% ---- Remove Extra ----
 def remove_extra_dirs(src_paths, dest,exclude=None):
 	"""
 	Removes extra directories in destination that are not present in the source paths.
@@ -1848,7 +1848,7 @@ def remove_extra_files(total_file_list, dest,max_workers,verbose,files_per_job,s
 			endTime = time.perf_counter()
 			print(f"Time taken to remove extra files: {endTime-start_time:0.4f} seconds")
 
-# ---- Main Helper Functions ----
+#%% ---- Main Helper Functions ----
 def mount_src_image(src_image,src_images: list,src_paths: list,mount_points: list,loop_devices: list):
 	for src_image_pattern in src_image:
 		if os.name != 'nt':
@@ -2483,7 +2483,7 @@ def get_args(args = None):
 	print(' '.join(startArgs))
 	return args
 
-# ---- Main Function ----
+#%% ---- Main Function ----
 def hpcp(src_path, dest_path = "", single_thread = False, max_workers = 4 * multiprocessing.cpu_count(),
 			verbose = False, directory_only = False,no_directory_sync = False, full_hash = False, files_per_job = 1, target_file_list = "",
 			compare_file_list = False, diff_file_list = None, tar_diff_file_list = False, remove = False,remove_force = False, remove_extra = False, parallel_file_listing = False,
@@ -2785,7 +2785,7 @@ def hpcp_gui():
 	tk.Button(root, text="Start Copy", command=run_hpcp).grid(row=13)
 	root.mainloop()
 
-# ---- CLI ----
+#%% ---- CLI ----
 def main():
 	args = get_args()
 	# we run gui if the current platform is windows and src_path is not specified
