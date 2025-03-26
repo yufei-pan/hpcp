@@ -163,7 +163,7 @@ except ImportError:
 	hasher = hashlib.blake2b()
 	xxhash_available = False
 
-version = '9.08'
+version = '9.09'
 __version__ = version
 
 #%% ---- Helper Functions ----
@@ -2427,7 +2427,7 @@ def clean_up(mount_points: list,loop_devices: list):
 		print(f"Removing loop device {loop_device_dest}")
 		run_command_in_multicmd_with_path_check(['losetup','-d',loop_device_dest])
 
-HASH_SIZE = 1<<16
+HASH_SIZE = 1<<24
 
 def get_args(args = None):
 	parser = argparse.ArgumentParser(description='Copy files from source to destination',
