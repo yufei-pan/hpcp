@@ -8,6 +8,7 @@
 # ]
 # ///
 import os
+import stat
 import sys
 import time
 import argparse
@@ -30,130 +31,175 @@ try:
 	import multiCMD
 	assert float(multiCMD.version) > 1.19
 except:	
-	import select
-	import sys
+	import io,subprocess,string,itertools,signal
 	class multiCMD:
-		version = 'build_in_0.09'
-		def run_commands(commands,timeout = 0,max_threads=1,quiet=False,dry_run=False):
-			_ = timeout
-			_ = max_threads
-			_rtnList_ = []
-			for command in commands:
-				if not isinstance(command,str):
-					# escape the spaces in the command
-					command = [arg.encode(errors='backslashreplace').decode('utf-8').replace(' ','\\ ') for arg in command]
-					command = ' '.join(command)
-				if not quiet:
-					print('*' * 80)
-					print('> ' , command)
+		version='1.29_build_in'
+		__version__=version
+		__running_threads=[]
+		class Task:
+			def __init__(A,command):A.command=command;A.returncode=None;A.stdout=[];A.stderr=[];A.thread=None;A.stop=False
+			def __iter__(A):return zip(['command','returncode','stdout','stderr'],[A.command,A.returncode,A.stdout,A.stderr])
+			def __repr__(A):return f"Task(command={A.command}, returncode={A.returncode}, stdout={A.stdout}, stderr={A.stderr}, stop={A.stop})"
+			def __str__(A):return str(dict(A))
+			def is_alive(A):
+				if A.thread is not None:return A.thread.is_alive()
+				return False
+		def _expand_ranges(inStr):
+			D=[inStr];F=[];I=string.digits+string.ascii_letters
+			while len(D)>0:
+				A=D.pop();E=re.search('\\[(.*?)]',A)
+				if not E:F.append(A);continue
+				J=E.group(1);K=J.split(',')
+				for G in K:
+					G=G.strip()
+					if'-'in G:
+						try:B,Q,C=G.partition('-')
+						except ValueError:F.append(A);continue
+						B=B.strip();C=C.strip()
+						if B.isdigit()and C.isdigit():
+							L=min(len(B),len(C));M='{:0'+str(L)+'d}'
+							for H in range(int(B),int(C)+1):N=M.format(H);D.append(A.replace(E.group(0),N,1))
+						elif all(A in string.hexdigits for A in B+C):
+							for H in range(int(B,16),int(C,16)+1):D.append(A.replace(E.group(0),format(H,'x'),1))
+						else:
+							try:
+								O=I.index(B);P=I.index(C)
+								for H in range(O,P+1):D.append(A.replace(E.group(0),I[H],1))
+							except ValueError:F.append(A)
+					else:D.append(A.replace(E.group(0),G,1))
+			F.reverse();return F
+		def __handle_stream(stream,target,pre='',post='',quiet=False):
+			E=quiet;C=target
+			def D(current_line,target,keepLastLine=True):
+				A=target
+				if not keepLastLine:
+					if not E:sys.stdout.write('\r')
+					A.pop()
+				elif not E:sys.stdout.write('\n')
+				B=current_line.decode('utf-8',errors='backslashreplace');A.append(B)
+				if not E:sys.stdout.write(pre+B+post);sys.stdout.flush()
+			A=bytearray();B=True
+			for F in iter(lambda:stream.read(1),b''):
+				if F==b'\n':
+					if not B and A:D(A,C,keepLastLine=False)
+					elif B:D(A,C,keepLastLine=True)
+					A=bytearray();B=True
+				elif F==b'\r':D(A,C,keepLastLine=B);A=bytearray();B=False
+				else:A.extend(F)
+			if A:D(A,C,keepLastLine=B)
+		def int_to_color(n,brightness_threshold=500):
+			B=brightness_threshold;A=hash(str(n));C=A>>16&255;D=A>>8&255;E=A&255
+			if C+D+E<B:return multiCMD.int_to_color(A,B)
+			return C,D,E
+		def __run_command(task,sem,timeout=60,quiet=False,dry_run=False,with_stdErr=False,identity=None):
+			P='Timeout!';I=timeout;F=identity;E=quiet;A=task;C='';D=''
+			with sem:
 				try:
-					if not dry_run:
-						_rtnList_.append(os.popen(command).read().strip().split('\n'))
-					else:
-						_rtnList_.append([f'Dry run: {command}'])
-				except Exception as e:
-					_rtnList_.append([f'Error: {e}'])
-				if not quiet:
-					print('\n'.join(_rtnList_[-1]))
-					print('*' * 80)
-			return _rtnList_
-		def run_command(command,timeout=0,quiet=False,dry_run=False):
-			return multiCMD.run_commands([command],timeout=timeout,quiet=quiet,dry_run=dry_run)[0]
-		def genrate_progress_bar(iteration, total, prefix='', suffix='',columns=120):
-			noPrefix = False
-			noSuffix = False
-			noPercent = False
-			noBar = False
-			# if total is 0, we don't want to divide by 0
-			if total == 0:
-				return f'{prefix} iteration:{iteration} total:{total} {suffix}\n'
-			percent = f'|{("{0:.1f}").format(100 * (iteration / float(total)))}% '
-			length = columns - len(prefix) - len(suffix) - len(percent) - 3
-			if length <= 0:
-				length = columns - len(prefix) - len(suffix) - 3
-				noPercent = True
-			if length <= 0:
-				length = columns - len(suffix) - 3
-				noPrefix = True
-			if length <= 0:
-				length = columns - 3
-				noSuffix = True
-			if length <= 0:
-				return f'{prefix}\niteration:\n {iteration}\ntotal:\n {total}\n| {suffix}\n'
-			if iteration == 0:
-				noBar = True
-			filled_length = int(length * iteration // total)
-			progress_chars = '▁▂▃▄▅▆▇█'
-			fractional_progress = (length * iteration / total) - filled_length
-			char_index = int(fractional_progress * (len(progress_chars) - 1))
-			bar_char = progress_chars[char_index]
-			if filled_length == length:
-				bar = progress_chars[-1] * length
+					if F is not None:
+						if F==...:F=threading.get_ident()
+						Q,R,S=multiCMD.int_to_color(F);C=f"[38;2;{Q};{R};{S}m";D='\x1b[0m'
+					if not E:print(C+'Running command: '+' '.join(A.command)+D);print(C+'-'*100+D)
+					if dry_run:return A.stdout+A.stderr
+					B=subprocess.Popen(A.command,stdout=subprocess.PIPE,stderr=subprocess.PIPE,stdin=subprocess.PIPE);J=threading.Thread(target=multiCMD.__handle_stream,args=(B.stdout,A.stdout,C,D,E),daemon=True);J.start();K=threading.Thread(target=multiCMD.__handle_stream,args=(B.stderr,A.stderr,C,D,E),daemon=True);K.start();L=time.time();M=len(A.stdout)+len(A.stderr);time.sleep(0);H=1e-07
+					while B.poll()is None:
+						if A.stop:B.send_signal(signal.SIGINT);time.sleep(.01);B.terminate();break
+						if I>0:
+							if len(A.stdout)+len(A.stderr)!=M:L=time.time();M=len(A.stdout)+len(A.stderr)
+							elif time.time()-L>I:A.stderr.append(P);B.send_signal(signal.SIGINT);time.sleep(.01);B.terminate();break
+						time.sleep(H)
+						if H<.001:H*=2
+					A.returncode=B.poll();J.join(timeout=1);K.join(timeout=1);N,O=B.communicate()
+					if N:multiCMD.__handle_stream(io.BytesIO(N),A.stdout,A)
+					if O:multiCMD.__handle_stream(io.BytesIO(O),A.stderr,A)
+					if A.returncode is None:
+						if A.stderr and A.stderr[-1].strip().startswith(P):A.returncode=124
+						elif A.stderr and A.stderr[-1].strip().startswith('Ctrl C detected, Emergency Stop!'):A.returncode=137
+						else:A.returncode=-1
+				except FileNotFoundError as G:print(f"Command / path not found: {A.command[0]}",file=sys.stderr,flush=True);A.stderr.append(str(G));A.returncode=127
+				except Exception as G:import traceback as T;print(f"Error running command: {A.command}",file=sys.stderr,flush=True);print(str(G).split('\n'));A.stderr.extend(str(G).split('\n'));A.stderr.extend(T.format_exc().split('\n'));A.returncode=-1
+				if not E:print(C+'\n'+'-'*100+D);print(C+f"Process exited with return code {A.returncode}"+D)
+				if with_stdErr:return A.stdout+A.stderr
+				else:return A.stdout
+		def run_command(command,timeout=0,max_threads=1,quiet=False,dry_run=False,with_stdErr=False,return_code_only=False,return_object=False,wait_for_return=True,sem=None):return multiCMD.run_commands(commands=[command],timeout=timeout,max_threads=max_threads,quiet=quiet,dry_run=dry_run,with_stdErr=with_stdErr,return_code_only=return_code_only,return_object=return_object,parse=False,wait_for_return=wait_for_return,sem=sem)[0]
+		def __format_command(command,expand=False):
+			D=expand;A=command
+			if isinstance(A,str):
+				if D:B=multiCMD._expand_ranges(A)
+				else:B=[A]
+				return[A.split()for A in B]
+			elif hasattr(A,'__iter__'):
+				C=[]
+				for E in A:
+					if isinstance(E,str):C.append(E)
+					else:C.append(repr(E))
+				if not D:return[C]
+				F=[multiCMD._expand_ranges(A)for A in C];B=list(itertools.product(*F));return[list(A)for A in B]
+			else:return multiCMD.__format_command(str(A),expand=D)
+		def run_commands(commands,timeout=0,max_threads=1,quiet=False,dry_run=False,with_stdErr=False,return_code_only=False,return_object=False,parse=False,wait_for_return=True,sem=None):
+			K=wait_for_return;J=dry_run;I=quiet;H=timeout;C=max_threads;B=sem;E=[]
+			for L in commands:E.extend(multiCMD.__format_command(L,expand=parse))
+			A=[multiCMD.Task(A)for A in E]
+			if C<1:C=len(E)
+			if C>1 or not K:
+				if not B:B=threading.Semaphore(C)
+				F=[threading.Thread(target=multiCMD.__run_command,args=(A,B,H,I,J,...),daemon=True)for A in A]
+				for(D,G)in zip(F,A):G.thread=D;D.start()
+				if K:
+					for D in F:D.join()
+				else:multiCMD.__running_threads.extend(F)
 			else:
-				bar = progress_chars[-1] * filled_length + bar_char + '_' * (length - filled_length)
-			lineOut = ''
-			if not noPrefix:
-				lineOut += prefix
-			if not noBar:
-				lineOut += f'{bar}'
-				if not noPercent:
-					lineOut += percent
-			else:
-				if length >= 16:
-					lineOut += f' Calculating... '
-			if not noSuffix:
-				lineOut += suffix
-			return lineOut
-		def print_progress_bar(iteration, total, prefix='', suffix=''):
-			prefix += ' |' if not prefix.endswith(' |') else ''
-			suffix = f'| {suffix}' if not suffix.startswith('| ') else suffix
-			try:
-				columns, _ = multiCMD.get_terminal_size()
-
-				sys.stdout.write(f'\r{multiCMD.genrate_progress_bar(iteration, total, prefix, suffix, columns)}')
-				sys.stdout.flush()
-				if iteration == total:
-					print(file=sys.stdout)
-			except:
-				if iteration % 5 == 0:
-					print(multiCMD.genrate_progress_bar(iteration, total, prefix, suffix))
+				B=threading.Semaphore(1)
+				for G in A:multiCMD.__run_command(G,B,H,I,J,identity=None)
+			if return_code_only:return[A.returncode for A in A]
+			elif return_object:return A
+			elif with_stdErr:return[A.stdout+A.stderr for A in A]
+			else:return[A.stdout for A in A]
+		def input_with_timeout_and_countdown(timeout,prompt='Please enter your selection'):
+			B=prompt;A=timeout;print(f"{B} [{A}s]: ",end='',flush=True)
+			for C in range(A,0,-1):
+				if sys.stdin in select.select([sys.stdin],[],[],0)[0]:return input().strip()
+				print(f"\r{B} [{C}s]: ",end='',flush=True);time.sleep(1)
+		def _genrate_progress_bar(iteration,total,prefix='',suffix='',columns=120):
+			G=columns;F=prefix;E=total;C=suffix;B=iteration;J=False;K=False;L=False;M=False
+			if E==0:return f"{F} iteration:{B} {C}".ljust(G)
+			N=f"|{'{0:.1f}'.format(100*(B/float(E)))}% ";A=G-len(F)-len(C)-len(N)-3
+			if A<=0:A=G-len(F)-len(C)-3;L=True
+			if A<=0:A=G-len(C)-3;J=True
+			if A<=0:A=G-3;K=True
+			if A<=0:return f"""{F}
+		iteration:
+		{B}
+		total:
+		{E}
+		| {C}
+		"""
+			if B==0:M=True
+			H=int(A*B//E);I='▁▂▃▄▅▆▇█';P=A*B/E-H;Q=int(P*(len(I)-1));R=I[Q]
+			if H==A:O=I[-1]*A
+			else:O=I[-1]*H+R+'_'*(A-H)
+			D=''
+			if not J:D+=F
+			if not M:
+				D+=f"{O}"
+				if not L:D+=N
+			elif A>=16:D+=f" Calculating... "
+			if not K:D+=C
+			return D
 		def get_terminal_size():
-			try:
-				_tsize = os.get_terminal_size()
+			C='HHHH'
+			try:import os;A=os.get_terminal_size()
 			except:
-				try:
-					import fcntl, termios, struct
-					packed = fcntl.ioctl(0, termios.TIOCGWINSZ, struct.pack('HHHH', 0, 0, 0, 0))
-					_tsize = struct.unpack('HHHH', packed)[:2]
-				except:
-					import shutil
-					_tsize = shutil.get_terminal_size(fallback=(120, 30))
-			return _tsize
-		def input_with_timeout_and_countdown(timeout, prompt='Please enter your selection'):
-			"""
-			Read an input from the user with a timeout and a countdown.
+				try:import fcntl,termios as D,struct as B;E=fcntl.ioctl(0,D.TIOCGWINSZ,B.pack(C,0,0,0,0));A=B.unpack(C,E)[:2]
+				except:import shutil as F;A=F.get_terminal_size(fallback=(120,30))
+			return A
+		def print_progress_bar(iteration,total,prefix='',suffix=''):
+			D=prefix;C=total;B=iteration;A=suffix;D+=' |'if not D.endswith(' |')else'';A=f"| {A}"if not A.startswith('| ')else A
+			try:
+				E,F=multiCMD.get_terminal_size();sys.stdout.write(f"\r{multiCMD._genrate_progress_bar(B,C,D,A,E)}");sys.stdout.flush()
+				if B==C and C>0:print(file=sys.stdout)
+			except:
+				if B%5==0:print(multiCMD._genrate_progress_bar(B,C,D,A))
 
-			Parameters:
-			timeout (int): The timeout value in seconds.
-			prompt (str): The prompt message to display to the user. Default is 'Please enter your selection'.
-
-			Returns:
-			str or None: The user input if received within the timeout, or None if no input is received.
-			"""
-			# Print the initial prompt with the countdown
-			print(f"{prompt} [{timeout}s]: ", end='', flush=True)
-			# Loop until the timeout
-			for remaining in range(timeout, 0, -1):
-				# If there is an input, return it
-				if sys.stdin in select.select([sys.stdin], [], [], 0)[0]:
-					return input().strip()
-				# Print the remaining time
-				print(f"\r{prompt} [{remaining}s]: ", end='', flush=True)
-				# Wait a second
-				time.sleep(1)
-			# If there is no input, return None
-			return None
-		
 try:
 	import xxhash
 	hasher = xxhash.xxh64()
@@ -163,7 +209,7 @@ except ImportError:
 	hasher = hashlib.blake2b()
 	xxhash_available = False
 
-version = '9.09'
+version = '9.11'
 __version__ = version
 
 #%% ---- Helper Functions ----
@@ -266,7 +312,7 @@ def check_path(program_name):
 	return False
 
 _binCalled = ['lsblk', 'losetup', 'sgdisk', 'blkid', 'umount', 'mount','dd','cp', 'xcopy',
-			  'fallocate','truncate', 
+			  'truncate', 
 			  'mkfs', 'mkfs.btrfs', 'mkfs.xfs', 'mkfs.ntfs', 'mkfs.vfat', 'mkfs.exfat', 'mkfs.hfsplus', 
 			  'mkudffs', 'mkfs.jfs', 'mkfs.reiserfs', 'newfs', 'mkfs.bfs', 'mkfs.minix', 'mkswap'
 			  'e2fsck', 'btrfs', 'xfs_repair', 'ntfsfix', 'fsck.fat', 'fsck.exfat', 'fsck.hfsplus', 
@@ -302,7 +348,12 @@ def run_command_in_multicmd_with_path_check(command, timeout=0,max_threads=1,qui
 		if strict: 
 			sys.exit(127)
 	# Run the command
-	return multiCMD.run_commands([command], timeout=timeout, max_threads=max_threads, quiet=quiet, dry_run=dry_run)[0]
+	task = multiCMD.run_commands([command], timeout=timeout, max_threads=max_threads, quiet=quiet, dry_run=dry_run,return_object=True)[0]
+	if task.returncode != 0:
+		print(f"Error: Command '{command}' failed with return code {task.returncode}.", file=sys.stderr, flush=True)
+		if strict:
+			raise RuntimeError(f"Command '{command}' failed with return code {task.returncode}.")
+	return task.stdout
 
 #%% -- Exclude --
 def is_excluded(path, exclude=None):
@@ -832,6 +883,25 @@ def create_sym_links(symLinks,exclude=None,no_link_tracking=False):
 	if len(nestedSymLinks) > 0:
 		print(f"\nNested Symbolic Links:   {len(nestedSymLinks)}")
 		create_sym_links(nestedSymLinks,exclude=exclude,no_link_tracking=no_link_tracking)
+
+def is_device(path):
+    mode = os.stat(path).st_mode
+    return stat.S_ISCHR(mode) or stat.S_ISBLK(mode)
+
+def get_mount_table():
+	"""
+	Get the mount table of the system.
+
+	Returns:
+		dict: A dictionary where the keys are device paths and the values are lists of mount points.
+	"""
+	mount_table = {}
+	with open('/proc/mounts', 'r') as f:
+		for line in f:
+			parts = line.split()
+			if len(parts) >= 2:
+				mount_table.setdefault(parts[0], []).append(parts[1])
+	return mount_table
 
 #%% -- File list --
 def natural_sort(l): 
@@ -2213,11 +2283,12 @@ def create_image(dest_image,target_mount_point,loop_devices: list,src_paths: lis
 		image_file_size = (int(image_file_size / 4096.0) + 1) * 4096 # round up to the nearest 4 KiB
 		print(f"Estimated file size {format_bytes(init_size)}B Creating {dest_image} with size {format_bytes(image_file_size)}B")
 		try:
-			# use fallocate to allocate the space
-			run_command_in_multicmd_with_path_check(["fallocate","-l",str(image_file_size),dest_image])
+			# use truncate to allocate the space
+			#run_command_in_multicmd_with_path_check(["fallocate","-l",str(image_file_size),dest_image])
+			run_command_in_multicmd_with_path_check(['truncate','-s',str(image_file_size),dest_image])
 		except:
 			# use python native method to allocate the space
-			print("fallocate not available, using python native method to allocate space")
+			print("truncate not available, using python native method to allocate space")
 			with open(dest_image, 'wb') as f:
 				f.seek(image_file_size-1)
 				f.write(b'\0')
@@ -2574,6 +2645,14 @@ def hpcp(src_path, dest_path = "", single_thread = False, max_workers = 4 * mult
 			print(f"Mounting {src_partition_path} at {src_mount_point}")
 			run_command_in_multicmd_with_path_check(['mount',src_partition_path,src_mount_point])
 			# check if the mount is successful
+			if not any(os.scandir(src_mount_point)) and not os.path.ismount(src_mount_point) and is_device(src_partition_path):
+				# if the source is a device and currently mounted, try to find the current mount point, then try to bind mount it
+				mtab = get_mount_table()
+				if src_partition_path in mtab:
+					src_partition_mount_path = mtab[src_partition_path][0]
+					print(f"Error mounting {src_partition_path}, trying to use bind mount {src_partition_mount_path}")
+					# try to bind mount
+					run_command_in_multicmd_with_path_check(['mount','--bind',src_partition_mount_path,src_mount_point])
 			if not any(os.scandir(src_mount_point)) and not os.path.ismount(src_mount_point):
 				print(f"Error mounting {src_partition_path}, usig dd for copying.")
 				dd_partition(src_partition_path,dest_partition_path,partition,dd_src,dd_dest)
@@ -2581,6 +2660,13 @@ def hpcp(src_path, dest_path = "", single_thread = False, max_workers = 4 * mult
 			print(f"Mounting {dest_partition_path} at {dest_mount_point}")
 			run_command_in_multicmd_with_path_check(['mount',dest_partition_path,dest_mount_point])
 			# check if the mount is successful
+			if not any(os.scandir(dest_mount_point)) and not os.path.ismount(dest_mount_point) and is_device(dest_partition_path):
+				mtab = get_mount_table()
+				if dest_partition_path in mtab:
+					dest_partition_mount_path = mtab[dest_partition_path][0]
+					print(f"Error mounting {dest_partition_path}, trying to use bind mount {dest_partition_mount_path}")
+					# try to bind mount
+					run_command_in_multicmd_with_path_check(['mount','--bind',dest_partition_mount_path,dest_mount_point])
 			if not any(os.scandir(dest_mount_point)) and not os.path.ismount(dest_mount_point):
 				print(f"Error mounting {dest_partition_path}, usig dd for copying.")
 				dd_partition(src_partition_path,dest_partition_path,partition,dd_src,dd_dest)
