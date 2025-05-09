@@ -1010,6 +1010,7 @@ def create_sym_links(symLinks,exclude=None,no_link_tracking=False):
 					dests.remove(dest)
 				try:
 					os.symlink(linkedTargetFile, dest, target_is_directory=os.path.isdir(linkedTargetFile))
+					break
 				except:
 					print(f'Could not create symbolic link from {linkedTargetFile} to {dest}')
 					if dests:
