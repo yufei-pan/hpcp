@@ -2068,9 +2068,7 @@ def remove_extra_dirs(src_paths, dests,exclude=None):
 	for d in dests:
 		if len(d) > 4096:
 			print(f'\nSkipped {d} because path is too long')
-		else:
-			newDests.append(d)
-		if exclude and is_excluded(d,exclude):
+		elif exclude and is_excluded(d,exclude):
 			print(f'\nSkipped {d} because it is excluded')
 		else:
 			newDests.append(d)
@@ -2082,18 +2080,22 @@ def remove_extra_dirs(src_paths, dests,exclude=None):
 	for src_path in src_paths:
 		if exclude and is_excluded(src_path,exclude):
 			src_paths.remove(src_path)
-	extraDirs = []
+	extraDirs = set()
+	print(dests)
 	for dest in dests:
 		for dirpath, dirnames, _ in os.walk(dest, topdown=False):
 			for dirname in dirnames:
-				if not dirname.endswith(os.path.sep):
-					dirname += os.path.sep
+				dirname += os.path.sep
 				dest_dir_path = os.path.join(dirpath, dirname)
 				# Check if the directory exists in the source paths
 				if not any(os.path.exists(os.path.join(os.path.dirname(src_path), os.path.relpath(dest_dir_path, dest))) for src_path in src_paths):
-					if exclude and not is_excluded(dest_dir_path,exclude):
+					if exclude and is_excluded(dest_dir_path,exclude):
+						print(f"Skipping excluded directory: {dest_dir_path}")
+					elif os.path.ismount(dest_dir_path):
+						print(f"Skipping mount point: {dest_dir_path}")
+					else:
 						print(f"Deleting extra directory: {dest_dir_path}")
-						extraDirs.append(dest_dir_path)
+						extraDirs.add(dest_dir_path)
 	for dir in extraDirs:
 		os.rmdir(dir)
 
@@ -2647,6 +2649,7 @@ def process_copy(src_paths: list, dests:list = [], single_thread = False, max_wo
 			print("Copying single file")
 			copy_file(src, dests,full_hash=full_hash,verbose=verbose)
 			continue
+		src += os.path.sep
 		if no_directory_sync:
 			print("Skipping directory sync")
 			sync_directory_metadata(src, dests)
