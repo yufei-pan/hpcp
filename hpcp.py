@@ -2487,12 +2487,15 @@ def process_compare_file_list(src_paths: list, dests, max_workers = 4 * multipro
 		endTime = time.perf_counter()
 		print(f"Time taken to get file list: {endTime-start_time:0.4f} seconds")
 	start_time = time.perf_counter()
+	file_list2 = set()
+	print('-'*80)
+	print(f"Getting file list from {dests}")
 	for dest in dests:
 		if not parallel_file_listing:
 			files,links,_,folders = get_file_list_serial(dest,exclude=exclude,append_hash=append_hash,full_hash=full_hash)
 		else:
 			files,links,_,folders  = get_file_list_parallel(dest, max_workers,exclude=exclude,append_hash=append_hash,full_hash=full_hash)
-		file_list2 = set(trim_paths(files,dest))
+		file_list2.update(trim_paths(files,dest))
 		file_list2.update(trim_paths(links,dest))
 		file_list2.update([folder_path + os.path.sep for folder_path in trim_paths(folders, dest)])
 	endTime = time.perf_counter()
