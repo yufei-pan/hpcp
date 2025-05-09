@@ -209,7 +209,7 @@ except ImportError:
 	hasher = hashlib.blake2b()
 	xxhash_available = False
 
-version = '9.17'
+version = '9.18'
 __version__ = version
 COMMIT_DATE = '2025-05-09'
 
@@ -326,7 +326,7 @@ def check_path(program_name):
 _binCalled = {'lsblk', 'losetup', 'sgdisk', 'blkid', 'umount', 'mount','dd','cp', 'xcopy',
 			  'truncate', 
 			  'mkfs', 'mkfs.btrfs', 'mkfs.xfs', 'mkfs.ntfs', 'mkfs.vfat', 'mkfs.exfat', 'mkfs.hfsplus', 
-			  'mkudffs', 'mkfs.jfs', 'mkfs.reiserfs', 'newfs', 'mkfs.bfs', 'mkfs.minix', 'mkswap'
+			  'mkudffs', 'mkfs.jfs', 'mkfs.reiserfs', 'newfs', 'mkfs.bfs', 'mkfs.minix', 'mkswap',
 			  'e2fsck', 'btrfs', 'xfs_repair', 'ntfsfix', 'fsck.fat', 'fsck.exfat', 'fsck.hfsplus', 
 			  'fsck.hfs', 'fsck.jfs', 'fsck.reiserfs', 'fsck.ufs', 'fsck.minix'}
 [check_path(program) for program in _binCalled]
