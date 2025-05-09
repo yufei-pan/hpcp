@@ -209,7 +209,7 @@ except ImportError:
 	hasher = hashlib.blake2b()
 	xxhash_available = False
 
-version = '9.15'
+version = '9.16'
 __version__ = version
 
 RANDOM_DESTINATION_SELECTION = False
@@ -361,7 +361,8 @@ def run_command_in_multicmd_with_path_check(command, timeout=0,max_threads=1,qui
 	# Run the command
 	task = multiCMD.run_commands([command], timeout=timeout, max_threads=max_threads, quiet=quiet, dry_run=dry_run,return_object=True)[0]
 	if task.returncode != 0:
-		print(f"Error: Command '{command}' failed with return code {task.returncode}.", file=sys.stderr, flush=True)
+		if not quiet:
+			print(f"Error: Command '{command}' failed with return code {task.returncode}.", file=sys.stderr, flush=True)
 		if strict:
 			raise RuntimeError(f"Command '{command}' failed with return code {task.returncode}.")
 	return task.stdout
@@ -1522,6 +1523,7 @@ def copy_file(src_path, dest_paths, full_hash=False, verbose=False):
 		print(f'\nSkipped {src_path} because path is too long')
 		return 0, 0, symLinks #, task_to_run
 	newDests = []
+	inDests = dest_paths
 	for dest in dest_paths:
 		if len(dest) > 4096:
 			print(f'\nSkipped {dest} because path is too long')
@@ -1559,7 +1561,7 @@ def copy_file(src_path, dest_paths, full_hash=False, verbose=False):
 				else:
 					idx = 0
 				dest_path = dest_paths.pop(idx)
-				if get_free_space_bytes(dest_path) < src_size:
+				if get_free_space_bytes(os.path.dirname(dest_path)) < src_size:
 					if verbose:
 						print(f'\nNot enough space on {dest_path} to copy {src_path}')
 					continue
@@ -1576,27 +1578,32 @@ def copy_file(src_path, dest_paths, full_hash=False, verbose=False):
 							shutil.copy2(src_path, dest_path, follow_symlinks=False)
 							#shutil.copystat(src_path, dest_path)
 					except Exception as e:
-						import traceback
-						print(f'\nError copying {src_path} to {dest_path}: {e}')
-						print(traceback.format_exc())
+						if not dest_paths:
+							import traceback
+							print(f'\nError copying {src_path} to {dest_path}: {e}')
+							print(traceback.format_exc())
+							print(f'\nTrying to copy from {src_path} to {dest_path} without sparse')
 						if os.name == 'posix':
-							run_command_in_multicmd_with_path_check(["cp", "-af", src_path, dest_path],timeout=0,quiet=True)
+							if not dest_paths:
+								run_command_in_multicmd_with_path_check(["cp", "-af", src_path, dest_path],timeout=0,quiet=True)
 							#task_to_run = ["cp", "-af", src_path, dest_path]
 						elif os.name == 'nt':
 							run_command_in_multicmd_with_path_check(["xcopy", "/I", "/E", "/Y", "/c", "/q", "/k", "/r", "/h", "/x", src_path, dest_path],timeout=0,quiet=True)
 							#task_to_run = ["xcopy", "/I", "/E", "/Y", "/c", "/q", "/k", "/r", "/h", "/x", src_path, dest_path]
 					copied = True
 				except Exception as e:
-					import traceback
-					print(f'\nError copying {src_path} to {dest_path}: {e}')
-					print(traceback.format_exc())
-					if dest_paths:
-						print(f'\nRetrying with a different destination path in {dest_paths}')
-					else:
+					if not dest_paths:
+						import traceback
+						print(f'\nError copying {src_path} to {dest_path}: {e}')
+						print(traceback.format_exc())
 						print(f'\nNo more destination paths to try')
 						return 0, time.perf_counter() - start_time, symLinks #, task_to_run
+					elif verbose:
+						print(f'\nRetrying with a different destination path in {dest_paths}')
 	except Exception as e:
-		print(f'\nError copying {src_path} to {dest_paths}: {e}')
+		print(f'\nFatal Error copying {src_path} to {inDests}: {e}')
+		import traceback
+		print(traceback.format_exc())
 		return 0, time.perf_counter() - start_time, symLinks #, task_to_run
 	if not copiedSize:
 		copiedSize = src_size
@@ -2433,10 +2440,11 @@ def get_dests(dest_paths,dest_image,mount_points: list,loop_devices: list,src_pa
 			dests.append(imgDest)
 		elif dest_paths:
 			print(f"Destination image {dest_image} does not exist, using dest_paths {dest_paths}")
-	for dest in dest_paths:
-		pathDest = get_dest_from_path(dest,src_paths,src_path,can_be_none=can_be_none)
-		if pathDest:
-			dests.append(pathDest)
+	if dest_paths:
+		for dest in dest_paths:
+			pathDest = get_dest_from_path(dest,src_paths,src_path,can_be_none=can_be_none)
+			if pathDest:
+				dests.append(pathDest)
 	# get the str representation of the dests
 	dest_str = '_'.join([os.path.basename(os.path.realpath(dest)) for dest in dests])
 	if not dest_str:
@@ -2490,10 +2498,12 @@ def process_compare_file_list(src_paths: list, dests, max_workers = 4 * multipro
 	print(f"Time taken to get file list: {endTime-start_time:0.4f} seconds")
 	compare_file_list(file_list, file_list2, diff_file_list,tar_diff_file_list = tar_diff_file_list)
 
-def create_image(dest_image,target_mount_point,loop_devices: list,src_paths: list, max_workers = 4 * multiprocessing.cpu_count(),
+def create_image(dest_image,target_mount_point,loop_devices: list,src_paths: list,mount_points, max_workers = 4 * multiprocessing.cpu_count(),
 				parallel_file_listing = False,exclude=None,dest_image_size=0):
 	if target_mount_point and dest_image:
 		# This means we were supplied a dest_image that does not exist, we need to create it and initialize it
+		returnMountPoints = []
+		currentMountPoint = target_mount_point + os.path.sep
 		init_size = 0
 		for src in src_paths:
 			src = os.path.abspath(src + os.path.sep)
@@ -2509,12 +2519,18 @@ def create_image(dest_image,target_mount_point,loop_devices: list,src_paths: lis
 		if dest_image_size <= 0:
 			print(f"Estimated content size {format_bytes(init_size)}B Creating {dest_image} with size {format_bytes(image_file_size)}B")
 		elif dest_image_size > image_file_size:
-			print(f"Destination image size {format_bytes(dest_image_size)}B is larger than estimated content size {format_bytes(image_file_size)}B, using {format_bytes(dest_image_size)}B")
+			print(f"Destination image size {format_bytes(dest_image_size)}B is larger than estimated content size {format_bytes(image_file_size)}B, using rounded {format_bytes(dest_image_size)}B")
 			image_file_size = dest_image_size
 		else:
-			number_of_images = image_file_size // dest_image_size + 1
+			slag = image_file_size - init_size
+			if slag >= dest_image_size:
+				print(f"Estimated file system bloat size {format_bytes(slag)}B is larger than destination image size {format_bytes(dest_image_size)}B, exiting")
+				exit(1)
+			dest_image_usable_size = dest_image_size - slag
+			number_of_images = image_file_size // dest_image_usable_size + 1
 			print(f"Destination image size {format_bytes(dest_image_size)}B is smaller than estimated content size {format_bytes(image_file_size)}B, creating {number_of_images} images of size {format_bytes(dest_image_size)}B")
 			image_file_size = dest_image_size
+		image_file_size = (int(image_file_size / 4096.0) + 1) * 4096 # round up to the nearest 4 KiB
 		for i in range(number_of_images):
 			if i > 0:
 				if '.img' in dest_image:
@@ -2523,6 +2539,8 @@ def create_image(dest_image,target_mount_point,loop_devices: list,src_paths: lis
 					imageName = dest_image.replace('.iso',f'_{i}.iso')
 				else:
 					imageName = dest_image + f'_{i}'
+				currentMountPoint = tempfile.mkdtemp() + os.path.sep
+				mount_points.append(currentMountPoint)
 			else:
 				imageName = dest_image
 			try:
@@ -2551,20 +2569,22 @@ def create_image(dest_image,target_mount_point,loop_devices: list,src_paths: lis
 			# if shutil.which('mkudffs') and image_file_size < 8 * 1024 * 1024 * 1024 * 1024:
 			# 	print(f"Formatting {target_partition} as udf")
 			# 	run_command_in_multicmd_with_path_check(f"mkudffs --utf8 --media-type=hd --blocksize=2048 --lvid=HPCP_disk_image --vid=HPCP_img --fsid=HPCP_img --vsid=HPCP_img {target_partition}")
-			if shutil.which('mkfs.xfs'):
+			# format with xfs if it is available and size bigger then 300 MiB
+			if shutil.which('mkfs.xfs') and image_file_size > 300 * 1024 * 1024:
 				print(f"Formatting {target_partition} as xfs")
 				run_command_in_multicmd_with_path_check(['mkfs.xfs','-f',target_partition])
 			else:
 				print(f"Formatting {target_partition} as ext4")
 				run_command_in_multicmd_with_path_check(['mkfs.ext4','-F',target_partition])
 			# mount the loop device to a temporary folder
-			print(f"Mounting {target_partition} at {target_mount_point}")
-			run_command_in_multicmd_with_path_check(["mount",target_partition,target_mount_point])
+			print(f"Mounting {target_partition} at {currentMountPoint}")
+			run_command_in_multicmd_with_path_check(["mount",target_partition,currentMountPoint])
 			# verify mount
-			if not os.path.ismount(target_mount_point):
+			if not os.path.ismount(currentMountPoint):
 				print(f"Destination image {imageName} cannot be mounted, exiting.")
 				exit(1)
-		return target_mount_point + os.path.sep
+			returnMountPoints.append(currentMountPoint)
+		return returnMountPoints
 	else:
 		print(f"Destination path not specified, exiting.")
 		exit(0)
@@ -3004,7 +3024,7 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = 4 * mul
 		if remove:
 			dests = ...
 		else:
-			dests = create_image(dest_image,target_mount_point,loop_devices,src_paths,max_workers=max_workers,parallel_file_listing=parallel_file_listing,exclude=exclude,dest_image_size = dest_image_size)
+			dests = create_image(dest_image,target_mount_point,loop_devices,src_paths,mount_points,max_workers=max_workers,parallel_file_listing=parallel_file_listing,exclude=exclude,dest_image_size = dest_image_size)
 
 	if dests != ...:
 		total_file_list, total_sym_links = process_copy(src_paths, dests, single_thread=single_thread, max_workers=max_workers,
@@ -3156,7 +3176,7 @@ def main():
 	if os.name == 'nt' and len(args.src_path) == 0:
 		hpcp_gui()
 	else:
-		rtnCode = hpcp(args.src_path, dest_path = args.dest_path, single_thread = args.single_thread, max_workers = args.max_workers, verbose = args.verbose,
+		rtnCode = hpcp(args.src_path, dest_paths = args.dest_path, single_thread = args.single_thread, max_workers = args.max_workers, verbose = args.verbose,
 			 directory_only =  args.directory_only, no_directory_sync = args.no_directory_sync,full_hash = args.full_hash, files_per_job = args.files_per_job,
 			 target_file_list = args.target_file_list, compare_file_list = args.compare_file_list , diff_file_list = args.diff_file_list, tar_diff_file_list = args.tar_diff_file_list,remove = args.remove, remove_force =args.remove_force,
 			 remove_extra = args.remove_extra, parallel_file_listing = args.parallel_file_listing,exclude = args.exclude,exclude_file = args.exclude_file,
