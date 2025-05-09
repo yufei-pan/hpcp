@@ -209,8 +209,9 @@ except ImportError:
 	hasher = hashlib.blake2b()
 	xxhash_available = False
 
-version = '9.16'
+version = '9.17'
 __version__ = version
+COMMIT_DATE = '2025-05-09'
 
 RANDOM_DESTINATION_SELECTION = False
 
@@ -322,12 +323,12 @@ def check_path(program_name):
 		return True
 	return False
 
-_binCalled = ['lsblk', 'losetup', 'sgdisk', 'blkid', 'umount', 'mount','dd','cp', 'xcopy',
+_binCalled = {'lsblk', 'losetup', 'sgdisk', 'blkid', 'umount', 'mount','dd','cp', 'xcopy',
 			  'truncate', 
 			  'mkfs', 'mkfs.btrfs', 'mkfs.xfs', 'mkfs.ntfs', 'mkfs.vfat', 'mkfs.exfat', 'mkfs.hfsplus', 
 			  'mkudffs', 'mkfs.jfs', 'mkfs.reiserfs', 'newfs', 'mkfs.bfs', 'mkfs.minix', 'mkswap'
 			  'e2fsck', 'btrfs', 'xfs_repair', 'ntfsfix', 'fsck.fat', 'fsck.exfat', 'fsck.hfsplus', 
-			  'fsck.hfs', 'fsck.jfs', 'fsck.reiserfs', 'fsck.ufs', 'fsck.minix']
+			  'fsck.hfs', 'fsck.jfs', 'fsck.reiserfs', 'fsck.ufs', 'fsck.minix'}
 [check_path(program) for program in _binCalled]
 
 def run_command_in_multicmd_with_path_check(command, timeout=0,max_threads=1,quiet=False,dry_run=False,strict=True):
@@ -2779,7 +2780,7 @@ HASH_SIZE = 1<<24
 
 def get_args(args = None):
 	parser = argparse.ArgumentParser(description='Copy files from source to destination',
-								  epilog=f'Found bins: {list(_binPaths.values())}')
+								  epilog=f'Found bins: {list(_binPaths.values())}\n Missing bins: {_binCalled - set(_binPaths.keys())}')
 	parser.add_argument('-s', '--single_thread', action='store_true', help='Use serial processing')
 	parser.add_argument('-j','-m','-t','--max_workers', type=int, default=4 * multiprocessing.cpu_count(), help='Max workers for parallel processing. Default is 4 * CPU count. Use negative numbers to indicate {n} * CPU count, 0 means 1/2 CPU count.')
 	parser.add_argument('-b','--batch',action='store_true', help='Batch mode, process all files in one go')
@@ -2801,7 +2802,7 @@ def get_args(args = None):
 	parser.add_argument('-e', '--exclude', action='append', default=[], help='Exclude source files matching the pattern')
 	parser.add_argument('-x', '--exclude_file', type=str, help='Exclude source files matching the pattern in the file')
 	parser.add_argument('-nlt', '--no_link_tracking', action='store_true', help='Do not copy files that symlinks point to.')
-	parser.add_argument('-V', '--version', action='version', version=f"%(prog)s {version} with {('XXHash' if xxhash_available else 'Blake2b')} and multiCMD V{multiCMD.version}; High Performance CoPy (HPC coPy) by pan@zopyr.us")
+	parser.add_argument('-V', '--version', action='version', version=f"%(prog)s {version} @ {COMMIT_DATE} with {('XXHash' if xxhash_available else 'Blake2b')}, multiCMD V{multiCMD.version}, and [ {', '.join(_binPaths.keys())} ]; High Performance CoPy (HPC coPy) by pan@zopyr.us")
 	parser.add_argument('-pfl', '--parallel_file_listing', action='store_true', help='Use parallel processing for file listing')
 	parser.add_argument('src_path', nargs='*', type=str, help='Source Path')
 	parser.add_argument('-si','--src_image',action='append', type=str, help='Source Image, mount the image and copy the files from it.')
