@@ -209,7 +209,7 @@ except ImportError:
 	hasher = hashlib.blake2b()
 	xxhash_available = False
 
-version = '9.18'
+version = '9.19'
 __version__ = version
 COMMIT_DATE = '2025-05-09'
 
@@ -2439,6 +2439,9 @@ def get_dests(dest_paths,dest_image,mount_points: list,loop_devices: list,src_pa
 	dests = []
 	target_mount_point = ''
 	if dest_image:
+		if os.geteuid() != 0:
+			print(f"Warning: mounting dest image likely requires root privileges, please expect errors if continuing. continuing in 5 seconds...")
+			time.sleep(5)
 		imgDest , target_mount_point = get_dest_from_image(dest_image,mount_points,loop_devices)
 		if imgDest:
 			dests.append(imgDest)
@@ -2883,6 +2886,10 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = 4 * mul
 		if os.name == 'nt':
 			print("dd mode is not supported on Windows, exiting")
 			return(0)
+		# check if running as root
+		if os.geteuid() != 0:
+			print("WARNING: dd mode likely requires root privileges, please expect errors. Continuing in 5 seconds...")
+			time.sleep(5)
 		print("dd mode enabled, performing Disk Dump Copy. Setting up the target ...")
 		if dest_paths:
 			if len(dest_paths) > 1:
@@ -2985,6 +2992,9 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = 4 * mul
 	# if not dest_path:
 	#     dest_path = src_path.pop()
 	if src_image:
+		if os.geteuid() != 0:
+			print("Warning: Source image mount may require root privileges, please expect errors. continuing in 5 seconds...")
+			time.sleep(5)
 		src_str = mount_src_image(src_image,src_images,src_paths,mount_points,loop_devices)
 
 	if source_file_list:
