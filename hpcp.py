@@ -2791,9 +2791,9 @@ def get_args(args = None):
 	parser.add_argument('-do', '--directory_only', action='store_true', help='Only copy directory structure')
 	parser.add_argument('-nds', '--no_directory_sync', action='store_true', help='Do not sync directory metadata, useful for verfication')
 	parser.add_argument('-fh', '--full_hash', action='store_true', help='Checks the full hash of files')
-	parser.add_argument('-hs', '--hash_size', type=int, default=1<<16, help='Hash size in bytes, default is 65536')
-	parser.add_argument('-f', '--files_per_job', type=int, default=1, help='Base number of files per job, will be adjusted dynamically. Default is 1')
-	parser.add_argument('-sfl','-lfl', '--source_file_list', type=str, help='Load source file list from file. Will treat it raw meaning do not expand files / folders files are seperated using newline.  If --compare_file_list is specified, it will be used as source for compare')
+	parser.add_argument('-hs', '--hash_size', type=int, default=1<<16, help='Hash size in bytes, default is 65536. This means hpcp will only check the last 64 KiB of the file.')
+	parser.add_argument('-fpj', '--files_per_job', type=int, default=1, help='Base number of files per job, will be adjusted dynamically. Default is 1')
+	parser.add_argument('-sfl','-lfl', '--source_file_list', type=str, help='Load source file list from file. Will treat it raw meaning do not expand files / folders. files are seperated using newline.  If --compare_file_list is specified, it will be used as source for compare')
 	parser.add_argument('-fl','-tfl', '--target_file_list', type=str,help='Specify the file_list file to store list of files in src_path to. If --compare_file_list is specified, it will be used as targets for compare')
 	parser.add_argument('-cfl', '--compare_file_list',action='store_true', help='Only compare file list. Use --file_list to specify a existing file list or specify the dest_path to compare src_path with. When not using with file_list, will compare hash.')
 	parser.add_argument('-dfl', '--diff_file_list', type=str, nargs='?', const="auto",default=None, help="Implies --compare_file_list, specify a file name to store the diff file list to or omit the value to auto-determine.")
@@ -2813,12 +2813,11 @@ def get_args(args = None):
 	parser.add_argument('-d','-C','--dest_path',action='append', type=str, help='Destination Path')
 	parser.add_argument('-rds','--random_dest_selection', action='store_true', help='Randomly select destination path from the list of destination paths instead of filling round robin. Can speed up transfer if dests are on different devices. Warning: can cause unable to fit in big files as dests are filled up by smaller files.')
 	parser.add_argument('-di','--dest_image', type=str, help='Base name for destination Image, create a image file and copy the files into it.')
-	parser.add_argument('-dis','--dest_image_size', type=str, help='Destination Image Size, specify the size of the destination image to split into. Default is 0 (No split).', default='0')
+	parser.add_argument('-dis','--dest_image_size', type=str, help=f'Destination Image Size, specify the size of the destination image to split into. Default is 0 (No split). Example: {{10TiB}} or {{1G}}', default='0')
 	parser.add_argument('-diff', '--get_diff_image', action='store_true', help='Not implemented. Compare the source and destination file list, create a diff image of that will update the destination to source.')
 	parser.add_argument('-dd', '--disk_dump', action='store_true', help='Disk to Disk mirror, use this if you are backuping / deploying an OS from / to a disk. \
-					 Require 1 source, can be 1 src_path or 1 -si src_image, require 1 -di dest_image.')
-	parser.add_argument('-ddr', '--dd_resize', action='append', type=str, help='Resize the destination image to the specified size with dd')
-	#args = parser.parse_args(args)
+					 Require 1 source, can be 1 src_path or 1 -si src_image, require 1 -di dest_image. Note: will only actually use dd if unable to mount / create a partition.')
+	parser.add_argument('-ddr', '--dd_resize', action='append', type=str, help=f'Resize the destination image to the specified size with -dd. Applies to biggest partiton first. Specify multiple -ddr to resize subsequent sized partitions. Example: {{100GiB}} or {{200G}}')
 	try:
 		args = parser.parse_intermixed_args(args)
 	except Exception:
