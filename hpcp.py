@@ -209,22 +209,24 @@ except ImportError:
 	hasher = hashlib.blake2b()
 	xxhash_available = False
 
-version = '9.19'
+version = '9.20'
 __version__ = version
-COMMIT_DATE = '2025-05-09'
+COMMIT_DATE = '2025-05-12'
 
+MAGIC_NUMBER = 1.61803398875
 RANDOM_DESTINATION_SELECTION = False
 
 #%% ---- Helper Functions ----
 class Adaptive_Progress_Bar:
-	def __init__(self, total_count = 0, total_size = 0,refresh_interval = 0.1,last_num_job_for_stats = 5,custom_prefix = None,custom_suffix = None,process_word = 'Processed',use_print_thread = False):
+	def __init__(self, total_count = 0, total_size = 0,refresh_interval = 0.1,last_num_job_for_stats = 5,custom_prefix = None,
+			  custom_suffix = None,process_word = 'Processed',use_print_thread = False, suppress_all_output = False):
 		self.total_count = total_count
 		self.total_size = total_size
 		self.refresh_interval = refresh_interval
 		self.item_counter = 0
 		self.size_counter = 0
 		self.scheduled_jobs = 0
-		self.stop_flag = False
+		self.stop_flag = suppress_all_output
 		self.process_word = process_word
 		self.start_time = time.perf_counter()
 		self.last_n_jobs = deque(maxlen=last_num_job_for_stats)
@@ -232,6 +234,7 @@ class Adaptive_Progress_Bar:
 		self.custom_suffix = custom_suffix
 		self.last_call_args = None
 		self.use_print_thread = use_print_thread
+		self.quiet = suppress_all_output
 		if use_print_thread:
 			...
 			# Disabling print thread as for python threading and process pool coexistance bug
@@ -245,6 +248,8 @@ class Adaptive_Progress_Bar:
 			time.sleep(self.refresh_interval)
 			self.print_progress()
 	def print_progress(self):
+		if self.quiet:
+			return
 		if self.total_count == self.total_size == self.item_counter == self.size_counter == 0:
 			return
 		if self.total_count > 0 and self.item_counter >= self.total_count:
@@ -369,8 +374,24 @@ def run_command_in_multicmd_with_path_check(command, timeout=0,max_threads=1,qui
 	return task.stdout
 
 def get_free_space_bytes(path):
-    stat = os.statvfs(path)
-    return stat.f_bavail * stat.f_frsize  # available blocks * fragment size
+	stat = os.statvfs(path)
+	return stat.f_bavail * stat.f_frsize  # available blocks * fragment size
+
+def get_file_size(path):
+	try:
+		st = os.stat(path,follow_symlinks=False)
+		if 'st_rsize' in st:
+			realSize = st.st_rsize
+		elif 'st_blocks' in st:
+			realSize = st.st_blocks * 512
+		else:
+			realSize = st.st_size
+	except:
+		try:
+			realSize = os.path.getsize(path)
+		except:
+			realSize = 0
+	return realSize
 
 #%% -- Exclude --
 def is_excluded(path, exclude=None):
@@ -1268,13 +1289,7 @@ def get_file_list_serial(root,exclude=None,append_hash=False,full_hash=False):
 	if os.path.islink(root):
 		return frozenset() ,frozenset([get_file_repr(root,append_hash,full_hash)]),0,frozenset()
 	if os.path.isfile(root):
-		st = os.stat(root, follow_symlinks=False)
-		if 'st_rsize' in st:
-			realSize = st.st_rsize
-		elif 'st_blocks' in st:
-			realSize = st.st_blocks * 512
-		else:
-			realSize = st.st_size
+		realSize = get_file_size(root)
 		return frozenset([get_file_repr(root,append_hash,full_hash)]) ,frozenset(), realSize,frozenset()
 	file_list = set()
 	links = set()
@@ -1298,33 +1313,11 @@ def get_file_list_serial(root,exclude=None,append_hash=False,full_hash=False):
 				continue
 			if entry.is_symlink():
 				links.add(get_file_repr(entry.path,append_hash,full_hash))
-				try:
-					st = entry.stat(follow_symlinks=False)
-					if 'st_rsize' in st:
-						realSize = st.st_rsize
-					elif 'st_blocks' in st:
-						realSize = st.st_blocks * 512
-					else:
-						realSize = st.st_size
-				except:
-					realSize = os.path.getsize(entry.path)
+				realSize = get_file_size(entry.path)
 				size += realSize
 			elif entry.is_file(follow_symlinks=False):
 				file_list.add(get_file_repr(entry.path,append_hash,full_hash))
-				try:
-					st = entry.stat(follow_symlinks=False)
-					# Extract nested conditional into separate statement
-					if 'st_rsize' in st:
-						realSize = st.st_rsize
-					elif 'st_blocks' in st:
-						realSize = st.st_blocks * 512
-					else:
-						realSize = st.st_size
-				except:
-					try:
-						realSize = os.path.getsize(entry.path)
-					except:
-						realSize = 0
+				realSize = get_file_size(entry.path)
 				size += realSize
 			elif entry.is_dir(follow_symlinks=False):
 				dir_files, dir_links, dir_size, dir_folders = get_file_list_serial(entry.path,exclude=exclude,append_hash=append_hash,full_hash=full_hash)
@@ -1348,13 +1341,7 @@ def get_file_list_parallel(path,max_workers=56,exclude=None,append_hash=False,fu
 	if os.path.islink(path):
 		return frozenset() ,frozenset([get_file_repr(path,append_hash,full_hash)]),0,frozenset()
 	if os.path.isfile(path):
-		st = os.stat(path, follow_symlinks=False)
-		if 'st_rsize' in st:
-			realSize = st.st_rsize
-		elif 'st_blocks' in st:
-			realSize = st.st_blocks * 512
-		else:
-			realSize = st.st_size
+		realSize = get_file_size(path)
 		return frozenset([get_file_repr(path,append_hash,full_hash)]) ,frozenset(), realSize,frozenset()
 
 	
@@ -1419,7 +1406,7 @@ def delete_file_list_parallel(file_list, max_workers, verbose=False,files_per_jo
 	last_refresh_time = start_time
 	futures = {}
 	files_per_job = max(1,files_per_job)
-	apb = Adaptive_Progress_Bar(total_count=total_files,total_size=init_size,last_num_job_for_stats=max(1,max_workers // 2),process_word='Deleted',use_print_thread = True)
+	apb = Adaptive_Progress_Bar(total_count=total_files,total_size=init_size,last_num_job_for_stats=max(1,max_workers // 2),process_word='Deleted',use_print_thread = True,suppress_all_output=verbose)
 	with ProcessPoolExecutor(max_workers=max_workers) as executor:
 		while file_list_iterator or futures:
 			# counter = 0
@@ -1461,12 +1448,12 @@ def delete_file_list_parallel(file_list, max_workers, verbose=False,files_per_jo
 					print(f'\nAverage rmtime is {current_iteration_total_run_time / len(done):0.2f} for {len(done)} jobs with {deleted_files_count_this_run} files each')
 
 			if file_list_iterator and deleted_files_count_this_run == files_per_job and (current_iteration_total_run_time / len(done) > 5 or time.perf_counter() - last_refresh_time > 5):
-				files_per_job //= 1.61803398875
+				files_per_job //= MAGIC_NUMBER
 				files_per_job = round(files_per_job)
 				if verbose:
 					print(f'\nCompletion time is long, changing files per job to {files_per_job}')
 			elif file_list_iterator and deleted_files_count_this_run == files_per_job and current_iteration_total_run_time / len(done) < 1:
-				files_per_job *= 1.61803398875
+				files_per_job *= MAGIC_NUMBER
 				files_per_job = round(files_per_job)
 				if verbose:
 					print(f'\nCompletion time is short, changing files per job to {files_per_job}')
@@ -1504,7 +1491,7 @@ def delete_files_parallel(paths, max_workers, verbose=False,files_per_job=1,excl
 	return delete_counter + 1, delete_size_counter
 
 #%% ---- Copy Files ----
-def copy_file(src_path, dest_paths, full_hash=False, verbose=False):
+def copy_file(src_path, dest_paths, full_hash=False, verbose=False, concurrent_processes=0):
 	"""
 	Copy a file from the source path to the destination path.
 
@@ -1513,6 +1500,7 @@ def copy_file(src_path, dest_paths, full_hash=False, verbose=False):
 		dest_path (list): The list of paths of the destination file.
 		full_hash (bool, optional): Whether to perform a full hash comparison to determine if the files are identical. Defaults to False.
 		verbose (bool, optional): Whether to print verbose output. Defaults to False.
+		concurrent_processes (int, optional): The number of concurrent processes running in parralle. Used to calculate preemptive back-off to next dest threashold. Defaults to 0 ( Do not back-off ).
 
 	Returns:
 		tuple: A tuple containing the size of the copied file, the time taken for the copy operation, and a dictionary of symbolic links encountered during the copy.
@@ -1537,14 +1525,13 @@ def copy_file(src_path, dest_paths, full_hash=False, verbose=False):
 		return 0, 0, symLinks
 	start_time = time.perf_counter()
 	try:
-		src_size = os.path.getsize(src_path)
+		src_size = get_file_size(src_path)
 		copiedSize = 0
 		for dest in dest_paths:
 			if os.path.exists(dest) and (not os.path.islink(src_path)) and is_file_identical(src_path, dest,src_size,full_hash):
 				# if verbose:
 				#     print(f'\nSkipped {src_path}')
 				st = os.stat(src_path,follow_symlinks=False)
-				# src_size = stis_file.st_rsize if 'st_rsize' in st else st.st_blocks * 512
 				shutil.copystat(src_path, dest,follow_symlinks=False)
 				if os.name == 'posix':
 					os.chown(dest, st.st_uid, st.st_gid)
@@ -1553,6 +1540,8 @@ def copy_file(src_path, dest_paths, full_hash=False, verbose=False):
 				os.utime(dest, (st.st_atime, st.st_mtime),follow_symlinks=False)
 				endTime = time.perf_counter()
 				return 0, endTime - start_time , symLinks #, task_to_run
+		bak_dest_paths = dest_paths.copy()
+		using_bak_paths = False
 		if os.path.islink(src_path):
 			symLinks[src_path] = dest_paths
 		else:
@@ -1563,47 +1552,85 @@ def copy_file(src_path, dest_paths, full_hash=False, verbose=False):
 				else:
 					idx = 0
 				dest_path = dest_paths.pop(idx)
-				if get_free_space_bytes(os.path.dirname(dest_path)) < src_size:
-					if verbose:
-						print(f'\nNot enough space on {dest_path} to copy {src_path}')
-					continue
+				dest_free_space = get_free_space_bytes(os.path.dirname(dest_path))
+				if not using_bak_paths:
+					to_skip = False
+					if dest_free_space < src_size:
+						if verbose:
+							print(f'\nEstimation: not enough space on {dest_path} to copy {src_path}')
+							print(f'Free space: {format_bytes(dest_free_space)}B, Required: {format_bytes(src_size)}B')
+						to_skip = True
+					if not to_skip and concurrent_processes > 0:
+						estimated_concurrent_write_size = src_size * concurrent_processes
+						backoff_threashold = dest_free_space / estimated_concurrent_write_size * 2.5
+						if backoff_threashold < random.random():
+							if verbose:
+								print(f'\nPreemptively backing off on {dest_path} to copy {src_path} with chance {1- backoff_threashold:.2f}')
+								print(f'Estimated concurrent write size: {format_bytes(estimated_concurrent_write_size)}B, Free space: {format_bytes(dest_free_space)}B')
+							to_skip = True
+						elif verbose:
+							print(f'\nLottery Win. Continuing on {dest_path} to copy {src_path} with chance {backoff_threashold:.2f}')
+							print(f'Estimated concurrent write size: {format_bytes(estimated_concurrent_write_size)}B, Free space: {format_bytes(dest_free_space)}B')
+					if to_skip:
+						if not dest_paths:
+							using_bak_paths = True
+							dest_paths = bak_dest_paths
+							if verbose:
+								print(f'Pre Gracious copy pass failed. Force trying all destination paths for {src_path}')
+						continue
 				if verbose:
 					print(f'\nTrying to copy from {src_path} to {dest_path}')
 				try:
 					try:
 						if os.name == 'posix':
 							run_command_in_multicmd_with_path_check(["cp", "-af", "--sparse=always", src_path, dest_path],timeout=0,quiet=True)
-							#task_to_run = ["cp", "-af", "--sparse=always", src_path, dest_path]
-							st = os.stat(dest_path,follow_symlinks=False)
-							copiedSize = st.st_rsize if 'st_rsize' in st else st.st_blocks * 512
+							copiedSize = get_file_size(dest_path)
 						else:
 							shutil.copy2(src_path, dest_path, follow_symlinks=False)
 							#shutil.copystat(src_path, dest_path)
+						copied = True
+						break
 					except Exception as e:
-						if not dest_paths:
-							import traceback
-							print(f'\nError copying {src_path} to {dest_path}: {e}')
-							print(traceback.format_exc())
-							print(f'\nTrying to copy from {src_path} to {dest_path} without sparse')
-						if os.name == 'posix':
-							if not dest_paths:
+						if os.path.exists(dest_path):
+							os.remove(dest_path)
+						if using_bak_paths:
+							if not dest_paths and not verbose:
+								import traceback
+								print(f'Error copying {src_path} to {dest_path}: {e}')
+								print(traceback.format_exc())
+								print(f'Trying to copy from {src_path} to {dest_path} without sparse')
+							if os.name == 'posix':
 								run_command_in_multicmd_with_path_check(["cp", "-af", src_path, dest_path],timeout=0,quiet=True)
-							#task_to_run = ["cp", "-af", src_path, dest_path]
-						elif os.name == 'nt':
-							run_command_in_multicmd_with_path_check(["xcopy", "/I", "/E", "/Y", "/c", "/q", "/k", "/r", "/h", "/x", src_path, dest_path],timeout=0,quiet=True)
-							#task_to_run = ["xcopy", "/I", "/E", "/Y", "/c", "/q", "/k", "/r", "/h", "/x", src_path, dest_path]
-					copied = True
+								#task_to_run = ["cp", "-af", src_path, dest_path]
+							elif os.name == 'nt':
+								run_command_in_multicmd_with_path_check(["xcopy", "/I", "/E", "/Y", "/c", "/q", "/k", "/r", "/h", "/x", src_path, dest_path],timeout=0,quiet=True)
+								#task_to_run = ["xcopy", "/I", "/E", "/Y", "/c", "/q", "/k", "/r", "/h", "/x", src_path, dest_path]
+						elif verbose:
+							print(f'Retrying with a different destination path in {dest_paths}')
 				except Exception as e:
-					if not dest_paths:
+					if using_bak_paths and not dest_paths:
 						import traceback
-						print(f'\nError copying {src_path} to {dest_path}: {e}')
+						print(f'ERROR copying {src_path} to {dest_path}: {e}')
 						print(traceback.format_exc())
-						print(f'\nNo more destination paths to try')
+						print(f'No more destination paths to try')
 						return 0, time.perf_counter() - start_time, symLinks #, task_to_run
 					elif verbose:
-						print(f'\nRetrying with a different destination path in {dest_paths}')
+						print(f'Re-Retrying with a different destination path in {dest_paths}')
+					if os.path.exists(dest_path):
+						os.remove(dest_path)
+				if not copied and not using_bak_paths and not dest_paths:
+					if verbose:
+						print(f'Gracious copy pass failed. Force trying all destination paths for {src_path}')
+					using_bak_paths = True
+					dest_paths = bak_dest_paths
+			if not copied:
+				print(f'ERROR: FAILED to copy {src_path} to {dest_paths}')
+				return 0, time.perf_counter() - start_time, symLinks
+			elif verbose:
+				print(f'Copied {src_path} to {dest_path}')
+				print(f'Estimated remaining size: {format_bytes(dest_free_space - copiedSize)}B')
 	except Exception as e:
-		print(f'\nFatal Error copying {src_path} to {inDests}: {e}')
+		print(f'Fatal Error copying {src_path} to {inDests}: {e}')
 		import traceback
 		print(traceback.format_exc())
 		return 0, time.perf_counter() - start_time, symLinks #, task_to_run
@@ -1612,15 +1639,17 @@ def copy_file(src_path, dest_paths, full_hash=False, verbose=False):
 	endTime = time.perf_counter()
 	return copiedSize, endTime - start_time , symLinks #, task_to_run
 
-def copy_files_bulk(src_files, dst_files,src_path, full_hash=False, verbose=False):
+def copy_files_bulk(src_files, dst_files,src_path, full_hash=False, verbose=False, concurrent_processes=0):
 	"""
 	Copy multiple files from source to destination.
 
 	Args:
 		src_files (list): List of source file paths.
 		dst_files (list): List of original destination file paths.
+		src_path (str): Source directory path.
 		full_hash (bool, optional): Whether to calculate full hash of files. Defaults to False.
 		verbose (bool, optional): Whether to display verbose output. Defaults to False.
+		concurrent_processes (int, optional): Number of concurrent processes to pass to copy_file. Defaults to 0.
 
 	Returns:
 		tuple: A tuple containing the total size of copied files, total time taken for copying, and a dictionary of symbolic links.
@@ -1633,7 +1662,7 @@ def copy_files_bulk(src_files, dst_files,src_path, full_hash=False, verbose=Fals
 	for src in src_files:
 		source_relative_path = os.path.relpath(src, src_path)
 		dests = [os.path.join(dest_path, source_relative_path) for dest_path in dst_files]
-		size , cpTime , rtnSymLinks = copy_file(src, dests, full_hash, verbose)
+		size , cpTime , rtnSymLinks = copy_file(src, dests, full_hash, verbose,concurrent_processes)
 		total_size += size
 		total_time += cpTime
 		symLinks.update(rtnSymLinks)
@@ -1686,7 +1715,7 @@ def copy_file_list_parallel(file_list, links, src_path, dest_paths, max_workers,
 	if len(file_list) == 0:
 		return 0, 0, symLinks , frozenset()
 	print(f"Processing {len(file_list)} files with {max_workers} workers")
-	apb = Adaptive_Progress_Bar(total_count=total_files,total_size=estimated_size,last_num_job_for_stats=max(1,max_workers//10),process_word='Copied',use_print_thread = True)
+	apb = Adaptive_Progress_Bar(total_count=total_files,total_size=estimated_size,last_num_job_for_stats=max(1,max_workers//10),process_word='Copied',use_print_thread = True,suppress_all_output=verbose)
 	with ProcessPoolExecutor(max_workers=max_workers) as executor:
 		while file_list_iterator or futures:
 			# counter = 0
@@ -1698,12 +1727,12 @@ def copy_file_list_parallel(file_list, links, src_path, dest_paths, max_workers,
 					for _ in range(max(1,round(files_per_job * noise))):
 						src_file = next(file_list_iterator)
 						src_files.append(src_file)
-					future = executor.submit(copy_files_bulk, src_files, dest_paths,src_path, full_hash, verbose)
+					future = executor.submit(copy_files_bulk, src_files, dest_paths,src_path, full_hash, verbose,len(futures))
 					futures[future] = src_files
 					# counter += 1
 				except StopIteration:
 					if src_files:
-						future = executor.submit(copy_files_bulk, src_files, dest_paths,src_path, full_hash, verbose)
+						future = executor.submit(copy_files_bulk, src_files, dest_paths,src_path, full_hash, verbose,len(futures))
 						futures[future] = src_files
 					file_list_iterator = None
 
@@ -1729,13 +1758,13 @@ def copy_file_list_parallel(file_list, links, src_path, dest_paths, max_workers,
 					print(f'\nAverage cptime is {current_iteration_total_run_time / len(done):0.2f} for {len(done)} jobs with {copied_file_count_this_run} files each')
 
 			if file_list_iterator and copied_file_count_this_run == files_per_job and time.perf_counter() - lastRefreshTime > 1:
-				files_per_job //= 1.61803398875
+				files_per_job //= MAGIC_NUMBER
 				files_per_job = round(files_per_job)
 				if verbose:
 					print(f'\nCompletion time is long, changing files per job to {files_per_job}')
 			#elif file_list_iterator and copied_file_count_this_run == files_per_job and current_iteration_total_run_time / len(done) < 1:
 			elif file_list_iterator and copied_file_count_this_run == files_per_job and time.perf_counter() - lastRefreshTime < 0.1:
-				files_per_job *= 1.61803398875
+				files_per_job *= MAGIC_NUMBER
 				files_per_job = round(files_per_job)
 				if verbose:
 					print(f'\nCompletion time is short, changing files per job to {files_per_job}')
@@ -1812,7 +1841,7 @@ def copy_files_serial(src_path, dest_paths, full_hash=False, verbose=False,exclu
 	total_files = len(file_list)
 	print(f"Number of files: {total_files}")
 	start_time = time.perf_counter()
-	apb = Adaptive_Progress_Bar(total_count=total_files,total_size=init_size,last_num_job_for_stats=1,process_word='Copied')
+	apb = Adaptive_Progress_Bar(total_count=total_files,total_size=init_size,last_num_job_for_stats=1,process_word='Copied',suppress_all_output=verbose)
 	for file in file_list:
 		srcRelativePath = os.path.relpath(file, src_path)
 		size, cpTime ,rtnSymLinks = copy_file(file, [os.path.join(dest_path, srcRelativePath) for dest_path in dest_paths],full_hash = full_hash, verbose=verbose)
@@ -1915,7 +1944,7 @@ def sync_directories_parallel(src, dests, max_workers, verbose=False,folder_per_
 	num_folders_copied_this_job = 0
 
 	print(f"Syncing Dir from {src} to {dests} with {max_workers} workers")
-	apb = Adaptive_Progress_Bar(total_count=len(folders),total_size=len(folders),use_print_thread = True)
+	apb = Adaptive_Progress_Bar(total_count=len(folders),total_size=len(folders),use_print_thread = True,suppress_all_output=verbose)
 	with ProcessPoolExecutor(max_workers=max_workers) as executor:
 		while folder_list_iterator or futures:
 			# counter = 0
@@ -1952,12 +1981,12 @@ def sync_directories_parallel(src, dests, max_workers, verbose=False,folder_per_
 					print(f'\nAverage cptime is {time_spent_this_iter / len(done):0.2f} for {len(done)} jobs with {num_folders_copied_this_job} folders each')
 
 			if folder_list_iterator and num_folders_copied_this_job == folder_per_job and (time_spent_this_iter / len(done) > 5 or time.perf_counter() - last_refresh_time > 5):
-				folder_per_job //= 1.61803398875
+				folder_per_job //= MAGIC_NUMBER
 				folder_per_job = round(folder_per_job)
 				if verbose:
 					print(f'\nCompletion time is long, changing folders per job to {folder_per_job}')
 			elif folder_list_iterator and num_folders_copied_this_job == folder_per_job and time_spent_this_iter / len(done) < 1:
-				folder_per_job *= 1.61803398875
+				folder_per_job *= MAGIC_NUMBER
 				folder_per_job = round(folder_per_job)
 				if verbose:
 					print(f'\nCompletion time is short, changing folders per job to {folder_per_job}')
@@ -2523,7 +2552,8 @@ def create_image(dest_image,target_mount_point,loop_devices: list,src_paths: lis
 			else:
 				_,_,size,_ = get_file_list_parallel(src, max_workers,exclude=exclude)
 				init_size += size
-		image_file_size = int(1.05 *init_size + 16*1024*1024) # add 16 MB for the file system
+		slag = 50*1024*1024
+		image_file_size = int(1.05 *init_size + slag) # add 50 MB for the file system
 		image_file_size = (int(image_file_size / 4096.0) + 1) * 4096 # round up to the nearest 4 KiB
 		number_of_images = 1
 		if dest_image_size <= 0:
@@ -2532,11 +2562,10 @@ def create_image(dest_image,target_mount_point,loop_devices: list,src_paths: lis
 			print(f"Destination image size {format_bytes(dest_image_size)}B is larger than estimated content size {format_bytes(image_file_size)}B, using rounded {format_bytes(dest_image_size)}B")
 			image_file_size = dest_image_size
 		else:
-			slag = image_file_size - init_size
 			if slag >= dest_image_size:
 				print(f"Estimated file system bloat size {format_bytes(slag)}B is larger than destination image size {format_bytes(dest_image_size)}B, exiting")
 				exit(1)
-			dest_image_usable_size = dest_image_size - slag
+			dest_image_usable_size = int((dest_image_size - slag) * 0.90)
 			number_of_images = image_file_size // dest_image_usable_size + 1
 			print(f"Destination image size {format_bytes(dest_image_size)}B is smaller than estimated content size {format_bytes(image_file_size)}B, creating {number_of_images} images of size {format_bytes(dest_image_size)}B")
 			image_file_size = dest_image_size
@@ -2570,7 +2599,7 @@ def create_image(dest_image,target_mount_point,loop_devices: list,src_paths: lis
 			print(f"Clearing {target_loop_device_dest} and create GPT partition table")
 			run_command_in_multicmd_with_path_check(['dd','if=/dev/zero','of='+target_loop_device_dest,'bs=1M','count=16'])
 			#run_command_in_multicmd_with_path_check(f"parted -s {target_loop_device_dest} mklabel gpt")
-			run_command_in_multicmd_with_path_check(['sgdisk','-Z',target_loop_device_dest])
+			#run_command_in_multicmd_with_path_check(['sgdisk','-Z',target_loop_device_dest])
 
 			print(f"Loop device {target_loop_device_dest} created")
 			target_partition = get_largest_partition(target_loop_device_dest) # should just return the loop device itself, but just in case.
