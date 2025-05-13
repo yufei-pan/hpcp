@@ -27,6 +27,7 @@ import random
 import re
 import threading
 from collections import deque
+from math import log
 try:
 	import multiCMD
 	assert float(multiCMD.version) > 1.19
@@ -1561,8 +1562,8 @@ def copy_file(src_path, dest_paths, full_hash=False, verbose=False, concurrent_p
 							print(f'Free space: {format_bytes(dest_free_space)}B, Required: {format_bytes(src_size)}B')
 						to_skip = True
 					if not to_skip and concurrent_processes > 0:
-						estimated_concurrent_write_size = src_size * concurrent_processes
-						backoff_threashold = dest_free_space / estimated_concurrent_write_size * 2.5
+						estimated_concurrent_write_size = src_size * log(concurrent_processes)
+						backoff_threashold = dest_free_space / estimated_concurrent_write_size
 						if backoff_threashold < random.random():
 							if verbose:
 								print(f'\nPreemptively backing off on {dest_path} to copy {src_path} with chance {1- backoff_threashold:.2f}')
