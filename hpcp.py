@@ -210,9 +210,9 @@ except ImportError:
 	hasher = hashlib.blake2b()
 	xxhash_available = False
 
-version = '9.20'
+version = '9.21'
 __version__ = version
-COMMIT_DATE = '2025-05-12'
+COMMIT_DATE = '2025-05-20'
 
 MAGIC_NUMBER = 1.61803398875
 RANDOM_DESTINATION_SELECTION = False
@@ -1138,7 +1138,7 @@ def format_bytes(size, use_1024_bytes=None, to_int=False, to_str=False,str_forma
 				power = 2**10
 			else:
 				power = 10**3
-			unit_labels = {'': 0, 'k': 1, 'm': 2, 'g': 3, 't': 4, 'p': 5}
+			unit_labels = {'': 0, 'k': 1, 'm': 2, 'g': 3, 't': 4, 'p': 5, 'e': 6, 'z': 7, 'y': 8}
 			if unit not in unit_labels:
 				if to_str:
 					return size
@@ -1164,7 +1164,7 @@ def format_bytes(size, use_1024_bytes=None, to_int=False, to_str=False,str_forma
 		if use_1024_bytes or use_1024_bytes is None:
 			power = 2**10
 			n = 0
-			power_labels = {0 : '', 1: 'Ki', 2: 'Mi', 3: 'Gi', 4: 'Ti', 5: 'Pi'}
+			power_labels = {0 : '', 1: 'Ki', 2: 'Mi', 3: 'Gi', 4: 'Ti', 5: 'Pi', 6: 'Ei', 7: 'Zi', 8: 'Yi'}
 			while size > power:
 				size /= power
 				n += 1
@@ -1172,7 +1172,7 @@ def format_bytes(size, use_1024_bytes=None, to_int=False, to_str=False,str_forma
 		else:
 			power = 10**3
 			n = 0
-			power_labels = {0 : '', 1: 'K', 2: 'M', 3: 'G', 4: 'T', 5: 'P'}
+			power_labels = {0 : '', 1: 'K', 2: 'M', 3: 'G', 4: 'T', 5: 'P', 6: 'E', 7: 'Z', 8: 'Y'}
 			while size > power:
 				size /= power
 				n += 1
@@ -1483,6 +1483,7 @@ def delete_files_parallel(paths, max_workers, verbose=False,files_per_job=1,excl
 	print(f"Time taken to get file list: {endTime-start_time:0.4f} seconds")
 	total_files = len(all_files)
 	print(f"Number of files: {total_files}")
+	print(f'Initial estimated size: {format_bytes(init_size_all)}B')
 	if total_files == 0:
 		return 1 , delete_file_bulk(paths)[0]
 	delete_counter, delete_size_counter = delete_file_list_parallel(all_files, max_workers, verbose,files_per_job,init_size=init_size)
@@ -2997,7 +2998,7 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = 4 * mul
 				continue
 			# copy the partition files
 			print(f"Copying partition {partition} files from {src_mount_point} to {dest_mount_point}")
-			hpcp([src_mount_point], dest_path = dest_mount_point, single_thread=single_thread, max_workers=max_workers,
+			hpcp([src_mount_point], dest_paths = [dest_mount_point], single_thread=single_thread, max_workers=max_workers,
 																verbose=verbose, directory_only=directory_only,no_directory_sync=no_directory_sync,
 																full_hash=full_hash, files_per_job=files_per_job, parallel_file_listing=parallel_file_listing,
 																exclude=exclude,no_link_tracking = True)
