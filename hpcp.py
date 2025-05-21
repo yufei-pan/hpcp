@@ -210,7 +210,7 @@ except ImportError:
 	hasher = hashlib.blake2b()
 	xxhash_available = False
 
-version = '9.21'
+version = '9.22'
 __version__ = version
 COMMIT_DATE = '2025-05-20'
 
@@ -1563,7 +1563,7 @@ def copy_file(src_path, dest_paths, full_hash=False, verbose=False, concurrent_p
 							print(f'Free space: {format_bytes(dest_free_space)}B, Required: {format_bytes(src_size)}B')
 						to_skip = True
 					if not to_skip and concurrent_processes > 0:
-						estimated_concurrent_write_size = src_size * log(concurrent_processes)
+						estimated_concurrent_write_size = max(src_size * log(concurrent_processes),1)
 						backoff_threashold = dest_free_space / estimated_concurrent_write_size
 						if backoff_threashold < random.random():
 							if verbose:
