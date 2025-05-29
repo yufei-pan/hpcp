@@ -210,17 +210,20 @@ except ImportError:
 	hasher = hashlib.blake2b()
 	xxhash_available = False
 
-version = '9.23'
+version = '9.24'
 __version__ = version
-COMMIT_DATE = '2025-05-20'
+COMMIT_DATE = '2025-05-29'
 
 MAGIC_NUMBER = 1.61803398875
 RANDOM_DESTINATION_SELECTION = False
 
+BYTES_RATE_LIMIT = 0
+FILES_RATE_LIMIT = 0
+
 #%% ---- Helper Functions ----
 class Adaptive_Progress_Bar:
-	def __init__(self, total_count = 0, total_size = 0,refresh_interval = 0.1,last_num_job_for_stats = 5,custom_prefix = None,
-			  custom_suffix = None,process_word = 'Processed',use_print_thread = False, suppress_all_output = False):
+	def __init__(self, total_count = 0, total_size = 0,refresh_interval = 0.1,last_num_job_for_stats = 10,custom_prefix = None,
+			  custom_suffix = None,process_word = 'Processed',use_print_thread = False, suppress_all_output = False,bytes_rate_limit = 0,files_rate_limit = 0):
 		self.total_count = total_count
 		self.total_size = total_size
 		self.refresh_interval = refresh_interval
@@ -236,6 +239,8 @@ class Adaptive_Progress_Bar:
 		self.last_call_args = None
 		self.use_print_thread = use_print_thread
 		self.quiet = suppress_all_output
+		self.bytes_rate_limit = bytes_rate_limit
+		self.files_rate_limit = files_rate_limit
 		if use_print_thread:
 			...
 			# Disabling print thread as for python threading and process pool coexistance bug
@@ -277,15 +282,20 @@ class Adaptive_Progress_Bar:
 			prefix = self.custom_prefix
 		else:
 			prefix = f'{format_bytes(self.item_counter,use_1024_bytes=False,to_str=True)}F ({format_bytes(self.size_counter)}B) {self.process_word} |'
-			if self.scheduled_jobs:
-				prefix += f' {self.scheduled_jobs} Scheduled'
+			#if self.scheduled_jobs:
+			prefix += f' {self.scheduled_jobs} Scheduled'
 			if job_count > 0:
-				prefix += f' {files_per_job:0>4.1f} F/Job '
+				prefix += f' {files_per_job:0>3.1f} F/Job '
 		if self.custom_suffix:
 			suffix = self.custom_suffix
 		else:
 			suffix = f'{format_bytes(total_size_speed)}B/s {format_bytes(total_file_speed,use_1024_bytes=False,to_str=True)}F/s |'
-			if job_count > 0:
+			if self.bytes_rate_limit > 0 or self.files_rate_limit > 0:
+				if self.bytes_rate_limit > 0:
+					suffix += f' {format_bytes(self.bytes_rate_limit)}B/s Limit |'
+				if self.files_rate_limit > 0:
+					suffix += f' {format_bytes(self.files_rate_limit,use_1024_bytes=False,to_str=True)}F/s Limit |'
+			elif job_count > 0:
 				suffix += f' {last_n_time:.1f}s: {format_bytes(last_n_size_speed)}B/s {format_bytes(last_n_file_speed,use_1024_bytes=False,to_str=True)}F/s |'
 			suffix += f' {format_time(remaining_time)}'
 		callArgs = (self.item_counter, self.total_count, prefix, suffix)
@@ -302,6 +312,29 @@ class Adaptive_Progress_Bar:
 		self.last_n_jobs.append((num_files, cpSize, cpTime, files_per_job))
 		if not self.use_print_thread:
 			self.print_progress()
+	def under_rate_limit(self):
+		# calculate the sleep time based on the rate limits
+		if self.total_count == self.item_counter:
+			return True
+		if not self.bytes_rate_limit and not self.files_rate_limit:
+			return True
+		duration = time.perf_counter() - self.start_time
+		if self.bytes_rate_limit > 0:
+			estimated_max_current_copy_size = self.bytes_rate_limit * duration
+			if self.size_counter > estimated_max_current_copy_size:
+				return False
+		if self.files_rate_limit > 0:
+			estimated_max_current_copy_files = self.files_rate_limit * duration
+			if self.item_counter > estimated_max_current_copy_files:
+				return False
+		return True
+	def rate_limit(self):
+		while not self.under_rate_limit():
+			# sleep for 0.1 seconds
+			self.print_progress()
+			time.sleep(self.refresh_interval)
+			
+
 
 _binPaths = {}
 @functools.lru_cache(maxsize=None)
@@ -1401,17 +1434,24 @@ def delete_file_bulk(paths):
 	return total_size, endTime - start_time
 
 def delete_file_list_parallel(file_list, max_workers, verbose=False,files_per_job=1,init_size=0):
+	global FILES_RATE_LIMIT
+	global BYTES_RATE_LIMIT
 	total_files = len(file_list)
 	file_list_iterator = iter(file_list)
 	start_time = time.perf_counter()
 	last_refresh_time = start_time
 	futures = {}
+	if FILES_RATE_LIMIT or BYTES_RATE_LIMIT:
+		max_scheduled_jobs = max_workers
+	else:
+		max_scheduled_jobs = max_workers * 1.2
 	files_per_job = max(1,files_per_job)
-	apb = Adaptive_Progress_Bar(total_count=total_files,total_size=init_size,last_num_job_for_stats=max(1,max_workers // 2),process_word='Deleted',use_print_thread = True,suppress_all_output=verbose)
+	apb = Adaptive_Progress_Bar(total_count=total_files,total_size=init_size,last_num_job_for_stats=max(1,max_workers // 2),process_word='Deleted',
+							 use_print_thread = True,suppress_all_output=verbose,bytes_rate_limit=BYTES_RATE_LIMIT,files_rate_limit=FILES_RATE_LIMIT)
 	with ProcessPoolExecutor(max_workers=max_workers) as executor:
 		while file_list_iterator or futures:
 			# counter = 0
-			while file_list_iterator and len(futures) < 1.2 * max_workers and last_refresh_time - time.perf_counter() < 5:
+			while file_list_iterator and len(futures) < max_scheduled_jobs and last_refresh_time - time.perf_counter() < 5 and apb.under_rate_limit():
 				delete_files = []
 				try:
 					for _ in range(files_per_job):
@@ -1425,7 +1465,7 @@ def delete_file_list_parallel(file_list, max_workers, verbose=False,files_per_jo
 						futures[future] = delete_files
 					file_list_iterator = None
 
-			done, _ = concurrent.futures.wait(futures.keys(), return_when=concurrent.futures.FIRST_COMPLETED)
+			done, _ = concurrent.futures.wait(futures.keys(), return_when=concurrent.futures.FIRST_COMPLETED, timeout=1)
 
 			#print('\n',len(done) ,'\t', len(futures))
 			# if file_list_iterator and len(done) / len(futures) > 0.2:
@@ -1444,22 +1484,29 @@ def delete_file_list_parallel(file_list, max_workers, verbose=False,files_per_jo
 					print(f'\n{future} generated an exception: {exc}')
 				current_iteration_total_run_time += rmTime
 				apb.update(num_files=deleted_files_count_this_run,cpSize=rmSize,cpTime=rmTime,files_per_job=files_per_job)
-				apb.scheduled_jobs = len(futures)
-			if verbose:
+			apb.scheduled_jobs = len(futures)
+			if done:
+				if verbose:
 					print(f'\nAverage rmtime is {current_iteration_total_run_time / len(done):0.2f} for {len(done)} jobs with {deleted_files_count_this_run} files each')
-
-			if file_list_iterator and deleted_files_count_this_run == files_per_job and (current_iteration_total_run_time / len(done) > 5 or time.perf_counter() - last_refresh_time > 5):
-				files_per_job //= MAGIC_NUMBER
-				files_per_job = round(files_per_job)
-				if verbose:
-					print(f'\nCompletion time is long, changing files per job to {files_per_job}')
-			elif file_list_iterator and deleted_files_count_this_run == files_per_job and current_iteration_total_run_time / len(done) < 1:
-				files_per_job *= MAGIC_NUMBER
-				files_per_job = round(files_per_job)
-				if verbose:
-					print(f'\nCompletion time is short, changing files per job to {files_per_job}')
-			if files_per_job < 1:
-				files_per_job = 1
+				if file_list_iterator and deleted_files_count_this_run == files_per_job and (current_iteration_total_run_time / len(done) > 5 or time.perf_counter() - last_refresh_time > 5):
+					files_per_job //= MAGIC_NUMBER
+					files_per_job = round(files_per_job)
+					if verbose:
+						print(f'\nCompletion time is long, changing files per job to {files_per_job}')
+				elif file_list_iterator and deleted_files_count_this_run == files_per_job and current_iteration_total_run_time / len(done) < 1:
+					files_per_job *= MAGIC_NUMBER
+					files_per_job = round(files_per_job)
+					if verbose:
+						print(f'\nCompletion time is short, changing files per job to {files_per_job}')
+				if files_per_job < 1:
+					files_per_job = 1
+			else:
+				if not apb.under_rate_limit():
+					if verbose:
+						print(f'\nWe had hit the rate limit, changing files per job to 1')
+					files_per_job = 1
+				time.sleep(apb.refresh_interval)
+				apb.print_progress()
 			last_refresh_time = time.perf_counter()
 	endTime = time.perf_counter()
 	apb.stop()
@@ -1691,6 +1738,12 @@ def copy_file_list_parallel(file_list, links, src_path, dest_paths, max_workers,
 			- symLinks (dict): Dictionary mapping symbolic links to their destination paths.
 			- file_list (frozenset): Frozen set of remaining files to be copied.
 	"""
+	global FILES_RATE_LIMIT
+	global BYTES_RATE_LIMIT
+	if FILES_RATE_LIMIT or BYTES_RATE_LIMIT:
+		max_scheduled_jobs = max_workers
+	else:
+		max_scheduled_jobs = max_workers * 1.1
 	if len(src_path) > 4096:
 		print(f'\nSkipped {src_path} because path is too long')
 		return 0, 0, {}, frozenset()
@@ -1717,11 +1770,11 @@ def copy_file_list_parallel(file_list, links, src_path, dest_paths, max_workers,
 	if len(file_list) == 0:
 		return 0, 0, symLinks , frozenset()
 	print(f"Processing {len(file_list)} files with {max_workers} workers")
-	apb = Adaptive_Progress_Bar(total_count=total_files,total_size=estimated_size,last_num_job_for_stats=max(1,max_workers//10),process_word='Copied',use_print_thread = True,suppress_all_output=verbose)
+	apb = Adaptive_Progress_Bar(total_count=total_files,total_size=estimated_size,last_num_job_for_stats=max(1,max_workers//10),process_word='Copied',use_print_thread = True,suppress_all_output=verbose,bytes_rate_limit=BYTES_RATE_LIMIT,files_rate_limit=FILES_RATE_LIMIT)
 	with ProcessPoolExecutor(max_workers=max_workers) as executor:
 		while file_list_iterator or futures:
 			# counter = 0
-			while file_list_iterator and len(futures) < 1.1 * max_workers and time.perf_counter() - lastRefreshTime < 1:
+			while file_list_iterator and len(futures) < max_scheduled_jobs and time.perf_counter() - lastRefreshTime < 1 and apb.under_rate_limit():
 				src_files = []
 				try:
 					# generate some noise from 0.9 to 1.1 to apply to the files per job to attempt spreading out the job scheduling
@@ -1738,7 +1791,7 @@ def copy_file_list_parallel(file_list, links, src_path, dest_paths, max_workers,
 						futures[future] = src_files
 					file_list_iterator = None
 
-			done, _ = concurrent.futures.wait(futures.keys(), return_when=concurrent.futures.FIRST_COMPLETED)
+			done, _ = concurrent.futures.wait(futures.keys(), return_when=concurrent.futures.FIRST_COMPLETED,timeout=1)
 
 			#print('\n',len(done) ,'\t', len(futures))
 			if file_list_iterator and len(done) > 1 and len(done) / len(futures) > 0.1:
@@ -1754,24 +1807,31 @@ def copy_file_list_parallel(file_list, links, src_path, dest_paths, max_workers,
 				cpSize, cpTime, rtnSymLinks = future.result()
 				current_iteration_total_run_time += cpTime
 				apb.update(num_files=copied_file_count_this_run,cpSize=cpSize,cpTime=cpTime,files_per_job=files_per_job)
-				apb.scheduled_jobs = len(futures)
 				symLinks.update(rtnSymLinks)
-			if verbose:
-					print(f'\nAverage cptime is {current_iteration_total_run_time / len(done):0.2f} for {len(done)} jobs with {copied_file_count_this_run} files each')
-
-			if file_list_iterator and copied_file_count_this_run == files_per_job and time.perf_counter() - lastRefreshTime > 1:
-				files_per_job //= MAGIC_NUMBER
-				files_per_job = round(files_per_job)
+			apb.scheduled_jobs = len(futures)
+			if done:
 				if verbose:
-					print(f'\nCompletion time is long, changing files per job to {files_per_job}')
-			#elif file_list_iterator and copied_file_count_this_run == files_per_job and current_iteration_total_run_time / len(done) < 1:
-			elif file_list_iterator and copied_file_count_this_run == files_per_job and time.perf_counter() - lastRefreshTime < 0.1:
-				files_per_job *= MAGIC_NUMBER
-				files_per_job = round(files_per_job)
-				if verbose:
-					print(f'\nCompletion time is short, changing files per job to {files_per_job}')
-			if files_per_job < 1:
-				files_per_job = 1
+						print(f'\nAverage cptime is {current_iteration_total_run_time / len(done):0.2f} for {len(done)} jobs with {copied_file_count_this_run} files each')
+				if file_list_iterator and copied_file_count_this_run == files_per_job and time.perf_counter() - lastRefreshTime > 1:
+					files_per_job //= MAGIC_NUMBER
+					files_per_job = round(files_per_job)
+					if verbose:
+						print(f'\nCompletion time is long, changing files per job to {files_per_job}')
+				#elif file_list_iterator and copied_file_count_this_run == files_per_job and current_iteration_total_run_time / len(done) < 1:
+				elif file_list_iterator and copied_file_count_this_run == files_per_job and time.perf_counter() - lastRefreshTime < 0.1:
+					files_per_job *= MAGIC_NUMBER
+					files_per_job = round(files_per_job)
+					if verbose:
+						print(f'\nCompletion time is short, changing files per job to {files_per_job}')
+				if files_per_job < 1:
+					files_per_job = 1
+			else:
+				if not apb.under_rate_limit():
+					if verbose:
+						print(f'\nWe had hit the rate limit, changing files per job to 1')
+					files_per_job = 1
+				time.sleep(apb.refresh_interval)
+				apb.print_progress()
 			lastRefreshTime = time.perf_counter()
 	endTime = time.perf_counter()
 	apb.stop()
@@ -1819,6 +1879,8 @@ def copy_files_parallel(src_path, dest_paths, max_workers, full_hash=False, verb
 
 def copy_files_serial(src_path, dest_paths, full_hash=False, verbose=False,exclude=None):
 	# skip if src path or dest path is longer than 4096 characters
+	global FILES_RATE_LIMIT
+	global BYTES_RATE_LIMIT
 	if len(src_path) > 4096:
 		print(f'Skipping: {src_path} is too long')
 		return 0, 0 , set(), frozenset()
@@ -1843,13 +1905,14 @@ def copy_files_serial(src_path, dest_paths, full_hash=False, verbose=False,exclu
 	total_files = len(file_list)
 	print(f"Number of files: {total_files}")
 	start_time = time.perf_counter()
-	apb = Adaptive_Progress_Bar(total_count=total_files,total_size=init_size,last_num_job_for_stats=1,process_word='Copied',suppress_all_output=verbose)
+	apb = Adaptive_Progress_Bar(total_count=total_files,total_size=init_size,last_num_job_for_stats=1,process_word='Copied',suppress_all_output=verbose,bytes_rate_limit=BYTES_RATE_LIMIT,files_rate_limit=FILES_RATE_LIMIT)
 	for file in file_list:
 		srcRelativePath = os.path.relpath(file, src_path)
 		size, cpTime ,rtnSymLinks = copy_file(file, [os.path.join(dest_path, srcRelativePath) for dest_path in dest_paths],full_hash = full_hash, verbose=verbose)
 		#update_progress_bar(copy_counter, copy_size_counter, total_files, start_time)
 		apb.update(num_files=1,cpSize=size,cpTime=cpTime,files_per_job=1)
 		links.update(rtnSymLinks)
+		apb.rate_limit()
 	symLinks = {}
 	for link in links:
 		srcRelativePath = os.path.relpath(link, src_path)
@@ -1912,6 +1975,8 @@ def sync_directory_metadata_bulk(src_paths, dest_paths,src_path):
 	return total_count , total_time, symLinks
 
 def sync_directories_parallel(src, dests, max_workers, verbose=False,folder_per_job=64,exclude=None):
+	global FILES_RATE_LIMIT
+	global BYTES_RATE_LIMIT
 	# skip if src path or dest path is longer than 4096 characters
 	if len(src) > 4096:
 		print(f'Skipping: {src} is too long')
@@ -1941,16 +2006,15 @@ def sync_directories_parallel(src, dests, max_workers, verbose=False,folder_per_
 	start_time = time.perf_counter()
 	last_refresh_time = start_time
 	max_workers = max(2,int(max_workers / 4))
-
 	folder_per_job = max(1,folder_per_job)
 	num_folders_copied_this_job = 0
 
 	print(f"Syncing Dir from {src} to {dests} with {max_workers} workers")
-	apb = Adaptive_Progress_Bar(total_count=len(folders),total_size=len(folders),use_print_thread = True,suppress_all_output=verbose)
+	apb = Adaptive_Progress_Bar(total_count=len(folders),total_size=len(folders),use_print_thread = True,suppress_all_output=verbose,process_word='Synced',bytes_rate_limit=BYTES_RATE_LIMIT,files_rate_limit=FILES_RATE_LIMIT)
 	with ProcessPoolExecutor(max_workers=max_workers) as executor:
 		while folder_list_iterator or futures:
 			# counter = 0
-			while folder_list_iterator and len(futures) <  max_workers and last_refresh_time - time.perf_counter() < 5:
+			while folder_list_iterator and len(futures) <  max_workers and last_refresh_time - time.perf_counter() < 5 and apb.under_rate_limit():
 				src_folders = []
 				try:
 					for _ in range(folder_per_job):
@@ -1965,7 +2029,7 @@ def sync_directories_parallel(src, dests, max_workers, verbose=False,folder_per_
 						futures[future] = src_folders
 					folder_list_iterator = None
 
-			done, _ = concurrent.futures.wait(futures.keys(), return_when=concurrent.futures.FIRST_COMPLETED)
+			done, _ = concurrent.futures.wait(futures.keys(), return_when=concurrent.futures.FIRST_COMPLETED,timeout=1)
 			time_spent_this_iter = 0
 			for future in done:
 				src_folders = futures.pop(future)
@@ -1977,23 +2041,32 @@ def sync_directories_parallel(src, dests, max_workers, verbose=False,folder_per_
 					#print(f'\n{future} generated an exception: {exc}')
 				#else:
 				apb.update(num_files=num_folders_copied_this_job, cpSize=cpSize, cpTime=cpTime , files_per_job=folder_per_job)
-				apb.scheduled_jobs = len(futures)
 				symLinks.update(rtnSymLinks)
-			if verbose:
-					print(f'\nAverage cptime is {time_spent_this_iter / len(done):0.2f} for {len(done)} jobs with {num_folders_copied_this_job} folders each')
+			apb.scheduled_jobs = len(futures)
+			if done:
+				if verbose:
+						print(f'\nAverage cptime is {time_spent_this_iter / len(done):0.2f} for {len(done)} jobs with {num_folders_copied_this_job} folders each')
 
-			if folder_list_iterator and num_folders_copied_this_job == folder_per_job and (time_spent_this_iter / len(done) > 5 or time.perf_counter() - last_refresh_time > 5):
-				folder_per_job //= MAGIC_NUMBER
-				folder_per_job = round(folder_per_job)
-				if verbose:
-					print(f'\nCompletion time is long, changing folders per job to {folder_per_job}')
-			elif folder_list_iterator and num_folders_copied_this_job == folder_per_job and time_spent_this_iter / len(done) < 1:
-				folder_per_job *= MAGIC_NUMBER
-				folder_per_job = round(folder_per_job)
-				if verbose:
-					print(f'\nCompletion time is short, changing folders per job to {folder_per_job}')
-			if folder_per_job < 1:
-				folder_per_job = 1
+				if folder_list_iterator and num_folders_copied_this_job == folder_per_job and (time_spent_this_iter / len(done) > 5 or time.perf_counter() - last_refresh_time > 5):
+					folder_per_job //= MAGIC_NUMBER
+					folder_per_job = round(folder_per_job)
+					if verbose:
+						print(f'\nCompletion time is long, changing folders per job to {folder_per_job}')
+				elif folder_list_iterator and num_folders_copied_this_job == folder_per_job and time_spent_this_iter / len(done) < 1:
+					folder_per_job *= MAGIC_NUMBER
+					folder_per_job = round(folder_per_job)
+					if verbose:
+						print(f'\nCompletion time is short, changing folders per job to {folder_per_job}')
+				if folder_per_job < 1:
+					folder_per_job = 1
+			else:
+				if not apb.under_rate_limit():
+					if verbose:
+						print(f'\nWe had hit the rate limit, changing folder per job to 1')
+					folder_per_job = 1
+				time.sleep(apb.refresh_interval)
+				apb.print_progress()
+			apb.rate_limit()
 			last_refresh_time = time.perf_counter()
 
 	endTime = time.perf_counter()
@@ -2025,6 +2098,8 @@ def sync_directories_serial(src, dests,exclude=None):
 		- If the source path is excluded based on the exclude patterns, the function will skip synchronization.
 		- The function prints progress information to the terminal, including the number of directories synced and the speed of synchronization.
 	"""
+	global FILES_RATE_LIMIT
+	global BYTES_RATE_LIMIT
 	# skip if src path or dest path is longer than 4096 characters
 	if len(src) > 4096:
 		print(f'Skipping: {src} is too long')
@@ -2049,11 +2124,12 @@ def sync_directories_serial(src, dests,exclude=None):
 	print(f'Getting file list for {src}')
 	_,_,_,folders = get_file_list_serial(src,exclude=exclude)
 	print(f"Syncing Dir from {src} to {dests} in single thread")
-	apb = Adaptive_Progress_Bar(total_count=len(folders),total_size=len(folders))
+	apb = Adaptive_Progress_Bar(total_count=len(folders),total_size=len(folders),process_word='Synced',bytes_rate_limit=BYTES_RATE_LIMIT,files_rate_limit=FILES_RATE_LIMIT)
 	for folder in folders:
 		source_relative_path = os.path.relpath(folder, src)
 		count , cpTime , _ = sync_directory_metadata(folder, [os.path.join(dest, source_relative_path) for dest in dests])
 		apb.update(num_files=1, cpSize=count, cpTime=cpTime , files_per_job=1)
+		apb.rate_limit()
 	apb.stop()
 	return symLinks
 #%% ---- Compare Files ----
@@ -2849,6 +2925,9 @@ def get_args(args = None):
 	parser.add_argument('-dd', '--disk_dump', action='store_true', help='Disk to Disk mirror, use this if you are backuping / deploying an OS from / to a disk. \
 					 Require 1 source, can be 1 src_path or 1 -si src_image, require 1 -di dest_image. Note: will only actually use dd if unable to mount / create a partition.')
 	parser.add_argument('-ddr', '--dd_resize', action='append', type=str, help=f'Resize the destination image to the specified size with -dd. Applies to biggest partiton first. Specify multiple -ddr to resize subsequent sized partitions. Example: {{100GiB}} or {{200G}}')
+	parser.add_argument('-L','-rl','--rate_limit', type=str, default=None, help='Approximate a rate limit the copy speed in bytes/second. Example: 10M for 10 MB/s, 1Gi for 1 GiB/s. Note: do not work in single thread mode. Default is 0: no rate limit.')
+	parser.add_argument('-F','-frl','--file_rate_limit', type=str, default=None, help='Approximate a rate limit the copy speed in files/second. Example: 10K for 10240 files/s, 1Mi for 1024*1024*1024 files/s. Note: do not work in serial mode. Default is 0: no rate limit.')
+
 	try:
 		args = parser.parse_intermixed_args(args)
 	except Exception:
@@ -2883,8 +2962,20 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = 4 * mul
 			verbose = False, directory_only = False,no_directory_sync = False, full_hash = False, files_per_job = 1, target_file_list = "",
 			compare_file_list = False, diff_file_list = None, tar_diff_file_list = False, remove = False,remove_force = False, remove_extra = False, parallel_file_listing = False,
 			exclude=None,exclude_file = None,dest_image = None,dest_image_size = '0', no_link_tracking = False,src_image = None,dd = False,dd_resize = 0,
-			batch = False, append_hash_to_file_list = True, hash_size = ..., source_file_list = None):
+			batch = False, append_hash_to_file_list = True, hash_size = ..., source_file_list = None, random_destination_selection = False, bytes_rate_limit = None, files_rate_limit = None):
 	global HASH_SIZE
+	global RANDOM_DESTINATION_SELECTION
+	global BYTES_RATE_LIMIT
+	global FILES_RATE_LIMIT
+	if random_destination_selection:
+		RANDOM_DESTINATION_SELECTION = True
+		print("Random destination selection enabled.")
+	else:
+		RANDOM_DESTINATION_SELECTION = False
+	if bytes_rate_limit:
+		BYTES_RATE_LIMIT = format_bytes(bytes_rate_limit,to_int=True)
+	if files_rate_limit:
+		FILES_RATE_LIMIT = format_bytes(files_rate_limit,to_int=True)
 	if hash_size != ...:
 		try:
 			HASH_SIZE = int(hash_size)
@@ -3215,11 +3306,6 @@ def hpcp_gui():
 def main():
 	global RANDOM_DESTINATION_SELECTION
 	args = get_args()
-	if args.random_dest_selection:
-		RANDOM_DESTINATION_SELECTION = True
-		print("Random destination selection enabled.")
-	else:
-		RANDOM_DESTINATION_SELECTION = False
 	# we run gui if the current platform is windows and src_path is not specified
 	if os.name == 'nt' and len(args.src_path) == 0:
 		hpcp_gui()
@@ -3229,7 +3315,7 @@ def main():
 			 target_file_list = args.target_file_list, compare_file_list = args.compare_file_list , diff_file_list = args.diff_file_list, tar_diff_file_list = args.tar_diff_file_list,remove = args.remove, remove_force =args.remove_force,
 			 remove_extra = args.remove_extra, parallel_file_listing = args.parallel_file_listing,exclude = args.exclude,exclude_file = args.exclude_file,
 			 dest_image = args.dest_image,dest_image_size=args.dest_image_size,no_link_tracking = args.no_link_tracking,src_image = args.src_image,dd=args.disk_dump,
-			 dd_resize=args.dd_resize,batch=args.batch,append_hash_to_file_list=not args.no_hash_file_list, hash_size=args.hash_size,source_file_list=args.source_file_list)
+			 dd_resize=args.dd_resize,batch=args.batch,append_hash_to_file_list=not args.no_hash_file_list, hash_size=args.hash_size,source_file_list=args.source_file_list,random_destination_selection = args.random_dest_selection,bytes_rate_limit = args.rate_limit,files_rate_limit = args.file_rate_limit)
 		if rtnCode:
 			exit(rtnCode)
 		
