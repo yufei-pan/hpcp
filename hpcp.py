@@ -210,9 +210,9 @@ except ImportError:
 	hasher = hashlib.blake2b()
 	xxhash_available = False
 
-version = '9.24'
+version = '9.25'
 __version__ = version
-COMMIT_DATE = '2025-05-29'
+COMMIT_DATE = '2025-06-17'
 
 MAGIC_NUMBER = 1.61803398875
 RANDOM_DESTINATION_SELECTION = False
@@ -2419,7 +2419,20 @@ def process_remove(src_paths: list,single_thread = False, max_workers = 4 * mult
 		print('-'*80)
 		start_time = time.perf_counter()
 		if single_thread:
-			shutil.rmtree(path)
+			if os.path.isfile(path) or os.path.islink(path):
+				if verbose:
+					print(f"Removing file: {path}")
+				try:
+					os.remove(path)
+				except Exception as e:
+					print(f"Error removing file {path}: {e}")
+			elif os.path.isdir(path):
+				if verbose:
+					print(f"Removing directory: {path}")
+				try:
+					shutil.rmtree(path)
+				except Exception as e:
+					print(f"Error removing directory {path}: {e}")
 		else:
 			delete_files_parallel(processedPaths if batch else path, max_workers, verbose=verbose,files_per_job=files_per_job,exclude=exclude,batch=batch)
 		endTime = time.perf_counter()
