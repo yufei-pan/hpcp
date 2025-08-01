@@ -32,7 +32,7 @@ try:
 	import multiCMD
 	assert float(multiCMD.version) > 1.19
 except:	
-	import io,subprocess,string,itertools,signal
+	import io,subprocess,string,itertools,signal,sys,threading,re,select,time
 	class multiCMD:
 		version='1.29_build_in'
 		__version__=version
