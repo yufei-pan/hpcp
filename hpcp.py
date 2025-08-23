@@ -210,9 +210,9 @@ except ImportError:
 	hasher = hashlib.blake2b()
 	xxhash_available = False
 
-version = '9.25'
+version = '9.27'
 __version__ = version
-COMMIT_DATE = '2025-06-17'
+COMMIT_DATE = '2025-08-22'
 
 MAGIC_NUMBER = 1.61803398875
 RANDOM_DESTINATION_SELECTION = False
@@ -1631,6 +1631,8 @@ def copy_file(src_path, dest_paths, full_hash=False, verbose=False, concurrent_p
 					print(f'\nTrying to copy from {src_path} to {dest_path}')
 				try:
 					try:
+						# if the parent path for the file does not exist, create it
+						os.makedirs(os.path.dirname(dest_path), exist_ok=True)
 						if os.name == 'posix':
 							run_command_in_multicmd_with_path_check(["cp", "-af", "--sparse=always", src_path, dest_path],timeout=0,quiet=True,strict=True)
 							copiedSize = get_file_size(dest_path)
@@ -1712,6 +1714,23 @@ def copy_files_bulk(src_files, dst_files,src_path, full_hash=False, verbose=Fals
 		source_relative_path = os.path.relpath(src, src_path)
 		dests = [os.path.join(dest_path, source_relative_path) for dest_path in dst_files]
 		size , cpTime , rtnSymLinks = copy_file(src, dests, full_hash, verbose,concurrent_processes)
+		total_size += size
+		total_time += cpTime
+		symLinks.update(rtnSymLinks)
+	return total_size , total_time, symLinks
+
+def copy_files_bulk_batch(current_jobs, full_hash=False, verbose=False, concurrent_processes=0):
+	total_size = 0
+	total_time = 0
+	symLinks = {}
+	# tasks_to_run = []
+	for (src_path, dest_paths, f) in current_jobs:
+		source_relative_path = os.path.relpath(f, src_path)
+		if source_relative_path == '.':
+			dests = dest_paths
+		else:
+			dests = [os.path.join(dest_path, source_relative_path) for dest_path in dest_paths]
+		size , cpTime , rtnSymLinks = copy_file(f, dests, full_hash, verbose,concurrent_processes)
 		total_size += size
 		total_time += cpTime
 		symLinks.update(rtnSymLinks)
@@ -1841,6 +1860,98 @@ def copy_file_list_parallel(file_list, links, src_path, dest_paths, max_workers,
 	print(f"Average bandwidth:      {format_bytes(apb.size_counter / (endTime-start_time) * 8,use_1024_bytes=False)}bps")
 	return apb.item_counter, apb.size_counter , symLinks ,file_list
 
+def get_copy_file_job_iter(jobs):
+	for src_path, dest_paths, file_list in jobs:
+		for f in file_list:
+			yield (src_path, dest_paths, f)
+
+def copy_file_list_parallel_batch(jobs, max_workers, full_hash=False, verbose=False, files_per_job=1,total_item_count=0,total_size_count=0):
+	global FILES_RATE_LIMIT
+	global BYTES_RATE_LIMIT
+	if FILES_RATE_LIMIT or BYTES_RATE_LIMIT:
+		max_scheduled_jobs = max_workers
+	else:
+		max_scheduled_jobs = max_workers * 1.1
+	symLinks = {}
+	# src_path, dest_paths, file_list
+	job_list_iterator = get_copy_file_job_iter(jobs)
+	start_time = time.perf_counter()
+	lastRefreshTime = start_time
+	futures = {}
+	files_per_job = max(1,files_per_job)
+
+	print(f"Processing {total_item_count} files with {max_workers} workers")
+	apb = Adaptive_Progress_Bar(total_count=total_item_count,total_size=total_size_count,last_num_job_for_stats=max(1,max_workers//10),process_word='Copied',use_print_thread = True,suppress_all_output=verbose,bytes_rate_limit=BYTES_RATE_LIMIT,files_rate_limit=FILES_RATE_LIMIT)
+	with ProcessPoolExecutor(max_workers=max_workers) as executor:
+		while job_list_iterator or futures:
+			# counter = 0
+			while job_list_iterator and len(futures) < max_scheduled_jobs and time.perf_counter() - lastRefreshTime < 1 and apb.under_rate_limit():
+				current_jobs = []
+				try:
+					# generate some noise from 0.9 to 1.1 to apply to the files per job to attempt spreading out the job scheduling
+					noise = random.uniform(0.9, 1.1)
+					for _ in range(max(1,round(files_per_job * noise))):
+						job = next(job_list_iterator)
+						current_jobs.append(job)
+					future = executor.submit(copy_files_bulk_batch, current_jobs, full_hash, verbose,len(futures))
+					futures[future] = current_jobs
+					# counter += 1
+				except StopIteration:
+					if current_jobs:
+						future = executor.submit(copy_files_bulk_batch, current_jobs, full_hash, verbose,len(futures))
+						futures[future] = current_jobs
+					job_list_iterator = None
+
+			done, _ = concurrent.futures.wait(futures.keys(), return_when=concurrent.futures.FIRST_COMPLETED,timeout=1)
+
+			#print('\n',len(done) ,'\t', len(futures))
+			if job_list_iterator and len(done) > 1 and len(done) / len(futures) > 0.1:
+				if verbose:
+					print(f'\nTransfer is fast, doubling files per job to {files_per_job * 2}')
+				files_per_job *= 2
+
+			current_iteration_total_run_time = 0
+			for future in done:
+				current_jobs = futures.pop(future)
+				copied_file_count_this_run = len(current_jobs)
+				#try:
+				cpSize, cpTime, rtnSymLinks = future.result()
+				current_iteration_total_run_time += cpTime
+				apb.update(num_files=copied_file_count_this_run,cpSize=cpSize,cpTime=cpTime,files_per_job=files_per_job)
+				symLinks.update(rtnSymLinks)
+			apb.scheduled_jobs = len(futures)
+			if done:
+				if verbose:
+						print(f'\nAverage cptime is {current_iteration_total_run_time / len(done):0.2f} for {len(done)} jobs with {copied_file_count_this_run} files each')
+				if job_list_iterator and copied_file_count_this_run == files_per_job and time.perf_counter() - lastRefreshTime > 1:
+					files_per_job //= MAGIC_NUMBER
+					files_per_job = round(files_per_job)
+					if verbose:
+						print(f'\nCompletion time is long, changing files per job to {files_per_job}')
+				#elif file_list_iterator and copied_file_count_this_run == files_per_job and current_iteration_total_run_time / len(done) < 1:
+				elif job_list_iterator and copied_file_count_this_run == files_per_job and time.perf_counter() - lastRefreshTime < 0.1:
+					files_per_job *= MAGIC_NUMBER
+					files_per_job = round(files_per_job)
+					if verbose:
+						print(f'\nCompletion time is short, changing files per job to {files_per_job}')
+				if files_per_job < 1:
+					files_per_job = 1
+			else:
+				if not apb.under_rate_limit():
+					if verbose:
+						print(f'\nWe had hit the rate limit, changing files per job to 1')
+					files_per_job = 1
+				time.sleep(apb.refresh_interval)
+				apb.print_progress()
+			lastRefreshTime = time.perf_counter()
+	endTime = time.perf_counter()
+	apb.stop()
+	print(f"\nTime taken:             {endTime-start_time:0.4f} seconds")
+	print(f"Average speed:          {format_bytes(apb.size_counter / (endTime-start_time))}B/s")
+	print(f"                        {apb.item_counter / (endTime-start_time):.2f} file/s")
+	print(f"Average bandwidth:      {format_bytes(apb.size_counter / (endTime-start_time) * 8,use_1024_bytes=False)}bps")
+	return apb.item_counter, apb.size_counter , symLinks 
+
 def copy_files_parallel(src_path, dest_paths, max_workers, full_hash=False, verbose=False,files_per_job=1,parallel_file_listing=False,exclude=None):
 	# skip if src path or dest path is longer than 4096 characters
 	if len(src_path) > 4096:
@@ -1876,6 +1987,55 @@ def copy_files_parallel(src_path, dest_paths, max_workers, full_hash=False, verb
 	print(f"Number of folders: {len(folders)}")
 	print(f"Estimated size: {format_bytes(init_size)}B")
 	return copy_file_list_parallel(file_list=file_list,links=links,src_path=src_path, dest_paths=dest_paths, max_workers=max_workers, full_hash=full_hash, verbose=verbose,files_per_job=files_per_job,estimated_size = init_size)
+
+def copy_files_parallel_batch(jobs, max_workers, full_hash=False, verbose=False,files_per_job=1,parallel_file_listing=False,exclude=None):
+	newJobs = []
+	total_symLinks = {}
+	total_files = []
+	copied_count = 0
+	copied_size = 0
+	total_item_count = 0
+	total_size_count = 0
+	total_link_count = 0
+	total_folder_count = 0
+	for src_path, dest_paths in jobs:
+		# skip if src path or dest path is longer than 4096 characters
+		if len(src_path) > 4096:
+			print(f'Skipping: {src_path} is too long')
+			continue
+		newDests = []
+		for dest in dest_paths:
+			if len(dest) > 4096:
+				print(f'\nSkipped {dest} because path is too long')
+			else:
+				newDests.append(dest)
+		dest_paths = newDests
+		if not dest_paths:
+			print(f'\nSkipped {src_path} because all destination paths are too long')
+			continue
+		if exclude and is_excluded(src_path,exclude):
+			continue
+		if parallel_file_listing:
+			file_list , links,init_size,folders  = get_file_list_parallel(src_path, max_workers,exclude=exclude)
+		else:
+			file_list,links,init_size,folders = get_file_list_serial(src_path,exclude=exclude)
+		newJobs.append((src_path, dest_paths, file_list))
+		total_item_count += len(file_list)
+		total_size_count += init_size
+		total_link_count += len(links)
+		total_folder_count += len(folders)
+		total_files.extend(file_list)
+		for link in links:
+			srcRelativePath = os.path.relpath(link, src_path)
+			total_symLinks[link] = [os.path.join(dest_path,srcRelativePath) for dest_path in dest_paths]
+
+	print(f"Number of files: {total_item_count}")
+	print(f"Number of links: {total_link_count}")
+	print(f"Number of folders: {total_folder_count}")
+	print(f"Estimated size: {format_bytes(total_size_count)}B")
+	item_counter, size_counter , symLinks =  copy_file_list_parallel_batch(newJobs, max_workers=max_workers, full_hash=full_hash, verbose=verbose,files_per_job=files_per_job,total_item_count=total_item_count,total_size_count=total_size_count)
+	total_symLinks.update(symLinks)
+	return total_item_count + item_counter, total_size_count + size_counter , total_symLinks ,frozenset(total_files)
 
 def copy_files_serial(src_path, dest_paths, full_hash=False, verbose=False,exclude=None):
 	# skip if src path or dest path is longer than 4096 characters
@@ -1925,6 +2085,141 @@ def copy_files_serial(src_path, dest_paths, full_hash=False, verbose=False,exclu
 	print(f"Average bandwidth:      {format_bytes(apb.size_counter / (endTime-start_time) * 8,use_1024_bytes=False)}bps")
 	return apb.item_counter, apb.size_counter , symLinks , frozenset(file_list)
 
+def copy_files_serial_batch(jobs, full_hash=False, verbose=False,exclude=None):
+	# skip if src path or dest path is longer than 4096 characters
+	global FILES_RATE_LIMIT
+	global BYTES_RATE_LIMIT
+	newJobs = []
+	total_symLinks = {}
+	total_files = []
+	copied_count = 0
+	copied_size = 0
+	total_item_count = 0
+	total_size_count = 0
+	for src_path, dest_paths in jobs:
+		if len(src_path) > 4096:
+			print(f'Skipping: {src_path} is too long')
+			continue
+		newDests = []
+		for dest in dest_paths:
+			if len(dest) > 4096:
+				print(f'\nSkipped {dest} because path is too long')
+			else:
+				newDests.append(dest)
+		dest_paths = newDests
+		if not dest_paths:
+			print(f'\nSkipped {src_path} because all destination paths are too long')
+			continue
+		if exclude and is_excluded(src_path,exclude):
+			continue
+		if not os.path.isdir(src_path):
+			src_size, _ , symLinks = copy_file(src_path, dest_paths,full_hash=full_hash, verbose=verbose)
+			#return 1, src_size , symLinks , frozenset([src_path])
+			copied_count += 1
+			copied_size += src_size
+			total_item_count += 1
+			total_size_count += src_size
+			total_symLinks.update(symLinks)
+			total_files.append(src_path)
+			continue
+		print(f'Getting file list for {src_path}')
+		file_list,links,init_size,_ = get_file_list_serial(src_path,exclude=exclude)
+		newJobs.append((src_path, dest_paths, file_list, set(links), init_size))
+		total_item_count += len(file_list)
+		total_size_count += init_size
+		total_files.extend(file_list)
+	print(f"Number of files: {total_item_count}")
+	print(f"Estimated size: {format_bytes(total_size_count)}B")
+	if total_item_count == 0:
+		return 0, 0, set(), frozenset()
+	start_time = time.perf_counter()
+	apb = Adaptive_Progress_Bar(total_count=total_item_count,total_size=total_size_count,last_num_job_for_stats=1,process_word='Copied',suppress_all_output=verbose,bytes_rate_limit=BYTES_RATE_LIMIT,files_rate_limit=FILES_RATE_LIMIT)
+	apb.item_counter = copied_count
+	apb.size_counter = copied_size
+	for src_path, dest_paths, file_list, links, init_size in newJobs:
+		for file in file_list:
+			srcRelativePath = os.path.relpath(file, src_path)
+			size, cpTime ,rtnSymLinks = copy_file(file, [os.path.join(dest_path, srcRelativePath) for dest_path in dest_paths],full_hash = full_hash, verbose=verbose)
+			#update_progress_bar(copy_counter, copy_size_counter, total_files, start_time)
+			apb.update(num_files=1,cpSize=size,cpTime=cpTime,files_per_job=1)
+			links.update(rtnSymLinks)
+			apb.rate_limit()
+		
+		for link in links:
+			srcRelativePath = os.path.relpath(link, src_path)
+			total_symLinks[link] = [os.path.join(dest_path, srcRelativePath) for dest_path in dest_paths]
+	endTime = time.perf_counter()
+	apb.stop()
+	print(f"\nTime taken:             {endTime-start_time:0.4f} seconds")
+	print(f"Average speed:          {format_bytes(apb.size_counter / (endTime-start_time))}B/s")
+	print(f"                        {apb.item_counter / (endTime-start_time):.2f} file/s")
+	print(f"Average bandwidth:      {format_bytes(apb.size_counter / (endTime-start_time) * 8,use_1024_bytes=False)}bps")
+	return apb.item_counter, apb.size_counter , total_symLinks , frozenset(total_files)
+
+class copy_scheduler:
+	def __init__(self, max_workers = 4 * multiprocessing.cpu_count(), full_hash=False, verbose=False,files_per_job=1,parallel_file_listing=False,exclude=None):
+		self.max_workers = max_workers
+		self.full_hash = full_hash
+		self.verbose = verbose	
+		self.files_per_job = files_per_job
+		self.parallel_file_listing = parallel_file_listing
+		self.exclude = exclude
+		self.dir_sync_job = []
+		self.copy_job = []
+		#copy_counter, copy_size_counter , rtnSymLinks , file_list 
+		self.copy_counter = 0
+		self.copy_size_counter = 0
+		self.total_sym_links = {}
+		self.total_file_list = []
+	def add_dir_sync(self, src, dests):
+		self.dir_sync_job.append((src, dests))
+	def add_copy(self, src, dests):
+		self.copy_job.append((src, dests))
+	def process(self):
+		if self.dir_sync_job:
+			start_time = time.perf_counter()
+			if self.max_workers == 1:
+				self.total_sym_links.update(sync_directories_serial_batch(self.dir_sync_job,exclude=self.exclude))
+			else:
+				self.total_sym_links.update(sync_directories_parallel_batch(self.dir_sync_job, max_workers=self.max_workers,verbose=self.verbose,exclude=self.exclude))
+			endTime = time.perf_counter()
+			print(f"\nTime taken to sync directory: {endTime-start_time:0.4f} seconds")
+			self.dir_sync_job = []
+		if self.copy_job:
+			global HASH_SIZE
+			if HASH_SIZE == 0:
+				print("Using file attributes only for skipping")
+			elif xxhash_available:
+				print("Using xxhash for skipping")
+			else:
+				print("Using blake2b for skipping")
+			if self.max_workers == 1:
+				copy_counter, copy_size_counter , rtnSymLinks , file_list = copy_files_serial_batch(self.copy_job, full_hash = self.full_hash,verbose=self.verbose,exclude=self.exclude)
+				#total_file_list.update(trim_paths(file_list,src))
+				#self.total_file_list.update(trim_paths(rtnSymLinks.keys(),src))
+			else:
+				copy_counter, copy_size_counter , rtnSymLinks , file_list = copy_files_parallel_batch(self.copy_job, max_workers=self.max_workers,full_hash = self.full_hash,verbose=self.verbose,files_per_job=self.files_per_job,parallel_file_listing=self.parallel_file_listing,exclude=self.exclude)
+				#total_file_list.update(trim_paths(file_list,src))
+				#self.total_file_list.update(trim_paths(rtnSymLinks.keys(),src))
+			print(f'Total files copied:     {copy_counter}')
+			print(f'Total size copied:      {format_bytes(copy_size_counter)}B')
+			print(f'Total files discovered: {len(self.total_file_list)}')
+			self.copy_counter += copy_counter
+			self.copy_size_counter += copy_size_counter
+			self.total_sym_links.update(rtnSymLinks)
+			self.total_file_list.extend(file_list)
+			self.copy_job = []
+		return self.total_file_list, self.total_sym_links
+	def clear(self,clear_pending_jobs=False):
+		self.copy_counter = 0
+		self.copy_size_counter = 0
+		self.total_sym_links = {}
+		self.total_file_list = []
+		if clear_pending_jobs:
+			self.dir_sync_job = []
+			self.copy_job = []
+
+
 #%% ---- Copy Directories ----
 def sync_directory_metadata(src_path, dest_paths):
 	# skip if src path or dest path is longer than 4096 characters
@@ -1969,6 +2264,19 @@ def sync_directory_metadata_bulk(src_paths, dest_paths,src_path):
 		source_relative_path = os.path.relpath(src, src_path)
 		dests = [os.path.join(dest_path, source_relative_path) for dest_path in dest_paths]
 		count , cpTime , rtnSymLinks = sync_directory_metadata(src, dests)
+		total_count += count
+		total_time += cpTime
+		symLinks.update(rtnSymLinks)
+	return total_count , total_time, symLinks
+
+def sync_directory_metadata_bulk_batch(jobs):
+	total_count = 0
+	total_time = 0
+	symLinks = {}
+	for (src_path,folder,dest_paths) in jobs:
+		source_relative_path = os.path.relpath(folder, src_path)
+		dests = [os.path.join(dest_path, source_relative_path) for dest_path in dest_paths]
+		count , cpTime , rtnSymLinks = sync_directory_metadata(folder, dests)
 		total_count += count
 		total_time += cpTime
 		symLinks.update(rtnSymLinks)
@@ -2077,6 +2385,110 @@ def sync_directories_parallel(src, dests, max_workers, verbose=False,folder_per_
 	print(f"Average bandwidth:      {format_bytes(apb.size_counter / (endTime-start_time) * 8,use_1024_bytes=False)}bps")
 	return symLinks
 
+def sync_directories_parallel_batch(jobs, max_workers, verbose=False,folder_per_job=64,exclude=None):
+	global FILES_RATE_LIMIT
+	global BYTES_RATE_LIMIT
+	symLinks = {}
+	allFolderToSync = []
+	for src, dests in jobs:
+		# skip if src path or dest path is longer than 4096 characters
+		if len(src) > 4096:
+			print(f'Skipping: {src} is too long')
+			continue
+		newDests = []
+		for d in dests:
+			if len(d) > 4096:
+				print(f'\nSkipped {d} because path is too long')
+			else:
+				newDests.append(d)
+		dests = newDests
+		if not dests:
+			print(f'\nSkipped {src} because all destination paths are too long')
+			continue
+		if exclude and is_excluded(src,exclude):
+			continue
+		if not os.path.isdir(src):
+			_, _ , sl = copy_file(src, dests)
+			symLinks.update(sl)
+			continue
+		sync_directory_metadata(src, dests)
+		print(f'Getting file list for {src}')
+		_,_,_,folders = get_file_list_serial(src,exclude=exclude)
+		allFolderToSync.extend([(src,folder,dests) for folder in folders])
+	if not allFolderToSync:
+		return symLinks
+	print(f"Syncing Dir for {len(allFolderToSync)} folders with {max_workers} workers")
+	apb = Adaptive_Progress_Bar(total_count=len(allFolderToSync),total_size=len(allFolderToSync),use_print_thread = True,suppress_all_output=verbose,process_word='Synced',bytes_rate_limit=BYTES_RATE_LIMIT,files_rate_limit=FILES_RATE_LIMIT)
+	job_iterator = iter(allFolderToSync)
+	futures = {}
+	start_time = time.perf_counter()
+	last_refresh_time = start_time
+	max_workers = max(2,int(max_workers / 4))
+	folder_per_job = max(1,folder_per_job)
+	num_folders_copied_this_job = 0
+	
+	with ProcessPoolExecutor(max_workers=max_workers) as executor:
+		while job_iterator or futures:
+			while job_iterator and len(futures) <  max_workers and last_refresh_time - time.perf_counter() < 5 and apb.under_rate_limit():
+				currentJobs = []
+				try:
+					for _ in range(folder_per_job):
+						currentJobs.append(next(job_iterator))
+					future = executor.submit(sync_directory_metadata_bulk_batch, currentJobs)
+					futures[future] = currentJobs
+				except StopIteration:
+					if currentJobs:
+						future = executor.submit(sync_directory_metadata_bulk_batch, currentJobs)
+						futures[future] = currentJobs
+					job_iterator = None
+
+			done, _ = concurrent.futures.wait(futures.keys(), return_when=concurrent.futures.FIRST_COMPLETED,timeout=1)
+			time_spent_this_iter = 0
+			for future in done:
+				currentJobs = futures.pop(future)
+				num_folders_copied_this_job = len(currentJobs)
+				#try:
+				cpSize, cpTime, rtnSymLinks = future.result()
+				time_spent_this_iter += cpTime
+				#except Exception as exc:
+					#print(f'\n{future} generated an exception: {exc}')
+				#else:
+				apb.update(num_files=num_folders_copied_this_job, cpSize=cpSize, cpTime=cpTime , files_per_job=folder_per_job)
+				symLinks.update(rtnSymLinks)
+			apb.scheduled_jobs = len(futures)
+			if done:
+				if verbose:
+						print(f'\nAverage cptime is {time_spent_this_iter / len(done):0.2f} for {len(done)} jobs with {num_folders_copied_this_job} folders each')
+				if job_iterator and num_folders_copied_this_job == folder_per_job and (time_spent_this_iter / len(done) > 5 or time.perf_counter() - last_refresh_time > 5):
+					folder_per_job //= MAGIC_NUMBER
+					folder_per_job = round(folder_per_job)
+					if verbose:
+						print(f'\nCompletion time is long, changing folders per job to {folder_per_job}')
+				elif job_iterator and num_folders_copied_this_job == folder_per_job and time_spent_this_iter / len(done) < 1:
+					folder_per_job *= MAGIC_NUMBER
+					folder_per_job = round(folder_per_job)
+					if verbose:
+						print(f'\nCompletion time is short, changing folders per job to {folder_per_job}')
+				if folder_per_job < 1:
+					folder_per_job = 1
+			else:
+				if not apb.under_rate_limit():
+					if verbose:
+						print(f'\nWe had hit the rate limit, changing folder per job to 1')
+					folder_per_job = 1
+				time.sleep(apb.refresh_interval)
+				apb.print_progress()
+			apb.rate_limit()
+			last_refresh_time = time.perf_counter()
+
+	endTime = time.perf_counter()
+	apb.stop()
+	print(f"\nTime taken:             {endTime-start_time:0.4f} seconds")
+	print(f"Average speed:          {format_bytes(apb.size_counter / (endTime-start_time))}B/s")
+	print(f"                        {apb.item_counter / (endTime-start_time):.2f} folder/s")
+	print(f"Average bandwidth:      {format_bytes(apb.size_counter / (endTime-start_time) * 8,use_1024_bytes=False)}bps")
+	return symLinks
+
 def sync_directories_serial(src, dests,exclude=None):
 	"""
 	Synchronizes directories from source to destination in a single thread.
@@ -2132,6 +2544,53 @@ def sync_directories_serial(src, dests,exclude=None):
 		apb.rate_limit()
 	apb.stop()
 	return symLinks
+
+def sync_directories_serial_batch(jobs,exclude=None):
+	global FILES_RATE_LIMIT
+	global BYTES_RATE_LIMIT
+	newJobs = []
+	# skip if src path or dest path is longer than 4096 characters
+	symLinks = {}
+	totalFolderCount = 0
+	srcFolders = []
+	for src,dests in jobs:
+		if len(src) > 4096:
+			print(f'Skipping: {src} is too long')
+			continue
+		newDests = []
+		for d in dests:
+			if len(d) > 4096:
+				print(f'\nSkipped {d} because path is too long')
+			else:
+				newDests.append(d)
+		dests = newDests
+		if not dests:
+			print(f'\nSkipped {src} because all destination paths are too long')
+			continue
+		if exclude and is_excluded(src,exclude):
+			continue
+		if not os.path.isdir(src):
+			_, _ , sls = copy_file(src, dests)
+			symLinks.update(sls)
+			continue
+		newJobs.append((src,dests))
+		print(f'Getting file list for {src}')
+		_,_,_,folders = get_file_list_serial(src,exclude=exclude)
+		srcFolders.append(folders)
+		totalFolderCount += len(folders)
+	if totalFolderCount == 0:
+		return symLinks
+	print(f"Syncing Dir from {len(newJobs)} in single thread")
+	apb = Adaptive_Progress_Bar(total_count=totalFolderCount,total_size=totalFolderCount,process_word='Synced',bytes_rate_limit=BYTES_RATE_LIMIT,files_rate_limit=FILES_RATE_LIMIT)
+	for (src, dests), folders in zip(newJobs, srcFolders):
+		for folder in folders:
+			source_relative_path = os.path.relpath(folder, src)
+			count , cpTime , _ = sync_directory_metadata(folder, [os.path.join(dest, source_relative_path) for dest in dests])
+			apb.update(num_files=1, cpSize=count, cpTime=cpTime , files_per_job=1)
+			apb.rate_limit()
+	apb.stop()
+	return symLinks
+
 #%% ---- Compare Files ----
 def compare_file_list(file_list, file_list2,diff_file_list=None,tar_diff_file_list = False):
 	print('-'*80)
@@ -2726,8 +3185,11 @@ def process_copy(src_paths: list, dests:list = [], single_thread = False, max_wo
 	total_sym_links = {}
 	taskCtr = 0
 	argDest = dests.copy()
+	if batch:
+		print(f"Copying from {src_paths} to {dests}")
+	max_workers = max_workers if not single_thread else 1
+	cs = copy_scheduler(max_workers=max_workers,full_hash=full_hash,verbose=verbose,files_per_job=files_per_job,parallel_file_listing=parallel_file_listing,exclude=exclude)
 	for src in src_paths:
-		print('-'*80)
 		taskCtr += 1
 		dests = argDest.copy()
 		if dest_image:
@@ -2758,8 +3220,9 @@ def process_copy(src_paths: list, dests:list = [], single_thread = False, max_wo
 					dest += os.path.sep
 				newDests.append(os.path.abspath(dest))
 			dests = newDests
-		print('-'*80)
-		print(f"Task {taskCtr} of {len(src_paths)}, copying from {src} to {dests}")
+		if not batch:
+			print('-'*80)
+			print(f"Task {taskCtr} of {len(src_paths)}, copying from {src} to {dests}")
 		# verify dest is writable
 		for dest in dests:
 			if not os.access(os.path.dirname(os.path.abspath(dest)), os.W_OK):
@@ -2769,40 +3232,31 @@ def process_copy(src_paths: list, dests:list = [], single_thread = False, max_wo
 			total_sym_links[src] = dests
 			print(f"{src} is a symlink, creating symlink in dests")
 			continue
-		if os.path.isfile(src):
-			print("Copying single file")
-			copy_file(src, dests,full_hash=full_hash,verbose=verbose)
-			continue
-		src += os.path.sep
-		if no_directory_sync:
-			print("Skipping directory sync")
-			sync_directory_metadata(src, dests)
-		else:
-			start_time = time.perf_counter()
-			if single_thread:
-				total_sym_links.update(sync_directories_serial(src, dests,exclude=exclude))
+		# if os.path.isfile(src):
+		# 	print("Copying single file")
+		# 	copy_file(src, dests,full_hash=full_hash,verbose=verbose)
+		# 	continue
+		if os.path.isdir(src):
+			src += os.path.sep
+			if no_directory_sync:
+				print("Skipping directory sync")
+				sync_directory_metadata(src, dests)
 			else:
-				total_sym_links.update(sync_directories_parallel(src, dests, max_workers,verbose=verbose,exclude=exclude))
-			endTime = time.perf_counter()
-			print(f"\nTime taken to sync directory: {endTime-start_time:0.4f} seconds")
+				cs.add_dir_sync(src, dests)
 		if not directory_only:
-			global HASH_SIZE
-			if HASH_SIZE == 0:
-				print("Using file attributes only for skipping")
-			elif xxhash_available:
-				print("Using xxhash for skipping")
-			else:
-				print("Using blake2b for skipping")
-			if single_thread:
-				copy_counter, copy_size_counter , rtnSymLinks , file_list = copy_files_serial(src, dests, full_hash = full_hash,verbose=verbose,exclude=exclude)
-			else:
-				copy_counter, copy_size_counter , rtnSymLinks , file_list = copy_files_parallel(src, dests, max_workers,full_hash = full_hash,verbose=verbose,files_per_job=files_per_job,parallel_file_listing=parallel_file_listing,exclude=exclude)
-			total_file_list.update(trim_paths(file_list,src))
-			print(f'Total files copied:     {copy_counter}')
-			print(f'Total size copied:      {format_bytes(copy_size_counter)}B')
-			print(f'Total files discovered: {len(total_file_list)}')
-			total_sym_links.update(rtnSymLinks)
-			total_file_list.update(trim_paths(rtnSymLinks.keys(),src))
+			cs.add_copy(src, dests)
+		if not batch:
+			fl, sl = cs.process()
+			total_file_list.update(fl)
+			total_sym_links.update(sl)
+			cs.clear()
+			print('-'*80)
+	if batch:
+		fl, sl = cs.process()
+		total_file_list.update(fl)
+		total_sym_links.update(sl)
+		cs.clear()
+		print(f"Processed {len(total_file_list)} files and {len(total_sym_links)} symlinks in total")
 		print('-'*80)
 	return total_file_list, total_sym_links
 
@@ -2906,7 +3360,9 @@ def get_args(args = None):
 								  epilog=f'Found bins: {list(_binPaths.values())}\n Missing bins: {_binCalled - set(_binPaths.keys())}')
 	parser.add_argument('-s', '--single_thread', action='store_true', help='Use serial processing')
 	parser.add_argument('-j','-m','-t','--max_workers', type=int, default=4 * multiprocessing.cpu_count(), help='Max workers for parallel processing. Default is 4 * CPU count. Use negative numbers to indicate {n} * CPU count, 0 means 1/2 CPU count.')
-	parser.add_argument('-b','--batch',action='store_true', help='Batch mode, process all files in one go')
+	batch_group = parser.add_mutually_exclusive_group()
+	batch_group.add_argument('-b','--batch',action='store_true', help='Batch mode, process all files in one go',default=True)
+	batch_group.add_argument('-nb','--no_batch','--sequential',action='store_false', dest='batch', help='Do not use batch mode', default=False)
 	parser.add_argument('-v', '--verbose', action='store_true', help='Verbose output')
 	parser.add_argument('-do', '--directory_only', action='store_true', help='Only copy directory structure')
 	parser.add_argument('-nds', '--no_directory_sync', action='store_true', help='Do not sync directory metadata, useful for verfication')
