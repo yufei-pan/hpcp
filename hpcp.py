@@ -32,12 +32,17 @@ try:
 	import multiCMD
 	assert float(multiCMD.version) > 1.19
 except:
+#!/usr/bin/env python3
 	import time,threading,io,argparse,sys,subprocess,select,os,string,re,itertools,signal
 	class multiCMD:
-		version='1.33_min'
+		version='1.34_min_hpcp'
 		__version__=version
+		COMMIT_DATE='2025-08-25'
 		__running_threads=set()
 		__variables={}
+		_BRACKET_RX=re.compile('\\[([^\\]]+)\\]')
+		_ALPHANUM=string.digits+string.ascii_letters
+		_ALPHA_IDX={B:A for(A,B)in enumerate(_ALPHANUM)}
 		class Task:
 			def __init__(A,command):A.command=command;A.returncode=None;A.stdout=[];A.stderr=[];A.thread=None;A.stop=False
 			def __iter__(A):return zip(['command','returncode','stdout','stderr'],[A.command,A.returncode,A.stdout,A.stderr])
@@ -46,56 +51,6 @@ except:
 			def is_alive(A):
 				if A.thread is not None:return A.thread.is_alive()
 				return False
-		class AsyncExecutor:
-			def __init__(A,max_threads=1,semaphore=...,timeout=0,quiet=True,dry_run=False,parse=False):
-				C=max_threads;B=semaphore;A.max_threads=C
-				if B is...:B=threading.Semaphore(C)
-				A.semaphore=B;A.runningThreads=[];A.tasks=[];A.timeout=timeout;A.quiet=quiet;A.dry_run=dry_run;A.parse=parse;A.__lastNotJoined=0
-			def __iter__(A):return iter(A.tasks)
-			def __repr__(A):return f"AsyncExecutor(max_threads={A.max_threads}, semaphore={A.semaphore}, runningThreads={A.runningThreads}, tasks={A.tasks}, timeout={A.timeout}, quiet={A.quiet}, dry_run={A.dry_run}, parse={A.parse})"
-			def __str__(A):return str(A.tasks)
-			def __len__(A):return len(A.tasks)
-			def __bool__(A):return bool(A.tasks)
-			def run_commands(A,commands,timeout=...,max_threads=...,quiet=...,dry_run=...,parse=...,sem=...):
-				G=sem;F=parse;E=dry_run;D=quiet;C=max_threads;B=timeout
-				if B is...:B=A.timeout
-				if C is...:C=A.max_threads
-				if D is...:D=A.quiet
-				if E is...:E=A.dry_run
-				if F is...:F=A.parse
-				if G is...:G=A.semaphore
-				if len(A.runningThreads)>130000:
-					A.wait(timeout=0)
-					if len(A.runningThreads)>130000:
-						print('The amount of running threads approching cpython limit of 130704. Waiting until some available.')
-						while len(A.runningThreads)>120000:A.wait(timeout=1)
-				elif len(A.runningThreads)+A.__lastNotJoined>1000:A.wait(timeout=0);A.__lastNotJoined=len(A.runningThreads)
-				H=multiCMD.run_commands(commands,timeout=B,max_threads=C,quiet=D,dry_run=E,with_stdErr=False,return_code_only=False,return_object=True,parse=F,wait_for_return=False,sem=G);A.tasks.extend(H);A.runningThreads.extend([A.thread for A in H]);return H
-			def run_command(A,command,timeout=...,max_threads=...,quiet=...,dry_run=...,parse=...,sem=...):return A.run_commands([command],timeout=timeout,max_threads=max_threads,quiet=quiet,dry_run=dry_run,parse=parse,sem=sem)[0]
-			def wait(A,timeout=...,threads=...):
-				C=threads;B=timeout
-				if C is...:C=A.runningThreads
-				if B is...:B=A.timeout
-				for D in C:
-					if B>=0:D.join(timeout=B)
-					else:D.join()
-				A.runningThreads=[A for A in A.runningThreads if A.is_alive()];return A.runningThreads
-			def stop(A,timeout=...):
-				for B in A.tasks:B.stop=True
-				A.wait(timeout);return A.tasks
-			def cleanup(A,timeout=...):A.stop(timeout);A.tasks=[];A.runningThreads=[];return A.tasks
-			def join(B,timeout=...,threads=...,print_error=True):
-				B.wait(timeout=timeout,threads=threads)
-				for A in B.tasks:
-					if A.returncode!=0 and print_error:print(f"Command: {A.command} failed with return code: {A.returncode}");print('Stdout:');print('\n  '.join(A.stdout));print('Stderr:');print('\n  '.join(A.stderr))
-				return B.tasks
-			def get_results(A,with_stdErr=False):
-				if with_stdErr:return[A.stdout+A.stderr for A in A.tasks]
-				else:return[A.stdout for A in A.tasks]
-			def get_return_codes(A):return[A.returncode for A in A.tasks]
-		_BRACKET_RX=re.compile('\\[([^\\]]+)\\]')
-		_ALPHANUM=string.digits+string.ascii_letters
-		_ALPHA_IDX={B:A for(A,B)in enumerate(_ALPHANUM)}
 		def _expand_piece(piece,vars_):
 			D=vars_;C=piece;C=C.strip()
 			if':'in C:E,F,G=C.partition(':');D[E]=G;return
@@ -116,34 +71,6 @@ except:
 					if F:E.extend(F)
 				A.append(E or['']);B=C.end()
 			A.append([D[B:]]);return[''.join(A)for A in itertools.product(*A)]
-		def _expand_ranges(inStr):
-			global __variables;E=[inStr];G=[];I=string.digits+string.ascii_letters
-			while len(E)>0:
-				C=E.pop();F=re.search('\\[(.*?)]',C)
-				if not F:G.append(C);continue
-				J=F.group(1);K=J.split(',')
-				for D in K:
-					D=D.strip()
-					if':'in D:L,M,D=D.partition(':');__variables[L]=D;E.append(C.replace(F.group(0),'',1))
-					elif'-'in D:
-						try:A,M,B=D.partition('-')
-						except ValueError:G.append(C);continue
-						A=A.strip()
-						if A in __variables:A=__variables[A]
-						B=B.strip()
-						if B in __variables:B=__variables[B]
-						if A.isdigit()and B.isdigit():
-							N=min(len(A),len(B));O='{:0'+str(N)+'d}'
-							for H in range(int(A),int(B)+1):P=O.format(H);E.append(C.replace(F.group(0),P,1))
-						elif all(A in string.hexdigits for A in A+B):
-							for H in range(int(A,16),int(B,16)+1):E.append(C.replace(F.group(0),format(H,'x'),1))
-						else:
-							try:
-								Q=I.index(A);R=I.index(B)
-								for H in range(Q,R+1):E.append(C.replace(F.group(0),I[H],1))
-							except ValueError:G.append(C)
-					else:E.append(C.replace(F.group(0),D,1))
-			G.reverse();return G
 		def __handle_stream(stream,target,pre='',post='',quiet=False):
 			E=quiet;C=target
 			def D(current_line,target,keepLastLine=True):
@@ -196,18 +123,6 @@ except:
 				if not E:print(C+'\n'+'-'*100+D);print(C+f"Process exited with return code {A.returncode}"+D)
 				if with_stdErr:return A.stdout+A.stderr
 				else:return A.stdout
-		def ping(hosts,timeout=1,max_threads=0,quiet=True,dry_run=False,with_stdErr=False,return_code_only=False,return_object=False,wait_for_return=True,return_true_false=True):
-			E=return_true_false;D=return_code_only;B=hosts;C=False
-			if isinstance(B,str):F=[f"ping -c 1 {B}"];C=True
-			else:F=[f"ping -c 1 {A}"for A in B]
-			if E:D=True
-			A=multiCMD.run_commands(F,timeout=timeout,max_threads=max_threads,quiet=quiet,dry_run=dry_run,with_stdErr=with_stdErr,return_code_only=D,return_object=return_object,wait_for_return=wait_for_return)
-			if E:
-				if C:return not A[0]
-				else:return[not A for A in A]
-			elif C:return A[0]
-			else:return A
-		def run_command(command,timeout=0,max_threads=1,quiet=False,dry_run=False,with_stdErr=False,return_code_only=False,return_object=False,wait_for_return=True,sem=None):return multiCMD.run_commands(commands=[command],timeout=timeout,max_threads=max_threads,quiet=quiet,dry_run=dry_run,with_stdErr=with_stdErr,return_code_only=return_code_only,return_object=return_object,parse=False,wait_for_return=wait_for_return,sem=sem)[0]
 		def __format_command(command,expand=False):
 			D=expand;A=command
 			if isinstance(A,str):
@@ -222,6 +137,7 @@ except:
 				if not D:return[C]
 				F=[multiCMD._expand_ranges_fast(A)for A in C];B=list(itertools.product(*F));return[list(A)for A in B]
 			else:return multiCMD.__format_command(str(A),expand=D)
+		def run_command(command,timeout=0,max_threads=1,quiet=False,dry_run=False,with_stdErr=False,return_code_only=False,return_object=False,wait_for_return=True,sem=None):return multiCMD.run_commands(commands=[command],timeout=timeout,max_threads=max_threads,quiet=quiet,dry_run=dry_run,with_stdErr=with_stdErr,return_code_only=return_code_only,return_object=return_object,parse=False,wait_for_return=wait_for_return,sem=sem)[0]
 		def run_commands(commands,timeout=0,max_threads=1,quiet=False,dry_run=False,with_stdErr=False,return_code_only=False,return_object=False,parse=False,wait_for_return=True,sem=None):
 			K=wait_for_return;J=dry_run;I=quiet;H=timeout;C=max_threads;B=sem;E=[]
 			for L in commands:E.extend(multiCMD.__format_command(L,expand=parse))
@@ -233,7 +149,7 @@ except:
 				for(D,G)in zip(F,A):G.thread=D;D.start()
 				if K:
 					for D in F:D.join()
-				else:__running_threads.update(F)
+				else:multiCMD.__running_threads.update(F)
 			else:
 				B=threading.Semaphore(1)
 				for G in A:multiCMD.__run_command(G,B,H,I,J,identity=None)
@@ -241,15 +157,17 @@ except:
 			elif return_object:return A
 			elif with_stdErr:return[A.stdout+A.stderr for A in A]
 			else:return[A.stdout for A in A]
-		def join_threads(threads=__running_threads,timeout=None):
-			A=threads;global __running_threads
-			for B in A:B.join(timeout=timeout)
-			if A is __running_threads:__running_threads={A for A in A if A.is_alive()}
 		def input_with_timeout_and_countdown(timeout,prompt='Please enter your selection'):
 			B=prompt;A=timeout;print(f"{B} [{A}s]: ",end='',flush=True)
 			for C in range(A,0,-1):
 				if sys.stdin in select.select([sys.stdin],[],[],0)[0]:return input().strip()
 				print(f"\r{B} [{C}s]: ",end='',flush=True);time.sleep(1)
+		def get_terminal_size():
+			try:import os;A=os.get_terminal_size()
+			except:
+				try:import fcntl,termios as C,struct as B;D=fcntl.ioctl(0,C.TIOCGWINSZ,B.pack('HHHH',0,0,0,0));A=B.unpack('HHHH',D)[:2]
+				except:import shutil as E;A=E.get_terminal_size(fallback=(120,30))
+			return A
 		def _genrate_progress_bar(iteration,total,prefix='',suffix='',columns=120):
 			G=columns;F=prefix;E=total;C=suffix;B=iteration;J=False;K=False;L=False;M=False
 			if E==0:return f"{F} iteration:{B} {C}".ljust(G)
@@ -276,12 +194,6 @@ total:
 			elif A>=16:D+=f" Calculating... "
 			if not K:D+=C
 			return D
-		def get_terminal_size():
-			try:import os;A=os.get_terminal_size()
-			except:
-				try:import fcntl,termios as C,struct as B;D=fcntl.ioctl(0,C.TIOCGWINSZ,B.pack('HHHH',0,0,0,0));A=B.unpack('HHHH',D)[:2]
-				except:import shutil as E;A=E.get_terminal_size(fallback=(120,30))
-			return A
 		def print_progress_bar(iteration,total,prefix='',suffix=''):
 			D=prefix;C=total;B=iteration;A=suffix;D+=' |'if not D.endswith(' |')else'';A=f"| {A}"if not A.startswith('| ')else A
 			try:
@@ -289,8 +201,6 @@ total:
 				if B==C and C>0:print(file=sys.stdout)
 			except:
 				if B%5==0:print(multiCMD._genrate_progress_bar(B,C,D,A))
-		def main(self):A=argparse.ArgumentParser(description='Run multiple commands in parallel');A.add_argument('commands',metavar='command',type=str,nargs='+',help='commands to run');A.add_argument('-p','--parse',action='store_true',help='Parse ranged input and expand them into multiple commands');A.add_argument('-t','--timeout',metavar='timeout',type=int,default=60,help='timeout for each command');A.add_argument('-m','--max_threads',metavar='max_threads',type=int,default=1,help='maximum number of threads to use');A.add_argument('-q','--quiet',action='store_true',help='quiet mode');A.add_argument('-V','--version',action='version',version=f"%(prog)s {self.version} by pan@zopyr.us");B=A.parse_args();multiCMD.run_commands(B.commands,B.timeout,B.max_threads,B.quiet,parse=B.parse,with_stdErr=True)
-
 try:
 	import xxhash
 	hasher = xxhash.xxh64()
@@ -300,9 +210,9 @@ except ImportError:
 	hasher = hashlib.blake2b()
 	xxhash_available = False
 
-version = '9.28'
+version = '9.29'
 __version__ = version
-COMMIT_DATE = '2025-08-23'
+COMMIT_DATE = '2025-08-25'
 
 MAGIC_NUMBER = 1.61803398875
 RANDOM_DESTINATION_SELECTION = False
