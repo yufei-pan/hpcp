@@ -61,12 +61,12 @@ except:
 				except KeyError:pass
 			return[D.get(C,C)]
 		def _expand_ranges_fast(inStr):
-			D=inStr;global __variables;A=[];B=0
+			D=inStr;A=[];B=0
 			for C in multiCMD._BRACKET_RX.finditer(D):
 				if C.start()>B:A.append([D[B:C.start()]])
 				E=[]
 				for G in C.group(1).split(','):
-					F=multiCMD._expand_piece(G,__variables)
+					F=multiCMD._expand_piece(G,multiCMD.__variables)
 					if F:E.extend(F)
 				A.append(E or['']);B=C.end()
 			A.append([D[B:]]);return[''.join(A)for A in itertools.product(*A)]
@@ -249,7 +249,7 @@ except ImportError:
 	hasher = hashlib.blake2b()
 	xxhash_available = False
 
-version = '9.30'
+version = '9.31'
 __version__ = version
 COMMIT_DATE = '2025-09-10'
 
