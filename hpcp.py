@@ -30,14 +30,13 @@ from collections import deque
 from math import log
 try:
 	import multiCMD
-	assert float(multiCMD.version) > 1.19
+	assert float(multiCMD.version) > 1.35
 except:
-#!/usr/bin/env python3
-	import time,threading,io,argparse,sys,subprocess,select,os,string,re,itertools,signal
+	import time,threading,io,sys,subprocess,select,string,re,itertools,signal
 	class multiCMD:
-		version='1.34_min_hpcp'
+		version='1.35_min_hpcp'
 		__version__=version
-		COMMIT_DATE='2025-08-25'
+		COMMIT_DATE='2025-09-10'
 		__running_threads=set()
 		__variables={}
 		_BRACKET_RX=re.compile('\\[([^\\]]+)\\]')
@@ -201,6 +200,46 @@ total:
 				if B==C and C>0:print(file=sys.stdout)
 			except:
 				if B%5==0:print(multiCMD._genrate_progress_bar(B,C,D,A))
+		def format_bytes(size,use_1024_bytes=None,to_int=False,to_str=False,str_format='.2f'):
+			H=str_format;F=to_str;C=use_1024_bytes;A=size
+			if to_int or isinstance(A,str):
+				if isinstance(A,int):return A
+				elif isinstance(A,str):
+					K=re.match('(\\d+(\\.\\d+)?)\\s*([a-zA-Z]*)',A)
+					if not K:
+						if F:return A
+						print("Invalid size format. Expected format: 'number [unit]', e.g., '1.5 GiB' or '1.5GiB'");print(f"Got: {A}");return 0
+					G,L,D=K.groups();G=float(G);D=D.strip().lower().rstrip('b')
+					if D.endswith('i'):C=True
+					elif C is None:C=False
+					D=D.rstrip('i')
+					if C:B=2**10
+					else:B=10**3
+					I={'':0,'k':1,'m':2,'g':3,'t':4,'p':5,'e':6,'z':7,'y':8}
+					if D not in I:
+						if F:return A
+					else:
+						if F:return multiCMD.format_bytes(size=int(G*B**I[D]),use_1024_bytes=C,to_str=True,str_format=H)
+						return int(G*B**I[D])
+				else:
+					try:return int(A)
+					except Exception:return 0
+			elif F or isinstance(A,int)or isinstance(A,float):
+				if isinstance(A,str):
+					try:A=A.rstrip('B').rstrip('b');A=float(A.lower().strip())
+					except Exception:return A
+				if C or C is None:
+					B=2**10;E=0;J={0:'',1:'Ki',2:'Mi',3:'Gi',4:'Ti',5:'Pi',6:'Ei',7:'Zi',8:'Yi'}
+					while A>B:A/=B;E+=1
+					return f"{A:{H}} {' '}{J[E]}".replace('  ',' ')
+				else:
+					B=10**3;E=0;J={0:'',1:'K',2:'M',3:'G',4:'T',5:'P',6:'E',7:'Z',8:'Y'}
+					while A>B:A/=B;E+=1
+					return f"{A:{H}} {' '}{J[E]}".replace('  ',' ')
+			else:
+				try:return multiCMD.format_bytes(float(A),C)
+				except Exception:pass
+				return 0
 try:
 	import xxhash
 	hasher = xxhash.xxh64()
@@ -210,9 +249,9 @@ except ImportError:
 	hasher = hashlib.blake2b()
 	xxhash_available = False
 
-version = '9.29'
+version = '9.30'
 __version__ = version
-COMMIT_DATE = '2025-08-25'
+COMMIT_DATE = '2025-09-10'
 
 MAGIC_NUMBER = 1.61803398875
 RANDOM_DESTINATION_SELECTION = False
@@ -1145,80 +1184,7 @@ def format_bytes(size, use_1024_bytes=None, to_int=False, to_str=False,str_forma
 		>>> format_bytes(1610612736, use_1024_bytes=False, to_str=True)
 		'1.61 G'
 	"""
-	if to_int or isinstance(size, str):
-		if isinstance(size, int):
-			return size
-		elif isinstance(size, str):
-			# Use regular expression to split the numeric part from the unit, handling optional whitespace
-			match = re.match(r"(\d+(\.\d+)?)\s*([a-zA-Z]*)", size)
-			if not match:
-				if to_str:
-					return size
-				print("Invalid size format. Expected format: 'number [unit]', e.g., '1.5 GiB' or '1.5GiB'")
-				print(f"Got: {size}")
-				return 0
-			number, _, unit = match.groups()
-			number = float(number)
-			unit  = unit.strip().lower().rstrip('b')
-			# Define the unit conversion dictionary
-			if unit.endswith('i'):
-				# this means we treat the unit as 1024 bytes if it ends with 'i'
-				use_1024_bytes = True
-			elif use_1024_bytes is None:
-				use_1024_bytes = False
-			unit  = unit.rstrip('i')
-			if use_1024_bytes:
-				power = 2**10
-			else:
-				power = 10**3
-			unit_labels = {'': 0, 'k': 1, 'm': 2, 'g': 3, 't': 4, 'p': 5, 'e': 6, 'z': 7, 'y': 8}
-			if unit not in unit_labels:
-				if to_str:
-					return size
-				print(f"Invalid unit '{unit}'. Expected one of {list(unit_labels.keys())}")
-				return 0
-			if to_str:
-				return format_bytes(size=int(number * (power ** unit_labels[unit])), use_1024_bytes=use_1024_bytes, to_str=True, str_format=str_format)
-			# Calculate the bytes
-			return int(number * (power ** unit_labels[unit]))
-		else:
-			try:
-				return int(size)
-			except Exception as e:
-				return 0
-	elif to_str or isinstance(size, int) or isinstance(size, float):
-		if isinstance(size, str):
-			try:
-				size = size.rstrip('B').rstrip('b')
-				size = float(size.lower().strip())
-			except Exception as e:
-				return size
-		# size is in bytes
-		if use_1024_bytes or use_1024_bytes is None:
-			power = 2**10
-			n = 0
-			power_labels = {0 : '', 1: 'Ki', 2: 'Mi', 3: 'Gi', 4: 'Ti', 5: 'Pi', 6: 'Ei', 7: 'Zi', 8: 'Yi'}
-			while size > power:
-				size /= power
-				n += 1
-			return f"{size:{str_format}}{' '}{power_labels[n]}"
-		else:
-			power = 10**3
-			n = 0
-			power_labels = {0 : '', 1: 'K', 2: 'M', 3: 'G', 4: 'T', 5: 'P', 6: 'E', 7: 'Z', 8: 'Y'}
-			while size > power:
-				size /= power
-				n += 1
-			return f"{size:{str_format}}{' '}{power_labels[n]}"
-	else:
-		try:
-			return format_bytes(float(size), use_1024_bytes)
-		except Exception as e:
-			import traceback
-			print(f"Error: {e}")
-			print(traceback.format_exc())
-			print(f"Invalid size: {size}")
-		return 0
+	return multiCMD.format_bytes(size, use_1024_bytes=use_1024_bytes, to_int=to_int, to_str=to_str,str_format=str_format)
 
 def format_time(seconds):
 	"""
