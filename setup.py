@@ -19,7 +19,7 @@ setup(
     install_requires=[
         'argparse',
 		'xxhash',
-		'multiCMD>1.35',
+		'multiCMD>=1.35',
     ],
     classifiers=[
         'Programming Language :: Python :: 3',
