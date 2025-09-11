@@ -30,7 +30,7 @@ from collections import deque
 from math import log
 try:
 	import multiCMD
-	assert float(multiCMD.version) > 1.35
+	assert float(multiCMD.version) >= 1.35
 except:
 	import time,threading,io,sys,subprocess,select,string,re,itertools,signal
 	class multiCMD:
