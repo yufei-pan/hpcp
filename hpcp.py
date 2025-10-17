@@ -7,239 +7,243 @@
 #     "multiCMD>1.19",
 # ]
 # ///
-import os
-import stat
-import sys
-import time
 import argparse
-import multiprocessing
 import concurrent.futures
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
-import shutil
-import glob
-import re
 import fnmatch
 import functools
-import tempfile
-import select
+import glob
+import multiprocessing
+import os
 import pathlib
 import random
 import re
-import threading
+import shutil
+import stat
+import sys
+import tempfile
+import time
 from collections import deque
+from concurrent.futures import ProcessPoolExecutor
 from math import log
+
 try:
 	import multiCMD
 	assert float(multiCMD.version) >= 1.35
-except:
-	import time,threading,io,sys,subprocess,select,string,re,itertools,signal
-	class multiCMD:
-		version='1.35_min_hpcp'
-		__version__=version
-		COMMIT_DATE='2025-09-10'
-		__running_threads=set()
-		__variables={}
-		_BRACKET_RX=re.compile('\\[([^\\]]+)\\]')
-		_ALPHANUM=string.digits+string.ascii_letters
-		_ALPHA_IDX={B:A for(A,B)in enumerate(_ALPHANUM)}
-		class Task:
-			def __init__(A,command):A.command=command;A.returncode=None;A.stdout=[];A.stderr=[];A.thread=None;A.stop=False
-			def __iter__(A):return zip(['command','returncode','stdout','stderr'],[A.command,A.returncode,A.stdout,A.stderr])
-			def __repr__(A):return f"Task(command={A.command}, returncode={A.returncode}, stdout={A.stdout}, stderr={A.stderr}, stop={A.stop})"
-			def __str__(A):return str(dict(A))
-			def is_alive(A):
-				if A.thread is not None:return A.thread.is_alive()
-				return False
-		def _expand_piece(piece,vars_):
-			D=vars_;C=piece;C=C.strip()
-			if':'in C:E,F,G=C.partition(':');D[E]=G;return
-			if'-'in C:
-				A,F,B=(A.strip()for A in C.partition('-'));A=D.get(A,A);B=D.get(B,B)
-				if A.isdigit()and B.isdigit():H=max(len(A),len(B));return[f"{A:0{H}d}"for A in range(int(A),int(B)+1)]
-				if all(A in string.hexdigits for A in A+B):return[format(A,'x')for A in range(int(A,16),int(B,16)+1)]
-				try:return[multiCMD._ALPHANUM[A]for A in range(multiCMD._ALPHA_IDX[A],multiCMD._ALPHA_IDX[B]+1)]
-				except KeyError:pass
-			return[D.get(C,C)]
-		def _expand_ranges_fast(inStr):
-			D=inStr;A=[];B=0
-			for C in multiCMD._BRACKET_RX.finditer(D):
-				if C.start()>B:A.append([D[B:C.start()]])
-				E=[]
-				for G in C.group(1).split(','):
-					F=multiCMD._expand_piece(G,multiCMD.__variables)
-					if F:E.extend(F)
-				A.append(E or['']);B=C.end()
-			A.append([D[B:]]);return[''.join(A)for A in itertools.product(*A)]
-		def __handle_stream(stream,target,pre='',post='',quiet=False):
-			E=quiet;C=target
-			def D(current_line,target,keepLastLine=True):
-				A=target
-				if not keepLastLine:
-					if not E:sys.stdout.write('\r')
-					A.pop()
-				elif not E:sys.stdout.write('\n')
-				B=current_line.decode('utf-8',errors='backslashreplace');A.append(B)
-				if not E:sys.stdout.write(pre+B+post);sys.stdout.flush()
+except Exception:
+	import sys
+	import types
+	multiCMD = types.ModuleType('multiCMD')
+	sys.modules['multiCMD'] = multiCMD
+	_src  = r'''
+import time,threading,io,sys,subprocess,select,string,re,itertools,signal
+version='1.38_min'
+__version__=version
+COMMIT_DATE='2025-10-06'
+__running_threads=set()
+__variables={}
+_BRACKET_RX=re.compile('\\[([^\\]]+)\\]')
+_ALPHANUM=string.digits+string.ascii_letters
+_ALPHA_IDX={B:A for(A,B)in enumerate(_ALPHANUM)}
+class Task:
+	def __init__(A,command):A.command=command;A.returncode=None;A.stdout=[];A.stderr=[];A.thread=None;A.stop=False
+	def __iter__(A):return zip(['command','returncode','stdout','stderr'],[A.command,A.returncode,A.stdout,A.stderr])
+	def __repr__(A):return f"Task(command={A.command}, returncode={A.returncode}, stdout={A.stdout}, stderr={A.stderr}, stop={A.stop})"
+	def __str__(A):return str(dict(A))
+	def is_alive(A):
+		if A.thread is not None:return A.thread.is_alive()
+		return False
+def _expand_piece(piece,vars_):
+	D=vars_;C=piece;C=C.strip()
+	if':'in C:E,F,G=C.partition(':');D[E]=G;return
+	if'-'in C:
+		A,F,B=(A.strip()for A in C.partition('-'));A=D.get(A,A);B=D.get(B,B)
+		if A.isdigit()and B.isdigit():H=max(len(A),len(B));return[f"{A:0{H}d}"for A in range(int(A),int(B)+1)]
+		if all(A in string.hexdigits for A in A+B):return[format(A,'x')for A in range(int(A,16),int(B,16)+1)]
+		try:return[_ALPHANUM[A]for A in range(_ALPHA_IDX[A],_ALPHA_IDX[B]+1)]
+		except KeyError:pass
+	return[D.get(C,C)]
+def _expand_ranges_fast(inStr):
+	D=inStr;global __variables;A=[];B=0
+	for C in _BRACKET_RX.finditer(D):
+		if C.start()>B:A.append([D[B:C.start()]])
+		E=[]
+		for G in C.group(1).split(','):
+			F=_expand_piece(G,__variables)
+			if F:E.extend(F)
+		A.append(E or['']);B=C.end()
+	A.append([D[B:]]);return[''.join(A)for A in itertools.product(*A)]
+def __handle_stream(stream,target,pre='',post='',quiet=False):
+	E=quiet;C=target
+	def D(current_line,target,keepLastLine=True):
+		A=target
+		if not keepLastLine:
+			if not E:sys.stdout.write('\r')
+			A.pop()
+		elif not E:sys.stdout.write('\n')
+		B=current_line.decode('utf-8',errors='backslashreplace');A.append(B)
+		if not E:sys.stdout.write(pre+B+post);sys.stdout.flush()
+	A=bytearray();B=True
+	for F in iter(lambda:stream.read(1),b''):
+		if F==b'\n':
+			if not B and A:D(A,C,keepLastLine=False)
+			elif B:D(A,C,keepLastLine=True)
 			A=bytearray();B=True
-			for F in iter(lambda:stream.read(1),b''):
-				if F==b'\n':
-					if not B and A:D(A,C,keepLastLine=False)
-					elif B:D(A,C,keepLastLine=True)
-					A=bytearray();B=True
-				elif F==b'\r':D(A,C,keepLastLine=B);A=bytearray();B=False
-				else:A.extend(F)
-			if A:D(A,C,keepLastLine=B)
-		def int_to_color(n,brightness_threshold=500):
-			B=brightness_threshold;A=hash(str(n));C=A>>16&255;D=A>>8&255;E=A&255
-			if C+D+E<B:return multiCMD.int_to_color(A,B)
-			return C,D,E
-		def __run_command(task,sem,timeout=60,quiet=False,dry_run=False,with_stdErr=False,identity=None):
-			I=timeout;F=identity;E=quiet;A=task;C='';D=''
-			with sem:
-				try:
-					if F is not None:
-						if F==...:F=threading.get_ident()
-						P,Q,R=multiCMD.int_to_color(F);C=f"[38;2;{P};{Q};{R}m";D='\x1b[0m'
-					if not E:print(C+'Running command: '+' '.join(A.command)+D);print(C+'-'*100+D)
-					if dry_run:return A.stdout+A.stderr
-					B=subprocess.Popen(A.command,stdout=subprocess.PIPE,stderr=subprocess.PIPE,stdin=subprocess.PIPE);J=threading.Thread(target=multiCMD.__handle_stream,args=(B.stdout,A.stdout,C,D,E),daemon=True);J.start();K=threading.Thread(target=multiCMD.__handle_stream,args=(B.stderr,A.stderr,C,D,E),daemon=True);K.start();L=time.time();M=len(A.stdout)+len(A.stderr);time.sleep(0);H=1e-07
-					while B.poll()is None:
-						if A.stop:B.send_signal(signal.SIGINT);time.sleep(.01);B.terminate();break
-						if I>0:
-							if len(A.stdout)+len(A.stderr)!=M:L=time.time();M=len(A.stdout)+len(A.stderr)
-							elif time.time()-L>I:A.stderr.append('Timeout!');B.send_signal(signal.SIGINT);time.sleep(.01);B.terminate();break
-						time.sleep(H)
-						if H<.001:H*=2
-					A.returncode=B.poll();J.join(timeout=1);K.join(timeout=1);N,O=B.communicate()
-					if N:multiCMD.__handle_stream(io.BytesIO(N),A.stdout,A)
-					if O:multiCMD.__handle_stream(io.BytesIO(O),A.stderr,A)
-					if A.returncode is None:
-						if A.stderr and A.stderr[-1].strip().startswith('Timeout!'):A.returncode=124
-						elif A.stderr and A.stderr[-1].strip().startswith('Ctrl C detected, Emergency Stop!'):A.returncode=137
-						else:A.returncode=-1
-				except FileNotFoundError as G:print(f"Command / path not found: {A.command[0]}",file=sys.stderr,flush=True);A.stderr.append(str(G));A.returncode=127
-				except Exception as G:import traceback as S;print(f"Error running command: {A.command}",file=sys.stderr,flush=True);print(str(G).split('\n'));A.stderr.extend(str(G).split('\n'));A.stderr.extend(S.format_exc().split('\n'));A.returncode=-1
-				if not E:print(C+'\n'+'-'*100+D);print(C+f"Process exited with return code {A.returncode}"+D)
-				if with_stdErr:return A.stdout+A.stderr
-				else:return A.stdout
-		def __format_command(command,expand=False):
-			D=expand;A=command
-			if isinstance(A,str):
-				if D:B=multiCMD._expand_ranges_fast(A)
-				else:B=[A]
-				return[A.split()for A in B]
-			elif hasattr(A,'__iter__'):
-				C=[]
-				for E in A:
-					if isinstance(E,str):C.append(E)
-					else:C.append(repr(E))
-				if not D:return[C]
-				F=[multiCMD._expand_ranges_fast(A)for A in C];B=list(itertools.product(*F));return[list(A)for A in B]
-			else:return multiCMD.__format_command(str(A),expand=D)
-		def run_command(command,timeout=0,max_threads=1,quiet=False,dry_run=False,with_stdErr=False,return_code_only=False,return_object=False,wait_for_return=True,sem=None):return multiCMD.run_commands(commands=[command],timeout=timeout,max_threads=max_threads,quiet=quiet,dry_run=dry_run,with_stdErr=with_stdErr,return_code_only=return_code_only,return_object=return_object,parse=False,wait_for_return=wait_for_return,sem=sem)[0]
-		def run_commands(commands,timeout=0,max_threads=1,quiet=False,dry_run=False,with_stdErr=False,return_code_only=False,return_object=False,parse=False,wait_for_return=True,sem=None):
-			K=wait_for_return;J=dry_run;I=quiet;H=timeout;C=max_threads;B=sem;E=[]
-			for L in commands:E.extend(multiCMD.__format_command(L,expand=parse))
-			A=[multiCMD.Task(A)for A in E]
-			if C<1:C=len(E)
-			if C>1 or not K:
-				if not B:B=threading.Semaphore(C)
-				F=[threading.Thread(target=multiCMD.__run_command,args=(A,B,H,I,J,...),daemon=True)for A in A]
-				for(D,G)in zip(F,A):G.thread=D;D.start()
-				if K:
-					for D in F:D.join()
-				else:multiCMD.__running_threads.update(F)
-			else:
-				B=threading.Semaphore(1)
-				for G in A:multiCMD.__run_command(G,B,H,I,J,identity=None)
-			if return_code_only:return[A.returncode for A in A]
-			elif return_object:return A
-			elif with_stdErr:return[A.stdout+A.stderr for A in A]
-			else:return[A.stdout for A in A]
-		def input_with_timeout_and_countdown(timeout,prompt='Please enter your selection'):
-			B=prompt;A=timeout;print(f"{B} [{A}s]: ",end='',flush=True)
-			for C in range(A,0,-1):
-				if sys.stdin in select.select([sys.stdin],[],[],0)[0]:return input().strip()
-				print(f"\r{B} [{C}s]: ",end='',flush=True);time.sleep(1)
-		def get_terminal_size():
-			try:import os;A=os.get_terminal_size()
-			except:
-				try:import fcntl,termios as C,struct as B;D=fcntl.ioctl(0,C.TIOCGWINSZ,B.pack('HHHH',0,0,0,0));A=B.unpack('HHHH',D)[:2]
-				except:import shutil as E;A=E.get_terminal_size(fallback=(120,30))
-			return A
-		def _genrate_progress_bar(iteration,total,prefix='',suffix='',columns=120):
-			G=columns;F=prefix;E=total;C=suffix;B=iteration;J=False;K=False;L=False;M=False
-			if E==0:return f"{F} iteration:{B} {C}".ljust(G)
-			N=f"|{'{0:.1f}'.format(100*(B/float(E)))}% ";A=G-len(F)-len(C)-len(N)-3
-			if A<=0:A=G-len(F)-len(C)-3;L=True
-			if A<=0:A=G-len(C)-3;J=True
-			if A<=0:A=G-3;K=True
-			if A<=0:return f"""{F}
+		elif F==b'\r':D(A,C,keepLastLine=B);A=bytearray();B=False
+		else:A.extend(F)
+	if A:D(A,C,keepLastLine=B)
+def int_to_color(n,brightness_threshold=500):
+	B=brightness_threshold;A=hash(str(n));C=A>>16&255;D=A>>8&255;E=A&255
+	if C+D+E<B:return int_to_color(A,B)
+	return C,D,E
+def __run_command(task,sem,timeout=60,quiet=False,dry_run=False,with_stdErr=False,identity=None):
+	I=timeout;F=identity;E=quiet;A=task;C='';D=''
+	with sem:
+		try:
+			if F is not None:
+				if F==...:F=threading.get_ident()
+				P,Q,R=int_to_color(F);C=f"\033[38;2;{P};{Q};{R}m";D='\x1b[0m'
+			if not E:print(C+'Running command: '+' '.join(A.command)+D);print(C+'-'*100+D)
+			if dry_run:return A.stdout+A.stderr
+			B=subprocess.Popen(A.command,stdout=subprocess.PIPE,stderr=subprocess.PIPE,stdin=subprocess.PIPE);J=threading.Thread(target=__handle_stream,args=(B.stdout,A.stdout,C,D,E),daemon=True);J.start();K=threading.Thread(target=__handle_stream,args=(B.stderr,A.stderr,C,D,E),daemon=True);K.start();L=time.time();M=len(A.stdout)+len(A.stderr);time.sleep(0);H=1e-07
+			while B.poll()is None:
+				if A.stop:B.send_signal(signal.SIGINT);time.sleep(.01);B.terminate();break
+				if I>0:
+					if len(A.stdout)+len(A.stderr)!=M:L=time.time();M=len(A.stdout)+len(A.stderr)
+					elif time.time()-L>I:A.stderr.append('Timeout!');B.send_signal(signal.SIGINT);time.sleep(.01);B.terminate();break
+				time.sleep(H)
+				if H<.001:H*=2
+			A.returncode=B.poll();J.join(timeout=1);K.join(timeout=1);N,O=B.communicate()
+			if N:__handle_stream(io.BytesIO(N),A.stdout,A)
+			if O:__handle_stream(io.BytesIO(O),A.stderr,A)
+			if A.returncode is None:
+				if A.stderr and A.stderr[-1].strip().startswith('Timeout!'):A.returncode=124
+				elif A.stderr and A.stderr[-1].strip().startswith('Ctrl C detected, Emergency Stop!'):A.returncode=137
+				else:A.returncode=-1
+		except FileNotFoundError as G:print(f"Command path not found: {A.command[0]}",file=sys.stderr,flush=True);A.stderr.append(str(G));A.returncode=127
+		except Exception as G:import traceback as S;print(f"Error running command: {A.command}",file=sys.stderr,flush=True);print(str(G).split('\n'));A.stderr.extend(str(G).split('\n'));A.stderr.extend(S.format_exc().split('\n'));A.returncode=-1
+		if not E:print(C+'\n'+'-'*100+D);print(C+f"Process exited with return code {A.returncode}"+D)
+		if with_stdErr:return A.stdout+A.stderr
+		else:return A.stdout
+def __format_command(command,expand=False):
+	D=expand;A=command
+	if isinstance(A,str):
+		if D:B=_expand_ranges_fast(A)
+		else:B=[A]
+		return[A.split()for A in B]
+	elif hasattr(A,'__iter__'):
+		C=[]
+		for E in A:
+			if isinstance(E,str):C.append(E)
+			else:C.append(repr(E))
+		if not D:return[C]
+		F=[_expand_ranges_fast(A)for A in C];B=list(itertools.product(*F));return[list(A)for A in B]
+	else:return __format_command(str(A),expand=D)
+def run_command(command,timeout=0,max_threads=1,quiet=False,dry_run=False,with_stdErr=False,return_code_only=False,return_object=False,wait_for_return=True,sem=None):return run_commands(commands=[command],timeout=timeout,max_threads=max_threads,quiet=quiet,dry_run=dry_run,with_stdErr=with_stdErr,return_code_only=return_code_only,return_object=return_object,parse=False,wait_for_return=wait_for_return,sem=sem)[0]
+def run_commands(commands,timeout=0,max_threads=1,quiet=False,dry_run=False,with_stdErr=False,return_code_only=False,return_object=False,parse=False,wait_for_return=True,sem=None):
+	K=wait_for_return;J=dry_run;I=quiet;H=timeout;C=max_threads;B=sem;E=[]
+	for L in commands:E.extend(__format_command(L,expand=parse))
+	A=[Task(A)for A in E]
+	if C<1:C=len(E)
+	if C>1 or not K:
+		if not B:B=threading.Semaphore(C)
+		F=[threading.Thread(target=__run_command,args=(A,B,H,I,J,...),daemon=True)for A in A]
+		for(D,G)in zip(F,A):G.thread=D;D.start()
+		if K:
+			for D in F:D.join()
+		else:__running_threads.update(F)
+	else:
+		B=threading.Semaphore(1)
+		for G in A:__run_command(G,B,H,I,J,identity=None)
+	if return_code_only:return[A.returncode for A in A]
+	elif return_object:return A
+	elif with_stdErr:return[A.stdout+A.stderr for A in A]
+	else:return[A.stdout for A in A]
+def input_with_timeout_and_countdown(timeout,prompt='Please enter your selection'):
+	B=prompt;A=timeout;print(f"{B} [{A}s]: ",end='',flush=True)
+	for C in range(A,0,-1):
+		if sys.stdin in select.select([sys.stdin],[],[],0)[0]:return input().strip()
+		print(f"\r{B} [{C}s]: ",end='',flush=True);time.sleep(1)
+def get_terminal_size():
+	try:import os;A=os.get_terminal_size()
+	except:
+		try:import fcntl,termios as C,struct as B;D=fcntl.ioctl(0,C.TIOCGWINSZ,B.pack('HHHH',0,0,0,0));A=B.unpack('HHHH',D)[:2]
+		except:import shutil as E;A=E.get_terminal_size(fallback=(120,30))
+	return A
+def _genrate_progress_bar(iteration,total,prefix='',suffix='',columns=120):
+	G=columns;F=prefix;E=total;C=suffix;B=iteration;J=False;K=False;L=False;M=False
+	if E==0:return f"{F} iteration:{B} {C}".ljust(G)
+	N=f"|{'{0:.1f}'.format(100*(B/float(E)))}% ";A=G-len(F)-len(C)-len(N)-3
+	if A<=0:A=G-len(F)-len(C)-3;L=True
+	if A<=0:A=G-len(C)-3;J=True
+	if A<=0:A=G-3;K=True
+	if A<=0:return f"""{F}
 iteration:
 {B}
 total:
 {E}
 | {C}
 """
-			if B==0:M=True
-			H=int(A*B//E);I='▁▂▃▄▅▆▇█';P=A*B/E-H;Q=int(P*(len(I)-1));R=I[Q]
-			if H==A:O=I[-1]*A
-			else:O=I[-1]*H+R+'_'*(A-H)
-			D=''
-			if not J:D+=F
-			if not M:
-				D+=f"{O}"
-				if not L:D+=N
-			elif A>=16:D+=f" Calculating... "
-			if not K:D+=C
-			return D
-		def print_progress_bar(iteration,total,prefix='',suffix=''):
-			D=prefix;C=total;B=iteration;A=suffix;D+=' |'if not D.endswith(' |')else'';A=f"| {A}"if not A.startswith('| ')else A
-			try:
-				E,F=multiCMD.get_terminal_size();sys.stdout.write(f"\r{multiCMD._genrate_progress_bar(B,C,D,A,E)}");sys.stdout.flush()
-				if B==C and C>0:print(file=sys.stdout)
-			except:
-				if B%5==0:print(multiCMD._genrate_progress_bar(B,C,D,A))
-		def format_bytes(size,use_1024_bytes=None,to_int=False,to_str=False,str_format='.2f'):
-			H=str_format;F=to_str;C=use_1024_bytes;A=size
-			if to_int or isinstance(A,str):
-				if isinstance(A,int):return A
-				elif isinstance(A,str):
-					K=re.match('(\\d+(\\.\\d+)?)\\s*([a-zA-Z]*)',A)
-					if not K:
-						if F:return A
-						print("Invalid size format. Expected format: 'number [unit]', e.g., '1.5 GiB' or '1.5GiB'");print(f"Got: {A}");return 0
-					G,L,D=K.groups();G=float(G);D=D.strip().lower().rstrip('b')
-					if D.endswith('i'):C=True
-					elif C is None:C=False
-					D=D.rstrip('i')
-					if C:B=2**10
-					else:B=10**3
-					I={'':0,'k':1,'m':2,'g':3,'t':4,'p':5,'e':6,'z':7,'y':8}
-					if D not in I:
-						if F:return A
-					else:
-						if F:return multiCMD.format_bytes(size=int(G*B**I[D]),use_1024_bytes=C,to_str=True,str_format=H)
-						return int(G*B**I[D])
-				else:
-					try:return int(A)
-					except Exception:return 0
-			elif F or isinstance(A,int)or isinstance(A,float):
-				if isinstance(A,str):
-					try:A=A.rstrip('B').rstrip('b');A=float(A.lower().strip())
-					except Exception:return A
-				if C or C is None:
-					B=2**10;E=0;J={0:'',1:'Ki',2:'Mi',3:'Gi',4:'Ti',5:'Pi',6:'Ei',7:'Zi',8:'Yi'}
-					while A>B:A/=B;E+=1
-					return f"{A:{H}} {' '}{J[E]}".replace('  ',' ')
-				else:
-					B=10**3;E=0;J={0:'',1:'K',2:'M',3:'G',4:'T',5:'P',6:'E',7:'Z',8:'Y'}
-					while A>B:A/=B;E+=1
-					return f"{A:{H}} {' '}{J[E]}".replace('  ',' ')
+	if B==0:M=True
+	H=int(A*B//E);I='▁▂▃▄▅▆▇█';P=A*B/E-H;Q=int(P*(len(I)-1));R=I[Q]
+	if H==A:O=I[-1]*A
+	else:O=I[-1]*H+R+'_'*(A-H)
+	D=''
+	if not J:D+=F
+	if not M:
+		D+=f"{O}"
+		if not L:D+=N
+	elif A>=16:D+=f" Calculating... "
+	if not K:D+=C
+	return D
+def print_progress_bar(iteration,total,prefix='',suffix=''):
+	D=prefix;C=total;B=iteration;A=suffix;D+=' |'if not D.endswith(' |')else'';A=f"| {A}"if not A.startswith('| ')else A
+	try:
+		E,F=get_terminal_size();sys.stdout.write(f"\r{_genrate_progress_bar(B,C,D,A,E)}");sys.stdout.flush()
+		if B==C and C>0:print(file=sys.stdout)
+	except:
+		if B%5==0:print(_genrate_progress_bar(B,C,D,A))
+def format_bytes(size,use_1024_bytes=None,to_int=False,to_str=False,str_format='.2f'):
+	H=str_format;F=to_str;C=use_1024_bytes;A=size
+	if to_int or isinstance(A,str):
+		if isinstance(A,int):return A
+		elif isinstance(A,str):
+			K=re.match('(\\d+(\\.\\d+)?)\\s*([a-zA-Z]*)',A)
+			if not K:
+				if F:return A
+				print("Invalid size format. Expected format: 'number [unit]', e.g., '1.5 GiB' or '1.5GiB'");print(f"Got: {A}");return 0
+			G,L,D=K.groups();G=float(G);D=D.strip().lower().rstrip('b')
+			if D.endswith('i'):C=True
+			elif C is None:C=False
+			D=D.rstrip('i')
+			if C:B=2**10
+			else:B=10**3
+			I={'':0,'k':1,'m':2,'g':3,'t':4,'p':5,'e':6,'z':7,'y':8}
+			if D not in I:
+				if F:return A
 			else:
-				try:return multiCMD.format_bytes(float(A),C)
-				except Exception:pass
-				return 0
+				if F:return format_bytes(size=int(G*B**I[D]),use_1024_bytes=C,to_str=True,str_format=H)
+				return int(G*B**I[D])
+		else:
+			try:return int(A)
+			except Exception:return 0
+	elif F or isinstance(A,int)or isinstance(A,float):
+		if isinstance(A,str):
+			try:A=A.rstrip('B').rstrip('b');A=float(A.lower().strip())
+			except Exception:return A
+		if C or C is None:
+			B=2**10;E=0;J={0:'',1:'Ki',2:'Mi',3:'Gi',4:'Ti',5:'Pi',6:'Ei',7:'Zi',8:'Yi'}
+			while A>B:A/=B;E+=1
+			return f"{A:{H}} {' '}{J[E]}".replace('  ',' ')
+		else:
+			B=10**3;E=0;J={0:'',1:'K',2:'M',3:'G',4:'T',5:'P',6:'E',7:'Z',8:'Y'}
+			while A>B:A/=B;E+=1
+			return f"{A:{H}} {' '}{J[E]}".replace('  ',' ')
+	else:
+		try:return format_bytes(float(A),C)
+		except Exception:pass
+		return 0
+'''
+	exec(_src, multiCMD.__dict__)
 try:
 	import xxhash
 	hasher = xxhash.xxh64()
@@ -249,9 +253,9 @@ except ImportError:
 	hasher = hashlib.blake2b()
 	xxhash_available = False
 
-version = '9.32'
+version = '9.34'
 __version__ = version
-COMMIT_DATE = '2025-09-10'
+COMMIT_DATE = '2025-10-17'
 
 MAGIC_NUMBER = 1.61803398875
 RANDOM_DESTINATION_SELECTION = False
@@ -259,7 +263,22 @@ RANDOM_DESTINATION_SELECTION = False
 BYTES_RATE_LIMIT = 0
 FILES_RATE_LIMIT = 0
 
+ERRORS = []
+
+#TODO: move label, uuid copy for dd mode AFTER hpcp copied data to avoid cannot mount because same uuid / label
 #%% ---- Helper Functions ----
+def eprint(*args, **kwargs):
+	global ERRORS
+	try:
+		if 'file' in kwargs:
+			print(*args, **kwargs)
+		else:
+			print(*args, file=sys.stderr, **kwargs)
+	except Exception as e:
+		print(f"Error: Cannot print to stderr: {e}")
+		print(*args, **kwargs)
+	ERRORS.append(' '.join(map(str,args)))
+
 class Adaptive_Progress_Bar:
 	def __init__(self, total_count = 0, total_size = 0,refresh_interval = 0.1,last_num_job_for_stats = 10,custom_prefix = None,
 			  custom_suffix = None,process_word = 'Processed',use_print_thread = False, suppress_all_output = False,bytes_rate_limit = 0,files_rate_limit = 0):
@@ -429,19 +448,19 @@ def run_command_in_multicmd_with_path_check(command, timeout=0,max_threads=1,qui
 	if isinstance(command, str):
 		command = command.split()
 	if not command:
-		print("Error: Command is empty.", file=sys.stderr, flush=True)
-		sys.exit(1)
+		eprint("Error: Command is empty.")
+		# sys.exit(1)
 	if not isinstance(command[0],str):
 		command[0] = str(command[0])
 	if command[0] not in _binPaths and not check_path(command[0]):
-		print(f"Error: Command '{command[0]}' not found. Please consider installing it then retry.", file=sys.stderr, flush=True)
+		eprint(f"Error: Command '{command[0]}' not found. Please consider installing it then retry.")
 		if strict: 
 			sys.exit(127)
 	# Run the command
 	task = multiCMD.run_commands([command], timeout=timeout, max_threads=max_threads, quiet=quiet, dry_run=dry_run,return_object=True)[0]
 	if task.returncode != 0:
 		if not quiet:
-			print(f"Error: Command '{command}' failed with return code {task.returncode}.", file=sys.stderr, flush=True)
+			eprint(f"Error: Command '{command}' failed with return code {task.returncode}.")
 		if strict:
 			raise RuntimeError(f"Command '{command}' failed with return code {task.returncode}.")
 	return task.stdout
@@ -459,10 +478,10 @@ def get_file_size(path):
 			realSize = st.st_blocks * 512
 		else:
 			realSize = st.st_size
-	except:
+	except Exception:
 		try:
 			realSize = os.path.getsize(path)
-		except:
+		except Exception:
 			realSize = 0
 	return realSize
 
@@ -515,10 +534,10 @@ def format_exclude(exclude = None,exclude_file = None) -> frozenset:
 			try:
 				with open(exclude_file,'r') as f:
 					exclude.update(f.read().splitlines())
-			except:
-				print(f"Error encounted while reading exclude file {exclude_file}, skipping")
+			except Exception:
+				eprint(f"Error encounted while reading exclude file {exclude_file}, skipping")
 		else:
-			print(f"Exclude file {exclude_file} does not exist, skipping")
+			eprint(f"Exclude file {exclude_file} does not exist, skipping")
 
 	exclude = set([re.sub(r'/+','/','*/'+ path if not path.startswith('*/') else path) if not path.startswith('/') else path for path in exclude ])
 	# freeze frozenset
@@ -616,12 +635,12 @@ def fix_fs(target_partition, fs_type=None):
 			#run_command_in_multicmd_with_path_check(f"fsck.reiserfs -y {target_partition}",strict=False)
 			run_command_in_multicmd_with_path_check(["fsck.reiserfs", '-y', target_partition],strict=False)
 		elif fs_type == 'udf':
-			print(f"Warning: Cannot fix udf file system. Skipping.")
+			print("Warning: Cannot fix udf file system. Skipping.")
 		elif fs_type == 'ufs':
 			#run_command_in_multicmd_with_path_check(f"fsck.ufs -y {target_partition}",strict=False)
 			run_command_in_multicmd_with_path_check(["fsck.ufs", '-y', target_partition],strict=False)
 		elif fs_type == 'bfs':
-			print(f"Warning: Cannot fix bfs file system. Skipping.")
+			print("Warning: Cannot fix bfs file system. Skipping.")
 		elif fs_type == 'minix':
 			#run_command_in_multicmd_with_path_check(f"fsck.minix -a {target_partition}",strict=False)
 			run_command_in_multicmd_with_path_check(["fsck.minix", '-a', target_partition],strict=False)
@@ -848,7 +867,7 @@ def write_partition_info(image, partition_infos, partition_name):
 		if partition_infos[partition_name]['fs_type']:
 			target_partition, loop_device = get_target_partition(image, partition_name)
 			if not target_partition:
-				print(f"Error: Cannot find partition {partition_name} in {image}.")
+				eprint(f"Error: Cannot find partition {partition_name} in {image}.")
 				return
 			fs_type = partition_infos[partition_name]['fs_type']
 			fs_label = partition_infos[partition_name]['fs_label']
@@ -884,7 +903,7 @@ def write_partition_info(image, partition_infos, partition_name):
 				command.append(target_partition)
 				run_command_in_multicmd_with_path_check(command,strict=False)
 				if fs_uuid:
-					print(f"Warning: Cannot set fs uuid for ntfs. Skipping.")
+					print("Warning: Cannot set fs uuid for ntfs. Skipping.")
 			elif fs_type == 'fat32' or fs_type == 'fat16' or fs_type == 'fat12' or fs_type == 'fat' or fs_type == 'vfat' or fs_type == 'msdos':
 				command = ['mkfs.vfat']
 				if fs_type == 'fat16':
@@ -947,7 +966,7 @@ def write_partition_info(image, partition_infos, partition_name):
 				command.append(target_partition)
 				run_command_in_multicmd_with_path_check(command,strict=False)
 				if fs_uuid:
-					print(f"Warning: Cannot set fs uuid for ufs. Skipping.")
+					print("Warning: Cannot set fs uuid for ufs. Skipping.")
 			elif fs_type == 'bfs':
 				command = ['mkfs.bfs']
 				if fs_label:
@@ -955,18 +974,18 @@ def write_partition_info(image, partition_infos, partition_name):
 				command.append(target_partition)
 				run_command_in_multicmd_with_path_check(command,strict=False)
 				if fs_uuid:
-					print(f"Warning: Cannot set fs uuid for bfs. Skipping.")
+					print("Warning: Cannot set fs uuid for bfs. Skipping.")
 			elif fs_type == 'cramfs':
-				print(f"Warning: cramfs is read-only file system. You should create one with mkfs.cramfs.")
+				print("Warning: cramfs is read-only file system. You should create one with mkfs.cramfs.")
 			elif fs_type == 'minix':
 				command = ['mkfs.minix',target_partition]
 				run_command_in_multicmd_with_path_check(command,strict=False)
 				if fs_label:
-					print(f"Warning: Cannot set fs label for minix. Skipping.")
+					print("Warning: Cannot set fs label for minix. Skipping.")
 				if fs_uuid:
-					print(f"Warning: Cannot set fs uuid for minix. Skipping.")
+					print("Warning: Cannot set fs uuid for minix. Skipping.")
 			elif fs_type == 'iso9660':
-				print(f"Warning: iso9660 is read-only file system. You should create one with mkfs.iso9660.")
+				print("Warning: iso9660 is read-only file system. You should create one with mkfs.iso9660.")
 			elif fs_type == 'swap':
 				command = ['mkswap']
 				if fs_label:
@@ -976,7 +995,7 @@ def write_partition_info(image, partition_infos, partition_name):
 				command.append(target_partition)
 				run_command_in_multicmd_with_path_check(command,strict=False)
 			elif fs_type == 'gpt':
-				print(f"Skip creating gpt padding.")
+				print("Skip creating gpt padding.")
 			else:
 				print(f"Warning: File system {fs_type} not currently supported by hpcp. Trying mkfs -t {fs_type} anyway...")
 				command = ['mkfs', '-t', fs_type]
@@ -993,7 +1012,7 @@ def write_partition_info(image, partition_infos, partition_name):
 
 
 	except Exception as e:
-		print("An error occurred while copying partition information:", e)
+		eprint("An error occurred while copying partition information:", e)
 
 def create_partition_table(image, partition_infos,sorted_partitions):
 	"""Create a partition table in the image file that will match the source device and sort the partitions by size."""
@@ -1054,7 +1073,7 @@ def create_sym_links(symLinks,exclude=None,no_link_tracking=False):
 	counter = 0
 	print(f"\nFound Symbolic Links:   {len(symLinks)}")
 	if no_link_tracking:
-		print(f"Skipping copying file as no_link_tracking ...\n")
+		print("Skipping copying file as no_link_tracking ...\n")
 	#print(symLinks)
 	start_time = time.perf_counter()
 	for src, dests in symLinks.items():
@@ -1106,14 +1125,14 @@ def create_sym_links(symLinks,exclude=None,no_link_tracking=False):
 				try:
 					os.symlink(linkedTargetFile, dest, target_is_directory=os.path.isdir(linkedTargetFile))
 					break
-				except:
+				except Exception:
 					print(f'Could not create symbolic link from {linkedTargetFile} to {dest}')
 					if dests:
-						print(f"Trying next destination...")
+						print("Trying next destination...")
 						dest = ''
 						continue
 					else:
-						print(f"All destinations failed, skipping...")
+						print("All destinations failed, skipping...")
 						break
 			counter += 1
 			# print the progress bar with the total count and the speed in F/s
@@ -1122,16 +1141,18 @@ def create_sym_links(symLinks,exclude=None,no_link_tracking=False):
 			multiCMD.print_progress_bar(counter, len(symLinks), prefix=prefix, suffix=suffix)
 			# we catch the file name too long exception
 		except OSError as e:
-			print("Exception caught! Possibly file name too long!")
-			print(f"\n{e}")
-			print(f"\n{src} -> {dests}")
-			print("Skipping...")
+			eprint(f"""
+Exception caught! Possibly file name too long!
+{e}
+{src} -> {dests}
+Skipping...""")
 			continue
 		except Exception as e:
-			print("Exception caught!")
-			print(f"\n{e}")
-			print(f"\n{src} -> {dests}")
-			print("Skipping...")
+			eprint(f"""
+Exception caught!
+{e}
+{src} -> {dests}
+Skipping...""")
 			continue
 
 
@@ -1142,19 +1163,21 @@ def create_sym_links(symLinks,exclude=None,no_link_tracking=False):
 		create_sym_links(nestedSymLinks,exclude=exclude,no_link_tracking=no_link_tracking)
 
 #%% -- File list --
-def natural_sort(l): 
+def natural_sort(L): 
 	"""
 	Sorts a list of strings naturally, considering both numeric and alphabetic characters.
 
 	Args:
-		l (list): The list of strings to be sorted.
+		L (list): The list of strings to be sorted.
 
 	Returns:
 		list: The sorted list of strings.
 	"""
-	convert = lambda text: int(text) if text.isdigit() else text.lower() 
-	alphanum_key = lambda key: [convert(c) for c in re.split('([0-9]+)', key)] 
-	return sorted(l, key=alphanum_key)
+	def convert(text):
+		return int(text) if text.isdigit() else text.lower() 
+	def alphanum_key(key):
+		return [convert(c) for c in re.split('([0-9]+)', key)] 
+	return sorted(L, key=alphanum_key)
 
 #%% -- Format --
 def format_bytes(size, use_1024_bytes=None, to_int=False, to_str=False,str_format='.2f'):
@@ -1198,7 +1221,7 @@ def format_time(seconds):
 	"""
 	try:
 		seconds = int(seconds)
-	except:
+	except Exception:
 		return seconds
 	seconds_in_minute = 60
 	seconds_in_hour = 60 * seconds_in_minute
@@ -1248,7 +1271,7 @@ def is_file_identical(src_path, dest_path,src_size,full_hash=False):
 		dst_mtime = os.path.getmtime(dest_path)
 		if src_mtime != dst_mtime:
 			return False
-	except:
+	except Exception:
 		pass
 	return src_size == dst_size and hash_file(src_path,src_size,full_hash) == hash_file(dest_path,dst_size,full_hash)
 
@@ -1327,7 +1350,7 @@ def get_file_list_serial(root,exclude=None,append_hash=False,full_hash=False):
 				folders.update(dir_folders)
 		#multiCMD.print_progress_bar(iteration=iteration, total=iteration, prefix=f'{root}', suffix=f'Files: {format_bytes(len(file_list),use_1024_bytes=False,to_str=True)} Links: {format_bytes(len(links),use_1024_bytes=False,to_str=True)} Folders: {format_bytes(len(folders),use_1024_bytes=False,to_str=True)} Size: {format_bytes(size)}B')
 	else:
-		print(f'Error: {root} is not a file or directory')
+		eprint(f'Error: {root} is not a file or directory')
 		return frozenset([root]) ,frozenset(), 0,frozenset()
 	return frozenset(file_list), frozenset(links) , size, frozenset(folders - set(['.', '..']))
 
@@ -1469,7 +1492,7 @@ def delete_file_list_parallel(file_list, max_workers, verbose=False,files_per_jo
 			else:
 				if not apb.under_rate_limit():
 					if verbose:
-						print(f'\nWe had hit the rate limit, changing files per job to 1')
+						print('\nWe had hit the rate limit, changing files per job to 1')
 					files_per_job = 1
 				time.sleep(apb.refresh_interval)
 				apb.print_progress()
@@ -1627,9 +1650,8 @@ def copy_file(src_path, dest_paths, full_hash=False, verbose=False, concurrent_p
 				except Exception as e:
 					if using_bak_paths and not dest_paths:
 						import traceback
-						print(f'ERROR copying {src_path} to {dest_path}: {e}')
+						eprint(f'ERROR copying {src_path} to {dest_path}, No more destination paths to try: {e}')
 						print(traceback.format_exc())
-						print(f'No more destination paths to try')
 						return 0, time.perf_counter() - start_time, symLinks #, task_to_run
 					elif verbose:
 						print(f'Re-Retrying with a different destination path in {dest_paths}')
@@ -1641,13 +1663,13 @@ def copy_file(src_path, dest_paths, full_hash=False, verbose=False, concurrent_p
 					using_bak_paths = True
 					dest_paths = bak_dest_paths
 			if not copied:
-				print(f'ERROR: FAILED to copy {src_path} to {dest_paths}')
+				eprint(f'ERROR: FAILED to copy {src_path} to {dest_paths}')
 				return 0, time.perf_counter() - start_time, symLinks
 			elif verbose:
 				print(f'Copied {src_path} to {dest_path}')
 				print(f'Estimated remaining size: {format_bytes(dest_free_space - copiedSize)}B')
 	except Exception as e:
-		print(f'Fatal Error copying {src_path} to {inDests}: {e}')
+		eprint(f'Fatal Error copying {src_path} to {inDests}: {e}')
 		import traceback
 		print(traceback.format_exc())
 		return 0, time.perf_counter() - start_time, symLinks #, task_to_run
@@ -1813,7 +1835,7 @@ def copy_file_list_parallel(file_list, links, src_path, dest_paths, max_workers,
 			else:
 				if not apb.under_rate_limit():
 					if verbose:
-						print(f'\nWe had hit the rate limit, changing files per job to 1')
+						print('\nWe had hit the rate limit, changing files per job to 1')
 					files_per_job = 1
 				time.sleep(apb.refresh_interval)
 				apb.print_progress()
@@ -1905,7 +1927,7 @@ def copy_file_list_parallel_batch(jobs, max_workers, full_hash=False, verbose=Fa
 			else:
 				if not apb.under_rate_limit():
 					if verbose:
-						print(f'\nWe had hit the rate limit, changing files per job to 1')
+						print('\nWe had hit the rate limit, changing files per job to 1')
 					files_per_job = 1
 				time.sleep(apb.refresh_interval)
 				apb.print_progress()
@@ -1958,8 +1980,6 @@ def copy_files_parallel_batch(jobs, max_workers, full_hash=False, verbose=False,
 	newJobs = []
 	total_symLinks = {}
 	total_files = []
-	copied_count = 0
-	copied_size = 0
 	total_item_count = 0
 	total_size_count = 0
 	total_link_count = 0
@@ -2336,7 +2356,7 @@ def sync_directories_parallel(src, dests, max_workers, verbose=False,folder_per_
 			else:
 				if not apb.under_rate_limit():
 					if verbose:
-						print(f'\nWe had hit the rate limit, changing folder per job to 1')
+						print('\nWe had hit the rate limit, changing folder per job to 1')
 					folder_per_job = 1
 				time.sleep(apb.refresh_interval)
 				apb.print_progress()
@@ -2440,7 +2460,7 @@ def sync_directories_parallel_batch(jobs, max_workers, verbose=False,folder_per_
 			else:
 				if not apb.under_rate_limit():
 					if verbose:
-						print(f'\nWe had hit the rate limit, changing folder per job to 1')
+						print('\nWe had hit the rate limit, changing folder per job to 1')
 					folder_per_job = 1
 				time.sleep(apb.refresh_interval)
 				apb.print_progress()
@@ -2566,11 +2586,11 @@ def compare_file_list(file_list, file_list2,diff_file_list=None,tar_diff_file_li
 	print('-'*80)
 	inSrcNotInDest = file_list - file_list2
 	inDestNotInSrc = file_list2 - file_list
-	print(f"Files in src but not in dest:")
+	print("Files in src but not in dest:")
 	for file in inSrcNotInDest:
 		print(file)
 	print('-'*80)
-	print(f"Files in dest but not in src:")
+	print("Files in dest but not in src:")
 	for file in inDestNotInSrc:
 		print(file)
 	print('-'*80)
@@ -2646,7 +2666,7 @@ def remove_extra_files(total_file_list, dests,max_workers,verbose,files_per_job,
 			# we then get the list of all extra files
 			inDestNotInSrc.update([os.path.join(dest,file) for file in (dest_file_list - total_file_list)])
 		print('-'*80)
-		print(f"Files in dest but not in src:")
+		print("Files in dest but not in src:")
 		for file in inDestNotInSrc:
 			print(file)
 		print('-'*80)
@@ -2654,7 +2674,7 @@ def remove_extra_files(total_file_list, dests,max_workers,verbose,files_per_job,
 			print(f"No extra files found in {dests}")
 		else:
 			print(f"Files in dest but not in src count: {len(inDestNotInSrc)}")
-			print(f"Do you want to delete them? (y/n)")
+			print("Do you want to delete them? (y/n)")
 			if not input().lower().startswith('y'):
 				exit(0)
 			start_time = time.perf_counter()
@@ -2675,7 +2695,7 @@ def mount_src_image(src_image,src_images: list,src_paths: list,mount_points: lis
 		if os.name != 'nt':
 			try:
 				src_images.extend(glob.glob(src_image_pattern,include_hidden=True,recursive=True))
-			except:
+			except Exception:
 				src_images.extend(glob.glob(src_image_pattern,recursive=True))
 		else:
 			src_images.append(src_image_pattern)
@@ -2705,7 +2725,7 @@ def mount_src_image(src_image,src_images: list,src_paths: list,mount_points: lis
 					print(f"Partition {partition} cannot be mounted, what to do? (s/f/n)")
 					print(f"s:  Skip {partition} \t:Skip this partition and continue mounting the rest ( default )")
 					print(f"f:  Fix {partition} \t:Try to fix the partition and mount it again")
-					print(f"n:  Exit")
+					print("n:  Exit")
 					# Wait for user input with a 5 second timeout
 					inStr = multiCMD.input_with_timeout_and_countdown(5)
 					if (not inStr) or inStr.lower().startswith('s'):
@@ -2720,10 +2740,10 @@ def mount_src_image(src_image,src_images: list,src_paths: list,mount_points: lis
 							print(f"Partition {partition} cannot be mounted after fixing, skipping")
 							continue
 					else:
-						print(f"Exiting")
+						print("Exiting")
 						exit(0)
 			except Exception as e:
-				print(f"Error mounting partition {partition}, skipping")
+				eprint(f"Error mounting partition {partition}, skipping")
 				print(e)
 				continue
 	return src_str.strip('-')
@@ -2735,7 +2755,7 @@ def verify_src_path(src_path,src_paths: list):
 			if os.name != 'nt':
 				try:
 					src_paths.extend(glob.glob(src_path_pattern,include_hidden=True,recursive=True))
-				except:
+				except Exception:
 					src_paths.extend(glob.glob(src_path_pattern,recursive=True))
 			else:
 				src_paths.append(src_path_pattern)
@@ -2748,7 +2768,7 @@ def verify_src_path(src_path,src_paths: list):
 		#     print(f"Remote syncing is not supported in this version, removing source path {src}.")
 		#     src_paths.remove(src)
 	if len(src_paths) == 0:
-		print(f"No source paths specified, exiting")
+		print("No source paths specified, exiting")
 		exit(0)
 
 def load_file_list(file_list):
@@ -2832,7 +2852,7 @@ def process_remove(src_paths: list,single_thread = False, max_workers = 4 * mult
 	#src = os.path.abspath(src +os.path.sep)
 	src_paths = [os.path.abspath(src + os.path.sep) for src in src_paths if os.path.exists(src)]
 	if not remove_force:
-		print(f"Do you want to continue? (y/n)")
+		print("Do you want to continue? (y/n)")
 		if not input().lower().startswith('y'):
 			exit(0)
 	processedPaths = []
@@ -2850,14 +2870,14 @@ def process_remove(src_paths: list,single_thread = False, max_workers = 4 * mult
 				try:
 					os.remove(path)
 				except Exception as e:
-					print(f"Error removing file {path}: {e}")
+					eprint(f"Error removing file {path}: {e}")
 			elif os.path.isdir(path):
 				if verbose:
 					print(f"Removing directory: {path}")
 				try:
 					shutil.rmtree(path)
 				except Exception as e:
-					print(f"Error removing directory {path}: {e}")
+					eprint(f"Error removing directory {path}: {e}")
 		else:
 			delete_files_parallel(processedPaths if batch else path, max_workers, verbose=verbose,files_per_job=files_per_job,exclude=exclude,batch=batch)
 		endTime = time.perf_counter()
@@ -2885,10 +2905,10 @@ def get_dest_from_image(dest_image,mount_points: list,loop_devices: list):
 		if os.path.ismount(target_mount_point):
 			dest = target_mount_point + os.path.sep
 		else:
-			print(f"Destination image cannot be mounted, do you want to continue? (f/d/n)")
+			print("Destination image cannot be mounted, do you want to continue? (f/d/n)")
 			print(f"f:  Fix {target_partition} \t:Try to fix the partition and mount it again ( default )")
 			print(f"d:  Delete {dest_image} \t:Delete the old and create a new image (Warning: this will overwrite the existing image)")
-			print(f"n:  Exit")
+			print("n:  Exit")
 			inStr = multiCMD.input_with_timeout_and_countdown(15)
 			if (not inStr) or inStr.lower().startswith('f'):
 				try:
@@ -2901,11 +2921,10 @@ def get_dest_from_image(dest_image,mount_points: list,loop_devices: list):
 					if os.path.ismount(target_mount_point):
 						dest = target_mount_point + os.path.sep
 					else:
-						print(f"Destination image cannot be mounted after fixing, exiting")
+						eprint("Destination image cannot be mounted after fixing, exiting")
 						exit(0)
 				except Exception as e:
-					print(f"Error fixing {target_partition}, exiting")
-					print(e)
+					eprint(f"Error fixing {target_partition}: {e}, exiting")
 					exit(0)
 			elif inStr.lower().startswith('d'):
 				run_command_in_multicmd_with_path_check(['losetup','-d',target_loop_device_dest])
@@ -2926,14 +2945,14 @@ def get_dest_from_path(dest_path,src_paths: list,src_path,can_be_none = False):
 		if len(src_path) > 1:
 			try:
 				cwd = os.path.join(os.getcwd()) + os.path.sep
-			except:
+			except Exception:
 				cwd = None
-			print(f"Destination path not specified, do you want to continue? (l/y/n/...)")
+			print("Destination path not specified, do you want to continue? (l/y/n/...)")
 			print(f"l:  {src_path[-1]} \t:Use last src_path in list ( default )")
 			if cwd:
 				print(f"y:  {cwd} \t:Use current working directory")
-			print(f"n:  Exit")
-			print(f"...:  Enter custom destination path")
+			print("n:  Exit")
+			print("...:  Enter custom destination path")
 			inStr = multiCMD.input_with_timeout_and_countdown(60)
 			if (not inStr) or inStr.lower() == 'l':
 				dest = str(src_path[-1])
@@ -2949,13 +2968,13 @@ def get_dest_from_path(dest_path,src_paths: list,src_path,can_be_none = False):
 		else:
 			try:
 				cwd = os.path.join(os.getcwd()) + os.path.sep
-			except:
+			except Exception:
 				cwd = None
-			print(f"Destination path not specified, src_path length is 1, do you want to continue? (y/n/...)")
+			print("Destination path not specified, src_path length is 1, do you want to continue? (y/n/...)")
 			if cwd:
 				print(f"y:  {os.getcwd() + os.path.sep} \t:Use current working directory ( default )")
-			print(f"n:  Exit")
-			print(f"...:  Enter custom destination path")
+			print("n:  Exit")
+			print("...:  Enter custom destination path")
 			inStr = multiCMD.input_with_timeout_and_countdown(60)
 			if (not inStr) or cwd and inStr.lower() == 'y':
 				dest = cwd
@@ -2970,8 +2989,8 @@ def get_dest_from_path(dest_path,src_paths: list,src_path,can_be_none = False):
 		return None
 	try:
 		dest = str(dest)
-	except Exception as e:
-		print(f"Error converting dest_path {dest} to string, ignoring it")
+	except Exception:
+		eprint(f"Error converting dest_path {dest} to string, ignoring it")
 		return None
 	if len(src_paths) == 1 and os.path.isdir(src_paths[0]) and not src_paths[0].endswith(os.path.sep) and not dest.endswith(os.path.sep):
 		src_paths[0] += os.path.sep
@@ -2985,7 +3004,7 @@ def get_dests(dest_paths,dest_image,mount_points: list,loop_devices: list,src_pa
 	target_mount_point = ''
 	if dest_image:
 		if os.geteuid() != 0:
-			print(f"Warning: mounting dest image likely requires root privileges, please expect errors if continuing. continuing in 5 seconds...")
+			eprint("Warning: mounting dest image likely requires root privileges, please expect errors if continuing. continuing in 5 seconds...")
 			time.sleep(5)
 		imgDest , target_mount_point = get_dest_from_image(dest_image,mount_points,loop_devices)
 		if imgDest:
@@ -3102,7 +3121,7 @@ def create_image(dest_image,target_mount_point,loop_devices: list,src_paths: lis
 				# use truncate to allocate the space
 				#run_command_in_multicmd_with_path_check(["fallocate","-l",str(image_file_size),imageName])
 				run_command_in_multicmd_with_path_check(['truncate','-s',str(image_file_size),imageName],strict=True)
-			except:
+			except Exception:
 				# use python native method to allocate the space
 				print("truncate not available, using python native method to allocate space")
 				with open(imageName, 'wb') as f:
@@ -3141,7 +3160,7 @@ def create_image(dest_image,target_mount_point,loop_devices: list,src_paths: lis
 			returnMountPoints.append(currentMountPoint)
 		return returnMountPoints
 	else:
-		print(f"Destination path not specified, exiting.")
+		print("Destination path not specified, exiting.")
 		exit(0)
 
 def process_copy(src_paths: list, dests:list = [], single_thread = False, max_workers = 4 * multiprocessing.cpu_count(),verbose = False, 
@@ -3255,7 +3274,7 @@ def validate_dd_source_path(src_path,loop_devices = None):
 def create_dd_dest_part_table(dd_src,dd_resize = [],src_path = None, dest_path = None):
 	src_path = src_path if src_path else dd_src
 	if not dest_path:
-		print(f"Destination path not specified.")
+		print("Destination path not specified.")
 		return
 	partition_infos = get_partition_infos(dd_src)
 	disk_name = dd_src
@@ -3291,7 +3310,7 @@ def create_dd_dest_part_table(dd_src,dd_resize = [],src_path = None, dest_path =
 		print(f"All data on {dest_path} will be lost, do you want to continue? (y/n) Default : y")
 		inStr = multiCMD.input_with_timeout_and_countdown(60)
 		if inStr and not inStr.lower().startswith('y'):
-			print(f"Exiting.")
+			print("Exiting.")
 			return
 	resize_image(dest_path, partition_infos[disk_name]['size'])
 	create_partition_table(dest_path,partition_infos,sorted_partitions)
@@ -3304,7 +3323,7 @@ def dd_partition(src_partition_path,dest_partition_path,partition,dd_src,dd_dest
 	dest_part_info = get_partition_infos(dd_dest)
 	if src_part_info[partition]['size'] > dest_part_info[partition]['size']:
 		print(f"Source partition size {src_part_info[partition]['size']} is than the destination partition size {dest_part_info[partition]['size']}.")
-		print(f"Cannot use DD, exiting.")
+		print("Cannot use DD, exiting.")
 		exit(1)
 	run_command_in_multicmd_with_path_check(['dd','if='+src_partition_path,'of='+dest_partition_path,'bs=1024M'],strict=True)
 
@@ -3355,18 +3374,17 @@ def get_args(args = None):
 	parser.add_argument('-d','-C','--dest_path',action='append', type=str, help='Destination Path')
 	parser.add_argument('-rds','--random_dest_selection', action='store_true', help='Randomly select destination path from the list of destination paths instead of filling round robin. Can speed up transfer if dests are on different devices. Warning: can cause unable to fit in big files as dests are filled up by smaller files.')
 	parser.add_argument('-di','--dest_image', type=str, help='Base name for destination Image, create a image file and copy the files into it.')
-	parser.add_argument('-dis','--dest_image_size', type=str, help=f'Destination Image Size, specify the size of the destination image to split into. Default is 0 (No split). Example: {{10TiB}} or {{1G}}', default='0')
+	parser.add_argument('-dis','--dest_image_size', type=str, help='Destination Image Size, specify the size of the destination image to split into. Default is 0 (No split). Example: {10TiB} or {1G}', default='0')
 	parser.add_argument('-diff', '--get_diff_image', action='store_true', help='Not implemented. Compare the source and destination file list, create a diff image of that will update the destination to source.')
 	parser.add_argument('-dd', '--disk_dump', action='store_true', help='Disk to Disk mirror, use this if you are backuping / deploying an OS from / to a disk. \
 					 Require 1 source, can be 1 src_path or 1 -si src_image, require 1 -di dest_image. Note: will only actually use dd if unable to mount / create a partition.')
-	parser.add_argument('-ddr', '--dd_resize', action='append', type=str, help=f'Resize the destination image to the specified size with -dd. Applies to biggest partiton first. Specify multiple -ddr to resize subsequent sized partitions. Example: {{100GiB}} or {{200G}}')
+	parser.add_argument('-ddr', '--dd_resize', action='append', type=str, help='Resize the destination image to the specified size with -dd. Applies to biggest partiton first. Specify multiple -ddr to resize subsequent sized partitions. Example: {100GiB} or {200G}')
 	parser.add_argument('-L','-rl','--rate_limit', type=str, default=None, help='Approximate a rate limit the copy speed in bytes/second. Example: 10M for 10 MB/s, 1Gi for 1 GiB/s. Note: do not work in single thread mode. Default is 0: no rate limit.')
 	parser.add_argument('-F','-frl','--file_rate_limit', type=str, default=None, help='Approximate a rate limit the copy speed in files/second. Example: 10K for 10240 files/s, 1Mi for 1024*1024*1024 files/s. Note: do not work in serial mode. Default is 0: no rate limit.')
 
 	try:
 		args = parser.parse_intermixed_args(args)
 	except Exception:
-		#eprint(f"Error while parsing arguments: {e!r}")
 		# try to parse the arguments using parse_known_args
 		args, unknown = parser.parse_known_args()
 		# if there are unknown arguments, we will try to parse them again using parse_args
@@ -3414,7 +3432,7 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = 4 * mul
 	if hash_size != ...:
 		try:
 			HASH_SIZE = int(hash_size)
-		except:
+		except Exception:
 			print(f"Invalid hash size {hash_size}, using default hash size {HASH_SIZE}")
 	if HASH_SIZE < 0:
 		HASH_SIZE = 0
@@ -3422,7 +3440,7 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = 4 * mul
 		print("Warning: Hash size set to 0, will not check file content for skipping.")
 	try:
 		dest_image_size = format_bytes(dest_image_size,to_int=True)
-	except:
+	except Exception:
 		print(f"Invalid destination image size {dest_image_size}, using default size 0")
 		dest_image_size = 0
 	print('-'*80)
@@ -3444,12 +3462,12 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = 4 * mul
 			return(0)
 		# check if running as root
 		if os.geteuid() != 0:
-			print("WARNING: dd mode likely requires root privileges, please expect errors. Continuing in 5 seconds...")
+			eprint("WARNING: dd mode likely requires root privileges, please expect errors. Continuing in 5 seconds...")
 			time.sleep(5)
 		print("dd mode enabled, performing Disk Dump Copy. Setting up the target ...")
 		if dest_paths:
 			if len(dest_paths) > 1:
-				print(f"Destination path is not 1, taking the first destination path as image file.")
+				print("Destination path is not 1, taking the first destination path as image file.")
 			dest_path = dest_paths[0]
 		else:
 			dest_path = dest_image
@@ -3460,7 +3478,7 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = 4 * mul
 			
 		if not dest_path and src_path:
 			print(f"Destination path not specified, using {src_path[-1]} as destination")
-			dest_path = src_path.pop()
+			dest_path = src_path[-1]
 
 		# check write permission on dest_path
 		if not os.access(os.path.dirname(os.path.abspath(dest_path)), os.W_OK):
@@ -3541,7 +3559,7 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = 4 * mul
 			return(0)
 		max_workers = min(max_workers,61)
 		if max_workers == 61:
-			print(f"Max workers set to 61 on Windows")
+			print("Max workers set to 61 on Windows")
 			print("This is because Windows has a limit of 64 threads per process and we need 3 threads for the main process")
 			print("See https://bugs.python.org/issue26903")
 
@@ -3549,7 +3567,7 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = 4 * mul
 	#     dest_path = src_path.pop()
 	if src_image:
 		if os.geteuid() != 0:
-			print("Warning: Source image mount may require root privileges, please expect errors. continuing in 5 seconds...")
+			eprint("Warning: Source image mount may require root privileges, please expect errors. continuing in 5 seconds...")
 			time.sleep(5)
 		src_str = mount_src_image(src_image,src_images,src_paths,mount_points,loop_devices)
 
@@ -3628,7 +3646,7 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = 4 * mul
 		process_remove(src_paths,single_thread=single_thread, max_workers=max_workers,verbose=verbose,
 					  files_per_job=files_per_job, remove_force=remove_force,exclude=exclude,batch=batch)
 	clean_up(mount_points,loop_devices)
-	print(f"Done.")
+	print("Done.")
 	# we exit if we are not involved with a gui
 		
 def hpcp_gui():
