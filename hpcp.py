@@ -253,9 +253,9 @@ except ImportError:
 	hasher = hashlib.blake2b()
 	xxhash_available = False
 
-version = '9.34'
+version = '9.35'
 __version__ = version
-COMMIT_DATE = '2025-10-17'
+COMMIT_DATE = '2025-10-20'
 
 MAGIC_NUMBER = 1.61803398875
 RANDOM_DESTINATION_SELECTION = False
@@ -484,6 +484,30 @@ def get_file_size(path):
 		except Exception:
 			realSize = 0
 	return realSize
+
+def get_timestamp_precision(num):
+	"""
+	Get the precision of a timestamp.
+
+	Args:
+		num (float): The number to get the precision of.
+
+	Returns:
+		int: The precision of the number. Possible precisions are 2, 1,  0.01, 0.0000001 , 1e-9
+	"""
+	if isinstance(num, int):
+		return 0
+	elif isinstance(num, float):
+		if num / 2 == int(num / 2):
+			return 2
+		if num == int(num):
+			return 1
+		if num * 100 == int(num * 100):
+			return 0.01
+		if num * 1e7 == int(num * 1e7):
+			return 0.0000001
+		return 1e-9
+	return 0
 
 #%% -- Exclude --
 def is_excluded(path, exclude=None):
@@ -1266,14 +1290,17 @@ def hash_file(path,size = ...,full_hash=False):
 def is_file_identical(src_path, dest_path,src_size,full_hash=False):
 	dst_size = os.path.getsize(dest_path)
 	# try to find the mtime are different
+	if src_size != dst_size:
+		return False
 	try:
 		src_mtime = os.path.getmtime(src_path)
 		dst_mtime = os.path.getmtime(dest_path)
-		if src_mtime != dst_mtime:
+		precision = max(get_timestamp_precision(src_mtime), get_timestamp_precision(dst_mtime))
+		if abs(src_mtime - dst_mtime) > precision * 2:
 			return False
-	except Exception:
+	except Ellipsis:
 		pass
-	return src_size == dst_size and hash_file(src_path,src_size,full_hash) == hash_file(dest_path,dst_size,full_hash)
+	return hash_file(src_path,src_size,full_hash) == hash_file(dest_path,dst_size,full_hash)
 
 def get_file_repr(filename,append_hash=False,full_hash=False):
 	if append_hash:
@@ -3479,6 +3506,7 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = 4 * mul
 		if not dest_path and src_path:
 			print(f"Destination path not specified, using {src_path[-1]} as destination")
 			dest_path = src_path[-1]
+			del src_path[-1]
 
 		# check write permission on dest_path
 		if not os.access(os.path.dirname(os.path.abspath(dest_path)), os.W_OK):
