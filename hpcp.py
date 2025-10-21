@@ -253,7 +253,7 @@ except ImportError:
 	hasher = hashlib.blake2b()
 	xxhash_available = False
 
-version = '9.35'
+version = '9.36'
 __version__ = version
 COMMIT_DATE = '2025-10-20'
 
@@ -425,7 +425,8 @@ _binCalled = {'lsblk', 'losetup', 'sgdisk', 'blkid', 'umount', 'mount','dd','cp'
 			  'mkfs', 'mkfs.btrfs', 'mkfs.xfs', 'mkfs.ntfs', 'mkfs.vfat', 'mkfs.exfat', 'mkfs.hfsplus', 
 			  'mkudffs', 'mkfs.jfs', 'mkfs.reiserfs', 'newfs', 'mkfs.bfs', 'mkfs.minix', 'mkswap',
 			  'e2fsck', 'btrfs', 'xfs_repair', 'ntfsfix', 'fsck.fat', 'fsck.exfat', 'fsck.hfsplus', 
-			  'fsck.hfs', 'fsck.jfs', 'fsck.reiserfs', 'fsck.ufs', 'fsck.minix'}
+			  'fsck.hfs', 'fsck.jfs', 'fsck.reiserfs', 'fsck.ufs', 'fsck.minix',
+			  'tune2fs', 'xfs_admin', 'exfatlabel', 'udflabel', 'jfs_tune', 'reiserfstune', 'swaplabel'}
 [check_path(program) for program in _binCalled]
 
 def run_command_in_multicmd_with_path_check(command, timeout=0,max_threads=1,quiet=False,dry_run=False,strict=False):
@@ -443,27 +444,49 @@ def run_command_in_multicmd_with_path_check(command, timeout=0,max_threads=1,qui
 	Returns:
 		list: The output of the command.
 	"""
+	return run_commands_in_multicmd_with_path_check([command], timeout=timeout, max_threads=max_threads, quiet=quiet, dry_run=dry_run, strict=strict)[0]
+
+def run_commands_in_multicmd_with_path_check(commands, timeout=0,max_threads=1,quiet=False,dry_run=False,strict=False):
+	"""
+	Run commands in multiCMD with path check.
+
+	Args:
+		commands (list): The commands to run.
+		timeout (int, optional): The timeout value in seconds. Defaults to 0.
+		max_threads (int, optional): The maximum number of threads to use. Defaults to 1.
+		quiet (bool, optional): Whether to suppress the output. Defaults to False.
+		dry_run (bool, optional): Whether to perform a dry run. Defaults to False.
+		strict (bool, optional): Whether to exit if the command fails to find the bin. Defaults to True.
+
+	Returns:
+		list: The outputs of the commands.
+	"""
 	global _binPaths
-	# Check the path of the command
-	if isinstance(command, str):
-		command = command.split()
-	if not command:
-		eprint("Error: Command is empty.")
-		# sys.exit(1)
-	if not isinstance(command[0],str):
-		command[0] = str(command[0])
-	if command[0] not in _binPaths and not check_path(command[0]):
-		eprint(f"Error: Command '{command[0]}' not found. Please consider installing it then retry.")
-		if strict: 
-			sys.exit(127)
+	newCommands = []
+	for command in commands:
+		# Check the path of the command
+		if isinstance(command, str):
+			command = command.split()
+		if not command:
+			eprint("Error: Command is empty.")
+			continue
+			# sys.exit(1)
+		if not isinstance(command[0],str):
+			command[0] = str(command[0])
+		if command[0] not in _binPaths and not check_path(command[0]):
+			eprint(f"Error: Command '{command[0]}' not found. Please consider installing it then retry.")
+			if strict: 
+				sys.exit(127)
+		newCommands.append(command)
 	# Run the command
-	task = multiCMD.run_commands([command], timeout=timeout, max_threads=max_threads, quiet=quiet, dry_run=dry_run,return_object=True)[0]
-	if task.returncode != 0:
-		if not quiet:
-			eprint(f"Error: Command '{command}' failed with return code {task.returncode}.")
-		if strict:
-			raise RuntimeError(f"Command '{command}' failed with return code {task.returncode}.")
-	return task.stdout
+	tasks = multiCMD.run_commands(newCommands, timeout=timeout, max_threads=max_threads, quiet=quiet, dry_run=dry_run,return_object=True)
+	for task in tasks:
+		if task.returncode != 0:
+			if not quiet:
+				eprint(f"Error: Command '{task.command}' failed with return code {task.returncode}.")
+			if strict:
+				raise RuntimeError(f"Command '{task.command}' failed with return code {task.returncode}.")
+	return [task.stdout for task in tasks]
 
 def get_free_space_bytes(path):
 	stat = os.statvfs(path)
@@ -877,6 +900,7 @@ def write_partition_info(image, partition_infos, partition_name):
 		warnings will be printed in these cases. Special handling is applied for read-only
 		file systems like cramfs and iso9660.
 	"""
+	delayed_commands = []
 	try:
 		# Apply the GUID code, unique GUID, and attributes to the target
 		if partition_infos[partition_name]['partition_guid_code']:
@@ -901,7 +925,8 @@ def write_partition_info(image, partition_infos, partition_name):
 				if fs_label:
 					command.extend(['-L', fs_label])
 				if fs_uuid:
-					command.extend(['-U', fs_uuid])
+					#command.extend(['-U', fs_uuid])
+					delayed_commands.append(['tune2fs', '-U', fs_uuid, target_partition])
 				command.append(target_partition)
 				run_command_in_multicmd_with_path_check(command,strict=False)
 			elif fs_type == 'btrfs':
@@ -909,6 +934,7 @@ def write_partition_info(image, partition_infos, partition_name):
 				if fs_label:
 					command.extend(['-L', fs_label])
 				if fs_uuid:
+					#cannot delay, must set during creation
 					command.extend(['-U', fs_uuid])
 				command.append(target_partition)
 				run_command_in_multicmd_with_path_check(command,strict=False)
@@ -917,7 +943,8 @@ def write_partition_info(image, partition_infos, partition_name):
 				if fs_label:
 					command.extend(['-L', fs_label])
 				if fs_uuid:
-					command.extend(['-m', f'uuid={fs_uuid}'])
+					#command.extend(['-m', f'uuid={fs_uuid}'])
+					delayed_commands.append(['xfs_admin', '-U', fs_uuid, target_partition])
 				command.append(target_partition)
 				run_command_in_multicmd_with_path_check(command,strict=False)
 			elif fs_type == 'ntfs':
@@ -937,6 +964,7 @@ def write_partition_info(image, partition_infos, partition_name):
 				if fs_label:
 					command.extend(['-n', fs_label])
 				if fs_uuid:
+					# cannot delay
 					command.extend(['-i', fs_uuid.lower().replace('-','')])
 				command.append(target_partition)
 				run_command_in_multicmd_with_path_check(command,strict=False)
@@ -947,7 +975,8 @@ def write_partition_info(image, partition_infos, partition_name):
 				command.append(target_partition)
 				run_command_in_multicmd_with_path_check(command,strict=False)
 				if fs_uuid:
-					run_command_in_multicmd_with_path_check(["exfatlabel", '-i', target_partition, fs_uuid],strict=False)
+					#run_command_in_multicmd_with_path_check(["exfatlabel", '-i', target_partition, fs_uuid],strict=False)
+					delayed_commands.append(['exfatlabel', '-i', target_partition, fs_uuid])
 			elif fs_type == 'hfsplus' or fs_type == 'hfs':
 				command = [f'mkfs.{fs_type}']
 				if fs_label:
@@ -962,7 +991,8 @@ def write_partition_info(image, partition_infos, partition_name):
 				if fs_label:
 					command.extend(['--label', fs_label])
 				if fs_uuid:
-					command.extend(['--uuid', fs_uuid])
+					#command.extend(['--uuid', fs_uuid])
+					delayed_commands.append(['udflabel', '--uuid', fs_uuid, target_partition])
 				command.append(target_partition)
 				run_command_in_multicmd_with_path_check(command,strict=False)
 			elif fs_type == 'jfs':
@@ -972,13 +1002,15 @@ def write_partition_info(image, partition_infos, partition_name):
 				command.append(target_partition)
 				run_command_in_multicmd_with_path_check(command,strict=False)
 				if fs_uuid:
-					run_command_in_multicmd_with_path_check(["jfs_tune", '-U', fs_uuid, target_partition],strict=False)
+					#run_command_in_multicmd_with_path_check(["jfs_tune", '-U', fs_uuid, target_partition],strict=False)
+					delayed_commands.append(['jfs_tune', '-U', fs_uuid, target_partition])
 			elif fs_type == 'reiserfs':
 				command = ['mkfs.reiserfs']
 				if fs_label:
 					command.extend(['-l', fs_label])
 				if fs_uuid:
-					command.extend(['-u', fs_uuid])
+					#command.extend(['-u', fs_uuid])
+					delayed_commands.append(['reiserfstune', '-u', fs_uuid, target_partition])
 				command.append(target_partition)
 				run_command_in_multicmd_with_path_check(command,strict=False)
 			elif fs_type == 'zfs':
@@ -1015,7 +1047,8 @@ def write_partition_info(image, partition_infos, partition_name):
 				if fs_label:
 					command.extend(['-L', fs_label])
 				if fs_uuid:
-					command.extend(['-U', fs_uuid])
+					#command.extend(['-U', fs_uuid])
+					delayed_commands.append(['swaplabel', '-U', fs_uuid, target_partition])
 				command.append(target_partition)
 				run_command_in_multicmd_with_path_check(command,strict=False)
 			elif fs_type == 'gpt':
@@ -1030,13 +1063,13 @@ def write_partition_info(image, partition_infos, partition_name):
 				command.append(target_partition)
 				run_command_in_multicmd_with_path_check(command,strict=False)
 			if loop_device:
-				run_command_in_multicmd_with_path_check(["losetup", '--detach', loop_device])
+				#run_command_in_multicmd_with_path_check(["losetup", '--detach', loop_device])
+				delayed_commands.append(['losetup', '--detach', loop_device])
 		if partition_infos[partition_name]['partition_name']:
 			run_command_in_multicmd_with_path_check(['sgdisk', f'--change-name={partition_name}:{partition_infos[partition_name]["partition_name"]}', image],strict=False)
-
-
 	except Exception as e:
 		eprint("An error occurred while copying partition information:", e)
+	return delayed_commands
 
 def create_partition_table(image, partition_infos,sorted_partitions):
 	"""Create a partition table in the image file that will match the source device and sort the partitions by size."""
@@ -1051,17 +1084,20 @@ def create_partition_table(image, partition_infos,sorted_partitions):
 		loop_device = create_loop_device(image)
 		image = loop_device
 	# Create the partitions
+	delayed_commands = []
 	for partition in sorted_partitions:
 		start_sector = int(run_command_in_multicmd_with_path_check(["sgdisk", '--first-aligned-in-largest', image])[0].strip())
 		end_sector = start_sector + int(partition_infos[partition]['size']/partition_infos[src_disk_path]['sector_size']) -1
 		# Create the partition
 		run_command_in_multicmd_with_path_check(["sgdisk", f'--new={partition}:{start_sector}:{end_sector}', image])
 		# Copy the partition information
-		write_partition_info(image, partition_infos,partition)
+		delayed_commands.extend(write_partition_info(image, partition_infos,partition))
 	# Fix the partition table
 	run_command_in_multicmd_with_path_check(["sgdisk", '--verify', image])
 	if loop_device:
-		run_command_in_multicmd_with_path_check(["losetup", '--detach', loop_device])
+		#run_command_in_multicmd_with_path_check(["losetup", '--detach', loop_device])
+		delayed_commands.append(['losetup', '--detach', loop_device])
+	return delayed_commands
 
 def resize_image(image, total_size):
 	"""Resize the image file to the calculated size."""
@@ -3340,9 +3376,9 @@ def create_dd_dest_part_table(dd_src,dd_resize = [],src_path = None, dest_path =
 			print("Exiting.")
 			return
 	resize_image(dest_path, partition_infos[disk_name]['size'])
-	create_partition_table(dest_path,partition_infos,sorted_partitions)
+	delayed_commands = create_partition_table(dest_path,partition_infos,sorted_partitions)
 	print("Image created successfully.")
-	return partition_infos
+	return partition_infos, delayed_commands
 
 def dd_partition(src_partition_path,dest_partition_path,partition,dd_src,dd_dest):
 	# First verify the two partition size is the same
@@ -3354,13 +3390,16 @@ def dd_partition(src_partition_path,dest_partition_path,partition,dd_src,dd_dest
 		exit(1)
 	run_command_in_multicmd_with_path_check(['dd','if='+src_partition_path,'of='+dest_partition_path,'bs=1024M'],strict=True)
 
-def clean_up(mount_points: list,loop_devices: list):
+def clean_up(mount_points: list,loop_devices: list, delayed_commands: list = []):
 	# clean up loop devices and mount points if we are using a image
 	for mount_point in mount_points:
 		print(f"Unmounting {mount_point}")
 		run_command_in_multicmd_with_path_check(["umount",mount_point])
 		print(f"Removing mount point {mount_point}")
 		os.rmdir(mount_point)
+	if delayed_commands:
+		print("Running delayed commands")
+		run_commands_in_multicmd_with_path_check(delayed_commands,strict=False)
 	for loop_device_dest in loop_devices:
 		print(f"Removing loop device {loop_device_dest}")
 		run_command_in_multicmd_with_path_check(['losetup','-d',loop_device_dest])
@@ -3513,7 +3552,7 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = 4 * mul
 			print(f"Destination path {dest_path} is not writable, continuing with high probability of failure.")
 			#exit(1)
 		dd_src = validate_dd_source_path(src_path,loop_devices = loop_devices)
-		partition_infos = create_dd_dest_part_table(dd_src,dd_resize=dd_resize,src_path=src_path, dest_path=dest_path)
+		partition_infos, delayed_commands = create_dd_dest_part_table(dd_src,dd_resize=dd_resize,src_path=src_path, dest_path=dest_path)
 		if not partition_infos:
 			return 1
 		
@@ -3574,7 +3613,7 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = 4 * mul
 																verbose=verbose, directory_only=directory_only,no_directory_sync=no_directory_sync,
 																full_hash=full_hash, files_per_job=files_per_job, parallel_file_listing=parallel_file_listing,
 																exclude=exclude,no_link_tracking = True)
-		clean_up(mount_points,loop_devices)
+		clean_up(mount_points,loop_devices,delayed_commands)
 		# sort the output partitions
 		#run_command_in_multicmd_with_path_check(f"sgdisk --sort {dest_path}")
 		print(f"Done disk dumping {src_path} to {dest_path}.")
