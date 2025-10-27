@@ -253,9 +253,9 @@ except ImportError:
 	hasher = hashlib.blake2b()
 	xxhash_available = False
 
-version = '9.36'
+version = '9.37'
 __version__ = version
-COMMIT_DATE = '2025-10-20'
+COMMIT_DATE = '2025-10-27'
 
 MAGIC_NUMBER = 1.61803398875
 RANDOM_DESTINATION_SELECTION = False
@@ -1334,7 +1334,7 @@ def is_file_identical(src_path, dest_path,src_size,full_hash=False):
 		precision = max(get_timestamp_precision(src_mtime), get_timestamp_precision(dst_mtime))
 		if abs(src_mtime - dst_mtime) > precision * 2:
 			return False
-	except Ellipsis:
+	except Exception:
 		pass
 	return hash_file(src_path,src_size,full_hash) == hash_file(dest_path,dst_size,full_hash)
 
