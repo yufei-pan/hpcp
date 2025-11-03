@@ -27,7 +27,7 @@ from concurrent.futures import ProcessPoolExecutor
 from math import log
 
 try:
-	import multiCMD
+	import multiCMD # type: ignore
 	assert float(multiCMD.version) >= 1.35
 except Exception:
 	import sys
@@ -245,7 +245,7 @@ def format_bytes(size,use_1024_bytes=None,to_int=False,to_str=False,str_format='
 '''
 	exec(_src, multiCMD.__dict__)
 try:
-	import xxhash
+	import xxhash # type: ignore
 	hasher = xxhash.xxh64()
 	xxhash_available = True
 except ImportError:
@@ -253,9 +253,9 @@ except ImportError:
 	hasher = hashlib.blake2b()
 	xxhash_available = False
 
-version = '9.37'
+version = '9.38'
 __version__ = version
-COMMIT_DATE = '2025-10-27'
+COMMIT_DATE = '2025-11-03'
 
 MAGIC_NUMBER = 1.61803398875
 RANDOM_DESTINATION_SELECTION = False
@@ -263,7 +263,51 @@ RANDOM_DESTINATION_SELECTION = False
 BYTES_RATE_LIMIT = 0
 FILES_RATE_LIMIT = 0
 
+COMMAND_TIMEOUT = 0
 ERRORS = []
+
+ERROR_TO_RETURNCODE_TABLE = {
+	'Success': 0,
+	'Runtime Error': 1,
+	'Command is empty': 64,
+	'General Exception': 70,
+	'Permission warning': 77,
+	'Platform error': 78,
+	'Command not found': 127,
+	'Task return code error': 128,
+	'Keyboard Interrupt': 130,
+	'User requested stop': 147,
+	'Create symlink os error': 160,
+	'Create symlink general error': 161,
+	'Exclude file read error': 170,
+	'Exclude file not exist': 171,
+	'Partition not found error': 180,
+	'Partition copy error': 181,
+	'Copy partition info error': 182,
+	'Copy failed': 190,
+	'Copy process crashed': 191,
+	'Source path type error': 200,
+	'Source image mount error': 201,
+	'No valid destination': 202,
+	'Remove file failed': 210,
+	'Remove directory failed': 211,
+	'Dest path DataType error': 220,
+	'Destination image broken': 221,
+	'Cannot fix destination image': 222,
+	'Destination image size too small': 223,
+	'Cannot mount destination image': 224,
+	'No destination image path': 225,
+	'Destination path does not exist': 226,
+	'Destination fs type mismatch': 227,
+	'Not enough space': 228,
+	'No DD source': 230,
+	'Too many DD sources': 231,
+	'DD source not found': 232,
+	'DD source type error': 233,
+	'Source partition larger than destination partition': 234,
+	'No source paths': 240,
+}
+RETURNCODE_TO_ERROR_TABLE = {v: k for k, v in ERROR_TO_RETURNCODE_TABLE.items()}
 
 #TODO: move label, uuid copy for dd mode AFTER hpcp copied data to avoid cannot mount because same uuid / label
 #%% ---- Helper Functions ----
@@ -277,7 +321,20 @@ def eprint(*args, **kwargs):
 	except Exception as e:
 		print(f"Error: Cannot print to stderr: {e}")
 		print(*args, **kwargs)
-	ERRORS.append(' '.join(map(str,args)))
+	stringRep = ' '.join(map(str,args))
+	if ':' in stringRep:
+		ERRORS.append(stringRep)
+
+def get_rc_from_error():
+	global ERRORS
+	global ERROR_TO_RETURNCODE_TABLE
+	if not ERRORS or len(ERRORS) == 0:
+		print('Done.')
+		rc = 0
+	else:
+		rc = max(ERROR_TO_RETURNCODE_TABLE.get(error.partition(':')[0], 128) for error in ERRORS if error.partition(':')[0] in ERROR_TO_RETURNCODE_TABLE)
+	ERRORS.clear()
+	return rc
 
 class Adaptive_Progress_Bar:
 	def __init__(self, total_count = 0, total_size = 0,refresh_interval = 0.1,last_num_job_for_stats = 10,custom_prefix = None,
@@ -391,7 +448,6 @@ class Adaptive_Progress_Bar:
 			# sleep for 0.1 seconds
 			self.print_progress()
 			time.sleep(self.refresh_interval)
-			
 
 
 _binPaths = {}
@@ -429,13 +485,13 @@ _binCalled = {'lsblk', 'losetup', 'sgdisk', 'blkid', 'umount', 'mount','dd','cp'
 			  'tune2fs', 'xfs_admin', 'exfatlabel', 'udflabel', 'jfs_tune', 'reiserfstune', 'swaplabel'}
 [check_path(program) for program in _binCalled]
 
-def run_command_in_multicmd_with_path_check(command, timeout=0,max_threads=1,quiet=False,dry_run=False,strict=False):
+def run_command_in_multicmd_with_path_check(command, timeout=...,max_threads=1,quiet=False,dry_run=False,strict=False):
 	"""
 	Run a command in multiCMD with path check.
 
 	Args:
 		command (str): The command to run.
-		timeout (int, optional): The timeout value in seconds. Defaults to 0.
+		timeout (int, optional): The timeout value in seconds. Defaults to COMMAND_TIMEOUT.
 		max_threads (int, optional): The maximum number of threads to use. Defaults to 1.
 		quiet (bool, optional): Whether to suppress the output. Defaults to False.
 		dry_run (bool, optional): Whether to perform a dry run. Defaults to False.
@@ -446,13 +502,13 @@ def run_command_in_multicmd_with_path_check(command, timeout=0,max_threads=1,qui
 	"""
 	return run_commands_in_multicmd_with_path_check([command], timeout=timeout, max_threads=max_threads, quiet=quiet, dry_run=dry_run, strict=strict)[0]
 
-def run_commands_in_multicmd_with_path_check(commands, timeout=0,max_threads=1,quiet=False,dry_run=False,strict=False):
+def run_commands_in_multicmd_with_path_check(commands, timeout=...,max_threads=1,quiet=False,dry_run=False,strict=False):
 	"""
 	Run commands in multiCMD with path check.
 
 	Args:
 		commands (list): The commands to run.
-		timeout (int, optional): The timeout value in seconds. Defaults to 0.
+		timeout (int, optional): The timeout value in seconds. Defaults to COMMAND_TIMEOUT.
 		max_threads (int, optional): The maximum number of threads to use. Defaults to 1.
 		quiet (bool, optional): Whether to suppress the output. Defaults to False.
 		dry_run (bool, optional): Whether to perform a dry run. Defaults to False.
@@ -462,33 +518,37 @@ def run_commands_in_multicmd_with_path_check(commands, timeout=0,max_threads=1,q
 		list: The outputs of the commands.
 	"""
 	global _binPaths
+	global COMMAND_TIMEOUT
+	if timeout is ...:
+		timeout = COMMAND_TIMEOUT
 	newCommands = []
 	for command in commands:
 		# Check the path of the command
 		if isinstance(command, str):
 			command = command.split()
 		if not command:
-			eprint("Error: Command is empty.")
+			eprint("Command is empty: The input command is empty")
 			continue
-			# sys.exit(1)
 		if not isinstance(command[0],str):
 			command[0] = str(command[0])
 		if command[0] not in _binPaths and not check_path(command[0]):
-			eprint(f"Error: Command '{command[0]}' not found. Please consider installing it then retry.")
+			eprint(f"Command not found: Command '{command[0]}' not found. Please consider installing it then retry.")
 			if strict: 
-				sys.exit(127)
+				raise RuntimeError(f"Command not found: Command '{command[0]}' not found. Please consider installing it then retry.")
 		newCommands.append(command)
 	# Run the command
 	tasks = multiCMD.run_commands(newCommands, timeout=timeout, max_threads=max_threads, quiet=quiet, dry_run=dry_run,return_object=True)
 	for task in tasks:
 		if task.returncode != 0:
 			if not quiet:
-				eprint(f"Error: Command '{task.command}' failed with return code {task.returncode}.")
+				eprint(f"Task return code error: Command '{task.command}' failed with return code {task.returncode}.")
 			if strict:
-				raise RuntimeError(f"Command '{task.command}' failed with return code {task.returncode}.")
+				raise RuntimeError(f"Task return code error: Command '{task.command}' failed with return code {task.returncode}.")
 	return [task.stdout for task in tasks]
 
 def get_free_space_bytes(path):
+	if not os.path.exists(path):
+		path = get_last_existing_parent(path)
 	stat = os.statvfs(path)
 	return stat.f_bavail * stat.f_frsize  # available blocks * fragment size
 
@@ -531,6 +591,73 @@ def get_timestamp_precision(num):
 			return 0.0000001
 		return 1e-9
 	return 0
+
+def get_last_existing_parent(path):
+	"""
+	Get the last existing parent directory of the given path.
+
+	Args:
+		path (str): The path to check.
+
+	Returns:
+		str: The last existing parent directory.
+	"""
+	current_path = os.path.realpath(path)
+	while not os.path.exists(current_path):
+		parent_path = os.path.dirname(current_path)
+		if current_path == parent_path:
+			return ''
+		current_path = parent_path
+	return current_path
+
+def get_fs_type_from_path(path):
+	"""
+	Get the filesystem type of the given path.
+
+	Args:
+		path (str): The path to check.
+
+	Returns:
+		str: The filesystem type of the path.
+	"""
+	try:
+		if not os.path.exists(path):
+			path = get_last_existing_parent(path)
+		if os.name == 'nt':
+			# Windows
+			drive, _ = os.path.splitdrive(os.path.abspath(path))
+			fs_type = run_command_in_multicmd_with_path_check(["fsutil", "fsinfo", "volumeinfo", drive],quiet=True)
+			for line in fs_type:
+				if 'File System Name' in line:
+					return line.partition(':')[-1].strip()
+			return ''
+		else:
+			fs_type = run_command_in_multicmd_with_path_check(["df", "-PT", path],quiet=True)[-1].split()[1]
+		return fs_type
+	except Exception:
+		return ''
+
+def expand_paths(paths):
+	"""
+	Expand a list of paths with glob patterns.
+
+	Args:
+		paths (list): The list of paths to expand.
+
+	Returns:
+		list: The list of expanded paths.
+	"""
+	output_list = []
+	for src_pattern in paths:
+		src_pattern = os.path.expanduser(src_pattern)
+		if os.name != 'nt':
+			try:
+				output_list.extend(glob.glob(src_pattern,include_hidden=True,recursive=True))
+			except Exception:
+				output_list.extend(glob.glob(src_pattern,recursive=True))
+		else:
+			output_list.append(src_pattern)
+	return output_list
 
 #%% -- Exclude --
 def is_excluded(path, exclude=None):
@@ -582,9 +709,9 @@ def format_exclude(exclude = None,exclude_file = None) -> frozenset:
 				with open(exclude_file,'r') as f:
 					exclude.update(f.read().splitlines())
 			except Exception:
-				eprint(f"Error encounted while reading exclude file {exclude_file}, skipping")
+				eprint(f"Exclude file read error: Error encountered while reading exclude file {exclude_file}, skipping")
 		else:
-			eprint(f"Exclude file {exclude_file} does not exist, skipping")
+			eprint(f"Exclude file not exist: Exclude file {exclude_file} does not exist, skipping")
 
 	exclude = set([re.sub(r'/+','/','*/'+ path if not path.startswith('*/') else path) if not path.startswith('/') else path for path in exclude ])
 	# freeze frozenset
@@ -915,7 +1042,7 @@ def write_partition_info(image, partition_infos, partition_name):
 		if partition_infos[partition_name]['fs_type']:
 			target_partition, loop_device = get_target_partition(image, partition_name)
 			if not target_partition:
-				eprint(f"Error: Cannot find partition {partition_name} in {image}.")
+				eprint(f"Partition not found error: Cannot find partition {partition_name} in {image}.")
 				return
 			fs_type = partition_infos[partition_name]['fs_type']
 			fs_label = partition_infos[partition_name]['fs_label']
@@ -1068,7 +1195,7 @@ def write_partition_info(image, partition_infos, partition_name):
 		if partition_infos[partition_name]['partition_name']:
 			run_command_in_multicmd_with_path_check(['sgdisk', f'--change-name={partition_name}:{partition_infos[partition_name]["partition_name"]}', image],strict=False)
 	except Exception as e:
-		eprint("An error occurred while copying partition information:", e)
+		eprint("Partition copy error: An error occurred while copying partition information:", e)
 	return delayed_commands
 
 def create_partition_table(image, partition_infos,sorted_partitions):
@@ -1201,14 +1328,14 @@ def create_sym_links(symLinks,exclude=None,no_link_tracking=False):
 			multiCMD.print_progress_bar(counter, len(symLinks), prefix=prefix, suffix=suffix)
 			# we catch the file name too long exception
 		except OSError as e:
-			eprint(f"""
+			eprint(f"""Create symlink os error:
 Exception caught! Possibly file name too long!
 {e}
 {src} -> {dests}
 Skipping...""")
 			continue
 		except Exception as e:
-			eprint(f"""
+			eprint(f"""Create symlink general error:
 Exception caught!
 {e}
 {src} -> {dests}
@@ -1413,7 +1540,7 @@ def get_file_list_serial(root,exclude=None,append_hash=False,full_hash=False):
 				folders.update(dir_folders)
 		#multiCMD.print_progress_bar(iteration=iteration, total=iteration, prefix=f'{root}', suffix=f'Files: {format_bytes(len(file_list),use_1024_bytes=False,to_str=True)} Links: {format_bytes(len(links),use_1024_bytes=False,to_str=True)} Folders: {format_bytes(len(folders),use_1024_bytes=False,to_str=True)} Size: {format_bytes(size)}B')
 	else:
-		eprint(f'Error: {root} is not a file or directory')
+		eprint(f'Source path type error: {root} is not a file or directory')
 		return frozenset([root]) ,frozenset(), 0,frozenset()
 	return frozenset(file_list), frozenset(links) , size, frozenset(folders - set(['.', '..']))
 
@@ -1686,7 +1813,7 @@ def copy_file(src_path, dest_paths, full_hash=False, verbose=False, concurrent_p
 						# if the parent path for the file does not exist, create it
 						os.makedirs(os.path.dirname(dest_path), exist_ok=True)
 						if os.name == 'posix':
-							run_command_in_multicmd_with_path_check(["cp", "-af", "--sparse=always", src_path, dest_path],timeout=0,quiet=True,strict=True)
+							run_command_in_multicmd_with_path_check(["cp", "-af", "--sparse=always", src_path, dest_path],quiet=True,strict=True)
 							copiedSize = get_file_size(dest_path)
 						else:
 							shutil.copy2(src_path, dest_path, follow_symlinks=False)
@@ -1703,17 +1830,17 @@ def copy_file(src_path, dest_paths, full_hash=False, verbose=False, concurrent_p
 								print(traceback.format_exc())
 								print(f'Trying to copy from {src_path} to {dest_path} without sparse')
 							if os.name == 'posix':
-								run_command_in_multicmd_with_path_check(["cp", "-af", src_path, dest_path],timeout=0,quiet=True,strict=True)
+								run_command_in_multicmd_with_path_check(["cp", "-af", src_path, dest_path],quiet=True,strict=True)
 								#task_to_run = ["cp", "-af", src_path, dest_path]
 							elif os.name == 'nt':
-								run_command_in_multicmd_with_path_check(["xcopy", "/I", "/E", "/Y", "/c", "/q", "/k", "/r", "/h", "/x", src_path, dest_path],timeout=0,quiet=True,strict=True)
+								run_command_in_multicmd_with_path_check(["xcopy", "/I", "/E", "/Y", "/c", "/q", "/k", "/r", "/h", "/x", src_path, dest_path],quiet=True,strict=True)
 								#task_to_run = ["xcopy", "/I", "/E", "/Y", "/c", "/q", "/k", "/r", "/h", "/x", src_path, dest_path]
 						elif verbose:
 							print(f'Retrying with a different destination path in {dest_paths}')
 				except Exception as e:
 					if using_bak_paths and not dest_paths:
 						import traceback
-						eprint(f'ERROR copying {src_path} to {dest_path}, No more destination paths to try: {e}')
+						eprint(f'Copy failed: ERROR copying {src_path} to {dest_path}, No more destination paths to try: {e}')
 						print(traceback.format_exc())
 						return 0, time.perf_counter() - start_time, symLinks #, task_to_run
 					elif verbose:
@@ -1726,13 +1853,13 @@ def copy_file(src_path, dest_paths, full_hash=False, verbose=False, concurrent_p
 					using_bak_paths = True
 					dest_paths = bak_dest_paths
 			if not copied:
-				eprint(f'ERROR: FAILED to copy {src_path} to {dest_paths}')
+				eprint(f'Copy failed: FAILED to copy {src_path} to {dest_paths}')
 				return 0, time.perf_counter() - start_time, symLinks
 			elif verbose:
 				print(f'Copied {src_path} to {dest_path}')
 				print(f'Estimated remaining size: {format_bytes(dest_free_space - copiedSize)}B')
 	except Exception as e:
-		eprint(f'Fatal Error copying {src_path} to {inDests}: {e}')
+		eprint(f'Copy process crashed: Fatal Error copying {src_path} to {inDests}: {e}')
 		import traceback
 		print(traceback.format_exc())
 		return 0, time.perf_counter() - start_time, symLinks #, task_to_run
@@ -2039,7 +2166,8 @@ def copy_files_parallel(src_path, dest_paths, max_workers, full_hash=False, verb
 	print(f"Estimated size: {format_bytes(init_size)}B")
 	return copy_file_list_parallel(file_list=file_list,links=links,src_path=src_path, dest_paths=dest_paths, max_workers=max_workers, full_hash=full_hash, verbose=verbose,files_per_job=files_per_job,estimated_size = init_size)
 
-def copy_files_parallel_batch(jobs, max_workers, full_hash=False, verbose=False,files_per_job=1,parallel_file_listing=False,exclude=None):
+def copy_files_parallel_batch(jobs, max_workers, full_hash=False, verbose=False,files_per_job=1,parallel_file_listing=False,exclude=None,
+							  exit_not_enough_space=False):
 	newJobs = []
 	total_symLinks = {}
 	total_files = []
@@ -2068,6 +2196,13 @@ def copy_files_parallel_batch(jobs, max_workers, full_hash=False, verbose=False,
 			file_list , links,init_size,folders  = get_file_list_parallel(src_path, max_workers,exclude=exclude)
 		else:
 			file_list,links,init_size,folders = get_file_list_serial(src_path,exclude=exclude)
+		if exit_not_enough_space:
+			# check if there is enough space on all dest paths
+			dest_free_space = sum(get_free_space_bytes(dest_path) for dest_path in dest_paths)
+			if dest_free_space < init_size:
+				eprint(f'Not enough space: free space on {dest_paths} too small, skipping copy {src_path}')
+				print(f'Free space: {format_bytes(dest_free_space)}B, Required: {format_bytes(init_size)}B')
+				continue
 		newJobs.append((src_path, dest_paths, file_list))
 		total_item_count += len(file_list)
 		total_size_count += init_size
@@ -2134,7 +2269,7 @@ def copy_files_serial(src_path, dest_paths, full_hash=False, verbose=False,exclu
 	print(f"Average bandwidth:      {format_bytes(apb.size_counter / (endTime-start_time) * 8,use_1024_bytes=False)}bps")
 	return apb.item_counter, apb.size_counter , symLinks , frozenset(file_list)
 
-def copy_files_serial_batch(jobs, full_hash=False, verbose=False,exclude=None):
+def copy_files_serial_batch(jobs, full_hash=False, verbose=False,exclude=None,exit_not_enough_space=False):
 	# skip if src path or dest path is longer than 4096 characters
 	global FILES_RATE_LIMIT
 	global BYTES_RATE_LIMIT
@@ -2173,6 +2308,13 @@ def copy_files_serial_batch(jobs, full_hash=False, verbose=False,exclude=None):
 			continue
 		print(f'Getting file list for {src_path}')
 		file_list,links,init_size,_ = get_file_list_serial(src_path,exclude=exclude)
+		if exit_not_enough_space:
+			# check if there is enough space on all dest paths
+			dest_free_space = sum(get_free_space_bytes(dest_path) for dest_path in dest_paths)
+			if dest_free_space < init_size:
+				eprint(f'Not enough space: free space on {dest_paths} too small, skipping copy {src_path}')
+				print(f'Free space: {format_bytes(dest_free_space)}B, Required: {format_bytes(init_size)}B')
+				continue
 		newJobs.append((src_path, dest_paths, file_list, set(links), init_size))
 		total_item_count += len(file_list)
 		total_size_count += init_size
@@ -2206,7 +2348,8 @@ def copy_files_serial_batch(jobs, full_hash=False, verbose=False,exclude=None):
 	return apb.item_counter, apb.size_counter , total_symLinks , frozenset(total_files)
 
 class copy_scheduler:
-	def __init__(self, max_workers = 4 * multiprocessing.cpu_count(), full_hash=False, verbose=False,files_per_job=1,parallel_file_listing=False,exclude=None):
+	def __init__(self, max_workers = 4 * multiprocessing.cpu_count(), full_hash=False, verbose=False,files_per_job=1,
+			  parallel_file_listing=False,exclude=None, exit_not_enough_space=False):
 		self.max_workers = max_workers
 		self.full_hash = full_hash
 		self.verbose = verbose	
@@ -2220,6 +2363,7 @@ class copy_scheduler:
 		self.copy_size_counter = 0
 		self.total_sym_links = {}
 		self.total_file_list = []
+		self.exit_not_enough_space = exit_not_enough_space
 	def add_dir_sync(self, src, dests):
 		self.dir_sync_job.append((src, dests))
 	def add_copy(self, src, dests):
@@ -2243,11 +2387,11 @@ class copy_scheduler:
 			else:
 				print("Using blake2b for skipping")
 			if self.max_workers == 1:
-				copy_counter, copy_size_counter , rtnSymLinks , file_list = copy_files_serial_batch(self.copy_job, full_hash = self.full_hash,verbose=self.verbose,exclude=self.exclude)
+				copy_counter, copy_size_counter , rtnSymLinks , file_list = copy_files_serial_batch(self.copy_job, full_hash = self.full_hash,verbose=self.verbose,exclude=self.exclude,exit_not_enough_space=self.exit_not_enough_space)
 				#total_file_list.update(trim_paths(file_list,src))
 				#self.total_file_list.update(trim_paths(rtnSymLinks.keys(),src))
 			else:
-				copy_counter, copy_size_counter , rtnSymLinks , file_list = copy_files_parallel_batch(self.copy_job, max_workers=self.max_workers,full_hash = self.full_hash,verbose=self.verbose,files_per_job=self.files_per_job,parallel_file_listing=self.parallel_file_listing,exclude=self.exclude)
+				copy_counter, copy_size_counter , rtnSymLinks , file_list = copy_files_parallel_batch(self.copy_job, max_workers=self.max_workers,full_hash = self.full_hash,verbose=self.verbose,files_per_job=self.files_per_job,parallel_file_listing=self.parallel_file_listing,exclude=self.exclude,exit_not_enough_space=self.exit_not_enough_space)
 				#total_file_list.update(trim_paths(file_list,src))
 				#self.total_file_list.update(trim_paths(rtnSymLinks.keys(),src))
 			print(f'Total files copied:     {copy_counter}')
@@ -2739,7 +2883,7 @@ def remove_extra_files(total_file_list, dests,max_workers,verbose,files_per_job,
 			print(f"Files in dest but not in src count: {len(inDestNotInSrc)}")
 			print("Do you want to delete them? (y/n)")
 			if not input().lower().startswith('y'):
-				exit(0)
+				raise RuntimeError("User requested stop: Not deleting extra files")
 			start_time = time.perf_counter()
 			if single_thread:
 				for file in inDestNotInSrc:
@@ -2753,15 +2897,7 @@ def remove_extra_files(total_file_list, dests,max_workers,verbose,files_per_job,
 			print(f"Time taken to remove extra files: {endTime-start_time:0.4f} seconds")
 
 #%% ---- Main Helper Functions ----
-def mount_src_image(src_image,src_images: list,src_paths: list,mount_points: list,loop_devices: list):
-	for src_image_pattern in src_image:
-		if os.name != 'nt':
-			try:
-				src_images.extend(glob.glob(src_image_pattern,include_hidden=True,recursive=True))
-			except Exception:
-				src_images.extend(glob.glob(src_image_pattern,recursive=True))
-		else:
-			src_images.append(src_image_pattern)
+def mount_src_image(src_images: list,src_paths: list,mount_points: list,loop_devices: list):
 	src_str = ''
 	for src in src_images:
 		if not os.path.exists(src):
@@ -2804,25 +2940,14 @@ def mount_src_image(src_image,src_images: list,src_paths: list,mount_points: lis
 							continue
 					else:
 						print("Exiting")
-						exit(0)
+						raise RuntimeError("User requested stop: Exiting due to mount error")
 			except Exception as e:
-				eprint(f"Error mounting partition {partition}, skipping")
+				eprint(f"Source image mount error: Error mounting partition {partition}, skipping")
 				print(e)
 				continue
 	return src_str.strip('-')
 
-def verify_src_path(src_path,src_paths: list):
-	if src_path:
-		for src_path_pattern in src_path:
-			#print(src_path_pattern)
-			if os.name != 'nt':
-				try:
-					src_paths.extend(glob.glob(src_path_pattern,include_hidden=True,recursive=True))
-				except Exception:
-					src_paths.extend(glob.glob(src_path_pattern,recursive=True))
-			else:
-				src_paths.append(src_path_pattern)
-			#print(src_paths)
+def verify_src_path(src_paths: list):
 	for src in src_paths:
 		if not os.path.exists(src):
 			print(f"Source path {src} does not exist")
@@ -2831,8 +2956,7 @@ def verify_src_path(src_path,src_paths: list):
 		#     print(f"Remote syncing is not supported in this version, removing source path {src}.")
 		#     src_paths.remove(src)
 	if len(src_paths) == 0:
-		print("No source paths specified, exiting")
-		exit(0)
+		raise RuntimeError("No source paths: No source paths specified, exiting")
 
 def load_file_list(file_list):
 	if not os.path.exists(file_list):
@@ -2875,7 +2999,7 @@ def store_file_list(file_list, src_paths: list, single_thread=False, max_workers
 			print('-' * 80)
 		else:
 			print("Currently only supports removing extra files for a single src_path when using file_list")
-		exit(0)
+		raise RuntimeError("Completed removing extra files, exiting")
 	fileList = set()
 	for src in src_paths:
 		print(f"Getting file list from {src}")
@@ -2906,8 +3030,6 @@ def store_file_list(file_list, src_paths: list, single_thread=False, max_workers
 		with open(file_list, 'w') as f:
 			for file in fileList:
 				f.write(file + '\n')
-	# cleanUp(mount_points,loop_devices)
-	# exit(0)
 
 def process_remove(src_paths: list,single_thread = False, max_workers = 4 * multiprocessing.cpu_count(),verbose = False,
 				  files_per_job = 1, remove_force = False,exclude=None,batch = False):
@@ -2917,7 +3039,7 @@ def process_remove(src_paths: list,single_thread = False, max_workers = 4 * mult
 	if not remove_force:
 		print("Do you want to continue? (y/n)")
 		if not input().lower().startswith('y'):
-			exit(0)
+			raise RuntimeError("User requested stop: Not removing files")
 	processedPaths = []
 	for path in src_paths:
 		while os.path.basename(path) == '':
@@ -2933,14 +3055,14 @@ def process_remove(src_paths: list,single_thread = False, max_workers = 4 * mult
 				try:
 					os.remove(path)
 				except Exception as e:
-					eprint(f"Error removing file {path}: {e}")
+					eprint(f"Remove file failed: Error removing file {path}: {e}")
 			elif os.path.isdir(path):
 				if verbose:
 					print(f"Removing directory: {path}")
 				try:
 					shutil.rmtree(path)
 				except Exception as e:
-					eprint(f"Error removing directory {path}: {e}")
+					eprint(f"Remove directory failed: Error removing directory {path}: {e}")
 		else:
 			delete_files_parallel(processedPaths if batch else path, max_workers, verbose=verbose,files_per_job=files_per_job,exclude=exclude,batch=batch)
 		endTime = time.perf_counter()
@@ -2984,17 +3106,15 @@ def get_dest_from_image(dest_image,mount_points: list,loop_devices: list):
 					if os.path.ismount(target_mount_point):
 						dest = target_mount_point + os.path.sep
 					else:
-						eprint("Destination image cannot be mounted after fixing, exiting")
-						exit(0)
+						raise RuntimeError("Destination image broken: Destination image cannot be mounted after fixing, exiting")
 				except Exception as e:
-					eprint(f"Error fixing {target_partition}: {e}, exiting")
-					exit(0)
+					raise RuntimeError(f"Cannot fix destination image: Error fixing {target_partition}: {e}, exiting")
 			elif inStr.lower().startswith('d'):
 				run_command_in_multicmd_with_path_check(['losetup','-d',target_loop_device_dest])
 				delete_file_bulk([dest_image])
 				dest = None
 			else:
-				exit(0)
+				raise RuntimeError("User requested stop: Exiting due to mount error")
 	else:
 		dest = None
 	return dest , target_mount_point
@@ -3025,7 +3145,7 @@ def get_dest_from_path(dest_path,src_paths: list,src_path,can_be_none = False):
 				dest = cwd
 				print(f"Destination path not specified, using {dest}")
 			elif inStr.lower() == 'n':
-				exit(0)
+				raise RuntimeError("User requested stop: Exiting due to no destination path specified")
 			else:
 				dest = inStr
 		else:
@@ -3043,7 +3163,7 @@ def get_dest_from_path(dest_path,src_paths: list,src_path,can_be_none = False):
 				dest = cwd
 				print(f"Destination path not specified, using {dest}")
 			elif inStr.lower() == 'n':
-				exit(0)
+				raise RuntimeError("User requested stop: Exiting due to no destination path specified")
 			else:
 				dest = inStr
 	else:
@@ -3053,7 +3173,7 @@ def get_dest_from_path(dest_path,src_paths: list,src_path,can_be_none = False):
 	try:
 		dest = str(dest)
 	except Exception:
-		eprint(f"Error converting dest_path {dest} to string, ignoring it")
+		eprint(f"Dest path DataType error: Error converting dest_path {dest} to string, ignoring it")
 		return None
 	if len(src_paths) == 1 and os.path.isdir(src_paths[0]) and not src_paths[0].endswith(os.path.sep) and not dest.endswith(os.path.sep):
 		src_paths[0] += os.path.sep
@@ -3067,7 +3187,7 @@ def get_dests(dest_paths,dest_image,mount_points: list,loop_devices: list,src_pa
 	target_mount_point = ''
 	if dest_image:
 		if os.geteuid() != 0:
-			eprint("Warning: mounting dest image likely requires root privileges, please expect errors if continuing. continuing in 5 seconds...")
+			eprint("Permission warning, mounting dest image likely requires root privileges, please expect errors if continuing. continuing in 5 seconds...")
 			time.sleep(5)
 		imgDest , target_mount_point = get_dest_from_image(dest_image,mount_points,loop_devices)
 		if imgDest:
@@ -3076,9 +3196,18 @@ def get_dests(dest_paths,dest_image,mount_points: list,loop_devices: list,src_pa
 			print(f"Destination image {dest_image} does not exist, using dest_paths {dest_paths}")
 	if dest_paths:
 		for dest in dest_paths:
-			pathDest = get_dest_from_path(dest,src_paths,src_path,can_be_none=can_be_none)
-			if pathDest:
-				dests.append(pathDest)
+			if '*' in dest or '?' in dest or '[' in dest:
+				expanded_dests = expand_paths(dest)
+			else:
+				expanded_dests = [os.path.expanduser(dest)]
+			for path in expanded_dests:
+				pathDest = get_dest_from_path(path,src_paths,src_path,can_be_none=can_be_none)
+				if pathDest:
+					dests.append(pathDest)
+	else:
+		pathDest = get_dest_from_path(None,src_paths,src_path,can_be_none=can_be_none)
+		if pathDest:
+			dests.append(pathDest)
 	# get the str representation of the dests
 	dest_str = '_'.join([os.path.basename(os.path.realpath(dest)) for dest in dests])
 	if not dest_str:
@@ -3096,8 +3225,7 @@ def process_compare_file_list(src_paths: list, dests, max_workers = 4 * multipro
 			newDests.append(dest)
 	dests = newDests
 	if not dests:
-		print(f"Destination image {dest_image} does not exist or dests {dests} is empty, exiting.")
-		exit(1)
+		raise RuntimeError(f"No destination paths in cpl: Destination image {dest_image} does not exist or dests {dests} is empty when comparing file lists, exiting")
 	print(f"Comparing file list from {src_paths} with {dests}")
 	file_list = set()
 	for src in src_paths:
@@ -3161,8 +3289,7 @@ def create_image(dest_image,target_mount_point,loop_devices: list,src_paths: lis
 			image_file_size = dest_image_size
 		else:
 			if slag >= dest_image_size:
-				print(f"Estimated file system bloat size {format_bytes(slag)}B is larger than destination image size {format_bytes(dest_image_size)}B, exiting")
-				exit(1)
+				raise RuntimeError(f"Destination image size too small: Estimated file system bloat size {format_bytes(slag)}B is larger than destination image size {format_bytes(dest_image_size)}B, exiting")
 			dest_image_usable_size = int((dest_image_size - slag) * 0.90)
 			number_of_images = image_file_size // dest_image_usable_size + 1
 			print(f"Destination image size {format_bytes(dest_image_size)}B is smaller than estimated content size {format_bytes(image_file_size)}B, creating {number_of_images} images of size {format_bytes(dest_image_size)}B")
@@ -3218,17 +3345,15 @@ def create_image(dest_image,target_mount_point,loop_devices: list,src_paths: lis
 			run_command_in_multicmd_with_path_check(["mount",target_partition,currentMountPoint],strict=False)
 			# verify mount
 			if not os.path.ismount(currentMountPoint):
-				print(f"Destination image {imageName} cannot be mounted, exiting.")
-				exit(1)
+				raise RuntimeError(f"Cannot mount destination image: Destination image {imageName} cannot be mounted, exiting.")
 			returnMountPoints.append(currentMountPoint)
 		return returnMountPoints
 	else:
-		print("Destination path not specified, exiting.")
-		exit(0)
+		raise RuntimeError("No destination image path: Destination path not specified, exiting.")
 
 def process_copy(src_paths: list, dests:list = [], single_thread = False, max_workers = 4 * multiprocessing.cpu_count(),verbose = False, 
 				directory_only = False,no_directory_sync = False, full_hash = False, files_per_job = 1, parallel_file_listing = False,
-				exclude=None,dest_image = None,batch = False):
+				exclude=None,dest_image = None,batch = False, exit_not_enough_space = False):
 	total_file_list = set()
 	total_sym_links = {}
 	taskCtr = 0
@@ -3236,7 +3361,7 @@ def process_copy(src_paths: list, dests:list = [], single_thread = False, max_wo
 	if batch:
 		print(f"Copying from {src_paths} to {dests}")
 	max_workers = max_workers if not single_thread else 1
-	cs = copy_scheduler(max_workers=max_workers,full_hash=full_hash,verbose=verbose,files_per_job=files_per_job,parallel_file_listing=parallel_file_listing,exclude=exclude)
+	cs = copy_scheduler(max_workers=max_workers,full_hash=full_hash,verbose=verbose,files_per_job=files_per_job,parallel_file_listing=parallel_file_listing,exclude=exclude,exit_not_enough_space=exit_not_enough_space)
 	for src in src_paths:
 		taskCtr += 1
 		dests = argDest.copy()
@@ -3275,7 +3400,6 @@ def process_copy(src_paths: list, dests:list = [], single_thread = False, max_wo
 		for dest in dests:
 			if not os.access(os.path.dirname(os.path.abspath(dest)), os.W_OK):
 				print(f"Destination {dest} is not writable, continue with caution.")
-				#exit(1)
 		if os.path.islink(src):
 			total_sym_links[src] = dests
 			print(f"{src} is a symlink, creating symlink in dests")
@@ -3313,21 +3437,17 @@ def validate_dd_source_path(src_path,loop_devices = None):
 		loop_devices = []
 	dd_src = src_path
 	if not dd_src:
-		print("DD Source not specified, exiting.")
-		exit(1)
+		raise RuntimeError("No DD source: DD Source not specified, exiting.")
 	if len(dd_src) != 1:
-		print("DD Source is not 1, exiting.")
-		exit(1)
+		raise RuntimeError("Too many DD sources: DD Source is not 1, exiting.")
 	dd_src = dd_src[0]
 	if not os.path.exists(dd_src):
-		print(f"DD Source {dd_src} does not exist, exiting.")
-		exit(1)
+		raise RuntimeError(f"DD source not found: DD Source {dd_src} does not exist, exiting.")
 	# check if dd_src is a block device
 	if not pathlib.Path(dd_src).resolve().is_block_device():
 		# check if dd_src is a file
 		if not os.path.isfile(dd_src):
-			print(f"DD Source {dd_src} is not a block device or a file, exiting.")
-			exit(1)
+			raise RuntimeError(f"DD source type error: DD Source {dd_src} is not a block device or a file, exiting.")
 		# mount as a loop device
 		print(f"DD Source {dd_src} is a file, mounting as a loop device")
 		dd_src = create_loop_device(dd_src,read_only=True)
@@ -3364,8 +3484,8 @@ def create_dd_dest_part_table(dd_src,dd_resize = [],src_path = None, dest_path =
 		disk_info['size'] = sum([partition_infos[partition]['size'] for partition in partition_infos]) + 1024*1024*len(partition_infos)
 	partition_infos[disk_name] = disk_info
 	sorted_partitions.append(disk_name)
-	
-	# if dest_path exit, print a confirmation message
+
+	# if dest_path exists, print a confirmation message
 	if os.path.exists(dest_path):
 		print(f"Warning: Destination path {dest_path} exists.")
 		print(f"Source device {src_path} will be copied to {dest_path} with the following partition info:")
@@ -3385,10 +3505,8 @@ def dd_partition(src_partition_path,dest_partition_path,partition,dd_src,dd_dest
 	src_part_info = get_partition_infos(dd_src)
 	dest_part_info = get_partition_infos(dd_dest)
 	if src_part_info[partition]['size'] > dest_part_info[partition]['size']:
-		print(f"Source partition size {src_part_info[partition]['size']} is than the destination partition size {dest_part_info[partition]['size']}.")
-		print("Cannot use DD, exiting.")
-		exit(1)
-	run_command_in_multicmd_with_path_check(['dd','if='+src_partition_path,'of='+dest_partition_path,'bs=1024M'],strict=True)
+		raise RuntimeError(f"Source partition larger than destination partition: {src_part_info[partition]['size']} > {dest_part_info[partition]['size']}, cannot use DD, exiting.")
+	run_command_in_multicmd_with_path_check(['dd','if='+src_partition_path,'of='+dest_partition_path,'bs=1024M'],timeout=0,strict=True)
 
 def clean_up(mount_points: list,loop_devices: list, delayed_commands: list = []):
 	# clean up loop devices and mount points if we are using a image
@@ -3397,12 +3515,15 @@ def clean_up(mount_points: list,loop_devices: list, delayed_commands: list = [])
 		run_command_in_multicmd_with_path_check(["umount",mount_point])
 		print(f"Removing mount point {mount_point}")
 		os.rmdir(mount_point)
+	mount_points.clear()
 	if delayed_commands:
 		print("Running delayed commands")
 		run_commands_in_multicmd_with_path_check(delayed_commands,strict=False)
+	delayed_commands.clear()
 	for loop_device_dest in loop_devices:
 		print(f"Removing loop device {loop_device_dest}")
 		run_command_in_multicmd_with_path_check(['losetup','-d',loop_device_dest])
+	loop_devices.clear()
 
 HASH_SIZE = 1<<24
 
@@ -3447,7 +3568,10 @@ def get_args(args = None):
 	parser.add_argument('-ddr', '--dd_resize', action='append', type=str, help='Resize the destination image to the specified size with -dd. Applies to biggest partiton first. Specify multiple -ddr to resize subsequent sized partitions. Example: {100GiB} or {200G}')
 	parser.add_argument('-L','-rl','--rate_limit', type=str, default=None, help='Approximate a rate limit the copy speed in bytes/second. Example: 10M for 10 MB/s, 1Gi for 1 GiB/s. Note: do not work in single thread mode. Default is 0: no rate limit.')
 	parser.add_argument('-F','-frl','--file_rate_limit', type=str, default=None, help='Approximate a rate limit the copy speed in files/second. Example: 10K for 10240 files/s, 1Mi for 1024*1024*1024 files/s. Note: do not work in serial mode. Default is 0: no rate limit.')
-
+	parser.add_argument('-tfs','--target_file_system', type=str, default=None, help='Specify the target file system type. Will abort if the target file system type does not match. Example: ext4, xfs, ntfs, fat32, exfat. Default is None: do not check target file system type.')
+	parser.add_argument('-ncd','--no_create_dir', action='store_true', help='Ignore any destination folder that does not already exist. ( Will still copy if dest is a file )')
+	parser.add_argument('-ctl','--command_timeout_limit', type=int, default=0, help='Set the command timeout limit in seconds for external commands ( ex. cp / dd ). Default is 0: no timeout.')
+	parser.add_argument('-enes','--exit_not_enough_space', action='store_true', help='Exit if there is not enough space on the destination instead of continuing (Note: Default is continue as in compressed fs copy can be down even if source is bigger than free space).')
 	try:
 		args = parser.parse_intermixed_args(args)
 	except Exception:
@@ -3481,11 +3605,14 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = 4 * mul
 			verbose = False, directory_only = False,no_directory_sync = False, full_hash = False, files_per_job = 1, target_file_list = "",
 			compare_file_list = False, diff_file_list = None, tar_diff_file_list = False, remove = False,remove_force = False, remove_extra = False, parallel_file_listing = False,
 			exclude=None,exclude_file = None,dest_image = None,dest_image_size = '0', no_link_tracking = False,src_image = None,dd = False,dd_resize = 0,
-			batch = False, append_hash_to_file_list = True, hash_size = ..., source_file_list = None, random_destination_selection = False, bytes_rate_limit = None, files_rate_limit = None):
+			batch = False, append_hash_to_file_list = True, hash_size = ..., source_file_list = None, random_destination_selection = False, 
+			bytes_rate_limit = None, files_rate_limit = None,target_file_system = None, no_create_dir = False, command_timeout_limit = 0,
+			exit_not_enough_space = False):
 	global HASH_SIZE
 	global RANDOM_DESTINATION_SELECTION
 	global BYTES_RATE_LIMIT
 	global FILES_RATE_LIMIT
+	global COMMAND_TIMEOUT
 	if random_destination_selection:
 		RANDOM_DESTINATION_SELECTION = True
 		print("Random destination selection enabled.")
@@ -3498,7 +3625,7 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = 4 * mul
 	if hash_size != ...:
 		try:
 			HASH_SIZE = int(hash_size)
-		except Exception:
+		except TypeError:
 			print(f"Invalid hash size {hash_size}, using default hash size {HASH_SIZE}")
 	if HASH_SIZE < 0:
 		HASH_SIZE = 0
@@ -3509,212 +3636,237 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = 4 * mul
 	except Exception:
 		print(f"Invalid destination image size {dest_image_size}, using default size 0")
 		dest_image_size = 0
+	COMMAND_TIMEOUT = command_timeout_limit if command_timeout_limit > 0 else 0
 	print('-'*80)
 	src_paths = []
-	src_images = []
 	mount_points = []
 	loop_devices = []
 	src_str = ''
 	programStartTime = time.perf_counter()
 	exclude = format_exclude(exclude,exclude_file)
+	if dest_image:
+		dest_image = os.path.expanduser(dest_image)
 	if max_workers == 0:
 		max_workers = round(0.5 * multiprocessing.cpu_count())
 	elif max_workers < 0:
 		max_workers = round(- max_workers * multiprocessing.cpu_count())
+	try:
+		if dd:
+			if os.name == 'nt':
+				raise RuntimeError("Platform error: dd mode is not supported on Windows, exiting")
+			# check if running as root
+			if os.geteuid() != 0:
+				eprint("Permission warning: dd mode likely requires root privileges, please expect errors. Continuing in 5 seconds...")
+				time.sleep(5)
+			print("dd mode enabled, performing Disk Dump Copy. Setting up the target ...")
+			if dest_paths:
+				if len(dest_paths) > 1:
+					print("Destination path is not 1, taking the first destination path as image file.")
+				dest_path = dest_paths[0]
+			else:
+				dest_path = dest_image
+			src_path = src_path if src_path else src_image
 
-	if dd:
-		if os.name == 'nt':
-			print("dd mode is not supported on Windows, exiting")
-			return(0)
-		# check if running as root
-		if os.geteuid() != 0:
-			eprint("WARNING: dd mode likely requires root privileges, please expect errors. Continuing in 5 seconds...")
-			time.sleep(5)
-		print("dd mode enabled, performing Disk Dump Copy. Setting up the target ...")
-		if dest_paths:
-			if len(dest_paths) > 1:
-				print("Destination path is not 1, taking the first destination path as image file.")
-			dest_path = dest_paths[0]
-		else:
-			dest_path = dest_image
-		src_path = src_path if src_path else src_image
+			if dest_image_size:
+				print(f"Currently not supporting dest_image_size in dd mode. Ignoring dest_image_size {dest_image_size}.")
+				
+			if not dest_path and src_path:
+				print(f"Destination path not specified, using {src_path[-1]} as destination")
+				dest_path = src_path[-1]
+				del src_path[-1]
 
-		if dest_image_size:
-			print(f"Currently not supporting dest_image_size in dd mode. Ignoring dest_image_size {dest_image_size}.")
+			# check write permission on dest_path
+			dest_path = os.path.expanduser(dest_path)
+			if not os.access(os.path.dirname(os.path.abspath(dest_path)), os.W_OK):
+				print(f"Destination path {dest_path} is not writable, continuing with high probability of failure.")
+			dd_src = validate_dd_source_path(src_path,loop_devices = loop_devices)
+			partition_infos, delayed_commands = create_dd_dest_part_table(dd_src,dd_resize=dd_resize,src_path=src_path, dest_path=dest_path)
+			if not partition_infos:
+				raise RuntimeError("Copy partition info error: Failed to create destination partition table, exiting.")
 			
-		if not dest_path and src_path:
-			print(f"Destination path not specified, using {src_path[-1]} as destination")
-			dest_path = src_path[-1]
-			del src_path[-1]
+			dd_dest = dest_path
+			# check if dd_dest is a block device
+			if not pathlib.Path(dd_dest).resolve().is_block_device():
+				# check if dd_dest is a file
+				if os.path.isfile(dd_dest):
+					print(f"DD Destination {dd_dest} is a file, mounting as a loop device")
+					dd_dest = create_loop_device(dd_dest)
+					loop_devices.append(dd_dest)
+			
+			_ = partition_infos.pop(dd_src)
+			# need to check if partion info is empty and fix partition table if necessary
+			src_partition_paths = get_partitions(dd_src)
+			dest_partition_paths = get_partitions(dd_dest)
+			for partition in partition_infos:
+				print(f"Copying partition {partition} from {dd_src} to {dd_dest}")
+				# mount both the src and dest to a temporary folder
+				src_mount_point = tempfile.mkdtemp()
+				mount_points.append(src_mount_point)
+				dest_mount_point = tempfile.mkdtemp()
+				mount_points.append(dest_mount_point)
+				src_partition_path = [path for path in src_partition_paths if path.endswith(partition)][0]
+				dest_partition_path = [path for path in dest_partition_paths if path.endswith(partition)][0]
+				print(f"Mounting {src_partition_path} at {src_mount_point}")
+				run_command_in_multicmd_with_path_check(['mount',src_partition_path,src_mount_point])
+				# check if the mount is successful
+				if not any(os.scandir(src_mount_point)) and not os.path.ismount(src_mount_point) and is_device(src_partition_path):
+					# if the source is a device and currently mounted, try to find the current mount point, then try to bind mount it
+					mtab = get_mount_table()
+					if src_partition_path in mtab:
+						src_partition_mount_path = mtab[src_partition_path][0]
+						print(f"Error mounting {src_partition_path}, trying to use bind mount {src_partition_mount_path}")
+						# try to bind mount
+						run_command_in_multicmd_with_path_check(['mount','--bind',src_partition_mount_path,src_mount_point],strict=False)
+				if not any(os.scandir(src_mount_point)) and not os.path.ismount(src_mount_point):
+					print(f"Error mounting {src_partition_path}, usig dd for copying.")
+					dd_partition(src_partition_path,dest_partition_path,partition,dd_src,dd_dest)
+					continue
+				print(f"Mounting {dest_partition_path} at {dest_mount_point}")
+				run_command_in_multicmd_with_path_check(['mount',dest_partition_path,dest_mount_point],strict=False)
+				# check if the mount is successful
+				if not any(os.scandir(dest_mount_point)) and not os.path.ismount(dest_mount_point) and is_device(dest_partition_path):
+					mtab = get_mount_table()
+					if dest_partition_path in mtab:
+						dest_partition_mount_path = mtab[dest_partition_path][0]
+						print(f"Error mounting {dest_partition_path}, trying to use bind mount {dest_partition_mount_path}")
+						# try to bind mount
+						run_command_in_multicmd_with_path_check(['mount','--bind',dest_partition_mount_path,dest_mount_point],strict=False)
+				if not any(os.scandir(dest_mount_point)) and not os.path.ismount(dest_mount_point):
+					print(f"Error mounting {dest_partition_path}, usig dd for copying.")
+					dd_partition(src_partition_path,dest_partition_path,partition,dd_src,dd_dest)
+					continue
+				# copy the partition files
+				print(f"Copying partition {partition} files from {src_mount_point} to {dest_mount_point}")
+				hpcp([src_mount_point], dest_paths = [dest_mount_point], single_thread=single_thread, max_workers=max_workers,
+					verbose=verbose, directory_only=directory_only,no_directory_sync=no_directory_sync,full_hash=full_hash, 
+					files_per_job=files_per_job, parallel_file_listing=parallel_file_listing,exclude=exclude,no_link_tracking = True,
+					batch=batch,append_hash_to_file_list = append_hash_to_file_list, hash_size = hash_size, source_file_list = source_file_list,
+					random_destination_selection = random_destination_selection, bytes_rate_limit = bytes_rate_limit, files_rate_limit = files_rate_limit,
+					target_file_system = target_file_system, no_create_dir = no_create_dir, command_timeout_limit = command_timeout_limit,
+					exit_not_enough_space = exit_not_enough_space)
+			clean_up(mount_points,loop_devices,delayed_commands)
+			# sort the output partitions
+			#run_command_in_multicmd_with_path_check(f"sgdisk --sort {dest_path}")
+			print(f"Done disk dumping {src_path} to {dest_path}.")
+			raise RuntimeError("Exiting after dd mode.")
+			
+		# set max_workers to 61 on windows
+		if os.name == 'nt':
+			if dest_image or src_image:
+				raise RuntimeError("Platform error: Destination / Source as a image is currently not supported on Windows, exiting")
+			max_workers = min(max_workers,61)
+			if max_workers == 61:
+				print("Max workers set to 61 on Windows")
+				print("This is because Windows has a limit of 64 threads per process and we need 3 threads for the main process")
+				print("See https://bugs.python.org/issue26903")
 
-		# check write permission on dest_path
-		if not os.access(os.path.dirname(os.path.abspath(dest_path)), os.W_OK):
-			print(f"Destination path {dest_path} is not writable, continuing with high probability of failure.")
-			#exit(1)
-		dd_src = validate_dd_source_path(src_path,loop_devices = loop_devices)
-		partition_infos, delayed_commands = create_dd_dest_part_table(dd_src,dd_resize=dd_resize,src_path=src_path, dest_path=dest_path)
-		if not partition_infos:
-			return 1
+		# if not dest_path:
+		#     dest_path = src_path.pop()
+		if src_image:
+			if os.geteuid() != 0:
+				eprint("Warning: Source image mount may require root privileges, please expect errors. continuing in 5 seconds...")
+				time.sleep(5)
+			src_images = expand_paths(src_image)
+			src_str = mount_src_image(src_images,src_paths,mount_points,loop_devices)
+
+		if source_file_list:
+			src_paths.extend(load_file_list(source_file_list))
+		src_paths.extend(expand_paths(src_path))
+		verify_src_path(src_paths)
+		if not src_str:
+			src_str = "-".join([os.path.basename(src) for src in src_paths])
+
+		if target_file_list:
+			store_file_list(target_file_list,src_paths,single_thread=single_thread, max_workers=max_workers,verbose=verbose, 
+							files_per_job=files_per_job,compare_file_list=compare_file_list, remove_extra=remove_extra,
+							parallel_file_listing=parallel_file_listing,exclude=exclude,diff_file_list=diff_file_list,tar_diff_file_list=tar_diff_file_list,src_str = src_str,
+							append_hash=append_hash_to_file_list,full_hash=full_hash)
+			raise RuntimeError("Exiting after storing file list.")
 		
-		dd_dest = dest_path
-		# check if dd_dest is a block device
-		if not pathlib.Path(dd_dest).resolve().is_block_device():
-			# check if dd_dest is a file
-			if os.path.isfile(dd_dest):
-				print(f"DD Destination {dd_dest} is a file, mounting as a loop device")
-				dd_dest = create_loop_device(dd_dest)
-				loop_devices.append(dd_dest)
+		# if dest_image:
+		# 	dest , target_mount_point = get_dest_from_image(dest_image,mount_points,loop_devices)
+		# 	dest_str = dest_image
+		# else:
+		# 	dest = get_dest_from_path(dest_path,src_paths,src_path,can_be_none=remove)
+		# 	dest_str = dest
+
+		dests, dest_folder_name, target_mount_point = get_dests(dest_paths,dest_image,mount_points,loop_devices,src_paths,src_path,can_be_none = remove)
+
+		if compare_file_list or diff_file_list:
+			if diff_file_list == 'auto':
+				if not src_str:
+					src_str = '-'.join([os.path.basename(os.path.realpath(src)) for src in src_paths])
+				diff_file_list = f'DIFF_{src_str}_TO_{dest_folder_name}_{int(time.time())}_{"tar_" if tar_diff_file_list else ""}file_list.txt'
+			process_compare_file_list(src_paths, dests, max_workers=max_workers,parallel_file_listing=parallel_file_listing,
+							exclude=exclude,dest_image=dest_image,diff_file_list=diff_file_list,tar_diff_file_list=tar_diff_file_list,append_hash=append_hash_to_file_list,full_hash=full_hash)
+			raise RuntimeError("Exiting after comparing file list.")
 		
-		_ = partition_infos.pop(dd_src)
-		# need to check if partion info is empty and fix partition table if necessary
-		src_partition_paths = get_partitions(dd_src)
-		dest_partition_paths = get_partitions(dd_dest)
-		for partition in partition_infos:
-			print(f"Copying partition {partition} from {dd_src} to {dd_dest}")
-			# mount both the src and dest to a temporary folder
-			src_mount_point = tempfile.mkdtemp()
-			mount_points.append(src_mount_point)
-			dest_mount_point = tempfile.mkdtemp()
-			mount_points.append(dest_mount_point)
-			src_partition_path = [path for path in src_partition_paths if path.endswith(partition)][0]
-			dest_partition_path = [path for path in dest_partition_paths if path.endswith(partition)][0]
-			print(f"Mounting {src_partition_path} at {src_mount_point}")
-			run_command_in_multicmd_with_path_check(['mount',src_partition_path,src_mount_point])
-			# check if the mount is successful
-			if not any(os.scandir(src_mount_point)) and not os.path.ismount(src_mount_point) and is_device(src_partition_path):
-				# if the source is a device and currently mounted, try to find the current mount point, then try to bind mount it
-				mtab = get_mount_table()
-				if src_partition_path in mtab:
-					src_partition_mount_path = mtab[src_partition_path][0]
-					print(f"Error mounting {src_partition_path}, trying to use bind mount {src_partition_mount_path}")
-					# try to bind mount
-					run_command_in_multicmd_with_path_check(['mount','--bind',src_partition_mount_path,src_mount_point],strict=False)
-			if not any(os.scandir(src_mount_point)) and not os.path.ismount(src_mount_point):
-				print(f"Error mounting {src_partition_path}, usig dd for copying.")
-				dd_partition(src_partition_path,dest_partition_path,partition,dd_src,dd_dest)
-				continue
-			print(f"Mounting {dest_partition_path} at {dest_mount_point}")
-			run_command_in_multicmd_with_path_check(['mount',dest_partition_path,dest_mount_point],strict=False)
-			# check if the mount is successful
-			if not any(os.scandir(dest_mount_point)) and not os.path.ismount(dest_mount_point) and is_device(dest_partition_path):
-				mtab = get_mount_table()
-				if dest_partition_path in mtab:
-					dest_partition_mount_path = mtab[dest_partition_path][0]
-					print(f"Error mounting {dest_partition_path}, trying to use bind mount {dest_partition_mount_path}")
-					# try to bind mount
-					run_command_in_multicmd_with_path_check(['mount','--bind',dest_partition_mount_path,dest_mount_point],strict=False)
-			if not any(os.scandir(dest_mount_point)) and not os.path.ismount(dest_mount_point):
-				print(f"Error mounting {dest_partition_path}, usig dd for copying.")
-				dd_partition(src_partition_path,dest_partition_path,partition,dd_src,dd_dest)
-				continue
-			# copy the partition files
-			print(f"Copying partition {partition} files from {src_mount_point} to {dest_mount_point}")
-			hpcp([src_mount_point], dest_paths = [dest_mount_point], single_thread=single_thread, max_workers=max_workers,
-																verbose=verbose, directory_only=directory_only,no_directory_sync=no_directory_sync,
-																full_hash=full_hash, files_per_job=files_per_job, parallel_file_listing=parallel_file_listing,
-																exclude=exclude,no_link_tracking = True)
-		clean_up(mount_points,loop_devices,delayed_commands)
-		# sort the output partitions
-		#run_command_in_multicmd_with_path_check(f"sgdisk --sort {dest_path}")
-		print(f"Done disk dumping {src_path} to {dest_path}.")
-		return 0
-		
-	# set max_workers to 61 on windows
-	if os.name == 'nt':
-		if dest_image or src_image:
-			print("Destination / Source as a image is currently not supported on Windows, exiting")
-			return(0)
-		max_workers = min(max_workers,61)
-		if max_workers == 61:
-			print("Max workers set to 61 on Windows")
-			print("This is because Windows has a limit of 64 threads per process and we need 3 threads for the main process")
-			print("See https://bugs.python.org/issue26903")
+		dests_to_remove = []
+		for dest in dests:
+			try:
+				if dest and dest != ... :
+					if dest.endswith(os.path.sep) and (not (os.path.exists(dest) or os.path.ismount(dest))):
+						if no_create_dir:
+							eprint(f"Destination path does not exist: {dest} does not exist, skipping as --no_create_dir is specified, ignoring {dest}.")
+							dests_to_remove.append(dest)
+						else:
+							os.makedirs(dest, exist_ok=True)
+					elif target_file_system:
+						destfs = get_fs_type_from_path(dest)
+						if destfs and destfs.lower() != target_file_system.lower():
+							eprint(f"Destination fs type mismatch: Expected {target_file_system}, got {destfs}, ignoring {dest}.")
+							dests_to_remove.append(dest)
+			except FileExistsError :
+				print(f"Destination path {dest} may be a mounted dir, known issue with os.path.exists\nContinuing without creating dest folder...")
+		if dests and dests_to_remove == dests:
+			raise RuntimeError("No valid destination: Exiting due to no valid destination paths.")
+		for dest in dests_to_remove:
+			dests.remove(dest)
+		if not dests:
+			if remove:
+				dests = ...
+			else:
+				dests = create_image(dest_image,target_mount_point,loop_devices,src_paths,mount_points,max_workers=max_workers,parallel_file_listing=parallel_file_listing,exclude=exclude,dest_image_size = dest_image_size)
 
-	# if not dest_path:
-	#     dest_path = src_path.pop()
-	if src_image:
-		if os.geteuid() != 0:
-			eprint("Warning: Source image mount may require root privileges, please expect errors. continuing in 5 seconds...")
-			time.sleep(5)
-		src_str = mount_src_image(src_image,src_images,src_paths,mount_points,loop_devices)
-
-	if source_file_list:
-		src_paths.extend(load_file_list(source_file_list))
-
-	verify_src_path(src_path,src_paths)
-	if not src_str:
-		src_str = "-".join([os.path.basename(src) for src in src_paths])
-
-	if target_file_list:
-		store_file_list(target_file_list,src_paths,single_thread=single_thread, max_workers=max_workers,verbose=verbose, 
-						files_per_job=files_per_job,compare_file_list=compare_file_list, remove_extra=remove_extra,
-						parallel_file_listing=parallel_file_listing,exclude=exclude,diff_file_list=diff_file_list,tar_diff_file_list=tar_diff_file_list,src_str = src_str,
-						append_hash=append_hash_to_file_list,full_hash=full_hash)
-		clean_up(mount_points,loop_devices)
-		return 0
-	
-	# if dest_image:
-	# 	dest , target_mount_point = get_dest_from_image(dest_image,mount_points,loop_devices)
-	# 	dest_str = dest_image
-	# else:
-	# 	dest = get_dest_from_path(dest_path,src_paths,src_path,can_be_none=remove)
-	# 	dest_str = dest
-
-	dests, dest_folder_name, target_mount_point = get_dests(dest_paths,dest_image,mount_points,loop_devices,src_paths,src_path,can_be_none = remove)
-
-	if compare_file_list or diff_file_list:
-		if diff_file_list == 'auto':
-			if not src_str:
-				src_str = '-'.join([os.path.basename(os.path.realpath(src)) for src in src_paths])
-			diff_file_list = f'DIFF_{src_str}_TO_{dest_folder_name}_{int(time.time())}_{"tar_" if tar_diff_file_list else ""}file_list.txt'
-		process_compare_file_list(src_paths, dests, max_workers=max_workers,parallel_file_listing=parallel_file_listing,
-						 exclude=exclude,dest_image=dest_image,diff_file_list=diff_file_list,tar_diff_file_list=tar_diff_file_list,append_hash=append_hash_to_file_list,full_hash=full_hash)
-		clean_up(mount_points,loop_devices)
-		return 0
-	
-	for dest in dests:
-		try:
-			if dest and dest != ... and dest.endswith(os.path.sep) and (not (os.path.exists(dest) or os.path.ismount(dest))):
-				os.makedirs(dest, exist_ok=True)
-		except FileExistsError :
-			print(f"Destination path {dest} maybe a mounted dir, known issue with os.path.exists\nContinuing without creating dest folder...")
-
-	if not dests:
+		if dests != ...:
+			total_file_list, total_sym_links = process_copy(src_paths, dests, single_thread=single_thread, max_workers=max_workers,
+																			verbose=verbose, directory_only=directory_only,no_directory_sync=no_directory_sync,
+																			full_hash=full_hash, files_per_job=files_per_job, parallel_file_listing=parallel_file_listing,
+																			exclude=exclude,dest_image=dest_image,batch = batch,exit_not_enough_space = exit_not_enough_space)
+			if verbose:
+				# sort file list and sym links
+				for file in natural_sort(total_file_list):
+					print(f"Copied File: {file}")
+				for link in total_sym_links:
+					print(f"Link: {link} -> {total_sym_links[link]}")
+			create_sym_links(total_sym_links,exclude=exclude,no_link_tracking=no_link_tracking)
+			if remove_extra:
+				print('-'*80)
+				remove_extra_files(total_file_list, dests,max_workers,verbose,files_per_job,single_thread,exclude=exclude)
+				print('-'*80)
+				print("Removing extra empty directories...")
+				remove_extra_dirs(src_paths, dests,exclude=exclude)
+			print('-'*80)
+			if len(src_paths) > 1:
+				print("Overall Summary:")
+				print(f"Number of files / links: {len(total_file_list)}")
+				print(f"Number of links: {len(total_sym_links)}")
+				print(f"Total time taken: {time.perf_counter()-programStartTime:0.4f} seconds")
 		if remove:
-			dests = ...
+			process_remove(src_paths,single_thread=single_thread, max_workers=max_workers,verbose=verbose,
+						files_per_job=files_per_job, remove_force=remove_force,exclude=exclude,batch=batch)
+	except KeyboardInterrupt:
+		eprint("Keyboard Interrupt: Signal received, cleaning up and exiting.")
+	except RuntimeError as e:
+		if str(e):
+			eprint(e)
 		else:
-			dests = create_image(dest_image,target_mount_point,loop_devices,src_paths,mount_points,max_workers=max_workers,parallel_file_listing=parallel_file_listing,exclude=exclude,dest_image_size = dest_image_size)
-
-	if dests != ...:
-		total_file_list, total_sym_links = process_copy(src_paths, dests, single_thread=single_thread, max_workers=max_workers,
-																		verbose=verbose, directory_only=directory_only,no_directory_sync=no_directory_sync,
-																		full_hash=full_hash, files_per_job=files_per_job, parallel_file_listing=parallel_file_listing,
-																		exclude=exclude,dest_image=dest_image,batch = batch)
-		if verbose:
-			# sort file list and sym links
-			for file in natural_sort(total_file_list):
-				print(f"Copied File: {file}")
-			for link in total_sym_links:
-				print(f"Link: {link} -> {total_sym_links[link]}")
-		create_sym_links(total_sym_links,exclude=exclude,no_link_tracking=no_link_tracking)
-		if remove_extra:
-			print('-'*80)
-			remove_extra_files(total_file_list, dests,max_workers,verbose,files_per_job,single_thread,exclude=exclude)
-			print('-'*80)
-			print("Removing extra empty directories...")
-			remove_extra_dirs(src_paths, dests,exclude=exclude)
-		print('-'*80)
-		if len(src_paths) > 1:
-			print("Overall Summary:")
-			print(f"Number of files / links: {len(total_file_list)}")
-			print(f"Number of links: {len(total_sym_links)}")
-			print(f"Total time taken: {time.perf_counter()-programStartTime:0.4f} seconds")
-	if remove:
-		process_remove(src_paths,single_thread=single_thread, max_workers=max_workers,verbose=verbose,
-					  files_per_job=files_per_job, remove_force=remove_force,exclude=exclude,batch=batch)
-	clean_up(mount_points,loop_devices)
-	print("Done.")
-	# we exit if we are not involved with a gui
+			eprint("Runtime Error: Exception raised during processing, exiting.")
+	except Exception as e:
+		eprint(f"General Exception: {e}")
+	finally:
+		clean_up(mount_points,loop_devices)
+	return get_rc_from_error()
 		
 def hpcp_gui():
 	import tkinter as tk
@@ -3835,7 +3987,10 @@ def main():
 			 target_file_list = args.target_file_list, compare_file_list = args.compare_file_list , diff_file_list = args.diff_file_list, tar_diff_file_list = args.tar_diff_file_list,remove = args.remove, remove_force =args.remove_force,
 			 remove_extra = args.remove_extra, parallel_file_listing = args.parallel_file_listing,exclude = args.exclude,exclude_file = args.exclude_file,
 			 dest_image = args.dest_image,dest_image_size=args.dest_image_size,no_link_tracking = args.no_link_tracking,src_image = args.src_image,dd=args.disk_dump,
-			 dd_resize=args.dd_resize,batch=args.batch,append_hash_to_file_list=not args.no_hash_file_list, hash_size=args.hash_size,source_file_list=args.source_file_list,random_destination_selection = args.random_dest_selection,bytes_rate_limit = args.rate_limit,files_rate_limit = args.file_rate_limit)
+			 dd_resize=args.dd_resize,batch=args.batch,append_hash_to_file_list=not args.no_hash_file_list, hash_size=args.hash_size,source_file_list=args.source_file_list,
+			 random_destination_selection = args.random_dest_selection,bytes_rate_limit = args.rate_limit,files_rate_limit = args.file_rate_limit,
+			 target_file_system = args.target_file_system, no_create_dir = args.no_create_dir, command_timeout_limit = args.command_timeout_limit,
+			 exit_not_enough_space = args.exit_not_enough_space)
 		if rtnCode:
 			exit(rtnCode)
 		
