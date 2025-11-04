@@ -253,7 +253,7 @@ except ImportError:
 	hasher = hashlib.blake2b()
 	xxhash_available = False
 
-version = '9.38'
+version = '9.39'
 __version__ = version
 COMMIT_DATE = '2025-11-03'
 
@@ -273,6 +273,7 @@ ERROR_TO_RETURNCODE_TABLE = {
 	'General Exception': 70,
 	'Permission warning': 77,
 	'Platform error': 78,
+	'Command timeout': 124,
 	'Command not found': 127,
 	'Task return code error': 128,
 	'Keyboard Interrupt': 130,
@@ -519,6 +520,7 @@ def run_commands_in_multicmd_with_path_check(commands, timeout=...,max_threads=1
 	"""
 	global _binPaths
 	global COMMAND_TIMEOUT
+	global ERRORS
 	if timeout is ...:
 		timeout = COMMAND_TIMEOUT
 	newCommands = []
@@ -539,11 +541,20 @@ def run_commands_in_multicmd_with_path_check(commands, timeout=...,max_threads=1
 	# Run the command
 	tasks = multiCMD.run_commands(newCommands, timeout=timeout, max_threads=max_threads, quiet=quiet, dry_run=dry_run,return_object=True)
 	for task in tasks:
-		if task.returncode != 0:
+		error = ''
+		if task.returncode == 124 and task.stderr[-1].strip().startswith('Timeout!'):
+			error = f"Command timeout: Command '{task.command}' timed out after {timeout} seconds."
+		elif task.returncode == 137 and task.stderr[-1].strip().startswith('Ctrl C detected, Emergency Stop!'):
+			error = f"Keyboard Interrupt: Command '{task.command}' was interrupted by user."
+		elif task.returncode != 0:
+			error = f"Task return code error: Command '{task.command}' failed with return code {task.returncode}."
+		if error:
 			if not quiet:
-				eprint(f"Task return code error: Command '{task.command}' failed with return code {task.returncode}.")
+				eprint(error)
+			else:
+				ERRORS.append(error)
 			if strict:
-				raise RuntimeError(f"Task return code error: Command '{task.command}' failed with return code {task.returncode}.")
+				raise RuntimeError(error)
 	return [task.stdout for task in tasks]
 
 def get_free_space_bytes(path):
