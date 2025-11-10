@@ -253,9 +253,9 @@ except ImportError:
 	hasher = hashlib.blake2b()
 	xxhash_available = False
 
-version = '9.39'
+version = '9.40'
 __version__ = version
-COMMIT_DATE = '2025-11-03'
+COMMIT_DATE = '2025-11-06'
 
 MAGIC_NUMBER = 1.61803398875
 RANDOM_DESTINATION_SELECTION = False
@@ -334,6 +334,7 @@ def get_rc_from_error():
 		rc = 0
 	else:
 		rc = max(ERROR_TO_RETURNCODE_TABLE.get(error.partition(':')[0], 128) for error in ERRORS if error.partition(':')[0] in ERROR_TO_RETURNCODE_TABLE)
+		print(f'Error occurred: {ERRORS}, return code: {rc}.')
 	ERRORS.clear()
 	return rc
 
