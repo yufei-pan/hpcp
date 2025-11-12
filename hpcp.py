@@ -253,9 +253,9 @@ except ImportError:
 	hasher = hashlib.blake2b()
 	xxhash_available = False
 
-version = '9.40'
+version = '9.41'
 __version__ = version
-COMMIT_DATE = '2025-11-06'
+COMMIT_DATE = '2025-11-11'
 
 MAGIC_NUMBER = 1.61803398875
 RANDOM_DESTINATION_SELECTION = False
@@ -3878,6 +3878,11 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = 4 * mul
 		eprint(f"General Exception: {e}")
 	finally:
 		clean_up(mount_points,loop_devices)
+		get_partition_details.cache_clear()
+		get_partition_infos.cache_clear()
+		hash_file.cache_clear()
+		get_file_list_serial.cache_clear()
+		get_file_list_parallel.cache_clear()
 	return get_rc_from_error()
 		
 def hpcp_gui():
