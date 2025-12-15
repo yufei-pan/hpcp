@@ -340,7 +340,7 @@ def get_rc_from_error():
 
 class Adaptive_Progress_Bar:
 	def __init__(self, total_count = 0, total_size = 0,refresh_interval = 0.1,last_num_job_for_stats = 10,custom_prefix = None,
-			  custom_suffix = None,process_word = 'Processed',use_print_thread = False, suppress_all_output = False,bytes_rate_limit = 0,files_rate_limit = 0):
+			  custom_suffix = None,process_word = 'Processed', suppress_all_output = False,bytes_rate_limit = 0,files_rate_limit = 0):
 		self.total_count = total_count
 		self.total_size = total_size
 		self.refresh_interval = refresh_interval
@@ -354,17 +354,9 @@ class Adaptive_Progress_Bar:
 		self.custom_prefix = custom_prefix
 		self.custom_suffix = custom_suffix
 		self.last_call_args = None
-		self.use_print_thread = use_print_thread
 		self.quiet = suppress_all_output
 		self.bytes_rate_limit = bytes_rate_limit
 		self.files_rate_limit = files_rate_limit
-		if use_print_thread:
-			...
-			# Disabling print thread as for python threading and process pool coexistance bug
-			self.use_print_thread = False
-			# self.print_thread = threading.Thread(target=self.print_progress_thread)
-			# self.print_thread.daemon = True
-			# self.print_thread.start()
 	def print_progress_thread(self):
 		while not self.stop_flag:
 			# sleep for refresh_interval
@@ -421,16 +413,11 @@ class Adaptive_Progress_Bar:
 			multiCMD.print_progress_bar(*callArgs)
 	def stop(self):
 		self.stop_flag = True
-		if self.use_print_thread and self.print_thread.is_alive():
-			self.print_thread.join()
 	def update(self, num_files, cpSize, cpTime= 0 , files_per_job=1):
 		self.item_counter += num_files
 		self.size_counter += cpSize
 		self.last_n_jobs.append((num_files, cpSize, cpTime, files_per_job))
-		if not self.use_print_thread:
-			self.print_progress()
 	def under_rate_limit(self):
-		# calculate the sleep time based on the rate limits
 		if self.total_count == self.item_counter:
 			return True
 		if not self.bytes_rate_limit and not self.files_rate_limit:
@@ -446,10 +433,11 @@ class Adaptive_Progress_Bar:
 				return False
 		return True
 	def rate_limit(self):
+		self.print_progress()
 		while not self.under_rate_limit():
 			# sleep for 0.1 seconds
-			self.print_progress()
 			time.sleep(self.refresh_interval)
+			self.print_progress()
 
 
 _binPaths = {}
@@ -1638,11 +1626,11 @@ def delete_file_list_parallel(file_list, max_workers, verbose=False,files_per_jo
 		max_scheduled_jobs = max_workers * 1.2
 	files_per_job = max(1,files_per_job)
 	apb = Adaptive_Progress_Bar(total_count=total_files,total_size=init_size,last_num_job_for_stats=max(1,max_workers // 2),process_word='Deleted',
-							 use_print_thread = True,suppress_all_output=verbose,bytes_rate_limit=BYTES_RATE_LIMIT,files_rate_limit=FILES_RATE_LIMIT)
+							 suppress_all_output=verbose,bytes_rate_limit=BYTES_RATE_LIMIT,files_rate_limit=FILES_RATE_LIMIT)
 	with ProcessPoolExecutor(max_workers=max_workers) as executor:
 		while file_list_iterator or futures:
 			# counter = 0
-			while file_list_iterator and len(futures) < max_scheduled_jobs and last_refresh_time - time.perf_counter() < 5 and apb.under_rate_limit():
+			while file_list_iterator and len(futures) < max_scheduled_jobs and time.perf_counter()  - last_refresh_time < 1 and apb.under_rate_limit():
 				delete_files = []
 				try:
 					for _ in range(files_per_job):
@@ -1665,17 +1653,18 @@ def delete_file_list_parallel(file_list, max_workers, verbose=False,files_per_jo
 			# 	files_per_job *= 2
 
 			current_iteration_total_run_time = 0
-			for future in done:
-				delete_files = futures.pop(future)
+			for doneTask in done:
+				delete_files = futures.pop(doneTask)
 				deleted_files_count_this_run = len(delete_files)
 				rmSize = rmTime = 0
 				try:
-					rmSize, rmTime = future.result()
+					rmSize, rmTime = doneTask.result()
 				except Exception as exc:
-					print(f'\n{future} generated an exception: {exc}')
+					print(f'\n{doneTask} generated an exception: {exc}')
 				current_iteration_total_run_time += rmTime
 				apb.update(num_files=deleted_files_count_this_run,cpSize=rmSize,cpTime=rmTime,files_per_job=files_per_job)
 			apb.scheduled_jobs = len(futures)
+			apb.print_progress()
 			if done:
 				if verbose:
 					print(f'\nAverage rmtime is {current_iteration_total_run_time / len(done):0.2f} for {len(done)} jobs with {deleted_files_count_this_run} files each')
@@ -1691,13 +1680,19 @@ def delete_file_list_parallel(file_list, max_workers, verbose=False,files_per_jo
 						print(f'\nCompletion time is short, changing files per job to {files_per_job}')
 				if files_per_job < 1:
 					files_per_job = 1
+				if len(done) >= max_scheduled_jobs:
+					if verbose:
+						print(f'\nAll scheduled jobs are done, increasing max scheduled jobs to {max_scheduled_jobs + 1}')
+					max_scheduled_jobs += 1
 			else:
+				if verbose:
+					print('\nNo job is done yet, sleeping for a while and reducing max scheduled jobs by 1')
+				max_scheduled_jobs = max(1, max_scheduled_jobs - 1)
 				if not apb.under_rate_limit():
 					if verbose:
-						print('\nWe had hit the rate limit, changing files per job to 1')
+						print('\nWe had hit the rate limit and no job is running currently, setting files per job to 1')
 					files_per_job = 1
 				time.sleep(apb.refresh_interval)
-				apb.print_progress()
 			last_refresh_time = time.perf_counter()
 	endTime = time.perf_counter()
 	apb.stop()
@@ -1979,7 +1974,7 @@ def copy_file_list_parallel(file_list, links, src_path, dest_paths, max_workers,
 	if len(file_list) == 0:
 		return 0, 0, symLinks , frozenset()
 	print(f"Processing {len(file_list)} files with {max_workers} workers")
-	apb = Adaptive_Progress_Bar(total_count=total_files,total_size=estimated_size,last_num_job_for_stats=max(1,max_workers//10),process_word='Copied',use_print_thread = True,suppress_all_output=verbose,bytes_rate_limit=BYTES_RATE_LIMIT,files_rate_limit=FILES_RATE_LIMIT)
+	apb = Adaptive_Progress_Bar(total_count=total_files,total_size=estimated_size,last_num_job_for_stats=max(1,max_workers//10),process_word='Copied',suppress_all_output=verbose,bytes_rate_limit=BYTES_RATE_LIMIT,files_rate_limit=FILES_RATE_LIMIT)
 	with ProcessPoolExecutor(max_workers=max_workers) as executor:
 		while file_list_iterator or futures:
 			# counter = 0
@@ -2018,6 +2013,7 @@ def copy_file_list_parallel(file_list, links, src_path, dest_paths, max_workers,
 				apb.update(num_files=copied_file_count_this_run,cpSize=cpSize,cpTime=cpTime,files_per_job=files_per_job)
 				symLinks.update(rtnSymLinks)
 			apb.scheduled_jobs = len(futures)
+			apb.print_progress()
 			if done:
 				if verbose:
 						print(f'\nAverage cptime is {current_iteration_total_run_time / len(done):0.2f} for {len(done)} jobs with {copied_file_count_this_run} files each')
@@ -2040,7 +2036,6 @@ def copy_file_list_parallel(file_list, links, src_path, dest_paths, max_workers,
 						print('\nWe had hit the rate limit, changing files per job to 1')
 					files_per_job = 1
 				time.sleep(apb.refresh_interval)
-				apb.print_progress()
 			lastRefreshTime = time.perf_counter()
 	endTime = time.perf_counter()
 	apb.stop()
@@ -2071,7 +2066,7 @@ def copy_file_list_parallel_batch(jobs, max_workers, full_hash=False, verbose=Fa
 	files_per_job = max(1,files_per_job)
 
 	print(f"Processing {total_item_count} files with {max_workers} workers")
-	apb = Adaptive_Progress_Bar(total_count=total_item_count,total_size=total_size_count,last_num_job_for_stats=max(1,max_workers//10),process_word='Copied',use_print_thread = True,suppress_all_output=verbose,bytes_rate_limit=BYTES_RATE_LIMIT,files_rate_limit=FILES_RATE_LIMIT)
+	apb = Adaptive_Progress_Bar(total_count=total_item_count,total_size=total_size_count,last_num_job_for_stats=max(1,max_workers//10),process_word='Copied',suppress_all_output=verbose,bytes_rate_limit=BYTES_RATE_LIMIT,files_rate_limit=FILES_RATE_LIMIT)
 	with ProcessPoolExecutor(max_workers=max_workers) as executor:
 		while job_list_iterator or futures:
 			# counter = 0
@@ -2110,6 +2105,7 @@ def copy_file_list_parallel_batch(jobs, max_workers, full_hash=False, verbose=Fa
 				apb.update(num_files=copied_file_count_this_run,cpSize=cpSize,cpTime=cpTime,files_per_job=files_per_job)
 				symLinks.update(rtnSymLinks)
 			apb.scheduled_jobs = len(futures)
+			apb.print_progress()
 			if done:
 				if verbose:
 						print(f'\nAverage cptime is {current_iteration_total_run_time / len(done):0.2f} for {len(done)} jobs with {copied_file_count_this_run} files each')
@@ -2132,7 +2128,6 @@ def copy_file_list_parallel_batch(jobs, max_workers, full_hash=False, verbose=Fa
 						print('\nWe had hit the rate limit, changing files per job to 1')
 					files_per_job = 1
 				time.sleep(apb.refresh_interval)
-				apb.print_progress()
 			lastRefreshTime = time.perf_counter()
 	endTime = time.perf_counter()
 	apb.stop()
@@ -2523,11 +2518,11 @@ def sync_directories_parallel(src, dests, max_workers, verbose=False,folder_per_
 	num_folders_copied_this_job = 0
 
 	print(f"Syncing Dir from {src} to {dests} with {max_workers} workers")
-	apb = Adaptive_Progress_Bar(total_count=len(folders),total_size=len(folders),use_print_thread = True,suppress_all_output=verbose,process_word='Synced',bytes_rate_limit=BYTES_RATE_LIMIT,files_rate_limit=FILES_RATE_LIMIT)
+	apb = Adaptive_Progress_Bar(total_count=len(folders),total_size=len(folders),suppress_all_output=verbose,process_word='Synced',bytes_rate_limit=BYTES_RATE_LIMIT,files_rate_limit=FILES_RATE_LIMIT)
 	with ProcessPoolExecutor(max_workers=max_workers) as executor:
 		while folder_list_iterator or futures:
 			# counter = 0
-			while folder_list_iterator and len(futures) <  max_workers and last_refresh_time - time.perf_counter() < 5 and apb.under_rate_limit():
+			while folder_list_iterator and len(futures) <  max_workers and time.perf_counter() - last_refresh_time < 1 and apb.under_rate_limit():
 				src_folders = []
 				try:
 					for _ in range(folder_per_job):
@@ -2556,6 +2551,7 @@ def sync_directories_parallel(src, dests, max_workers, verbose=False,folder_per_
 				apb.update(num_files=num_folders_copied_this_job, cpSize=cpSize, cpTime=cpTime , files_per_job=folder_per_job)
 				symLinks.update(rtnSymLinks)
 			apb.scheduled_jobs = len(futures)
+			apb.print_progress()
 			if done:
 				if verbose:
 						print(f'\nAverage cptime is {time_spent_this_iter / len(done):0.2f} for {len(done)} jobs with {num_folders_copied_this_job} folders each')
@@ -2578,8 +2574,6 @@ def sync_directories_parallel(src, dests, max_workers, verbose=False,folder_per_
 						print('\nWe had hit the rate limit, changing folder per job to 1')
 					folder_per_job = 1
 				time.sleep(apb.refresh_interval)
-				apb.print_progress()
-			apb.rate_limit()
 			last_refresh_time = time.perf_counter()
 
 	endTime = time.perf_counter()
@@ -2623,7 +2617,7 @@ def sync_directories_parallel_batch(jobs, max_workers, verbose=False,folder_per_
 	if not allFolderToSync:
 		return symLinks
 	print(f"Syncing Dir for {len(allFolderToSync)} folders with {max_workers} workers")
-	apb = Adaptive_Progress_Bar(total_count=len(allFolderToSync),total_size=len(allFolderToSync),use_print_thread = True,suppress_all_output=verbose,process_word='Synced',bytes_rate_limit=BYTES_RATE_LIMIT,files_rate_limit=FILES_RATE_LIMIT)
+	apb = Adaptive_Progress_Bar(total_count=len(allFolderToSync),total_size=len(allFolderToSync),suppress_all_output=verbose,process_word='Synced',bytes_rate_limit=BYTES_RATE_LIMIT,files_rate_limit=FILES_RATE_LIMIT)
 	job_iterator = iter(allFolderToSync)
 	futures = {}
 	start_time = time.perf_counter()
@@ -2634,7 +2628,7 @@ def sync_directories_parallel_batch(jobs, max_workers, verbose=False,folder_per_
 	
 	with ProcessPoolExecutor(max_workers=max_workers) as executor:
 		while job_iterator or futures:
-			while job_iterator and len(futures) <  max_workers and last_refresh_time - time.perf_counter() < 5 and apb.under_rate_limit():
+			while job_iterator and len(futures) <  max_workers and time.perf_counter() - last_refresh_time < 1 and apb.under_rate_limit():
 				currentJobs = []
 				try:
 					for _ in range(folder_per_job):
@@ -2661,6 +2655,7 @@ def sync_directories_parallel_batch(jobs, max_workers, verbose=False,folder_per_
 				apb.update(num_files=num_folders_copied_this_job, cpSize=cpSize, cpTime=cpTime , files_per_job=folder_per_job)
 				symLinks.update(rtnSymLinks)
 			apb.scheduled_jobs = len(futures)
+			apb.print_progress()
 			if done:
 				if verbose:
 						print(f'\nAverage cptime is {time_spent_this_iter / len(done):0.2f} for {len(done)} jobs with {num_folders_copied_this_job} folders each')
@@ -2682,8 +2677,6 @@ def sync_directories_parallel_batch(jobs, max_workers, verbose=False,folder_per_
 						print('\nWe had hit the rate limit, changing folder per job to 1')
 					folder_per_job = 1
 				time.sleep(apb.refresh_interval)
-				apb.print_progress()
-			apb.rate_limit()
 			last_refresh_time = time.perf_counter()
 
 	endTime = time.perf_counter()
