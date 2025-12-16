@@ -253,9 +253,9 @@ except ImportError:
 	hasher = hashlib.blake2b()
 	xxhash_available = False
 
-version = '9.41'
+version = '9.42'
 __version__ = version
-COMMIT_DATE = '2025-11-11'
+COMMIT_DATE = '2025-12-16'
 
 MAGIC_NUMBER = 1.61803398875
 RANDOM_DESTINATION_SELECTION = False
@@ -264,6 +264,7 @@ BYTES_RATE_LIMIT = 0
 FILES_RATE_LIMIT = 0
 
 COMMAND_TIMEOUT = 0
+NO_CREATE_DIR = False
 ERRORS = []
 
 ERROR_TO_RETURNCODE_TABLE = {
@@ -287,6 +288,7 @@ ERROR_TO_RETURNCODE_TABLE = {
 	'Copy partition info error': 182,
 	'Copy failed': 190,
 	'Copy process crashed': 191,
+	'Remove process exception': 192,
 	'Source path type error': 200,
 	'Source image mount error': 201,
 	'No valid destination': 202,
@@ -1660,7 +1662,7 @@ def delete_file_list_parallel(file_list, max_workers, verbose=False,files_per_jo
 				try:
 					rmSize, rmTime = doneTask.result()
 				except Exception as exc:
-					print(f'\n{doneTask} generated an exception: {exc}')
+					eprint(f'Remove process exception:{doneTask} generated an exception: {exc}')
 				current_iteration_total_run_time += rmTime
 				apb.update(num_files=deleted_files_count_this_run,cpSize=rmSize,cpTime=rmTime,files_per_job=files_per_job)
 			apb.scheduled_jobs = len(futures)
@@ -1732,7 +1734,7 @@ def copy_file(src_path, dest_paths, full_hash=False, verbose=False, concurrent_p
 
 	Args:
 		src_path (str): The path of the source file.
-		dest_path (list): The list of paths of the destination file.
+		dest_paths (list): The list of paths of the destination file.
 		full_hash (bool, optional): Whether to perform a full hash comparison to determine if the files are identical. Defaults to False.
 		verbose (bool, optional): Whether to print verbose output. Defaults to False.
 		concurrent_processes (int, optional): The number of concurrent processes running in parralle. Used to calculate preemptive back-off to next dest threashold. Defaults to 0 ( Do not back-off ).
@@ -1741,6 +1743,7 @@ def copy_file(src_path, dest_paths, full_hash=False, verbose=False, concurrent_p
 		tuple: A tuple containing the size of the copied file, the time taken for the copy operation, and a dictionary of symbolic links encountered during the copy.
 	"""
 	global RANDOM_DESTINATION_SELECTION
+	global NO_CREATE_DIR
 	symLinks = {}
 	#task_to_run = []
 	# skip if src path or dest path is longer than 4096 characters
@@ -1818,7 +1821,8 @@ def copy_file(src_path, dest_paths, full_hash=False, verbose=False, concurrent_p
 				try:
 					try:
 						# if the parent path for the file does not exist, create it
-						os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+						if not NO_CREATE_DIR:
+							os.makedirs(os.path.dirname(dest_path), exist_ok=True)
 						if os.name == 'posix':
 							run_command_in_multicmd_with_path_check(["cp", "-af", "--sparse=always", src_path, dest_path],quiet=True,strict=True)
 							copiedSize = get_file_size(dest_path)
@@ -2030,10 +2034,17 @@ def copy_file_list_parallel(file_list, links, src_path, dest_paths, max_workers,
 						print(f'\nCompletion time is short, changing files per job to {files_per_job}')
 				if files_per_job < 1:
 					files_per_job = 1
+				if len(done) >= max_scheduled_jobs:
+					if verbose:
+						print(f'\nAll scheduled jobs are done, increasing max scheduled jobs to {max_scheduled_jobs + 1}')
+					max_scheduled_jobs += 1
 			else:
+				if verbose:
+					print('\nNo job is done yet, sleeping for a while and reducing max scheduled jobs by 1')
+				max_scheduled_jobs = max(1, max_scheduled_jobs - 1)
 				if not apb.under_rate_limit():
 					if verbose:
-						print('\nWe had hit the rate limit, changing files per job to 1')
+						print('\nWe had hit the rate limit and no job is running currently, setting files per job to 1')
 					files_per_job = 1
 				time.sleep(apb.refresh_interval)
 			lastRefreshTime = time.perf_counter()
@@ -2122,10 +2133,17 @@ def copy_file_list_parallel_batch(jobs, max_workers, full_hash=False, verbose=Fa
 						print(f'\nCompletion time is short, changing files per job to {files_per_job}')
 				if files_per_job < 1:
 					files_per_job = 1
+				if len(done) >= max_scheduled_jobs:
+					if verbose:
+						print(f'\nAll scheduled jobs are done, increasing max scheduled jobs to {max_scheduled_jobs + 1}')
+					max_scheduled_jobs += 1
 			else:
+				if verbose:
+					print('\nNo job is done yet, sleeping for a while and reducing max scheduled jobs by 1')
+				max_scheduled_jobs = max(1, max_scheduled_jobs - 1)
 				if not apb.under_rate_limit():
 					if verbose:
-						print('\nWe had hit the rate limit, changing files per job to 1')
+						print('\nWe had hit the rate limit and no job is running currently, setting files per job to 1')
 					files_per_job = 1
 				time.sleep(apb.refresh_interval)
 			lastRefreshTime = time.perf_counter()
@@ -2422,6 +2440,7 @@ class copy_scheduler:
 
 #%% ---- Copy Directories ----
 def sync_directory_metadata(src_path, dest_paths):
+	global NO_CREATE_DIR
 	# skip if src path or dest path is longer than 4096 characters
 	if len(src_path) > 4096:
 		print(f'Skipping: {src_path} is too long')
@@ -2445,7 +2464,7 @@ def sync_directory_metadata(src_path, dest_paths):
 	st = os.stat(src_path)
 	for dest_path in dest_paths:
 		try:
-			if not (os.path.exists(dest_path) or os.path.ismount(dest_path)):
+			if not NO_CREATE_DIR and not (os.path.exists(dest_path) or os.path.ismount(dest_path)):
 				os.makedirs(dest_path, exist_ok=True)
 		except FileExistsError:
 			print(f"Destination path {dest_path} maybe a mounted dir, known issue with os.path.exists\nContinuing without creating dest folder...")
@@ -2485,6 +2504,10 @@ def sync_directory_metadata_bulk_batch(jobs):
 def sync_directories_parallel(src, dests, max_workers, verbose=False,folder_per_job=64,exclude=None):
 	global FILES_RATE_LIMIT
 	global BYTES_RATE_LIMIT
+	if FILES_RATE_LIMIT or BYTES_RATE_LIMIT:
+		max_scheduled_jobs = max_workers
+	else:
+		max_scheduled_jobs = max_workers * 1.1
 	# skip if src path or dest path is longer than 4096 characters
 	if len(src) > 4096:
 		print(f'Skipping: {src} is too long')
@@ -2522,7 +2545,7 @@ def sync_directories_parallel(src, dests, max_workers, verbose=False,folder_per_
 	with ProcessPoolExecutor(max_workers=max_workers) as executor:
 		while folder_list_iterator or futures:
 			# counter = 0
-			while folder_list_iterator and len(futures) <  max_workers and time.perf_counter() - last_refresh_time < 1 and apb.under_rate_limit():
+			while folder_list_iterator and len(futures) <  max_scheduled_jobs and time.perf_counter() - last_refresh_time < 1 and apb.under_rate_limit():
 				src_folders = []
 				try:
 					for _ in range(folder_per_job):
@@ -2568,10 +2591,17 @@ def sync_directories_parallel(src, dests, max_workers, verbose=False,folder_per_
 						print(f'\nCompletion time is short, changing folders per job to {folder_per_job}')
 				if folder_per_job < 1:
 					folder_per_job = 1
+				if len(done) >= max_scheduled_jobs:
+					if verbose:
+						print(f'\nAll scheduled jobs are done, increasing max scheduled jobs to {max_scheduled_jobs + 1}')
+					max_scheduled_jobs += 1
 			else:
+				if verbose:
+					print('\nNo job is done yet, sleeping for a while and reducing max scheduled jobs by 1')
+				max_scheduled_jobs = max(1, max_scheduled_jobs - 1)
 				if not apb.under_rate_limit():
 					if verbose:
-						print('\nWe had hit the rate limit, changing folder per job to 1')
+						print('\nWe had hit the rate limit and no job is running currently, setting folders per job to 1')
 					folder_per_job = 1
 				time.sleep(apb.refresh_interval)
 			last_refresh_time = time.perf_counter()
@@ -2587,6 +2617,10 @@ def sync_directories_parallel(src, dests, max_workers, verbose=False,folder_per_
 def sync_directories_parallel_batch(jobs, max_workers, verbose=False,folder_per_job=64,exclude=None):
 	global FILES_RATE_LIMIT
 	global BYTES_RATE_LIMIT
+	if FILES_RATE_LIMIT or BYTES_RATE_LIMIT:
+		max_scheduled_jobs = max_workers
+	else:
+		max_scheduled_jobs = max_workers * 1.1
 	symLinks = {}
 	allFolderToSync = []
 	for src, dests in jobs:
@@ -2628,7 +2662,7 @@ def sync_directories_parallel_batch(jobs, max_workers, verbose=False,folder_per_
 	
 	with ProcessPoolExecutor(max_workers=max_workers) as executor:
 		while job_iterator or futures:
-			while job_iterator and len(futures) <  max_workers and time.perf_counter() - last_refresh_time < 1 and apb.under_rate_limit():
+			while job_iterator and len(futures) <  max_scheduled_jobs and time.perf_counter() - last_refresh_time < 1 and apb.under_rate_limit():
 				currentJobs = []
 				try:
 					for _ in range(folder_per_job):
@@ -2671,10 +2705,17 @@ def sync_directories_parallel_batch(jobs, max_workers, verbose=False,folder_per_
 						print(f'\nCompletion time is short, changing folders per job to {folder_per_job}')
 				if folder_per_job < 1:
 					folder_per_job = 1
+				if len(done) >= max_scheduled_jobs:
+					if verbose:
+						print(f'\nAll scheduled jobs are done, increasing max scheduled jobs to {max_scheduled_jobs + 1}')
+					max_scheduled_jobs += 1
 			else:
+				if verbose:
+					print('\nNo job is done yet, sleeping for a while and reducing max scheduled jobs by 1')
+				max_scheduled_jobs = max(1, max_scheduled_jobs - 1)
 				if not apb.under_rate_limit():
 					if verbose:
-						print('\nWe had hit the rate limit, changing folder per job to 1')
+						print('\nWe had hit the rate limit and no job is running currently, setting folders per job to 1')
 					folder_per_job = 1
 				time.sleep(apb.refresh_interval)
 			last_refresh_time = time.perf_counter()
@@ -3618,6 +3659,8 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = 4 * mul
 	global BYTES_RATE_LIMIT
 	global FILES_RATE_LIMIT
 	global COMMAND_TIMEOUT
+	global NO_CREATE_DIR
+	NO_CREATE_DIR = no_create_dir
 	if random_destination_selection:
 		RANDOM_DESTINATION_SELECTION = True
 		print("Random destination selection enabled.")
