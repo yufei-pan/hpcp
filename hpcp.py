@@ -312,7 +312,6 @@ ERROR_TO_RETURNCODE_TABLE = {
 }
 RETURNCODE_TO_ERROR_TABLE = {v: k for k, v in ERROR_TO_RETURNCODE_TABLE.items()}
 
-#TODO: move label, uuid copy for dd mode AFTER hpcp copied data to avoid cannot mount because same uuid / label
 #%% ---- Helper Functions ----
 def eprint(*args, **kwargs):
 	global ERRORS
