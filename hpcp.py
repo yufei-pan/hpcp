@@ -22,6 +22,7 @@ import stat
 import sys
 import tempfile
 import time
+import threading
 from collections import deque
 from concurrent.futures import ProcessPoolExecutor
 from math import log
@@ -109,7 +110,7 @@ except ImportError:
 	hasher = hashlib.blake2b()
 	xxhash_available = False
 
-version = '9.45'
+version = '9.46'
 __version__ = version
 COMMIT_DATE = '2025-02-02'
 
@@ -518,6 +519,17 @@ def expand_paths(paths):
 		else:
 			output_list.append(src_pattern)
 	return output_list
+
+def _on_worker_start():
+	parent = os.getppid()
+	def watch_parent():
+		# every 0.5s, check if parent still exists
+		while True:
+			if os.getppid() != parent:
+				os._exit(1)
+			time.sleep(0.5)
+	t = threading.Thread(target=watch_parent, daemon=True)
+	t.start()
 
 #%% -- Exclude --
 def is_excluded(path, exclude=None):
@@ -1093,8 +1105,8 @@ def resize_image(image, total_size):
 		run_command_in_multicmd_with_path_check(["truncate", f'--size={format_bytes(total_size,to_int=True)}', image],strict=True)
 
 def is_device(path):
-    mode = os.stat(path).st_mode
-    return stat.S_ISCHR(mode) or stat.S_ISBLK(mode)
+	mode = os.stat(path).st_mode
+	return stat.S_ISCHR(mode) or stat.S_ISBLK(mode)
 
 def get_mount_table():
 	"""
@@ -1427,22 +1439,7 @@ def get_file_list_parallel(path,max_workers=56,exclude=None,append_hash=False,fu
 		folder_list = set(folder_list)
 		folders_to_expand = folder_list - set([path])
 		futures = {}
-		with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
-			
-			# for subPath in os.listdir(path):
-			# 	fullPath = os.path.join(path, subPath)
-			# 	if exclude and is_excluded(fullPath,exclude):
-			# 		continue
-			# 	if os.path.islink(fullPath):
-			# 		link_list.add(get_file_repr(fullPath,append_hash,full_hash))
-			# 	elif os.path.isfile(fullPath):
-			# 		file_list.add(get_file_repr(fullPath,append_hash,full_hash))
-			# 	elif os.path.isdir(fullPath):
-			# 		futures.add(executor.submit(get_file_list_serial, fullPath,exclude=exclude,append_hash=append_hash,full_hash=full_hash))
-			# 		folder_list.add(fullPath)
-			# 	else:
-			# 		print(f'Unknown file type: {fullPath}')
-			# 		file_list.add(fullPath)
+		with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers,initializer=_on_worker_start) as executor:
 			while folders_to_expand or futures:
 				for folder in folders_to_expand:
 					futures[executor.submit(get_file_list_serial, folder,exclude=exclude,append_hash=append_hash,full_hash=full_hash,recurse=False)] = folder
@@ -1462,6 +1459,7 @@ def get_file_list_parallel(path,max_workers=56,exclude=None,append_hash=False,fu
 		print(f'Unknown file type: {path}')
 		return frozenset([path]) ,frozenset(), 0,frozenset()
 	return frozenset(file_list), frozenset(link_list) ,size, frozenset(folder_list - set(['.', '..']))
+
 
 #%% ---- Delete Files ----
 def delete_file_bulk(paths):
@@ -1499,7 +1497,7 @@ def delete_file_list_parallel(file_list, max_workers, verbose=False,files_per_jo
 							 suppress_all_output=verbose,bytes_rate_limit=BYTES_RATE_LIMIT,files_rate_limit=FILES_RATE_LIMIT)
 	last_transition_time = time.monotonic()
 	last_under_limit = True
-	with ProcessPoolExecutor(max_workers=max_workers) as executor:
+	with ProcessPoolExecutor(max_workers=max_workers,initializer=_on_worker_start) as executor:
 		while file_list_iterator or futures:
 			# counter = 0
 			under_limit = apb.under_rate_limit()
@@ -1859,7 +1857,7 @@ def copy_file_list_parallel(file_list, links, src_path, dest_paths, max_workers,
 	apb = Adaptive_Progress_Bar(total_count=total_files,total_size=estimated_size,last_num_job_for_stats=max(1,max_workers//10),process_word='Copied',suppress_all_output=verbose,bytes_rate_limit=BYTES_RATE_LIMIT,files_rate_limit=FILES_RATE_LIMIT)
 	last_transition_time = time.monotonic()
 	last_under_limit = True
-	with ProcessPoolExecutor(max_workers=max_workers) as executor:
+	with ProcessPoolExecutor(max_workers=max_workers,initializer=_on_worker_start) as executor:
 		while file_list_iterator or futures:
 			# counter = 0
 			under_limit = apb.under_rate_limit()
@@ -1967,7 +1965,7 @@ def copy_file_list_parallel_batch(jobs, max_workers, full_hash=False, verbose=Fa
 	apb = Adaptive_Progress_Bar(total_count=total_item_count,total_size=total_size_count,last_num_job_for_stats=max(1,max_workers//10),process_word='Copied',suppress_all_output=verbose,bytes_rate_limit=BYTES_RATE_LIMIT,files_rate_limit=FILES_RATE_LIMIT)
 	last_transition_time = time.monotonic()
 	last_under_limit = True
-	with ProcessPoolExecutor(max_workers=max_workers) as executor:
+	with ProcessPoolExecutor(max_workers=max_workers,initializer=_on_worker_start) as executor:
 		while job_list_iterator or futures:
 			# counter = 0
 			under_limit = apb.under_rate_limit()
@@ -2440,7 +2438,7 @@ def sync_directories_parallel(src, dests, max_workers, verbose=False,folder_per_
 
 	print(f"Syncing Dir from {src} to {dests} with {max_workers} workers")
 	apb = Adaptive_Progress_Bar(total_count=len(folders),total_size=len(folders),suppress_all_output=verbose,process_word='Synced',bytes_rate_limit=BYTES_RATE_LIMIT,files_rate_limit=FILES_RATE_LIMIT)
-	with ProcessPoolExecutor(max_workers=max_workers) as executor:
+	with ProcessPoolExecutor(max_workers=max_workers,initializer=_on_worker_start) as executor:
 		while folder_list_iterator or futures:
 			# counter = 0
 			while folder_list_iterator and len(futures) <  max_scheduled_jobs and apb.under_rate_limit():
@@ -2554,7 +2552,7 @@ def sync_directories_parallel_batch(jobs, max_workers, verbose=False,folder_per_
 	folder_per_job = max(1,folder_per_job)
 	num_folders_copied_this_job = 0
 	
-	with ProcessPoolExecutor(max_workers=max_workers) as executor:
+	with ProcessPoolExecutor(max_workers=max_workers,initializer=_on_worker_start) as executor:
 		while job_iterator or futures:
 			while job_iterator and len(futures) <  max_scheduled_jobs and apb.under_rate_limit():
 				currentJobs = []
