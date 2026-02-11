@@ -110,9 +110,9 @@ except ImportError:
 	hasher = hashlib.blake2b()
 	xxhash_available = False
 
-version = '9.46'
+version = '9.47'
 __version__ = version
-COMMIT_DATE = '2025-02-02'
+COMMIT_DATE = '2026-02-10'
 
 MAGIC_NUMBER = 1.61803398875
 RANDOM_DESTINATION_SELECTION = False
@@ -1363,7 +1363,26 @@ def trim_paths(paths, baseDir):
 	return set([os.path.relpath(path,os.path.dirname(baseDir)) for path in paths])
 
 #%% ---- Generate File List ----
-@functools.lru_cache(maxsize=None)
+_get_file_list_cache = {}
+
+def _get_file_list_cache_key(path, exclude, append_hash, full_hash):
+	exclude_key = frozenset(exclude) if isinstance(exclude, (list, set)) else exclude
+	return (path, exclude_key, append_hash, full_hash)
+
+def get_file_list(path, exclude=None, append_hash=False, full_hash=False, max_workers=56, drop_cache=False, parallel_file_listing=True):
+	"""Unified file list getter with a single cache. Dispatches to get_file_list_serial or get_file_list_parallel based on serial."""
+	cache_key = _get_file_list_cache_key(path, exclude, append_hash, full_hash)
+	if drop_cache:
+		_get_file_list_cache.pop(cache_key, None)
+	if cache_key in _get_file_list_cache:
+		return _get_file_list_cache[cache_key]
+	if parallel_file_listing:
+		result = get_file_list_parallel(path, max_workers=max_workers, exclude=exclude, append_hash=append_hash, full_hash=full_hash)
+	else:
+		result = get_file_list_serial(path, exclude=exclude, append_hash=append_hash, full_hash=full_hash)
+	_get_file_list_cache[cache_key] = result
+	return result
+
 def get_file_list_serial(root,exclude=None,append_hash=False,full_hash=False,recurse=True):
 	# skip if path is longer than 4096 characters
 	if len(root) > 4096:
@@ -1419,7 +1438,6 @@ def get_file_list_serial(root,exclude=None,append_hash=False,full_hash=False,rec
 		return frozenset([root]) ,frozenset(), 0,frozenset()
 	return frozenset(file_list), frozenset(links) , size, frozenset(folders - set(['.', '..']))
 
-@functools.lru_cache(maxsize=None)
 def get_file_list_parallel(path,max_workers=56,exclude=None,append_hash=False,full_hash=False):
 	# skip if path is longer than 4096 characters
 	if len(path) > 4096:
@@ -1583,11 +1601,7 @@ def delete_files_parallel(paths, max_workers, verbose=False,files_per_job=1,excl
 	all_files = set()
 	init_size_all = 0
 	for path in paths:
-		if parallel_file_listing:
-			file_list, links,init_size, _ = get_file_list_parallel(path, max_workers,exclude=exclude)
-		else:
-			file_list, links,init_size, _ = get_file_list_serial(path,exclude=exclude)
-		#file_list, links,init_size, folders = get_file_list_parallel(path, max_workers,exclude=exclude)
+		file_list, links,init_size, _ = get_file_list(path, max_workers=max_workers, exclude=exclude, parallel_file_listing=parallel_file_listing)
 		all_files.update(set(file_list) | set(links))
 		init_size_all += init_size
 	endTime = time.monotonic()
@@ -2071,10 +2085,7 @@ def copy_files_parallel(src_path, dest_paths, max_workers, full_hash=False, verb
 		src_size, _ , symLinks = copy_file(src_path, dest_paths,full_hash=full_hash, verbose=verbose)
 		return 1, src_size , symLinks , frozenset([src_path])
 	start_time = time.monotonic()
-	if parallel_file_listing:
-		file_list , links,init_size,folders  = get_file_list_parallel(src_path, max_workers,exclude=exclude)
-	else:
-		file_list,links,init_size,folders = get_file_list_serial(src_path,exclude=exclude)
+	file_list, links, init_size, folders = get_file_list(src_path, max_workers=max_workers, exclude=exclude, parallel_file_listing=parallel_file_listing)
 		
 	endTime = time.monotonic()
 	print(f"Time taken to get file list: {endTime-start_time:0.4f} seconds")
@@ -2111,10 +2122,7 @@ def copy_files_parallel_batch(jobs, max_workers, full_hash=False, verbose=False,
 			continue
 		if exclude and is_excluded(src_path,exclude):
 			continue
-		if parallel_file_listing:
-			file_list , links,init_size,folders  = get_file_list_parallel(src_path, max_workers,exclude=exclude)
-		else:
-			file_list,links,init_size,folders = get_file_list_serial(src_path,exclude=exclude)
+		file_list , links,init_size,folders  = get_file_list(src_path, max_workers=max_workers,exclude=exclude,parallel_file_listing=parallel_file_listing)
 		if exit_not_enough_space:
 			# check if there is enough space on all dest paths
 			dest_free_space = sum(get_free_space_bytes(dest_path) for dest_path in dest_paths)
@@ -2163,7 +2171,7 @@ def copy_files_serial(src_path, dest_paths, full_hash=False, verbose=False,exclu
 		src_size, _ , symLinks = copy_file(src_path, dest_paths,full_hash=full_hash, verbose=verbose)
 		return 1, src_size , symLinks , frozenset([src_path])
 	print(f'Getting file list for {src_path}')
-	file_list,links,init_size,_ = get_file_list_serial(src_path,exclude=exclude)
+	file_list,links,init_size,_ = get_file_list(src_path,exclude=exclude,parallel_file_listing=False)
 	links = set(links)
 	total_files = len(file_list)
 	print(f"Number of files: {total_files}")
@@ -2226,7 +2234,7 @@ def copy_files_serial_batch(jobs, full_hash=False, verbose=False,exclude=None,ex
 			total_files.append(src_path)
 			continue
 		print(f'Getting file list for {src_path}')
-		file_list,links,init_size,_ = get_file_list_serial(src_path,exclude=exclude)
+		file_list,links,init_size,_ = get_file_list(src_path,exclude=exclude,parallel_file_listing=False)
 		if exit_not_enough_space:
 			# check if there is enough space on all dest paths
 			dest_free_space = sum(get_free_space_bytes(dest_path) for dest_path in dest_paths)
@@ -2424,10 +2432,7 @@ def sync_directories_parallel(src, dests, max_workers, verbose=False,folder_per_
 		return symLinks
 	sync_directory_metadata(src, dests)
 	print(f'Getting file list for {src}')
-	if parallel_file_listing:
-		_,_,_,folders  = get_file_list_parallel(src, max_workers,exclude=exclude)
-	else:
-		_,_,_,folders = get_file_list_serial(src,exclude=exclude)
+	_,_,_,folders  = get_file_list(src, max_workers=max_workers,exclude=exclude,parallel_file_listing=parallel_file_listing)
 	folder_list_iterator = iter(folders)
 	futures = {}
 	start_time = time.monotonic()
@@ -2535,10 +2540,7 @@ def sync_directories_parallel_batch(jobs, max_workers, verbose=False,folder_per_
 			continue
 		sync_directory_metadata(src, dests)
 		print(f'Getting file list for {src}')
-		if parallel_file_listing:
-			_,_,_,folders  = get_file_list_parallel(src, max_workers,exclude=exclude)
-		else:
-			_,_,_,folders = get_file_list_serial(src,exclude=exclude)
+		_,_,_,folders  = get_file_list(src, max_workers=max_workers,exclude=exclude,parallel_file_listing=parallel_file_listing)
 		allFolderToSync.extend([(src,folder,dests) for folder in folders])
 	if not allFolderToSync:
 		return symLinks
@@ -2658,7 +2660,7 @@ def sync_directories_serial(src, dests,exclude=None):
 		return symLinks
 	#sync_directory_metadata(src, dest)
 	print(f'Getting file list for {src}')
-	_,_,_,folders = get_file_list_serial(src,exclude=exclude)
+	_,_,_,folders = get_file_list(src,exclude=exclude,parallel_file_listing=False)
 	print(f"Syncing Dir from {src} to {dests} in single thread")
 	apb = Adaptive_Progress_Bar(total_count=len(folders),total_size=len(folders),process_word='Synced',bytes_rate_limit=BYTES_RATE_LIMIT,files_rate_limit=FILES_RATE_LIMIT)
 	for folder in folders:
@@ -2699,7 +2701,7 @@ def sync_directories_serial_batch(jobs,exclude=None):
 			continue
 		newJobs.append((src,dests))
 		print(f'Getting file list for {src}')
-		_,_,_,folders = get_file_list_serial(src,exclude=exclude)
+		_,_,_,folders = get_file_list(src,exclude=exclude,parallel_file_listing=False)
 		srcFolders.append(folders)
 		totalFolderCount += len(folders)
 	if totalFolderCount == 0:
@@ -2795,10 +2797,7 @@ def remove_extra_files(total_file_list, dests,max_workers,verbose,files_per_job,
 		# we first get a file list of the dest dir
 		inDestNotInSrc = set()
 		for dest in dests:
-			if parallel_file_listing:
-				dest_file_list,links,_ ,_ = get_file_list_parallel(dest, max_workers,exclude=exclude)
-			else:
-				dest_file_list,links,_, _ = get_file_list_serial(dest,exclude=exclude)
+			dest_file_list,links,_ ,_ = get_file_list(dest, max_workers=max_workers,exclude=exclude,parallel_file_listing=parallel_file_listing)
 			dest_file_list = trim_paths(dest_file_list,dest)
 			dest_file_list.update(trim_paths(links,dest))
 			# we then get the list of all extra files
@@ -2935,10 +2934,7 @@ def store_file_list(file_list, src_paths: list, single_thread=False, max_workers
 	for src in src_paths:
 		print(f"Getting file list from {src}")
 		start_time = time.monotonic()
-		if not parallel_file_listing:
-			files, links, _,folders = get_file_list_serial(src, exclude=exclude,append_hash=append_hash,full_hash=full_hash)
-		else:
-			files, links, _,folders  = get_file_list_parallel(src, max_workers, exclude=exclude,append_hash=append_hash,full_hash=full_hash)
+		files, links, _,folders  = get_file_list(src, max_workers=max_workers, exclude=exclude,append_hash=append_hash,full_hash=full_hash,parallel_file_listing=parallel_file_listing)
 		fileList.update(trim_paths(files, src))
 		fileList.update(trim_paths(links, src))
 		fileList.update([folder_path + os.path.sep for folder_path in trim_paths(folders, src)])
@@ -3167,10 +3163,7 @@ def process_compare_file_list(src_paths: list, dests, max_workers = 4 * multipro
 		print('-'*80)
 		print(f"Getting file list from {src}")
 		start_time = time.monotonic()
-		if not parallel_file_listing:
-			files,links,_,folders = get_file_list_serial(src,exclude=exclude,append_hash=append_hash,full_hash=full_hash)
-		else:
-			files,links,_,folders  = get_file_list_parallel(src, max_workers,exclude=exclude,append_hash=append_hash,full_hash=full_hash)
+		files,links,_,folders  = get_file_list(src, max_workers=max_workers,exclude=exclude,append_hash=append_hash,full_hash=full_hash,parallel_file_listing=parallel_file_listing)
 		if dest_image:
 			# we use full path for src when comparing file list with dest image
 			file_list.update(trim_paths([os.path.abspath(file) for file in files],'/'))
@@ -3187,10 +3180,7 @@ def process_compare_file_list(src_paths: list, dests, max_workers = 4 * multipro
 	print('-'*80)
 	print(f"Getting file list from {dests}")
 	for dest in dests:
-		if not parallel_file_listing:
-			files,links,_,folders = get_file_list_serial(dest,exclude=exclude,append_hash=append_hash,full_hash=full_hash)
-		else:
-			files,links,_,folders  = get_file_list_parallel(dest, max_workers,exclude=exclude,append_hash=append_hash,full_hash=full_hash)
+		files,links,_,folders  = get_file_list(dest, max_workers=max_workers,exclude=exclude,append_hash=append_hash,full_hash=full_hash,parallel_file_listing=parallel_file_listing)
 		file_list2.update(trim_paths(files,dest))
 		file_list2.update(trim_paths(links,dest))
 		file_list2.update([folder_path + os.path.sep for folder_path in trim_paths(folders, dest)])
@@ -3207,12 +3197,8 @@ def create_image(dest_image,target_mount_point,loop_devices: list,src_paths: lis
 		init_size = 0
 		for src in src_paths:
 			src = os.path.abspath(src + os.path.sep)
-			if not parallel_file_listing:
-				_,_,size,_ = get_file_list_serial(src,exclude=exclude)
-				init_size += size
-			else:
-				_,_,size,_ = get_file_list_parallel(src, max_workers,exclude=exclude)
-				init_size += size
+			_,_,size,_ = get_file_list(src, max_workers=max_workers,exclude=exclude,parallel_file_listing=parallel_file_listing)
+			init_size += size
 		slag = 50*1024*1024
 		image_file_size = int(1.05 *init_size + slag) # add 50 MB for the file system
 		image_file_size = (int(image_file_size / 4096.0) + 1) * 4096 # round up to the nearest 4 KiB
@@ -3809,8 +3795,7 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = 4 * mul
 		get_partition_details.cache_clear()
 		get_partition_infos.cache_clear()
 		hash_file.cache_clear()
-		get_file_list_serial.cache_clear()
-		get_file_list_parallel.cache_clear()
+		_get_file_list_cache.clear()
 	return get_rc_from_error()
 		
 def hpcp_gui():
