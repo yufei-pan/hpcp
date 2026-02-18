@@ -110,9 +110,9 @@ except ImportError:
 	hasher = hashlib.blake2b()
 	xxhash_available = False
 
-version = '9.47'
+version = '9.48'
 __version__ = version
-COMMIT_DATE = '2026-02-10'
+COMMIT_DATE = '2026-02-11'
 
 MAGIC_NUMBER = 1.61803398875
 RANDOM_DESTINATION_SELECTION = False
@@ -530,6 +530,16 @@ def _on_worker_start():
 			time.sleep(0.5)
 	t = threading.Thread(target=watch_parent, daemon=True)
 	t.start()
+
+_worker_initialized = False
+def _call_with_worker_init(func, *args, **kwargs):
+	"""Wrapper that ensures _on_worker_start() runs once per worker process.
+	Used instead of ProcessPoolExecutor's initializer parameter for Python 3.6 compatibility."""
+	global _worker_initialized
+	if not _worker_initialized:
+		_on_worker_start()
+		_worker_initialized = True
+	return func(*args, **kwargs)
 
 #%% -- Exclude --
 def is_excluded(path, exclude=None):
@@ -1457,10 +1467,10 @@ def get_file_list_parallel(path,max_workers=56,exclude=None,append_hash=False,fu
 		folder_list = set(folder_list)
 		folders_to_expand = folder_list - set([path])
 		futures = {}
-		with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers,initializer=_on_worker_start) as executor:
+		with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
 			while folders_to_expand or futures:
 				for folder in folders_to_expand:
-					futures[executor.submit(get_file_list_serial, folder,exclude=exclude,append_hash=append_hash,full_hash=full_hash,recurse=False)] = folder
+					futures[executor.submit(_call_with_worker_init, get_file_list_serial, folder,exclude=exclude,append_hash=append_hash,full_hash=full_hash,recurse=False)] = folder
 				folders_to_expand.clear()
 				
 				done, _ = concurrent.futures.wait(futures, return_when=concurrent.futures.FIRST_COMPLETED)
@@ -1515,7 +1525,7 @@ def delete_file_list_parallel(file_list, max_workers, verbose=False,files_per_jo
 							 suppress_all_output=verbose,bytes_rate_limit=BYTES_RATE_LIMIT,files_rate_limit=FILES_RATE_LIMIT)
 	last_transition_time = time.monotonic()
 	last_under_limit = True
-	with ProcessPoolExecutor(max_workers=max_workers,initializer=_on_worker_start) as executor:
+	with ProcessPoolExecutor(max_workers=max_workers) as executor:
 		while file_list_iterator or futures:
 			# counter = 0
 			under_limit = apb.under_rate_limit()
@@ -1524,12 +1534,12 @@ def delete_file_list_parallel(file_list, max_workers, verbose=False,files_per_jo
 				try:
 					for _ in range(round(files_per_job)):
 						delete_files.append(next(file_list_iterator))
-					future = executor.submit(delete_file_bulk, delete_files)
+					future = executor.submit(_call_with_worker_init, delete_file_bulk, delete_files)
 					futures[future] = delete_files
 					# counter += 1
 				except StopIteration:
 					if delete_files:
-						future = executor.submit(delete_file_bulk, delete_files)
+						future = executor.submit(_call_with_worker_init, delete_file_bulk, delete_files)
 						futures[future] = delete_files
 					file_list_iterator = None
 
@@ -1871,7 +1881,7 @@ def copy_file_list_parallel(file_list, links, src_path, dest_paths, max_workers,
 	apb = Adaptive_Progress_Bar(total_count=total_files,total_size=estimated_size,last_num_job_for_stats=max(1,max_workers//10),process_word='Copied',suppress_all_output=verbose,bytes_rate_limit=BYTES_RATE_LIMIT,files_rate_limit=FILES_RATE_LIMIT)
 	last_transition_time = time.monotonic()
 	last_under_limit = True
-	with ProcessPoolExecutor(max_workers=max_workers,initializer=_on_worker_start) as executor:
+	with ProcessPoolExecutor(max_workers=max_workers) as executor:
 		while file_list_iterator or futures:
 			# counter = 0
 			under_limit = apb.under_rate_limit()
@@ -1883,12 +1893,12 @@ def copy_file_list_parallel(file_list, links, src_path, dest_paths, max_workers,
 					for _ in range(max(1,round(files_per_job * noise))):
 						src_file = next(file_list_iterator)
 						src_files.append(src_file)
-					future = executor.submit(copy_files_bulk, src_files, dest_paths,src_path, full_hash, verbose,len(futures))
+					future = executor.submit(_call_with_worker_init, copy_files_bulk, src_files, dest_paths,src_path, full_hash, verbose,len(futures))
 					futures[future] = src_files
 					# counter += 1
 				except StopIteration:
 					if src_files:
-						future = executor.submit(copy_files_bulk, src_files, dest_paths,src_path, full_hash, verbose,len(futures))
+						future = executor.submit(_call_with_worker_init, copy_files_bulk, src_files, dest_paths,src_path, full_hash, verbose,len(futures))
 						futures[future] = src_files
 					file_list_iterator = None
 
@@ -1979,7 +1989,7 @@ def copy_file_list_parallel_batch(jobs, max_workers, full_hash=False, verbose=Fa
 	apb = Adaptive_Progress_Bar(total_count=total_item_count,total_size=total_size_count,last_num_job_for_stats=max(1,max_workers//10),process_word='Copied',suppress_all_output=verbose,bytes_rate_limit=BYTES_RATE_LIMIT,files_rate_limit=FILES_RATE_LIMIT)
 	last_transition_time = time.monotonic()
 	last_under_limit = True
-	with ProcessPoolExecutor(max_workers=max_workers,initializer=_on_worker_start) as executor:
+	with ProcessPoolExecutor(max_workers=max_workers) as executor:
 		while job_list_iterator or futures:
 			# counter = 0
 			under_limit = apb.under_rate_limit()
@@ -1991,12 +2001,12 @@ def copy_file_list_parallel_batch(jobs, max_workers, full_hash=False, verbose=Fa
 					for _ in range(max(1,round(files_per_job * noise))):
 						job = next(job_list_iterator)
 						current_jobs.append(job)
-					future = executor.submit(copy_files_bulk_batch, current_jobs, full_hash, verbose,len(futures))
+					future = executor.submit(_call_with_worker_init, copy_files_bulk_batch, current_jobs, full_hash, verbose,len(futures))
 					futures[future] = current_jobs
 					# counter += 1
 				except StopIteration:
 					if current_jobs:
-						future = executor.submit(copy_files_bulk_batch, current_jobs, full_hash, verbose,len(futures))
+						future = executor.submit(_call_with_worker_init, copy_files_bulk_batch, current_jobs, full_hash, verbose,len(futures))
 						futures[future] = current_jobs
 					job_list_iterator = None
 
@@ -2443,7 +2453,7 @@ def sync_directories_parallel(src, dests, max_workers, verbose=False,folder_per_
 
 	print(f"Syncing Dir from {src} to {dests} with {max_workers} workers")
 	apb = Adaptive_Progress_Bar(total_count=len(folders),total_size=len(folders),suppress_all_output=verbose,process_word='Synced',bytes_rate_limit=BYTES_RATE_LIMIT,files_rate_limit=FILES_RATE_LIMIT)
-	with ProcessPoolExecutor(max_workers=max_workers,initializer=_on_worker_start) as executor:
+	with ProcessPoolExecutor(max_workers=max_workers) as executor:
 		while folder_list_iterator or futures:
 			# counter = 0
 			while folder_list_iterator and len(futures) <  max_scheduled_jobs and apb.under_rate_limit():
@@ -2452,12 +2462,12 @@ def sync_directories_parallel(src, dests, max_workers, verbose=False,folder_per_
 					for _ in range(folder_per_job):
 						src_folder = next(folder_list_iterator)
 						src_folders.append(src_folder)
-					future = executor.submit(sync_directory_metadata_bulk, src_folders, dests,src)
+					future = executor.submit(_call_with_worker_init, sync_directory_metadata_bulk, src_folders, dests,src)
 					futures[future] = src_folders
 					# counter += 1
 				except StopIteration:
 					if src_folders:
-						future = executor.submit(sync_directory_metadata_bulk, src_folders, dests,src)
+						future = executor.submit(_call_with_worker_init, sync_directory_metadata_bulk, src_folders, dests,src)
 						futures[future] = src_folders
 					folder_list_iterator = None
 
@@ -2554,18 +2564,18 @@ def sync_directories_parallel_batch(jobs, max_workers, verbose=False,folder_per_
 	folder_per_job = max(1,folder_per_job)
 	num_folders_copied_this_job = 0
 	
-	with ProcessPoolExecutor(max_workers=max_workers,initializer=_on_worker_start) as executor:
+	with ProcessPoolExecutor(max_workers=max_workers) as executor:
 		while job_iterator or futures:
 			while job_iterator and len(futures) <  max_scheduled_jobs and apb.under_rate_limit():
 				currentJobs = []
 				try:
 					for _ in range(folder_per_job):
 						currentJobs.append(next(job_iterator))
-					future = executor.submit(sync_directory_metadata_bulk_batch, currentJobs)
+					future = executor.submit(_call_with_worker_init, sync_directory_metadata_bulk_batch, currentJobs)
 					futures[future] = currentJobs
 				except StopIteration:
 					if currentJobs:
-						future = executor.submit(sync_directory_metadata_bulk_batch, currentJobs)
+						future = executor.submit(_call_with_worker_init, sync_directory_metadata_bulk_batch, currentJobs)
 						futures[future] = currentJobs
 					job_iterator = None
 
