@@ -21,11 +21,12 @@ import shutil
 import stat
 import sys
 import tempfile
-import time
 import threading
+import time
 from collections import deque
 from concurrent.futures import ProcessPoolExecutor
 from math import log
+from pprint import pformat
 
 try:
 	import multiCMD  # type: ignore
@@ -113,7 +114,7 @@ Y$HAoI?L>:"=U*oZC6;fo93:Kl@@;-6$B/>6DG>Z:I149n(e;X%Ip3+Z'YI$BtL[07htO'\D;N-:;Y'V
 gn5pn(cj?[HiO-H**9$V?6?kQ!!0Mda1D?PS=_AOZ,C;P!WW3#!!HG.'''
 	exec(lzma.decompress(base64.a85decode(_SRC_B85)).decode("utf-8"), multiCMD.__dict__)
 try:
-	import xxhash # type: ignore
+	import xxhash  # type: ignore
 	hasher = xxhash.xxh64()
 	xxhash_available = True
 except ImportError:
@@ -121,9 +122,9 @@ except ImportError:
 	hasher = hashlib.blake2b()
 	xxhash_available = False
 
-version = '9.49'
+version = '9.50'
 __version__ = version
-COMMIT_DATE = '2026-02-19'
+COMMIT_DATE = '2026-03-05'
 
 MAGIC_NUMBER = 1.61803398875
 RANDOM_DESTINATION_SELECTION = False
@@ -147,19 +148,38 @@ ERROR_TO_RETURNCODE_TABLE = {
 	'Task return code error': 128,
 	'Keyboard Interrupt': 130,
 	'User requested stop': 147,
+	'Fix fs Error': 150,
+	'Not supported fs for fixing': 151,
+	'Cannot set fs uuid for ntfs': 152,
+	'Cannot set fs uuid for hfs': 153,
+	'Cannot set fs uuid for ufs': 154,
+	'Cannot set fs uuid for bfs': 155,
+	'Cannot set fs label for minix': 156,
+	'Cannot set fs uuid for minix': 157,
 	'Create symlink os error': 160,
 	'Create symlink general error': 161,
+	'Failed to create symbolic link': 162,
 	'Exclude file read error': 170,
 	'Exclude file not exist': 171,
 	'Partition not found error': 180,
 	'Partition copy error': 181,
 	'Copy partition info error': 182,
+	'Cannot create zfs file system': 183,
+	'Cannot create cramfs file system': 184,	
+	'Cannot create iso9660 file system': 185,
+	'Not supported fs for creating': 186,
 	'Copy failed': 190,
 	'Copy process crashed': 191,
 	'Remove process exception': 192,
 	'Source path type error': 200,
 	'Source image mount error': 201,
 	'No valid destination': 202,
+	'Source path length error': 203,
+	'Destination path length error': 204,
+	'All destination paths are too long': 205,
+	'Source image not found': 206,
+	'Source path not found': 207,
+	'File list not found': 208,
 	'Remove file failed': 210,
 	'Remove directory failed': 211,
 	'Dest path DataType error': 220,
@@ -209,6 +229,29 @@ def get_rc_from_error():
 		print(f'Error occurred: {ERRORS}, return code: {rc}.')
 	ERRORS.clear()
 	return rc
+
+def _validate_paths(src, dests):
+	"""Validate path lengths (4096 char limit). Returns filtered dest list, or None if invalid."""
+	if len(src) > 4096:
+		eprint(f'Source path length error: {src} is too long')
+		return None
+	valid = []
+	for d in dests:
+		if len(d) > 4096:
+			eprint(f'Destination path length error: {d} is too long')
+		else:
+			valid.append(d)
+	if not valid:
+		eprint(f'All destination paths are too long: Skipping {src}')
+		return None
+	return valid
+
+def _print_operation_summary(apb, elapsed, unit='file', show_bandwidth=False):
+	print(f"\nTime taken:             {elapsed:0.4f} seconds")
+	print(f"Average speed:          {format_bytes(apb.size_counter / elapsed)}B/s")
+	print(f"                        {apb.item_counter / elapsed:.2f} {unit}/s")
+	if show_bandwidth:
+		print(f"Average bandwidth:      {format_bytes(apb.size_counter / elapsed * 8,use_1024_bytes=False)}bps")
 
 class Adaptive_Progress_Bar:
 	def __init__(self, total_count = 0, total_size = 0,refresh_interval = 0.1,last_num_job_for_stats = 10,custom_prefix = None,
@@ -656,6 +699,28 @@ def get_fs_type(path):
 	fs_type = run_command_in_multicmd_with_path_check(["lsblk", '-nbl', '-o', 'FSTYPE', path],strict=True)[0].strip()
 	return fs_type
 
+_FS_FIX_COMMANDS = {
+	'ext4':     ['e2fsck', '-f', '-y'],
+	'ext3':     ['e2fsck', '-f', '-y'],
+	'ext2':     ['e2fsck', '-f', '-y'],
+	'btrfs':    ['btrfs', 'check', '--repair'],
+	'xfs':      ['xfs_repair', '-L'],
+	'ntfs':     ['ntfsfix'],
+	'fat32':    ['fsck.fat', '-w', '-r', '-l', '-a', '-v'],
+	'fat16':    ['fsck.fat', '-w', '-r', '-l', '-a', '-v'],
+	'fat12':    ['fsck.fat', '-w', '-r', '-l', '-a', '-v'],
+	'fat':      ['fsck.fat', '-w', '-r', '-l', '-a', '-v'],
+	'vfat':     ['fsck.fat', '-w', '-r', '-l', '-a', '-v'],
+	'exfat':    ['fsck.exfat', '-p', '-y'],
+	'hfsplus':  ['fsck.hfsplus', '-y'],
+	'hfs':      ['fsck.hfs', '-y'],
+	'jfs':      ['fsck.jfs', '-y'],
+	'reiserfs': ['fsck.reiserfs', '-y'],
+	'ufs':      ['fsck.ufs', '-y'],
+	'minix':    ['fsck.minix', '-a'],
+}
+_FS_FIX_UNSUPPORTED = {'udf', 'bfs'}
+
 def fix_fs(target_partition, fs_type=None):
 	"""
 	Fix the file system errors on the specified target partition.
@@ -670,52 +735,15 @@ def fix_fs(target_partition, fs_type=None):
 	try:
 		if not fs_type:
 			fs_type = get_fs_type(target_partition)
-		# Fix it!
-		if fs_type == 'ext4' or fs_type == 'ext3' or fs_type == 'ext2':
-			#run_command_in_multicmd_with_path_check(f"e2fsck -f -y {target_partition}",strict=False)
-			run_command_in_multicmd_with_path_check(["e2fsck", '-f', '-y', target_partition],strict=False)
-		elif fs_type == 'btrfs':
-			#run_command_in_multicmd_with_path_check(f"btrfs check --repair {target_partition}",strict=False)
-			run_command_in_multicmd_with_path_check(["btrfs", 'check', '--repair', target_partition],strict=False)
-		elif fs_type == 'xfs':
-			#run_command_in_multicmd_with_path_check(f"xfs_repair -L {target_partition}",strict=False)
-			run_command_in_multicmd_with_path_check(["xfs_repair", '-L', target_partition],strict=False)
-		elif fs_type == 'ntfs':
-			#run_command_in_multicmd_with_path_check(f"ntfsfix {target_partition}",strict=False)
-			run_command_in_multicmd_with_path_check(["ntfsfix", target_partition],strict=False)
-		elif fs_type == 'fat32' or fs_type == 'fat16' or fs_type == 'fat12' or fs_type == 'fat' or fs_type == 'vfat':
-			#run_command_in_multicmd_with_path_check(f"fsck.fat -w -r -l -a -v {target_partition}",strict=False)
-			run_command_in_multicmd_with_path_check(["fsck.fat", '-w', '-r', '-l', '-a', '-v', target_partition],strict=False)
-		elif fs_type == 'exfat':
-			#run_command_in_multicmd_with_path_check(f"fsck.exfat -p -y {target_partition}",strict=False)
-			run_command_in_multicmd_with_path_check(["fsck.exfat", '-p', '-y', target_partition],strict=False)
-		elif fs_type == 'hfsplus':
-			#run_command_in_multicmd_with_path_check(f"fsck.hfsplus -y {target_partition}",strict=False)
-			run_command_in_multicmd_with_path_check(["fsck.hfsplus", '-y', target_partition],strict=False)
-		elif fs_type == 'hfs':
-			#run_command_in_multicmd_with_path_check(f"fsck.hfs -y {target_partition}",strict=False)
-			run_command_in_multicmd_with_path_check(["fsck.hfs", '-y', target_partition],strict=False)
-		elif fs_type == 'jfs':
-			#run_command_in_multicmd_with_path_check(f"fsck.jfs -y {target_partition}",strict=False)
-			run_command_in_multicmd_with_path_check(["fsck.jfs", '-y', target_partition],strict=False)
-		elif fs_type == 'reiserfs':
-			#run_command_in_multicmd_with_path_check(f"fsck.reiserfs -y {target_partition}",strict=False)
-			run_command_in_multicmd_with_path_check(["fsck.reiserfs", '-y', target_partition],strict=False)
-		elif fs_type == 'udf':
-			print("Warning: Cannot fix udf file system. Skipping.")
-		elif fs_type == 'ufs':
-			#run_command_in_multicmd_with_path_check(f"fsck.ufs -y {target_partition}",strict=False)
-			run_command_in_multicmd_with_path_check(["fsck.ufs", '-y', target_partition],strict=False)
-		elif fs_type == 'bfs':
-			print("Warning: Cannot fix bfs file system. Skipping.")
-		elif fs_type == 'minix':
-			#run_command_in_multicmd_with_path_check(f"fsck.minix -a {target_partition}",strict=False)
-			run_command_in_multicmd_with_path_check(["fsck.minix", '-a', target_partition],strict=False)
+		if fs_type in _FS_FIX_COMMANDS:
+			run_command_in_multicmd_with_path_check(_FS_FIX_COMMANDS[fs_type] + [target_partition], strict=False)
+		elif fs_type in _FS_FIX_UNSUPPORTED:
+			eprint(f"Cannot fix {fs_type} file system. Skipping.")
 		else:
-			print(f"File system {fs_type} not supported.")
+			eprint(f"Not supported fs for fixing: File system {fs_type} not supported.")
 			return False
 	except Exception as e:
-		print(f"Exception caught when trying to fix {target_partition} with {fs_type}: {e}")
+		eprint(f"Fix fs Error: Exception caught when trying to fix {target_partition} with {fs_type}: {e}")
 		return False
 	return True
 
@@ -940,7 +968,7 @@ def write_partition_info(image, partition_infos, partition_name):
 			fs_type = partition_infos[partition_name]['fs_type']
 			fs_label = partition_infos[partition_name]['fs_label']
 			fs_uuid = partition_infos[partition_name]['fs_uuid']
-			if fs_type == 'ext4' or fs_type == 'ext3' or fs_type == 'ext2':
+			if fs_type in ('ext4', 'ext3', 'ext2'):
 				command = ['mkfs', '-t', fs_type]
 				if fs_label:
 					command.extend(['-L', fs_label])
@@ -974,8 +1002,8 @@ def write_partition_info(image, partition_infos, partition_name):
 				command.append(target_partition)
 				run_command_in_multicmd_with_path_check(command,strict=False)
 				if fs_uuid:
-					print("Warning: Cannot set fs uuid for ntfs. Skipping.")
-			elif fs_type == 'fat32' or fs_type == 'fat16' or fs_type == 'fat12' or fs_type == 'fat' or fs_type == 'vfat' or fs_type == 'msdos':
+					eprint("Cannot set fs uuid for ntfs: Skipping.")
+			elif fs_type in ('fat32', 'fat16', 'fat12', 'fat', 'vfat', 'msdos'):
 				command = ['mkfs.vfat']
 				if fs_type == 'fat16':
 					command.extend(['-F', '16'])
@@ -997,14 +1025,14 @@ def write_partition_info(image, partition_infos, partition_name):
 				if fs_uuid:
 					#run_command_in_multicmd_with_path_check(["exfatlabel", '-i', target_partition, fs_uuid],strict=False)
 					delayed_commands.append(['exfatlabel', '-i', target_partition, fs_uuid])
-			elif fs_type == 'hfsplus' or fs_type == 'hfs':
+			elif fs_type in ('hfsplus', 'hfs'):
 				command = [f'mkfs.{fs_type}']
 				if fs_label:
 					command.extend(['-v', fs_label])
 				command.append(target_partition)
 				run_command_in_multicmd_with_path_check(command,strict=False)
 				if fs_uuid:
-					print(f"Warning: Cannot set fs uuid for {fs_type}. Skipping.")
+					eprint(f"Cannot set fs uuid for hfs: {fs_type}. Skipping.")
 			elif fs_type == 'udf':
 				# command += f" {target_partition}"
 				command = ['mkudffs', '--media-type=hd']
@@ -1034,7 +1062,7 @@ def write_partition_info(image, partition_infos, partition_name):
 				command.append(target_partition)
 				run_command_in_multicmd_with_path_check(command,strict=False)
 			elif fs_type == 'zfs':
-				print("Skip creating zfs file system. ZFS file system should be created using zpool command.")
+				eprint("Cannot create zfs file system: ZFS file system should be created using zpool command.")
 			elif fs_type == 'ufs':
 				command = ['newfs', '-t']
 				if fs_label:
@@ -1042,7 +1070,7 @@ def write_partition_info(image, partition_infos, partition_name):
 				command.append(target_partition)
 				run_command_in_multicmd_with_path_check(command,strict=False)
 				if fs_uuid:
-					print("Warning: Cannot set fs uuid for ufs. Skipping.")
+					eprint("Cannot set fs uuid for ufs: Skipping.")
 			elif fs_type == 'bfs':
 				command = ['mkfs.bfs']
 				if fs_label:
@@ -1050,18 +1078,18 @@ def write_partition_info(image, partition_infos, partition_name):
 				command.append(target_partition)
 				run_command_in_multicmd_with_path_check(command,strict=False)
 				if fs_uuid:
-					print("Warning: Cannot set fs uuid for bfs. Skipping.")
+					eprint("Cannot set fs uuid for bfs: Skipping.")
 			elif fs_type == 'cramfs':
-				print("Warning: cramfs is read-only file system. You should create one with mkfs.cramfs.")
+				eprint("Cannot create cramfs file system: cramfs is read-only file system. You should create one with mkfs.cramfs.")
 			elif fs_type == 'minix':
 				command = ['mkfs.minix',target_partition]
 				run_command_in_multicmd_with_path_check(command,strict=False)
 				if fs_label:
-					print("Warning: Cannot set fs label for minix. Skipping.")
+					eprint("Cannot set fs label for minix: Skipping.")
 				if fs_uuid:
-					print("Warning: Cannot set fs uuid for minix. Skipping.")
+					eprint("Cannot set fs uuid for minix: Skipping.")
 			elif fs_type == 'iso9660':
-				print("Warning: iso9660 is read-only file system. You should create one with mkfs.iso9660.")
+				eprint("Cannot create iso9660 file system: iso9660 is read-only file system. You should create one with mkfs.iso9660.")
 			elif fs_type == 'swap':
 				command = ['mkswap']
 				if fs_label:
@@ -1072,9 +1100,9 @@ def write_partition_info(image, partition_infos, partition_name):
 				command.append(target_partition)
 				run_command_in_multicmd_with_path_check(command,strict=False)
 			elif fs_type == 'gpt':
-				print("Skip creating gpt padding.")
+				eprint("Skip creating gpt padding.")
 			else:
-				print(f"Warning: File system {fs_type} not currently supported by hpcp. Trying mkfs -t {fs_type} anyway...")
+				eprint(f"Not supported fs for creating: File system {fs_type} not currently supported by hpcp. Trying mkfs -t {fs_type} anyway...")
 				command = ['mkfs', '-t', fs_type]
 				if fs_label:
 					command.extend(['-L', fs_label])
@@ -1128,7 +1156,7 @@ def resize_image(image_name, image_file_size):
 			run_command_in_multicmd_with_path_check(["truncate", f'--size={image_file_size}', image_name],strict=True)
 		except Exception:
 			# use python native method to allocate the space
-			print("truncate not available, using python native method to allocate space")
+			eprint("truncate not available, using python native method to allocate space")
 			with open(image_name, 'wb') as f:
 				f.seek(image_file_size-1)
 				f.write(b'\0')
@@ -1169,7 +1197,7 @@ def create_sym_links(symLinks,exclude=None,no_link_tracking=False):
 			src = os.path.normpath(src)
 			dests = [os.path.normpath(d) for d in dests]
 			if exclude and is_excluded(src,exclude):
-				print(f"\n{src} is excluded, skipping...")
+				print(f"\n{pformat(src)} is excluded, skipping...")
 				continue
 			dest = ''
 			for d in dests:
@@ -1178,11 +1206,11 @@ def create_sym_links(symLinks,exclude=None,no_link_tracking=False):
 				dest = d
 				if os.path.exists(d):
 					if os.path.isdir(d):
-						print(f"\n{d} is a directory, skipping...")
+						print(f"\n{pformat(d)} is a directory, skipping...")
 						#shutil.rmtree(dest)
 						continue
 					else:
-						print(f"\n{d} is a file, skipping...")
+						print(f"\n{pformat(d)} is a file, skipping...")
 						#os.remove(dest)
 						continue
 			# Determine if the link is a absolute link or relative link
@@ -1197,7 +1225,7 @@ def create_sym_links(symLinks,exclude=None,no_link_tracking=False):
 						break
 				if not dest:
 					if not os.path.exists(sourceLinkedFile):
-						print(f"\nFile {sourceLinkedFile} which is linked by {src} doesn't exist! \nSkipping copying original file...")
+						eprint(f"\nFile {sourceLinkedFile} which is linked by {src} doesn't exist! \nSkipping copying original file...")
 					else:
 						_, _ , rtnSymLinks , _ = copy_files_serial(sourceLinkedFile, destLinkedFiles,exclude=exclude)
 						nestedSymLinks.update(rtnSymLinks)
@@ -1214,13 +1242,13 @@ def create_sym_links(symLinks,exclude=None,no_link_tracking=False):
 					os.symlink(linkedTargetFile, dest, target_is_directory=os.path.isdir(linkedTargetFile))
 					break
 				except Exception:
-					print(f'Could not create symbolic link from {linkedTargetFile} to {dest}')
+					eprint(f'Could not create symbolic link from {linkedTargetFile} to {dest}')
 					if dests:
-						print("Trying next destination...")
+						eprint("Trying next destination...")
 						dest = ''
 						continue
 					else:
-						print("All destinations failed, skipping...")
+						eprint("Failed to create symbolic link: All destinations failed, skipping...")
 						break
 			counter += 1
 			# print the progress bar with the total count and the speed in F/s
@@ -1503,7 +1531,7 @@ def get_file_list_parallel(path,max_workers=56,exclude=None,append_hash=False,fu
 					folders_to_expand.update(dir_folder_list - set([folder_path]))
 			
 	else:
-		print(f'Unknown file type: {path}')
+		eprint(f'Source path type error: {path} is not a file or directory')
 		return frozenset([path]) ,frozenset(), 0,frozenset()
 	return frozenset(file_list), frozenset(link_list) ,size, frozenset(folder_list - set(['.', '..']))
 
@@ -1523,7 +1551,7 @@ def delete_file_bulk(paths):
 				else:
 					os.remove(path)
 			except Exception as exc:
-				print(f'\nDeleting {path} generated an exception: {exc}')
+				eprint(f'Remove process exception:\n Deleting {path} generated an exception: {exc}')
 	endTime = time.monotonic()
 	return total_size, endTime - start_time
 
@@ -1563,12 +1591,6 @@ def delete_file_list_parallel(file_list, max_workers, verbose=False,files_per_jo
 					file_list_iterator = None
 
 			done, _ = concurrent.futures.wait(futures.keys(), return_when=concurrent.futures.FIRST_COMPLETED, timeout=1)
-
-			#print('\n',len(done) ,'\t', len(futures))
-			# if file_list_iterator and len(done) / len(futures) > 0.2:
-			# 	if verbose:
-			# 		print(f'\nTransfer is fast, doubling files per job to {files_per_job * 2}')
-			# 	files_per_job *= 2
 
 			current_iteration_total_run_time = 0
 			for doneTask in done:
@@ -1618,9 +1640,7 @@ def delete_file_list_parallel(file_list, max_workers, verbose=False,files_per_jo
 			last_refresh_time = time.monotonic()
 	endTime = time.monotonic()
 	apb.stop()
-	print(f"\nTime taken:             {endTime-start_time:0.4f} seconds")
-	print(f"Average speed:          {format_bytes(apb.size_counter / (endTime-start_time))}B/s")
-	print(f"                        {apb.item_counter / (endTime-start_time):.2f} file/s")
+	_print_operation_summary(apb, endTime - start_time)
 	return apb.item_counter, apb.size_counter
 
 def delete_files_parallel(paths, max_workers, verbose=False,files_per_job=1,exclude=None,batch=False,parallel_file_listing=False):
@@ -1665,20 +1685,9 @@ def copy_file(src_path, dest_paths, full_hash=False, verbose=False, concurrent_p
 	global NO_CREATE_DIR
 	symLinks = {}
 	#task_to_run = []
-	# skip if src path or dest path is longer than 4096 characters
-	if len(src_path) > 4096:
-		print(f'\nSkipped {src_path} because path is too long')
-		return 0, 0, symLinks #, task_to_run
-	newDests = []
 	inDests = dest_paths
-	for dest in dest_paths:
-		if len(dest) > 4096:
-			print(f'\nSkipped {dest} because path is too long')
-		else:
-			newDests.append(dest)
-	dest_paths = newDests
-	if len(dest_paths) == 0:
-		print(f'\nSkipped {src_path} because all destination paths are too long')
+	dest_paths = _validate_paths(src_path, dest_paths)
+	if dest_paths is None:
 		return 0, 0, symLinks
 	start_time = time.monotonic()
 	try:
@@ -1686,8 +1695,6 @@ def copy_file(src_path, dest_paths, full_hash=False, verbose=False, concurrent_p
 		copiedSize = 0
 		for dest in dest_paths:
 			if os.path.exists(dest) and (not os.path.islink(src_path)) and is_file_identical(src_path, dest,src_size,full_hash):
-				# if verbose:
-				#     print(f'\nSkipped {src_path}')
 				st = os.stat(src_path,follow_symlinks=False)
 				shutil.copystat(src_path, dest,follow_symlinks=False)
 				if os.name == 'posix':
@@ -1756,7 +1763,7 @@ def copy_file(src_path, dest_paths, full_hash=False, verbose=False, concurrent_p
 						if using_bak_paths:
 							if not dest_paths and not verbose:
 								import traceback
-								print(f'Error copying {src_path} to {dest_path}: {e}')
+								print(f'Error copying {src_path} to {dest_path}, {e}')
 								print(traceback.format_exc())
 								print(f'Trying to copy from {src_path} to {dest_path} without sparse')
 							if os.name == 'posix':
@@ -1766,7 +1773,7 @@ def copy_file(src_path, dest_paths, full_hash=False, verbose=False, concurrent_p
 								run_command_in_multicmd_with_path_check(["xcopy", "/I", "/E", "/Y", "/c", "/q", "/k", "/r", "/h", "/x", src_path, dest_path],quiet=True,strict=True)
 								#task_to_run = ["xcopy", "/I", "/E", "/Y", "/c", "/q", "/k", "/r", "/h", "/x", src_path, dest_path]
 						elif verbose:
-							print(f'Retrying with a different destination path in {dest_paths}')
+							eprint(f'Retrying with a different destination path in {dest_paths}')
 				except Exception as e:
 					if using_bak_paths and not dest_paths:
 						import traceback
@@ -1871,18 +1878,8 @@ def copy_file_list_parallel(file_list, links, src_path, dest_paths, max_workers,
 		max_scheduled_jobs = max_workers
 	else:
 		max_scheduled_jobs = max_workers * 1.1
-	if len(src_path) > 4096:
-		print(f'\nSkipped {src_path} because path is too long')
-		return 0, 0, {}, frozenset()
-	newDests = []
-	for dest in dest_paths:
-		if len(dest) > 4096:
-			print(f'\nSkipped {dest} because path is too long')
-		else:
-			newDests.append(dest)
-	dest_paths = newDests
-	if not dest_paths:
-		print(f'\nSkipped {src_path} because all destination paths are too long')
+	dest_paths = _validate_paths(src_path, dest_paths)
+	if dest_paths is None:
 		return 0, 0, {}, frozenset()
 	file_list_iterator = iter(file_list)
 	start_time = time.monotonic()
@@ -1978,10 +1975,7 @@ def copy_file_list_parallel(file_list, links, src_path, dest_paths, max_workers,
 			lastRefreshTime = time.monotonic()
 	endTime = time.monotonic()
 	apb.stop()
-	print(f"\nTime taken:             {endTime-start_time:0.4f} seconds")
-	print(f"Average speed:          {format_bytes(apb.size_counter / (endTime-start_time))}B/s")
-	print(f"                        {apb.item_counter / (endTime-start_time):.2f} file/s")
-	print(f"Average bandwidth:      {format_bytes(apb.size_counter / (endTime-start_time) * 8,use_1024_bytes=False)}bps")
+	_print_operation_summary(apb, endTime - start_time, show_bandwidth=True)
 	return apb.item_counter, apb.size_counter , symLinks ,file_list
 
 def get_copy_file_job_iter(jobs):
@@ -2086,26 +2080,12 @@ def copy_file_list_parallel_batch(jobs, max_workers, full_hash=False, verbose=Fa
 			lastRefreshTime = time.monotonic()
 	endTime = time.monotonic()
 	apb.stop()
-	print(f"\nTime taken:             {endTime-start_time:0.4f} seconds")
-	print(f"Average speed:          {format_bytes(apb.size_counter / (endTime-start_time))}B/s")
-	print(f"                        {apb.item_counter / (endTime-start_time):.2f} file/s")
-	print(f"Average bandwidth:      {format_bytes(apb.size_counter / (endTime-start_time) * 8,use_1024_bytes=False)}bps")
+	_print_operation_summary(apb, endTime - start_time, show_bandwidth=True)
 	return apb.item_counter, apb.size_counter , symLinks 
 
 def copy_files_parallel(src_path, dest_paths, max_workers, full_hash=False, verbose=False,files_per_job=1,parallel_file_listing=False,exclude=None):
-	# skip if src path or dest path is longer than 4096 characters
-	if len(src_path) > 4096:
-		print(f'Skipping: {src_path} is too long')
-		return 0, 0 , set(), frozenset()
-	newDests = []
-	for dest in dest_paths:
-		if len(dest) > 4096:
-			print(f'\nSkipped {dest} because path is too long')
-		else:
-			newDests.append(dest)
-	dest_paths = newDests
-	if not dest_paths:
-		print(f'\nSkipped {src_path} because all destination paths are too long')
+	dest_paths = _validate_paths(src_path, dest_paths)
+	if dest_paths is None:
 		return 0, 0, set(), frozenset()
 	if exclude and is_excluded(src_path,exclude):
 		return 0, 0 , set(), frozenset()
@@ -2135,19 +2115,8 @@ def copy_files_parallel_batch(jobs, max_workers, full_hash=False, verbose=False,
 	total_link_count = 0
 	total_folder_count = 0
 	for src_path, dest_paths in jobs:
-		# skip if src path or dest path is longer than 4096 characters
-		if len(src_path) > 4096:
-			print(f'Skipping: {src_path} is too long')
-			continue
-		newDests = []
-		for dest in dest_paths:
-			if len(dest) > 4096:
-				print(f'\nSkipped {dest} because path is too long')
-			else:
-				newDests.append(dest)
-		dest_paths = newDests
-		if not dest_paths:
-			print(f'\nSkipped {src_path} because all destination paths are too long')
+		dest_paths = _validate_paths(src_path, dest_paths)
+		if dest_paths is None:
 			continue
 		if exclude and is_excluded(src_path,exclude):
 			continue
@@ -2178,21 +2147,10 @@ def copy_files_parallel_batch(jobs, max_workers, full_hash=False, verbose=False,
 	return total_item_count + item_counter, total_size_count + size_counter , total_symLinks ,frozenset(total_files)
 
 def copy_files_serial(src_path, dest_paths, full_hash=False, verbose=False,exclude=None):
-	# skip if src path or dest path is longer than 4096 characters
 	global FILES_RATE_LIMIT
 	global BYTES_RATE_LIMIT
-	if len(src_path) > 4096:
-		print(f'Skipping: {src_path} is too long')
-		return 0, 0 , set(), frozenset()
-	newDests = []
-	for dest in dest_paths:
-		if len(dest) > 4096:
-			print(f'\nSkipped {dest} because path is too long')
-		else:
-			newDests.append(dest)
-	dest_paths = newDests
-	if not dest_paths:
-		print(f'\nSkipped {src_path} because all destination paths are too long')
+	dest_paths = _validate_paths(src_path, dest_paths)
+	if dest_paths is None:
 		return 0, 0 , set(), frozenset()
 	if exclude and is_excluded(src_path,exclude):
 		return 0, 0 , set(), frozenset()
@@ -2219,10 +2177,7 @@ def copy_files_serial(src_path, dest_paths, full_hash=False, verbose=False,exclu
 		symLinks[link] = [os.path.join(dest_path, srcRelativePath) for dest_path in dest_paths]
 	endTime = time.monotonic()
 	apb.stop()
-	print(f"\nTime taken:             {endTime-start_time:0.4f} seconds")
-	print(f"Average speed:          {format_bytes(apb.size_counter / (endTime-start_time))}B/s")
-	print(f"                        {apb.item_counter / (endTime-start_time):.2f} file/s")
-	print(f"Average bandwidth:      {format_bytes(apb.size_counter / (endTime-start_time) * 8,use_1024_bytes=False)}bps")
+	_print_operation_summary(apb, endTime - start_time, show_bandwidth=True)
 	return apb.item_counter, apb.size_counter , symLinks , frozenset(file_list)
 
 def copy_files_serial_batch(jobs, full_hash=False, verbose=False,exclude=None,exit_not_enough_space=False):
@@ -2237,18 +2192,8 @@ def copy_files_serial_batch(jobs, full_hash=False, verbose=False,exclude=None,ex
 	total_item_count = 0
 	total_size_count = 0
 	for src_path, dest_paths in jobs:
-		if len(src_path) > 4096:
-			print(f'Skipping: {src_path} is too long')
-			continue
-		newDests = []
-		for dest in dest_paths:
-			if len(dest) > 4096:
-				print(f'\nSkipped {dest} because path is too long')
-			else:
-				newDests.append(dest)
-		dest_paths = newDests
-		if not dest_paths:
-			print(f'\nSkipped {src_path} because all destination paths are too long')
+		dest_paths = _validate_paths(src_path, dest_paths)
+		if dest_paths is None:
 			continue
 		if exclude and is_excluded(src_path,exclude):
 			continue
@@ -2297,10 +2242,7 @@ def copy_files_serial_batch(jobs, full_hash=False, verbose=False,exclude=None,ex
 			total_symLinks[link] = [os.path.join(dest_path, srcRelativePath) for dest_path in dest_paths]
 	endTime = time.monotonic()
 	apb.stop()
-	print(f"\nTime taken:             {endTime-start_time:0.4f} seconds")
-	print(f"Average speed:          {format_bytes(apb.size_counter / (endTime-start_time))}B/s")
-	print(f"                        {apb.item_counter / (endTime-start_time):.2f} file/s")
-	print(f"Average bandwidth:      {format_bytes(apb.size_counter / (endTime-start_time) * 8,use_1024_bytes=False)}bps")
+	_print_operation_summary(apb, endTime - start_time, show_bandwidth=True)
 	return apb.item_counter, apb.size_counter , total_symLinks , frozenset(total_files)
 
 class copy_scheduler:
@@ -2371,19 +2313,8 @@ class copy_scheduler:
 
 #%% ---- Copy Directories ----
 def sync_directory_metadata(src_path, dest_paths):
-	# skip if src path or dest path is longer than 4096 characters
-	if len(src_path) > 4096:
-		print(f'Skipping: {src_path} is too long')
-		return 0, 0 , set(), frozenset()
-	newDests = []
-	for dest in dest_paths:
-		if len(dest) > 4096:
-			print(f'\nSkipped {dest} because path is too long')
-		else:
-			newDests.append(dest)
-	dest_paths = newDests
-	if not dest_paths:
-		print(f'\nSkipped {src_path} because all destination paths are too long')
+	dest_paths = _validate_paths(src_path, dest_paths)
+	if dest_paths is None:
 		return 0, 0 , set(), frozenset()
 	start_time = time.monotonic()
 	if os.path.islink(src_path):
@@ -2397,7 +2328,7 @@ def sync_directory_metadata(src_path, dest_paths):
 			if not (os.path.exists(dest_path) or os.path.ismount(dest_path)):
 				os.makedirs(dest_path, exist_ok=True)
 		except FileExistsError:
-			print(f"Destination path {dest_path} maybe a mounted dir, known issue with os.path.exists\nContinuing without creating dest folder...")
+			eprint(f"Destination path {dest_path} maybe a mounted dir, known issue with os.path.exists\nContinuing without creating dest folder...")
 		# Sync the metadata
 		shutil.copystat(src_path, dest_path)
 		if os.name == 'posix':
@@ -2438,19 +2369,8 @@ def sync_directories_parallel(src, dests, max_workers, verbose=False,folder_per_
 		max_scheduled_jobs = max_workers
 	else:
 		max_scheduled_jobs = max_workers * 1.1
-	# skip if src path or dest path is longer than 4096 characters
-	if len(src) > 4096:
-		print(f'Skipping: {src} is too long')
-		return 0, 0 , set(), frozenset()
-	newDests = []
-	for d in dests:
-		if len(d) > 4096:
-			print(f'\nSkipped {d} because path is too long')
-		else:
-			newDests.append(d)
-	dests = newDests
-	if not dests:
-		print(f'\nSkipped {src} because all destination paths are too long')
+	dests = _validate_paths(src, dests)
+	if dests is None:
 		return 0, 0, set(), frozenset()
 	symLinks = {}
 	if exclude and is_excluded(src,exclude):
@@ -2531,10 +2451,7 @@ def sync_directories_parallel(src, dests, max_workers, verbose=False,folder_per_
 
 	endTime = time.monotonic()
 	apb.stop()
-	print(f"\nTime taken:             {endTime-start_time:0.4f} seconds")
-	print(f"Average speed:          {format_bytes(apb.size_counter / (endTime-start_time))}B/s")
-	print(f"                        {apb.item_counter / (endTime-start_time):.2f} folder/s")
-	print(f"Average bandwidth:      {format_bytes(apb.size_counter / (endTime-start_time) * 8,use_1024_bytes=False)}bps")
+	_print_operation_summary(apb, endTime - start_time, unit='folder', show_bandwidth=True)
 	return symLinks
 
 def sync_directories_parallel_batch(jobs, max_workers, verbose=False,folder_per_job=64,exclude=None,parallel_file_listing=False):
@@ -2547,19 +2464,8 @@ def sync_directories_parallel_batch(jobs, max_workers, verbose=False,folder_per_
 	symLinks = {}
 	allFolderToSync = []
 	for src, dests in jobs:
-		# skip if src path or dest path is longer than 4096 characters
-		if len(src) > 4096:
-			print(f'Skipping: {src} is too long')
-			continue
-		newDests = []
-		for d in dests:
-			if len(d) > 4096:
-				print(f'\nSkipped {d} because path is too long')
-			else:
-				newDests.append(d)
-		dests = newDests
-		if not dests:
-			print(f'\nSkipped {src} because all destination paths are too long')
+		dests = _validate_paths(src, dests)
+		if dests is None:
 			continue
 		if exclude and is_excluded(src,exclude):
 			continue
@@ -2638,10 +2544,7 @@ def sync_directories_parallel_batch(jobs, max_workers, verbose=False,folder_per_
 
 	endTime = time.monotonic()
 	apb.stop()
-	print(f"\nTime taken:             {endTime-start_time:0.4f} seconds")
-	print(f"Average speed:          {format_bytes(apb.size_counter / (endTime-start_time))}B/s")
-	print(f"                        {apb.item_counter / (endTime-start_time):.2f} folder/s")
-	print(f"Average bandwidth:      {format_bytes(apb.size_counter / (endTime-start_time) * 8,use_1024_bytes=False)}bps")
+	_print_operation_summary(apb, endTime - start_time, unit='folder', show_bandwidth=True)
 	return symLinks
 
 def sync_directories_serial(src, dests,exclude=None):
@@ -2667,19 +2570,8 @@ def sync_directories_serial(src, dests,exclude=None):
 	"""
 	global FILES_RATE_LIMIT
 	global BYTES_RATE_LIMIT
-	# skip if src path or dest path is longer than 4096 characters
-	if len(src) > 4096:
-		print(f'Skipping: {src} is too long')
-		return 0, 0 , set(), frozenset()
-	newDests = []
-	for d in dests:
-		if len(d) > 4096:
-			print(f'\nSkipped {d} because path is too long')
-		else:
-			newDests.append(d)
-	dests = newDests
-	if not dests:
-		print(f'\nSkipped {src} because all destination paths are too long')
+	dests = _validate_paths(src, dests)
+	if dests is None:
 		return 0, 0, set(), frozenset()
 	if exclude and is_excluded(src,exclude):
 		return 0, 0 , set(), frozenset()
@@ -2709,18 +2601,8 @@ def sync_directories_serial_batch(jobs,exclude=None):
 	totalFolderCount = 0
 	srcFolders = []
 	for src,dests in jobs:
-		if len(src) > 4096:
-			print(f'Skipping: {src} is too long')
-			continue
-		newDests = []
-		for d in dests:
-			if len(d) > 4096:
-				print(f'\nSkipped {d} because path is too long')
-			else:
-				newDests.append(d)
-		dests = newDests
-		if not dests:
-			print(f'\nSkipped {src} because all destination paths are too long')
+		dests = _validate_paths(src, dests)
+		if dests is None:
 			continue
 		if exclude and is_excluded(src,exclude):
 			continue
@@ -2789,21 +2671,21 @@ def remove_extra_dirs(src_paths, dests,exclude=None):
 	newDests = []
 	for d in dests:
 		if len(d) > 4096:
-			print(f'\nSkipped {d} because path is too long')
+			eprint(f'Destination path length error: {d} is too long')
 		elif exclude and is_excluded(d,exclude):
-			print(f'\nSkipped {d} because it is excluded')
+			eprint(f'Destination path excluded: {d} is excluded')
 		else:
 			newDests.append(d)
 	dests = newDests
 	if not dests:
-		print(f'\nSkipped {src_paths} because all destination paths are too long')
+		eprint(f'All destination paths are too long: Skipping {src_paths}')
 		return 0, 0, set(), frozenset()
 	# remove excluded paths from src_paths
 	for src_path in src_paths:
 		if exclude and is_excluded(src_path,exclude):
 			src_paths.remove(src_path)
 	extraDirs = set()
-	print(dests)
+	print(pformat(dests))
 	for dest in dests:
 		for dirpath, dirnames, _ in os.walk(dest, topdown=False):
 			for dirname in dirnames:
@@ -2860,7 +2742,7 @@ def mount_src_image(src_images: list,src_paths: list,mount_points: list,loop_dev
 	src_str = ''
 	for src in src_images:
 		if not os.path.exists(src):
-			print(f"Source image {src} does not exist")
+			eprint(f"Source image not found: {src} does not exist")
 			src_images.remove(src)
 		src_str += f"{os.path.basename(src)}-"
 		# we will mount the all image all partitions to seperate temorary folders and add them to src_paths
@@ -2909,7 +2791,7 @@ def mount_src_image(src_images: list,src_paths: list,mount_points: list,loop_dev
 def verify_src_path(src_paths: list):
 	for src in src_paths:
 		if not os.path.exists(src):
-			print(f"Source path {src} does not exist")
+			eprint(f"Source path not found: {src} does not exist")
 			src_paths.remove(src)
 		# if ':' in src:
 		#     print(f"Remote syncing is not supported in this version, removing source path {src}.")
@@ -2919,7 +2801,7 @@ def verify_src_path(src_paths: list):
 
 def load_file_list(file_list):
 	if not os.path.exists(file_list):
-		print(f"File list {file_list} does not exist")
+		eprint(f"File list not found: {file_list} does not exist")
 		return frozenset()
 	with open(file_list, 'r') as f:
 		fileList = frozenset([entry.strip() for entry in f.read().splitlines() if entry.strip()])
@@ -2999,7 +2881,7 @@ def process_remove(src_paths: list,single_thread = False, max_workers = 4 * mult
 			print(f'Skipping excluded path: {path}')
 		else:
 			processedPaths.append(path)
-	print(f"Removing files from {processedPaths} with {max_workers if not single_thread else '1'} workers")
+	print(f"Removing files from {pformat(processedPaths)} with {max_workers if not single_thread else '1'} workers")
 	if not remove_force:
 		print("Do you want to continue? (y/n)")
 		if not input().lower().startswith('y'):
@@ -3611,10 +3493,10 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = 4 * mul
 			src_path = src_path if src_path else src_image
 
 			if dest_image_size:
-				print(f"Currently not supporting dest_image_size in dd mode. Ignoring dest_image_size {dest_image_size}.")
+				eprint(f"Currently not supporting dest_image_size in dd mode. Ignoring dest_image_size {dest_image_size}.")
 				
 			if not dest_path and src_path:
-				print(f"Destination path not specified, using {src_path[-1]} as destination")
+				eprint(f"Destination path not specified, using {src_path[-1]} as destination")
 				dest_path = src_path[-1]
 				del src_path[-1]
 
@@ -3657,11 +3539,11 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = 4 * mul
 					mtab = get_mount_table()
 					if src_partition_path in mtab:
 						src_partition_mount_path = mtab[src_partition_path][0]
-						print(f"Error mounting {src_partition_path}, trying to use bind mount {src_partition_mount_path}")
+						eprint(f"Error mounting {src_partition_path}, trying to use bind mount {src_partition_mount_path}")
 						# try to bind mount
 						run_command_in_multicmd_with_path_check(['mount','--bind',src_partition_mount_path,src_mount_point],strict=False)
 				if not any(os.scandir(src_mount_point)) and not os.path.ismount(src_mount_point):
-					print(f"Error mounting {src_partition_path}, usig dd for copying.")
+					eprint(f"Error mounting {src_partition_path}, usig dd for copying.")
 					dd_partition(src_partition_path,dest_partition_path,partition,dd_src,dd_dest)
 					continue
 				print(f"Mounting {dest_partition_path} at {dest_mount_point}")
@@ -3671,11 +3553,11 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = 4 * mul
 					mtab = get_mount_table()
 					if dest_partition_path in mtab:
 						dest_partition_mount_path = mtab[dest_partition_path][0]
-						print(f"Error mounting {dest_partition_path}, trying to use bind mount {dest_partition_mount_path}")
+						eprint(f"Error mounting {dest_partition_path}, trying to use bind mount {dest_partition_mount_path}")
 						# try to bind mount
 						run_command_in_multicmd_with_path_check(['mount','--bind',dest_partition_mount_path,dest_mount_point],strict=False)
 				if not any(os.scandir(dest_mount_point)) and not os.path.ismount(dest_mount_point):
-					print(f"Error mounting {dest_partition_path}, usig dd for copying.")
+					eprint(f"Error mounting {dest_partition_path}, usig dd for copying.")
 					dd_partition(src_partition_path,dest_partition_path,partition,dd_src,dd_dest)
 					continue
 				# copy the partition files
@@ -3699,8 +3581,8 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = 4 * mul
 				raise RuntimeError("Platform error: Destination / Source as a image is currently not supported on Windows, exiting")
 			max_workers = min(max_workers,61)
 			if max_workers == 61:
-				print("Max workers set to 61 on Windows")
-				print("This is because Windows has a limit of 64 threads per process and we need 3 threads for the main process")
+				eprint("Max workers set to 61 on Windows")
+				eprint("This is because Windows has a limit of 64 threads per process and we need 3 threads for the main process")
 				print("See https://bugs.python.org/issue26903")
 
 		# if not dest_path:
@@ -3760,7 +3642,7 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = 4 * mul
 							eprint(f"Destination fs type mismatch: Expected {target_file_system}, got {destfs}, ignoring {dest}.")
 							dests_to_remove.append(dest)
 			except FileExistsError :
-				print(f"Destination path {dest} may be a mounted dir, known issue with os.path.exists\nContinuing without creating dest folder...")
+				eprint(f"Destination path {dest} may be a mounted dir, known issue with os.path.exists\nContinuing without creating dest folder...")
 		if dests and dests_to_remove == dests:
 			raise RuntimeError("No valid destination: Exiting due to no valid destination paths.")
 		for dest in dests_to_remove:
