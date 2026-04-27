@@ -122,9 +122,9 @@ except ImportError:
 	hasher = hashlib.blake2b()
 	xxhash_available = False
 
-version = '9.50'
+version = '9.51'
 __version__ = version
-COMMIT_DATE = '2026-03-05'
+COMMIT_DATE = '2026-04-27'
 
 MAGIC_NUMBER = 1.61803398875
 RANDOM_DESTINATION_SELECTION = False
@@ -383,9 +383,9 @@ def check_path(program_name):
 
 _binCalled = {'lsblk', 'losetup', 'sgdisk', 'blkid', 'umount', 'mount','dd','cp', 'xcopy',
 			  'truncate', 
-			  'mkfs', 'mkfs.btrfs', 'mkfs.xfs', 'mkfs.ntfs', 'mkfs.vfat', 'mkfs.exfat', 'mkfs.hfsplus', 
+			  'mkfs', 'mkfs.btrfs', 'mkfs.xfs', 'mkfs.f2fs', 'mkfs.ntfs', 'mkfs.vfat', 'mkfs.exfat', 'mkfs.hfsplus', 
 			  'mkudffs', 'mkfs.jfs', 'mkfs.reiserfs', 'newfs', 'mkfs.bfs', 'mkfs.minix', 'mkswap',
-			  'e2fsck', 'btrfs', 'xfs_repair', 'ntfsfix', 'fsck.fat', 'fsck.exfat', 'fsck.hfsplus', 
+			  'e2fsck', 'btrfs', 'xfs_repair', 'fsck.f2fs', 'ntfsfix', 'fsck.fat', 'fsck.exfat', 'fsck.hfsplus', 
 			  'fsck.hfs', 'fsck.jfs', 'fsck.reiserfs', 'fsck.ufs', 'fsck.minix',
 			  'tune2fs', 'xfs_admin', 'exfatlabel', 'udflabel', 'jfs_tune', 'reiserfstune', 'swaplabel'}
 [check_path(program) for program in _binCalled]
@@ -705,6 +705,7 @@ _FS_FIX_COMMANDS = {
 	'ext2':     ['e2fsck', '-f', '-y'],
 	'btrfs':    ['btrfs', 'check', '--repair'],
 	'xfs':      ['xfs_repair', '-L'],
+	'f2fs':     ['fsck.f2fs', '-a', '-f'],
 	'ntfs':     ['ntfsfix'],
 	'fat32':    ['fsck.fat', '-w', '-r', '-l', '-a', '-v'],
 	'fat16':    ['fsck.fat', '-w', '-r', '-l', '-a', '-v'],
@@ -924,7 +925,7 @@ def write_partition_info(image, partition_infos, partition_name):
 	
 	This function handles the configuration of partition attributes, GUID codes,
 	unique GUIDs, and file system creation. It supports various file systems including
-	ext2/3/4, btrfs, xfs, ntfs, fat/vfat variants, exfat, hfs/hfsplus, udf, jfs,
+	ext2/3/4, btrfs, xfs, f2fs, ntfs, fat/vfat variants, exfat, hfs/hfsplus, udf, jfs,
 	reiserfs, and others.
 	
 	Args:
@@ -993,6 +994,14 @@ def write_partition_info(image, partition_infos, partition_name):
 				if fs_uuid:
 					#command.extend(['-m', f'uuid={fs_uuid}'])
 					delayed_commands.append(['xfs_admin', '-U', fs_uuid, target_partition])
+				command.append(target_partition)
+				run_command_in_multicmd_with_path_check(command,strict=False)
+			elif fs_type == 'f2fs':
+				command = ['mkfs.f2fs', '-f']
+				if fs_label:
+					command.extend(['-l', fs_label])
+				if fs_uuid:
+					command.extend(['-U', fs_uuid])
 				command.append(target_partition)
 				run_command_in_multicmd_with_path_check(command,strict=False)
 			elif fs_type == 'ntfs':
@@ -3391,7 +3400,7 @@ def get_args(args = None):
 	parser.add_argument('-ddr', '--dd_resize', action='append', type=str, help='Resize the destination image to the specified size with -dd. Applies to biggest partiton first. Specify multiple -ddr to resize subsequent sized partitions. Example: {100GiB} or {200G}')
 	parser.add_argument('-L','-rl','--rate_limit', type=str, default=None, help='Approximate a rate limit the copy speed in bytes/second. Example: 10M for 10 MB/s, 1Gi for 1 GiB/s. Note: do not work in single thread mode. Default is 0: no rate limit.')
 	parser.add_argument('-F','-frl','--file_rate_limit', type=str, default=None, help='Approximate a rate limit the copy speed in files/second. Example: 10K for 10240 files/s, 1Mi for 1024*1024*1024 files/s. Note: do not work in serial mode. Default is 0: no rate limit.')
-	parser.add_argument('-tfs','--target_file_system', type=str, default=None, help='Specify the target file system type. Will abort if the target file system type does not match. Example: ext4, xfs, ntfs, fat32, exfat. Default is None: do not check target file system type.')
+	parser.add_argument('-tfs','--target_file_system', type=str, default=None, help='Specify the target file system type. Will abort if the target file system type does not match. Example: ext4, xfs, f2fs, ntfs, fat32, exfat. Default is None: do not check target file system type.')
 	parser.add_argument('-ncd','--no_create_dir', action='store_true', help='Ignore any destination folder that does not already exist. ( Will still copy if dest is a file )')
 	parser.add_argument('-ctl','--command_timeout_limit', type=int, default=0, help='Set the command timeout limit in seconds for external commands ( ex. cp / dd ). Default is 0: no timeout.')
 	parser.add_argument('-enes','--exit_not_enough_space', action='store_true', help='Exit if there is not enough space on the destination instead of continuing (Note: Default is continue as in compressed fs copy can be down even if source is bigger than free space).')
