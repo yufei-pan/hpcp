@@ -122,9 +122,9 @@ except ImportError:
 	hasher = hashlib.blake2b()
 	xxhash_available = False
 
-version = '9.51'
+version = '9.52'
 __version__ = version
-COMMIT_DATE = '2026-04-27'
+COMMIT_DATE = '2026-04-28'
 
 MAGIC_NUMBER = 1.61803398875
 RANDOM_DESTINATION_SELECTION = False
@@ -2809,10 +2809,13 @@ def verify_src_path(src_paths: list):
 		raise RuntimeError("No source paths: No source paths specified, exiting")
 
 def load_file_list(file_list):
-	if not os.path.exists(file_list):
-		eprint(f"File list not found: {file_list} does not exist")
+	file_list_value = '' if file_list is None else str(file_list)
+	if file_list_value in ('-', '/dev/stdin'):
+		return frozenset([entry.strip() for entry in sys.stdin.read().splitlines() if entry.strip()])
+	if not os.path.exists(file_list_value):
+		eprint(f"File list not found: {file_list_value} does not exist")
 		return frozenset()
-	with open(file_list, 'r') as f:
+	with open(file_list_value, 'r') as f:
 		fileList = frozenset([entry.strip() for entry in f.read().splitlines() if entry.strip()])
 	return fileList
 
@@ -2973,6 +2976,7 @@ def get_dest_from_image(dest_image,mount_points: list,loop_devices: list):
 def get_dest_from_path(dest_path,src_paths: list,src_path,can_be_none = False):
 	dest = ''
 	src_path = list(src_path)
+	interactive_input = sys.stdin.isatty()
 	if not dest_path:
 		if can_be_none:
 			return None
@@ -2987,7 +2991,11 @@ def get_dest_from_path(dest_path,src_paths: list,src_path,can_be_none = False):
 				print(f"y:  {cwd} \t:Use current working directory")
 			print("n:  Exit")
 			print("...:  Enter custom destination path")
-			inStr = multiCMD.input_with_timeout_and_countdown(60)
+			if not interactive_input:
+				# In non-interactive mode (e.g. piped stdin), follow the same default as empty input.
+				inStr = ''
+			else:
+				inStr = multiCMD.input_with_timeout_and_countdown(60)
 			if (not inStr) or inStr.lower() == 'l':
 				dest = str(src_path[-1])
 				src_paths.remove(dest) if dest in src_paths else None
@@ -3009,7 +3017,11 @@ def get_dest_from_path(dest_path,src_paths: list,src_path,can_be_none = False):
 				print(f"y:  {os.getcwd() + os.path.sep} \t:Use current working directory ( default )")
 			print("n:  Exit")
 			print("...:  Enter custom destination path")
-			inStr = multiCMD.input_with_timeout_and_countdown(60)
+			if not interactive_input:
+				# In non-interactive mode (e.g. piped stdin), follow the same default as empty input.
+				inStr = ''
+			else:
+				inStr = multiCMD.input_with_timeout_and_countdown(60)
 			if (not inStr) or cwd and inStr.lower() == 'y':
 				dest = cwd
 				print(f"Destination path not specified, using {dest}")
@@ -3373,7 +3385,7 @@ def get_args(args = None):
 	parser.add_argument('-fh', '--full_hash', action='store_true', help='Checks the full hash of files')
 	parser.add_argument('-hs', '--hash_size', type=int, default=1<<16, help='Hash size in bytes, default is 65536. This means hpcp will only check the last 64 KiB (about 1 page in a SSD) of the file.')
 	parser.add_argument('-fpj', '--files_per_job', type=int, default=1, help='Base number of files per job, will be adjusted dynamically. Default is 1')
-	parser.add_argument('-sfl','-lfl', '--source_file_list', type=str, help='Load source file list from file. Will treat it raw meaning do not expand files / folders. files are seperated using newline.  If --compare_file_list is specified, it will be used as source for compare')
+	parser.add_argument('-sfl','-lfl', '--source_file_list', type=str, help='Load source file list from file, or use "-" to read from stdin. Will treat it raw meaning do not expand files / folders. files are seperated using newline.  If --compare_file_list is specified, it will be used as source for compare')
 	parser.add_argument('-fl','-tfl', '--target_file_list', type=str,help='Specify the file_list file to store list of files in src_path to. If --compare_file_list is specified, it will be used as targets for compare')
 	parser.add_argument('-cfl', '--compare_file_list',action='store_true', help='Only compare file list. Use --file_list to specify a existing file list or specify the dest_path to compare src_path with. When not using with file_list, will compare hash.')
 	parser.add_argument('-dfl', '--diff_file_list', type=str, nargs='?', const="auto",default=None, help="Implies --compare_file_list, specify a file name to store the diff file list to or omit the value to auto-determine.")
@@ -3605,6 +3617,9 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = 4 * mul
 
 		if source_file_list:
 			src_paths.extend(load_file_list(source_file_list))
+		elif not src_path and not sys.stdin.isatty():
+			print("Reading source file list from stdin...")
+			src_paths.extend(load_file_list('-'))
 		src_paths.extend(expand_paths(src_path))
 		verify_src_path(src_paths)
 		if not src_str:
