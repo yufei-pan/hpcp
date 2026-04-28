@@ -122,9 +122,9 @@ except ImportError:
 	hasher = hashlib.blake2b()
 	xxhash_available = False
 
-version = '9.51'
+version = '9.52'
 __version__ = version
-COMMIT_DATE = '2026-04-27'
+COMMIT_DATE = '2026-04-28'
 
 MAGIC_NUMBER = 1.61803398875
 RANDOM_DESTINATION_SELECTION = False
@@ -1652,27 +1652,183 @@ def delete_file_list_parallel(file_list, max_workers, verbose=False,files_per_jo
 	_print_operation_summary(apb, endTime - start_time)
 	return apb.item_counter, apb.size_counter
 
+def scan_and_delete_serial(root, exclude=None, recurse=True):
+	"""Scan a path and delete files/links inline. Returns (deleted_count, deleted_size, folders).
+
+	Files and symlinks are removed as they are encountered, so their paths are not retained
+	in memory. Directories are accumulated and returned so the caller can remove them once
+	their contents are guaranteed to be gone.
+	"""
+	if len(root) > 4096:
+		return 0, 0, frozenset()
+	if exclude and is_excluded(root, exclude):
+		return 0, 0, frozenset()
+	if os.path.islink(root):
+		size = get_file_size(root)
+		try:
+			os.unlink(root)
+			return 1, size, frozenset()
+		except Exception as exc:
+			eprint(f'Remove process exception: Deleting {root} generated an exception: {exc}')
+			return 0, 0, frozenset()
+	if os.path.isfile(root):
+		size = get_file_size(root)
+		try:
+			os.remove(root)
+			return 1, size, frozenset()
+		except Exception as exc:
+			eprint(f'Remove process exception: Deleting {root} generated an exception: {exc}')
+			return 0, 0, frozenset()
+	if not os.path.isdir(root):
+		eprint(f'Source path type error: {root} is not a file or directory')
+		return 0, 0, frozenset()
+	folders = set([root])
+	deleted_count = 0
+	deleted_size = 0
+	start_time = time.monotonic()
+	globalStartTime = start_time
+	try:
+		entries = list(os.scandir(root))
+	except Exception as exc:
+		eprint(f'Scan exception: scandir on {root} generated an exception: {exc}')
+		return 0, 0, frozenset(folders - set(['.', '..']))
+	for entry in entries:
+		currentTime = time.monotonic()
+		if currentTime - start_time > 0.5:
+			start_time = currentTime
+			iteration = int(currentTime - globalStartTime)
+			multiCMD.print_progress_bar(iteration=iteration, total=0, prefix=f'{root}'[-50:], suffix=f'Deleted: {format_bytes(deleted_count,use_1024_bytes=False,to_str=True)}F Folders: {format_bytes(len(folders),use_1024_bytes=False,to_str=True)} Size: {format_bytes(deleted_size)}B')
+		if exclude and is_excluded(entry.path, exclude):
+			continue
+		try:
+			if entry.is_symlink():
+				size = get_file_size(entry.path)
+				os.unlink(entry.path)
+				deleted_count += 1
+				deleted_size += size
+			elif entry.is_file(follow_symlinks=False):
+				size = get_file_size(entry.path)
+				os.remove(entry.path)
+				deleted_count += 1
+				deleted_size += size
+			elif entry.is_dir(follow_symlinks=False):
+				if recurse:
+					sub_count, sub_size, sub_folders = scan_and_delete_serial(entry.path, exclude=exclude, recurse=True)
+					deleted_count += sub_count
+					deleted_size += sub_size
+					folders.update(sub_folders)
+				else:
+					folders.add(entry.path)
+		except Exception as exc:
+			eprint(f'Remove process exception: Deleting {entry.path} generated an exception: {exc}')
+	return deleted_count, deleted_size, frozenset(folders - set(['.', '..']))
+
+def scan_and_delete_parallel(path, max_workers=56, exclude=None, verbose=False):
+	"""Parallel scan-and-delete that mirrors get_file_list_parallel but removes files/links
+	inline. Returns (deleted_count, deleted_size, folders)."""
+	if len(path) > 4096:
+		return 0, 0, frozenset()
+	if exclude and is_excluded(path, exclude):
+		return 0, 0, frozenset()
+	if os.path.islink(path):
+		size = get_file_size(path)
+		try:
+			os.unlink(path)
+			return 1, size, frozenset()
+		except Exception as exc:
+			eprint(f'Remove process exception: Deleting {path} generated an exception: {exc}')
+			return 0, 0, frozenset()
+	if os.path.isfile(path):
+		size = get_file_size(path)
+		try:
+			os.remove(path)
+			return 1, size, frozenset()
+		except Exception as exc:
+			eprint(f'Remove process exception: Deleting {path} generated an exception: {exc}')
+			return 0, 0, frozenset()
+	if not os.path.isdir(path):
+		eprint(f'Source path type error: {path} is not a file or directory')
+		return 0, 0, frozenset()
+	deleted_count, deleted_size, folder_list = scan_and_delete_serial(path, exclude=exclude, recurse=False)
+	folder_list = set(folder_list)
+	folders_to_expand = folder_list - set([path])
+	last_print_time = time.monotonic()
+	start_time = last_print_time
+	futures = {}
+	with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
+		while folders_to_expand or futures:
+			for folder in folders_to_expand:
+				futures[executor.submit(_call_with_worker_init, scan_and_delete_serial, folder, exclude=exclude, recurse=False)] = folder
+			folders_to_expand.clear()
+
+			done, _ = concurrent.futures.wait(futures.keys(), return_when=concurrent.futures.FIRST_COMPLETED, timeout=0.5)
+			for doneTask in done:
+				folder_path = futures.pop(doneTask)
+				try:
+					dir_count, dir_size, dir_folders = doneTask.result()
+				except Exception as exc:
+					eprint(f'Remove process exception: scanning {folder_path} generated an exception: {exc}')
+					continue
+				deleted_count += dir_count
+				deleted_size += dir_size
+				folder_list.update(dir_folders)
+				folders_to_expand.update(dir_folders - set([folder_path]))
+			if not verbose:
+				current_time = time.monotonic()
+				if current_time - last_print_time > 0.5:
+					last_print_time = current_time
+					iteration = int(current_time - start_time)
+					multiCMD.print_progress_bar(iteration=iteration, total=0, prefix=f'{path}'[-50:], suffix=f'Deleted: {format_bytes(deleted_count,use_1024_bytes=False,to_str=True)}F Folders: {format_bytes(len(folder_list),use_1024_bytes=False,to_str=True)} Pending: {len(futures)} Size: {format_bytes(deleted_size)}B')
+	return deleted_count, deleted_size, frozenset(folder_list - set(['.', '..']))
+
 def delete_files_parallel(paths, max_workers, verbose=False,files_per_job=1,exclude=None,batch=False,parallel_file_listing=False):
 	if not batch and isinstance(paths, str):
 		paths = [paths]
 	start_time = time.monotonic()
-	all_files = set()
-	init_size_all = 0
+	# Split inputs by whether get_file_list has already cached an entry for them. Cached
+	# paths keep the previous two-phase behaviour (reuse the cached list, then bulk delete).
+	# Uncached paths fold the scan and the file deletion into a single pass so we never
+	# accumulate a giant in-memory file list just to delete every entry afterwards.
+	cached_paths = []
+	uncached_paths = []
 	for path in paths:
-		file_list, links,init_size, _ = get_file_list(path, max_workers=max_workers, exclude=exclude, parallel_file_listing=parallel_file_listing)
-		all_files.update(set(file_list) | set(links))
-		init_size_all += init_size
-	endTime = time.monotonic()
-	print(f"Time taken to get file list: {endTime-start_time:0.4f} seconds")
-	total_files = len(all_files)
-	print(f"Number of files: {total_files}")
-	print(f'Initial estimated size: {format_bytes(init_size_all)}B')
-	if total_files == 0:
-		return 1 , delete_file_bulk(paths)[0]
-	delete_counter, delete_size_counter = delete_file_list_parallel(all_files, max_workers, verbose,files_per_job,init_size=init_size)
+		cache_key = _get_file_list_cache_key(path, exclude, False, False)
+		if cache_key in _get_file_list_cache:
+			cached_paths.append(path)
+		else:
+			uncached_paths.append(path)
+	delete_counter = 0
+	delete_size_counter = 0
+	if cached_paths:
+		all_files = set()
+		init_size_all = 0
+		for path in cached_paths:
+			file_list, links, init_size, _ = get_file_list(path, max_workers=max_workers, exclude=exclude, parallel_file_listing=parallel_file_listing)
+			all_files.update(set(file_list) | set(links))
+			init_size_all += init_size
+		print(f"Time taken to get cached file list: {time.monotonic()-start_time:0.4f} seconds")
+		print(f"Number of cached files: {len(all_files)}")
+		print(f'Initial estimated size: {format_bytes(init_size_all)}B')
+		if all_files:
+			c, s = delete_file_list_parallel(all_files, max_workers, verbose, files_per_job, init_size=init_size_all)
+			delete_counter += c
+			delete_size_counter += s
+	if uncached_paths:
+		scan_start = time.monotonic()
+		print(f"No cached file list for {len(uncached_paths)} path(s); scanning and deleting in one pass")
+		for path in uncached_paths:
+			if parallel_file_listing:
+				d_count, d_size, _folders = scan_and_delete_parallel(path, max_workers=max_workers, exclude=exclude, verbose=verbose)
+			else:
+				d_count, d_size, _folders = scan_and_delete_serial(path, exclude=exclude)
+			delete_counter += d_count
+			delete_size_counter += d_size
+		print(f"\nTime taken to scan and delete files: {time.monotonic()-scan_start:0.4f} seconds")
+	if delete_counter == 0 and not cached_paths and not uncached_paths:
+		return 1, delete_file_bulk(paths)[0]
 	print("Removing directory structures....")
 	delete_size_counter += delete_file_bulk(paths)[0]
-	print(f"Initial estimated size: {format_bytes(init_size_all)}B, Final size: {format_bytes(delete_size_counter)}B")
+	print(f"Final size: {format_bytes(delete_size_counter)}B")
 	return delete_counter + 1, delete_size_counter
 
 #%% ---- Copy Files ----
@@ -2809,10 +2965,13 @@ def verify_src_path(src_paths: list):
 		raise RuntimeError("No source paths: No source paths specified, exiting")
 
 def load_file_list(file_list):
-	if not os.path.exists(file_list):
-		eprint(f"File list not found: {file_list} does not exist")
+	file_list_value = '' if file_list is None else str(file_list)
+	if file_list_value in ('-', '/dev/stdin'):
+		return frozenset([entry.strip() for entry in sys.stdin.read().splitlines() if entry.strip()])
+	if not os.path.exists(file_list_value):
+		eprint(f"File list not found: {file_list_value} does not exist")
 		return frozenset()
-	with open(file_list, 'r') as f:
+	with open(file_list_value, 'r') as f:
 		fileList = frozenset([entry.strip() for entry in f.read().splitlines() if entry.strip()])
 	return fileList
 
@@ -2973,6 +3132,7 @@ def get_dest_from_image(dest_image,mount_points: list,loop_devices: list):
 def get_dest_from_path(dest_path,src_paths: list,src_path,can_be_none = False):
 	dest = ''
 	src_path = list(src_path)
+	interactive_input = sys.stdin.isatty()
 	if not dest_path:
 		if can_be_none:
 			return None
@@ -2987,7 +3147,11 @@ def get_dest_from_path(dest_path,src_paths: list,src_path,can_be_none = False):
 				print(f"y:  {cwd} \t:Use current working directory")
 			print("n:  Exit")
 			print("...:  Enter custom destination path")
-			inStr = multiCMD.input_with_timeout_and_countdown(60)
+			if not interactive_input:
+				# In non-interactive mode (e.g. piped stdin), follow the same default as empty input.
+				inStr = ''
+			else:
+				inStr = multiCMD.input_with_timeout_and_countdown(60)
 			if (not inStr) or inStr.lower() == 'l':
 				dest = str(src_path[-1])
 				src_paths.remove(dest) if dest in src_paths else None
@@ -3009,7 +3173,11 @@ def get_dest_from_path(dest_path,src_paths: list,src_path,can_be_none = False):
 				print(f"y:  {os.getcwd() + os.path.sep} \t:Use current working directory ( default )")
 			print("n:  Exit")
 			print("...:  Enter custom destination path")
-			inStr = multiCMD.input_with_timeout_and_countdown(60)
+			if not interactive_input:
+				# In non-interactive mode (e.g. piped stdin), follow the same default as empty input.
+				inStr = ''
+			else:
+				inStr = multiCMD.input_with_timeout_and_countdown(60)
 			if (not inStr) or cwd and inStr.lower() == 'y':
 				dest = cwd
 				print(f"Destination path not specified, using {dest}")
@@ -3373,7 +3541,7 @@ def get_args(args = None):
 	parser.add_argument('-fh', '--full_hash', action='store_true', help='Checks the full hash of files')
 	parser.add_argument('-hs', '--hash_size', type=int, default=1<<16, help='Hash size in bytes, default is 65536. This means hpcp will only check the last 64 KiB (about 1 page in a SSD) of the file.')
 	parser.add_argument('-fpj', '--files_per_job', type=int, default=1, help='Base number of files per job, will be adjusted dynamically. Default is 1')
-	parser.add_argument('-sfl','-lfl', '--source_file_list', type=str, help='Load source file list from file. Will treat it raw meaning do not expand files / folders. files are seperated using newline.  If --compare_file_list is specified, it will be used as source for compare')
+	parser.add_argument('-sfl','-lfl', '--source_file_list', type=str, help='Load source file list from file, or use "-" to read from stdin. Will treat it raw meaning do not expand files / folders. files are seperated using newline.  If --compare_file_list is specified, it will be used as source for compare')
 	parser.add_argument('-fl','-tfl', '--target_file_list', type=str,help='Specify the file_list file to store list of files in src_path to. If --compare_file_list is specified, it will be used as targets for compare')
 	parser.add_argument('-cfl', '--compare_file_list',action='store_true', help='Only compare file list. Use --file_list to specify a existing file list or specify the dest_path to compare src_path with. When not using with file_list, will compare hash.')
 	parser.add_argument('-dfl', '--diff_file_list', type=str, nargs='?', const="auto",default=None, help="Implies --compare_file_list, specify a file name to store the diff file list to or omit the value to auto-determine.")
@@ -3605,6 +3773,9 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = 4 * mul
 
 		if source_file_list:
 			src_paths.extend(load_file_list(source_file_list))
+		elif not src_path and not sys.stdin.isatty():
+			print("Reading source file list from stdin...")
+			src_paths.extend(load_file_list('-'))
 		src_paths.extend(expand_paths(src_path))
 		verify_src_path(src_paths)
 		if not src_str:
