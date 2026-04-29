@@ -30,88 +30,89 @@ from pprint import pformat
 
 try:
 	import multiCMD  # type: ignore
-	assert float(multiCMD.version) >= 1.44
+	assert float(multiCMD.version) >= 1.47
 except (ImportError, AssertionError):
 	import sys,types,base64,lzma   # noqa: E401
 	multiCMD = types.ModuleType("multiCMD")
 	sys.modules["multiCMD"] = multiCMD
 	_SRC_B85=r'''
-rAT%)=o\O*k16n/!WXAE)uos=&C4J&i*F>A)I3=TLdFUh,;[5]%l=/aQgL]knEMJj2Td\)1[`bH(.0)JfPPs3eIh*#BVY2@n9=XkOcI@DKhS;F=XYf@.
-bkU"!;JY/2uZq5d6W*qmS$*M-\,Pd5gM:^G;SrceSRe-B2<VH6Ya:6h\6GCk6R8o)@LoX9[l<#c]cMI3N%AI8M2n]q-emL['LA&Y<iW`0eg/]B%[;TcP
-gU!<>(e8+2$o0k@uf:M`T]S+:V@fWEDl2XZ,H%;_Z*\NBC?r!ek)q__NKl3cd<[gMN*GbOUGLlC3h]F4'IFdtM<qm?b<:,@(h2D_RPbL1upRD?;D7="i
-T=bS[;7Ef2<$cG_qomKUYh;tt,F/g4OE58X_nirX"@JfPao%3Tu`Inf.49+mAuNFM*+PaiXj.6a5ZQ(!"-88?<Xk\0ib`F0"hZ%3s1QYXV@'g=JWbceB
-?</d-5!):>CEf@pIUCE@aSXSu,MCC3*T*0U5Xqk>59j!b#F8,L-OmR)0pgCYqJbb23").D=\)a6SQr+To"U-j*5OH"s"@AiS,!TXmY/Q)S9.;#&'d5+N
-]]")O>;q,=+qMjrV,:JSNkcd^="Na3fH5-21]Jp&=M,=egU#j&!NY`TopDR[1_il+j@`q<pcG\/Z/IA%<)DHVLK+0mgc59$O!6k2<8\Z5lIVghmaQ/5a
-g2Ne9*^O4bC1Ys*hjf?]-ef5FM4,C&[)Qf8?@O4KqpGOEUHE:LKH+1JHQ&VBdW!F4PHr6.nH"P7J>\fp`X-',_=S(Al\kaZTjc^[,>(Z:N3*"U_-[k<k
-Y]^C:"@BBPbMFS?dWVDhtPG:8!"!:p`%n/HmE?p"TYReBfO`-RR!uV-T@9lbF@a,#A+HnW)WppKt?I3>2qB2E@ZFg6(u/ff=5B$J^<WI[Ku]*iYrq[#^
-SlP'F*;N$1W+]@!YXNV$-'PLL%n9`FW/Xt*)]%0:rDJK)0M>c%`eFnkTVoqSRR*G4[d%">J\:EmpuNskENs2&jY'AG/MPjs.,JcBuJe#MS6d%cI]rhCD
-$L&f+]i]hLH5s;ebW;enXK,FXQKKc2SQr)Y'VCjZG]<o5W^4Yn+3k]khKZCXuhWQ(fP!d+>c8atF:XuM@F4H>+\J)R"CjpM<hCiN#FI8\8.VXG=K0_kN
-g&&:FQHXdn"PFs$5*)D>I3iLuF)E<^gbVB6[Xs`,5$YITPGXfj7Nr`t@7s=g@JaQl(5QWl^LF!o^Fq(aT=%LN?Uu;;GcK_j%<aZ'JA::^kJ.J3=W?W=`
-Dm_Al>\"U1PE$=9d*JS?/!NGs3U-V@1HjBF<GoUKTM$\M@@6UJhX.m6>ocN#@E0'Gad6@#G0BoG(b@LUUK=/jY2]"MU,BHKubN5.X=k<"ke)k&OQoR"f
-NtHiVU_R/Gj;>=q2Pl@XJMtDqV=:%MM6Pbt@T]Wgd>5UEeP)rck.^8c8GCONum!bVAD4?0/3Jai07+"eJRmgPmoES%_Q:\L_X`#3VNueVtO*S51G/.7F
-:JUCW+4%qBJ+PHF+B'_:='@<<*NlV.^%CeJV.6h@%]-3VF]Vcp0(1of0!lU2:pN9s[fANU6ni\f"I*sIN14VamS+<qIe+2*3+[,'h/8&78g)MSm2aN)Q
-sM]&JHNLW#ba]Jm5$XpahK]2@]kg6SCl2*UdF/u1f2',md,nnk&Q?NUc>8R@MQ`[8nPT<B7o>cp_;+qalD9Fh%5rX3Hq7:,paNC]14"FI8EMX/8qW33i
-QeIh@&#[bn;[47?0?ut,@).*X2bZ/=#&mra,1Qa8;?Z<Te-Je&qFMI)IF0TYJqu6<rh5%Z-!7>^j`bXOCC#\>#h8g1+0%6@ef2KheI5,@Tf$:qk`XMk&
-P&=:Jr`)e5eIY@b1;O`atNQ..%P4a6;GVH2WJ\g[+='\\t!ViWU6>;NF]5em<qA5kn]S^b/rq"Q:\3%8-kt"=Yr1CNaKl2,?7o<'5@RG*Cc\\^Md[ohf
-MjM_7'BeNtGh%\XY=(pf>nYjW#$r;.Th\0>XTR&!K4(+&sani\r,LLf+Vu"-d#(J,d!?93#6"`lZf;HYL#/<H,q1(X#cq:<\nnN&A4Iic%[nGE]SE/Q5
-<76H)Ms6,Go:DL/3>#^VWX6H`D)REN$_\N;J/$fCpNf1K$:cG/3GRU;Fgbc2EZ>FMde4P#ZP]j+WJ'f2_YU6g2$LD[%UZM-$]p+O'L5K;;t=&lI%DVSB
-%9k=#Aki5CQeK$VopQr!7?/%g?g+IA_p8nC'=*YJA=7$/`Nq:/tjX!*ReoJ*mVNal*Ik+1didG>M4@PBh@C[+,d\o-&rer_#lGYM*a0'G[k9W40m>=5Z
-8^JR%a\FJC5+%N5pR6V&*!`UUIc-o,$*:r'LlE7<_5>M`,/<B<imekaEHU(\/K$\Tb9%<mSTHs4,[e&lcoHlV.pjh`2M=XdL(@q^\ll21nLh>?OP&ThJ
-[:geLNdMt@$ZZGm_<a%f%5i9i-JrcbTCa$irC$<OlR-&F72WcK&\LS[oVaZCds/5nA^s6l\;dfIW)0@/kcX)UF^D:(U!>VbP.F=E:uJ[Ae2&t]0k]4*&
-F:9>jIJuXAaBL*^%!1CbkhVei#j,LPZ?,\^2KC9U#n_)p`X_7t888J;++0iTrC67jB*^FKsE"!RD2&Z^UfgaKQ!B,urRo;3YH0?kWeoH:'6&>"$\.]CW
-<QJUW>sP1dj_dF8<(aBGY$/9kdblG]+%,Aehi?=?tF.<L;iF>N)i@ViT*#R*C^(G;NV2aP#6a#te#UE88]kf&JV't7YH5F<"o!Gng0XBQ$F7U4?EX]s-
-`:$5rfI5Vofh.^7_pWdF&*0X3Oan=eR9gF4dn*Tk;^[Q"sgk:*m$%AJ.7s\rf@8TMW-e(==*]$]93bZCS@S)TVB),!_%)2,6/8MTjR("YM<HZ7AHS-tl
-*Z#86r8LIp"UX2VpG<l!R3*[h3*^&uI!n(/QjiFuo8bp/;&;N*alaoX88@0V#f(E.*@ldd<d9A=>(%9=0%Z"bS6XP?5Rd_`!:EV66=?eo.FI#U#p[No<
-7FUiT3kuh-LK^j+gEJUa_-Na;dSsZcVadNC,nc[*\`]X=ofi;_:_nGB'LP$,^+1DX6;:tS,-E'[lOPDVkocpq`j=PLHp)PC1uXLl+hp3l;PRo$OJt53i
-O^Y^pInB&GCaM\`:Z@nNc,lneTAoctpkV;t1geFZNPJV<;]r314kreZ!'j83@HnUG?Ud`Dd'2'81eP7d3(dSu<FkW/UN/-51Cm@-o@;YT-75O#V!DYa&
-eNQ:q/4d$RCSNU+U9?O%n[ZKec$YQNNR+@#t]1DG<`;6l5]q!M1-8!sTH[97eLXFP4mMC9qG4Oq1(kR/p[m_S#PJ&q#pkA1J!CWG2iGXA?$Rbi=J`777
-Lh&D0/+&F1;#qDi;ESplPSu_froWe?PM0*q>XD;/R^m1kaed]+cs!CS%H"=qPm@n8es7CU!j9;V=]%hVVqn`R(>km:'10D:M>ur"8Z+.$F,8F"gA/oVP
-*mm_>DFZ>@V:.GspaZ8:E)Qs!h![QE(4(4rJ,9nU1NIa-[^Md.g9gun@Qk6.FJG"=!CS0=`m9q:F]::9:A)C`oWN#qX2"V6Tj'n<Lci"f-T,*9lS#_:q
-:8e4'm#9.Z6*K\7rm_=WcJa"a'VrJ$Sne$9a?X_!F7l`Kb^>.jTlaIcNB/:)m%1!E6SMa/Ur)/Bmb6D;^E"5VPLNJP-P_?[;2P)6.m#!c6>@!Gpe%?^'
-G,VETHe8F#&DlUH+pL#AO0*dsg@R1n<hSjSuOMTtgXaa6bSH^`bUpF$]OV_5;lZA?.ACW0XbZ^eXEDcf5"J/fCBKD*$dTE8HfUd%*0:E&:QV.1)j)mUa
-1ukTohQ>?bT:JR%(YN-N\IeM23Ki&^*Jri[j033$.`@"[%$P8O6#o2nMs!,ZK/]ueL^68u(4f/fnMreYTrcVH`5]5+e:7LhAZaFSNn9C7[*iV_u^<+WH
-W3'9]j\!Uo8&@)E,VDt"30.uH;,qR9UV_\:q<YJ7hNWZ\NVg2_f:;_U^SE9X9GkoSq8'sl?$+`uH$\[!fg(1@Y!-:(n'(QlS_a:k-eNd@""Us3"C\saQ
-V,Ca@aJrPejpV^Y766g?T]mR-B0i6qd/rs1FJf)S.,VOJOAc8Q>,KPUUotC:5..]"b'nFOkt]R+K%RO<\;'`Cm=)kAI_5hfPK5Nq;Bd&/0"%HD<MN='Q
-8%$E_c;;/EKGhDp,GYS0Tmtk;a6ji+^X@A>OT2nVQ@p9(edu\/H"^gTKUDI^ElCLJ)PKChRI76Phn\I8]g`V[^i%2!OL+00Hm-tF3dj^98"U(D%3[o@B
-*K)$@=Z!EP/h--Y,a]/JigF_bscj-'!t>0(kOH-T8]FJtiaT%!-$M0Er?I@`#QOA%YH)i5^9hZ_\+5%.`Va#1bq3+p3N=p!_dO9Cn1P@R?<:URBh?RY0
-*`HcXL81!I!]hB!KJi48p:G(R>Ro[NE*_fq5n%Tn+3NF<QOZ:N1]>1^\d6eojWM6j'te.*5]Urb.IM<ElDIHKmVTPr@RG!``>"d8!hCY.PQ@`$m#<hM[
-Yl+YjWIR%W_T:=Q`[nR&SkVZ$UlAb,",*<oeZtA%m0WO**HG]k[;3DS_EoM_j`k-fH\*/k*ld]OJ/k9IS)lX7UDs_>!A>T<lcC:.Q6OSh9GN*%4pigj&
-=eR'/h!]XDR<9K4a3FQHrOF(r^UkjoBV9[k,3"Lm494\[MqOMANLf)r?f-$*$rF/Wp]n+R*I5ZJjs@HM=2>25?i"4_/.0"&h?BZJ]p#9cL20`.N-H2/l
-1m!U<!H7p%kh=YQ9,X5).<@j1V79"?OmL-#GZ2'nt@-ur0@_,r\\(ZI_kqV]N9&#epi5ef.W]7&op;d-Wsq>KD3^+Rl=j4I-P"m&Y7JlW;:3.41VCcMV
-@5`PY%o)H1&jjcK6>T!'6\KdCV1`GXISsI;tGpSKmG=BKT>sSL38</_CQa5"T_6h@deVHOpm">6FRVG;In=oP04)BP">6GH7Z!AW[-;T)[8TTmln3@n>
-!>;u?W_X8<4i9jUXRS?qNmp!DolZYRV%/4)Edr1<AN"CPU6YFMlhB+7E*0T&SG@ZW.iIrJm)gL&f',aiS2*#hj^K:R0^g'D6fY>6.Fb%>aDqj+ghK?;S
-@0f+%VQt?f%/.^.YXEL]L:.Z#^.I_i(:L_hH)GTNh7+OoeHO,)5mDpIcSs*AQ>)W7-S$RV8[OlEGD8ZukQrc<o43H*XNi-aC#]kuq:NGE$?).IIF^6OM
-VauT-6[BJ8)P0(hpk)nESAMl3:))]M6(T9:FPMbaj]k%pZ0P+[`HMP%^aDqSR,)17b6`-TJ[r[h+qs-M#*e?.>,/Shg:^=l8kX(?V=A`8g!#j)'!%ll"
-6iS215`kG8.^l])^L_eUh;Lm+K#`4OH2^2o=SWoquM-*m%Y)Sna[6^R1^<4Sg`i\[d>.']=rQ/_;qCP;$t3r!_P\h.E,#smuUZr'IeisK(:\3@>"ccWa
-s_raCidX*XXjR)lqM:A4=LWb:oa*6b00UWFu0G`E>0\Wk/21fqS'Y>N[8P/:UT(D`2Ln;:49uf\E*U[rp0]aH`Bjm-)JLo["KFo;enWX0MC9dfu/>H*o
-j"a9Ou"+-"*$J1F+R%7m.]]]O>AQq=rFHe*;?6Z(DdE3*YG-T[kNPs=_`JULk[>=F/<ZNm$B_I?"t\0$tK,LlF]iLO`N!Ufrpad[?%F8h_+o"c`C_>en
-["B>aWBfrH13b3YH*N*[bVFPG05iqd/Ylu^n;S+j9H4HWhmfUAefKNhEUp<MHs+3f2U*@9@(UR>]br;750?$V(jWCT2@t>=q>HYl7E6L+7$:uDfG`"7)
-Q=Etg?!-.EBME#N@'%:7\Y8L<4k/Z+eVaJF8b7=B$i.=4q<hN_-i8>P\9"SMi/VOHacj8&.alHupsl$=gK6B1<DK9[]Z,2TeVQ%Wi$g[n)fm'0LW2b(&
-g$FaYhsBo;PP<;/_@3i-dHf+BPB5KCXbi(PK_6cL\c`PmX]JjCtX^ZW!D\JcFK&EL_k.K!i5k#Sl#h,j[`^]bSKI&F5np,BAL;OK)G%8S4BhT[%@qu>0
-t*[8S.8`\\ABiXi%H.MBYr'Xa)g%!NgQ<#^=3fm(*Q_Gnh^Co^1a[l$ZA?[lsfs"aL)T$S[]p^`ne=GX1IWJKfc%ahU`UG#oa4q6hl'42aei/F@sLcIB
-mi:21p_BUH!m:dj=V^S[uBN@\oCiB8TfUZgK1)U18/[1=T3P%j^WOO]Zr2U\CB2c\dI$V]A]+$mBYAn6@H:KW7tSs%Bm[\"541[elb1b>@haqs1A$^Vf
-pi.dCXOttoh"(Fd=jdWcH#oSFi>.u.!.0kr%<ooOHFh50ZSoN:L,:jtd9i/qH*!FeOpAGn?!8T'Qs#t_Hm;\9b_T]V6D/(:XURiT_.?hN\?3Spr4uDaW
-KNn?]G(LBED'juW\qA+D6dgpVg.2+`C,$cU?LaT0:8b4%5GBBuaW>8s4\Kkm0(r/h59*8h+I`1iaI5t7Mla<,#Ri9eo:K">fW6m9q$!JE+nfCH*/8VG:
-Ai3Z^Z'-q*B:CEO";qX,RX3j=Y?tX^Er:T<\`El1ZKJu"3#?$!>SR"n"d5!8?*k$E8+)DD@e86.qNTfPRsCImKkb'.fJ7op"CF;i4uq*DZXjR;7ZU2I(
-Btos$[!4d,W=ONO$&)Jg(1`=U&sqE%=lcTIiiMbRSUjhfKEj!F;8k8#!C:r`,\bV@)?3^VH]bE4Rq7In$>DL:=2C?8:i4l[8Mj[-L.3cbuD1M;YUWl?s
-</-QFR'LaX4>]N<`IH[\$o0"$i*ZZV%P:tA7cL,e.#rRg=8kK<CBnR7j`F1gt.F5_,YIiDc7-GJY.mP^t]5j\8:*?b$rG>L\o>;HN-:]T1:'=kmk05cb
-:kSgLF>HPbB0-67q$rZBl[.sba]6N\2+%_CkqFN_;S"_>onKD?]X1E2F];d6+j\D7;Ki:7)TN.doA6V,uKGsm4Ls7>5pE1)AbH@JF4D]=*akGdB!hc\1
-,QhO0Y`$U>8/[Bkf1s3)dPLk^N8oE)$E6bbV$W*sRA0=mI*!7_XDj+J?3[cM3D?TG8f#@AM;r)^^!\DgX)FqBj2Mhg:SFpOj<("g/WNpA!-di[HUs:j9
-36do3f,A$#9_jK*BU0=Xq7^WDU*)#e22VkLORD$TG^'=l3EhhLuV3HT2tf^6o'o!gnVU)RhT<bR0iIBO?Z_5:S*<DE*3V(AbhTd/8E_B.R)J/.0XF_=T
-Q6(kS?\5p![*u*3]s8TfHE"e#_O9>-d*I58/g<aOp%g#9_1V*'$0)$"%%T?\-j>R<cT4oi=eG&ZL/4hb72U%F;!""HH5]4<K`j/(:KMb0T(cB<I;*p1@
-6*\!JRu5/0f$%M?Pj/I,I8#Xda1/MsL?k`j*f=^s`GGA4PpFd7QVpkD79TA]D#359BPcfJP4l_WCkRFnssaD8L&ge^M?DbtM9ft?]UD$Wsm&>C`!FkFB
-_9d3E[WEje7]^07`g"]=\_CQVHkCJ5+:5]n1f"]A@hjo$iD6pKid;,11iIfRba^a2gp%M(YeGn\$ZSmXaSK#kCC':uGFpQi-q)f1<bB"OkU$'gghW>,=
-AmIT,300j89=X)U;@#Q;YQjla!H'KHOT(VcGlSA9;<79PCMKEF?5fY^2,eGYs&@1RO)+.REq@X'm/kWnlR'>S_[/2SJ'r8c-n"s"%R0FJ\on>+ci#;#r
-6EuUk53^(Vj$G@&c/-C'3)2dB)01-iIT$R51;K[a@/U,AL,Tu+_Z,X"BTr$2X,8Jm.&$!;9YTLBXp%HU^]J=Q7$,`=IS6-R2sU-HK<VlH89]HW0E-<:D
-\@An3o.Y3j0ecAg9JA9oo!9m8rG7drMgRk>>LklYRUWJ;tpn]q(hThj-`?05=K?fsWVZEl>,2IjB$+*T*eM,)#O_S$t9>@"91p=SS3c.K<G..XJ#H,<i
-6AK`PF,a4;i5Ne:HQKt8\A[+'C3Ii,+t5I%R+KNGCk_6AtObl[JL1E-a7d/W``,'D"hee+/>hTXpU0iDKjHRGPLNp>Qq'+dT\Kh_ZifZ;62SGA`bi@K'
-LT5&eB*QRU2^1M_]N^JC"ma!&8X:XVb8RM=</F:!W$rC$S:7'2;#]k@^l[&SK3&q]*5@!c3Y7T@s3p1`T74mpXABb+tCZ;@%odk8H4(qq>7+j$9;$&uR
-pC57tfNHt#+D(I@mDn@UnK`ra`san@MAdG^9*5Pu8X-eE;$<sdioR_mr:S0.bRK5V%_a*`H#(6hL8cM72S?JC[Ku^'l=866mH?T?D?ca#LCWKc5lM[VP
-EpWEL2e$RVb;_!EF:D]"cJC`$Pr1R9Nr)4C>B"I86(IWdY/p'0"7@j+J<4='8>s1Pk:((I*b(b]Q&%PeXKV:b4];ej).ZdO0>M.iL!Nd.*bf0OBVIH;P
-Y$HAoI?L>:"=U*oZC6;fo93:Kl@@;-6$B/>6DG>Z:I149n(e;X%Ip3+Z'YI$BtL[07htO'\D;N-:;Y'VWil9$;r;@QAc.B0i5X%0aCO8)eWRRbZKuKP[
-(?:C4l">/2_$EquD^Z/'4a3f8P=@ibAV--Xl3=.sIYo2T5lp`j63KX@1VN71/"on]Xj&`h0s?Ac'$I=F`LqMDad[>3k\ffB=l7)oi+8o+X\h`LskC0q'
-+-<:OG9i>1'Lkn:".bS5-W74rJdFeAk/"rdUC>YkA^sfD/@#G-aW?HXf22IF#`UBD#P/&:CY\J6YS-Tpo+l@&6q%(kK[p=NFgU8nif:;_BoY?JX'tmnK
-gn5pn(cj?[HiO-H**9$V?6?kQ!!0Mda1D?PS=_AOZ,C;P!WW3#!!HG.'''
+rAT%)=o\O*k16n/!WXAE$ig8-O-i5'i*R6=FBnkYLdFUh,;[5]%l=/aQgL]knEMJj2Td\)1[`bH(.0)JfPPs3eIh*#BVY2@n9=XkOcI@DKhS;F=XYf@.
+bkU"!;JY/2uZq5d6W*qmS$*M-\,Pd5gM:^G;SrceSRe-B2<VH6Ya:5DN5q#E@aeCT\u:L=Ahc3b=*V%>Cctj(2ncD(q47UQ/T['Tu4`n!B,&"9c;Dp?X
+$Mt3`>UhCLNd2)!\2+QeY[<Ld@R^mOoJ9%I_T>5@D.V'T`X>3j7@/UqE90=Li(ZK@\[6PX_i!c%e(RYrSgB-#(M%JD!R`+"%C.LPs4f6,NOi[csmhntR
+-llggcNB6JO`h#?qZ+3g)3@PanuB_`LSZf3g\r4ETI3taQ\$1Ip\?+6MIf8q"3KC5_L=fF[F^DA2H;Nq0Z^0f-*o;;IDIus:3#%ku1GW$!@?oF"1^\,$
+r+@;;eq>,?5Bkj<\ZW8g/bT=1TIGTc+V"f<;/]*IQbUA:\*1aM!+dN@VE3/j',.P9fWaeWVn6N(pB"uW50>`_a2sT$A&-qe[rC-j=$%Bo&psb,[EUBLB
+"#L:oQiq"!ho19f]h:Ir3:`gSZHXH7Y"^+n231\615&fFFL<l"-VWt<1;ammd-XZLfk<l6hB,mO[6b;cWQ.bPD<#OS6q'@1?eOlh0)HH*]2AN]bqVFCQ
+usE7CA#Y^M(<I]X:6[MIDAjI5(TSY`rN*mNY4OKL!^X%.&)0ccTsOUk,C*FW+Fk/TCIMSs'i6DH2:?<@&Wm?p#=.BG8G'"M:=`0Lu!!b+lki\TOFt2T%
+DEdZ/(>WOLt$FDWS'UUedNe#<aQNWMOfZO&h\sZQ?DdmY=.BG3U[MXg_2KcY,kQLJI*Gl*8N3nk\?HI@J8RTY"qE=fcpG2m!'q7Y-8t<EN[iBohQ(Hd.
+;&3`T`Q\IcI9ACM%;Uoj^o@K_2:+&>!AWadU&N["c'-WC.CD3Cn#G;Ot=Z+g0+\,`H=?$M-n:Tbc\Gr&U4pf13\;c*r>6@I\:/$4D9mfoiFb=YKF^a]@
+1EFY_[KhKKd-\?r'7\<,8PZ@A=#o5L1gdVtQ=CRZ_dM/Z#j'PJbHs,.n+cS#=Np7b%EoY^nCFWlQB"J<ld:l34]`ed$-Zm:)NSY$B2ifEjSU=MZ;&V%5
+`W$Cu<GY!UmQ7!uG'k4>"#4-,&)25T/PEJ*_S,0)*4d2*p8Q.[OeLs*@r/)pL4EP#IXhCrrO.MUoIE!9_qEi@Z*/!_=/bdKXg#GYdU>VUB,QX_c(9CWo
+iusRYl+dm]Enn!f-Bf.E3@5=<G@"^IY*u]EfG=!E%-lQaqYDnT&?3iC%SgYmXoOK:7%dSl[j,V&?^,[r?!DUoN2j9]C@G'A^6Em2B!8>SE(uXg$)E5:i
+#4/KXSDq=8_4^Ymk3rSg;nG<(5])2k90.:4FRh?]nQ4I)0FUH+C.NIK5b3^D,l_r<e_!']",DT$T=[^aE;dM+ihF.-:!jf@8`cXLiV_!#6@3rlQ\hf8I
+sTc&=1*BSIIB.jRF>K;YO#4r-oPYq2t]9nVe_6$JGGoSii$[%otAkd%W!]R"0.&J['!;EmF`EKBL'"K83-Aue]KW>CoNQ*FA1&nnE)ISY32n9u"E7Tk^
+I.cDHoQ8>nL_`>E16jAotl6sdA%e((c"->b=lgT!(k4Vq;Ds7redC[tr$^RP!W[An<V.k*1<RG4VW3N1<[(B.bhU5:]b&AFjPDR<Yj=mEa3OC!1Nn_@\
+)!e"gf@ljZ_fu,(`C2>W>"Gg\P%*fH8:0/2W=GrMf!Rs'hM/iKU4%^<O<dQ@?,%Rjp)cYJ6]WH7\@/LV86Zea&gI*:_m#q9bq8FSH/<T_4l&hrB__F4U
+n;RATdu`;%ejZG#\qd<?*GNtilO.kJ;TFqrN31b(6eml`h\!ZM8qZ^@>^?@LTI-kN&gm:.jPHH)%kF?hbBM9ou.^i'Mc_3?@-F;=S8B*(c?uYaaddX[>
+K$G9M,7eS;foJeoIa9P>8XqqS[j#?d!8dRnP)lO!rF(4G,sXRBr@8kM-lcep'"IHcG5E7Nd*M054%?pY=BJ1=`Rk2mT'k[C8BA,]o-pYe6L'/CEc"TDO
+"'l+)0oHG*rYmG<83"UrXe(;HP7rITEkc"gSh(.e"0m,%peMO%!p*fd2OrGYo<^n6F`]kiU:W_4G=i$:s0s7Q[cgf->X-jRQD/BnXm!!:KZeLm`uDbct
+Yeiu[+9g71mg3qQY#c_;@\(<f[fqoBOKJM/=kJE-*D!PKVVt&fE"!4Y.B@'MmGQ7lEQD,G+o-,V-l)XL$(KFlF/pdWF"68oZ@HTec2:c@<?6?_^qH8*$
+)^,aL`FYs<:eq>>7Q?I1JJ+Qu/ktpI`BU^5Y5b3p9+.5jb2ef1ngl;>_b"NR`gH:f(\dan_otEO>l3Y8@)#'bfM`9\\b;IR->j3-F]=!&.aT\jSF$6Vp
+(;20f*T9eC\;8_']b7XX+(f.T/?^7pmsWLS)\`V0&lE'Y@0QL#Pcd*,kZ*$]4/ko"'piq>8n-`9!f7OS&DD$Vhi[*=a$>on0bK_nIlgl0Xgaq1F@)c=-
+UP*D;T]74/BP&\o,k(RH&_,IVdIUSIun)[\gZRoFFpthI=Tke3H`uG%c+C`MOo&9KO`m%Ci8:Q?"tioWf5/7<@URNj.;8^@E8mm%M_GbgPcsZ5)q#=h8
+Lkp?g/8jW;B;?%]+S1cSC4ge6kJgGf[pGZQ,t#:VQk=\G<NO>s8'+cK>3L]D?2.W\r&q6S<Io=X1c0)uEa"nM)=+@1dT4'qfamV\e7bJ.^?^fO`ZcMC*
+[,D.o4_(gW3PF<fIY>9]p>RKY_Y]$<)X]!h\RJ-l<\HPEo9cRl=U7O-Xms2`NZ`@cj!?--E^efQg82eF:40_TFK7W8Z@D)eqP`/VMcSBY0J2L30;@96k
+Qu8&cClKj3[8[VEZe3@T?UqsRWPX1MjQ?2MPt;;/BhUaVLLnHV^eXYk'.&83SWe/=;*82@W.3-=EmE8@36-'to`IMp-3-WXZO3Je>e7D2H(]A)m6$h])
+&RaU?^3a04Us]eX8a;9U\ac*Bg3)m3LO1mq2>:\G+>BYES*$RGGOjKi^^4LL2NP`A2Zt2%[:Q>Oo>eFm)@'p#/9]]bSqB"7.X\)9ArC<s&`;&NCX%C(B
+'Xp+O3iq$k>CN[^3`"R[5;M64)NpPCtht15H4!,I\r.#tnesTb^t2W2ml"#N+uKNHghY*WJUEmI2iu+3_74#]l?N&."u?_Nk!b-`TmK<&gU*MW`e)L,"
+C<?$q,CYiLU3K!#O<$%*U<Oe<MQlTUZMhEV:cb.o'T*UD6$huoD1&s_2m!78L:k[Z#[oOLaG#d419j"%lXGs4]:ZGF';l8tgFNBRB:7\(fdSMAj((N]K
+ui(Rh^4@7iTSad@FE4%NtD0[=^29uOnM14T@TKKq+*e+^_7N+6G@+0<LT2[`jC;/Ig+:hkYC'8)li+Cu&Ni$]/*Z6FIqY"__h,FRZLBkL%9u;ZJdTN*b
+$3TVDAfX#)nC:gcAe:ojjoh)-Ch=)0#:13_VX4+ml<k-3/[o5T;2&M4e1?_;SsJbGrrMU`)kDo-3,Z(o]&/?ZnJ`GFT\0bJ5N8?tQNjE$83Tq=.3^QeR
+o)A8$eTTSoe*<7jF->T,(q6u3!q+lETSj4JgGgQ-WEUnS1"Nj03/g50ODjs't<%'[G$P2As4l@@Z/,[b3bUoOH^=/3b\VhO2,@$Y)kKJQuY,?f!ka=@6
+CCTq<I76S"+fkXDbgb_Qd&.K6W:p$:!Do!F\YQ87MI]Ds.5.oYD6D!;N,;*cRl7IUUAmeRJq<-!IH,@""^mgW94OY*le/!i?X,]sI,GAML?rE>qphfkO
+YJ,Vuj/]SUZd0FZ888Jq-m_gP;p0W^!*M1ku,dsnTf&mSmK,l++s+K<%22Su[q_jG%Y<NWi:a&pk($PdJQ6e;s+oQ4N`@S0M+Hk_0C:XR\fW]KmA4C_@
+kDn,[/?'bf1FXd(c,IJCdhBkj!J\FuR4`ZZ5h@f:A1^#aeC0@?bos]m=5S9IjAZd:1q`VkP%8orE?_8\<c$G:=?%^E3Q_LJ<QJTagUY^##`..).T]90C
+@Pa.O4b>!Z(pb!I,%o6.X:GGeX^^!j%&^.N\sGJ_"c6"c"$U33,j`dqg>]@doLqkfbC"m7F0k!kbC<un=W3h!\f#]oda9P\:W#e#Ka8?m_Cmkd"YWp.,
+&YQYP&NE@Bg>?LVt1@'K6_]%@2!'%H?kj-AK)#K`6fr_6&bVRGR*2l%oqcHmJlRFY)B;/C>.ZpC'Op3#-a8">PPJ()X1RMPe'E8%pT!$N(\SsrdP4]&S
+O5agH(I14'])T>f;q!io(_pF,RL53T9n1oQY.?PTXGCfbo1^3q;M;s+eege2QR!nuH<hTLZA-FH"%Wpl=uDEX2h>a(^Gd<pbDpX3N-2Dtr=;9:)ZR;V*
+US,]T&\-:6YoDF3$:dLD[bc>G3^l]]hLo,;OI_^*u3Z*Q8M3DcYQZL>8p[O1=6,K"4]Tu2Q\3F+W8G_<P4e)N4Qa^#njARj_jn\Yee>%J(]7%a]ZfIE8
+#aKsa)5#P60_dgR3g=AecSat#>Uc!kdNV]Ko2&f*c\!mi^co4Z8]4tUuQgEHZ80"1Nq/Y1M0FK@Co'=#%,Dt7)n-/ac,/&V#jLA9p,%;#Tj*+DS(Vh,B
+qns'j@X1!0XIH70-tXtGWL2g.Li@X4dtIHua7Mtn`>Z(3.H,^_:p>nHZW]T5R<<OBYVup?8'H.8+/2<;QRb0$<XEa8*[4,nJaM#X_ZJP:oZRlA#qHmEJ
+n];Phnlt<1l!hS&cSL5]$uki$+n)TeJ.MZ]UYT_d)$pfBM3[qg:7'R&U#M^`%)%FouJ+tC+a%Ro25'a\GY:Kp;2nR"F/Vjg+tLmiAD'Qo*b\N(7RH"8B
+u$Amm*k11AQaXE&/^_Z=@;34,?')Gcf)SG_8m'nI=E+He<DOa)QR2D8Bq+Tlr`7)2"e/^I-l)6DV"U_3L&(>$uHUbQe:Bm<WZp0Xt3;3CgoQ<WO&81.`
+buKZC$aUm\'aV<]:.2u_$t/#Q+Q\np/fCsm%Ur7T3c\\<AUJ\gD`]7a2_s.>X/+43M4L.IjUg!lBS4?ofL]"#Y.#QP8_#V]Z,1X5pKQG)b<ndqPP:VI%
+Bl0SF7=5*O'k=JB00oPA8d:>,m0?&/6dg2toLO+A=(&RFl2]Q%nr[D?No`XhANt@qZ_9cXW"Nt/TD9nr4Hu@cQi:V;:WI'-Igl?eL+/TNa\or-1^Ge*<
+Fm<4I`E3uPV^:IbPhZO27(#07YYbqGG5/t(3s/g3'5t7#!>ml]67$?6Z7U^OIf\iM^n(!4%'D7'+nLJL+E<40Ak4F@E7XY<$WF+u@MDP88U[`ek\l6D/
+>2\`_^AkeUc0)/hqUhY\OI)@H$h,m#h`i9-\ZH8nBJd8ln4qikio-Aj1['ng)TcgfDd/@L+aKr6s7aHAmVd?!GJ?"ReS.)9FjNS9(n)tC87!>+'Zj)I1
+rpo:Wc.ALMY1EHQDJbPLjb10nSi\V[K^NQX#g9QsW9Jn/GcnPF&Rid+IDOGBS28H^$Cr820MpaO2qGMDE'hVg5(l*#F`lfb&18(pn^A<NPB@3l@3gaJt
+'bUEZE0g>t`YG#?e3,g+p^fp2k]!+\3:`$G2EFj>)YjE.RrDhs&UZN:pEW[6(Lp#5*sTjEX!Z3^4/!fU>AO6_G`nic-pF^hH0%1<M_-.+I6.Zhdj/tU[
+T8VgQ):E2heq7S+_5Y$RDs5aCM:$E.Bn9NTX']&&gGWit#qIljA7&m'?.r1UKVQDtc@[0i^Vnb[t$h4;je0U#-\:ch7IWj=s`]\]Y7j%PBAuP[d?b)a(
+2r#$@c@9S^^SE[)+s)^H_D9f0W'S\E=_aWt5$#1'<fG$am[Z>@[W*=BKs&+&bddSF/l[uD+pWEU^n33CXJV#:*[AZt.-#tRe#Y.b^e\9=l_YV5W&l`\P
+tp.*d>2S:V6s3Wgji5Yp(tm%%(>ii61i%!Ue;tWs)QgD6&W.k%dUBK""`,sMgK$8pf6#I-FZ;2LhU29F%k\SgFEnmJk&H\'aN,i9u%+RZKt$eZ5_^p^7
+RCVlPB\nLTQT#%RdY)UgZUDja/))0S>Z(dl]JOTc+`kO!rLBi(.,)S]E&T<\kn%I;2HWC(MH5Se#9T!f`1..ig`r0kEtH#lChE6>"KY!,J6=<i+D.0TD
+p,>UNHe'?Qc2YdUS8`3Z"`^"E3.dsr_J3U[4&!LBAd)++(`^T0f065CN7e3C4-n7i9GMS'50jNOts+SP)'MHQoo$aT&9>,APsP$Jc\b6GQu+:d37%ch9
+LZ2=#P`;3U.rf,J$?RkTZ#MV$'f+\Y\Z*+t_Z:eS#$tlcg58]'D+`hP)6Fi*.8O-'A^FKlY41'_>SX9s7$<i"&?[kB#N"7Xfm5B>T?"</73aa]R,"l:e
+SBM65Ris]Q^HP7-.Qk$]/i4erX/EI8aBrrB?F/.(MJ[GBWr"U["EhW0pM,j=QXht+bUE+jJ_WN'Z-[%Cbei\T462gLKV=onOXZjVbkglRNbH<>iaEluZ
+E_j0=cKN)5_97+S2qRpI&aYJebDlJ``c.ubCUMnhSBu%:XYkrK(<p[I)uATcDl6CGAUKYUZ5%M(=3sV_ugb[_mss_SiHUY/:!i0d=A:s=(Xdt3eE$nYg
+kAJbZ7PA=)8,l4",!Z`Tf"6:7,q;%`4_:1lHL0?c$P()@4g"lZ,kRX/i\`.ecTO=];p)HGXR-Ak@S^3'kLX5[-HF"$%FO"'/Q:EV@5sGJre:O85d_6.O
+]5EM%Xed4:&p3\F]2l)78&OaMpqQVA2h3c<XI*ZTjF@)CT7]-#3[rPtAE)a61-c5)81,"D^gUWNBOLO.'t8?`ZFN^!nri;-7iFb>cPZuWRJ#8<F-n8ZP
+s[HV)j=B?QCaFZj9KVbG^.#H[(%,VKqn5Dg\o#PohECC@$N#9!p"BYe`G3Dur<P^6.G)RT7hQQ#nAVE6#G+?&2"j$Cd*ga`X2h,`<mQ^X\r^GQ.oIeL^
+$n,cu,6o[tB3`/W_XYJb7)=EB"NY;q!0sekD*kLi:47s&I_G,'7XT7;oh(AC;N55[G>Z)K11VXZbED^I8_hU9,JP'(72Z^]R^'Yj9t0(uD&=@Ci^.t_,
+&GOJp?_jXX-Y8?'CX!S44oYNk$HX3#fe8?dKWc^G)"1P&r7+8K/=>-*-D*Q@9_MkZFOd&MnK9f9t@jQ_$bdrEB:o1-6^[l6K[HIoSQdX4Siug_g7h#@P
+\eXjn[JH=/:,naV:7"3//$DqOP)_55/Pb6(!.#&@/)s7J:UnnUWde51]s!j<qABZLs@(=\cb[Ne_s[oiO/E?HG$9kC54>DodIaCCqPoZkS%!\P"".WMI
+7T6V/^3D%ogN'MZG<n<pB91mVi>KJfG<+TpnR_SdtZ6bbJ<M`.b%/jaEH3?NlL7m>khf6)`dNSE9W`iObDnO607E[8b'"UeNq,pZdo<6Vc*fBg&m5u[7
+%;m!99NiTErSinTc'6FUhGng7EAch0cF[c=qF^Bf3E6/*Gp2L]b.,>0JWL!u+rA*cYGc"!>pAeOe[bBdu4hoAR:R5Ht&s5%O!H33_:7YWge:*RqRNcqo
+-@tUfp.n0-HFMb0X$@l!/MBS29*r5RQse=&C#nD*nLqOmlV#rR8pg$o)4G!.R/V*(BS$,q;?l%HgW:n_/60c+Cu3hsd!R9]>pmM3kIl;e+jgt(6ZH+=9
+6W*)`/#UQYD/B";cO8e8aO+]2^9t&Gf!3+h*hQ`*s?k"RG4tWQ;s.H\a#.68gH)T%&Mpq"=Iu+JVZo3;hsIkL$rKfC>ZQF,5)f[&MMr?G\5_a/QA)0=A
+r>G)@YG<"^3Y',R`%$6Iu9f1^bk55.F%Z#F,`(D\SNL(CCA0TE*?enc0Eih1Ug!?b\L3@$*m4^BRKbI&h0+'ucSb=O$kH,7/4E@7.S9)u;9dn^.2SR)/
+?mfLZ3*W-cb-6?gpZGO%UPCX4'Q`dAj7THe`OMUdFj=cP69I05FMdkqrA1L]!-AUu;V\RE8`5C=]i\Ud$:p+VF_*83U:o.N20K*-\SaN>n>1KS$A]V1o
+"JC.iI._*ONrK`%tOJ87:6\sc'pi68t$5m,#*8)8$M<ts$IHT*B[oQr$2N91f8,MEF]L^2"Nh)*VLKRR&cKq\j,L5Dg=+C8EHRe[8C5Sng]:(83?=25l
+5eeh/h7Buf0!EagVN5]YR"[%3i!CdKSiQk)?Y.Zi^QMUk]K9[?%ur?AnKQ5lV+j^JYrRn]INh5V8e%2c71[#Tq'((n#0S4@)Sm!o3@,">TfcmS")`O#_
+\!c#e"#ua%.=Q$M=o5!<Okg*H]Td)2qoTnNn:(O;'r*TTsYgFSbj>AkS;'IjB14D_ck=.h?0i/QXs'%5I'Zk:;4p;(m8/>+]#G$mgpKO[=r%Y@5A7PHL
+@Y&aFurl2"_d<X@`?6H27)0r4>MFDuPBa_Bg,"/qCLQCCu?RIfE]\ioI56eRIr-cDKVhG.Z;jjrd@A`LApWZ9^7!cu9!ZBc9Q0/X:#]Zs_E>Hau#6`0Y
+YN1T,,0D"MF*:(U`S\<N;7gK$l%&lq]o5glY&r-37nSAISQ>\h6]c1%SWEm;'-$bGQS!!8Cq5ik:rR,<1]hJ<WJ/hf>kU>ghu6Ku>9LUng5EU2a]&QiQ
+N*I0[aMNKA7KNHu-`DXr=/WgYKNF(5D"%3*ks4Wr!j-3[@s2"8PM/5?eUJt;PV&T:u![O[Y[A'!8[2O>]rF,1j/G=#f_XBB$@5g!/Nq"m8P@-Doa%WoE
+J%qnMk3G%Ki=s>n[1@,^@>j\8FEhN0`om\)D0qE:R`HqPJ4V2sGJQF,mfou/XJaY?rc[UV'\!tti]K/e%3;p7@SNFf[s'7\]4L4kbgc8r$2#b)fj<"rX
+3o1Z^c;DqS!6qW$2SYp!!/0?QbEJ#:7ZhqZ,C;P!WW3#!!HG.'''
 	exec(lzma.decompress(base64.a85decode(_SRC_B85)).decode("utf-8"), multiCMD.__dict__)
 try:
 	import xxhash  # type: ignore
@@ -122,7 +123,7 @@ except ImportError:
 	hasher = hashlib.blake2b()
 	xxhash_available = False
 
-version = '9.52'
+version = '9.53'
 __version__ = version
 COMMIT_DATE = '2026-04-28'
 
@@ -199,6 +200,8 @@ ERROR_TO_RETURNCODE_TABLE = {
 	'No source paths': 240,
 }
 RETURNCODE_TO_ERROR_TABLE = {v: k for k, v in ERROR_TO_RETURNCODE_TABLE.items()}
+
+REMOVE_FILES_WHILE_LISTING = True
 
 # set limit to 1m files
 SINGLE_PASS_FILE_LIMIT = 1_000_000
@@ -1211,7 +1214,7 @@ def create_sym_links(symLinks,exclude=None,no_link_tracking=False):
 			dest = ''
 			for d in dests:
 				if os.path.islink(d):
-					os.unlink(d)
+					os.remove(d)
 				dest = d
 				if os.path.exists(d):
 					if os.path.isdir(d):
@@ -1435,36 +1438,90 @@ def _get_file_list_cache_key(path, exclude, append_hash, full_hash):
 	exclude_key = frozenset(exclude) if isinstance(exclude, (list, set)) else exclude
 	return (path, exclude_key, append_hash, full_hash)
 
-def get_file_list(path, exclude=None, append_hash=False, full_hash=False, max_workers=56, drop_cache=False, parallel_file_listing=True):
+def get_file_list(path, exclude=None, append_hash=False, full_hash=False, max_workers=56, drop_cache=False, parallel_file_listing=True, remove_files_while_listing=False):
 	"""Unified file list getter with a single cache. Dispatches to get_file_list_serial or get_file_list_parallel based on serial."""
 	cache_key = _get_file_list_cache_key(path, exclude, append_hash, full_hash)
 	if drop_cache:
 		_get_file_list_cache.pop(cache_key, None)
 	if cache_key in _get_file_list_cache:
-		return _get_file_list_cache[cache_key]
+		result = _get_file_list_cache[cache_key]
+		if remove_files_while_listing:
+			# Drop the cache if we are removing files while listing ( indicating we are removing the files later )
+			del _get_file_list_cache[cache_key]
+		return result
+	start_time = time.monotonic()
+	print(f"Getting file list for {path}")
+	if remove_files_while_listing:
+		print("Note: removing files while listing")
 	if parallel_file_listing:
-		result = get_file_list_parallel(path, max_workers=max_workers, exclude=exclude, append_hash=append_hash, full_hash=full_hash)
+		file_list, links, size, folders, removed_count = get_file_list_parallel(path, max_workers=max_workers, exclude=exclude, append_hash=append_hash, full_hash=full_hash, remove_files_while_listing=remove_files_while_listing)
 	else:
-		result = get_file_list_serial(path, exclude=exclude, append_hash=append_hash, full_hash=full_hash)
-	_get_file_list_cache[cache_key] = result
+		file_list, links, size, folders, removed_count = get_file_list_serial(path, exclude=exclude, append_hash=append_hash, full_hash=full_hash, remove_files_while_listing=remove_files_while_listing)
+	result = (file_list, links, size, folders)
+	if remove_files_while_listing:
+		print(f"Removed: {removed_count} files/links with size of {format_bytes(size)}")
+		# Do not cache the result if we are in deletion mode
+	else:
+		_get_file_list_cache[cache_key] = result
+	print(f"Time taken to get file list: {time.monotonic() - start_time:0.4f} seconds")
 	return result
 
-def get_file_list_serial(root,exclude=None,append_hash=False,full_hash=False,recurse=True):
+def _file_list_rate_limit(limiter_state, increment=1):
+	"""Throttle file-list iteration based on FILES_RATE_LIMIT."""
+	if not limiter_state:
+		return
+	increment_added = False
+	while True:
+		if not increment_added:
+			limiter_state['count'] += increment
+			increment_added = True
+		elapsed = time.monotonic() - limiter_state['start_time']
+		limit = limiter_state['limit']
+		allowed = limit * elapsed
+		count = limiter_state['count']
+		if count <= allowed:
+			return
+		wait_for = (count - allowed) / limit
+		time.sleep(min(0.1, max(0.01, wait_for)))
+
+def _remove_file_or_link(path):
+	try:
+		os.remove(path)
+		return True
+	except Exception as exc:
+		eprint(f'Remove process exception:\n Deleting {path} generated an exception: {exc}')
+		return False
+
+def get_file_list_serial(root,exclude=None,append_hash=False,full_hash=False,recurse=True,_rate_limiter=None,respect_file_rate_limit=True,remove_files_while_listing=False):
 	# skip if path is longer than 4096 characters
 	if len(root) > 4096:
-		return frozenset() ,frozenset(),0,frozenset()
+		return frozenset() ,frozenset(),0,frozenset(),0
 	#print(f'Getting file list for {root}')
+	global FILES_RATE_LIMIT
+	if _rate_limiter is None and respect_file_rate_limit and FILES_RATE_LIMIT > 0:
+		_rate_limiter = {'start_time': time.monotonic(), 'count': 0, 'limit': FILES_RATE_LIMIT}
 	if exclude and is_excluded(root,exclude):
-		return frozenset() ,frozenset(),0,frozenset()
+		return frozenset() ,frozenset(),0,frozenset(),0
 	if os.path.islink(root):
-		return frozenset() ,frozenset([get_file_repr(root,append_hash,full_hash)]),0,frozenset()
+		_file_list_rate_limit(_rate_limiter)
+		removed_count = 0
+		if remove_files_while_listing:
+			removed_count = int(_remove_file_or_link(root))
+			return frozenset() ,frozenset(),0,frozenset(),removed_count
+		return frozenset() ,frozenset([get_file_repr(root,append_hash,full_hash)]),0,frozenset(),0
 	if os.path.isfile(root):
+		_file_list_rate_limit(_rate_limiter)
 		realSize = get_file_size(root)
-		return frozenset([get_file_repr(root,append_hash,full_hash)]) ,frozenset(), realSize,frozenset()
+		removed_count = 0
+		if remove_files_while_listing:
+			removed_count = int(_remove_file_or_link(root))
+			return frozenset() ,frozenset(), realSize,frozenset(),removed_count
+		return frozenset([get_file_repr(root,append_hash,full_hash)]) ,frozenset(), realSize,frozenset(),0
 	file_list = set()
 	links = set()
 	folders = set()
 	size = 0
+	removed_count = 0
 	iteration = 0
 	start_time = time.monotonic()
 	globalStartTIme = start_time
@@ -1477,72 +1534,140 @@ def get_file_list_serial(root,exclude=None,append_hash=False,full_hash=False,rec
 				start_time = currentTime
 				# use the time passed as the iteration number
 				iteration = int(currentTime - globalStartTIme)
+				suffix = ''
+				if file_list:
+					suffix += f'Files: {format_bytes(len(file_list),use_1024_bytes=False,to_str=True)} '
+				if removed_count:
+					suffix += f'Removed: {format_bytes(removed_count,use_1024_bytes=False,to_str=True)} '
+				if links:
+					suffix += f'Links: {format_bytes(len(links),use_1024_bytes=False,to_str=True)} '
+				if folders:
+					suffix += f'Folders: {format_bytes(len(folders),use_1024_bytes=False,to_str=True)} '
+				if size:
+					suffix += f'Size: {format_bytes(size)}B '
+				if _rate_limiter:
+					suffix += f'| Overall: {format_bytes(_rate_limiter["count"],use_1024_bytes=False,to_str=True)} Files'
 				# if the root is longer than 50 characters, we only show the last 50 characters
-				multiCMD.print_progress_bar(iteration=iteration, total=0, prefix=f'{root}'[-50:], suffix=f'Files: {format_bytes(len(file_list),use_1024_bytes=False,to_str=True)} Links: {format_bytes(len(links),use_1024_bytes=False,to_str=True)} Folders: {format_bytes(len(folders),use_1024_bytes=False,to_str=True)} Size: {format_bytes(size)}B')
+				multiCMD.print_progress_bar(iteration=iteration, total=0, prefix=f'{root}'[-50:], suffix=suffix)
 			if exclude and is_excluded(entry.path,exclude):
 				continue
 			if entry.is_symlink():
-				links.add(get_file_repr(entry.path,append_hash,full_hash))
+				_file_list_rate_limit(_rate_limiter)
 				realSize = get_file_size(entry.path)
 				size += realSize
+				if remove_files_while_listing:
+					removed_count += int(_remove_file_or_link(entry.path))
+				else:
+					links.add(get_file_repr(entry.path,append_hash,full_hash))
 			elif entry.is_file(follow_symlinks=False):
-				file_list.add(get_file_repr(entry.path,append_hash,full_hash))
+				_file_list_rate_limit(_rate_limiter)
 				realSize = get_file_size(entry.path)
 				size += realSize
+				if remove_files_while_listing:
+					removed_count += int(_remove_file_or_link(entry.path))
+				else:
+					file_list.add(get_file_repr(entry.path,append_hash,full_hash))
 			elif entry.is_dir(follow_symlinks=False):
 				if recurse:
-					dir_files, dir_links, dir_size, dir_folders = get_file_list_serial(entry.path,exclude=exclude,append_hash=append_hash,full_hash=full_hash)
+					dir_files, dir_links, dir_size, dir_folders, dir_removed_count = get_file_list_serial(entry.path,exclude=exclude,append_hash=append_hash,full_hash=full_hash,_rate_limiter=_rate_limiter,respect_file_rate_limit=respect_file_rate_limit,remove_files_while_listing=remove_files_while_listing)
 					file_list.update(dir_files)
 					links.update(dir_links)
 					size += dir_size
 					folders.update(dir_folders)
+					removed_count += dir_removed_count
 				else:
 					folders.add(entry.path)
 		#multiCMD.print_progress_bar(iteration=iteration, total=iteration, prefix=f'{root}', suffix=f'Files: {format_bytes(len(file_list),use_1024_bytes=False,to_str=True)} Links: {format_bytes(len(links),use_1024_bytes=False,to_str=True)} Folders: {format_bytes(len(folders),use_1024_bytes=False,to_str=True)} Size: {format_bytes(size)}B')
 	else:
 		eprint(f'Source path type error: {root} is not a file or directory')
-		return frozenset([root]) ,frozenset(), 0,frozenset()
-	return frozenset(file_list), frozenset(links) , size, frozenset(folders - set(['.', '..']))
+		return frozenset([root]) ,frozenset(), 0,frozenset(),0
+	return frozenset(file_list), frozenset(links) , size, frozenset(folders - set(['.', '..'])),removed_count
 
-def get_file_list_parallel(path,max_workers=56,exclude=None,append_hash=False,full_hash=False):
+def get_file_list_parallel(path,max_workers=56,exclude=None,append_hash=False,full_hash=False,remove_files_while_listing=False):
+	global FILES_RATE_LIMIT
 	# skip if path is longer than 4096 characters
 	if len(path) > 4096:
-		return frozenset() ,frozenset(),0,frozenset()
+		return frozenset() ,frozenset(),0,frozenset(),0
 	if exclude and is_excluded(path,exclude):
-		return frozenset() ,frozenset(),0,frozenset()
+		return frozenset() ,frozenset(),0,frozenset(),0
 	if os.path.islink(path):
-		return frozenset() ,frozenset([get_file_repr(path,append_hash,full_hash)]),0,frozenset()
+		removed_count = 0
+		if remove_files_while_listing:
+			removed_count = int(_remove_file_or_link(path))
+			return frozenset() ,frozenset(),0,frozenset(),removed_count
+		return frozenset() ,frozenset([get_file_repr(path,append_hash,full_hash)]),0,frozenset(),0
 	if os.path.isfile(path):
 		realSize = get_file_size(path)
-		return frozenset([get_file_repr(path,append_hash,full_hash)]) ,frozenset(), realSize,frozenset()
+		removed_count = 0
+		if remove_files_while_listing:
+			removed_count = int(_remove_file_or_link(path))
+			return frozenset() ,frozenset(), realSize,frozenset(),removed_count
+		return frozenset([get_file_repr(path,append_hash,full_hash)]) ,frozenset(), realSize,frozenset(),0
 	#print(f'Getting file list for {path}')
 	if os.path.isdir(path):
-		file_list, link_list , size, folder_list = get_file_list_serial(path,exclude=exclude,append_hash=append_hash,full_hash=full_hash,recurse=False)
+		file_list, link_list , size, folder_list, removed_count = get_file_list_serial(
+			path,
+			exclude=exclude,
+			append_hash=append_hash,
+			full_hash=full_hash,
+			recurse=False,
+			respect_file_rate_limit=False,
+			remove_files_while_listing=remove_files_while_listing
+		)
 		file_list = set(file_list)
 		link_list = set(link_list)
 		folder_list = set(folder_list)
-		folders_to_expand = folder_list - set([path])
+		folders_to_expand = deque(folder_list - set([path]))
+		enqueued_folders = set(folders_to_expand)
 		futures = {}
+		listing_start_time = time.monotonic()
+		listed_items = len(file_list) + len(link_list) + removed_count
 		with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
 			while folders_to_expand or futures:
-				for folder in folders_to_expand:
-					futures[executor.submit(_call_with_worker_init, get_file_list_serial, folder,exclude=exclude,append_hash=append_hash,full_hash=full_hash,recurse=False)] = folder
-				folders_to_expand.clear()
-				
+				under_rate_limit = (
+					FILES_RATE_LIMIT <= 0
+					or listed_items <= FILES_RATE_LIMIT * (time.monotonic() - listing_start_time)
+				)
+				while folders_to_expand and len(futures) < max_workers and under_rate_limit:
+					folder = folders_to_expand.popleft()
+					futures[executor.submit(
+						_call_with_worker_init,
+						get_file_list_serial,
+						folder,
+						exclude=exclude,
+						append_hash=append_hash,
+						full_hash=full_hash,
+						recurse=False,
+						respect_file_rate_limit=False,
+						remove_files_while_listing=remove_files_while_listing
+					)] = folder
+					under_rate_limit = (
+						FILES_RATE_LIMIT <= 0
+						or listed_items <= FILES_RATE_LIMIT * (time.monotonic() - listing_start_time)
+					)
+				if not futures:
+					if folders_to_expand and FILES_RATE_LIMIT > 0:
+						time.sleep(0.05)
+					continue
 				done, _ = concurrent.futures.wait(futures, return_when=concurrent.futures.FIRST_COMPLETED)
 				for doneTask in done:
 					folder_path = futures.pop(doneTask)
-					dir_file_list, dir_link_list, dir_size, dir_folder_list = doneTask.result()
+					dir_file_list, dir_link_list, dir_size, dir_folder_list, dir_removed_count = doneTask.result()
 					file_list.update(dir_file_list)
 					link_list.update(dir_link_list)
 					size += dir_size
+					removed_count += dir_removed_count
+					listed_items += len(dir_file_list) + len(dir_link_list) + dir_removed_count
+					for sub_folder in dir_folder_list:
+						if sub_folder != folder_path and sub_folder not in enqueued_folders:
+							folders_to_expand.append(sub_folder)
+							enqueued_folders.add(sub_folder)
 					folder_list.update(dir_folder_list)
-					folders_to_expand.update(dir_folder_list - set([folder_path]))
 			
 	else:
 		eprint(f'Source path type error: {path} is not a file or directory')
-		return frozenset([path]) ,frozenset(), 0,frozenset()
-	return frozenset(file_list), frozenset(link_list) ,size, frozenset(folder_list - set(['.', '..']))
+		return frozenset([path]) ,frozenset(), 0,frozenset(),0
+	return frozenset(file_list), frozenset(link_list) ,size, frozenset(folder_list - set(['.', '..'])),removed_count
 
 
 #%% ---- Delete Files ----
@@ -1553,9 +1678,7 @@ def delete_file_bulk(paths):
 		if os.path.exists(path):
 			try:
 				total_size += os.path.getsize(path)
-				if os.path.islink(path):
-					os.unlink(path)
-				elif os.path.isdir(path):
+				if os.path.isdir(path):
 					shutil.rmtree(path)
 				else:
 					os.remove(path)
@@ -1653,17 +1776,15 @@ def delete_file_list_parallel(file_list, max_workers, verbose=False,files_per_jo
 	return apb.item_counter, apb.size_counter
 
 def delete_files_parallel(paths, max_workers, verbose=False,files_per_job=1,exclude=None,batch=False,parallel_file_listing=False):
+	global REMOVE_FILES_WHILE_LISTING
 	if not batch and isinstance(paths, str):
 		paths = [paths]
-	start_time = time.monotonic()
 	all_files = set()
 	init_size_all = 0
 	for path in paths:
-		file_list, links,init_size, _ = get_file_list(path, max_workers=max_workers, exclude=exclude, parallel_file_listing=parallel_file_listing)
+		file_list, links,init_size, _ = get_file_list(path, max_workers=max_workers, exclude=exclude, parallel_file_listing=parallel_file_listing,remove_files_while_listing=REMOVE_FILES_WHILE_LISTING)
 		all_files.update(set(file_list) | set(links))
 		init_size_all += init_size
-	endTime = time.monotonic()
-	print(f"Time taken to get file list: {endTime-start_time:0.4f} seconds")
 	total_files = len(all_files)
 	print(f"Number of files: {total_files}")
 	print(f'Initial estimated size: {format_bytes(init_size_all)}B')
@@ -2102,11 +2223,7 @@ def copy_files_parallel(src_path, dest_paths, max_workers, full_hash=False, verb
 	if not os.path.isdir(src_path):
 		src_size, _ , symLinks = copy_file(src_path, dest_paths,full_hash=full_hash, verbose=verbose)
 		return 1, src_size , symLinks , frozenset([src_path])
-	start_time = time.monotonic()
 	file_list, links, init_size, folders = get_file_list(src_path, max_workers=max_workers, exclude=exclude, parallel_file_listing=parallel_file_listing)
-		
-	endTime = time.monotonic()
-	print(f"Time taken to get file list: {endTime-start_time:0.4f} seconds")
 	total_files = len(file_list)
 	print(f"Number of files: {total_files}")
 	print(f"Number of links: {len(links)}")
@@ -2166,7 +2283,6 @@ def copy_files_serial(src_path, dest_paths, full_hash=False, verbose=False,exclu
 	if not os.path.isdir(src_path):
 		src_size, _ , symLinks = copy_file(src_path, dest_paths,full_hash=full_hash, verbose=verbose)
 		return 1, src_size , symLinks , frozenset([src_path])
-	print(f'Getting file list for {src_path}')
 	file_list,links,init_size,_ = get_file_list(src_path,exclude=exclude,parallel_file_listing=False)
 	links = set(links)
 	total_files = len(file_list)
@@ -2216,7 +2332,6 @@ def copy_files_serial_batch(jobs, full_hash=False, verbose=False,exclude=None,ex
 			total_symLinks.update(symLinks)
 			total_files.append(src_path)
 			continue
-		print(f'Getting file list for {src_path}')
 		file_list,links,init_size,_ = get_file_list(src_path,exclude=exclude,parallel_file_listing=False)
 		if exit_not_enough_space:
 			# check if there is enough space on all dest paths
@@ -2389,7 +2504,6 @@ def sync_directories_parallel(src, dests, max_workers, verbose=False,folder_per_
 		_, _ , symLinks = copy_file(src, dests)
 		return symLinks
 	sync_directory_metadata(src, dests)
-	print(f'Getting file list for {src}')
 	_,_,_,folders  = get_file_list(src, max_workers=max_workers,exclude=exclude,parallel_file_listing=parallel_file_listing)
 	folder_list_iterator = iter(folders)
 	futures = {}
@@ -2483,7 +2597,6 @@ def sync_directories_parallel_batch(jobs, max_workers, verbose=False,folder_per_
 			symLinks.update(sl)
 			continue
 		sync_directory_metadata(src, dests)
-		print(f'Getting file list for {src}')
 		_,_,_,folders  = get_file_list(src, max_workers=max_workers,exclude=exclude,parallel_file_listing=parallel_file_listing)
 		allFolderToSync.extend([(src,folder,dests) for folder in folders])
 	if not allFolderToSync:
@@ -2589,7 +2702,6 @@ def sync_directories_serial(src, dests,exclude=None):
 		_, _ , symLinks = copy_file(src, dests)
 		return symLinks
 	#sync_directory_metadata(src, dest)
-	print(f'Getting file list for {src}')
 	_,_,_,folders = get_file_list(src,exclude=exclude,parallel_file_listing=False)
 	print(f"Syncing Dir from {src} to {dests} in single thread")
 	apb = Adaptive_Progress_Bar(total_count=len(folders),total_size=len(folders),process_word='Synced',bytes_rate_limit=BYTES_RATE_LIMIT,files_rate_limit=FILES_RATE_LIMIT)
@@ -2620,7 +2732,6 @@ def sync_directories_serial_batch(jobs,exclude=None):
 			symLinks.update(sls)
 			continue
 		newJobs.append((src,dests))
-		print(f'Getting file list for {src}')
 		_,_,_,folders = get_file_list(src,exclude=exclude,parallel_file_listing=False)
 		srcFolders.append(folders)
 		totalFolderCount += len(folders)
@@ -2730,6 +2841,8 @@ def remove_extra_files(total_file_list, dests,max_workers,verbose,files_per_job,
 		if len(inDestNotInSrc) == 0:
 			print(f"No extra files found in {dests}")
 		else:
+			if not sys.stdin.isatty():
+				raise RuntimeError("User requested stop: Not deleting extra files as stdin is not a tty")
 			print(f"Files in dest but not in src count: {len(inDestNotInSrc)}")
 			print("Do you want to delete them? (y/n)")
 			if not input().lower().startswith('y'):
@@ -2771,12 +2884,14 @@ def mount_src_image(src_images: list,src_paths: list,mount_points: list,loop_dev
 				if os.path.ismount(target_mount_point):
 					src_paths.append(target_mount_point + os.path.sep)
 				else:
-					print(f"Partition {partition} cannot be mounted, what to do? (s/f/n)")
-					print(f"s:  Skip {partition} \t:Skip this partition and continue mounting the rest ( default )")
-					print(f"f:  Fix {partition} \t:Try to fix the partition and mount it again")
-					print("n:  Exit")
-					# Wait for user input with a 5 second timeout
-					inStr = multiCMD.input_with_timeout_and_countdown(5)
+					inStr = ''
+					if sys.stdin.isatty():
+						print(f"Partition {partition} cannot be mounted, what to do? (s/f/n)")
+						print(f"s:  Skip {partition} \t:Skip this partition and continue mounting the rest ( default )")
+						print(f"f:  Fix {partition} \t:Try to fix the partition and mount it again")
+						print("n:  Exit")
+						# Wait for user input with a 5 second timeout
+						inStr = multiCMD.input_with_timeout_and_countdown(5)
 					if (not inStr) or inStr.lower().startswith('s'):
 						print(f"Partition {partition} cannot be mounted, skipping")
 						continue
@@ -2855,14 +2970,10 @@ def store_file_list(file_list, src_paths: list, single_thread=False, max_workers
 		raise RuntimeError("Completed removing extra files, exiting")
 	fileList = set()
 	for src in src_paths:
-		print(f"Getting file list from {src}")
-		start_time = time.monotonic()
 		files, links, _,folders  = get_file_list(src, max_workers=max_workers, exclude=exclude,append_hash=append_hash,full_hash=full_hash,parallel_file_listing=parallel_file_listing)
 		fileList.update(trim_paths(files, src))
 		fileList.update(trim_paths(links, src))
 		fileList.update([folder_path + os.path.sep for folder_path in trim_paths(folders, src)])
-		endTime = time.monotonic()
-		print(f"Time taken to get file list: {endTime - start_time:0.4f} seconds")
 	if compare_file_list:
 		# This means we have a file_list and a src_path so we compare them
 		print(f"Comparing file list from {src_paths} with {file_list}")
@@ -2883,6 +2994,7 @@ def store_file_list(file_list, src_paths: list, single_thread=False, max_workers
 
 def process_remove(src_paths: list,single_thread = False, max_workers = 4 * multiprocessing.cpu_count(),verbose = False,
 				  files_per_job = 1, remove_force = False,exclude=None,batch = False,parallel_file_listing=False):
+	global REMOVE_FILES_WHILE_LISTING
 	#src = os.path.abspath(src +os.path.sep)
 	src_paths = [os.path.abspath(src + os.path.sep) for src in src_paths if os.path.exists(src)]
 	processedPaths = []
@@ -2895,28 +3007,29 @@ def process_remove(src_paths: list,single_thread = False, max_workers = 4 * mult
 			processedPaths.append(path)
 	print(f"Removing files from {pformat(processedPaths)} with {max_workers if not single_thread else '1'} workers")
 	if not remove_force:
+		if not sys.stdin.isatty():
+			raise RuntimeError("User requested stop: Not removing files as stdin is not a tty")
 		print("Do you want to continue? (y/n)")
 		if not input().lower().startswith('y'):
 			raise RuntimeError("User requested stop: Not removing files")
-
 	for path in processedPaths:
 		print('-'*80)
 		start_time = time.monotonic()
 		if single_thread:
-			if os.path.isfile(path) or os.path.islink(path):
-				if verbose:
-					print(f"Removing file: {path}")
-				try:
+			get_file_list_serial(path,exclude=exclude,remove_files_while_listing=REMOVE_FILES_WHILE_LISTING)
+			try:
+				if os.path.isfile(path) or os.path.islink(path):
+					if verbose:
+						print(f"Removing file: {path}")
 					os.remove(path)
-				except Exception as e:
-					eprint(f"Remove file failed: Error removing file {path}: {e}")
-			elif os.path.isdir(path):
-				if verbose:
-					print(f"Removing directory: {path}")
-				try:
+				elif os.path.isdir(path):
+					if verbose:
+						print(f"Removing directory: {path}")
 					shutil.rmtree(path)
-				except Exception as e:
-					eprint(f"Remove directory failed: Error removing directory {path}: {e}")
+			except FileNotFoundError:
+				pass
+			except Exception as e:
+				eprint(f"Remove file/directory failed: Error removing file/directory {path}: {e}")
 		else:
 			delete_files_parallel(processedPaths if batch else path, max_workers, verbose=verbose,files_per_job=files_per_job,exclude=exclude,batch=batch,parallel_file_listing=parallel_file_listing)
 		endTime = time.monotonic()
@@ -2944,11 +3057,13 @@ def get_dest_from_image(dest_image,mount_points: list,loop_devices: list):
 		if os.path.ismount(target_mount_point):
 			dest = target_mount_point + os.path.sep
 		else:
-			print("Destination image cannot be mounted, do you want to continue? (f/d/n)")
-			print(f"f:  Fix {target_partition} \t:Try to fix the partition and mount it again ( default )")
-			print(f"d:  Delete {dest_image} \t:Delete the old and create a new image (Warning: this will overwrite the existing image)")
-			print("n:  Exit")
-			inStr = multiCMD.input_with_timeout_and_countdown(15)
+			inStr = ''
+			if sys.stdin.isatty():
+				print("Destination image cannot be mounted, do you want to continue? (f/d/n)")
+				print(f"f:  Fix {target_partition} \t:Try to fix the partition and mount it again ( default )")
+				print(f"d:  Delete {dest_image} \t:Delete the old and create a new image (Warning: this will overwrite the existing image)")
+				print("n:  Exit")
+				inStr = multiCMD.input_with_timeout_and_countdown(15)
 			if (not inStr) or inStr.lower().startswith('f'):
 				try:
 					# First find out the fs type
@@ -2976,7 +3091,6 @@ def get_dest_from_image(dest_image,mount_points: list,loop_devices: list):
 def get_dest_from_path(dest_path,src_paths: list,src_path,can_be_none = False):
 	dest = ''
 	src_path = list(src_path)
-	interactive_input = sys.stdin.isatty()
 	if not dest_path:
 		if can_be_none:
 			return None
@@ -2985,16 +3099,14 @@ def get_dest_from_path(dest_path,src_paths: list,src_path,can_be_none = False):
 				cwd = os.path.join(os.getcwd()) + os.path.sep
 			except Exception:
 				cwd = None
-			print("Destination path not specified, do you want to continue? (l/y/n/...)")
-			print(f"l:  {src_path[-1]} \t:Use last src_path in list ( default )")
-			if cwd:
-				print(f"y:  {cwd} \t:Use current working directory")
-			print("n:  Exit")
-			print("...:  Enter custom destination path")
-			if not interactive_input:
-				# In non-interactive mode (e.g. piped stdin), follow the same default as empty input.
-				inStr = ''
-			else:
+			inStr = ''
+			if sys.stdin.isatty():
+				print("Destination path not specified, do you want to continue? (l/y/n/...)")
+				print(f"l:  {src_path[-1]} \t:Use last src_path in list ( default )")
+				if cwd:
+					print(f"y:  {cwd} \t:Use current working directory")
+				print("n:  Exit")
+				print("...:  Enter custom destination path")
 				inStr = multiCMD.input_with_timeout_and_countdown(60)
 			if (not inStr) or inStr.lower() == 'l':
 				dest = str(src_path[-1])
@@ -3012,15 +3124,13 @@ def get_dest_from_path(dest_path,src_paths: list,src_path,can_be_none = False):
 				cwd = os.path.join(os.getcwd()) + os.path.sep
 			except Exception:
 				cwd = None
-			print("Destination path not specified, src_path length is 1, do you want to continue? (y/n/...)")
-			if cwd:
-				print(f"y:  {os.getcwd() + os.path.sep} \t:Use current working directory ( default )")
-			print("n:  Exit")
-			print("...:  Enter custom destination path")
-			if not interactive_input:
-				# In non-interactive mode (e.g. piped stdin), follow the same default as empty input.
-				inStr = ''
-			else:
+			inStr = ''
+			if sys.stdin.isatty():
+				print("Destination path not specified, src_path length is 1, do you want to continue? (y/n/...)")
+				if cwd:
+					print(f"y:  {os.getcwd() + os.path.sep} \t:Use current working directory ( default )")
+				print("n:  Exit")
+				print("...:  Enter custom destination path")
 				inStr = multiCMD.input_with_timeout_and_countdown(60)
 			if (not inStr) or cwd and inStr.lower() == 'y':
 				dest = cwd
@@ -3093,8 +3203,6 @@ def process_compare_file_list(src_paths: list, dests, max_workers = 4 * multipro
 	file_list = set()
 	for src in src_paths:
 		print('-'*80)
-		print(f"Getting file list from {src}")
-		start_time = time.monotonic()
 		files,links,_,folders  = get_file_list(src, max_workers=max_workers,exclude=exclude,append_hash=append_hash,full_hash=full_hash,parallel_file_listing=parallel_file_listing)
 		if dest_image:
 			# we use full path for src when comparing file list with dest image
@@ -3105,19 +3213,13 @@ def process_compare_file_list(src_paths: list, dests, max_workers = 4 * multipro
 			file_list.update(trim_paths(files,src))
 			file_list.update(trim_paths(links,src))
 			file_list.update([folder_path + os.path.sep for folder_path in trim_paths(folders, src)])
-		endTime = time.monotonic()
-		print(f"Time taken to get file list: {endTime-start_time:0.4f} seconds")
-	start_time = time.monotonic()
 	file_list2 = set()
 	print('-'*80)
-	print(f"Getting file list from {dests}")
 	for dest in dests:
 		files,links,_,folders  = get_file_list(dest, max_workers=max_workers,exclude=exclude,append_hash=append_hash,full_hash=full_hash,parallel_file_listing=parallel_file_listing)
 		file_list2.update(trim_paths(files,dest))
 		file_list2.update(trim_paths(links,dest))
 		file_list2.update([folder_path + os.path.sep for folder_path in trim_paths(folders, dest)])
-	endTime = time.monotonic()
-	print(f"Time taken to get file list: {endTime-start_time:0.4f} seconds")
 	compare_file_list(file_list, file_list2, diff_file_list,tar_diff_file_list = tar_diff_file_list)
 
 def create_image(dest_image,target_mount_point,loop_devices: list,src_paths: list,mount_points, max_workers = 4 * multiprocessing.cpu_count(),
@@ -3331,11 +3433,13 @@ def create_dd_dest_part_table(dd_src,dd_resize = [],src_path = None, dest_path =
 
 	# if dest_path exists, print a confirmation message
 	if os.path.exists(dest_path):
-		print(f"Warning: Destination path {dest_path} exists.")
-		print(f"Source device {src_path} will be copied to {dest_path} with the following partition info:")
-		print(partition_infos)
-		print(f"All data on {dest_path} will be lost, do you want to continue? (y/n) Default : y")
-		inStr = multiCMD.input_with_timeout_and_countdown(60)
+		inStr = ''
+		if sys.stdin.isatty():
+			print(f"Warning: Destination path {dest_path} exists.")
+			print(f"Source device {src_path} will be copied to {dest_path} with the following partition info:")
+			print(partition_infos)
+			print(f"All data on {dest_path} will be lost, do you want to continue? (y/n) Default : y")
+			inStr = multiCMD.input_with_timeout_and_countdown(60)
 		if inStr and not inStr.lower().startswith('y'):
 			print("Exiting.")
 			return
@@ -3394,6 +3498,7 @@ def get_args(args = None):
 	parser.add_argument('-rm', '--remove', action='store_true', help='Remove all files and folders specified in src_path')
 	parser.add_argument('-rf', '--remove_force', action='store_true', help='Remove all files without prompt')
 	parser.add_argument('-rme', '--remove_extra', action='store_true', help='Remove all files and folders in dest_path that are not in src_path')
+	parser.add_argument('-rwloff','--do_not_remove_files_while_listing', action='store_true', help='Do not remove files while listing. This is useful if you want to remove files after listing.')
 	parser.add_argument('-e', '--exclude', action='append', default=[], help='Exclude source files matching the pattern')
 	parser.add_argument('-x', '--exclude_file', type=str, help='Exclude source files matching the pattern in the file')
 	parser.add_argument('-nlt', '--no_link_tracking', action='store_true', help='Do not copy files that symlinks point to.')
@@ -3451,13 +3556,14 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = 4 * mul
 			exclude=None,exclude_file = None,dest_image = None,dest_image_size = '0', no_link_tracking = False,src_image = None,dd = False,dd_resize = 0,
 			batch = False, append_hash_to_file_list = True, hash_size = ..., source_file_list = None, random_destination_selection = False, 
 			bytes_rate_limit = None, files_rate_limit = None,target_file_system = None, no_create_dir = False, command_timeout_limit = 0,
-			exit_not_enough_space = False):
+			exit_not_enough_space = False,do_not_remove_files_while_listing = False):
 	global HASH_SIZE
 	global RANDOM_DESTINATION_SELECTION
 	global BYTES_RATE_LIMIT
 	global FILES_RATE_LIMIT
 	global COMMAND_TIMEOUT
 	global NO_CREATE_DIR
+	global REMOVE_FILES_WHILE_LISTING
 	NO_CREATE_DIR = no_create_dir
 	if random_destination_selection:
 		RANDOM_DESTINATION_SELECTION = True
@@ -3483,6 +3589,7 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = 4 * mul
 		print(f"Invalid destination image size {dest_image_size}, using default size 0")
 		dest_image_size = 0
 	COMMAND_TIMEOUT = command_timeout_limit if command_timeout_limit > 0 else 0
+	REMOVE_FILES_WHILE_LISTING = not do_not_remove_files_while_listing
 	print('-'*80)
 	src_paths = []
 	mount_points = []
@@ -3846,7 +3953,7 @@ def main():
 			 dd_resize=args.dd_resize,batch=args.batch,append_hash_to_file_list=not args.no_hash_file_list, hash_size=args.hash_size,source_file_list=args.source_file_list,
 			 random_destination_selection = args.random_dest_selection,bytes_rate_limit = args.rate_limit,files_rate_limit = args.file_rate_limit,
 			 target_file_system = args.target_file_system, no_create_dir = args.no_create_dir, command_timeout_limit = args.command_timeout_limit,
-			 exit_not_enough_space = args.exit_not_enough_space)
+			 exit_not_enough_space = args.exit_not_enough_space,do_not_remove_files_while_listing = args.do_not_remove_files_while_listing)
 		if rtnCode:
 			exit(rtnCode)
 		
