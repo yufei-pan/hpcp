@@ -1459,7 +1459,7 @@ def get_file_list(path, exclude=None, append_hash=False, full_hash=False, max_wo
 		file_list, links, size, folders, removed_count = get_file_list_serial(path, exclude=exclude, append_hash=append_hash, full_hash=full_hash, remove_files_while_listing=remove_files_while_listing)
 	result = (file_list, links, size, folders)
 	if remove_files_while_listing:
-		print(f"Removed: {removed_count} files/links with size of {format_bytes(size)}")
+		print(f"Removed: {removed_count} files/links with size of {format_bytes(size,to_str=True)}B")
 		# Do not cache the result if we are in deletion mode
 	else:
 		_get_file_list_cache[cache_key] = result
@@ -2370,7 +2370,7 @@ def copy_files_serial_batch(jobs, full_hash=False, verbose=False,exclude=None,ex
 	return apb.item_counter, apb.size_counter , total_symLinks , frozenset(total_files)
 
 class copy_scheduler:
-	def __init__(self, max_workers = 4 * multiprocessing.cpu_count(), full_hash=False, verbose=False,files_per_job=1,
+	def __init__(self, max_workers = multiprocessing.cpu_count(), full_hash=False, verbose=False,files_per_job=1,
 			  parallel_file_listing=False,exclude=None, exit_not_enough_space=False):
 		self.max_workers = max_workers
 		self.full_hash = full_hash
@@ -2823,16 +2823,98 @@ def remove_extra_dirs(src_paths, dests,exclude=None):
 	for dir in extraDirs:
 		os.rmdir(dir)
 
-def remove_extra_files(total_file_list, dests,max_workers,verbose,files_per_job,single_thread=False,exclude=None,parallel_file_listing=False):
-		print(f"Removing extra files from {dests} with {max_workers} workers")
-		# we first get a file list of the dest dir
-		inDestNotInSrc = set()
+def _src_to_dest_map(src_paths, dests):
+	"""Build ``[(src_abs, [actual_dest_abs, ...]), ...]`` mirroring process_copy.
+
+	``process_copy`` decides per-src whether each ``dest`` gains the src
+	basename or receives the src contents directly:
+	  * ``hpcp src dest/``   -> files land in ``dest/src/...``
+	  * ``hpcp src/ dest/``  -> files land in ``dest/...``
+	  * ``hpcp src dest``    -> ``get_dest_from_path`` first appends ``/`` to
+	                            both, so it behaves like ``hpcp src/ dest/``
+
+	The list is sorted by ``src_abs`` length (longest first) so that nested
+	srcs are attributed to the most specific entry.
+	"""
+	mapping = []
+	for src in src_paths or []:
+		if not src:
+			continue
+		src_abs = os.path.abspath(src)
+		# basename respects trailing separators: 'src/' -> '', 'src' -> 'src'
+		sourceFolderName = os.path.basename(src)
+		actual_dests = []
 		for dest in dests:
-			dest_file_list,links,_ ,_ = get_file_list(dest, max_workers=max_workers,exclude=exclude,parallel_file_listing=parallel_file_listing)
-			dest_file_list = trim_paths(dest_file_list,dest)
-			dest_file_list.update(trim_paths(links,dest))
-			# we then get the list of all extra files
-			inDestNotInSrc.update([os.path.join(dest,file) for file in (dest_file_list - total_file_list)])
+			if os.path.basename(dest) == '' and sourceFolderName:
+				actual_dests.append(os.path.abspath(os.path.join(dest, sourceFolderName)))
+			else:
+				actual_dests.append(os.path.abspath(dest))
+		mapping.append((src_abs, actual_dests))
+	mapping.sort(key=lambda item: len(item[0]), reverse=True)
+	return mapping
+
+def _expected_dest_paths(src_entries, src_paths, dests):
+	"""Compute the set of absolute dest paths each src entry should occupy."""
+	expected = set()
+	if not src_entries:
+		return expected
+	mapping = _src_to_dest_map(src_paths, dests)
+	for entry in src_entries:
+		if not entry or not os.path.isabs(entry):
+			continue
+		entry_abs = os.path.abspath(entry)
+		for src_abs, actual_dests in mapping:
+			if entry_abs == src_abs:
+				expected.update(actual_dests)
+				break
+			if entry_abs.startswith(src_abs + os.path.sep):
+				rel = os.path.relpath(entry_abs, src_abs)
+				for actual_dest in actual_dests:
+					expected.add(os.path.join(actual_dest, rel))
+				break
+	return expected
+
+def remove_extra_files(total_file_list, dests,max_workers,verbose,files_per_job,single_thread=False,exclude=None,parallel_file_listing=False,src_paths=None,sym_links=None):
+		"""Remove files in ``dests`` that have no counterpart in ``total_file_list``.
+
+		``total_file_list`` may contain absolute src-side paths (as returned by
+		``process_copy``) or already-trimmed relative paths (as loaded from a
+		stored file list). When ``src_paths`` is provided, we compute the
+		expected absolute dest path for each src entry by mirroring how
+		``process_copy`` maps src into dest, then subtract from the actual
+		dest listing. When ``src_paths`` is omitted, the legacy trim-based
+		comparison is used (callers must then pass already-trimmed entries).
+		``sym_links`` is the ``{src_link: [dest_links]}`` mapping returned by
+		``process_copy``; its keys are added to the src side so legitimately
+		copied symlinks are not mistaken for extras.
+		"""
+		print(f"Removing extra files from {dests} with {max_workers} workers")
+		src_entries = set(total_file_list) if total_file_list else set()
+		if sym_links:
+			src_entries.update(sym_links.keys() if hasattr(sym_links, 'keys') else sym_links)
+		inDestNotInSrc = set()
+		if src_paths:
+			expected = _expected_dest_paths(src_entries, src_paths, dests)
+			for dest in dests:
+				dest_file_list, links, _, _ = get_file_list(dest, max_workers=max_workers, exclude=exclude, parallel_file_listing=parallel_file_listing)
+				dest_abs_root = os.path.abspath(dest)
+				actual = {os.path.abspath(p) for p in dest_file_list}
+				actual.update({os.path.abspath(p) for p in links})
+				# Only consider entries that actually live under this dest so we
+				# never accidentally point os.remove outside of the destination.
+				for path in actual - expected:
+					if path == dest_abs_root or path.startswith(dest_abs_root + os.path.sep):
+						inDestNotInSrc.add(path)
+		else:
+			for dest in dests:
+				dest_file_list,links,_ ,_ = get_file_list(dest, max_workers=max_workers,exclude=exclude,parallel_file_listing=parallel_file_listing)
+				dest_trimmed = trim_paths(dest_file_list,dest)
+				dest_trimmed.update(trim_paths(links,dest))
+				# trim_paths roots everything at os.path.dirname(dest); rebuild
+				# absolute paths against the same base or we'd double up the
+				# dest basename when ``dest`` lacks a trailing separator.
+				dest_base = os.path.dirname(dest) or os.path.sep
+				inDestNotInSrc.update([os.path.join(dest_base,file) for file in (dest_trimmed - src_entries)])
 		print('-'*80)
 		print("Files in dest but not in src:")
 		for file in inDestNotInSrc:
@@ -2934,7 +3016,7 @@ def load_file_list(file_list):
 		fileList = frozenset([entry.strip() for entry in f.read().splitlines() if entry.strip()])
 	return fileList
 
-def store_file_list(file_list, src_paths: list, single_thread=False, max_workers=4 * multiprocessing.cpu_count(), verbose=False,
+def store_file_list(file_list, src_paths: list, single_thread=False, max_workers=multiprocessing.cpu_count(), verbose=False,
 					files_per_job=1, compare_file_list=False, remove_extra=False, parallel_file_listing=False, exclude=None,
 					diff_file_list=None,tar_diff_file_list = False, src_str=None,append_hash=True,full_hash=False):
 	"""
@@ -2963,7 +3045,9 @@ def store_file_list(file_list, src_paths: list, single_thread=False, max_workers
 		print('-' * 80)
 		file_list_file = load_file_list(file_list)
 		if len(src_paths) == 1:
-			remove_extra_files(file_list_file, src_paths[0], max_workers, verbose, files_per_job, single_thread, exclude=exclude, parallel_file_listing=parallel_file_listing)
+			# file_list_file already holds trimmed (relative) paths, so we don't
+			# pass src_paths -- entries are used as-is for the comparison.
+			remove_extra_files(file_list_file, [src_paths[0]], max_workers, verbose, files_per_job, single_thread, exclude=exclude, parallel_file_listing=parallel_file_listing)
 			print('-' * 80)
 		else:
 			print("Currently only supports removing extra files for a single src_path when using file_list")
@@ -2992,7 +3076,7 @@ def store_file_list(file_list, src_paths: list, single_thread=False, max_workers
 			for file in fileList:
 				f.write(file + '\n')
 
-def process_remove(src_paths: list,single_thread = False, max_workers = 4 * multiprocessing.cpu_count(),verbose = False,
+def process_remove(src_paths: list,single_thread = False, max_workers = multiprocessing.cpu_count(),verbose = False,
 				  files_per_job = 1, remove_force = False,exclude=None,batch = False,parallel_file_listing=False):
 	global REMOVE_FILES_WHILE_LISTING
 	#src = os.path.abspath(src +os.path.sep)
@@ -3187,7 +3271,7 @@ def get_dests(dest_paths,dest_image,mount_points: list,loop_devices: list,src_pa
 		dest_str = 'undefined'
 	return dests, dest_str, target_mount_point
 	
-def process_compare_file_list(src_paths: list, dests, max_workers = 4 * multiprocessing.cpu_count(),
+def process_compare_file_list(src_paths: list, dests, max_workers = multiprocessing.cpu_count(),
 							  parallel_file_listing = False,exclude=None,dest_image = None,diff_file_list = None,tar_diff_file_list = False,
 							  append_hash = True,full_hash = False):
 	# while os.path.basename(dest) == '':
@@ -3222,7 +3306,7 @@ def process_compare_file_list(src_paths: list, dests, max_workers = 4 * multipro
 		file_list2.update([folder_path + os.path.sep for folder_path in trim_paths(folders, dest)])
 	compare_file_list(file_list, file_list2, diff_file_list,tar_diff_file_list = tar_diff_file_list)
 
-def create_image(dest_image,target_mount_point,loop_devices: list,src_paths: list,mount_points, max_workers = 4 * multiprocessing.cpu_count(),
+def create_image(dest_image,target_mount_point,loop_devices: list,src_paths: list,mount_points, max_workers = multiprocessing.cpu_count(),
 				parallel_file_listing = False,exclude=None,dest_image_size=0):
 	if target_mount_point and dest_image:
 		# This means we were supplied a dest_image that does not exist, we need to create it and initialize it
@@ -3297,7 +3381,7 @@ def create_image(dest_image,target_mount_point,loop_devices: list,src_paths: lis
 	else:
 		raise RuntimeError("No destination image path: Destination path not specified, exiting.")
 
-def process_copy(src_paths: list, dests:list = [], single_thread = False, max_workers = 4 * multiprocessing.cpu_count(),verbose = False, 
+def process_copy(src_paths: list, dests:list = [], single_thread = False, max_workers = multiprocessing.cpu_count(),verbose = False, 
 				directory_only = False,no_directory_sync = False, full_hash = False, files_per_job = 1, parallel_file_listing = False,
 				exclude=None,dest_image = None,batch = False, exit_not_enough_space = False):
 	total_file_list = set()
@@ -3479,7 +3563,7 @@ def get_args(args = None):
 	parser = argparse.ArgumentParser(description='Copy files from source to destination',
 								  epilog=f'Found bins: {list(_binPaths.values())}\n Missing bins: {_binCalled - set(_binPaths.keys())}')
 	parser.add_argument('-s', '--single_thread', action='store_true', help='Use serial processing')
-	parser.add_argument('-j','-m','-t','--max_workers', type=int, default=4 * multiprocessing.cpu_count(), help='Max workers for parallel processing. Default is 4 * CPU count. Use negative numbers to indicate {n} * CPU count, 0 means 1/2 CPU count.')
+	parser.add_argument('-j','-m','-t','--max_workers', type=int, default=multiprocessing.cpu_count(), help='Max workers for parallel processing. Default is 1 * CPU count. Use negative numbers to indicate {n} * CPU count, 0 means 1/2 CPU count.')
 	batch_group = parser.add_mutually_exclusive_group()
 	batch_group.add_argument('-b','--batch',action='store_true', help='Batch mode, process all files in one go',default=True)
 	batch_group.add_argument('-nb','--no_batch','--sequential',action='store_false', dest='batch', help='Do not use batch mode', default=False)
@@ -3550,7 +3634,7 @@ def get_args(args = None):
 	return args
 
 #%% ---- Main Function ----
-def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = 4 * multiprocessing.cpu_count(),
+def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = multiprocessing.cpu_count(),
 			verbose = False, directory_only = False,no_directory_sync = False, full_hash = False, files_per_job = 1, target_file_list = "",
 			compare_file_list = False, diff_file_list = None, tar_diff_file_list = False, remove = False,remove_force = False, remove_extra = False, parallel_file_listing = False,
 			exclude=None,exclude_file = None,dest_image = None,dest_image_size = '0', no_link_tracking = False,src_image = None,dd = False,dd_resize = 0,
@@ -3798,9 +3882,9 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = 4 * mul
 			create_sym_links(total_sym_links,exclude=exclude,no_link_tracking=no_link_tracking)
 			if remove_extra:
 				print('-'*80)
-				remove_extra_files(total_file_list, dests,max_workers,verbose,files_per_job,single_thread,exclude=exclude,parallel_file_listing=parallel_file_listing)
+				remove_extra_files(total_file_list, dests,max_workers,verbose,files_per_job,single_thread,exclude=exclude,parallel_file_listing=parallel_file_listing,src_paths=src_paths,sym_links=total_sym_links)
 				print('-'*80)
-				print("Removing extra empty directories...")
+				print("Removing extra directories...")
 				remove_extra_dirs(src_paths, dests,exclude=exclude)
 			print('-'*80)
 			if len(src_paths) > 1:
@@ -3852,7 +3936,7 @@ def hpcp_gui():
 	dest_browse_button = tk.Button(root, text="Browse", command=lambda: dest_entry.insert(0, filedialog.askdirectory()))
 	dest_browse_button.grid(row=1, column=2)
 
-	var_max_workers = tk.IntVar(value=4 * multiprocessing.cpu_count())
+	var_max_workers = tk.IntVar(value=multiprocessing.cpu_count())
 	tk.Entry(root, textvariable=var_max_workers).grid(row=2, column=1)
 	tk.Label(root, text="Max Workers").grid(row=2)
 
@@ -3904,7 +3988,7 @@ def hpcp_gui():
 			# we print out any arguments that are not default
 			if var_single_thread.get():
 				print(f"Single Thread: {var_single_thread.get()}")
-			if var_max_workers.get() != 4 * multiprocessing.cpu_count():
+			if var_max_workers.get() != multiprocessing.cpu_count():
 				print(f"Max Workers: {var_max_workers.get()}")
 			if var_verbose.get():
 				print(f"Verbose: {var_verbose.get()}")
