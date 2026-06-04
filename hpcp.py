@@ -123,9 +123,9 @@ except ImportError:
 	hasher = hashlib.blake2b()
 	xxhash_available = False
 
-version = '9.53'
+version = '9.54'
 __version__ = version
-COMMIT_DATE = '2026-04-28'
+COMMIT_DATE = '2026-06-03'
 
 MAGIC_NUMBER = 1.61803398875
 RANDOM_DESTINATION_SELECTION = False
@@ -3261,7 +3261,7 @@ def get_dests(dest_paths,dest_image,mount_points: list,loop_devices: list,src_pa
 				pathDest = get_dest_from_path(path,src_paths,src_path,can_be_none=can_be_none)
 				if pathDest:
 					dests.append(pathDest)
-	else:
+	elif not target_mount_point:
 		pathDest = get_dest_from_path(None,src_paths,src_path,can_be_none=can_be_none)
 		if pathDest:
 			dests.append(pathDest)
