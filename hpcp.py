@@ -123,9 +123,9 @@ except ImportError:
 	hasher = hashlib.blake2b()
 	xxhash_available = False
 
-version = '9.54'
+version = '9.56'
 __version__ = version
-COMMIT_DATE = '2026-06-03'
+COMMIT_DATE = '2026-07-10'
 
 MAGIC_NUMBER = 1.61803398875
 RANDOM_DESTINATION_SELECTION = False
@@ -2270,7 +2270,7 @@ def copy_files_parallel_batch(jobs, max_workers, full_hash=False, verbose=False,
 	print(f"Estimated size: {format_bytes(total_size_count)}B")
 	item_counter, size_counter , symLinks =  copy_file_list_parallel_batch(newJobs, max_workers=max_workers, full_hash=full_hash, verbose=verbose,files_per_job=files_per_job,total_item_count=total_item_count,total_size_count=total_size_count)
 	total_symLinks.update(symLinks)
-	return total_item_count + item_counter, total_size_count + size_counter , total_symLinks ,frozenset(total_files)
+	return item_counter, size_counter , total_symLinks ,frozenset(total_files)
 
 def copy_files_serial(src_path, dest_paths, full_hash=False, verbose=False,exclude=None):
 	global FILES_RATE_LIMIT
