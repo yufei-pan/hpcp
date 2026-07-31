@@ -135,6 +135,7 @@ FILES_RATE_LIMIT = 0
 
 COMMAND_TIMEOUT = 0
 NO_CREATE_DIR = False
+CONTENT_ONLY = False
 ERRORS = []
 
 ERROR_TO_RETURNCODE_TABLE = {
@@ -3603,6 +3604,7 @@ def get_args(args = None):
 	parser.add_argument('-F','-frl','--file_rate_limit', type=str, default=None, help='Approximate a rate limit the copy speed in files/second. Example: 10K for 10240 files/s, 1Mi for 1024*1024*1024 files/s. Note: do not work in serial mode. Default is 0: no rate limit.')
 	parser.add_argument('-tfs','--target_file_system', type=str, default=None, help='Specify the target file system type. Will abort if the target file system type does not match. Example: ext4, xfs, f2fs, ntfs, fat32, exfat. Default is None: do not check target file system type.')
 	parser.add_argument('-ncd','--no_create_dir', action='store_true', help='Ignore any destination folder that does not already exist. ( Will still copy if dest is a file )')
+	parser.add_argument('-co','--content_only', action='store_true', help='Content-only copy: do not sync mode, owner, or timestamps on files or directories. Still create missing destination directories using filesystem-default permissions (so parent ACL/setgid/setuid inherit).')
 	parser.add_argument('-ctl','--command_timeout_limit', type=int, default=0, help='Set the command timeout limit in seconds for external commands ( ex. cp / dd ). Default is 0: no timeout.')
 	parser.add_argument('-enes','--exit_not_enough_space', action='store_true', help='Exit if there is not enough space on the destination instead of continuing (Note: Default is continue as in compressed fs copy can be down even if source is bigger than free space).')
 	try:
@@ -3639,7 +3641,7 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = multipr
 			compare_file_list = False, diff_file_list = None, tar_diff_file_list = False, remove = False,remove_force = False, remove_extra = False, parallel_file_listing = False,
 			exclude=None,exclude_file = None,dest_image = None,dest_image_size = '0', no_link_tracking = False,src_image = None,dd = False,dd_resize = 0,
 			batch = False, append_hash_to_file_list = True, hash_size = ..., source_file_list = None, random_destination_selection = False, 
-			bytes_rate_limit = None, files_rate_limit = None,target_file_system = None, no_create_dir = False, command_timeout_limit = 0,
+			bytes_rate_limit = None, files_rate_limit = None,target_file_system = None, no_create_dir = False, content_only = False, command_timeout_limit = 0,
 			exit_not_enough_space = False,do_not_remove_files_while_listing = False):
 	global HASH_SIZE
 	global RANDOM_DESTINATION_SELECTION
@@ -3647,8 +3649,10 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = multipr
 	global FILES_RATE_LIMIT
 	global COMMAND_TIMEOUT
 	global NO_CREATE_DIR
+	global CONTENT_ONLY
 	global REMOVE_FILES_WHILE_LISTING
 	NO_CREATE_DIR = no_create_dir
+	CONTENT_ONLY = content_only
 	if random_destination_selection:
 		RANDOM_DESTINATION_SELECTION = True
 		print("Random destination selection enabled.")
@@ -3779,7 +3783,7 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = multipr
 					files_per_job=files_per_job, parallel_file_listing=parallel_file_listing,exclude=exclude,no_link_tracking = True,
 					batch=batch,append_hash_to_file_list = append_hash_to_file_list, hash_size = hash_size, source_file_list = source_file_list,
 					random_destination_selection = random_destination_selection, bytes_rate_limit = bytes_rate_limit, files_rate_limit = files_rate_limit,
-					target_file_system = target_file_system, no_create_dir = no_create_dir, command_timeout_limit = command_timeout_limit,
+					target_file_system = target_file_system, no_create_dir = no_create_dir, content_only = content_only, command_timeout_limit = command_timeout_limit,
 					exit_not_enough_space = exit_not_enough_space)
 			clean_up(mount_points,loop_devices,delayed_commands)
 			# sort the output partitions
@@ -4036,7 +4040,7 @@ def main():
 			 dest_image = args.dest_image,dest_image_size=args.dest_image_size,no_link_tracking = args.no_link_tracking,src_image = args.src_image,dd=args.disk_dump,
 			 dd_resize=args.dd_resize,batch=args.batch,append_hash_to_file_list=not args.no_hash_file_list, hash_size=args.hash_size,source_file_list=args.source_file_list,
 			 random_destination_selection = args.random_dest_selection,bytes_rate_limit = args.rate_limit,files_rate_limit = args.file_rate_limit,
-			 target_file_system = args.target_file_system, no_create_dir = args.no_create_dir, command_timeout_limit = args.command_timeout_limit,
+			 target_file_system = args.target_file_system, no_create_dir = args.no_create_dir, content_only = args.content_only, command_timeout_limit = args.command_timeout_limit,
 			 exit_not_enough_space = args.exit_not_enough_space,do_not_remove_files_while_listing = args.do_not_remove_files_while_listing)
 		if rtnCode:
 			exit(rtnCode)
