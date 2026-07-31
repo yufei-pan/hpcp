@@ -1883,8 +1883,8 @@ def copy_file(src_path, dest_paths, full_hash=False, verbose=False, concurrent_p
 						if not NO_CREATE_DIR:
 							os.makedirs(os.path.dirname(dest_path), exist_ok=True)
 						if os.name == 'posix':
-							cp_flags = ["-f"] if CONTENT_ONLY else ["-af"]
-							run_command_in_multicmd_with_path_check(["cp", *cp_flags, "--sparse=always", src_path, dest_path],quiet=True,strict=True)
+							cp_flags = "-f" if CONTENT_ONLY else "-af"
+							run_command_in_multicmd_with_path_check(["cp", cp_flags, "--sparse=always", src_path, dest_path],quiet=True,strict=True)
 							copiedSize = get_file_size(dest_path)
 						else:
 							if CONTENT_ONLY:
@@ -1904,8 +1904,8 @@ def copy_file(src_path, dest_paths, full_hash=False, verbose=False, concurrent_p
 								print(traceback.format_exc())
 								print(f'Trying to copy from {src_path} to {dest_path} without sparse')
 							if os.name == 'posix':
-								cp_flags = ["-f"] if CONTENT_ONLY else ["-af"]
-								run_command_in_multicmd_with_path_check(["cp", *cp_flags, src_path, dest_path],quiet=True,strict=True)
+								cp_flags = "-f" if CONTENT_ONLY else "-af"
+								run_command_in_multicmd_with_path_check(["cp", cp_flags, src_path, dest_path],quiet=True,strict=True)
 								#task_to_run = ["cp", "-af", src_path, dest_path]
 							elif os.name == 'nt':
 								run_command_in_multicmd_with_path_check(["xcopy", "/I", "/E", "/Y", "/c", "/q", "/k", "/r", "/h", "/x", src_path, dest_path],quiet=True,strict=True)
