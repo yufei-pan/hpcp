@@ -75,7 +75,7 @@ $ hpcp -h
 usage: hpcp.py [-h] [-s] [-j MAX_WORKERS] [-b | -nb] [-v] [-do] [-nds] [-fh] [-hs HASH_SIZE] [-fpj FILES_PER_JOB] [-sfl SOURCE_FILE_LIST]
                [-fl TARGET_FILE_LIST] [-cfl] [-dfl [DIFF_FILE_LIST]] [-tdfl] [-nhfl] [-rm] [-rf] [-rme] [-e EXCLUDE] [-x EXCLUDE_FILE]
                [-nlt] [-V] [-pfl] [-si SRC_IMAGE] [-siff LOAD_DIFF_IMAGE] [-d DEST_PATH] [-rds] [-di DEST_IMAGE] [-dis DEST_IMAGE_SIZE]
-               [-diff] [-dd] [-ddr DD_RESIZE] [-L RATE_LIMIT] [-F FILE_RATE_LIMIT] [-tfs TARGET_FILE_SYSTEM] [-ncd]
+               [-diff] [-dd] [-ddr DD_RESIZE] [-L RATE_LIMIT] [-F FILE_RATE_LIMIT] [-tfs TARGET_FILE_SYSTEM] [-ncd] [-co]
                [-ctl COMMAND_TIMEOUT_LIMIT] [-enes]
                [src_path ...]
 
@@ -166,6 +166,11 @@ options:
                         ntfs, fat32, exfat. Default is None: do not check target file system type.
   -ncd, --no_create_dir
                         Ignore any destination folder that does not already exist. ( Will still copy if dest is a file )
+  -co, --content_only   Content-only copy: do not sync mode, owner, or
+                        timestamps on files or directories. Still create
+                        missing destination directories using filesystem-
+                        default permissions (so parent ACL/setgid/setuid
+                        inherit).
   -ctl, --command_timeout_limit COMMAND_TIMEOUT_LIMIT
                         Set the command timeout limit in seconds for external commands ( ex. cp / dd ). Default is 0: no timeout.
   -enes, --exit_not_enough_space
