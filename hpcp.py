@@ -2445,6 +2445,7 @@ class copy_scheduler:
 
 #%% ---- Copy Directories ----
 def sync_directory_metadata(src_path, dest_paths):
+	global CONTENT_ONLY
 	dest_paths = _validate_paths(src_path, dest_paths)
 	if dest_paths is None:
 		return 0, 0 , set(), frozenset()
@@ -2462,10 +2463,11 @@ def sync_directory_metadata(src_path, dest_paths):
 		except FileExistsError:
 			eprint(f"Destination path {dest_path} maybe a mounted dir, known issue with os.path.exists\nContinuing without creating dest folder...")
 		# Sync the metadata
-		shutil.copystat(src_path, dest_path)
-		if os.name == 'posix':
-			os.chown(dest_path, st.st_uid, st.st_gid)
-		os.utime(dest_path, (st.st_atime, st.st_mtime))
+		if not CONTENT_ONLY:
+			shutil.copystat(src_path, dest_path)
+			if os.name == 'posix':
+				os.chown(dest_path, st.st_uid, st.st_gid)
+			os.utime(dest_path, (st.st_atime, st.st_mtime))
 	return 1,time.monotonic()-start_time,frozenset()
 
 def sync_directory_metadata_bulk(src_paths, dest_paths,src_path):
