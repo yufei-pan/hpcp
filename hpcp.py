@@ -1814,6 +1814,7 @@ def copy_file(src_path, dest_paths, full_hash=False, verbose=False, concurrent_p
 	"""
 	global RANDOM_DESTINATION_SELECTION
 	global NO_CREATE_DIR
+	global CONTENT_ONLY
 	symLinks = {}
 	#task_to_run = []
 	inDests = dest_paths
@@ -1826,13 +1827,14 @@ def copy_file(src_path, dest_paths, full_hash=False, verbose=False, concurrent_p
 		copiedSize = 0
 		for dest in dest_paths:
 			if os.path.exists(dest) and (not os.path.islink(src_path)) and is_file_identical(src_path, dest,src_size,full_hash):
-				st = os.stat(src_path,follow_symlinks=False)
-				shutil.copystat(src_path, dest,follow_symlinks=False)
-				if os.name == 'posix':
-					os.chown(dest, st.st_uid, st.st_gid)
-					#also copy the modes
-					os.chmod(dest, st.st_mode)
-				os.utime(dest, (st.st_atime, st.st_mtime),follow_symlinks=False)
+				if not CONTENT_ONLY:
+					st = os.stat(src_path,follow_symlinks=False)
+					shutil.copystat(src_path, dest,follow_symlinks=False)
+					if os.name == 'posix':
+						os.chown(dest, st.st_uid, st.st_gid)
+						#also copy the modes
+						os.chmod(dest, st.st_mode)
+					os.utime(dest, (st.st_atime, st.st_mtime),follow_symlinks=False)
 				endTime = time.monotonic()
 				return 0, endTime - start_time , symLinks #, task_to_run
 		bak_dest_paths = dest_paths.copy()
@@ -1881,10 +1883,14 @@ def copy_file(src_path, dest_paths, full_hash=False, verbose=False, concurrent_p
 						if not NO_CREATE_DIR:
 							os.makedirs(os.path.dirname(dest_path), exist_ok=True)
 						if os.name == 'posix':
-							run_command_in_multicmd_with_path_check(["cp", "-af", "--sparse=always", src_path, dest_path],quiet=True,strict=True)
+							cp_flags = ["-f"] if CONTENT_ONLY else ["-af"]
+							run_command_in_multicmd_with_path_check(["cp", *cp_flags, "--sparse=always", src_path, dest_path],quiet=True,strict=True)
 							copiedSize = get_file_size(dest_path)
 						else:
-							shutil.copy2(src_path, dest_path, follow_symlinks=False)
+							if CONTENT_ONLY:
+								shutil.copy(src_path, dest_path, follow_symlinks=False)
+							else:
+								shutil.copy2(src_path, dest_path, follow_symlinks=False)
 							#shutil.copystat(src_path, dest_path)
 						copied = True
 						break
@@ -1898,7 +1904,8 @@ def copy_file(src_path, dest_paths, full_hash=False, verbose=False, concurrent_p
 								print(traceback.format_exc())
 								print(f'Trying to copy from {src_path} to {dest_path} without sparse')
 							if os.name == 'posix':
-								run_command_in_multicmd_with_path_check(["cp", "-af", src_path, dest_path],quiet=True,strict=True)
+								cp_flags = ["-f"] if CONTENT_ONLY else ["-af"]
+								run_command_in_multicmd_with_path_check(["cp", *cp_flags, src_path, dest_path],quiet=True,strict=True)
 								#task_to_run = ["cp", "-af", src_path, dest_path]
 							elif os.name == 'nt':
 								run_command_in_multicmd_with_path_check(["xcopy", "/I", "/E", "/Y", "/c", "/q", "/k", "/r", "/h", "/x", src_path, dest_path],quiet=True,strict=True)
