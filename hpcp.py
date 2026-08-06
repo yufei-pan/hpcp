@@ -123,7 +123,7 @@ except ImportError:
 	hasher = hashlib.blake2b()
 	xxhash_available = False
 
-version = '9.57'
+version = '9.58'
 __version__ = version
 COMMIT_DATE = '2026-07-31'
 
@@ -1133,7 +1133,13 @@ def write_partition_info(image, partition_infos, partition_name):
 	return delayed_commands
 
 def create_partition_table(image, partition_infos,sorted_partitions):
-	"""Create a partition table in the image file that will match the source device and sort the partitions by size."""
+	"""Create a partition table in the image file that will match the source device and sort the partitions by size.
+
+	Returns:
+		tuple: (delayed_commands, loop_device). loop_device is the losetup device created for an
+			image file, or None when image is already a block device. Caller owns the loop and
+			must detach it (typically via loop_devices / clean_up); it is not queued for detach here.
+	"""
 	# Create a partition table in the image file
 	run_command_in_multicmd_with_path_check(["sgdisk", '--clear', image])
 	src_disk_path = sorted_partitions.pop()
@@ -1141,24 +1147,27 @@ def create_partition_table(image, partition_infos,sorted_partitions):
 	run_command_in_multicmd_with_path_check(["sgdisk", f'--disk-guid={partition_infos[src_disk_path]["disk_identifier"]}', image])
 	# Create the filesystem, need to mount the image first if it is a image
 	loop_device = None
-	if not pathlib.Path(image).resolve().is_block_device():
-		loop_device = create_loop_device(image)
-		image = loop_device
-	# Create the partitions
-	delayed_commands = []
-	for partition in sorted_partitions:
-		start_sector = int(run_command_in_multicmd_with_path_check(["sgdisk", '--first-aligned-in-largest', image])[0].strip())
-		end_sector = start_sector + int(partition_infos[partition]['size']/partition_infos[src_disk_path]['sector_size']) -1
-		# Create the partition
-		run_command_in_multicmd_with_path_check(["sgdisk", f'--new={partition}:{start_sector}:{end_sector}', image])
-		# Copy the partition information
-		delayed_commands.extend(write_partition_info(image, partition_infos,partition))
-	# Fix the partition table
-	run_command_in_multicmd_with_path_check(["sgdisk", '--verify', image])
-	if loop_device:
-		#run_command_in_multicmd_with_path_check(["losetup", '--detach', loop_device])
-		delayed_commands.append(['losetup', '--detach', loop_device])
-	return delayed_commands
+	try:
+		if not pathlib.Path(image).resolve().is_block_device():
+			loop_device = create_loop_device(image)
+			image = loop_device
+		# Create the partitions
+		delayed_commands = []
+		for partition in sorted_partitions:
+			start_sector = int(run_command_in_multicmd_with_path_check(["sgdisk", '--first-aligned-in-largest', image])[0].strip())
+			end_sector = start_sector + int(partition_infos[partition]['size']/partition_infos[src_disk_path]['sector_size']) -1
+			# Create the partition
+			run_command_in_multicmd_with_path_check(["sgdisk", f'--new={partition}:{start_sector}:{end_sector}', image])
+			# Copy the partition information
+			delayed_commands.extend(write_partition_info(image, partition_infos,partition))
+		# Fix the partition table
+		run_command_in_multicmd_with_path_check(["sgdisk", '--verify', image])
+		return delayed_commands, loop_device
+	except Exception:
+		# If setup fails after attaching a loop, detach it so the caller does not leak it.
+		if loop_device:
+			detach_loop_device(loop_device)
+		raise
 
 def resize_image(image_name, image_file_size):
 	"""Resize the image file to the calculated size."""
@@ -3495,15 +3504,21 @@ def validate_dd_source_path(src_path,loop_devices = None):
 	return dd_src
 
 def create_dd_dest_part_table(dd_src,dd_resize = [],src_path = None, dest_path = None):
+	"""Create / resize dest image and write a matching partition table.
+
+	Returns:
+		tuple: (partition_infos, delayed_commands, loop_device). On cancel / error setup,
+			returns (None, [], None). loop_device is owned by the caller when not None.
+	"""
 	src_path = src_path if src_path else dd_src
 	if not dest_path:
 		print("Destination path not specified.")
-		return
+		return None, [], None
 	partition_infos = get_partition_infos(dd_src)
 	disk_name = dd_src
 	if len(partition_infos) == 1:
 		print(f"Source device {dd_src} is not partitioned, exiting.")
-		return
+		return None, [], None
 	# sort the partitions by size
 	disk_info = partition_infos.pop(disk_name)
 	sorted_partitions = sorted(partition_infos.keys(), key=lambda x: partition_infos[x]['size'])
@@ -3536,11 +3551,11 @@ def create_dd_dest_part_table(dd_src,dd_resize = [],src_path = None, dest_path =
 			inStr = multiCMD.input_with_timeout_and_countdown(60)
 		if inStr and not inStr.lower().startswith('y'):
 			print("Exiting.")
-			return
+			return None, [], None
 	resize_image(dest_path, partition_infos[disk_name]['size'])
-	delayed_commands = create_partition_table(dest_path,partition_infos,sorted_partitions)
+	delayed_commands, loop_device = create_partition_table(dest_path,partition_infos,sorted_partitions)
 	print("Image created successfully.")
-	return partition_infos, delayed_commands
+	return partition_infos, delayed_commands, loop_device
 
 def dd_partition(src_partition_path,dest_partition_path,partition,dd_src,dd_dest):
 	# First verify the two partition size is the same
@@ -3550,21 +3565,78 @@ def dd_partition(src_partition_path,dest_partition_path,partition,dd_src,dd_dest
 		raise RuntimeError(f"Source partition larger than destination partition: {src_part_info[partition]['size']} > {dest_part_info[partition]['size']}, cannot use DD, exiting.")
 	run_command_in_multicmd_with_path_check(['dd','if='+src_partition_path,'of='+dest_partition_path,'bs=1024M'],timeout=0,strict=True)
 
-def clean_up(mount_points: list,loop_devices: list, delayed_commands: list = []):
+def detach_loop_device(loop_device, retries=5, delay=0.5):
+	"""Detach a loop device with sync and retries for intermittent EBUSY."""
+	if not loop_device:
+		return True
+	losetup = _binPaths.get('losetup', 'losetup')
+	for attempt in range(1, retries + 1):
+		try:
+			os.sync()
+		except Exception:
+			pass
+		if not os.path.exists(loop_device):
+			print(f"Loop device {loop_device} already gone.")
+			return True
+		if attempt > 1:
+			# Give udev / partition holders a moment to release after a busy failure.
+			udevadm = shutil.which('udevadm')
+			if udevadm:
+				multiCMD.run_commands([[udevadm, 'settle', '--timeout=5']], timeout=10, max_threads=1, quiet=True)
+			time.sleep(delay * attempt)
+		tasks = multiCMD.run_commands([[losetup, '-d', loop_device]], timeout=COMMAND_TIMEOUT, max_threads=1, quiet=True, return_object=True)
+		if tasks and getattr(tasks[0], 'returncode', 1) == 0:
+			if attempt > 1:
+				print(f"Detached loop device {loop_device} on attempt {attempt}.")
+			return True
+		err = ''
+		if tasks:
+			stderr = getattr(tasks[0], 'stderr', None) or []
+			err = (stderr[-1].strip() if stderr else '') or f"return code {tasks[0].returncode}"
+		eprint(f"Failed to detach {loop_device} (attempt {attempt}/{retries}): {err}")
+	eprint(f"Giving up detaching loop device {loop_device}")
+	return False
+
+def clean_up(mount_points: list,loop_devices: list, delayed_commands: list = None):
 	# clean up loop devices and mount points if we are using a image
-	for mount_point in mount_points:
+	if delayed_commands is None:
+		delayed_commands = []
+	for mount_point in list(mount_points):
 		print(f"Unmounting {mount_point}")
-		run_command_in_multicmd_with_path_check(["umount",mount_point])
+		run_command_in_multicmd_with_path_check(["umount",mount_point],strict=False)
+		if os.path.ismount(mount_point):
+			# Still busy; sync and retry once before leaving it for loop detach retries.
+			try:
+				os.sync()
+			except Exception:
+				pass
+			time.sleep(0.5)
+			run_command_in_multicmd_with_path_check(["umount",mount_point],strict=False)
 		print(f"Removing mount point {mount_point}")
-		os.rmdir(mount_point)
+		try:
+			os.rmdir(mount_point)
+		except OSError as e:
+			eprint(f"Failed to remove mount point {mount_point}: {e}")
 	mount_points.clear()
-	if delayed_commands:
-		print("Running delayed commands")
-		run_commands_in_multicmd_with_path_check(delayed_commands,strict=False)
+	# Fold any delayed losetup --detach into loop_devices so they get sync/retry handling.
+	remaining_commands = []
+	for cmd in delayed_commands:
+		if cmd and len(cmd) >= 3 and cmd[0] == 'losetup' and cmd[1] in ('-d', '--detach'):
+			if cmd[2] not in loop_devices:
+				loop_devices.append(cmd[2])
+		else:
+			remaining_commands.append(cmd)
 	delayed_commands.clear()
-	for loop_device_dest in loop_devices:
+	if remaining_commands:
+		print("Running delayed commands")
+		run_commands_in_multicmd_with_path_check(remaining_commands,strict=False)
+	try:
+		os.sync()
+	except Exception:
+		pass
+	for loop_device_dest in list(loop_devices):
 		print(f"Removing loop device {loop_device_dest}")
-		run_command_in_multicmd_with_path_check(['losetup','-d',loop_device_dest])
+		detach_loop_device(loop_device_dest)
 	loop_devices.clear()
 
 HASH_SIZE = 1<<24
@@ -3691,6 +3763,7 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = multipr
 	src_paths = []
 	mount_points = []
 	loop_devices = []
+	delayed_commands = []
 	src_str = ''
 	programStartTime = time.monotonic()
 	exclude = format_exclude(exclude,exclude_file)
@@ -3730,18 +3803,25 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = multipr
 			if not os.access(os.path.dirname(os.path.abspath(dest_path)), os.W_OK):
 				print(f"Destination path {dest_path} is not writable, continuing with high probability of failure.")
 			dd_src = validate_dd_source_path(src_path,loop_devices = loop_devices)
-			partition_infos, delayed_commands = create_dd_dest_part_table(dd_src,dd_resize=dd_resize,src_path=src_path, dest_path=dest_path)
+			partition_infos, delayed_commands, dest_loop = create_dd_dest_part_table(dd_src,dd_resize=dd_resize,src_path=src_path, dest_path=dest_path)
 			if not partition_infos:
 				raise RuntimeError("Copy partition info error: Failed to create destination partition table, exiting.")
 			
-			dd_dest = dest_path
-			# check if dd_dest is a block device
-			if not pathlib.Path(dd_dest).resolve().is_block_device():
-				# check if dd_dest is a file
-				if os.path.isfile(dd_dest):
-					print(f"DD Destination {dd_dest} is a file, mounting as a loop device")
-					dd_dest = create_loop_device(dd_dest)
-					loop_devices.append(dd_dest)
+			# Reuse the loop created while writing the partition table; do not attach the same image twice.
+			if dest_loop:
+				dd_dest = dest_loop
+				if dest_loop not in loop_devices:
+					loop_devices.append(dest_loop)
+					print(f"Reusing loop device {dest_loop} for DD destination {dest_path}")
+			else:
+				dd_dest = dest_path
+				# check if dd_dest is a block device
+				if not pathlib.Path(dd_dest).resolve().is_block_device():
+					# check if dd_dest is a file
+					if os.path.isfile(dd_dest):
+						print(f"DD Destination {dd_dest} is a file, mounting as a loop device")
+						dd_dest = create_loop_device(dd_dest)
+						loop_devices.append(dd_dest)
 			
 			_ = partition_infos.pop(dd_src)
 			# need to check if partion info is empty and fix partition table if necessary
@@ -3794,7 +3874,6 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = multipr
 					random_destination_selection = random_destination_selection, bytes_rate_limit = bytes_rate_limit, files_rate_limit = files_rate_limit,
 					target_file_system = target_file_system, no_create_dir = no_create_dir, content_only = content_only, command_timeout_limit = command_timeout_limit,
 					exit_not_enough_space = exit_not_enough_space)
-			clean_up(mount_points,loop_devices,delayed_commands)
 			# sort the output partitions
 			#run_command_in_multicmd_with_path_check(f"sgdisk --sort {dest_path}")
 			print(f"Done disk dumping {src_path} to {dest_path}.")
@@ -3921,7 +4000,7 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = multipr
 		track = traceback.format_exc()
 		eprint(f"General Exception: {e} \n{track}")
 	finally:
-		clean_up(mount_points,loop_devices)
+		clean_up(mount_points,loop_devices,delayed_commands)
 		get_partition_details.cache_clear()
 		get_partition_infos.cache_clear()
 		hash_file.cache_clear()
