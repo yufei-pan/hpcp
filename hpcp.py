@@ -1436,8 +1436,8 @@ def trim_paths(paths, baseDir):
 		set: A set of file paths, each relative to the parent directory of baseDir.
 	
 	Example:
-		>>> trim_paths({'/home/user/project/file1.py', '/home/user/project/file2.py'}, '/home/user/project/main.py')
-		{'file1.py', 'file2.py'}
+		>>> sorted(trim_paths({'/home/user/project/file1.py', '/home/user/project/file2.py'}, '/home/user/project/main.py'))
+		['file1.py', 'file2.py']
 	"""
 	return set([os.path.relpath(path,os.path.dirname(baseDir)) for path in paths])
 
