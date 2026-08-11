@@ -25,6 +25,17 @@ def restore_argv():
 		sys.argv = old
 
 
+def _clear_hpcp_transient_state():
+	"""Drop cross-test pollution from caches and the global ERRORS list."""
+	if hasattr(hpcp, '_get_file_list_cache'):
+		hpcp._get_file_list_cache.clear()
+	if hasattr(hpcp, 'ERRORS'):
+		hpcp.ERRORS.clear()
+	hash_file = getattr(hpcp, 'hash_file', None)
+	if hash_file is not None and hasattr(hash_file, 'cache_clear'):
+		hash_file.cache_clear()
+
+
 @pytest.fixture
 def reset_hpcp_globals():
 	"""Snapshot and restore module globals tests commonly mutate."""
@@ -38,16 +49,13 @@ def reset_hpcp_globals():
 		'REMOVE_FILES_WHILE_LISTING': hpcp.REMOVE_FILES_WHILE_LISTING,
 		'RANDOM_DESTINATION_SELECTION': hpcp.RANDOM_DESTINATION_SELECTION,
 	}
-	# Clear file-list cache between tests
-	if hasattr(hpcp, '_get_file_list_cache'):
-		hpcp._get_file_list_cache.clear()
+	_clear_hpcp_transient_state()
 	try:
 		yield hpcp
 	finally:
 		for k, v in snap.items():
 			setattr(hpcp, k, v)
-		if hasattr(hpcp, '_get_file_list_cache'):
-			hpcp._get_file_list_cache.clear()
+		_clear_hpcp_transient_state()
 
 
 @pytest.fixture
