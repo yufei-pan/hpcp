@@ -727,6 +727,60 @@ _FS_FIX_COMMANDS = {
 }
 _FS_FIX_UNSUPPORTED = {'udf', 'bfs'}
 
+#%% -- Filesystem Parameter Mirroring --
+# Probe a source filesystem for the parameters mkfs would otherwise pick by
+# default (geometry + features), so a dd-mode clone is not silently rebuilt
+# with the building host's defaults. Registries are filled in below.
+_FS_PARAM_PROBES = {}
+_FS_MKFS_BUILDERS = {}
+
+def probe_fs_params(target_partition, fs_type):
+	"""
+	Read the creation parameters of an existing filesystem.
+
+	Args:
+		target_partition (str): Path to the partition holding the filesystem.
+		fs_type (str): Filesystem type as reported by blkid (e.g. 'ext4').
+
+	Returns:
+		dict: Opaque, filesystem-specific parameters for the matching builder in
+			_FS_MKFS_BUILDERS. Empty dict when the type is unknown, the probe tool
+			is missing, or parsing fails. This function never raises: a failed
+			probe must degrade to default mkfs behaviour, not abort a copy.
+	"""
+	probe = _FS_PARAM_PROBES.get(fs_type)
+	if not probe:
+		return {}
+	try:
+		return probe(target_partition) or {}
+	except Exception as e:
+		eprint(f"FS param probe warning: Could not read {fs_type} parameters from {target_partition}: {e}")
+		return {}
+
+def build_mkfs_params(fs_type, fs_params):
+	"""
+	Translate probed filesystem parameters into mkfs arguments.
+
+	Args:
+		fs_type (str): Filesystem type as reported by blkid.
+		fs_params (dict): The dict returned by probe_fs_params for the same type.
+
+	Returns:
+		list: Extra argv fragments to splice into the mkfs command, or an empty
+			list when the type is unknown, params are empty, or building fails.
+			This function never raises.
+	"""
+	if not fs_params:
+		return []
+	builder = _FS_MKFS_BUILDERS.get(fs_type)
+	if not builder:
+		return []
+	try:
+		return builder(fs_params) or []
+	except Exception as e:
+		eprint(f"FS param build warning: Could not build {fs_type} mkfs parameters: {e}")
+		return []
+
 def fix_fs(target_partition, fs_type=None):
 	"""
 	Fix the file system errors on the specified target partition.
@@ -837,7 +891,7 @@ def get_partition_details(device, partition,sector_size=512):
 	"""
 	# Get the partition info from the source
 	result = run_command_in_multicmd_with_path_check(["sgdisk", '--info='+partition, device],strict=True)
-	rtnDic = {'partition_guid_code': '', 'unique_partition_guid': '', 'partition_name': '', 'partition_attrs': '', 'fs_type': '', 'fs_uuid': '', 'fs_label': '', 'size': 0}
+	rtnDic = {'partition_guid_code': '', 'unique_partition_guid': '', 'partition_name': '', 'partition_attrs': '', 'fs_type': '', 'fs_uuid': '', 'fs_label': '', 'size': 0, 'fs_params': {}}
 	for line in result:
 		if "guid code:" in line.lower():
 			rtnDic['partition_guid_code'] = line.split(":")[1].split()[0].strip()
@@ -865,6 +919,8 @@ def get_partition_details(device, partition,sector_size=512):
 			rtnDic['fs_uuid'] = line.split('=')[1].strip()
 		elif 'LABEL' in line.upper() and 'PARTLABEL' not in line.upper():
 			rtnDic['fs_label'] = line.split('=')[1].strip()
+	if rtnDic['fs_type']:
+		rtnDic['fs_params'] = probe_fs_params(target_partition, rtnDic['fs_type'])
 	if loop_device:
 		run_command_in_multicmd_with_path_check(["losetup", '--detach', loop_device])
 	return rtnDic
