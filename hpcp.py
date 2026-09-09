@@ -393,7 +393,8 @@ _binCalled = {'lsblk', 'losetup', 'sgdisk', 'blkid', 'umount', 'mount','dd','cp'
 			  'e2fsck', 'btrfs', 'xfs_repair', 'xfs_info', 'fsck.f2fs', 'dump.f2fs', 'ntfsfix', 'ntfsinfo',
 			  'fsck.fat', 'fsck.exfat', 'dump.exfat', 'fsck.hfsplus',
 			  'fsck.hfs', 'fsck.jfs', 'fsck.reiserfs', 'fsck.ufs', 'fsck.minix',
-			  'tune2fs', 'dumpe2fs', 'xfs_admin', 'exfatlabel', 'udflabel', 'jfs_tune', 'reiserfstune', 'swaplabel'}
+			  'tune2fs', 'dumpe2fs', 'xfs_admin', 'exfatlabel', 'udflabel', 'udfinfo', 'jfs_tune',
+			  'reiserfstune', 'debugreiserfs', 'swaplabel'}
 [check_path(program) for program in _binCalled]
 
 def run_command_in_multicmd_with_path_check(command, timeout=...,max_threads=1,quiet=False,dry_run=False,strict=False):
@@ -1170,6 +1171,69 @@ def _build_f2fs(params):
 
 _FS_PARAM_PROBES.update({'ntfs': _probe_ntfs, 'exfat': _probe_exfat, 'f2fs': _probe_f2fs})
 _FS_MKFS_BUILDERS.update({'ntfs': _build_ntfs, 'exfat': _build_exfat, 'f2fs': _build_f2fs})
+
+def _probe_udf(device):
+	"""Read udf block size and revision from udfinfo."""
+	params = {}
+	for line in run_command_in_multicmd_with_path_check(['udfinfo', device], quiet=True):
+		key, sep, value = line.partition('=')
+		if not sep:
+			continue
+		key = key.strip()
+		value = value.strip()
+		if key == 'blocksize' and value.isdigit():
+			params['block_size'] = int(value)
+		elif key == 'udfrev' and value:
+			params['udfrev'] = value
+	return params
+
+def _build_udf(params):
+	"""Translate probed udf parameters into mkudffs arguments."""
+	args = []
+	if params.get('block_size'):
+		args.append('--blocksize=' + str(params['block_size']))
+	if params.get('udfrev'):
+		args.append('--udfrev=' + params['udfrev'])
+	return args
+
+def _probe_reiserfs(device):
+	"""Read reiserfs block size, on-disk format and hash from debugreiserfs."""
+	params = {}
+	for line in run_command_in_multicmd_with_path_check(['debugreiserfs', device], quiet=True):
+		stripped = line.strip()
+		if stripped.lower().startswith('blocksize:'):
+			value = stripped.partition(':')[2].strip()
+			if value.isdigit():
+				params['block_size'] = int(value)
+		elif 'of format' in stripped:
+			fields = stripped.split('of format')[1].split()
+			if fields:
+				params['fs_format'] = fields[0]
+		elif 'hash function' in stripped.lower() and '"' in stripped:
+			params['hash_function'] = stripped.split('"')[1]
+	return params
+
+def _build_reiserfs(params):
+	"""Translate probed reiserfs parameters into mkfs.reiserfs arguments."""
+	args = []
+	if params.get('block_size'):
+		args.extend(['-b', str(params['block_size'])])
+	if params.get('fs_format'):
+		args.extend(['--format', params['fs_format']])
+	if params.get('hash_function'):
+		args.extend(['-h', params['hash_function']])
+	return args
+
+_FS_PARAM_PROBES.update({'udf': _probe_udf, 'reiserfs': _probe_reiserfs})
+_FS_MKFS_BUILDERS.update({'udf': _build_udf, 'reiserfs': _build_reiserfs})
+
+# Deliberately not registered, with reasons:
+#   jfs   - mkfs.jfs exposes no geometry options; block size is fixed at 4096.
+#   bfs, ufs, swap - mkfs/newfs/mkswap expose nothing worth mirroring, and the
+#                    on-disk headers carry no creation parameters we can act on.
+#   zfs, cramfs, iso9660 - hpcp already declines to create these.
+# Unregistered types fall through probe_fs_params/build_mkfs_params to {} / [],
+# which is exactly today's default-mkfs behaviour.
 
 def fix_fs(target_partition, fs_type=None):
 	"""

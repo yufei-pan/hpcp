@@ -623,3 +623,59 @@ def test_ntfs_exfat_f2fs_registered():
 									('f2fs', hpcp._probe_f2fs, hpcp._build_f2fs)):
 		assert hpcp._FS_PARAM_PROBES[fs_type] is probe
 		assert hpcp._FS_MKFS_BUILDERS[fs_type] is builder
+
+
+_UDFINFO_OUTPUT = """filename=/dev/fake8
+label=UD
+uuid=6aa09dfa158beac7
+lvid=UD
+vid=UD
+blocksize=512
+udfrev=2.01
+integrity=closed
+blocks=409600
+usedblocks=103
+""".splitlines()
+
+_DEBUGREISERFS_OUTPUT = """debugreiserfs 3.6.27
+Filesystem state: consistent
+Reiserfs super block in block 16 on 0x0 of format 3.6 with standard journal
+Count of blocks on the device: 76800
+Blocksize: 4096
+Hash function used to sort names: "r5"
+sb_version: 2
+""".splitlines()
+
+
+def test_probe_udf_reads_blocksize_and_revision(monkeypatch):
+	monkeypatch.setattr(hpcp, 'run_command_in_multicmd_with_path_check',
+						lambda command, **kwargs: _UDFINFO_OUTPUT)
+	params = hpcp._probe_udf('/dev/fake8')
+	assert params['block_size'] == 512
+	assert params['udfrev'] == '2.01'
+
+
+def test_build_udf():
+	args = hpcp._build_udf({'block_size': 512, 'udfrev': '2.01'})
+	assert args == ['--blocksize=512', '--udfrev=2.01']
+
+
+def test_probe_reiserfs_reads_blocksize_format_and_hash(monkeypatch):
+	monkeypatch.setattr(hpcp, 'run_command_in_multicmd_with_path_check',
+						lambda command, **kwargs: _DEBUGREISERFS_OUTPUT)
+	params = hpcp._probe_reiserfs('/dev/fake9')
+	assert params['block_size'] == 4096
+	assert params['fs_format'] == '3.6'
+	assert params['hash_function'] == 'r5'
+
+
+def test_build_reiserfs():
+	args = hpcp._build_reiserfs({'block_size': 4096, 'fs_format': '3.6', 'hash_function': 'r5'})
+	assert args == ['-b', '4096', '--format', '3.6', '-h', 'r5']
+
+
+def test_udf_reiserfs_registered():
+	assert hpcp._FS_PARAM_PROBES['udf'] is hpcp._probe_udf
+	assert hpcp._FS_MKFS_BUILDERS['udf'] is hpcp._build_udf
+	assert hpcp._FS_PARAM_PROBES['reiserfs'] is hpcp._probe_reiserfs
+	assert hpcp._FS_MKFS_BUILDERS['reiserfs'] is hpcp._build_reiserfs
