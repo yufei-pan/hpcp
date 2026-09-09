@@ -1,5 +1,7 @@
 import os
+import struct
 import sys
+import tempfile
 
 import pytest
 
@@ -679,3 +681,71 @@ def test_udf_reiserfs_registered():
 	assert hpcp._FS_MKFS_BUILDERS['udf'] is hpcp._build_udf
 	assert hpcp._FS_PARAM_PROBES['reiserfs'] is hpcp._probe_reiserfs
 	assert hpcp._FS_MKFS_BUILDERS['reiserfs'] is hpcp._build_reiserfs
+
+
+def _write_superblock(path, offset, payload):
+	with open(path, 'wb') as f:
+		f.write(b'\0' * offset)
+		f.write(payload)
+		f.write(b'\0' * 512)
+
+
+def test_probe_hfsplus_reads_block_size():
+	# HFS+ volume header lives at byte 1024: 'H+' signature, blockSize at +40 big-endian.
+	header = bytearray(64)
+	struct.pack_into('>H', header, 0, 0x482B)
+	struct.pack_into('>H', header, 2, 4)
+	struct.pack_into('>I', header, 40, 8192)
+	with tempfile.NamedTemporaryFile(suffix='.img', delete=False) as tmp:
+		path = tmp.name
+	try:
+		_write_superblock(path, 1024, bytes(header))
+		assert hpcp._probe_hfsplus(path) == {'block_size': 8192}
+	finally:
+		os.unlink(path)
+
+
+def test_probe_hfsplus_rejects_foreign_signature():
+	with tempfile.NamedTemporaryFile(suffix='.img', delete=False) as tmp:
+		path = tmp.name
+	try:
+		_write_superblock(path, 1024, b'\0' * 64)
+		assert hpcp._probe_hfsplus(path) == {}
+	finally:
+		os.unlink(path)
+
+
+def test_build_hfsplus():
+	assert hpcp._build_hfsplus({'block_size': 8192}) == ['-b', '8192']
+
+
+def test_probe_minix_detects_version_and_name_length():
+	# v1/v2 magic sits at 1024+16; v3 magic at 1024+24.
+	cases = ((0x137F, 16, 1, 14), (0x138F, 16, 1, 30), (0x2468, 16, 2, 14),
+			 (0x2478, 16, 2, 30), (0x4D5A, 24, 3, 60))
+	for magic, offset, expected_version, expected_namelen in cases:
+		sb = bytearray(64)
+		struct.pack_into('<H', sb, offset, magic)
+		with tempfile.NamedTemporaryFile(suffix='.img', delete=False) as tmp:
+			path = tmp.name
+		try:
+			_write_superblock(path, 1024, bytes(sb))
+			params = hpcp._probe_minix(path)
+			assert params['fs_version'] == expected_version
+			assert params['name_length'] == expected_namelen
+		finally:
+			os.unlink(path)
+
+
+def test_build_minix_versions():
+	assert hpcp._build_minix({'fs_version': 3, 'name_length': 60}) == ['-3']
+	assert hpcp._build_minix({'fs_version': 2, 'name_length': 30}) == ['-2', '-n', '30']
+	assert hpcp._build_minix({'fs_version': 1, 'name_length': 14}) == ['-1', '-n', '14']
+
+
+def test_hfsplus_minix_registered():
+	assert hpcp._FS_PARAM_PROBES['hfsplus'] is hpcp._probe_hfsplus
+	assert hpcp._FS_PARAM_PROBES['hfs'] is hpcp._probe_hfsplus
+	assert hpcp._FS_MKFS_BUILDERS['hfsplus'] is hpcp._build_hfsplus
+	assert hpcp._FS_PARAM_PROBES['minix'] is hpcp._probe_minix
+	assert hpcp._FS_MKFS_BUILDERS['minix'] is hpcp._build_minix

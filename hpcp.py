@@ -19,6 +19,7 @@ import random
 import re
 import shutil
 import stat
+import struct
 import sys
 import tempfile
 import threading
@@ -1226,6 +1227,69 @@ def _build_reiserfs(params):
 
 _FS_PARAM_PROBES.update({'udf': _probe_udf, 'reiserfs': _probe_reiserfs})
 _FS_MKFS_BUILDERS.update({'udf': _build_udf, 'reiserfs': _build_reiserfs})
+
+# minix superblock magic -> (version, max filename length). v1/v2 keep the magic
+# at byte 16 of the superblock, v3 at byte 24.
+_MINIX_MAGICS = {0x137F: (1, 14), 0x138F: (1, 30), 0x2468: (2, 14), 0x2478: (2, 30)}
+_MINIX3_MAGIC = 0x4D5A
+
+def _probe_hfsplus(device):
+	"""
+	Read the hfs+ allocation block size straight from the volume header.
+
+	No fsck.hfsplus output reports it, but the volume header is at a fixed
+	offset: signature at byte 1024 ('H+' / 'HX'), blockSize as a big-endian
+	uint32 40 bytes into the header.
+	"""
+	with open(device, 'rb') as f:
+		f.seek(1024)
+		header = f.read(64)
+	if len(header) < 44:
+		return {}
+	signature = struct.unpack_from('>H', header, 0)[0]
+	if signature not in (0x482B, 0x4858):
+		return {}
+	block_size = struct.unpack_from('>I', header, 40)[0]
+	return {'block_size': block_size} if block_size else {}
+
+def _build_hfsplus(params):
+	"""Translate probed hfs+ parameters into mkfs.hfsplus arguments."""
+	if params.get('block_size'):
+		return ['-b', str(params['block_size'])]
+	return []
+
+def _probe_minix(device):
+	"""Read the minix filesystem version and filename length from the superblock."""
+	with open(device, 'rb') as f:
+		f.seek(1024)
+		superblock = f.read(64)
+	if len(superblock) < 32:
+		return {}
+	magic = struct.unpack_from('<H', superblock, 16)[0]
+	if magic in _MINIX_MAGICS:
+		version, name_length = _MINIX_MAGICS[magic]
+		return {'fs_version': version, 'name_length': name_length}
+	if struct.unpack_from('<H', superblock, 24)[0] == _MINIX3_MAGIC:
+		return {'fs_version': 3, 'name_length': 60}
+	return {}
+
+def _build_minix(params):
+	"""
+	Translate probed minix parameters into mkfs.minix arguments.
+
+	mkfs.minix exposes no block size option, so a v3 block size cannot be
+	mirrored; version and filename length are what it accepts.
+	"""
+	args = []
+	version = params.get('fs_version')
+	if version in (1, 2, 3):
+		args.append(f'-{version}')
+	if version in (1, 2) and params.get('name_length') in (14, 30):
+		args.extend(['-n', str(params['name_length'])])
+	return args
+
+_FS_PARAM_PROBES.update({'hfsplus': _probe_hfsplus, 'hfs': _probe_hfsplus, 'minix': _probe_minix})
+_FS_MKFS_BUILDERS.update({'hfsplus': _build_hfsplus, 'hfs': _build_hfsplus, 'minix': _build_minix})
 
 # Deliberately not registered, with reasons:
 #   jfs   - mkfs.jfs exposes no geometry options; block size is fixed at 4096.
