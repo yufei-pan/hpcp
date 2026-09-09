@@ -1069,6 +1069,10 @@ def write_partition_info(image, partition_infos, partition_name):
 			fs_type = partition_infos[partition_name]['fs_type']
 			fs_label = partition_infos[partition_name]['fs_label']
 			fs_uuid = partition_infos[partition_name]['fs_uuid']
+			fs_params = partition_infos[partition_name].get('fs_params') or {}
+			param_args = build_mkfs_params(fs_type, fs_params) if MIRROR_FS_PARAMS else []
+			if param_args:
+				print(f"Mirroring source {fs_type} parameters onto {target_partition}: {' '.join(param_args)}")
 			if fs_type in ('ext4', 'ext3', 'ext2'):
 				command = ['mkfs', '-t', fs_type]
 				if fs_label:
@@ -1076,8 +1080,7 @@ def write_partition_info(image, partition_infos, partition_name):
 				if fs_uuid:
 					#command.extend(['-U', fs_uuid])
 					delayed_commands.append(['tune2fs', '-U', fs_uuid, target_partition])
-				command.append(target_partition)
-				run_command_in_multicmd_with_path_check(command,strict=False)
+				_run_mkfs_with_fallback(command, param_args, target_partition, fs_type)
 			elif fs_type == 'btrfs':
 				command = ['mkfs.btrfs']
 				if fs_label:
@@ -1085,8 +1088,7 @@ def write_partition_info(image, partition_infos, partition_name):
 				if fs_uuid:
 					#cannot delay, must set during creation
 					command.extend(['-U', fs_uuid])
-				command.append(target_partition)
-				run_command_in_multicmd_with_path_check(command,strict=False)
+				_run_mkfs_with_fallback(command, param_args, target_partition, fs_type)
 			elif fs_type == 'xfs':
 				command = ['mkfs.xfs']
 				if fs_label:
@@ -1094,22 +1096,19 @@ def write_partition_info(image, partition_infos, partition_name):
 				if fs_uuid:
 					#command.extend(['-m', f'uuid={fs_uuid}'])
 					delayed_commands.append(['xfs_admin', '-U', fs_uuid, target_partition])
-				command.append(target_partition)
-				run_command_in_multicmd_with_path_check(command,strict=False)
+				_run_mkfs_with_fallback(command, param_args, target_partition, fs_type)
 			elif fs_type == 'f2fs':
 				command = ['mkfs.f2fs', '-f']
 				if fs_label:
 					command.extend(['-l', fs_label])
 				if fs_uuid:
 					command.extend(['-U', fs_uuid])
-				command.append(target_partition)
-				run_command_in_multicmd_with_path_check(command,strict=False)
+				_run_mkfs_with_fallback(command, param_args, target_partition, fs_type)
 			elif fs_type == 'ntfs':
 				command = ['mkfs.ntfs']
 				if fs_label:
 					command.extend(['-L', fs_label])
-				command.append(target_partition)
-				run_command_in_multicmd_with_path_check(command,strict=False)
+				_run_mkfs_with_fallback(command, param_args, target_partition, fs_type)
 				if fs_uuid:
 					eprint("Cannot set fs uuid for ntfs: Skipping.")
 			elif fs_type in ('fat32', 'fat16', 'fat12', 'fat', 'vfat', 'msdos'):
@@ -1123,14 +1122,12 @@ def write_partition_info(image, partition_infos, partition_name):
 				if fs_uuid:
 					# cannot delay
 					command.extend(['-i', fs_uuid.lower().replace('-','')])
-				command.append(target_partition)
-				run_command_in_multicmd_with_path_check(command,strict=False)
+				_run_mkfs_with_fallback(command, param_args, target_partition, fs_type)
 			elif fs_type == 'exfat':
 				command = ['mkfs.exfat']
 				if fs_label:
 					command.extend(['-L', fs_label])
-				command.append(target_partition)
-				run_command_in_multicmd_with_path_check(command,strict=False)
+				_run_mkfs_with_fallback(command, param_args, target_partition, fs_type)
 				if fs_uuid:
 					#run_command_in_multicmd_with_path_check(["exfatlabel", '-i', target_partition, fs_uuid],strict=False)
 					delayed_commands.append(['exfatlabel', '-i', target_partition, fs_uuid])
@@ -1138,8 +1135,7 @@ def write_partition_info(image, partition_infos, partition_name):
 				command = [f'mkfs.{fs_type}']
 				if fs_label:
 					command.extend(['-v', fs_label])
-				command.append(target_partition)
-				run_command_in_multicmd_with_path_check(command,strict=False)
+				_run_mkfs_with_fallback(command, param_args, target_partition, fs_type)
 				if fs_uuid:
 					eprint(f"Cannot set fs uuid for hfs: {fs_type}. Skipping.")
 			elif fs_type == 'udf':
@@ -1150,14 +1146,12 @@ def write_partition_info(image, partition_infos, partition_name):
 				if fs_uuid:
 					#command.extend(['--uuid', fs_uuid])
 					delayed_commands.append(['udflabel', '--uuid', fs_uuid, target_partition])
-				command.append(target_partition)
-				run_command_in_multicmd_with_path_check(command,strict=False)
+				_run_mkfs_with_fallback(command, param_args, target_partition, fs_type)
 			elif fs_type == 'jfs':
 				command = ['mkfs.jfs']
 				if fs_label:
 					command.extend(['-L', fs_label])
-				command.append(target_partition)
-				run_command_in_multicmd_with_path_check(command,strict=False)
+				_run_mkfs_with_fallback(command, param_args, target_partition, fs_type)
 				if fs_uuid:
 					#run_command_in_multicmd_with_path_check(["jfs_tune", '-U', fs_uuid, target_partition],strict=False)
 					delayed_commands.append(['jfs_tune', '-U', fs_uuid, target_partition])
@@ -1168,31 +1162,28 @@ def write_partition_info(image, partition_infos, partition_name):
 				if fs_uuid:
 					#command.extend(['-u', fs_uuid])
 					delayed_commands.append(['reiserfstune', '-u', fs_uuid, target_partition])
-				command.append(target_partition)
-				run_command_in_multicmd_with_path_check(command,strict=False)
+				_run_mkfs_with_fallback(command, param_args, target_partition, fs_type)
 			elif fs_type == 'zfs':
 				eprint("Cannot create zfs file system: ZFS file system should be created using zpool command.")
 			elif fs_type == 'ufs':
 				command = ['newfs', '-t']
 				if fs_label:
 					command.extend(['-L', fs_label])
-				command.append(target_partition)
-				run_command_in_multicmd_with_path_check(command,strict=False)
+				_run_mkfs_with_fallback(command, param_args, target_partition, fs_type)
 				if fs_uuid:
 					eprint("Cannot set fs uuid for ufs: Skipping.")
 			elif fs_type == 'bfs':
 				command = ['mkfs.bfs']
 				if fs_label:
 					command.extend(['-F', fs_label, '-V', fs_label])
-				command.append(target_partition)
-				run_command_in_multicmd_with_path_check(command,strict=False)
+				_run_mkfs_with_fallback(command, param_args, target_partition, fs_type)
 				if fs_uuid:
 					eprint("Cannot set fs uuid for bfs: Skipping.")
 			elif fs_type == 'cramfs':
 				eprint("Cannot create cramfs file system: cramfs is read-only file system. You should create one with mkfs.cramfs.")
 			elif fs_type == 'minix':
-				command = ['mkfs.minix',target_partition]
-				run_command_in_multicmd_with_path_check(command,strict=False)
+				command = ['mkfs.minix']
+				_run_mkfs_with_fallback(command, param_args, target_partition, fs_type)
 				if fs_label:
 					eprint("Cannot set fs label for minix: Skipping.")
 				if fs_uuid:
@@ -1206,8 +1197,7 @@ def write_partition_info(image, partition_infos, partition_name):
 				if fs_uuid:
 					#command.extend(['-U', fs_uuid])
 					delayed_commands.append(['swaplabel', '-U', fs_uuid, target_partition])
-				command.append(target_partition)
-				run_command_in_multicmd_with_path_check(command,strict=False)
+				_run_mkfs_with_fallback(command, param_args, target_partition, fs_type)
 			elif fs_type == 'gpt':
 				eprint("Skip creating gpt padding.")
 			else:
@@ -1217,8 +1207,7 @@ def write_partition_info(image, partition_infos, partition_name):
 					command.extend(['-L', fs_label])
 				if fs_uuid:
 					command.extend(['-U', fs_uuid])
-				command.append(target_partition)
-				run_command_in_multicmd_with_path_check(command,strict=False)
+				_run_mkfs_with_fallback(command, param_args, target_partition, fs_type)
 			if loop_device:
 				#run_command_in_multicmd_with_path_check(["losetup", '--detach', loop_device])
 				delayed_commands.append(['losetup', '--detach', loop_device])

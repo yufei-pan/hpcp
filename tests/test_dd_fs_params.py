@@ -146,3 +146,56 @@ def test_mkfs_fallback_resolves_binary_path_from_binpaths(monkeypatch):
 	# Verify the resolved path is used, remaining args are preserved
 	assert calls[0][0] == '/usr/sbin/mkfs'
 	assert calls[0][1:] == ['-t', 'ext4', '-b', '1024', '/dev/fake1']
+
+
+def test_write_partition_info_applies_mirrored_params(monkeypatch):
+	seen = {}
+
+	def fake_target(image, partition_name):
+		return '/dev/fake1', None
+
+	def fake_run_cmd(command, **kwargs):
+		return ['']
+
+	def fake_mkfs(base_command, param_args, target_partition, fs_type):
+		seen['base'] = list(base_command)
+		seen['params'] = list(param_args)
+		seen['target'] = target_partition
+		return True
+
+	monkeypatch.setattr(hpcp, 'get_target_partition', fake_target)
+	monkeypatch.setattr(hpcp, 'run_command_in_multicmd_with_path_check', fake_run_cmd)
+	monkeypatch.setattr(hpcp, '_run_mkfs_with_fallback', fake_mkfs)
+	monkeypatch.setattr(hpcp, 'MIRROR_FS_PARAMS', True)
+	monkeypatch.setitem(hpcp._FS_MKFS_BUILDERS, 'ext4', lambda p: ['-b', '1024'])
+
+	infos = {'2': {'partition_guid_code': '', 'unique_partition_guid': '', 'partition_name': '',
+				   'partition_attrs': '', 'fs_type': 'ext4', 'fs_uuid': '', 'fs_label': 'BOOTFS',
+				   'size': 0, 'fs_params': {'block_size': 1024}}}
+	hpcp.write_partition_info('/dev/fakeimg', infos, '2')
+
+	assert seen['params'] == ['-b', '1024']
+	assert seen['target'] == '/dev/fake1'
+	assert seen['base'][:3] == ['mkfs', '-t', 'ext4']
+	assert '/dev/fake1' not in seen['base']
+
+
+def test_write_partition_info_skips_mirroring_when_disabled(monkeypatch):
+	seen = {}
+
+	def fake_mkfs(base_command, param_args, target_partition, fs_type):
+		seen['params'] = list(param_args)
+		return True
+
+	monkeypatch.setattr(hpcp, 'get_target_partition', lambda image, name: ('/dev/fake1', None))
+	monkeypatch.setattr(hpcp, 'run_command_in_multicmd_with_path_check', lambda command, **kwargs: [''])
+	monkeypatch.setattr(hpcp, '_run_mkfs_with_fallback', fake_mkfs)
+	monkeypatch.setattr(hpcp, 'MIRROR_FS_PARAMS', False)
+	monkeypatch.setitem(hpcp._FS_MKFS_BUILDERS, 'ext4', lambda p: ['-b', '1024'])
+
+	infos = {'2': {'partition_guid_code': '', 'unique_partition_guid': '', 'partition_name': '',
+				   'partition_attrs': '', 'fs_type': 'ext4', 'fs_uuid': '', 'fs_label': '',
+				   'size': 0, 'fs_params': {'block_size': 1024}}}
+	hpcp.write_partition_info('/dev/fakeimg', infos, '2')
+
+	assert seen['params'] == []
