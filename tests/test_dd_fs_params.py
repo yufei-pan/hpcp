@@ -591,6 +591,32 @@ def test_probe_f2fs_handles_no_features(monkeypatch):
 	assert '-O' not in hpcp._build_f2fs(params)
 
 
+def test_build_f2fs_translates_quota_ino_to_quota():
+	args = hpcp._build_f2fs({'features': ['quota_ino']})
+	assert args[args.index('-O') + 1] == 'quota'
+
+
+def test_build_f2fs_drops_unrecognised_feature_but_keeps_geometry(capsys):
+	params = {
+		'log_sectorsize': 9,
+		'segs_per_sec': 2,
+		'secs_per_zone': 1,
+		'features': ['extra_attr', 'some_future_feature'],
+	}
+	args = hpcp._build_f2fs(params)
+	assert args[args.index('-w') + 1] == '512'
+	assert args[args.index('-s') + 1] == '2'
+	assert args[args.index('-z') + 1] == '1'
+	assert args[args.index('-O') + 1] == 'extra_attr'
+	assert 'some_future_feature' not in args
+	assert 'some_future_feature' in capsys.readouterr().err
+
+
+def test_build_f2fs_omits_dash_o_when_all_features_dropped():
+	args = hpcp._build_f2fs({'features': ['some_future_feature']})
+	assert '-O' not in args
+
+
 def test_ntfs_exfat_f2fs_registered():
 	for fs_type, probe, builder in (('ntfs', hpcp._probe_ntfs, hpcp._build_ntfs),
 									('exfat', hpcp._probe_exfat, hpcp._build_exfat),

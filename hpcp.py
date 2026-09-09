@@ -1108,6 +1108,24 @@ def _build_exfat(params):
 		args.extend(['-c', str(params['cluster_size'])])
 	return args
 
+# f2fs superblock feature names dump.f2fs reports that differ from the name
+# mkfs.f2fs -O expects for the same feature. Confirmed via a live round-trip:
+# `mkfs.f2fs -O quota` produces a superblock dump.f2fs reports as `quota_ino`;
+# feeding `quota_ino` straight back to `mkfs.f2fs -O` is rejected with
+# "Error: Wrong features quota_ino".
+_F2FS_FLAG_TO_MKFS = {'quota_ino': 'quota'}
+
+# Feature names mkfs.f2fs -O actually accepts, per `man mkfs.f2fs` / mkfs.f2fs's
+# own usage text (f2fs-tools 1.16.0) and confirmed live: `mkfs.f2fs -O <all of
+# these, comma separated>` exits 0. Anything dump.f2fs reports that isn't in
+# here (e.g. `blkzoned`, a zoned-device property rather than an -O feature) is
+# dropped rather than passed through, since an unrecognised -O name makes
+# mkfs.f2fs reject the whole argument set - geometry included.
+_F2FS_CURATED_FEATURES = (
+	'encrypt', 'extra_attr', 'project_quota', 'inode_checksum', 'flexible_inline_xattr',
+	'quota', 'inode_crtime', 'lost_found', 'verity', 'sb_checksum', 'casefold', 'compression',
+)
+
 # mkfs.f2fs enables no features by default and has no negation syntax, so the
 # source's feature list is applied additively rather than as a delta.
 def _probe_f2fs(device):
@@ -1137,8 +1155,17 @@ def _build_f2fs(params):
 		args.extend(['-s', str(params['segs_per_sec'])])
 	if params.get('secs_per_zone'):
 		args.extend(['-z', str(params['secs_per_zone'])])
-	if params.get('features'):
-		args.extend(['-O', ','.join(params['features'])])
+	kept, dropped = [], []
+	for name in params.get('features') or []:
+		mapped = _F2FS_FLAG_TO_MKFS.get(name, name)
+		if mapped in _F2FS_CURATED_FEATURES:
+			kept.append(mapped)
+		else:
+			dropped.append(name)
+	if dropped:
+		eprint(f"FS param warning: f2fs feature(s) not recognised by mkfs.f2fs -O, dropping: {', '.join(dropped)}")
+	if kept:
+		args.extend(['-O', ','.join(kept)])
 	return args
 
 _FS_PARAM_PROBES.update({'ntfs': _probe_ntfs, 'exfat': _probe_exfat, 'f2fs': _probe_f2fs})
