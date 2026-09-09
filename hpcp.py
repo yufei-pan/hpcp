@@ -1006,6 +1006,59 @@ def _build_btrfs(params):
 _FS_PARAM_PROBES['btrfs'] = _probe_btrfs
 _FS_MKFS_BUILDERS['btrfs'] = _build_btrfs
 
+def _probe_vfat(device):
+	"""
+	Read FAT width and geometry.
+
+	blkid -o export reports TYPE=vfat for FAT12, FAT16 and FAT32 alike, so the
+	width has to come from blkid -p's VERSION field. Without it mkfs.vfat picks
+	the width from the partition size and can turn a FAT32 EFI System Partition
+	into FAT16 that firmware refuses to boot.
+	"""
+	params = {}
+	for line in run_command_in_multicmd_with_path_check(['blkid', '-p', '-o', 'export', device], quiet=True):
+		key, sep, value = line.partition('=')
+		if sep and key.strip() == 'VERSION':
+			version = value.strip().upper()
+			if version.startswith('FAT') and version[3:].isdigit():
+				params['fat_bits'] = int(version[3:])
+	for line in run_command_in_multicmd_with_path_check(['fsck.fat', '-nv', device], quiet=True):
+		fields = line.split()
+		if not fields or not fields[0].isdigit():
+			continue
+		if 'bytes per logical sector' in line:
+			params['sector_size'] = int(fields[0])
+		elif 'bytes per cluster' in line:
+			params['cluster_size'] = int(fields[0])
+		elif 'reserved sectors' in line:
+			params['reserved_sectors'] = int(fields[0])
+		elif 'FATs,' in line and 'bit entries' in line:
+			params['fat_count'] = int(fields[0])
+			params.setdefault('fat_bits', int(fields[2]))
+	return params
+
+def _build_vfat(params):
+	"""Translate probed FAT parameters into mkfs.vfat arguments."""
+	args = []
+	if params.get('fat_bits') in (12, 16, 32):
+		args.extend(['-F', str(params['fat_bits'])])
+	sector_size = params.get('sector_size')
+	if sector_size:
+		args.extend(['-S', str(sector_size)])
+		cluster_size = params.get('cluster_size')
+		if cluster_size and cluster_size >= sector_size:
+			args.extend(['-s', str(cluster_size // sector_size)])
+	if params.get('fat_count'):
+		args.extend(['-f', str(params['fat_count'])])
+	if params.get('reserved_sectors'):
+		args.extend(['-R', str(params['reserved_sectors'])])
+	return args
+
+for _fat_alias in ('vfat', 'fat', 'fat12', 'fat16', 'fat32', 'msdos'):
+	_FS_PARAM_PROBES[_fat_alias] = _probe_vfat
+	_FS_MKFS_BUILDERS[_fat_alias] = _build_vfat
+del _fat_alias
+
 def fix_fs(target_partition, fs_type=None):
 	"""
 	Fix the file system errors on the specified target partition.
@@ -1299,10 +1352,6 @@ def write_partition_info(image, partition_infos, partition_name):
 					eprint("Cannot set fs uuid for ntfs: Skipping.")
 			elif fs_type in ('fat32', 'fat16', 'fat12', 'fat', 'vfat', 'msdos'):
 				command = ['mkfs.vfat']
-				if fs_type == 'fat16':
-					command.extend(['-F', '16'])
-				elif fs_type == 'fat12':
-					command.extend(['-F', '12'])
 				if fs_label:
 					command.extend(['-n', fs_label])
 				if fs_uuid:

@@ -415,3 +415,78 @@ def test_build_btrfs_negates_features_when_source_has_none_mappable():
 def test_btrfs_registered():
 	assert hpcp._FS_PARAM_PROBES['btrfs'] is hpcp._probe_btrfs
 	assert hpcp._FS_MKFS_BUILDERS['btrfs'] is hpcp._build_btrfs
+
+
+_BLKID_P_FAT32_OUTPUT = """DEVNAME=/dev/loop8p1
+LABEL_FATBOOT=ESP
+LABEL=ESP
+UUID=A4D7-1D90
+VERSION=FAT32
+FSBLOCKSIZE=512
+BLOCK_SIZE=512
+TYPE=vfat
+USAGE=filesystem
+PART_ENTRY_TYPE=c12a7328-f81f-11d2-ba4b-00a0c93ec93b
+""".splitlines()
+
+_FSCK_FAT_OUTPUT = """fsck.fat 4.2 (2021-01-31)
+Checking we can access the last sector of the filesystem
+Boot sector contents:
+System ID "mkfs.fat"
+Media byte 0xf8 (hard disk)
+       512 bytes per logical sector
+       512 bytes per cluster
+        32 reserved sectors
+First FAT starts at byte 16384 (sector 32)
+         2 FATs, 32 bit entries
+   2097152 bytes per FAT (= 4096 sectors)
+""".splitlines()
+
+
+def _fake_fat_runner(command, **kwargs):
+	return _BLKID_P_FAT32_OUTPUT if command[0] == 'blkid' else _FSCK_FAT_OUTPUT
+
+
+def test_probe_vfat_reads_fat_width_and_geometry(monkeypatch):
+	monkeypatch.setattr(hpcp, 'run_command_in_multicmd_with_path_check', _fake_fat_runner)
+	params = hpcp._probe_vfat('/dev/fake1')
+	assert params['fat_bits'] == 32
+	assert params['sector_size'] == 512
+	assert params['cluster_size'] == 512
+	assert params['reserved_sectors'] == 32
+	assert params['fat_count'] == 2
+
+
+def test_build_vfat_forces_source_fat_width(monkeypatch):
+	monkeypatch.setattr(hpcp, 'run_command_in_multicmd_with_path_check', _fake_fat_runner)
+	args = hpcp._build_vfat(hpcp._probe_vfat('/dev/fake1'))
+	# Without -F 32 mkfs.vfat picks FAT16 for a partition this size.
+	assert args[args.index('-F') + 1] == '32'
+	assert args[args.index('-S') + 1] == '512'
+	assert args[args.index('-s') + 1] == '1'
+	assert args[args.index('-f') + 1] == '2'
+	assert args[args.index('-R') + 1] == '32'
+
+
+def test_build_vfat_computes_sectors_per_cluster():
+	args = hpcp._build_vfat({'sector_size': 512, 'cluster_size': 8192})
+	assert args[args.index('-s') + 1] == '16'
+
+
+def test_build_vfat_skips_bad_fat_width():
+	assert '-F' not in hpcp._build_vfat({'fat_bits': 64, 'sector_size': 512})
+
+
+def test_vfat_registered_for_all_fat_aliases():
+	for fs_type in ('vfat', 'fat', 'fat12', 'fat16', 'fat32', 'msdos'):
+		assert hpcp._FS_PARAM_PROBES[fs_type] is hpcp._probe_vfat
+		assert hpcp._FS_MKFS_BUILDERS[fs_type] is hpcp._build_vfat
+
+
+def test_dead_fat_width_branches_removed():
+	# The old -F 16 / -F 12 branches keyed on blkid TYPE could never fire and
+	# would now conflict with the probed width.
+	import inspect
+	src = inspect.getsource(hpcp.write_partition_info)
+	assert "'-F', '16'" not in src
+	assert "'-F', '12'" not in src
