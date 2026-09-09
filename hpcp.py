@@ -941,6 +941,71 @@ def _build_xfs(params):
 _FS_PARAM_PROBES['xfs'] = _probe_xfs
 _FS_MKFS_BUILDERS['xfs'] = _build_xfs
 
+# btrfs superblock flag names -> the feature names mkfs.btrfs -O accepts.
+# Flags with no mkfs equivalent (MIXED_BACKREF, BIG_METADATA, DEFAULT_SUBVOL,
+# FREE_SPACE_TREE_VALID, COMPRESS_*) are intentionally absent and get dropped.
+_BTRFS_FLAG_TO_MKFS = {
+	'MIXED_GROUPS':     'mixed-bg',
+	'EXTENDED_IREF':    'extref',
+	'SKINNY_METADATA':  'skinny-metadata',
+	'NO_HOLES':         'no-holes',
+	'RAID56':           'raid56',
+	'RAID1C34':         'raid1c34',
+	'ZONED':            'zoned',
+	'SIMPLE_QUOTA':     'squota',
+	'FREE_SPACE_TREE':  'free-space-tree',
+	'BLOCK_GROUP_TREE': 'block-group-tree',
+}
+_BTRFS_CURATED_FEATURES = tuple(sorted(set(_BTRFS_FLAG_TO_MKFS.values())))
+
+def _probe_btrfs(device):
+	"""Read btrfs geometry, checksum type and feature flags from the superblock."""
+	params = {'incompat_flags': [], 'compat_ro_flags': []}
+	current = None
+	for line in run_command_in_multicmd_with_path_check(['btrfs', 'inspect-internal', 'dump-super', device], quiet=True):
+		stripped = line.strip()
+		if not stripped:
+			continue
+		fields = stripped.split()
+		name = fields[0]
+		if name in ('nodesize', 'sectorsize') and len(fields) > 1:
+			params[name] = int(fields[1])
+			current = None
+		elif name == 'csum_type' and len(fields) > 2:
+			params['csum_type'] = fields[2].strip('()')
+			current = None
+		elif name in ('incompat_flags', 'compat_ro_flags'):
+			current = name
+		elif current:
+			# Flag blocks look like "( MIXED_BACKREF |" ... "  NO_HOLES )".
+			token = stripped.strip('()| \t')
+			if token and token.replace('_', '').isalnum() and token.upper() == token:
+				params[current].append(token)
+			if stripped.endswith(')'):
+				current = None
+		else:
+			current = None
+	return params
+
+def _build_btrfs(params):
+	"""Translate probed btrfs parameters into mkfs.btrfs arguments."""
+	args = []
+	if params.get('nodesize'):
+		args.extend(['-n', str(params['nodesize'])])
+	if params.get('sectorsize'):
+		args.extend(['-s', str(params['sectorsize'])])
+	if params.get('csum_type'):
+		args.extend(['--csum', params['csum_type']])
+	flags = list(params.get('incompat_flags', [])) + list(params.get('compat_ro_flags', []))
+	if flags:
+		src_features = {_BTRFS_FLAG_TO_MKFS[f] for f in flags if f in _BTRFS_FLAG_TO_MKFS}
+		feature_opts = sorted(src_features) + ['^' + f for f in _BTRFS_CURATED_FEATURES if f not in src_features]
+		args.extend(['-O', ','.join(feature_opts)])
+	return args
+
+_FS_PARAM_PROBES['btrfs'] = _probe_btrfs
+_FS_MKFS_BUILDERS['btrfs'] = _build_btrfs
+
 def fix_fs(target_partition, fs_type=None):
 	"""
 	Fix the file system errors on the specified target partition.

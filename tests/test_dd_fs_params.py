@@ -343,3 +343,75 @@ def test_build_xfs_skips_missing_keys():
 def test_xfs_registered():
 	assert hpcp._FS_PARAM_PROBES['xfs'] is hpcp._probe_xfs
 	assert hpcp._FS_MKFS_BUILDERS['xfs'] is hpcp._build_xfs
+
+
+_BTRFS_SUPER_OUTPUT = """superblock: bytenr=65536, device=/dev/fake4
+---------------------------------------------------------
+csum_type		0 (crc32c)
+csum_size		4
+bytenr			65536
+flags			0x1
+			( WRITTEN )
+magic			_BHRfS_M [match]
+label			ROOTFS
+sectorsize		4096
+nodesize		4096
+leafsize (deprecated)	4096
+stripesize		4096
+num_devices		1
+compat_flags		0x0
+compat_ro_flags		0x3
+			( FREE_SPACE_TREE |
+			  FREE_SPACE_TREE_VALID )
+incompat_flags		0x341
+			( MIXED_BACKREF |
+			  EXTENDED_IREF |
+			  SKINNY_METADATA |
+			  NO_HOLES )
+""".splitlines()
+
+
+def test_probe_btrfs_parses_super(monkeypatch):
+	monkeypatch.setattr(hpcp, 'run_command_in_multicmd_with_path_check',
+						lambda command, **kwargs: _BTRFS_SUPER_OUTPUT)
+	params = hpcp._probe_btrfs('/dev/fake4')
+	assert params['nodesize'] == 4096
+	assert params['sectorsize'] == 4096
+	assert params['csum_type'] == 'crc32c'
+	assert 'NO_HOLES' in params['incompat_flags']
+	assert 'EXTENDED_IREF' in params['incompat_flags']
+	assert 'FREE_SPACE_TREE' in params['compat_ro_flags']
+	# The WRITTEN flag belongs to `flags`, not to the feature flag blocks.
+	assert 'WRITTEN' not in params['incompat_flags']
+	assert 'WRITTEN' not in params['compat_ro_flags']
+
+
+def test_build_btrfs_mirrors_geometry_and_features(monkeypatch):
+	monkeypatch.setattr(hpcp, 'run_command_in_multicmd_with_path_check',
+						lambda command, **kwargs: _BTRFS_SUPER_OUTPUT)
+	args = hpcp._build_btrfs(hpcp._probe_btrfs('/dev/fake4'))
+	assert args[args.index('-n') + 1] == '4096'
+	assert args[args.index('-s') + 1] == '4096'
+	assert args[args.index('--csum') + 1] == 'crc32c'
+	features = args[args.index('-O') + 1].split(',')
+	assert 'no-holes' in features
+	assert 'extref' in features
+	assert 'skinny-metadata' in features
+	assert 'free-space-tree' in features
+	# Absent curated features are negated so mkfs defaults cannot reintroduce them.
+	assert '^raid56' in features
+	assert '^block-group-tree' in features
+	# Unmappable / non-creation flags are dropped entirely.
+	assert 'MIXED_BACKREF' not in features
+	assert 'FREE_SPACE_TREE_VALID' not in features
+
+
+def test_build_btrfs_negates_features_when_source_has_none_mappable():
+	args = hpcp._build_btrfs({'incompat_flags': ['MIXED_BACKREF'], 'compat_ro_flags': []})
+	features = args[args.index('-O') + 1].split(',')
+	assert all(f.startswith('^') for f in features)
+
+
+def test_btrfs_registered():
+	assert hpcp._FS_PARAM_PROBES['btrfs'] is hpcp._probe_btrfs
+	assert hpcp._FS_MKFS_BUILDERS['btrfs'] is hpcp._build_btrfs
