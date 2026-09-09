@@ -136,6 +136,7 @@ FILES_RATE_LIMIT = 0
 COMMAND_TIMEOUT = 0
 NO_CREATE_DIR = False
 CONTENT_ONLY = False
+MIRROR_FS_PARAMS = True
 ERRORS = []
 
 ERROR_TO_RETURNCODE_TABLE = {
@@ -3681,6 +3682,7 @@ def get_args(args = None):
 	parser.add_argument('-dd', '--disk_dump', action='store_true', help='Disk to Disk mirror, use this if you are backuping / deploying an OS from / to a disk. \
 					 Require 1 source, can be 1 src_path or 1 -si src_image, require 1 -di dest_image. Note: will only actually use dd if unable to mount / create a partition.')
 	parser.add_argument('-ddr', '--dd_resize', action='append', type=str, help='Resize the destination image to the specified size with -dd. Applies to biggest partiton first. Specify multiple -ddr to resize subsequent sized partitions. Example: {100GiB} or {200G}')
+	parser.add_argument('-nfp','--no_fs_param_mirror', action='store_true', help='Do not mirror source filesystem parameters (geometry, features) in -dd mode. Create destination filesystems with mkfs defaults, preserving only label and UUID.')
 	parser.add_argument('-L','-rl','--rate_limit', type=str, default=None, help='Approximate a rate limit the copy speed in bytes/second. Example: 10M for 10 MB/s, 1Gi for 1 GiB/s. Note: do not work in single thread mode. Default is 0: no rate limit.')
 	parser.add_argument('-F','-frl','--file_rate_limit', type=str, default=None, help='Approximate a rate limit the copy speed in files/second. Example: 10K for 10240 files/s, 1Mi for 1024*1024*1024 files/s. Note: do not work in serial mode. Default is 0: no rate limit.')
 	parser.add_argument('-tfs','--target_file_system', type=str, default=None, help='Specify the target file system type. Will abort if the target file system type does not match. Example: ext4, xfs, f2fs, ntfs, fat32, exfat. Default is None: do not check target file system type.')
@@ -3723,7 +3725,7 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = multipr
 			exclude=None,exclude_file = None,dest_image = None,dest_image_size = '0', no_link_tracking = False,src_image = None,dd = False,dd_resize = 0,
 			batch = False, append_hash_to_file_list = True, hash_size = ..., source_file_list = None, random_destination_selection = False, 
 			bytes_rate_limit = None, files_rate_limit = None,target_file_system = None, no_create_dir = False, content_only = False, command_timeout_limit = 0,
-			exit_not_enough_space = False,do_not_remove_files_while_listing = False):
+			exit_not_enough_space = False,do_not_remove_files_while_listing = False,no_fs_param_mirror = False):
 	global HASH_SIZE
 	global RANDOM_DESTINATION_SELECTION
 	global BYTES_RATE_LIMIT
@@ -3731,9 +3733,11 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = multipr
 	global COMMAND_TIMEOUT
 	global NO_CREATE_DIR
 	global CONTENT_ONLY
+	global MIRROR_FS_PARAMS
 	global REMOVE_FILES_WHILE_LISTING
 	NO_CREATE_DIR = no_create_dir
 	CONTENT_ONLY = content_only
+	MIRROR_FS_PARAMS = not no_fs_param_mirror
 	if random_destination_selection:
 		RANDOM_DESTINATION_SELECTION = True
 		print("Random destination selection enabled.")
@@ -4129,7 +4133,8 @@ def main():
 			 dd_resize=args.dd_resize,batch=args.batch,append_hash_to_file_list=not args.no_hash_file_list, hash_size=args.hash_size,source_file_list=args.source_file_list,
 			 random_destination_selection = args.random_dest_selection,bytes_rate_limit = args.rate_limit,files_rate_limit = args.file_rate_limit,
 			 target_file_system = args.target_file_system, no_create_dir = args.no_create_dir, content_only = args.content_only, command_timeout_limit = args.command_timeout_limit,
-			 exit_not_enough_space = args.exit_not_enough_space,do_not_remove_files_while_listing = args.do_not_remove_files_while_listing)
+			 exit_not_enough_space = args.exit_not_enough_space,do_not_remove_files_while_listing = args.do_not_remove_files_while_listing,
+			 no_fs_param_mirror = args.no_fs_param_mirror)
 		if rtnCode:
 			exit(rtnCode)
 		
