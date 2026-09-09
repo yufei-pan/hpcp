@@ -199,3 +199,86 @@ def test_write_partition_info_skips_mirroring_when_disabled(monkeypatch):
 	hpcp.write_partition_info('/dev/fakeimg', infos, '2')
 
 	assert seen['params'] == []
+
+
+_DUMPE2FS_OUTPUT = """dumpe2fs 1.47.2 (1-Jan-2025)
+Filesystem volume name:   BOOTFS
+Last mounted on:          /tmp/tmp.BJpz2N4pR0
+Filesystem UUID:          d0bac943-fd97-4462-bc04-0ba9a3097027
+Filesystem magic number:  0xEF53
+Filesystem revision #:    1 (dynamic)
+Filesystem features:      has_journal ext_attr resize_inode orphan_file filetype extent flex_bg sparse_super large_file huge_file dir_nlink extra_isize
+Filesystem flags:         signed_directory_hash
+Default mount options:    user_xattr acl
+Filesystem state:         clean
+Inode count:              32768
+Block count:              524288
+Reserved block count:     0
+Free blocks:              501204
+Free inodes:              32754
+First block:              1
+Block size:               1024
+Fragment size:            1024
+Blocks per group:         8192
+Inode size:               128
+""".splitlines()
+
+
+def test_probe_ext_parses_geometry_and_features(monkeypatch):
+	monkeypatch.setattr(hpcp, 'run_command_in_multicmd_with_path_check',
+						lambda command, **kwargs: _DUMPE2FS_OUTPUT)
+	params = hpcp._probe_ext('/dev/fake2')
+	assert params['block_size'] == 1024
+	assert params['inode_size'] == 128
+	assert params['inode_count'] == 32768
+	assert params['block_count'] == 524288
+	assert params['reserved_block_count'] == 0
+	assert 'has_journal' in params['features']
+	assert '64bit' not in params['features']
+	assert 'metadata_csum' not in params['features']
+
+
+def test_build_ext_mirrors_geometry():
+	args = hpcp._build_ext({'block_size': 1024, 'inode_size': 128})
+	assert args[:4] == ['-b', '1024', '-I', '128']
+
+
+def test_build_ext_negates_absent_curated_features():
+	args = hpcp._build_ext({'features': ['has_journal', 'extent']})
+	features = args[args.index('-O') + 1].split(',')
+	# Present features are emitted plain...
+	assert 'has_journal' in features
+	assert 'extent' in features
+	# ...and every curated feature the source lacks is explicitly negated,
+	# because a plain -O list is merged with the mke2fs.conf defaults.
+	assert '^64bit' in features
+	assert '^metadata_csum' in features
+	assert '^dir_index' in features
+
+
+def test_build_ext_filters_runtime_state_features():
+	args = hpcp._build_ext({'features': ['has_journal', 'needs_recovery', 'journal_dev']})
+	features = args[args.index('-O') + 1].split(',')
+	assert 'needs_recovery' not in features
+	assert 'journal_dev' not in features
+	assert '^needs_recovery' not in features
+
+
+def test_build_ext_mirrors_inode_ratio_not_absolute_count():
+	# 524288 blocks * 1024 bytes / 32768 inodes = 16384 bytes per inode
+	args = hpcp._build_ext({'block_size': 1024, 'block_count': 524288, 'inode_count': 32768})
+	assert args[args.index('-i') + 1] == '16384'
+	assert '-N' not in args
+
+
+def test_build_ext_mirrors_reserved_percentage():
+	args = hpcp._build_ext({'block_count': 524288, 'reserved_block_count': 0})
+	assert args[args.index('-m') + 1] == '0.00'
+	args = hpcp._build_ext({'block_count': 200000, 'reserved_block_count': 10000})
+	assert args[args.index('-m') + 1] == '5.00'
+
+
+def test_ext_registered_for_all_three_types():
+	for fs_type in ('ext2', 'ext3', 'ext4'):
+		assert hpcp._FS_PARAM_PROBES[fs_type] is hpcp._probe_ext
+		assert hpcp._FS_MKFS_BUILDERS[fs_type] is hpcp._build_ext

@@ -392,7 +392,7 @@ _binCalled = {'lsblk', 'losetup', 'sgdisk', 'blkid', 'umount', 'mount','dd','cp'
 			  'mkudffs', 'mkfs.jfs', 'mkfs.reiserfs', 'newfs', 'mkfs.bfs', 'mkfs.minix', 'mkswap',
 			  'e2fsck', 'btrfs', 'xfs_repair', 'fsck.f2fs', 'ntfsfix', 'fsck.fat', 'fsck.exfat', 'fsck.hfsplus', 
 			  'fsck.hfs', 'fsck.jfs', 'fsck.reiserfs', 'fsck.ufs', 'fsck.minix',
-			  'tune2fs', 'xfs_admin', 'exfatlabel', 'udflabel', 'jfs_tune', 'reiserfstune', 'swaplabel'}
+			  'tune2fs', 'dumpe2fs', 'xfs_admin', 'exfatlabel', 'udflabel', 'jfs_tune', 'reiserfstune', 'swaplabel'}
 [check_path(program) for program in _binCalled]
 
 def run_command_in_multicmd_with_path_check(command, timeout=...,max_threads=1,quiet=False,dry_run=False,strict=False):
@@ -819,6 +819,66 @@ def _run_mkfs_with_fallback(base_command, param_args, target_partition, fs_type)
 		eprint(f"Create fs error: Failed to create {fs_type} on {target_partition}: {err}")
 		return False
 	return True
+
+# Features mke2fs may enable from mke2fs.conf regardless of the source. A plain
+# -O list is *merged* with those defaults, so every curated feature the source
+# lacks has to be negated explicitly or it silently comes back.
+_EXT_CURATED_FEATURES = ('has_journal', 'ext_attr', 'resize_inode', 'dir_index', 'filetype', 'extent',
+						 '64bit', 'flex_bg', 'metadata_csum', 'metadata_csum_seed', 'sparse_super',
+						 'large_file', 'huge_file', 'dir_nlink', 'extra_isize', 'orphan_file',
+						 'fast_commit', 'casefold', 'project', 'quota', 'verity', 'encrypt',
+						 'bigalloc', 'inline_data', 'ea_inode', 'mmp', 'stable_inodes', 'uninit_bg',
+						 'sparse_super2', 'meta_bg')
+# Runtime state, not creation parameters. Never hand these to mke2fs.
+_EXT_RUNTIME_FEATURES = {'needs_recovery', 'orphan_present', 'has_snapshot', 'journal_dev', 'shared_blocks'}
+
+def _probe_ext(device):
+	"""Read ext2/3/4 geometry and features from dumpe2fs."""
+	params = {}
+	for line in run_command_in_multicmd_with_path_check(['dumpe2fs', '-h', device], quiet=True):
+		key, sep, value = line.partition(':')
+		if not sep:
+			continue
+		key = key.strip().lower()
+		value = value.strip()
+		if key == 'filesystem features':
+			params['features'] = value.split()
+		elif key == 'block size':
+			params['block_size'] = int(value)
+		elif key == 'inode size':
+			params['inode_size'] = int(value)
+		elif key == 'inode count':
+			params['inode_count'] = int(value)
+		elif key == 'block count':
+			params['block_count'] = int(value)
+		elif key == 'reserved block count':
+			params['reserved_block_count'] = int(value)
+	return params
+
+def _build_ext(params):
+	"""Translate probed ext parameters into mke2fs arguments."""
+	args = []
+	if params.get('block_size'):
+		args.extend(['-b', str(params['block_size'])])
+	if params.get('inode_size'):
+		args.extend(['-I', str(params['inode_size'])])
+	src_features = [f for f in params.get('features', []) if f not in _EXT_RUNTIME_FEATURES]
+	if src_features:
+		feature_opts = list(src_features) + ['^' + f for f in _EXT_CURATED_FEATURES if f not in src_features]
+		args.extend(['-O', ','.join(feature_opts)])
+	block_count = params.get('block_count')
+	block_size = params.get('block_size')
+	inode_count = params.get('inode_count')
+	if block_count and block_size and inode_count:
+		# Mirror the inode ratio, never the absolute count: -ddr can resize the partition.
+		args.extend(['-i', str(max(1024, (block_count * block_size) // inode_count))])
+	reserved = params.get('reserved_block_count')
+	if block_count and reserved is not None:
+		args.extend(['-m', f"{reserved * 100.0 / block_count:.2f}"])
+	return args
+
+_FS_PARAM_PROBES.update({'ext2': _probe_ext, 'ext3': _probe_ext, 'ext4': _probe_ext})
+_FS_MKFS_BUILDERS.update({'ext2': _build_ext, 'ext3': _build_ext, 'ext4': _build_ext})
 
 def fix_fs(target_partition, fs_type=None):
 	"""
