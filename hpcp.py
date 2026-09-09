@@ -781,6 +781,44 @@ def build_mkfs_params(fs_type, fs_params):
 		eprint(f"FS param build warning: Could not build {fs_type} mkfs parameters: {e}")
 		return []
 
+def _run_mkfs_with_fallback(base_command, param_args, target_partition, fs_type):
+	"""
+	Run mkfs with mirrored source parameters, falling back to defaults if rejected.
+
+	Mirrored parameters can be legitimately invalid on a resized destination (a
+	1 KiB block size on a filesystem grown past 16 TiB, FAT32 on a partition too
+	small for it). A rejected parameter set must degrade to a default filesystem,
+	not abort the copy.
+
+	Args:
+		base_command (list): The mkfs command without the target partition.
+		param_args (list): Mirrored parameter arguments, possibly empty.
+		target_partition (str): Partition to create the filesystem on.
+		fs_type (str): Filesystem type, for messages.
+
+	Returns:
+		bool: True if the filesystem was created by either attempt.
+	"""
+	def _attempt(command):
+		tasks = multiCMD.run_commands([command], timeout=COMMAND_TIMEOUT, max_threads=1, return_object=True)
+		if not tasks:
+			return 1, ''
+		rc = getattr(tasks[0], 'returncode', 1)
+		stderr = getattr(tasks[0], 'stderr', None) or []
+		return rc, (stderr[-1].strip() if stderr else '')
+
+	if param_args:
+		rc, err = _attempt(list(base_command) + list(param_args) + [target_partition])
+		if rc == 0:
+			return True
+		eprint(f"FS param warning: mkfs rejected mirrored {fs_type} parameters {' '.join(param_args)} on {target_partition}: {err}")
+		eprint(f"FS param warning: Retrying with {fs_type} defaults. The destination filesystem will not match the source exactly.")
+	rc, err = _attempt(list(base_command) + [target_partition])
+	if rc != 0:
+		eprint(f"Create fs error: Failed to create {fs_type} on {target_partition}: {err}")
+		return False
+	return True
+
 def fix_fs(target_partition, fs_type=None):
 	"""
 	Fix the file system errors on the specified target partition.
