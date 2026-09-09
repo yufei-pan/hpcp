@@ -387,10 +387,10 @@ def check_path(program_name):
 	return False
 
 _binCalled = {'lsblk', 'losetup', 'sgdisk', 'blkid', 'umount', 'mount','dd','cp', 'xcopy',
-			  'truncate', 
-			  'mkfs', 'mkfs.btrfs', 'mkfs.xfs', 'mkfs.f2fs', 'mkfs.ntfs', 'mkfs.vfat', 'mkfs.exfat', 'mkfs.hfsplus', 
+			  'truncate',
+			  'mkfs', 'mkfs.btrfs', 'mkfs.xfs', 'mkfs.f2fs', 'mkfs.ntfs', 'mkfs.vfat', 'mkfs.exfat', 'mkfs.hfsplus',
 			  'mkudffs', 'mkfs.jfs', 'mkfs.reiserfs', 'newfs', 'mkfs.bfs', 'mkfs.minix', 'mkswap',
-			  'e2fsck', 'btrfs', 'xfs_repair', 'fsck.f2fs', 'ntfsfix', 'fsck.fat', 'fsck.exfat', 'fsck.hfsplus', 
+			  'e2fsck', 'btrfs', 'xfs_repair', 'xfs_info', 'fsck.f2fs', 'ntfsfix', 'fsck.fat', 'fsck.exfat', 'fsck.hfsplus',
 			  'fsck.hfs', 'fsck.jfs', 'fsck.reiserfs', 'fsck.ufs', 'fsck.minix',
 			  'tune2fs', 'dumpe2fs', 'xfs_admin', 'exfatlabel', 'udflabel', 'jfs_tune', 'reiserfstune', 'swaplabel'}
 [check_path(program) for program in _binCalled]
@@ -879,6 +879,67 @@ def _build_ext(params):
 
 _FS_PARAM_PROBES.update({'ext2': _probe_ext, 'ext3': _probe_ext, 'ext4': _probe_ext})
 _FS_MKFS_BUILDERS.update({'ext2': _build_ext, 'ext3': _build_ext, 'ext4': _build_ext})
+
+def _probe_xfs(device):
+	"""
+	Read xfs geometry and features from xfs_info.
+
+	xfs_info groups values into sections (meta-data / data / naming / log /
+	realtime) and reuses key names across them - `bsize` is the block size under
+	`data` but the directory block size under `naming` - so values are bucketed
+	by section rather than flattened.
+	"""
+	params = {}
+	section = ''
+	for line in run_command_in_multicmd_with_path_check(['xfs_info', device], quiet=True):
+		if not line.strip():
+			continue
+		if not line[0].isspace():
+			section = line.split('=')[0].strip()
+		if not section:
+			continue
+		bucket = params.setdefault(section, {})
+		for token in line.replace(',', ' ').split():
+			key, sep, value = token.partition('=')
+			if key and sep and value:
+				bucket[key] = value
+	return params
+
+def _build_xfs(params):
+	"""Translate probed xfs parameters into mkfs.xfs arguments."""
+	meta = params.get('meta-data', {})
+	data = params.get('data', {})
+	naming = params.get('naming', {})
+	args = []
+	if data.get('bsize'):
+		args.extend(['-b', 'size=' + data['bsize']])
+	if meta.get('sectsz'):
+		args.extend(['-s', 'size=' + meta['sectsz']])
+	inode_opts = []
+	if meta.get('isize'):
+		inode_opts.append('size=' + meta['isize'])
+	for key in ('sparse', 'projid32bit', 'nrext64'):
+		if key in meta:
+			inode_opts.append(f'{key}={meta[key]}')
+	if data.get('imaxpct'):
+		inode_opts.append('maxpct=' + data['imaxpct'])
+	if inode_opts:
+		args.extend(['-i', ','.join(inode_opts)])
+	naming_opts = []
+	if naming.get('bsize'):
+		naming_opts.append('size=' + naming['bsize'])
+	if 'ftype' in naming:
+		naming_opts.append('ftype=' + naming['ftype'])
+	if naming_opts:
+		args.extend(['-n', ','.join(naming_opts)])
+	meta_opts = [f'{key}={meta[key]}' for key in ('crc', 'finobt', 'rmapbt', 'reflink', 'bigtime', 'inobtcount') if key in meta]
+	if meta_opts:
+		args.extend(['-m', ','.join(meta_opts)])
+	# Log size and agcount are deliberately not mirrored: both scale with fs size.
+	return args
+
+_FS_PARAM_PROBES['xfs'] = _probe_xfs
+_FS_MKFS_BUILDERS['xfs'] = _build_xfs
 
 def fix_fs(target_partition, fs_type=None):
 	"""

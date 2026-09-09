@@ -282,3 +282,64 @@ def test_ext_registered_for_all_three_types():
 	for fs_type in ('ext2', 'ext3', 'ext4'):
 		assert hpcp._FS_PARAM_PROBES[fs_type] is hpcp._probe_ext
 		assert hpcp._FS_MKFS_BUILDERS[fs_type] is hpcp._build_ext
+
+
+_XFS_INFO_OUTPUT = """meta-data=/dev/loop8p3           isize=1024   agcount=4, agsize=40127 blks
+         =                       sectsz=512   attr=2, projid32bit=1
+         =                       crc=1        finobt=1, sparse=1, rmapbt=1
+         =                       reflink=0    bigtime=1 inobtcount=1 nrext64=1
+         =                       exchange=0   metadir=0
+data     =                       bsize=4096   blocks=160507, imaxpct=25
+         =                       sunit=0      swidth=0 blks
+naming   =version 2              bsize=8192   ascii-ci=0, ftype=1, parent=0
+log      =internal log           bsize=4096   blocks=16384, version=2
+         =                       sectsz=512   sunit=0 blks, lazy-count=1
+realtime =none                   extsz=4096   blocks=0, rtextents=0
+""".splitlines()
+
+
+def test_probe_xfs_parses_sections(monkeypatch):
+	monkeypatch.setattr(hpcp, 'run_command_in_multicmd_with_path_check',
+						lambda command, **kwargs: _XFS_INFO_OUTPUT)
+	params = hpcp._probe_xfs('/dev/fake3')
+	assert params['meta-data']['isize'] == '1024'
+	assert params['meta-data']['sectsz'] == '512'
+	assert params['meta-data']['reflink'] == '0'
+	assert params['meta-data']['crc'] == '1'
+	# bsize appears in three sections; each must land in its own bucket.
+	assert params['data']['bsize'] == '4096'
+	assert params['naming']['bsize'] == '8192'
+	assert params['log']['bsize'] == '4096'
+	assert params['data']['imaxpct'] == '25'
+
+
+def test_build_xfs_mirrors_geometry_and_features(monkeypatch):
+	monkeypatch.setattr(hpcp, 'run_command_in_multicmd_with_path_check',
+						lambda command, **kwargs: _XFS_INFO_OUTPUT)
+	args = hpcp._build_xfs(hpcp._probe_xfs('/dev/fake3'))
+	assert args[args.index('-b') + 1] == 'size=4096'
+	assert args[args.index('-s') + 1] == 'size=512'
+	assert args[args.index('-i') + 1] == 'size=1024,sparse=1,projid32bit=1,nrext64=1,maxpct=25'
+	assert args[args.index('-n') + 1] == 'size=8192,ftype=1'
+	assert args[args.index('-m') + 1] == 'crc=1,finobt=1,rmapbt=1,reflink=0,bigtime=1,inobtcount=1'
+
+
+def test_build_xfs_omits_size_dependent_params(monkeypatch):
+	monkeypatch.setattr(hpcp, 'run_command_in_multicmd_with_path_check',
+						lambda command, **kwargs: _XFS_INFO_OUTPUT)
+	args = hpcp._build_xfs(hpcp._probe_xfs('/dev/fake3'))
+	joined = ' '.join(args)
+	# Log size and agcount scale with filesystem size and must never be mirrored.
+	assert 'agcount' not in joined
+	assert 'logdev' not in joined
+	assert '-l' not in args
+
+
+def test_build_xfs_skips_missing_keys():
+	args = hpcp._build_xfs({'data': {'bsize': '4096'}})
+	assert args == ['-b', 'size=4096']
+
+
+def test_xfs_registered():
+	assert hpcp._FS_PARAM_PROBES['xfs'] is hpcp._probe_xfs
+	assert hpcp._FS_MKFS_BUILDERS['xfs'] is hpcp._build_xfs
