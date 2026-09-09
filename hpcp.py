@@ -800,7 +800,8 @@ def _run_mkfs_with_fallback(base_command, param_args, target_partition, fs_type)
 		bool: True if the filesystem was created by either attempt.
 	"""
 	def _attempt(command):
-		tasks = multiCMD.run_commands([command], timeout=COMMAND_TIMEOUT, max_threads=1, return_object=True)
+		resolved = [_binPaths.get(command[0], command[0])] + list(command[1:])
+		tasks = multiCMD.run_commands([resolved], timeout=COMMAND_TIMEOUT, max_threads=1, return_object=True)
 		if not tasks:
 			return 1, ''
 		rc = getattr(tasks[0], 'returncode', 1)

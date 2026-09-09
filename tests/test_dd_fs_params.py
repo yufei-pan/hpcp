@@ -84,6 +84,7 @@ def test_mkfs_fallback_uses_mirrored_params_when_they_succeed(monkeypatch):
 		calls.append(list(commands[0]))
 		return [_FakeTask(0)]
 
+	monkeypatch.setattr(hpcp, '_binPaths', {})
 	monkeypatch.setattr(hpcp.multiCMD, 'run_commands', fake_run)
 	ok = hpcp._run_mkfs_with_fallback(['mkfs', '-t', 'ext4'], ['-b', '1024'], '/dev/fake1', 'ext4')
 	assert ok is True
@@ -99,6 +100,7 @@ def test_mkfs_fallback_retries_without_params_on_failure(monkeypatch):
 		# First attempt (with mirrored params) fails, second succeeds.
 		return [_FakeTask(1, ['invalid block size'])] if len(calls) == 1 else [_FakeTask(0)]
 
+	monkeypatch.setattr(hpcp, '_binPaths', {})
 	monkeypatch.setattr(hpcp.multiCMD, 'run_commands', fake_run)
 	ok = hpcp._run_mkfs_with_fallback(['mkfs', '-t', 'ext4'], ['-b', '1024'], '/dev/fake1', 'ext4')
 	assert ok is True
@@ -111,6 +113,7 @@ def test_mkfs_fallback_reports_failure_when_both_attempts_fail(monkeypatch):
 	def fake_run(commands, **kwargs):
 		return [_FakeTask(1, ['no such device'])]
 
+	monkeypatch.setattr(hpcp, '_binPaths', {})
 	monkeypatch.setattr(hpcp.multiCMD, 'run_commands', fake_run)
 	assert hpcp._run_mkfs_with_fallback(['mkfs', '-t', 'ext4'], ['-b', '1024'], '/dev/fake1', 'ext4') is False
 
@@ -122,6 +125,24 @@ def test_mkfs_fallback_single_attempt_when_no_params(monkeypatch):
 		calls.append(list(commands[0]))
 		return [_FakeTask(0)]
 
+	monkeypatch.setattr(hpcp, '_binPaths', {})
 	monkeypatch.setattr(hpcp.multiCMD, 'run_commands', fake_run)
 	assert hpcp._run_mkfs_with_fallback(['mkfs.xfs'], [], '/dev/fake1', 'xfs') is True
 	assert calls == [['mkfs.xfs', '/dev/fake1']]
+
+
+def test_mkfs_fallback_resolves_binary_path_from_binpaths(monkeypatch):
+	calls = []
+
+	def fake_run(commands, **kwargs):
+		calls.append(list(commands[0]))
+		return [_FakeTask(0)]
+
+	monkeypatch.setattr(hpcp, '_binPaths', {'mkfs': '/usr/sbin/mkfs'})
+	monkeypatch.setattr(hpcp.multiCMD, 'run_commands', fake_run)
+	ok = hpcp._run_mkfs_with_fallback(['mkfs', '-t', 'ext4'], ['-b', '1024'], '/dev/fake1', 'ext4')
+	assert ok is True
+	assert len(calls) == 1
+	# Verify the resolved path is used, remaining args are preserved
+	assert calls[0][0] == '/usr/sbin/mkfs'
+	assert calls[0][1:] == ['-t', 'ext4', '-b', '1024', '/dev/fake1']
