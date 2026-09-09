@@ -490,3 +490,110 @@ def test_dead_fat_width_branches_removed():
 	src = inspect.getsource(hpcp.write_partition_info)
 	assert "'-F', '16'" not in src
 	assert "'-F', '12'" not in src
+
+
+_NTFSINFO_OUTPUT = """Volume Information
+	Name of device: /dev/fake5
+	Device state: 11
+	Volume Name: NT
+	Volume State: 1
+	Volume Version: 3.1
+	Sector Size: 512
+	Cluster Size: 8192
+	Index Block Size: 4096
+	Volume Size in Clusters: 25599
+""".splitlines()
+
+_DUMP_EXFAT_OUTPUT = """exfatprogs version : 1.2.9
+-------------- Dump Boot sector region --------------
+Volume Length(sectors):                  409600
+FAT Offset(sector offset):               2048
+FAT Length(sectors):                     13
+Cluster Heap Offset (sector offset):     4096
+Cluster Count:                           1584
+Root Cluster (cluster offset):           4
+Volume Serial:                           0xebe5bdee
+Bytes per Sector:                        512
+Sectors per Cluster:                     256
+
+---------------- Show the statistics ----------------
+Cluster size:                            131072
+""".splitlines()
+
+_DUMP_F2FS_OUTPUT = """Info: Debug level = 1
+Info: superblock features = 4 : extra_attr
+Info: superblock encrypt level = 0, salt = 00000000000000000000000000000000
+magic                         		[0xf2f52010 : 4076150800]
+major_ver                     		[0x       1 : 1]
+volum_name                    		[F2]
+log_sectorsize                		[0x       9 : 9]
+log_sectors_per_block         		[0x       3 : 3]
+log_blocksize                 		[0x       c : 12]
+log_blocks_per_seg            		[0x       9 : 9]
+segs_per_sec                  		[0x       2 : 2]
+secs_per_zone                 		[0x       1 : 1]
+block_count                   		[0x   12c00 : 76800]
+""".splitlines()
+
+
+def test_probe_ntfs_reads_cluster_and_sector_size(monkeypatch):
+	monkeypatch.setattr(hpcp, 'run_command_in_multicmd_with_path_check',
+						lambda command, **kwargs: _NTFSINFO_OUTPUT)
+	params = hpcp._probe_ntfs('/dev/fake5')
+	assert params['cluster_size'] == 8192
+	assert params['sector_size'] == 512
+
+
+def test_build_ntfs():
+	args = hpcp._build_ntfs({'cluster_size': 8192, 'sector_size': 512})
+	assert args == ['-c', '8192', '-s', '512']
+
+
+def test_probe_exfat_reads_geometry(monkeypatch):
+	monkeypatch.setattr(hpcp, 'run_command_in_multicmd_with_path_check',
+						lambda command, **kwargs: _DUMP_EXFAT_OUTPUT)
+	params = hpcp._probe_exfat('/dev/fake6')
+	assert params['sector_size'] == 512
+	assert params['cluster_size'] == 131072
+
+
+def test_build_exfat():
+	args = hpcp._build_exfat({'sector_size': 512, 'cluster_size': 131072})
+	assert args == ['-s', '512', '-c', '131072']
+
+
+def test_probe_f2fs_reads_geometry_and_features(monkeypatch):
+	monkeypatch.setattr(hpcp, 'run_command_in_multicmd_with_path_check',
+						lambda command, **kwargs: _DUMP_F2FS_OUTPUT)
+	params = hpcp._probe_f2fs('/dev/fake7')
+	assert params['log_sectorsize'] == 9
+	assert params['segs_per_sec'] == 2
+	assert params['secs_per_zone'] == 1
+	assert params['features'] == ['extra_attr']
+
+
+def test_build_f2fs_converts_log_sector_size(monkeypatch):
+	monkeypatch.setattr(hpcp, 'run_command_in_multicmd_with_path_check',
+						lambda command, **kwargs: _DUMP_F2FS_OUTPUT)
+	args = hpcp._build_f2fs(hpcp._probe_f2fs('/dev/fake7'))
+	assert args[args.index('-w') + 1] == '512'
+	assert args[args.index('-s') + 1] == '2'
+	assert args[args.index('-z') + 1] == '1'
+	assert args[args.index('-O') + 1] == 'extra_attr'
+
+
+def test_probe_f2fs_handles_no_features(monkeypatch):
+	no_features = ['Info: superblock features = 0 : ', 'log_sectorsize                \t\t[0x       9 : 9]']
+	monkeypatch.setattr(hpcp, 'run_command_in_multicmd_with_path_check',
+						lambda command, **kwargs: no_features)
+	params = hpcp._probe_f2fs('/dev/fake7')
+	assert params['features'] == []
+	assert '-O' not in hpcp._build_f2fs(params)
+
+
+def test_ntfs_exfat_f2fs_registered():
+	for fs_type, probe, builder in (('ntfs', hpcp._probe_ntfs, hpcp._build_ntfs),
+									('exfat', hpcp._probe_exfat, hpcp._build_exfat),
+									('f2fs', hpcp._probe_f2fs, hpcp._build_f2fs)):
+		assert hpcp._FS_PARAM_PROBES[fs_type] is probe
+		assert hpcp._FS_MKFS_BUILDERS[fs_type] is builder

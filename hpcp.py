@@ -390,7 +390,8 @@ _binCalled = {'lsblk', 'losetup', 'sgdisk', 'blkid', 'umount', 'mount','dd','cp'
 			  'truncate',
 			  'mkfs', 'mkfs.btrfs', 'mkfs.xfs', 'mkfs.f2fs', 'mkfs.ntfs', 'mkfs.vfat', 'mkfs.exfat', 'mkfs.hfsplus',
 			  'mkudffs', 'mkfs.jfs', 'mkfs.reiserfs', 'newfs', 'mkfs.bfs', 'mkfs.minix', 'mkswap',
-			  'e2fsck', 'btrfs', 'xfs_repair', 'xfs_info', 'fsck.f2fs', 'ntfsfix', 'fsck.fat', 'fsck.exfat', 'fsck.hfsplus',
+			  'e2fsck', 'btrfs', 'xfs_repair', 'xfs_info', 'fsck.f2fs', 'dump.f2fs', 'ntfsfix', 'ntfsinfo',
+			  'fsck.fat', 'fsck.exfat', 'dump.exfat', 'fsck.hfsplus',
 			  'fsck.hfs', 'fsck.jfs', 'fsck.reiserfs', 'fsck.ufs', 'fsck.minix',
 			  'tune2fs', 'dumpe2fs', 'xfs_admin', 'exfatlabel', 'udflabel', 'jfs_tune', 'reiserfstune', 'swaplabel'}
 [check_path(program) for program in _binCalled]
@@ -1058,6 +1059,90 @@ for _fat_alias in ('vfat', 'fat', 'fat12', 'fat16', 'fat32', 'msdos'):
 	_FS_PARAM_PROBES[_fat_alias] = _probe_vfat
 	_FS_MKFS_BUILDERS[_fat_alias] = _build_vfat
 del _fat_alias
+
+def _probe_ntfs(device):
+	"""Read ntfs cluster and sector size from ntfsinfo."""
+	params = {}
+	for line in run_command_in_multicmd_with_path_check(['ntfsinfo', '-m', device], quiet=True):
+		key, sep, value = line.partition(':')
+		if not sep:
+			continue
+		key = key.strip().lower()
+		value = value.strip()
+		if key == 'cluster size' and value.isdigit():
+			params['cluster_size'] = int(value)
+		elif key == 'sector size' and value.isdigit():
+			params['sector_size'] = int(value)
+	return params
+
+def _build_ntfs(params):
+	"""Translate probed ntfs parameters into mkfs.ntfs arguments."""
+	args = []
+	if params.get('cluster_size'):
+		args.extend(['-c', str(params['cluster_size'])])
+	if params.get('sector_size'):
+		args.extend(['-s', str(params['sector_size'])])
+	return args
+
+def _probe_exfat(device):
+	"""Read exfat sector and cluster size from dump.exfat."""
+	params = {}
+	for line in run_command_in_multicmd_with_path_check(['dump.exfat', device], quiet=True):
+		key, sep, value = line.partition(':')
+		if not sep:
+			continue
+		key = key.strip().lower()
+		value = value.strip()
+		if key == 'bytes per sector' and value.isdigit():
+			params['sector_size'] = int(value)
+		elif key == 'cluster size' and value.isdigit():
+			params['cluster_size'] = int(value)
+	return params
+
+def _build_exfat(params):
+	"""Translate probed exfat parameters into mkfs.exfat arguments."""
+	args = []
+	if params.get('sector_size'):
+		args.extend(['-s', str(params['sector_size'])])
+	if params.get('cluster_size'):
+		args.extend(['-c', str(params['cluster_size'])])
+	return args
+
+# mkfs.f2fs enables no features by default and has no negation syntax, so the
+# source's feature list is applied additively rather than as a delta.
+def _probe_f2fs(device):
+	"""Read f2fs geometry and features from dump.f2fs."""
+	params = {}
+	for line in run_command_in_multicmd_with_path_check(['dump.f2fs', '-d', '1', device], quiet=True):
+		if 'superblock features' in line:
+			names = line.rpartition(':')[2]
+			params['features'] = [n.strip() for n in names.replace(',', ' ').split() if n.strip()]
+			continue
+		fields = line.split()
+		if not fields or '[' not in line or ':' not in line:
+			continue
+		if fields[0] not in ('log_sectorsize', 'segs_per_sec', 'secs_per_zone'):
+			continue
+		value = line.rpartition(':')[2].strip().rstrip(']').strip()
+		if value.isdigit():
+			params[fields[0]] = int(value)
+	return params
+
+def _build_f2fs(params):
+	"""Translate probed f2fs parameters into mkfs.f2fs arguments."""
+	args = []
+	if params.get('log_sectorsize'):
+		args.extend(['-w', str(1 << params['log_sectorsize'])])
+	if params.get('segs_per_sec'):
+		args.extend(['-s', str(params['segs_per_sec'])])
+	if params.get('secs_per_zone'):
+		args.extend(['-z', str(params['secs_per_zone'])])
+	if params.get('features'):
+		args.extend(['-O', ','.join(params['features'])])
+	return args
+
+_FS_PARAM_PROBES.update({'ntfs': _probe_ntfs, 'exfat': _probe_exfat, 'f2fs': _probe_f2fs})
+_FS_MKFS_BUILDERS.update({'ntfs': _build_ntfs, 'exfat': _build_exfat, 'f2fs': _build_f2fs})
 
 def fix_fs(target_partition, fs_type=None):
 	"""
