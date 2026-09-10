@@ -60,11 +60,13 @@ For partitions that **hpcp** cannot create a separate unique mount point, **hpcp
 ### Filesystem parameter mirroring
 
 In `-dd` mode `hpcp` reads each source filesystem's creation parameters and recreates the
-destination with the same geometry and feature set, instead of whatever the local `mkfs` defaults
-happen to be. This covers ext2/3/4 (block size, inode size, inode ratio, reserved percentage, full
-feature set), xfs (block/sector/inode/directory geometry and v5 feature flags), btrfs (nodesize,
-sectorsize, checksum type, features), FAT (width, sector and cluster size, FAT count, reserved
-sectors), ntfs, exfat, f2fs, udf, reiserfs, hfs+, and minix.
+destination with matching geometry and features, instead of whatever the local `mkfs` defaults
+happen to be. Coverage varies by filesystem: ext2/3/4 (block size, inode size, inode ratio, reserved
+percentage, full feature set), xfs (block/sector/inode/directory geometry and v5 feature flags),
+btrfs (nodesize, sectorsize, checksum type, features), FAT (width, sector and cluster size, FAT
+count, reserved sectors), ntfs and exfat (cluster and sector size), f2fs (geometry and features),
+udf and reiserfs (block size and format), hfs+ (allocation block size), and minix (filesystem
+version and filename length).
 
 Without it, a clone built on a modern host can be unmountable or unbootable on the system it came
 from — for example a FAT32 EFI System Partition recreated as FAT16, or an ext4 `/boot` that gains
