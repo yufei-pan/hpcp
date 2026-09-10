@@ -87,6 +87,23 @@ def test_get_rc_from_error_returns_zero_for_fs_param_warning_only():
 		hpcp.ERRORS.extend(saved_errors)
 
 
+def test_get_rc_from_error_returns_nonzero_for_create_fs_error_only():
+	# Sibling to the test above, pinning the follow-up correction: unlike the
+	# three FS param *warnings* (a successful copy that degraded to mkfs
+	# defaults), "Create fs error" means every fallback tier in
+	# _run_mkfs_with_fallback failed and the destination partition has no
+	# filesystem at all - a real failure that must keep a non-zero exit code,
+	# not be flattened to 0 alongside the warnings.
+	saved_errors = list(hpcp.ERRORS)
+	hpcp.ERRORS.clear()
+	hpcp.ERRORS.append('Create fs error: Failed to create ext4 on /dev/loop0p1: no such device')
+	try:
+		assert hpcp.get_rc_from_error() == 187
+	finally:
+		hpcp.ERRORS.clear()
+		hpcp.ERRORS.extend(saved_errors)
+
+
 def test_build_mkfs_params_unknown_type_returns_empty_list():
 	assert hpcp.build_mkfs_params('no_such_fs', {'block_size': 4096}) == []
 

@@ -172,6 +172,11 @@ ERROR_TO_RETURNCODE_TABLE = {
 	'Cannot create cramfs file system': 184,	
 	'Cannot create iso9660 file system': 185,
 	'Not supported fs for creating': 186,
+	# _run_mkfs_with_fallback() has exhausted every tier (mirrored params, the
+	# -O-stripped retry, and bare defaults) and the destination partition has
+	# no filesystem at all - a real partition-level failure, not a degrade,
+	# so unlike the FS param warnings below it keeps a non-zero code.
+	'Create fs error': 187,
 	'Copy failed': 190,
 	'Copy process crashed': 191,
 	'Remove process exception': 192,
@@ -201,12 +206,14 @@ ERROR_TO_RETURNCODE_TABLE = {
 	'DD source type error': 233,
 	'Source partition larger than destination partition': 234,
 	'No source paths': 240,
-	# FS param mirroring warnings: these report a degrade-to-default, not a
-	# failed copy, so they must not inflate the overall exit code.
+	# FS param mirroring warnings: each of these reports a successful copy that
+	# degraded to mkfs defaults (a probe/build failure, or mkfs rejecting the
+	# mirrored parameters), not a failed one, so they must not inflate the
+	# overall exit code. (Create fs error is a real failure, not a degrade -
+	# it keeps a non-zero code in the partition-failure family above.)
 	'FS param probe warning': 0,
 	'FS param build warning': 0,
 	'FS param warning': 0,
-	'Create fs error': 0,
 }
 RETURNCODE_TO_ERROR_TABLE = {v: k for k, v in ERROR_TO_RETURNCODE_TABLE.items()}
 
