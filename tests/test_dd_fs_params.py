@@ -774,6 +774,52 @@ def _partition_params(image, index, fs_type):
 		subprocess.run(['losetup', '-d', loop], check=False, capture_output=True)
 
 
+def _detach_loops_for_image(image):
+	"""Detach every loop device still backed by `image`.
+
+	hpcp.py -dd leaves its own read-only *source* loop attached after it
+	returns - a documented, pre-existing leak that is out of scope for this
+	test task to fix in hpcp.py. This compensates on the test side so a
+	repeated or CI run does not keep accumulating attached loop devices on
+	the host. Scoped strictly to this image's own backing file (via
+	`losetup -j`), so unrelated loop devices - e.g. this host's snap-package
+	loops - are never touched.
+	"""
+	try:
+		output = _run('losetup', '-j', image)
+	except subprocess.CalledProcessError:
+		return
+	for line in output.splitlines():
+		device = line.partition(':')[0].strip()
+		if device:
+			subprocess.run(['losetup', '-d', device], check=False, capture_output=True)
+
+
+def _run_hpcp_dd(extra_args, src, dest, timeout=900):
+	"""Run `hpcp.py -dd [extra_args] src dest` and fail loudly if it crashes.
+
+	A successful -dd run exits 0: hpcp's dd path deliberately ends by raising
+	RuntimeError("Exiting after dd mode.") internally, but hpcp() catches
+	that itself, eprints a message with no colon in it (so it is not counted
+	as an error), and returns get_rc_from_error() == 0 - confirmed empirically
+	by running a successful -dd here and inspecting its actual exit code
+	before writing this assertion. A crash (e.g. the pre-existing -dd
+	partition-table-sizing bug) leaves a returncode that get_rc_from_error()
+	maps away from 0, so asserting on it directly surfaces hpcp's own
+	stdout/stderr in the pytest failure instead of a bare, opaque KeyError
+	from a later probe of a destination that never got a filesystem.
+	"""
+	hpcp_py = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'hpcp.py')
+	open(dest, 'wb').close()
+	result = subprocess.run([sys.executable, hpcp_py, '-dd', *extra_args, src, dest],
+							 stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=timeout)
+	assert result.returncode == 0, (
+		f"hpcp.py -dd {' '.join(extra_args)} {src} {dest} exited {result.returncode}\n"
+		f"--- hpcp stdout ---\n{result.stdout}\n--- hpcp stderr ---\n{result.stderr}"
+	)
+	return result
+
+
 def _build_three_partition_source(tmp_path):
 	"""Build the shared 1400 MiB / three-partition source image.
 
@@ -823,33 +869,35 @@ def test_dd_roundtrip_preserves_source_fs_params(tmp_path):
 	src = _build_three_partition_source(tmp_path)
 	dest = str(tmp_path / 'dest.img')
 
-	src_fat = _partition_params(src, 1, 'vfat')
-	src_ext = _partition_params(src, 2, 'ext4')
-	src_xfs = _partition_params(src, 3, 'xfs')
+	try:
+		src_fat = _partition_params(src, 1, 'vfat')
+		src_ext = _partition_params(src, 2, 'ext4')
+		src_xfs = _partition_params(src, 3, 'xfs')
 
-	hpcp_py = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'hpcp.py')
-	open(dest, 'wb').close()
-	subprocess.run([sys.executable, hpcp_py, '-dd', src, dest],
-				   stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=900)
+		_run_hpcp_dd([], src, dest)
 
-	dest_fat = _partition_params(dest, 1, 'vfat')
-	dest_ext = _partition_params(dest, 2, 'ext4')
-	dest_xfs = _partition_params(dest, 3, 'xfs')
+		dest_fat = _partition_params(dest, 1, 'vfat')
+		dest_ext = _partition_params(dest, 2, 'ext4')
+		dest_xfs = _partition_params(dest, 3, 'xfs')
 
-	# The ESP must stay FAT32; plain mkfs.vfat picks FAT16 at this size.
-	assert dest_fat['fat_bits'] == src_fat['fat_bits'] == 32
-	assert dest_fat['cluster_size'] == src_fat['cluster_size']
+		# The ESP must stay FAT32; plain mkfs.vfat picks FAT16 at this size.
+		assert dest_fat['fat_bits'] == src_fat['fat_bits'] == 32
+		assert dest_fat['cluster_size'] == src_fat['cluster_size']
 
-	assert dest_ext['block_size'] == src_ext['block_size'] == 1024
-	assert dest_ext['inode_size'] == src_ext['inode_size'] == 128
-	assert dest_ext['reserved_block_count'] == 0
-	assert sorted(dest_ext['features']) == sorted(src_ext['features'])
-	for absent in ('64bit', 'metadata_csum', 'dir_index'):
-		assert absent not in dest_ext['features']
+		assert dest_ext['block_size'] == src_ext['block_size'] == 1024
+		assert dest_ext['inode_size'] == src_ext['inode_size'] == 128
+		assert dest_ext['reserved_block_count'] == 0
+		assert sorted(dest_ext['features']) == sorted(src_ext['features'])
+		for absent in ('64bit', 'metadata_csum', 'dir_index'):
+			assert absent not in dest_ext['features']
 
-	assert dest_xfs['meta-data']['isize'] == src_xfs['meta-data']['isize'] == '1024'
-	assert dest_xfs['naming']['bsize'] == src_xfs['naming']['bsize'] == '8192'
-	assert dest_xfs['meta-data']['reflink'] == src_xfs['meta-data']['reflink'] == '0'
+		assert dest_xfs['meta-data']['isize'] == src_xfs['meta-data']['isize'] == '1024'
+		assert dest_xfs['naming']['bsize'] == src_xfs['naming']['bsize'] == '8192'
+		assert dest_xfs['meta-data']['reflink'] == src_xfs['meta-data']['reflink'] == '0'
+	finally:
+		# hpcp -dd leaves its own read-only source loop attached; see
+		# _detach_loops_for_image's docstring.
+		_detach_loops_for_image(src)
 
 
 @requires_root_and_tools
@@ -862,14 +910,16 @@ def test_dd_roundtrip_uses_defaults_with_no_fs_param_mirror(tmp_path):
 	src = _build_three_partition_source(tmp_path)
 	dest = str(tmp_path / 'dest.img')
 
-	src_ext = _partition_params(src, 2, 'ext4')
-	assert src_ext['block_size'] == 1024
+	try:
+		src_ext = _partition_params(src, 2, 'ext4')
+		assert src_ext['block_size'] == 1024
 
-	hpcp_py = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'hpcp.py')
-	open(dest, 'wb').close()
-	subprocess.run([sys.executable, hpcp_py, '-dd', '-nfp', src, dest],
-				   stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=900)
+		_run_hpcp_dd(['-nfp'], src, dest)
 
-	dest_ext = _partition_params(dest, 2, 'ext4')
-	# -nfp restores today's behaviour: mkfs defaults, not the source's 1 KiB blocks.
-	assert dest_ext['block_size'] == 4096
+		dest_ext = _partition_params(dest, 2, 'ext4')
+		# -nfp restores today's behaviour: mkfs defaults, not the source's 1 KiB blocks.
+		assert dest_ext['block_size'] == 4096
+	finally:
+		# hpcp -dd leaves its own read-only source loop attached; see
+		# _detach_loops_for_image's docstring.
+		_detach_loops_for_image(src)
