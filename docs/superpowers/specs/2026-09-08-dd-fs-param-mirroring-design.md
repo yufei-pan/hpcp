@@ -163,7 +163,7 @@ warning line.
 | ntfs | `ntfsinfo -m` | `-c` cluster size, `-s` sector size |
 | exfat | `dump.exfat` | `-c` cluster size, `-b` boundary alignment |
 | f2fs | `dump.f2fs` | `-w` sector size, `-O` feature list |
-| udf | `udfinfo` | `--blocksize`, `--udfrev`, `--media-type` |
+| udf | `udfinfo` | `--blocksize`, `--udfrev` |
 | reiserfs | `debugreiserfs` | `-b` block size |
 | jfs | `jfs_tune -l` | block size where reported (jfs is effectively fixed at 4096; likely a no-op entry) |
 | hfs / hfsplus | `fsck.hfsplus -n` | `-b` block size where reported |
@@ -237,11 +237,13 @@ equal the source's. Skipped unless running as root with the required tools prese
 
 Honest coverage split:
 
-- **Round-trip verified:** ext2/3/4, xfs, btrfs, vfat — and ntfs, exfat, f2fs where their tools are
-  installed.
-- **Fixture-tested only, not round-trip verified:** jfs, reiserfs, udf, hfs/hfsplus, minix, bfs,
-  ufs. Their probes and builders are written against documented tool output formats. This
-  limitation is stated here deliberately rather than implied away.
+- **Round-trip verified by the automated suite:** ext2/3/4, xfs, vfat.
+- **Manually verified, not covered by the automated round-trip suite:** btrfs, ntfs, exfat, f2fs,
+  jfs, reiserfs, udf, hfs/hfsplus, minix, bfs, ufs. Each was exercised manually per-task during
+  development, and the final whole-branch review replayed all of them again successfully — but
+  their probes and builders are otherwise only fixture-tested (Tier 1), against documented tool
+  output formats, with no automated live round-trip. This limitation is stated here deliberately
+  rather than implied away.
 
 ## Success criteria
 

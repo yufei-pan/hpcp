@@ -50,6 +50,43 @@ def test_probe_fs_params_never_raises_on_probe_error():
 		del hpcp._FS_PARAM_PROBES['test_boom_fs']
 
 
+def test_probe_fs_params_truncates_errors_left_by_failed_tool():
+	# Pins finding 2: run_command_in_multicmd_with_path_check appends
+	# "Task return code error: ..." to the global ERRORS even with quiet=True
+	# (hpcp.py ~465-467), so a probe tool that exits non-zero (e.g. fsck.fat -nv
+	# on a FAT with the dirty bit set) must not leave that entry behind - a
+	# clean copy must not come out of it with a poisoned exit code.
+	def fake_probe_like_a_failed_quiet_tool(device):
+		hpcp.ERRORS.append(f"Task return code error: Command '['dumpe2fs', '-h', '{device}']' failed with return code 19.")
+		return {}
+	hpcp._FS_PARAM_PROBES['test_quiet_fail_fs'] = fake_probe_like_a_failed_quiet_tool
+	saved_errors = list(hpcp.ERRORS)
+	hpcp.ERRORS.clear()
+	try:
+		result = hpcp.probe_fs_params('/dev/null', 'test_quiet_fail_fs')
+		assert result == {}
+		assert hpcp.ERRORS == []
+	finally:
+		del hpcp._FS_PARAM_PROBES['test_quiet_fail_fs']
+		hpcp.ERRORS.clear()
+		hpcp.ERRORS.extend(saved_errors)
+
+
+def test_get_rc_from_error_returns_zero_for_fs_param_warning_only():
+	# Pins finding 1: none of this branch's warning prefixes used to be
+	# registered in ERROR_TO_RETURNCODE_TABLE, so when one was the only entry
+	# in ERRORS, get_rc_from_error()'s max() over an empty filtered generator
+	# raised ValueError at the very end of an otherwise successful -dd run.
+	saved_errors = list(hpcp.ERRORS)
+	hpcp.ERRORS.clear()
+	hpcp.ERRORS.append('FS param warning: mkfs rejected mirrored btrfs parameters -O ^squota on /dev/loop0p1: err')
+	try:
+		assert hpcp.get_rc_from_error() == 0
+	finally:
+		hpcp.ERRORS.clear()
+		hpcp.ERRORS.extend(saved_errors)
+
+
 def test_build_mkfs_params_unknown_type_returns_empty_list():
 	assert hpcp.build_mkfs_params('no_such_fs', {'block_size': 4096}) == []
 
@@ -73,6 +110,47 @@ def test_partition_details_dict_has_fs_params_key():
 	import inspect
 	src = inspect.getsource(hpcp.get_partition_details)
 	assert "'fs_params'" in src
+
+
+def test_get_partition_details_skips_probe_when_mirroring_disabled(monkeypatch):
+	# Pins finding 3: -nfp must stop hpcp from spawning probe tools at all
+	# (dumpe2fs / xfs_info / fsck.fat -nv / btrfs dump-super / ...), not just
+	# discard the probed result later in write_partition_info.
+	sgdisk_output = [
+		'Partition GUID code: C12A7328-F81F-11D2-BA4B-00A0C93EC93B (EFI System)',
+		'Partition unique GUID: 11111111-1111-1111-1111-111111111111',
+		"Partition name: 'ESP'",
+		'Attribute flags: 0000000000000000',
+		'Partition size: 2048 sectors (1.0 MiB)',
+	]
+	blkid_output = ['TYPE=vfat']
+
+	def fake_run_cmd(command, **kwargs):
+		if command[0] == 'sgdisk':
+			return sgdisk_output
+		if command[0] == 'blkid':
+			return blkid_output
+		return ['']
+
+	probe_calls = []
+
+	def spy_probe(target_partition, fs_type):
+		probe_calls.append((target_partition, fs_type))
+		return {}
+
+	monkeypatch.setattr(hpcp, 'run_command_in_multicmd_with_path_check', fake_run_cmd)
+	monkeypatch.setattr(hpcp, 'get_target_partition', lambda device, partition: (device, None))
+	monkeypatch.setattr(hpcp, 'probe_fs_params', spy_probe)
+	monkeypatch.setattr(hpcp, 'MIRROR_FS_PARAMS', False)
+
+	hpcp.get_partition_details.cache_clear()
+	try:
+		result = hpcp.get_partition_details('/dev/fake_nfp_test_img', '1')
+		assert probe_calls == []
+		assert result['fs_type'] == 'vfat'
+		assert result['fs_params'] == {}
+	finally:
+		hpcp.get_partition_details.cache_clear()
 
 
 class _FakeTask:
@@ -150,6 +228,34 @@ def test_mkfs_fallback_resolves_binary_path_from_binpaths(monkeypatch):
 	# Verify the resolved path is used, remaining args are preserved
 	assert calls[0][0] == '/usr/sbin/mkfs'
 	assert calls[0][1:] == ['-t', 'ext4', '-b', '1024', '/dev/fake1']
+
+
+def test_mkfs_fallback_drops_only_dash_o_on_middle_retry(monkeypatch):
+	# Pins finding 4: an unrecognised -O feature name must not drag down the
+	# rest of the mirrored parameters (block size, inode size, -m, ...) with
+	# it. When -O is present and the full set is rejected, the middle retry
+	# must strip only the -O pair and keep everything else, before falling
+	# all the way back to bare defaults.
+	calls = []
+
+	def fake_run(commands, **kwargs):
+		calls.append(list(commands[0]))
+		# First two attempts fail; the third (bare defaults) succeeds.
+		return [_FakeTask(0)] if len(calls) >= 3 else [_FakeTask(1, [f'attempt {len(calls)} rejected'])]
+
+	monkeypatch.setattr(hpcp, '_binPaths', {})
+	monkeypatch.setattr(hpcp.multiCMD, 'run_commands', fake_run)
+	param_args = ['-b', '1024', '-O', 'has_journal,^orphan_file', '-m', '0.00']
+	ok = hpcp._run_mkfs_with_fallback(['mkfs', '-t', 'ext4'], param_args, '/dev/fake1', 'ext4')
+
+	assert ok is True
+	assert len(calls) == 3
+	# Attempt 1: the full mirrored parameter set, -O included.
+	assert calls[0] == ['mkfs', '-t', 'ext4', '-b', '1024', '-O', 'has_journal,^orphan_file', '-m', '0.00', '/dev/fake1']
+	# Attempt 2: -O and its value gone, the other mirrored parameters kept.
+	assert calls[1] == ['mkfs', '-t', 'ext4', '-b', '1024', '-m', '0.00', '/dev/fake1']
+	# Attempt 3: bare defaults, no mirrored parameters at all.
+	assert calls[2] == ['mkfs', '-t', 'ext4', '/dev/fake1']
 
 
 def test_write_partition_info_applies_mirrored_params(monkeypatch):
@@ -754,7 +860,8 @@ def test_hfsplus_minix_registered():
 
 
 _ROUNDTRIP_TOOLS = ('losetup', 'sgdisk', 'mkfs.vfat', 'mkfs.ext4', 'mkfs.xfs',
-					'blkid', 'dumpe2fs', 'xfs_info', 'fsck.fat', 'truncate')
+					'blkid', 'dumpe2fs', 'xfs_info', 'fsck.fat', 'truncate',
+					'mount', 'umount', 'udevadm')
 
 requires_root_and_tools = pytest.mark.skipif(
 	os.geteuid() != 0 or any(shutil.which(t) is None for t in _ROUNDTRIP_TOOLS),

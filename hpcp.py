@@ -201,6 +201,12 @@ ERROR_TO_RETURNCODE_TABLE = {
 	'DD source type error': 233,
 	'Source partition larger than destination partition': 234,
 	'No source paths': 240,
+	# FS param mirroring warnings: these report a degrade-to-default, not a
+	# failed copy, so they must not inflate the overall exit code.
+	'FS param probe warning': 0,
+	'FS param build warning': 0,
+	'FS param warning': 0,
+	'Create fs error': 0,
 }
 RETURNCODE_TO_ERROR_TABLE = {v: k for k, v in ERROR_TO_RETURNCODE_TABLE.items()}
 
@@ -231,7 +237,12 @@ def get_rc_from_error():
 		print('Done.')
 		rc = 0
 	else:
-		rc = max(ERROR_TO_RETURNCODE_TABLE.get(error.partition(':')[0], 128) for error in ERRORS if error.partition(':')[0] in ERROR_TO_RETURNCODE_TABLE)
+		# default=0: ERRORS can hold messages whose prefix is not in the table (a
+		# gap the four FS param mirroring prefixes used to fall into before they
+		# were registered above); without a default, an all-unregistered ERRORS
+		# makes this a call to max() on an empty sequence, which raises ValueError
+		# at the very end of an otherwise successful run.
+		rc = max((ERROR_TO_RETURNCODE_TABLE.get(error.partition(':')[0], 128) for error in ERRORS if error.partition(':')[0] in ERROR_TO_RETURNCODE_TABLE), default=0)
 		print(f'Error occurred: {ERRORS}, return code: {rc}.')
 	ERRORS.clear()
 	return rc
@@ -754,11 +765,26 @@ def probe_fs_params(target_partition, fs_type):
 	probe = _FS_PARAM_PROBES.get(fs_type)
 	if not probe:
 		return {}
+	# A probe tool can fail (e.g. a dirty FAT bit makes fsck.fat exit non-zero) and
+	# still be a correct, quiet degrade to {} - but run_command_in_multicmd_with_path_check
+	# appends "Task return code error: ..." to the global ERRORS even with quiet=True,
+	# and that prefix IS in ERROR_TO_RETURNCODE_TABLE, so it would otherwise poison
+	# hpcp's exit code after a fully successful copy. Snapshot and truncate ERRORS
+	# back to this mark on the way out so nothing appended during this probe call
+	# survives it. Probing is strictly serial (get_partition_infos iterates
+	# partitions one at a time), so this can only ever discard messages this same
+	# probe call appended - never another operation's errors.
+	mark = len(ERRORS)
 	try:
 		return probe(target_partition) or {}
 	except Exception as e:
-		eprint(f"FS param probe warning: Could not read {fs_type} parameters from {target_partition}: {e}")
+		# Use a plain print here, not eprint: eprint's own ERRORS.append() would
+		# just be wiped by the finally below anyway, and this keeps the intent
+		# (stderr diagnostic, not a copy-breaking error) obvious at the call site.
+		print(f"FS param probe warning: Could not read {fs_type} parameters from {target_partition}: {e}", file=sys.stderr)
 		return {}
+	finally:
+		del ERRORS[mark:]
 
 def build_mkfs_params(fs_type, fs_params):
 	"""
@@ -778,11 +804,43 @@ def build_mkfs_params(fs_type, fs_params):
 	builder = _FS_MKFS_BUILDERS.get(fs_type)
 	if not builder:
 		return []
+	# Same rationale as probe_fs_params above: a builder can legitimately warn on
+	# the success path (e.g. _build_f2fs's "dropped, not recognised" notice) as
+	# well as on failure, and neither should inflate hpcp's exit code. Building is
+	# also serial per partition, so truncating back to this mark is safe.
+	mark = len(ERRORS)
 	try:
 		return builder(fs_params) or []
 	except Exception as e:
-		eprint(f"FS param build warning: Could not build {fs_type} mkfs parameters: {e}")
+		print(f"FS param build warning: Could not build {fs_type} mkfs parameters: {e}", file=sys.stderr)
 		return []
+	finally:
+		del ERRORS[mark:]
+
+def _strip_dash_o(args):
+	"""
+	Return `args` with a `-O <value>` pair removed, or None if `-O` is not present.
+
+	-O is the only version-fragile flag shared across ext/btrfs/f2fs: an ext or
+	btrfs -O value always includes this branch's curated feature negations (see
+	_EXT_CURATED_FEATURES / _BTRFS_CURATED_FEATURES below), and a single feature
+	name the local mkfs does not recognise makes it reject the ENTIRE argument
+	set - block size, inode size, -m, -i, FAT width and all - not just -O. That
+	silently regresses mirroring to full mkfs defaults on any host whose mkfs
+	predates one curated feature name (common: e2fsprogs < 1.46/1.47, btrfs-progs
+	< 6.1/6.7 - most current LTS/enterprise distros for at least one feature).
+	"""
+	stripped = []
+	found = False
+	i = 0
+	while i < len(args):
+		if args[i] == '-O' and i + 1 < len(args):
+			found = True
+			i += 2
+			continue
+		stripped.append(args[i])
+		i += 1
+	return stripped if found else None
 
 def _run_mkfs_with_fallback(base_command, param_args, target_partition, fs_type):
 	"""
@@ -793,6 +851,15 @@ def _run_mkfs_with_fallback(base_command, param_args, target_partition, fs_type)
 	small for it). A rejected parameter set must degrade to a default filesystem,
 	not abort the copy.
 
+	Three tiers are attempted, in order, stopping at the first success:
+	  1. The full mirrored parameter set, including -O if present.
+	  2. If (1) failed and -O was present: the same parameters with the -O pair
+	     removed. This is what recovers block size / inode size / -m / -i / FAT
+	     width - the parameters that actually affect bootability and layout -
+	     when the only problem is an -O feature name the local mkfs is too old
+	     to know (see _strip_dash_o).
+	  3. Bare mkfs defaults, no mirrored parameters at all.
+
 	Args:
 		base_command (list): The mkfs command without the target partition.
 		param_args (list): Mirrored parameter arguments, possibly empty.
@@ -800,7 +867,7 @@ def _run_mkfs_with_fallback(base_command, param_args, target_partition, fs_type)
 		fs_type (str): Filesystem type, for messages.
 
 	Returns:
-		bool: True if the filesystem was created by either attempt.
+		bool: True if the filesystem was created by any attempted tier.
 	"""
 	def _attempt(command):
 		resolved = [_binPaths.get(command[0], command[0])] + list(command[1:])
@@ -816,6 +883,13 @@ def _run_mkfs_with_fallback(base_command, param_args, target_partition, fs_type)
 		if rc == 0:
 			return True
 		eprint(f"FS param warning: mkfs rejected mirrored {fs_type} parameters {' '.join(param_args)} on {target_partition}: {err}")
+		stripped = _strip_dash_o(param_args)
+		if stripped is not None:
+			eprint(f"FS param warning: Retrying {fs_type} on {target_partition} with -O dropped, keeping the remaining mirrored parameters.")
+			rc, err = _attempt(list(base_command) + list(stripped) + [target_partition])
+			if rc == 0:
+				return True
+			eprint(f"FS param warning: mkfs still rejected {fs_type} parameters {' '.join(stripped)} on {target_partition} after dropping -O: {err}")
 		eprint(f"FS param warning: Retrying with {fs_type} defaults. The destination filesystem will not match the source exactly.")
 	rc, err = _attempt(list(base_command) + [target_partition])
 	if rc != 0:
@@ -1402,6 +1476,9 @@ def get_partition_details(device, partition,sector_size=512):
 			- 'fs_uuid': The UUID of the filesystem.
 			- 'fs_label': The filesystem label if available.
 			- 'size': Size of the partition in bytes.
+			- 'fs_params': Probed source filesystem creation parameters used for
+				mirroring in dd mode (see probe_fs_params). Empty dict when
+				fs_type is unknown, MIRROR_FS_PARAMS is False, or probing failed.
 
 	Notes:
 		- This function uses external tools (sgdisk, blkid) and requires appropriate permissions.
@@ -1437,7 +1514,7 @@ def get_partition_details(device, partition,sector_size=512):
 			rtnDic['fs_uuid'] = line.split('=')[1].strip()
 		elif 'LABEL' in line.upper() and 'PARTLABEL' not in line.upper():
 			rtnDic['fs_label'] = line.split('=')[1].strip()
-	if rtnDic['fs_type']:
+	if rtnDic['fs_type'] and MIRROR_FS_PARAMS:
 		rtnDic['fs_params'] = probe_fs_params(target_partition, rtnDic['fs_type'])
 	if loop_device:
 		run_command_in_multicmd_with_path_check(["losetup", '--detach', loop_device])
