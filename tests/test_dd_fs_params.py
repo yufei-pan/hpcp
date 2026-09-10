@@ -1,5 +1,7 @@
 import os
+import shutil
 import struct
+import subprocess
 import sys
 import tempfile
 
@@ -749,3 +751,111 @@ def test_hfsplus_minix_registered():
 	assert hpcp._FS_MKFS_BUILDERS['hfsplus'] is hpcp._build_hfsplus
 	assert hpcp._FS_PARAM_PROBES['minix'] is hpcp._probe_minix
 	assert hpcp._FS_MKFS_BUILDERS['minix'] is hpcp._build_minix
+
+
+_ROUNDTRIP_TOOLS = ('losetup', 'sgdisk', 'mkfs.vfat', 'mkfs.ext4', 'mkfs.xfs',
+					'blkid', 'dumpe2fs', 'xfs_info', 'fsck.fat', 'truncate')
+
+requires_root_and_tools = pytest.mark.skipif(
+	os.geteuid() != 0 or any(shutil.which(t) is None for t in _ROUNDTRIP_TOOLS),
+	reason='dd round-trip test needs root and losetup/sgdisk/mkfs tools')
+
+
+def _run(*command):
+	return subprocess.run(command, check=True, capture_output=True, text=True).stdout
+
+
+def _partition_params(image, index, fs_type):
+	loop = _run('losetup', '--partscan', '--find', '--show', '--read-only', image).strip()
+	try:
+		subprocess.run(['udevadm', 'settle'], check=False, capture_output=True)
+		return hpcp.probe_fs_params(f'{loop}p{index}', fs_type)
+	finally:
+		subprocess.run(['losetup', '-d', loop], check=False, capture_output=True)
+
+
+@requires_root_and_tools
+def test_dd_roundtrip_preserves_source_fs_params(tmp_path):
+	src = str(tmp_path / 'src.img')
+	dest = str(tmp_path / 'dest.img')
+	_run('truncate', '-s', '1400M', src)
+	_run('sgdisk', '--clear',
+		 '--new=1:0:+260M', '--typecode=1:ef00', '--change-name=1:EFI System',
+		 '--new=2:0:+512M', '--typecode=2:8300', '--change-name=2:boot',
+		 '--new=3:0:0', '--typecode=3:8300', '--change-name=3:root', src)
+
+	loop = _run('losetup', '--partscan', '--find', '--show', src).strip()
+	try:
+		subprocess.run(['udevadm', 'settle'], check=False, capture_output=True)
+		# Deliberately non-default: a FAT32 ESP small enough that mkfs.vfat would
+		# otherwise pick FAT16, an ext4 built the way an older distro would, and
+		# an xfs with non-default inode and directory geometry.
+		_run('mkfs.vfat', '-F', '32', '-n', 'ESP', f'{loop}p1')
+		_run('mkfs.ext4', '-q', '-F', '-b', '1024', '-I', '128',
+			 '-O', '^metadata_csum,^64bit,^dir_index', '-m', '0', '-L', 'BOOTFS', f'{loop}p2')
+		_run('mkfs.xfs', '-q', '-f', '-i', 'size=1024', '-n', 'size=8192',
+			 '-m', 'reflink=0', '-L', 'ROOTFS', f'{loop}p3')
+		for index in (1, 2, 3):
+			mount_point = str(tmp_path / f'mnt{index}')
+			os.makedirs(mount_point, exist_ok=True)
+			_run('mount', f'{loop}p{index}', mount_point)
+			try:
+				os.makedirs(os.path.join(mount_point, 'dir'), exist_ok=True)
+				with open(os.path.join(mount_point, 'dir', f'file{index}.txt'), 'w') as f:
+					f.write(f'hello-{index}\n')
+			finally:
+				_run('umount', mount_point)
+	finally:
+		subprocess.run(['losetup', '-d', loop], check=False, capture_output=True)
+
+	src_fat = _partition_params(src, 1, 'vfat')
+	src_ext = _partition_params(src, 2, 'ext4')
+	src_xfs = _partition_params(src, 3, 'xfs')
+
+	hpcp_py = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'hpcp.py')
+	open(dest, 'wb').close()
+	subprocess.run([sys.executable, hpcp_py, '-dd', src, dest],
+				   stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=900)
+
+	dest_fat = _partition_params(dest, 1, 'vfat')
+	dest_ext = _partition_params(dest, 2, 'ext4')
+	dest_xfs = _partition_params(dest, 3, 'xfs')
+
+	# The ESP must stay FAT32; plain mkfs.vfat picks FAT16 at this size.
+	assert dest_fat['fat_bits'] == src_fat['fat_bits'] == 32
+	assert dest_fat['cluster_size'] == src_fat['cluster_size']
+
+	assert dest_ext['block_size'] == src_ext['block_size'] == 1024
+	assert dest_ext['inode_size'] == src_ext['inode_size'] == 128
+	assert dest_ext['reserved_block_count'] == 0
+	assert sorted(dest_ext['features']) == sorted(src_ext['features'])
+	for absent in ('64bit', 'metadata_csum', 'dir_index'):
+		assert absent not in dest_ext['features']
+
+	assert dest_xfs['meta-data']['isize'] == src_xfs['meta-data']['isize'] == '1024'
+	assert dest_xfs['naming']['bsize'] == src_xfs['naming']['bsize'] == '8192'
+	assert dest_xfs['meta-data']['reflink'] == src_xfs['meta-data']['reflink'] == '0'
+
+
+@requires_root_and_tools
+def test_dd_roundtrip_uses_defaults_with_no_fs_param_mirror(tmp_path):
+	src = str(tmp_path / 'src.img')
+	dest = str(tmp_path / 'dest.img')
+	_run('truncate', '-s', '700M', src)
+	_run('sgdisk', '--clear', '--new=1:0:0', '--typecode=1:8300', '--change-name=1:root', src)
+
+	loop = _run('losetup', '--partscan', '--find', '--show', src).strip()
+	try:
+		subprocess.run(['udevadm', 'settle'], check=False, capture_output=True)
+		_run('mkfs.ext4', '-q', '-F', '-b', '1024', '-I', '128', '-L', 'ROOTFS', f'{loop}p1')
+	finally:
+		subprocess.run(['losetup', '-d', loop], check=False, capture_output=True)
+
+	hpcp_py = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'hpcp.py')
+	open(dest, 'wb').close()
+	subprocess.run([sys.executable, hpcp_py, '-dd', '-nfp', src, dest],
+				   stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=900)
+
+	dest_ext = _partition_params(dest, 1, 'ext4')
+	# -nfp restores today's behaviour: mkfs defaults, not the source's 1 KiB blocks.
+	assert dest_ext['block_size'] == 4096
