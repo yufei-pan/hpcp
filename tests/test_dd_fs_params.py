@@ -328,6 +328,87 @@ def test_write_partition_info_skips_mirroring_when_disabled(monkeypatch):
 	assert seen['params'] == []
 
 
+def _partition_info_stub(fs_type, fs_uuid, partition='2'):
+	return {partition: {'partition_guid_code': '', 'unique_partition_guid': '', 'partition_name': '',
+						'partition_attrs': '', 'fs_type': fs_type, 'fs_uuid': fs_uuid, 'fs_label': '',
+						'size': 0, 'fs_params': {}}}
+
+
+@pytest.mark.parametrize('fs_type', ['ext2', 'ext3', 'ext4'])
+def test_write_partition_info_fscks_ext_before_delayed_uuid(monkeypatch, fs_type):
+	# tune2fs -U on a metadata_csum filesystem (default ext4) refuses unless
+	# e2fsck -f has just run. UUID is delayed until after the copy so the live
+	# source and new dest do not share a UUID while both are mounted, which
+	# dirties the superblock - so the delayed pair must be e2fsck then tune2fs.
+	target = '/dev/loop0p2'
+	uuid = '9a7908e4-8af1-4be2-b7a0-83536e09ecc2'
+	monkeypatch.setattr(hpcp, 'get_target_partition', lambda image, name: (target, None))
+	monkeypatch.setattr(hpcp, 'run_command_in_multicmd_with_path_check', lambda command, **kwargs: [''])
+	monkeypatch.setattr(hpcp, '_run_mkfs_with_fallback', lambda *a, **k: True)
+
+	delayed = hpcp.write_partition_info('/dev/fakeimg', _partition_info_stub(fs_type, uuid), '2')
+
+	assert delayed[0] == ['e2fsck', '-f', '-y', target]
+	assert delayed[1] == ['tune2fs', '-U', uuid, target]
+
+
+def test_write_partition_info_does_not_fsck_ext_when_uuid_is_empty(monkeypatch):
+	monkeypatch.setattr(hpcp, 'get_target_partition', lambda image, name: ('/dev/loop0p2', None))
+	monkeypatch.setattr(hpcp, 'run_command_in_multicmd_with_path_check', lambda command, **kwargs: [''])
+	monkeypatch.setattr(hpcp, '_run_mkfs_with_fallback', lambda *a, **k: True)
+
+	delayed = hpcp.write_partition_info('/dev/fakeimg', _partition_info_stub('ext4', ''), '2')
+
+	assert delayed == []
+	assert not any(cmd and cmd[0] == 'e2fsck' for cmd in delayed)
+
+
+def test_e2fsck_exit_1_is_not_a_task_error(monkeypatch):
+	# e2fsck uses a bitmask: 1 = errors corrected, 2 = reboot recommended.
+	# A live-system clone almost always needs journal replay, so treating 1 as
+	# "Task return code error" would still fail the clone after we fsck so
+	# tune2fs -U can run.
+	class Task:
+		def __init__(self, command, returncode):
+			self.command = command
+			self.returncode = returncode
+			self.stdout = []
+			self.stderr = []
+
+	saved_errors = list(hpcp.ERRORS)
+	hpcp.ERRORS.clear()
+	command = ['e2fsck', '-f', '-y', '/dev/loop0p2']
+	monkeypatch.setattr(hpcp, '_binPaths', {'e2fsck': '/sbin/e2fsck'})
+	monkeypatch.setattr(hpcp.multiCMD, 'run_commands', lambda commands, **kwargs: [Task(commands[0], 1)])
+	try:
+		hpcp.run_commands_in_multicmd_with_path_check([command], strict=False)
+		assert hpcp.ERRORS == []
+	finally:
+		hpcp.ERRORS.clear()
+		hpcp.ERRORS.extend(saved_errors)
+
+
+def test_e2fsck_exit_4_is_still_a_task_error(monkeypatch):
+	class Task:
+		def __init__(self, command, returncode):
+			self.command = command
+			self.returncode = returncode
+			self.stdout = []
+			self.stderr = []
+
+	saved_errors = list(hpcp.ERRORS)
+	hpcp.ERRORS.clear()
+	command = ['e2fsck', '-f', '-y', '/dev/loop0p2']
+	monkeypatch.setattr(hpcp, '_binPaths', {'e2fsck': '/sbin/e2fsck'})
+	monkeypatch.setattr(hpcp.multiCMD, 'run_commands', lambda commands, **kwargs: [Task(commands[0], 4)])
+	try:
+		hpcp.run_commands_in_multicmd_with_path_check([command], strict=False)
+		assert any(err.startswith('Task return code error:') for err in hpcp.ERRORS)
+	finally:
+		hpcp.ERRORS.clear()
+		hpcp.ERRORS.extend(saved_errors)
+
+
 _DUMPE2FS_OUTPUT = """dumpe2fs 1.47.2 (1-Jan-2025)
 Filesystem volume name:   BOOTFS
 Last mounted on:          /tmp/tmp.BJpz2N4pR0
@@ -898,6 +979,15 @@ def _partition_params(image, index, fs_type):
 		subprocess.run(['losetup', '-d', loop], check=False, capture_output=True)
 
 
+def _partition_uuid(image, index):
+	loop = _run('losetup', '--partscan', '--find', '--show', '--read-only', image).strip()
+	try:
+		subprocess.run(['udevadm', 'settle'], check=False, capture_output=True)
+		return _run('blkid', '-s', 'UUID', '-o', 'value', f'{loop}p{index}').strip()
+	finally:
+		subprocess.run(['losetup', '-d', loop], check=False, capture_output=True)
+
+
 def _detach_loops_for_image(image):
 	"""Detach every loop device still backed by `image`.
 
@@ -1046,7 +1136,7 @@ def test_dd_roundtrip_uses_defaults_with_no_fs_param_mirror(tmp_path):
 
 
 def test_version_bumped():
-	assert hpcp.version == '9.59'
+	assert hpcp.version == '9.60'
 	assert hpcp.__version__ == hpcp.version
 	assert hpcp.COMMIT_DATE == '2026-09-10'
 
@@ -1112,7 +1202,10 @@ def _build_single_partition_source(tmp_path):
 	loop = _run('losetup', '--partscan', '--find', '--show', src).strip()
 	try:
 		subprocess.run(['udevadm', 'settle'], check=False, capture_output=True)
-		_run('mkfs.ext4', '-q', '-F', '-b', '1024', '-I', '128', '-L', 'ROOTFS', f'{loop}p1')
+		# metadata_csum without metadata_csum_seed is the layout that makes
+		# delayed tune2fs -U refuse unless e2fsck -f ran after the copy.
+		_run('mkfs.ext4', '-q', '-F', '-b', '1024', '-I', '128',
+			 '-O', '^metadata_csum_seed', '-L', 'ROOTFS', f'{loop}p1')
 		mount_point = str(tmp_path / 'mnt1')
 		os.makedirs(mount_point, exist_ok=True)
 		_run('mount', f'{loop}p1', mount_point)
@@ -1134,13 +1227,35 @@ def test_dd_clones_a_single_partition_spanning_the_whole_disk(tmp_path):
 
 	try:
 		src_ext = _partition_params(src, 1, 'ext4')
+		src_uuid = _partition_uuid(src, 1)
 		assert src_ext['block_size'] == 1024
+		assert src_uuid
 
 		_run_hpcp_dd([], src, dest)
 
 		dest_ext = _partition_params(dest, 1, 'ext4')
 		assert dest_ext['block_size'] == src_ext['block_size'] == 1024
 		assert dest_ext['inode_size'] == src_ext['inode_size'] == 128
+		assert _partition_uuid(dest, 1) == src_uuid
+	finally:
+		_detach_loops_for_image(src)
+		_detach_loops_for_image(dest)
+
+
+@requires_root_and_tools
+def test_dd_honors_dis_as_dest_image_size(tmp_path):
+	# -dd used to print "Currently not supporting dest_image_size" and ignore
+	# -dis. For an image-file destination, -dis should pad the clone to the
+	# requested size so the result can be written onto a larger disk.
+	src = _build_single_partition_source(tmp_path)
+	dest = str(tmp_path / 'dest.img')
+	requested = 900 * 1024 * 1024
+	try:
+		result = _run_hpcp_dd(['-dis', '900MiB'], src, dest)
+		assert os.path.getsize(dest) == requested
+		# The clone must still be a usable ext4 volume at the original UUID.
+		assert _partition_uuid(dest, 1)
+		assert 'dest_image_size in dd mode' not in (result.stderr or '')
 	finally:
 		_detach_loops_for_image(src)
 		_detach_loops_for_image(dest)

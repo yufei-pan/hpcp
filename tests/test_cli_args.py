@@ -41,3 +41,9 @@ def test_exclude_append(hpcp_mod, restore_argv, reset_hpcp_globals):
 	args = _parse(hpcp_mod, ['hpcp', '-e', '*.o', '-e', 'tmp*', '-d', '/tmp', '/tmp/src'])
 	assert '*.o' in args.exclude
 	assert 'tmp*' in args.exclude
+
+
+def test_dest_image_size_flag(hpcp_mod, restore_argv, reset_hpcp_globals):
+	args = _parse(hpcp_mod, ['hpcp', '-di', '/tmp/d.img', '-dis', '1G', '/tmp/src'])
+	assert args.dest_image == '/tmp/d.img'
+	assert args.dest_image_size == '1G'

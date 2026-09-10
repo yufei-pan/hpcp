@@ -124,7 +124,7 @@ except ImportError:
 	hasher = hashlib.blake2b()
 	xxhash_available = False
 
-version = '9.59'
+version = '9.60'
 __version__ = version
 COMMIT_DATE = '2026-09-10'
 
@@ -477,7 +477,19 @@ def run_commands_in_multicmd_with_path_check(commands, timeout=...,max_threads=1
 		elif task.returncode == 137 and task.stderr[-1].strip().startswith('Ctrl C detected, Emergency Stop!'):
 			error = f"Keyboard Interrupt: Command '{task.command}' was interrupted by user."
 		elif task.returncode != 0:
-			error = f"Task return code error: Command '{task.command}' failed with return code {task.returncode}."
+			program = ''
+			cmd = getattr(task, 'command', None)
+			if isinstance(cmd, (list, tuple)) and cmd:
+				program = os.path.basename(str(cmd[0]))
+			elif isinstance(cmd, str) and cmd.strip():
+				program = os.path.basename(cmd.split()[0])
+			# e2fsck encodes "errors corrected" as bits 0 and 1 (exit 1, 2, or 3).
+			# A live clone's journal replay is exit 1; that is success, not a
+			# failed delayed UUID rewrite.
+			if program == 'e2fsck' and task.returncode in (1, 2, 3):
+				error = ''
+			else:
+				error = f"Task return code error: Command '{task.command}' failed with return code {task.returncode}."
 		if error:
 			if not quiet:
 				eprint(error)
@@ -1665,7 +1677,14 @@ def write_partition_info(image, partition_infos, partition_name):
 				if fs_label:
 					command.extend(['-L', fs_label])
 				if fs_uuid:
-					#command.extend(['-U', fs_uuid])
+					# UUID is delayed until after the copy so the live source and
+					# the new dest do not share a UUID while both are mounted.
+					# tune2fs -U on a metadata_csum filesystem (default ext4)
+					# refuses unless the fs has been freshly checked, and the
+					# copy dirties the superblock, so e2fsck -f must run first.
+					# These two delayed commands are an ordered pair; clean_up
+					# runs remaining delayed commands serially.
+					delayed_commands.append(_FS_FIX_COMMANDS[fs_type] + [target_partition])
 					delayed_commands.append(['tune2fs', '-U', fs_uuid, target_partition])
 				_run_mkfs_with_fallback(command, param_args, target_partition, fs_type)
 			elif fs_type == 'btrfs':
@@ -1850,6 +1869,80 @@ def resize_image(image_name, image_file_size):
 			with open(image_name, 'wb') as f:
 				f.seek(image_file_size-1)
 				f.write(b'\0')
+
+# Filesystem overhead reserved when sizing a -di dest image. Also the floor for
+# -dis: an image smaller than this cannot hold a journal plus the copy.
+_FS_IMAGE_SLAG = 50 * 1024 * 1024
+_IMAGE_BLOCK = 4096
+
+def _align_up(size, block=_IMAGE_BLOCK):
+	"""Round size up to a multiple of block; already-aligned values are unchanged."""
+	size = int(size or 0)
+	if size <= 0:
+		return 0
+	return ((size + block - 1) // block) * block
+
+def _split_dest_image_name(dest_image, index):
+	"""Name for split volume `index` (0 is the original dest_image path)."""
+	if index <= 0:
+		return dest_image
+	for suffix in ('.img', '.iso'):
+		if dest_image.endswith(suffix):
+			return dest_image[:-len(suffix)] + f'_{index}' + suffix
+	return dest_image + f'_{index}'
+
+def _plan_dest_images(init_size, dest_image_size=0):
+	"""Plan how many -di images to create and how large each one is.
+
+	Returns:
+		tuple: (number_of_images, image_file_size). image_file_size is 4 KiB aligned.
+	Raises:
+		RuntimeError: dest_image_size is positive but too small to hold a filesystem.
+	"""
+	init_size = int(init_size or 0)
+	needed = _align_up(int(1.05 * init_size + _FS_IMAGE_SLAG))
+	dest_image_size = int(dest_image_size or 0)
+	if dest_image_size <= 0:
+		return 1, needed
+	dest_image_size = _align_up(dest_image_size)
+	if dest_image_size >= needed:
+		return 1, dest_image_size
+	if dest_image_size <= _FS_IMAGE_SLAG:
+		raise RuntimeError(f"Destination image size too small: Estimated file system bloat size {format_bytes(_FS_IMAGE_SLAG)}B is larger than destination image size {format_bytes(dest_image_size)}B, exiting")
+	# 50 MiB slag pads a *single* auto-sized image. Per split volume the journal
+	# is much smaller; reserving 50 MiB on every piece over-counted volumes.
+	usable = int(dest_image_size * 0.90) - (16 * 1024 * 1024)
+	if usable <= 0:
+		raise RuntimeError(f"Destination image size too small: Estimated file system bloat size {format_bytes(_FS_IMAGE_SLAG)}B is larger than destination image size {format_bytes(dest_image_size)}B, exiting")
+	payload = max(int(1.05 * init_size), 1)
+	number_of_images = (payload + usable - 1) // usable
+	return max(number_of_images, 1), dest_image_size
+
+def _apply_dis_to_dd_image(computed_size, dest_image_size, dest_path):
+	"""Honor -dis for a -dd image-file destination.
+
+	Block devices cannot be truncated to -dis, so they keep computed_size.
+	A requested size below the packed partition layout cannot fit, so that
+	is an error rather than a silent ignore.
+	"""
+	dest_image_size = int(dest_image_size or 0)
+	if dest_image_size <= 0:
+		return computed_size
+	dest_image_size = _align_up(dest_image_size)
+	dest_is_file = True
+	if dest_path:
+		try:
+			if pathlib.Path(dest_path).exists() and pathlib.Path(dest_path).resolve().is_block_device():
+				dest_is_file = False
+		except Exception:
+			dest_is_file = True
+	if not dest_is_file:
+		print(f"Ignoring dest_image_size {format_bytes(dest_image_size)}B: destination {dest_path} is a block device.")
+		return computed_size
+	if dest_image_size < computed_size:
+		raise RuntimeError(f"Destination image size too small: Packed clone needs {format_bytes(computed_size)}B but dest_image_size is {format_bytes(dest_image_size)}B, exiting")
+	print(f"Padding -dd destination image to dest_image_size {format_bytes(dest_image_size)}B (clone layout {format_bytes(computed_size)}B)")
+	return dest_image_size
 
 def is_device(path):
 	mode = os.stat(path).st_mode
@@ -4016,31 +4109,17 @@ def create_image(dest_image,target_mount_point,loop_devices: list,src_paths: lis
 			src = os.path.abspath(src + os.path.sep)
 			_,_,size,_ = get_file_list(src, max_workers=max_workers,exclude=exclude,parallel_file_listing=parallel_file_listing)
 			init_size += size
-		slag = 50*1024*1024
-		image_file_size = int(1.05 *init_size + slag) # add 50 MB for the file system
-		image_file_size = (int(image_file_size / 4096.0) + 1) * 4096 # round up to the nearest 4 KiB
-		number_of_images = 1
+		needed = _align_up(int(1.05 * init_size + _FS_IMAGE_SLAG))
+		number_of_images, image_file_size = _plan_dest_images(init_size, dest_image_size)
 		if dest_image_size <= 0:
 			print(f"Estimated content size {format_bytes(init_size)}B Creating {dest_image} with size {format_bytes(image_file_size)}B")
-		elif dest_image_size > image_file_size:
-			print(f"Destination image size {format_bytes(dest_image_size)}B is larger than estimated content size {format_bytes(image_file_size)}B, using rounded {format_bytes(dest_image_size)}B")
-			image_file_size = dest_image_size
+		elif number_of_images == 1:
+			print(f"Destination image size {format_bytes(image_file_size)}B is larger than estimated content size {format_bytes(needed)}B, using {format_bytes(image_file_size)}B")
 		else:
-			if slag >= dest_image_size:
-				raise RuntimeError(f"Destination image size too small: Estimated file system bloat size {format_bytes(slag)}B is larger than destination image size {format_bytes(dest_image_size)}B, exiting")
-			dest_image_usable_size = int((dest_image_size - slag) * 0.90)
-			number_of_images = image_file_size // dest_image_usable_size + 1
-			print(f"Destination image size {format_bytes(dest_image_size)}B is smaller than estimated content size {format_bytes(image_file_size)}B, creating {number_of_images} images of size {format_bytes(dest_image_size)}B")
-			image_file_size = dest_image_size
-		image_file_size = (int(image_file_size / 4096.0) + 1) * 4096 # round up to the nearest 4 KiB
+			print(f"Destination image size {format_bytes(image_file_size)}B is smaller than estimated content size {format_bytes(needed)}B, creating {number_of_images} images of size {format_bytes(image_file_size)}B")
 		for i in range(number_of_images):
 			if i > 0:
-				if '.img' in dest_image:
-					imageName = dest_image.replace('.img',f'_{i}.img')
-				elif '.iso' in dest_image:
-					imageName = dest_image.replace('.iso',f'_{i}.iso')
-				else:
-					imageName = dest_image + f'_{i}'
+				imageName = _split_dest_image_name(dest_image, i)
 				currentMountPoint = tempfile.mkdtemp() + os.path.sep
 				mount_points.append(currentMountPoint)
 			else:
@@ -4193,7 +4272,7 @@ def validate_dd_source_path(src_path,loop_devices = None):
 # partition), and the backup header in the final 33 sectors.
 _GPT_STRUCTURE_RESERVE = 2 * 1024 * 1024
 
-def create_dd_dest_part_table(dd_src,dd_resize = [],src_path = None, dest_path = None):
+def create_dd_dest_part_table(dd_src,dd_resize = [],src_path = None, dest_path = None, dest_image_size=0):
 	"""Create / resize dest image and write a matching partition table.
 
 	Returns:
@@ -4234,6 +4313,7 @@ def create_dd_dest_part_table(dd_src,dd_resize = [],src_path = None, dest_path =
 	# all ("Could not create partition 1 from ...", sgdisk rc 4). Verified: a lone
 	# partition of size S needs S + 2M, where S + 1M fails.
 	disk_info['size'] = sum([partition_infos[partition]['size'] for partition in partition_infos]) + 1024*1024*len(partition_infos) + _GPT_STRUCTURE_RESERVE
+	disk_info['size'] = _apply_dis_to_dd_image(disk_info['size'], dest_image_size, dest_path)
 	partition_infos[disk_name] = disk_info
 	sorted_partitions.append(disk_name)
 
@@ -4326,7 +4406,9 @@ def clean_up(mount_points: list,loop_devices: list, delayed_commands: list = Non
 	delayed_commands.clear()
 	if remaining_commands:
 		print("Running delayed commands")
-		run_commands_in_multicmd_with_path_check(remaining_commands,strict=False)
+		# Serial on purpose: write_partition_info queues e2fsck then tune2fs -U
+		# as ordered pairs, and a parallel run would let tune2fs race the fsck.
+		run_commands_in_multicmd_with_path_check(remaining_commands,strict=False,max_threads=1)
 	try:
 		os.sync()
 	except Exception:
@@ -4491,7 +4573,7 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = multipr
 			src_path = src_path if src_path else src_image
 
 			if dest_image_size:
-				eprint(f"Currently not supporting dest_image_size in dd mode. Ignoring dest_image_size {dest_image_size}.")
+				print(f"Applying dest_image_size {format_bytes(dest_image_size)}B to -dd destination image.")
 				
 			if not dest_path and src_path:
 				eprint(f"Destination path not specified, using {src_path[-1]} as destination")
@@ -4503,7 +4585,7 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = multipr
 			if not os.access(os.path.dirname(os.path.abspath(dest_path)), os.W_OK):
 				print(f"Destination path {dest_path} is not writable, continuing with high probability of failure.")
 			dd_src = validate_dd_source_path(src_path,loop_devices = loop_devices)
-			partition_infos, delayed_commands, dest_loop = create_dd_dest_part_table(dd_src,dd_resize=dd_resize,src_path=src_path, dest_path=dest_path)
+			partition_infos, delayed_commands, dest_loop = create_dd_dest_part_table(dd_src,dd_resize=dd_resize,src_path=src_path, dest_path=dest_path, dest_image_size=dest_image_size)
 			if not partition_infos:
 				raise RuntimeError("Copy partition info error: Failed to create destination partition table, exiting.")
 			
