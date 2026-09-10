@@ -211,3 +211,36 @@ def test_dis_splits_overflow_across_images_without_empty_spares(tmp_path, hpcp_m
 	finally:
 		for image in created or [dest]:
 			_detach_loops_for_image(image)
+
+
+def test_get_dest_from_image_missing_returns_none(tmp_path, hpcp_mod, reset_hpcp_globals, require_linux):
+	import shutil
+	mounts = []
+	loops = []
+	mp = None
+	try:
+		dest, mp = hpcp_mod.get_dest_from_image(str(tmp_path / 'no.img'), mounts, loops)
+		assert dest is None
+		assert mp
+	finally:
+		for p in mounts:
+			shutil.rmtree(p, ignore_errors=True)
+		if mp:
+			shutil.rmtree(mp, ignore_errors=True)
+
+
+def test_create_image_requires_dest_and_mount(hpcp_mod, reset_hpcp_globals):
+	with pytest.raises(RuntimeError, match='No destination image path'):
+		hpcp_mod.create_image(None, '', [], [], [])
+
+
+def test_mount_src_image_skips_missing_file(hpcp_mod, reset_hpcp_globals, tmp_path):
+	src_paths = []
+	mounts = []
+	loops = []
+	missing = str(tmp_path / 'missing.img')
+	try:
+		hpcp_mod.mount_src_image([missing], src_paths, mounts, loops)
+	except Exception as e:
+		pytest.xfail(f'BUGS.md#3 missing src image is not skipped: {e}')
+	assert src_paths == []

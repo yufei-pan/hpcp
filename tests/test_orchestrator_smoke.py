@@ -27,3 +27,20 @@ def test_compare_file_list_identical_sets(tmp_tree, hpcp_mod, reset_hpcp_globals
 	b = {'file1:hash', 'file2:hash'}
 	# No exception; function prints summary to stdout
 	hpcp_mod.compare_file_list(a, b, diff_file_list=None, tar_diff_file_list=False)
+
+
+def test_hpcp_verbose_copy(tmp_tree, hpcp_mod, reset_hpcp_globals, require_linux, copy_args):
+	tmp_tree.add_file('a.txt', 'v')
+	srcs, opts = copy_args(verbose=True, files_per_job=2)
+	rc = hpcp_mod.hpcp(srcs, **opts)
+	assert rc in (None, 0)
+	assert (tmp_tree.dst / 'a.txt').read_text() == 'v'
+
+
+def test_hpcp_no_batch_copy(tmp_tree, hpcp_mod, reset_hpcp_globals, require_linux, copy_args):
+	tmp_tree.add_file('a.txt', 'seq')
+	tmp_tree.add_file('b.txt', 'seq2')
+	srcs, opts = copy_args(batch=False)
+	hpcp_mod.hpcp(srcs, **opts)
+	assert (tmp_tree.dst / 'a.txt').read_text() == 'seq'
+	assert (tmp_tree.dst / 'b.txt').read_text() == 'seq2'

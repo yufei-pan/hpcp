@@ -43,3 +43,16 @@ def test_is_file_identical_false_for_different_content(tmp_tree, hpcp_mod, reset
 	if hasattr(hpcp_mod.hash_file, 'cache_clear'):
 		hpcp_mod.hash_file.cache_clear()
 	assert hpcp_mod.is_file_identical(src, dst, os.path.getsize(src), full_hash=True) is False
+
+
+def test_full_hash_sees_difference_partial_hash_misses(tmp_tree, hpcp_mod, reset_hpcp_globals):
+	hpcp_mod.HASH_SIZE = 4
+	if hasattr(hpcp_mod.hash_file, 'cache_clear'):
+		hpcp_mod.hash_file.cache_clear()
+	src = tmp_tree.add_file('a.bin', b'XXXXYYYY', under='src')
+	dst = tmp_tree.add_file('a.bin', b'ZZZZYYYY', under='dst')
+	t = time.time() - 1000
+	os.utime(src, (t, t))
+	os.utime(dst, (t, t))
+	assert hpcp_mod.is_file_identical(src, dst, os.path.getsize(src), full_hash=False) is True
+	assert hpcp_mod.is_file_identical(src, dst, os.path.getsize(src), full_hash=True) is False

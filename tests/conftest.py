@@ -48,6 +48,7 @@ def reset_hpcp_globals():
 		'COMMAND_TIMEOUT': hpcp.COMMAND_TIMEOUT,
 		'REMOVE_FILES_WHILE_LISTING': hpcp.REMOVE_FILES_WHILE_LISTING,
 		'RANDOM_DESTINATION_SELECTION': hpcp.RANDOM_DESTINATION_SELECTION,
+		'MIRROR_FS_PARAMS': hpcp.MIRROR_FS_PARAMS,
 	}
 	_clear_hpcp_transient_state()
 	try:
@@ -139,3 +140,25 @@ def require_linux():
 def require_windows():
 	if os.name != 'nt':
 		pytest.skip('Windows-only test')
+
+
+def trailing_copy_args(tmp_tree, **kwargs):
+	"""Build hpcp() kwargs that land src contents directly under dest."""
+	opts = dict(
+		dest_paths=[str(tmp_tree.dst) + os.sep],
+		single_thread=True,
+		max_workers=1,
+		verbose=False,
+		batch=True,
+		do_not_remove_files_while_listing=True,
+	)
+	opts.update(kwargs)
+	return [str(tmp_tree.src) + os.sep], opts
+
+
+@pytest.fixture
+def copy_args(tmp_tree):
+	"""Return (src_paths, kwargs) for an hpcp() copy that lands under dest."""
+	def _args(**kwargs):
+		return trailing_copy_args(tmp_tree, **kwargs)
+	return _args

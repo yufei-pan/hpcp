@@ -33,3 +33,16 @@ def test_src_to_dest_map_trailing_sep(tmp_tree, hpcp_mod, reset_hpcp_globals):
 	assert len(mapping) == 1
 	src_abs, dests = mapping[0]
 	assert os.path.abspath(str(tmp_tree.dst)) in [os.path.abspath(d) for d in dests]
+
+
+def test_expand_user_in_expand_paths(hpcp_mod, reset_hpcp_globals, tmp_path, monkeypatch):
+	monkeypatch.setenv('HOME', str(tmp_path))
+	marker = tmp_path / 'marker.txt'
+	marker.write_text('x')
+	got = hpcp_mod.expand_paths(['~/marker.txt'])
+	assert any(os.path.samefile(p, marker) for p in got)
+
+
+def test_get_mount_table_is_dict(hpcp_mod, reset_hpcp_globals, require_linux):
+	table = hpcp_mod.get_mount_table()
+	assert isinstance(table, dict)

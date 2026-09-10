@@ -1,5 +1,6 @@
 import os
-import stat
+import random
+import time
 import pytest
 
 
@@ -36,3 +37,115 @@ def test_sync_directory_metadata_default_applies_mtime(tmp_tree, hpcp_mod, reset
 	hpcp_mod.sync_directory_metadata(src_dir, [dst_dir])
 	assert os.path.isdir(dst_dir)
 	assert abs(os.stat(dst_dir).st_mtime - os.stat(src_dir).st_mtime) < 2
+
+
+def test_copy_file_skips_identical_content(tmp_tree, hpcp_mod, reset_hpcp_globals, require_linux):
+	src = tmp_tree.add_file('a.txt', 'same-bytes', under='src')
+	dst = tmp_tree.add_file('a.txt', 'same-bytes', under='dst')
+	t = time.time() - 1000
+	os.utime(src, (t, t))
+	os.utime(dst, (t, t))
+	hpcp_mod.HASH_SIZE = 65536
+	if hasattr(hpcp_mod.hash_file, 'cache_clear'):
+		hpcp_mod.hash_file.cache_clear()
+	size, _, _ = hpcp_mod.copy_file(src, [dst])
+	assert size == 0
+
+
+def test_no_create_dir_skips_missing_parent(tmp_tree, hpcp_mod, reset_hpcp_globals, require_linux):
+	src = tmp_tree.add_file('a.txt', 'x')
+	dst = str(tmp_tree.dst / 'missing' / 'a.txt')
+	hpcp_mod.NO_CREATE_DIR = True
+	size, _, _ = hpcp_mod.copy_file(src, [dst])
+	assert not os.path.exists(dst)
+	assert size == 0
+
+
+def test_hpcp_no_create_dir_skips_missing_dest(tmp_tree, hpcp_mod, reset_hpcp_globals, require_linux, copy_args):
+	tmp_tree.add_file('a.txt', 'x')
+	missing = str(tmp_tree.root / 'nope') + os.sep
+	srcs, opts = copy_args(dest_paths=[missing], no_create_dir=True)
+	hpcp_mod.hpcp(srcs, **opts)
+	assert not os.path.exists(missing.rstrip(os.sep))
+
+
+def test_copy_files_parallel_smoke(tmp_tree, hpcp_mod, reset_hpcp_globals, require_linux):
+	tmp_tree.add_file('a.txt', 'A')
+	tmp_tree.add_file('nested/b.txt', 'B')
+	hpcp_mod.copy_files_parallel(
+		str(tmp_tree.src),
+		[str(tmp_tree.dst)],
+		max_workers=2,
+		parallel_file_listing=False,
+	)
+	assert (tmp_tree.dst / 'a.txt').read_text() == 'A'
+	assert (tmp_tree.dst / 'nested' / 'b.txt').read_text() == 'B'
+
+
+def test_hpcp_parallel_copy(tmp_tree, hpcp_mod, reset_hpcp_globals, require_linux, copy_args):
+	tmp_tree.add_file('a.txt', 'par')
+	srcs, opts = copy_args(single_thread=False, max_workers=2)
+	hpcp_mod.hpcp(srcs, **opts)
+	assert (tmp_tree.dst / 'a.txt').read_text() == 'par'
+
+
+def test_directory_only_creates_dirs_not_files(tmp_tree, hpcp_mod, reset_hpcp_globals, require_linux, copy_args):
+	tmp_tree.add_file('sub/a.txt', 'secret')
+	srcs, opts = copy_args(directory_only=True)
+	hpcp_mod.hpcp(srcs, **opts)
+	assert (tmp_tree.dst / 'sub').is_dir()
+	assert not (tmp_tree.dst / 'sub' / 'a.txt').exists()
+
+
+def test_no_directory_sync_skips_nested_dir_mtime(tmp_tree, hpcp_mod, reset_hpcp_globals, require_linux, copy_args):
+	tmp_tree.add_file('sub/a.txt', 'x')
+	src_sub = tmp_tree.src / 'sub'
+	t = time.time() - 86400
+	os.utime(src_sub, (t, t))
+	srcs, opts = copy_args(no_directory_sync=True)
+	hpcp_mod.hpcp(srcs, **opts)
+	assert (tmp_tree.dst / 'sub' / 'a.txt').read_text() == 'x'
+	assert abs(os.stat(tmp_tree.dst / 'sub').st_mtime - t) > 5
+
+
+def test_copy_file_uses_first_dest_without_random(tmp_tree, hpcp_mod, reset_hpcp_globals, require_linux):
+	src = tmp_tree.add_file('a.txt', 'one-dest')
+	alt = tmp_tree.root / 'dst2'
+	alt.mkdir()
+	d1 = str(tmp_tree.dst / 'a.txt')
+	d2 = str(alt / 'a.txt')
+	hpcp_mod.RANDOM_DESTINATION_SELECTION = False
+	hpcp_mod.copy_file(src, [d1, d2])
+	assert os.path.isfile(d1)
+	assert not os.path.exists(d2)
+
+
+def test_copy_file_random_dest_picks_one(tmp_tree, hpcp_mod, reset_hpcp_globals, require_linux):
+	src = tmp_tree.add_file('a.txt', 'rand')
+	alt = tmp_tree.root / 'dst2'
+	alt.mkdir()
+	d1 = str(tmp_tree.dst / 'a.txt')
+	d2 = str(alt / 'a.txt')
+	hpcp_mod.RANDOM_DESTINATION_SELECTION = True
+	random.seed(1)
+	hpcp_mod.copy_file(src, [d1, d2])
+	assert os.path.isfile(d1) ^ os.path.isfile(d2)
+
+
+def test_symlink_is_recreated_on_dest(tmp_tree, hpcp_mod, reset_hpcp_globals, require_linux, copy_args):
+	tmp_tree.add_file('target.txt', 'data')
+	tmp_tree.add_symlink('link', 'target.txt')
+	srcs, opts = copy_args()
+	hpcp_mod.hpcp(srcs, **opts)
+	assert (tmp_tree.dst / 'target.txt').read_text() == 'data'
+	assert (tmp_tree.dst / 'link').is_symlink()
+	assert os.readlink(tmp_tree.dst / 'link') == 'target.txt'
+
+
+def test_no_link_tracking_still_creates_symlink(tmp_tree, hpcp_mod, reset_hpcp_globals, require_linux, copy_args):
+	tmp_tree.add_file('target.txt', 'data')
+	tmp_tree.add_symlink('link', 'target.txt')
+	srcs, opts = copy_args(no_link_tracking=True)
+	hpcp_mod.hpcp(srcs, **opts)
+	assert (tmp_tree.dst / 'link').is_symlink()
+	assert os.readlink(tmp_tree.dst / 'link') == 'target.txt'
