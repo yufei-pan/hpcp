@@ -518,6 +518,14 @@ def get_timestamp_precision(num):
 
 	Returns:
 		int: The precision of the number. Possible precisions are 2, 1,  0.01, 0.0000001 , 1e-9
+
+	Examples:
+		>>> get_timestamp_precision(10)
+		0
+		>>> get_timestamp_precision(10.0)
+		2
+		>>> get_timestamp_precision(10.5)
+		0.01
 	"""
 	if isinstance(num, int):
 		return 0
@@ -632,6 +640,14 @@ def is_excluded(path, exclude=None):
 
 	Returns:
 		bool: True if the path is excluded, False otherwise.
+
+	Examples:
+		>>> is_excluded('/data/tmp/cache', ['*/cache'])
+		True
+		>>> is_excluded('/data/tmp/cache', ['*/logs'])
+		False
+		>>> is_excluded('/data/tmp/cache', None)
+		False
 	"""
 	if exclude is None:
 		return False
@@ -660,6 +676,12 @@ def format_exclude(exclude = None,exclude_file = None) -> frozenset:
 	Note:
 		- Patterns not starting with '/' will have '*/' prepended unless they already start with '*/'.
 		- The function handles errors gracefully if the exclude_file doesn't exist or can't be read.
+
+	Examples:
+		>>> sorted(format_exclude(['cache', '*/logs']))
+		['*/cache', '*/logs']
+		>>> format_exclude(None)
+		frozenset()
 	"""
 	if not exclude:
 		exclude = set()
@@ -1956,6 +1978,10 @@ def natural_sort(L):
 
 	Returns:
 		list: The sorted list of strings.
+
+	Examples:
+		>>> natural_sort(['file10.txt', 'file2.txt', 'file1.txt'])
+		['file1.txt', 'file2.txt', 'file10.txt']
 	"""
 	def convert(text):
 		return int(text) if text.isdigit() else text.lower() 
@@ -2002,6 +2028,14 @@ def format_time(seconds):
 
 	Returns:
 		str: The formatted time in a human-readable format.
+
+	Examples:
+		>>> format_time(0)
+		'0s'
+		>>> format_time(65)
+		'1m5s'
+		>>> format_time(3661)
+		'1h1m1s'
 	"""
 	try:
 		seconds = int(seconds)
@@ -2082,8 +2116,8 @@ def trim_paths(paths, baseDir):
 		set: A set of file paths, each relative to the parent directory of baseDir.
 	
 	Example:
-		>>> trim_paths({'/home/user/project/file1.py', '/home/user/project/file2.py'}, '/home/user/project/main.py')
-		{'file1.py', 'file2.py'}
+		>>> sorted(trim_paths({'/home/user/project/file1.py', '/home/user/project/file2.py'}, '/home/user/project/main.py'))
+		['file1.py', 'file2.py']
 	"""
 	return set([os.path.relpath(path,os.path.dirname(baseDir)) for path in paths])
 
