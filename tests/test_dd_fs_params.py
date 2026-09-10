@@ -451,7 +451,9 @@ def test_build_ext_mirrors_geometry():
 	assert args[:4] == ['-b', '1024', '-I', '128']
 
 
-def test_build_ext_negates_absent_curated_features():
+def test_build_ext_negates_absent_curated_features(monkeypatch):
+	monkeypatch.setattr(hpcp, '_ext_mkfs_knows_feature', lambda name: True)
+	monkeypatch.setattr(hpcp, '_ext_mkfs_probe_features', lambda names: None)
 	args = hpcp._build_ext({'features': ['has_journal', 'extent']})
 	features = args[args.index('-O') + 1].split(',')
 	# Present features are emitted plain...
@@ -464,12 +466,110 @@ def test_build_ext_negates_absent_curated_features():
 	assert '^dir_index' in features
 
 
-def test_build_ext_filters_runtime_state_features():
+def test_build_ext_filters_runtime_state_features(monkeypatch):
+	monkeypatch.setattr(hpcp, '_ext_mkfs_knows_feature', lambda name: True)
+	monkeypatch.setattr(hpcp, '_ext_mkfs_probe_features', lambda names: None)
 	args = hpcp._build_ext({'features': ['has_journal', 'needs_recovery', 'journal_dev']})
 	features = args[args.index('-O') + 1].split(',')
 	assert 'needs_recovery' not in features
 	assert 'journal_dev' not in features
 	assert '^needs_recovery' not in features
+
+
+def test_build_ext_drops_feature_names_unknown_to_mke2fs(monkeypatch):
+	# Pins the 1.45.6 failure: mke2fs rejects the entire -O list if it
+	# contains even one name it does not know, including a negation of a
+	# feature the source never had (^orphan_file / ^fast_commit). Those
+	# names must be dropped so geometry and the remaining features still
+	# make it onto the destination.
+	monkeypatch.setattr(
+		hpcp, '_ext_mkfs_knows_feature',
+		lambda name: name not in ('orphan_file', 'fast_commit'))
+	monkeypatch.setattr(hpcp, '_ext_mkfs_probe_features', lambda names: None)
+	args = hpcp._build_ext({'features': ['has_journal', 'extent', 'orphan_file']})
+	features = args[args.index('-O') + 1].split(',')
+	assert 'has_journal' in features
+	assert 'extent' in features
+	assert '^64bit' in features
+	assert 'orphan_file' not in features
+	assert '^orphan_file' not in features
+	assert '^fast_commit' not in features
+
+
+def test_build_ext_omits_dash_o_when_all_features_unknown(monkeypatch):
+	monkeypatch.setattr(hpcp, '_ext_mkfs_knows_feature', lambda name: False)
+	monkeypatch.setattr(hpcp, '_ext_mkfs_probe_features', lambda names: None)
+	args = hpcp._build_ext({'features': ['has_journal'], 'block_size': 4096})
+	assert '-O' not in args
+	assert args[:2] == ['-b', '4096']
+
+
+def test_ext_mkfs_knows_feature_false_on_invalid_option_set(monkeypatch):
+	# mke2fs prints this and exits 1 before touching the device. That is the
+	# only signal that the *name* is unknown; other non-zero exits mean the
+	# name parsed and something later failed (dummy path, size, ...).
+	hpcp._EXT_MKFS_FEATURE_KNOWN.clear()
+	def fake_run(commands, **kwargs):
+		return [_FakeTask(1, [
+			'mke2fs 1.45.6 (20-Mar-2020)',
+			'Invalid filesystem option set: orphan_file',
+		])]
+	monkeypatch.setattr(hpcp, '_binPaths', {'mkfs': '/usr/sbin/mkfs'})
+	monkeypatch.setattr(hpcp.multiCMD, 'run_commands', fake_run)
+	assert hpcp._ext_mkfs_knows_feature('orphan_file') is False
+
+
+def test_ext_mkfs_knows_feature_true_when_name_parses(monkeypatch):
+	hpcp._EXT_MKFS_FEATURE_KNOWN.clear()
+	def fake_run(commands, **kwargs):
+		return [_FakeTask(1, [
+			'mkfs.ext4: No such file or directory while trying to determine hardware sector size',
+		])]
+	monkeypatch.setattr(hpcp, '_binPaths', {'mkfs': '/usr/sbin/mkfs'})
+	monkeypatch.setattr(hpcp.multiCMD, 'run_commands', fake_run)
+	assert hpcp._ext_mkfs_knows_feature('has_journal') is True
+
+
+def test_ext_mkfs_knows_feature_fail_open_when_probe_cannot_run(monkeypatch):
+	hpcp._EXT_MKFS_FEATURE_KNOWN.clear()
+	def fake_run(commands, **kwargs):
+		raise RuntimeError('mkfs missing')
+	monkeypatch.setattr(hpcp.multiCMD, 'run_commands', fake_run)
+	assert hpcp._ext_mkfs_knows_feature('orphan_file') is True
+
+
+@pytest.mark.skipif(
+	shutil.which('mkfs') is None and shutil.which('mkfs.ext4') is None,
+	reason='mkfs.ext4 not available')
+def test_ext_mkfs_knows_feature_matches_real_mke2fs():
+	hpcp._EXT_MKFS_FEATURE_KNOWN.clear()
+	assert hpcp._ext_mkfs_knows_feature('has_journal') is True
+	assert hpcp._ext_mkfs_knows_feature('nosuch_hpcp_feature_xyz') is False
+
+
+@pytest.mark.skipif(
+	shutil.which('mkfs') is None and shutil.which('mkfs.ext4') is None,
+	reason='mkfs.ext4 not available')
+def test_build_ext_emitted_dash_o_is_accepted_by_local_mke2fs():
+	# The 1.45.6 failure: a source without orphan_file/fast_commit still
+	# emitted ^orphan_file,^fast_commit, and mke2fs rejected the whole -O
+	# list. Whatever we emit now must parse on this host.
+	hpcp._EXT_MKFS_FEATURE_KNOWN.clear()
+	args = hpcp._build_ext({
+		'features': [
+			'has_journal', 'ext_attr', 'resize_inode', 'dir_index', 'filetype',
+			'extent', '64bit', 'flex_bg', 'sparse_super', 'large_file',
+			'huge_file', 'dir_nlink', 'extra_isize', 'metadata_csum',
+		],
+	})
+	assert '-O' in args
+	option_set = args[args.index('-O') + 1]
+	mkfs = hpcp._binPaths.get('mkfs', shutil.which('mkfs') or 'mkfs')
+	result = subprocess.run(
+		[mkfs, '-t', 'ext4', '-n', '-F', '-O', option_set, '/hpcp-ext-feature-probe', '256'],
+		capture_output=True, text=True)
+	assert 'Invalid filesystem option set' not in (result.stderr or '')
+	assert 'Invalid filesystem option set' not in (result.stdout or '')
 
 
 def test_build_ext_mirrors_inode_ratio_not_absolute_count():
@@ -1136,7 +1236,7 @@ def test_dd_roundtrip_uses_defaults_with_no_fs_param_mirror(tmp_path):
 
 
 def test_version_bumped():
-	assert hpcp.version == '9.60'
+	assert hpcp.version == '9.61'
 	assert hpcp.__version__ == hpcp.version
 	assert hpcp.COMMIT_DATE == '2026-09-10'
 

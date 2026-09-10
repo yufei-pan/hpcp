@@ -124,7 +124,7 @@ except ImportError:
 	hasher = hashlib.blake2b()
 	xxhash_available = False
 
-version = '9.60'
+version = '9.61'
 __version__ = version
 COMMIT_DATE = '2026-09-10'
 
@@ -863,13 +863,13 @@ def _strip_dash_o(args):
 	Return `args` with a `-O <value>` pair removed, or None if `-O` is not present.
 
 	-O is the only version-fragile flag shared across ext/btrfs/f2fs: an ext or
-	btrfs -O value always includes this branch's curated feature negations (see
+	btrfs -O value includes this branch's curated feature negations (see
 	_EXT_CURATED_FEATURES / _BTRFS_CURATED_FEATURES below), and a single feature
 	name the local mkfs does not recognise makes it reject the ENTIRE argument
-	set - block size, inode size, -m, -i, FAT width and all - not just -O. That
-	silently regresses mirroring to full mkfs defaults on any host whose mkfs
-	predates one curated feature name (common: e2fsprogs < 1.46/1.47, btrfs-progs
-	< 6.1/6.7 - most current LTS/enterprise distros for at least one feature).
+	set - block size, inode size, -m, -i, FAT width and all - not just -O.
+	_build_ext now drops names local mke2fs does not parse, so this fallback is
+	the last resort for invalid *combinations* rather than unknown names
+	(common leftover: e2fsprogs < 1.46/1.47, btrfs-progs < 6.1/6.7).
 	"""
 	stripped = []
 	found = False
@@ -950,6 +950,66 @@ _EXT_CURATED_FEATURES = ('has_journal', 'ext_attr', 'resize_inode', 'dir_index',
 # Runtime state, not creation parameters. Never hand these to mke2fs.
 _EXT_RUNTIME_FEATURES = {'needs_recovery', 'orphan_present', 'has_snapshot', 'journal_dev', 'shared_blocks'}
 
+# Local mke2fs -O name -> bool. Unknown names (including ^negations of features
+# this e2fsprogs has never heard of) make mke2fs reject the entire option set.
+_EXT_MKFS_FEATURE_KNOWN = {}
+
+def _ext_mkfs_task_text(task):
+	"""Join a multiCMD Task's stdout and stderr into one searchable string."""
+	chunks = []
+	for attr in ('stderr', 'stdout'):
+		val = getattr(task, attr, None) or []
+		if isinstance(val, str):
+			chunks.append(val)
+		else:
+			chunks.extend(str(line) for line in val)
+	return '\n'.join(chunks)
+
+def _ext_mkfs_probe_features(names):
+	"""Ask local mke2fs whether each -O feature name parses. Cache the answers.
+
+	Uses `mke2fs -n` against a nonexistent path so nothing is created. An
+	unknown name fails immediately with 'Invalid filesystem option set'; a
+	known name gets past option parsing and then fails on the dummy path,
+	which still means the name is known. Probe failures fail open (known)
+	so a missing mkfs does not strip a usable -O list.
+	"""
+	todo = [n for n in dict.fromkeys(names) if n and n not in _EXT_MKFS_FEATURE_KNOWN]
+	if not todo:
+		return
+	try:
+		mkfs = _binPaths.get('mkfs', 'mkfs')
+		commands = [
+			[mkfs, '-t', 'ext4', '-n', '-F', '-O', name, '/hpcp-ext-feature-probe', '256']
+			for name in todo
+		]
+		tasks = multiCMD.run_commands(
+			commands, timeout=COMMAND_TIMEOUT, max_threads=min(8, len(commands)),
+			return_object=True, quiet=True)
+		if not tasks:
+			for name in todo:
+				_EXT_MKFS_FEATURE_KNOWN.setdefault(name, True)
+			return
+		for name, task in zip(todo, tasks):
+			text = _ext_mkfs_task_text(task)
+			_EXT_MKFS_FEATURE_KNOWN[name] = 'Invalid filesystem option set' not in text
+		for name in todo[len(tasks):]:
+			_EXT_MKFS_FEATURE_KNOWN.setdefault(name, True)
+	except Exception:
+		for name in todo:
+			_EXT_MKFS_FEATURE_KNOWN.setdefault(name, True)
+
+def _ext_mkfs_knows_feature(name):
+	"""True if local mke2fs parses this -O feature name.
+
+	One unknown name, including a negation of a feature this e2fsprogs has
+	never heard of, makes mke2fs reject the entire -O list (e2fsprogs 1.45:
+	^orphan_file, ^fast_commit). Callers drop those names and keep the rest.
+	"""
+	if name not in _EXT_MKFS_FEATURE_KNOWN:
+		_ext_mkfs_probe_features([name])
+	return _EXT_MKFS_FEATURE_KNOWN.get(name, True)
+
 def _probe_ext(device):
 	"""Read ext2/3/4 geometry and features from dumpe2fs."""
 	params = {}
@@ -983,7 +1043,19 @@ def _build_ext(params):
 	src_features = [f for f in params.get('features', []) if f not in _EXT_RUNTIME_FEATURES]
 	if src_features:
 		feature_opts = list(src_features) + ['^' + f for f in _EXT_CURATED_FEATURES if f not in src_features]
-		args.extend(['-O', ','.join(feature_opts)])
+		_ext_mkfs_probe_features(
+			opt[1:] if opt.startswith('^') else opt for opt in feature_opts)
+		kept, dropped = [], []
+		for opt in feature_opts:
+			name = opt[1:] if opt.startswith('^') else opt
+			if _ext_mkfs_knows_feature(name):
+				kept.append(opt)
+			else:
+				dropped.append(opt)
+		if dropped:
+			eprint(f"FS param warning: mke2fs does not recognise -O feature(s), dropping: {', '.join(dropped)}")
+		if kept:
+			args.extend(['-O', ','.join(kept)])
 	block_count = params.get('block_count')
 	block_size = params.get('block_size')
 	inode_count = params.get('inode_count')

@@ -31,6 +31,8 @@ def _clear_hpcp_transient_state():
 		hpcp._get_file_list_cache.clear()
 	if hasattr(hpcp, 'ERRORS'):
 		hpcp.ERRORS.clear()
+	if hasattr(hpcp, '_EXT_MKFS_FEATURE_KNOWN'):
+		hpcp._EXT_MKFS_FEATURE_KNOWN.clear()
 	hash_file = getattr(hpcp, 'hash_file', None)
 	if hash_file is not None and hasattr(hash_file, 'cache_clear'):
 		hash_file.cache_clear()
