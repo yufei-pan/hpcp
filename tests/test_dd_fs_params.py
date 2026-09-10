@@ -774,10 +774,18 @@ def _partition_params(image, index, fs_type):
 		subprocess.run(['losetup', '-d', loop], check=False, capture_output=True)
 
 
-@requires_root_and_tools
-def test_dd_roundtrip_preserves_source_fs_params(tmp_path):
+def _build_three_partition_source(tmp_path):
+	"""Build the shared 1400 MiB / three-partition source image.
+
+	A 260 MiB FAT32 ESP (a size at which mkfs.vfat would otherwise pick
+	FAT16), a 512 MiB ext4 built the way an older distro would, and an xfs
+	with non-default inode and directory geometry. Used by both the positive
+	round-trip test and the -nfp negative control so their source layouts
+	can never drift apart - the negative control specifically avoids a
+	single, whole-disk partition (see test_dd_roundtrip_uses_defaults_with_no_fs_param_mirror),
+	which runs into a pre-existing, unrelated -dd partition-table-sizing bug.
+	"""
 	src = str(tmp_path / 'src.img')
-	dest = str(tmp_path / 'dest.img')
 	_run('truncate', '-s', '1400M', src)
 	_run('sgdisk', '--clear',
 		 '--new=1:0:+260M', '--typecode=1:ef00', '--change-name=1:EFI System',
@@ -807,6 +815,13 @@ def test_dd_roundtrip_preserves_source_fs_params(tmp_path):
 				_run('umount', mount_point)
 	finally:
 		subprocess.run(['losetup', '-d', loop], check=False, capture_output=True)
+	return src
+
+
+@requires_root_and_tools
+def test_dd_roundtrip_preserves_source_fs_params(tmp_path):
+	src = _build_three_partition_source(tmp_path)
+	dest = str(tmp_path / 'dest.img')
 
 	src_fat = _partition_params(src, 1, 'vfat')
 	src_ext = _partition_params(src, 2, 'ext4')
@@ -839,23 +854,22 @@ def test_dd_roundtrip_preserves_source_fs_params(tmp_path):
 
 @requires_root_and_tools
 def test_dd_roundtrip_uses_defaults_with_no_fs_param_mirror(tmp_path):
-	src = str(tmp_path / 'src.img')
+	# Reuses the same three-partition layout the positive test already proves
+	# works, rather than a single whole-disk partition: that layout runs into
+	# a pre-existing, unrelated -dd partition-table-sizing bug (destination
+	# image sized with no room for the GPT backup header/array) that has
+	# nothing to do with -nfp or fs parameter mirroring.
+	src = _build_three_partition_source(tmp_path)
 	dest = str(tmp_path / 'dest.img')
-	_run('truncate', '-s', '700M', src)
-	_run('sgdisk', '--clear', '--new=1:0:0', '--typecode=1:8300', '--change-name=1:root', src)
 
-	loop = _run('losetup', '--partscan', '--find', '--show', src).strip()
-	try:
-		subprocess.run(['udevadm', 'settle'], check=False, capture_output=True)
-		_run('mkfs.ext4', '-q', '-F', '-b', '1024', '-I', '128', '-L', 'ROOTFS', f'{loop}p1')
-	finally:
-		subprocess.run(['losetup', '-d', loop], check=False, capture_output=True)
+	src_ext = _partition_params(src, 2, 'ext4')
+	assert src_ext['block_size'] == 1024
 
 	hpcp_py = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'hpcp.py')
 	open(dest, 'wb').close()
 	subprocess.run([sys.executable, hpcp_py, '-dd', '-nfp', src, dest],
 				   stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=900)
 
-	dest_ext = _partition_params(dest, 1, 'ext4')
+	dest_ext = _partition_params(dest, 2, 'ext4')
 	# -nfp restores today's behaviour: mkfs defaults, not the source's 1 KiB blocks.
 	assert dest_ext['block_size'] == 4096
