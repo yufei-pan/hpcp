@@ -923,3 +923,8 @@ def test_dd_roundtrip_uses_defaults_with_no_fs_param_mirror(tmp_path):
 		# hpcp -dd leaves its own read-only source loop attached; see
 		# _detach_loops_for_image's docstring.
 		_detach_loops_for_image(src)
+
+
+def test_version_bumped():
+	assert hpcp.version == '9.59'
+	assert hpcp.__version__ == hpcp.version

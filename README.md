@@ -57,6 +57,24 @@ Only available on Linux currently!
 The created disk image can be resized using the `-ddr --dd_resize` option to the desired size. (This feature is provided so that you can shrink the raw size of the resulting image and provides some shrink capability for XFS.)  
 For partitions that **hpcp** cannot create a separate unique mount point, **hpcp** will fall back to using the Linux program `dd` to clone the drive. Note that this can be risky and can lead to broken filesystems if the drive is actively being written to. (However, since you generally cannot mount that partition on the current OS, the real-world scenarios for this remain limited.)
 
+### Filesystem parameter mirroring
+
+In `-dd` mode `hpcp` reads each source filesystem's creation parameters and recreates the
+destination with the same geometry and feature set, instead of whatever the local `mkfs` defaults
+happen to be. This covers ext2/3/4 (block size, inode size, inode ratio, reserved percentage, full
+feature set), xfs (block/sector/inode/directory geometry and v5 feature flags), btrfs (nodesize,
+sectorsize, checksum type, features), FAT (width, sector and cluster size, FAT count, reserved
+sectors), ntfs, exfat, f2fs, udf, reiserfs, hfs+, and minix.
+
+Without it, a clone built on a modern host can be unmountable or unbootable on the system it came
+from — for example a FAT32 EFI System Partition recreated as FAT16, or an ext4 `/boot` that gains
+`metadata_csum` and `64bit` that its bootloader does not understand.
+
+Size-dependent values are scaled rather than copied, so `-ddr` resizes stay valid: the ext inode
+*ratio* and reserved *percentage* are mirrored, never absolute counts. If `mkfs` rejects a mirrored
+parameter set, `hpcp` warns and retries with defaults rather than failing the copy. Use `-nfp` to
+turn mirroring off entirely.
+
 ## Remove Extra Feature Note
 
 `-rme --remove_extra`: Especially when combined with `-rf`, **PLEASE PAY CLOSE ATTENTION TO YOUR TARGET DIRECTORY!**  
@@ -72,11 +90,15 @@ For partitions that **hpcp** cannot create a separate unique mount point, **hpcp
 
 ```bash
 $ hpcp -h
-usage: hpcp.py [-h] [-s] [-j MAX_WORKERS] [-b | -nb] [-v] [-do] [-nds] [-fh] [-hs HASH_SIZE] [-fpj FILES_PER_JOB] [-sfl SOURCE_FILE_LIST]
-               [-fl TARGET_FILE_LIST] [-cfl] [-dfl [DIFF_FILE_LIST]] [-tdfl] [-nhfl] [-rm] [-rf] [-rme] [-e EXCLUDE] [-x EXCLUDE_FILE]
-               [-nlt] [-V] [-pfl] [-si SRC_IMAGE] [-siff LOAD_DIFF_IMAGE] [-d DEST_PATH] [-rds] [-di DEST_IMAGE] [-dis DEST_IMAGE_SIZE]
-               [-diff] [-dd] [-ddr DD_RESIZE] [-L RATE_LIMIT] [-F FILE_RATE_LIMIT] [-tfs TARGET_FILE_SYSTEM] [-ncd] [-co]
-               [-ctl COMMAND_TIMEOUT_LIMIT] [-enes]
+usage: hpcp.py [-h] [-s] [-j MAX_WORKERS] [-b | -nb] [-v] [-do] [-nds] [-fh]
+               [-hs HASH_SIZE] [-fpj FILES_PER_JOB] [-sfl SOURCE_FILE_LIST]
+               [-fl TARGET_FILE_LIST] [-cfl] [-dfl [DIFF_FILE_LIST]] [-tdfl]
+               [-nhfl] [-rm] [-rf] [-rme] [-rwloff] [-e EXCLUDE]
+               [-x EXCLUDE_FILE] [-nlt] [-V] [-pfl] [-si SRC_IMAGE]
+               [-siff LOAD_DIFF_IMAGE] [-d DEST_PATH] [-rds] [-di DEST_IMAGE]
+               [-dis DEST_IMAGE_SIZE] [-diff] [-dd] [-ddr DD_RESIZE] [-nfp]
+               [-L RATE_LIMIT] [-F FILE_RATE_LIMIT] [-tfs TARGET_FILE_SYSTEM]
+               [-ncd] [-co] [-ctl COMMAND_TIMEOUT_LIMIT] [-enes]
                [src_path ...]
 
 Copy files from source to destination
@@ -88,8 +110,9 @@ options:
   -h, --help            show this help message and exit
   -s, --single_thread   Use serial processing
   -j, -m, -t, --max_workers MAX_WORKERS
-                        Max workers for parallel processing. Default is 4 * CPU count. Use negative numbers to indicate {n} * CPU count, 0
-                        means 1/2 CPU count.
+                        Max workers for parallel processing. Default is 1 *
+                        CPU count. Use negative numbers to indicate {n} * CPU
+                        count, 0 means 1/2 CPU count.
   -b, --batch           Batch mode, process all files in one go
   -nb, --no_batch, --sequential
                         Do not use batch mode
@@ -100,28 +123,43 @@ options:
                         Do not sync directory metadata, useful for verfication
   -fh, --full_hash      Checks the full hash of files
   -hs, --hash_size HASH_SIZE
-                        Hash size in bytes, default is 65536. This means hpcp will only check the last 64 KiB of the file.
+                        Hash size in bytes, default is 65536. This means hpcp
+                        will only check the last 64 KiB (about 1 page in a
+                        SSD) of the file.
   -fpj, --files_per_job FILES_PER_JOB
-                        Base number of files per job, will be adjusted dynamically. Default is 1
+                        Base number of files per job, will be adjusted
+                        dynamically. Default is 1
   -sfl, -lfl, --source_file_list SOURCE_FILE_LIST
-                        Load source file list from file. Will treat it raw meaning do not expand files / folders. files are seperated
-                        using newline. If --compare_file_list is specified, it will be used as source for compare
+                        Load source file list from file, or use "-" to read
+                        from stdin. Will treat it raw meaning do not expand
+                        files / folders. files are seperated using newline. If
+                        --compare_file_list is specified, it will be used as
+                        source for compare
   -fl, -tfl, --target_file_list TARGET_FILE_LIST
-                        Specify the file_list file to store list of files in src_path to. If --compare_file_list is specified, it will be
-                        used as targets for compare
+                        Specify the file_list file to store list of files in
+                        src_path to. If --compare_file_list is specified, it
+                        will be used as targets for compare
   -cfl, --compare_file_list
-                        Only compare file list. Use --file_list to specify a existing file list or specify the dest_path to compare
-                        src_path with. When not using with file_list, will compare hash.
+                        Only compare file list. Use --file_list to specify a
+                        existing file list or specify the dest_path to compare
+                        src_path with. When not using with file_list, will
+                        compare hash.
   -dfl, --diff_file_list [DIFF_FILE_LIST]
-                        Implies --compare_file_list, specify a file name to store the diff file list to or omit the value to auto-
+                        Implies --compare_file_list, specify a file name to
+                        store the diff file list to or omit the value to auto-
                         determine.
   -tdfl, --tar_diff_file_list
-                        Generate a tar compatible diff file list. ( update / new files only )
+                        Generate a tar compatible diff file list. ( update /
+                        new files only )
   -nhfl, --no_hash_file_list
                         Do not append hash to file list
   -rm, --remove         Remove all files and folders specified in src_path
   -rf, --remove_force   Remove all files without prompt
-  -rme, --remove_extra  Remove all files and folders in dest_path that are not in src_path
+  -rme, --remove_extra  Remove all files and folders in dest_path that are not
+                        in src_path
+  -rwloff, --do_not_remove_files_while_listing
+                        Do not remove files while listing. This is useful if
+                        you want to remove files after listing.
   -e, --exclude EXCLUDE
                         Exclude source files matching the pattern
   -x, --exclude_file EXCLUDE_FILE
@@ -132,48 +170,73 @@ options:
   -pfl, --parallel_file_listing
                         Use parallel processing for file listing
   -si, --src_image SRC_IMAGE
-                        Source Image, mount the image and copy the files from it.
+                        Source Image, mount the image and copy the files from
+                        it.
   -siff, --load_diff_image LOAD_DIFF_IMAGE
-                        Not implemented. Load diff images and apply the changes to the destination.
+                        Not implemented. Load diff images and apply the
+                        changes to the destination.
   -d, -C, --dest_path DEST_PATH
                         Destination Path
   -rds, --random_dest_selection
-                        Randomly select destination path from the list of destination paths instead of filling round robin. Can speed up
-                        transfer if dests are on different devices. Warning: can cause unable to fit in big files as dests are filled up
-                        by smaller files.
+                        Randomly select destination path from the list of
+                        destination paths instead of filling round robin. Can
+                        speed up transfer if dests are on different devices.
+                        Warning: can cause unable to fit in big files as dests
+                        are filled up by smaller files.
   -di, --dest_image DEST_IMAGE
-                        Base name for destination Image, create a image file and copy the files into it.
+                        Base name for destination Image, create a image file
+                        and copy the files into it.
   -dis, --dest_image_size DEST_IMAGE_SIZE
-                        Destination Image Size, specify the size of the destination image to split into. Default is 0 (No split). Example:
-                        {10TiB} or {1G}
+                        Destination Image Size, specify the size of the
+                        destination image to split into. Default is 0 (No
+                        split). Example: {10TiB} or {1G}
   -diff, --get_diff_image
-                        Not implemented. Compare the source and destination file list, create a diff image of that will update the
+                        Not implemented. Compare the source and destination
+                        file list, create a diff image of that will update the
                         destination to source.
-  -dd, --disk_dump      Disk to Disk mirror, use this if you are backuping / deploying an OS from / to a disk. Require 1 source, can be 1
-                        src_path or 1 -si src_image, require 1 -di dest_image. Note: will only actually use dd if unable to mount / create
-                        a partition.
+  -dd, --disk_dump      Disk to Disk mirror, use this if you are backuping /
+                        deploying an OS from / to a disk. Require 1 source,
+                        can be 1 src_path or 1 -si src_image, require 1 -di
+                        dest_image. Note: will only actually use dd if unable
+                        to mount / create a partition.
   -ddr, --dd_resize DD_RESIZE
-                        Resize the destination image to the specified size with -dd. Applies to biggest partiton first. Specify multiple
-                        -ddr to resize subsequent sized partitions. Example: {100GiB} or {200G}
+                        Resize the destination image to the specified size
+                        with -dd. Applies to biggest partiton first. Specify
+                        multiple -ddr to resize subsequent sized partitions.
+                        Example: {100GiB} or {200G}
+  -nfp, --no_fs_param_mirror
+                        Do not mirror source filesystem parameters (geometry,
+                        features) in -dd mode. Create destination filesystems
+                        with mkfs defaults, preserving only label and UUID.
   -L, -rl, --rate_limit RATE_LIMIT
-                        Approximate a rate limit the copy speed in bytes/second. Example: 10M for 10 MB/s, 1Gi for 1 GiB/s. Note: do not
-                        work in single thread mode. Default is 0: no rate limit.
+                        Approximate a rate limit the copy speed in
+                        bytes/second. Example: 10M for 10 MB/s, 1Gi for 1
+                        GiB/s. Note: do not work in single thread mode.
+                        Default is 0: no rate limit.
   -F, -frl, --file_rate_limit FILE_RATE_LIMIT
-                        Approximate a rate limit the copy speed in files/second. Example: 10K for 10240 files/s, 1Mi for 1024*1024*1024
-                        files/s. Note: do not work in serial mode. Default is 0: no rate limit.
+                        Approximate a rate limit the copy speed in
+                        files/second. Example: 10K for 10240 files/s, 1Mi for
+                        1024*1024*1024 files/s. Note: do not work in serial
+                        mode. Default is 0: no rate limit.
   -tfs, --target_file_system TARGET_FILE_SYSTEM
-                        Specify the target file system type. Will abort if the target file system type does not match. Example: ext4, xfs,
-                        ntfs, fat32, exfat. Default is None: do not check target file system type.
+                        Specify the target file system type. Will abort if the
+                        target file system type does not match. Example: ext4,
+                        xfs, f2fs, ntfs, fat32, exfat. Default is None: do not
+                        check target file system type.
   -ncd, --no_create_dir
-                        Ignore any destination folder that does not already exist. ( Will still copy if dest is a file )
+                        Ignore any destination folder that does not already
+                        exist. ( Will still copy if dest is a file )
   -co, --content_only   Content-only copy: do not sync mode, owner, or
                         timestamps on files or directories. Still create
                         missing destination directories using filesystem-
                         default permissions (so parent ACL/setgid/setuid
                         inherit).
   -ctl, --command_timeout_limit COMMAND_TIMEOUT_LIMIT
-                        Set the command timeout limit in seconds for external commands ( ex. cp / dd ). Default is 0: no timeout.
+                        Set the command timeout limit in seconds for external
+                        commands ( ex. cp / dd ). Default is 0: no timeout.
   -enes, --exit_not_enough_space
-                        Exit if there is not enough space on the destination instead of continuing (Note: Default is continue as in
-                        compressed fs copy can be down even if source is bigger than free space).
+                        Exit if there is not enough space on the destination
+                        instead of continuing (Note: Default is continue as in
+                        compressed fs copy can be down even if source is
+                        bigger than free space).
 ```
