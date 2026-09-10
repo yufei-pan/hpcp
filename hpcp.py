@@ -126,7 +126,7 @@ except ImportError:
 
 version = '9.59'
 __version__ = version
-COMMIT_DATE = '2026-09-09'
+COMMIT_DATE = '2026-09-10'
 
 MAGIC_NUMBER = 1.61803398875
 RANDOM_DESTINATION_SELECTION = False
@@ -1628,7 +1628,9 @@ def write_partition_info(image, partition_infos, partition_name):
 			target_partition, loop_device = get_target_partition(image, partition_name)
 			if not target_partition:
 				eprint(f"Partition not found error: Cannot find partition {partition_name} in {image}.")
-				return
+				# Callers do delayed_commands.extend(write_partition_info(...)), so this
+				# must stay a list; a bare return turned a handled error into TypeError.
+				return delayed_commands
 			fs_type = partition_infos[partition_name]['fs_type']
 			fs_label = partition_infos[partition_name]['fs_label']
 			fs_uuid = partition_infos[partition_name]['fs_uuid']
@@ -4126,7 +4128,12 @@ def process_copy(src_paths: list, dests:list = [], single_thread = False, max_wo
 	return total_file_list, total_sym_links
 
 def validate_dd_source_path(src_path,loop_devices = None):
-	if not loop_devices:
+	# `is None`, not `if not loop_devices`: an empty list is falsy, so the old
+	# check rebound the parameter to a fresh local list whenever the caller passed
+	# one that was still empty - which is exactly what hpcp() does. The source loop
+	# was then appended to a list nobody owned and clean_up() never detached it,
+	# leaking one read-only loop device per -dd run. Matches clean_up() below.
+	if loop_devices is None:
 		loop_devices = []
 	dd_src = src_path
 	if not dd_src:
@@ -4146,6 +4153,11 @@ def validate_dd_source_path(src_path,loop_devices = None):
 		dd_src = create_loop_device(dd_src,read_only=True)
 		loop_devices.append(dd_src)
 	return dd_src
+
+# Bytes reserved on a destination image for GPT's own structures: the primary
+# header + partition array at the head (and the 1M alignment before the first
+# partition), and the backup header in the final 33 sectors.
+_GPT_STRUCTURE_RESERVE = 2 * 1024 * 1024
 
 def create_dd_dest_part_table(dd_src,dd_resize = [],src_path = None, dest_path = None):
 	"""Create / resize dest image and write a matching partition table.
@@ -4180,7 +4192,14 @@ def create_dd_dest_part_table(dd_src,dd_resize = [],src_path = None, dest_path =
 			partition_infos[sorted_partitions[-i-1]]['size'] = dd_resize[i]
 
 		# recaclulate the disk size, also include 1M extra for each partition 
-	disk_info['size'] = sum([partition_infos[partition]['size'] for partition in partition_infos]) + 1024*1024*len(partition_infos)
+	# ...plus room for GPT itself. GPT keeps a primary header and partition array
+	# at the start of the disk and a backup copy in the last 33 sectors, and sgdisk
+	# refuses to create a partition that would run into either. The per-partition
+	# 1M slack above is consumed by the 1M start alignment, so nothing reserved the
+	# tail: a single partition spanning its source disk could not be recreated at
+	# all ("Could not create partition 1 from ...", sgdisk rc 4). Verified: a lone
+	# partition of size S needs S + 2M, where S + 1M fails.
+	disk_info['size'] = sum([partition_infos[partition]['size'] for partition in partition_infos]) + 1024*1024*len(partition_infos) + _GPT_STRUCTURE_RESERVE
 	partition_infos[disk_name] = disk_info
 	sorted_partitions.append(disk_name)
 

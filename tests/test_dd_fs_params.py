@@ -901,13 +901,13 @@ def _partition_params(image, index, fs_type):
 def _detach_loops_for_image(image):
 	"""Detach every loop device still backed by `image`.
 
-	hpcp.py -dd leaves its own read-only *source* loop attached after it
-	returns - a documented, pre-existing leak that is out of scope for this
-	test task to fix in hpcp.py. This compensates on the test side so a
-	repeated or CI run does not keep accumulating attached loop devices on
-	the host. Scoped strictly to this image's own backing file (via
-	`losetup -j`), so unrelated loop devices - e.g. this host's snap-package
-	loops - are never touched.
+	hpcp.py used to leave its own read-only *source* loop attached after it
+	returned; that leak is fixed now (see
+	test_dd_does_not_leak_the_source_loop_device), but this stays as a safety
+	net so a test that fails partway through still cannot accumulate attached
+	loop devices on the host. Scoped strictly to this image's own backing file
+	(via `losetup -j`), so unrelated loop devices - e.g. this host's
+	snap-package loops - are never touched.
 	"""
 	try:
 		output = _run('losetup', '-j', image)
@@ -927,8 +927,7 @@ def _run_hpcp_dd(extra_args, src, dest, timeout=900):
 	that itself, eprints a message with no colon in it (so it is not counted
 	as an error), and returns get_rc_from_error() == 0 - confirmed empirically
 	by running a successful -dd here and inspecting its actual exit code
-	before writing this assertion. A crash (e.g. the pre-existing -dd
-	partition-table-sizing bug) leaves a returncode that get_rc_from_error()
+	before writing this assertion. A crash leaves a returncode that get_rc_from_error()
 	maps away from 0, so asserting on it directly surfaces hpcp's own
 	stdout/stderr in the pytest failure instead of a bare, opaque KeyError
 	from a later probe of a destination that never got a filesystem.
@@ -951,9 +950,8 @@ def _build_three_partition_source(tmp_path):
 	FAT16), a 512 MiB ext4 built the way an older distro would, and an xfs
 	with non-default inode and directory geometry. Used by both the positive
 	round-trip test and the -nfp negative control so their source layouts
-	can never drift apart - the negative control specifically avoids a
-	single, whole-disk partition (see test_dd_roundtrip_uses_defaults_with_no_fs_param_mirror),
-	which runs into a pre-existing, unrelated -dd partition-table-sizing bug.
+	can never drift apart. Single, whole-disk partition layouts are covered
+	separately by test_dd_clones_a_single_partition_spanning_the_whole_disk.
 	"""
 	src = str(tmp_path / 'src.img')
 	_run('truncate', '-s', '1400M', src)
@@ -1026,11 +1024,9 @@ def test_dd_roundtrip_preserves_source_fs_params(tmp_path):
 
 @requires_root_and_tools
 def test_dd_roundtrip_uses_defaults_with_no_fs_param_mirror(tmp_path):
-	# Reuses the same three-partition layout the positive test already proves
-	# works, rather than a single whole-disk partition: that layout runs into
-	# a pre-existing, unrelated -dd partition-table-sizing bug (destination
-	# image sized with no room for the GPT backup header/array) that has
-	# nothing to do with -nfp or fs parameter mirroring.
+	# Reuses the same three-partition layout as the positive test, so the two
+	# differ only in the -nfp flag and nothing else can explain a difference
+	# in the result.
 	src = _build_three_partition_source(tmp_path)
 	dest = str(tmp_path / 'dest.img')
 
@@ -1052,4 +1048,114 @@ def test_dd_roundtrip_uses_defaults_with_no_fs_param_mirror(tmp_path):
 def test_version_bumped():
 	assert hpcp.version == '9.59'
 	assert hpcp.__version__ == hpcp.version
-	assert hpcp.COMMIT_DATE == '2026-09-09'
+	assert hpcp.COMMIT_DATE == '2026-09-10'
+
+
+#%% -- Pre-existing -dd defects found while building the mirroring feature --
+# These three bugs predate filesystem parameter mirroring: they reproduce on
+# the commit this branch forked from, with none of the mirroring code present.
+
+
+def test_validate_dd_source_path_registers_loop_in_empty_caller_list(monkeypatch, tmp_path):
+	image = tmp_path / 'src.img'
+	image.write_bytes(b'\0' * 1024)
+	monkeypatch.setattr(hpcp, 'create_loop_device', lambda path, read_only=False: '/dev/fakeloop9')
+
+	caller_loops = []
+	dd_src = hpcp.validate_dd_source_path([str(image)], loop_devices=caller_loops)
+
+	assert dd_src == '/dev/fakeloop9'
+	# An empty list is falsy, so `if not loop_devices:` used to rebind the
+	# parameter to a fresh local list. The caller's list never learned about the
+	# source loop, so clean_up() could not detach it and every -dd run leaked one.
+	assert caller_loops == ['/dev/fakeloop9']
+
+
+def test_validate_dd_source_path_appends_to_populated_caller_list(monkeypatch, tmp_path):
+	image = tmp_path / 'src.img'
+	image.write_bytes(b'\0' * 1024)
+	monkeypatch.setattr(hpcp, 'create_loop_device', lambda path, read_only=False: '/dev/fakeloop9')
+
+	caller_loops = ['/dev/preexisting0']
+	hpcp.validate_dd_source_path([str(image)], loop_devices=caller_loops)
+
+	# A populated list was always truthy, which is why only the first loop leaked.
+	assert caller_loops == ['/dev/preexisting0', '/dev/fakeloop9']
+
+
+def test_write_partition_info_returns_list_when_partition_missing(monkeypatch):
+	monkeypatch.setattr(hpcp, 'get_target_partition', lambda image, name: ('', None))
+	monkeypatch.setattr(hpcp, 'run_command_in_multicmd_with_path_check', lambda command, **kwargs: [''])
+
+	infos = {'1': {'partition_guid_code': '', 'unique_partition_guid': '', 'partition_name': '',
+				   'partition_attrs': '', 'fs_type': 'ext4', 'fs_uuid': '', 'fs_label': '',
+				   'size': 0, 'fs_params': {}}}
+	result = hpcp.write_partition_info('/dev/fakeimg', infos, '1')
+
+	# Every caller does `delayed_commands.extend(write_partition_info(...))`, so
+	# a bare `return` here turned a handled "partition not found" into
+	# TypeError: 'NoneType' object is not iterable.
+	assert result == []
+
+
+def _build_single_partition_source(tmp_path):
+	"""Build a 700 MiB image whose single partition spans the whole disk.
+
+	This is the layout that used to be impossible to clone: with one partition
+	the destination was sized at partition + 1 MiB, which the 1 MiB start
+	alignment consumed entirely, leaving nothing for GPT's backup header.
+	"""
+	src = str(tmp_path / 'src.img')
+	_run('truncate', '-s', '700M', src)
+	_run('sgdisk', '--clear', '--new=1:0:0', '--typecode=1:8300', '--change-name=1:root', src)
+
+	loop = _run('losetup', '--partscan', '--find', '--show', src).strip()
+	try:
+		subprocess.run(['udevadm', 'settle'], check=False, capture_output=True)
+		_run('mkfs.ext4', '-q', '-F', '-b', '1024', '-I', '128', '-L', 'ROOTFS', f'{loop}p1')
+		mount_point = str(tmp_path / 'mnt1')
+		os.makedirs(mount_point, exist_ok=True)
+		_run('mount', f'{loop}p1', mount_point)
+		try:
+			os.makedirs(os.path.join(mount_point, 'dir'), exist_ok=True)
+			with open(os.path.join(mount_point, 'dir', 'file1.txt'), 'w') as f:
+				f.write('hello-single\n')
+		finally:
+			_run('umount', mount_point)
+	finally:
+		subprocess.run(['losetup', '-d', loop], check=False, capture_output=True)
+	return src
+
+
+@requires_root_and_tools
+def test_dd_clones_a_single_partition_spanning_the_whole_disk(tmp_path):
+	src = _build_single_partition_source(tmp_path)
+	dest = str(tmp_path / 'dest.img')
+
+	try:
+		src_ext = _partition_params(src, 1, 'ext4')
+		assert src_ext['block_size'] == 1024
+
+		_run_hpcp_dd([], src, dest)
+
+		dest_ext = _partition_params(dest, 1, 'ext4')
+		assert dest_ext['block_size'] == src_ext['block_size'] == 1024
+		assert dest_ext['inode_size'] == src_ext['inode_size'] == 128
+	finally:
+		_detach_loops_for_image(src)
+		_detach_loops_for_image(dest)
+
+
+@requires_root_and_tools
+def test_dd_does_not_leak_the_source_loop_device(tmp_path):
+	src = _build_single_partition_source(tmp_path)
+	dest = str(tmp_path / 'dest.img')
+
+	try:
+		_run_hpcp_dd([], src, dest)
+		# hpcp must detach its own read-only source loop before returning.
+		assert subprocess.run(['losetup', '-j', src], capture_output=True, text=True).stdout.strip() == ''
+		assert subprocess.run(['losetup', '-j', dest], capture_output=True, text=True).stdout.strip() == ''
+	finally:
+		_detach_loops_for_image(src)
+		_detach_loops_for_image(dest)
