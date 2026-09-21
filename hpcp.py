@@ -124,9 +124,9 @@ except ImportError:
 	hasher = hashlib.blake2b()
 	xxhash_available = False
 
-version = '9.61'
+version = '9.62'
 __version__ = version
-COMMIT_DATE = '2026-09-10'
+COMMIT_DATE = '2026-09-21'
 
 MAGIC_NUMBER = 1.61803398875
 RANDOM_DESTINATION_SELECTION = False
@@ -2293,17 +2293,20 @@ def _get_file_list_cache_key(path, exclude, append_hash, full_hash):
 	exclude_key = frozenset(exclude) if isinstance(exclude, (list, set)) else exclude
 	return (path, exclude_key, append_hash, full_hash)
 
-def get_file_list(path, exclude=None, append_hash=False, full_hash=False, max_workers=56, drop_cache=False, parallel_file_listing=True, remove_files_while_listing=False):
-	"""Unified file list getter with a single cache. Dispatches to get_file_list_serial or get_file_list_parallel based on serial."""
+def get_file_list(path, exclude=None, append_hash=False, full_hash=False, max_workers=56, drop_cache=False, parallel_file_listing=True, remove_files_while_listing=False, return_removed_count=False):
+	"""Unified file list getter with a single cache. Dispatches to get_file_list_serial or get_file_list_parallel based on serial.
+
+	With return_removed_count, returns a 5-tuple whose last element is the number of
+	files/links unlinked during the scan (always 0 unless remove_files_while_listing).
+	"""
 	cache_key = _get_file_list_cache_key(path, exclude, append_hash, full_hash)
-	if drop_cache:
+	if drop_cache or remove_files_while_listing:
+		# In deletion mode the scan itself is what unlinks the files, so a cached list
+		# would silently skip the removal. Always drop it and walk the tree for real.
 		_get_file_list_cache.pop(cache_key, None)
 	if cache_key in _get_file_list_cache:
 		result = _get_file_list_cache[cache_key]
-		if remove_files_while_listing:
-			# Drop the cache if we are removing files while listing ( indicating we are removing the files later )
-			del _get_file_list_cache[cache_key]
-		return result
+		return (*result, 0) if return_removed_count else result
 	start_time = time.monotonic()
 	print(f"Getting file list for {path}")
 	if remove_files_while_listing:
@@ -2319,7 +2322,7 @@ def get_file_list(path, exclude=None, append_hash=False, full_hash=False, max_wo
 	else:
 		_get_file_list_cache[cache_key] = result
 	print(f"Time taken to get file list: {time.monotonic() - start_time:0.4f} seconds")
-	return result
+	return (*result, removed_count) if return_removed_count else result
 
 def _file_list_rate_limit(limiter_state, increment=1):
 	"""Throttle file-list iteration based on FILES_RATE_LIMIT."""
@@ -2636,20 +2639,25 @@ def delete_files_parallel(paths, max_workers, verbose=False,files_per_job=1,excl
 		paths = [paths]
 	all_files = set()
 	init_size_all = 0
+	removed_while_listing = 0
 	for path in paths:
-		file_list, links,init_size, _ = get_file_list(path, max_workers=max_workers, exclude=exclude, parallel_file_listing=parallel_file_listing,remove_files_while_listing=REMOVE_FILES_WHILE_LISTING)
+		file_list, links,init_size, _, removed_count = get_file_list(path, max_workers=max_workers, exclude=exclude, parallel_file_listing=parallel_file_listing,remove_files_while_listing=REMOVE_FILES_WHILE_LISTING,return_removed_count=True)
 		all_files.update(set(file_list) | set(links))
 		init_size_all += init_size
-	total_files = len(all_files)
+		removed_while_listing += removed_count
+	# Entries unlinked during the scan never reach all_files, so count them separately.
+	total_files = len(all_files) + removed_while_listing
 	print(f"Number of files: {total_files}")
 	print(f'Initial estimated size: {format_bytes(init_size_all)}B')
-	if total_files == 0:
-		return 1 , delete_file_bulk(paths)[0]
-	delete_counter, delete_size_counter = delete_file_list_parallel(all_files, max_workers, verbose,files_per_job,init_size=init_size)
+	if not all_files:
+		# Nothing left to delete in parallel: either the tree was empty or the scan
+		# already removed everything. Only the directory structure remains.
+		return removed_while_listing + 1 , delete_file_bulk(paths)[0]
+	delete_counter, delete_size_counter = delete_file_list_parallel(all_files, max_workers, verbose,files_per_job,init_size=init_size_all)
 	print("Removing directory structures....")
 	delete_size_counter += delete_file_bulk(paths)[0]
 	print(f"Initial estimated size: {format_bytes(init_size_all)}B, Final size: {format_bytes(delete_size_counter)}B")
-	return delete_counter + 1, delete_size_counter
+	return delete_counter + removed_while_listing + 1, delete_size_counter
 
 #%% ---- Copy Files ----
 def copy_file(src_path, dest_paths, full_hash=False, verbose=False, concurrent_processes=0):
