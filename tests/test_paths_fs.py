@@ -46,3 +46,19 @@ def test_expand_user_in_expand_paths(hpcp_mod, reset_hpcp_globals, tmp_path, mon
 def test_get_mount_table_is_dict(hpcp_mod, reset_hpcp_globals, require_linux):
 	table = hpcp_mod.get_mount_table()
 	assert isinstance(table, dict)
+
+
+@pytest.mark.parametrize('has_valid_source', [True, False])
+def test_source_validation_removes_all_missing_entries(tmp_path, hpcp_mod, reset_hpcp_globals, has_valid_source):
+	paths = [str(tmp_path / 'missing1'), str(tmp_path / 'missing2')]
+	valid = tmp_path / 'valid'
+	valid.write_text('valid')
+	if has_valid_source:
+		paths.append(str(valid))
+		hpcp_mod.verify_src_path(paths)
+		assert paths == [str(valid)]
+	else:
+		with pytest.raises(RuntimeError, match='No source paths:'):
+			hpcp_mod.verify_src_path(paths)
+		assert paths == []
+	assert len(hpcp_mod.ERRORS) == 2

@@ -44,3 +44,12 @@ def test_hpcp_no_batch_copy(tmp_tree, hpcp_mod, reset_hpcp_globals, require_linu
 	hpcp_mod.hpcp(srcs, **opts)
 	assert (tmp_tree.dst / 'a.txt').read_text() == 'seq'
 	assert (tmp_tree.dst / 'b.txt').read_text() == 'seq2'
+
+
+def test_compare_missing_destination_reports_failure(tmp_tree, hpcp_mod, reset_hpcp_globals):
+	tmp_tree.add_file('a.txt', 'a')
+	rc = hpcp_mod.hpcp(
+		[str(tmp_tree.src)], dest_paths=[str(tmp_tree.root / 'missing')],
+		compare_file_list=True, single_thread=True,
+	)
+	assert rc != 0

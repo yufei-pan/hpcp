@@ -69,14 +69,11 @@ def test_compare_file_list_writes_diff(tmp_path, hpcp_mod, reset_hpcp_globals):
 def test_tar_diff_file_list_is_new_or_updated_only(tmp_path, hpcp_mod, reset_hpcp_globals):
 	"""Help text: tar-compatible diff lists update/new files only (in src not dest)."""
 	diff = tmp_path / 'tar.txt'
-	src = {'new.txt:h', 'same.txt:h'}
-	dst = {'same.txt:h', 'extra.txt:h'}
+	src = {'new.txt:h', 'updated.txt:new', 'same.txt:h'}
+	dst = {'same.txt:h', 'updated.txt:old', 'extra.txt:h'}
 	hpcp_mod.compare_file_list(src, dst, diff_file_list=str(diff), tar_diff_file_list=True)
 	text = diff.read_text()
-	if 'new.txt' not in text or 'extra.txt' in text:
-		pytest.xfail('BUGS.md#2 tar_diff_file_list writes dest extras instead of src-only updates')
-	assert 'new.txt' in text
-	assert 'extra.txt' not in text
+	assert set(text.splitlines()) == {'new.txt', 'updated.txt'}
 
 
 def test_hpcp_compare_file_list_with_dest(tmp_tree, hpcp_mod, reset_hpcp_globals, copy_args, require_linux):
@@ -107,3 +104,22 @@ def test_source_file_list_copies_listed_file(tmp_tree, hpcp_mod, reset_hpcp_glob
 	copied = list(tmp_tree.dst.rglob('listed.txt'))
 	assert copied
 	assert copied[0].read_text() == 'from-list'
+
+
+@pytest.mark.parametrize('compare_requested', [True, False])
+def test_compare_stored_list_preserves_baseline_and_writes_diff(
+	tmp_tree, hpcp_mod, reset_hpcp_globals, compare_requested,
+):
+	tmp_tree.add_file('same.txt', 'same')
+	tmp_tree.add_file('new.txt', 'new')
+	baseline = tmp_tree.root / 'baseline.txt'
+	baseline.write_text('./\nsame.txt\n')
+	diff = tmp_tree.root / 'diff.txt'
+	rc = hpcp_mod.hpcp(
+		[str(tmp_tree.src) + os.sep], target_file_list=str(baseline),
+		compare_file_list=compare_requested, diff_file_list=str(diff),
+		append_hash_to_file_list=False, single_thread=True,
+	)
+	assert rc == 0
+	assert baseline.read_text() == './\nsame.txt\n'
+	assert diff.read_bytes() == b'-\x00new.txt\n'

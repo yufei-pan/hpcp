@@ -209,3 +209,70 @@ def test_copy_file_skips_identical_small_file_on_rerun(tmp_tree, hpcp_mod, reset
 	hpcp_mod.HASH_SIZE = 65536
 	assert hpcp_mod.copy_file(src, [dst])[0] > 0
 	assert hpcp_mod.copy_file(src, [dst])[0] == 0
+
+
+def test_no_directory_sync_preserves_root_metadata(tmp_tree, hpcp_mod, reset_hpcp_globals, require_linux):
+	os.chmod(tmp_tree.src, 0o750)
+	os.chmod(tmp_tree.dst, 0o700)
+	os.utime(tmp_tree.src, (1234567890, 1234567890))
+	os.utime(tmp_tree.dst, (1600000000, 1600000000))
+	rc = hpcp_mod.hpcp(
+		[str(tmp_tree.src) + os.sep], dest_paths=[str(tmp_tree.dst) + os.sep],
+		single_thread=True, no_directory_sync=True,
+	)
+	assert rc == 0
+	assert os.stat(tmp_tree.dst).st_mode & 0o777 == 0o700
+	assert os.stat(tmp_tree.dst).st_mtime == 1600000000
+
+
+@pytest.mark.parametrize('no_create_dir', [True, False])
+def test_no_directory_sync_creates_root_only_when_allowed(
+	tmp_tree, hpcp_mod, reset_hpcp_globals, require_linux, no_create_dir,
+):
+	tmp_tree.add_file('a.txt', 'copy me')
+	rc = hpcp_mod.hpcp(
+		[str(tmp_tree.src)], dest_paths=[str(tmp_tree.dst) + os.sep],
+		single_thread=True, no_directory_sync=True, no_create_dir=no_create_dir,
+	)
+	new_root = tmp_tree.dst / 'src'
+	if no_create_dir:
+		assert not new_root.exists()
+		assert rc != 0
+	else:
+		assert rc == 0
+		assert (new_root / 'a.txt').read_text() == 'copy me'
+
+
+@pytest.mark.parametrize('single_thread', [True, False])
+def test_successful_destination_retry_continues_copying(
+	tmp_tree, hpcp_mod, reset_hpcp_globals, require_linux, single_thread,
+):
+	# The first destination cannot hold sub/*; the second is usable.
+	(tmp_tree.dst / 'sub').write_text('not a directory')
+	alt = tmp_tree.root / 'alt'
+	(alt / 'sub').mkdir(parents=True)
+	for i in range(6):
+		tmp_tree.add_file(f'sub/{i}.txt', f'payload {i}')
+	rc = hpcp_mod.hpcp(
+		[str(tmp_tree.src) + os.sep],
+		dest_paths=[str(tmp_tree.dst) + os.sep, str(alt) + os.sep],
+		single_thread=single_thread, max_workers=2, files_per_job=1,
+		no_directory_sync=True, no_create_dir=True, verbose=True,
+	)
+	assert rc == 0
+	for i in range(6):
+		assert (alt / 'sub' / f'{i}.txt').read_text() == f'payload {i}'
+
+
+def test_successful_retry_preserves_prior_errors(
+	tmp_tree, hpcp_mod, reset_hpcp_globals, require_linux,
+):
+	src = tmp_tree.add_file('a.txt', 'payload')
+	blocked = tmp_tree.dst / 'blocked'
+	blocked.write_text('not a directory')
+	hpcp_mod.NO_CREATE_DIR = True
+	hpcp_mod.ERRORS.append('Copy failed: earlier file')
+	size, _, _ = hpcp_mod.copy_file(src, [str(blocked / 'a.txt'), str(tmp_tree.dst / 'a.txt')])
+	assert size > 0
+	assert (tmp_tree.dst / 'a.txt').read_text() == 'payload'
+	assert hpcp_mod.ERRORS == ['Copy failed: earlier file']

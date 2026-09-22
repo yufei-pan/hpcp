@@ -9,6 +9,7 @@
 # ///
 import argparse
 import concurrent.futures
+import errno
 import fnmatch
 import functools
 import glob
@@ -124,7 +125,7 @@ except ImportError:
 	hasher = hashlib.blake2b()
 	xxhash_available = False
 
-version = '9.63'
+version = '9.64'
 __version__ = version
 COMMIT_DATE = '2026-09-22'
 
@@ -244,12 +245,8 @@ def get_rc_from_error():
 		print('Done.')
 		rc = 0
 	else:
-		# default=0: ERRORS can hold messages whose prefix is not in the table (a
-		# gap the four FS param mirroring prefixes used to fall into before they
-		# were registered above); without a default, an all-unregistered ERRORS
-		# makes this a call to max() on an empty sequence, which raises ValueError
-		# at the very end of an otherwise successful run.
-		rc = max((ERROR_TO_RETURNCODE_TABLE.get(error.partition(':')[0], 128) for error in ERRORS if error.partition(':')[0] in ERROR_TO_RETURNCODE_TABLE), default=0)
+		# Unknown errors must fail too; only explicitly registered warnings are 0.
+		rc = max((ERROR_TO_RETURNCODE_TABLE.get(error.partition(':')[0], 128) for error in ERRORS), default=0)
 		print(f'Error occurred: {ERRORS}, return code: {rc}.')
 	ERRORS.clear()
 	return rc
@@ -657,7 +654,19 @@ def _call_with_worker_init(func, *args, **kwargs):
 	if not _worker_initialized:
 		_on_worker_start()
 		_worker_initialized = True
-	return func(*args, **kwargs)
+	# ERRORS is process-local. Send failures back through the future instead of
+	# leaving the parent to report success after a worker logged a failed copy.
+	error_start = len(ERRORS)
+	try:
+		result = func(*args, **kwargs)
+		failures = [error for error in ERRORS[error_start:]
+			if ERROR_TO_RETURNCODE_TABLE.get(error.partition(':')[0], 128) != 0]
+		if failures:
+			raise RuntimeError('\n'.join(failures))
+		return result
+	finally:
+		# A reused worker must not carry this task's errors into its next job.
+		del ERRORS[error_start:]
 
 #%% -- Exclude --
 def is_excluded(path, exclude=None):
@@ -2547,15 +2556,29 @@ def get_file_list_parallel(path,max_workers=56,exclude=None,append_hash=False,fu
 
 
 #%% ---- Delete Files ----
-def delete_file_bulk(paths):
+def delete_file_bulk(paths, exclude=None):
 	total_size = 0
 	start_time = time.monotonic()
 	for path in paths:
-		if os.path.exists(path):
+		if exclude and is_excluded(path, exclude):
+			continue
+		if os.path.lexists(path):
 			try:
-				total_size += os.path.getsize(path)
-				if os.path.isdir(path):
-					shutil.rmtree(path)
+				total_size += os.lstat(path).st_size
+				if os.path.isdir(path) and not os.path.islink(path):
+					if exclude:
+						# The listing pass may have left protected entries behind.
+						# Recheck exclusions during cleanup, including empty directories.
+						with os.scandir(path) as entries:
+							children = [entry.path for entry in entries]
+						total_size += delete_file_bulk(children, exclude=exclude)[0]
+						try:
+							os.rmdir(path)
+						except OSError as exc:
+							if exc.errno not in (errno.ENOTEMPTY, errno.EEXIST):
+								raise
+					else:
+						shutil.rmtree(path)
 				else:
 					os.remove(path)
 			except Exception as exc:
@@ -2670,10 +2693,10 @@ def delete_files_parallel(paths, max_workers, verbose=False,files_per_job=1,excl
 	if not all_files:
 		# Nothing left to delete in parallel: either the tree was empty or the scan
 		# already removed everything. Only the directory structure remains.
-		return removed_while_listing + 1 , delete_file_bulk(paths)[0]
+		return removed_while_listing + 1 , delete_file_bulk(paths, exclude=exclude)[0]
 	delete_counter, delete_size_counter = delete_file_list_parallel(all_files, max_workers, verbose,files_per_job,init_size=init_size_all)
 	print("Removing directory structures....")
-	delete_size_counter += delete_file_bulk(paths)[0]
+	delete_size_counter += delete_file_bulk(paths, exclude=exclude)[0]
 	print(f"Initial estimated size: {format_bytes(init_size_all)}B, Final size: {format_bytes(delete_size_counter)}B")
 	return delete_counter + removed_while_listing + 1, delete_size_counter
 
@@ -2723,6 +2746,7 @@ def copy_file(src_path, dest_paths, full_hash=False, verbose=False, concurrent_p
 			symLinks[src_path] = dest_paths
 		else:
 			copied = False
+			copy_error_start = len(ERRORS)
 			while (not copied) and dest_paths:
 				if RANDOM_DESTINATION_SELECTION:
 					idx = random.randrange(len(dest_paths))
@@ -2815,7 +2839,10 @@ def copy_file(src_path, dest_paths, full_hash=False, verbose=False, concurrent_p
 			if not copied:
 				eprint(f'Copy failed: FAILED to copy {src_path} to {dest_paths}')
 				return 0, time.monotonic() - start_time, symLinks
-			elif verbose:
+			# A successful retry resolves this file's failed attempts. Preserve
+			# errors from earlier files and from path validation above.
+			del ERRORS[copy_error_start:]
+			if verbose:
 				print(f'Copied {src_path} to {dest_path}')
 				print(f'Estimated remaining size: {format_bytes(dest_free_space - copiedSize)}B')
 	except Exception as e:
@@ -3644,7 +3671,7 @@ def sync_directories_serial_batch(jobs,exclude=None):
 	return symLinks
 
 #%% ---- Compare Files ----
-def compare_file_list(file_list, file_list2,diff_file_list=None,tar_diff_file_list = False):
+def _compare_file_lists(file_list, file_list2,diff_file_list=None,tar_diff_file_list = False):
 	print('-'*80)
 	print(f"Number of files in src: {len(file_list)}")
 	print(f"Number of files in dest: {len(file_list2)}")
@@ -3664,14 +3691,17 @@ def compare_file_list(file_list, file_list2,diff_file_list=None,tar_diff_file_li
 	print(f"Files in dest but not in src count: {len(inDestNotInSrc)}")
 	if diff_file_list:
 		with open(diff_file_list,'w') as f:
-			if inDestNotInSrc:
-				for file in inDestNotInSrc:
-					f.write((file.rpartition(':')[0] if ':' in file else file)+'\n')
+			entries = inSrcNotInDest if tar_diff_file_list else inDestNotInSrc
+			for file in entries:
+				f.write((file.rpartition(':')[0] if ':' in file else file)+'\n')
 			if inSrcNotInDest and not tar_diff_file_list:
 				#f.write('-\0'+'\n-\0'.join(inSrcNotInDest.rpartition(':')[0] if ':' in inSrcNotInDest else inSrcNotInDest)+ '\n') 
 				for file in inSrcNotInDest:
 					f.write('-\0'+(file.rpartition(':')[0] if ':' in file else file)+'\n')
 		print(f"Diff file list written to {diff_file_list}")
+
+# Preserve the public name while avoiding the boolean option's name in store_file_list.
+compare_file_list = _compare_file_lists
 
 #%% ---- Remove Extra ----
 def remove_extra_dirs(src_paths, dests,exclude=None):
@@ -3715,7 +3745,7 @@ def remove_extra_dirs(src_paths, dests,exclude=None):
 					else:
 						print(f"Deleting extra directory: {dest_dir_path}")
 						extraDirs.add(dest_dir_path)
-	for dir in extraDirs:
+	for dir in sorted(extraDirs, key=lambda path: len(pathlib.Path(path).parts), reverse=True):
 		os.rmdir(dir)
 
 def _src_to_dest_map(src_paths, dests):
@@ -3842,7 +3872,7 @@ def mount_src_image(src_images: list,src_paths: list,mount_points: list,loop_dev
 	for src in src_images:
 		if not os.path.exists(src):
 			eprint(f"Source image not found: {src} does not exist")
-			src_images.remove(src)
+			continue
 		src_str += f"{os.path.basename(src)}-"
 		# we will mount the all image all partitions to seperate temorary folders and add them to src_paths
 		loop_device_dest = create_loop_device(src,read_only=True)
@@ -3890,7 +3920,7 @@ def mount_src_image(src_images: list,src_paths: list,mount_points: list,loop_dev
 	return src_str.strip('-')
 
 def verify_src_path(src_paths: list):
-	for src in src_paths:
+	for src in list(src_paths):
 		if not os.path.exists(src):
 			eprint(f"Source path not found: {src} does not exist")
 			src_paths.remove(src)
@@ -3953,7 +3983,7 @@ def store_file_list(file_list, src_paths: list, single_thread=False, max_workers
 		fileList.update(trim_paths(files, src))
 		fileList.update(trim_paths(links, src))
 		fileList.update([folder_path + os.path.sep for folder_path in trim_paths(folders, src)])
-	if compare_file_list:
+	if compare_file_list or diff_file_list:
 		# This means we have a file_list and a src_path so we compare them
 		print(f"Comparing file list from {src_paths} with {file_list}")
 		if diff_file_list == 'auto':
@@ -3961,7 +3991,7 @@ def store_file_list(file_list, src_paths: list, single_thread=False, max_workers
 				src_str = '-'.join([os.path.basename(os.path.realpath(src)) for src in src_paths])
 			diff_file_list = f'DIFF_{src_str}_TO_{os.path.basename(os.path.realpath(file_list))}_{int(time.time())}_{"tar_" if tar_diff_file_list else ""}file_list.txt'
 		fileList2 = load_file_list(file_list)
-		compare_file_list(fileList, fileList2,diff_file_list,tar_diff_file_list = tar_diff_file_list)
+		_compare_file_lists(fileList, fileList2,diff_file_list,tar_diff_file_list = tar_diff_file_list)
 	else:
 		print(f"Number of files: {len(fileList)}")
 		print(f"Writing file list to {fileList}")
@@ -3996,19 +4026,7 @@ def process_remove(src_paths: list,single_thread = False, max_workers = multipro
 		start_time = time.monotonic()
 		if single_thread:
 			get_file_list_serial(path,exclude=exclude,remove_files_while_listing=REMOVE_FILES_WHILE_LISTING)
-			try:
-				if os.path.isfile(path) or os.path.islink(path):
-					if verbose:
-						print(f"Removing file: {path}")
-					os.remove(path)
-				elif os.path.isdir(path):
-					if verbose:
-						print(f"Removing directory: {path}")
-					shutil.rmtree(path)
-			except FileNotFoundError:
-				pass
-			except Exception as e:
-				eprint(f"Remove file/directory failed: Error removing file/directory {path}: {e}")
+			delete_file_bulk([path], exclude=exclude)
 		else:
 			delete_files_parallel(processedPaths if batch else path, max_workers, verbose=verbose,files_per_job=files_per_job,exclude=exclude,batch=batch,parallel_file_listing=parallel_file_listing)
 		endTime = time.monotonic()
@@ -4323,7 +4341,9 @@ def process_copy(src_paths: list, dests:list = [], single_thread = False, max_wo
 			src += os.path.sep
 			if no_directory_sync:
 				print("Skipping directory sync")
-				sync_directory_metadata(src, dests)
+				if not NO_CREATE_DIR:
+					for dest in dests:
+						os.makedirs(dest, exist_ok=True)
 			else:
 				cs.add_dir_sync(src, dests)
 		if not directory_only:
@@ -4619,6 +4639,7 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = multipr
 	NO_CREATE_DIR = no_create_dir
 	CONTENT_ONLY = content_only
 	MIRROR_FS_PARAMS = not no_fs_param_mirror
+	remove = remove or remove_force
 	if random_destination_selection:
 		RANDOM_DESTINATION_SELECTION = True
 		print("Random destination selection enabled.")
@@ -4752,13 +4773,15 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = multipr
 					continue
 				# copy the partition files
 				print(f"Copying partition {partition} files from {src_mount_point} to {dest_mount_point}")
-				hpcp([src_mount_point], dest_paths = [dest_mount_point], single_thread=single_thread, max_workers=max_workers,
+				copy_rc = hpcp([src_mount_point], dest_paths = [dest_mount_point], single_thread=single_thread, max_workers=max_workers,
 					verbose=verbose, directory_only=directory_only,no_directory_sync=no_directory_sync,full_hash=full_hash, 
 					files_per_job=files_per_job, parallel_file_listing=parallel_file_listing,exclude=exclude,no_link_tracking = True,
 					batch=batch,append_hash_to_file_list = append_hash_to_file_list, hash_size = hash_size, source_file_list = source_file_list,
 					random_destination_selection = random_destination_selection, bytes_rate_limit = bytes_rate_limit, files_rate_limit = files_rate_limit,
 					target_file_system = target_file_system, no_create_dir = no_create_dir, content_only = content_only, command_timeout_limit = command_timeout_limit,
 					exit_not_enough_space = exit_not_enough_space)
+				if copy_rc:
+					raise RuntimeError(f"Partition copy error: Copying partition {partition} failed with return code {copy_rc}.")
 			# sort the output partitions
 			#run_command_in_multicmd_with_path_check(f"sgdisk --sort {dest_path}")
 			print(f"Done disk dumping {src_path} to {dest_path}.")

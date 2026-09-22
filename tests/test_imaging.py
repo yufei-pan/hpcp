@@ -234,13 +234,37 @@ def test_create_image_requires_dest_and_mount(hpcp_mod, reset_hpcp_globals):
 		hpcp_mod.create_image(None, '', [], [], [])
 
 
-def test_mount_src_image_skips_missing_file(hpcp_mod, reset_hpcp_globals, tmp_path):
+def test_mount_src_image_skips_missing_file(hpcp_mod, reset_hpcp_globals, tmp_path, monkeypatch):
 	src_paths = []
 	mounts = []
 	loops = []
 	missing = str(tmp_path / 'missing.img')
-	try:
-		hpcp_mod.mount_src_image([missing], src_paths, mounts, loops)
-	except Exception as e:
-		pytest.xfail(f'BUGS.md#3 missing src image is not skipped: {e}')
+	def unexpected_attach(*args, **kwargs):
+		raise AssertionError('must not attach a nonexistent image')
+	monkeypatch.setattr(hpcp_mod, 'create_loop_device', unexpected_attach)
+	hpcp_mod.mount_src_image([missing], src_paths, mounts, loops)
 	assert src_paths == []
+	assert mounts == loops == []
+
+
+def test_mount_src_image_keeps_valid_image_after_missing_entries(hpcp_mod, reset_hpcp_globals, tmp_path, monkeypatch):
+	from types import SimpleNamespace
+	valid = tmp_path / 'valid.img'
+	valid.write_bytes(b'placeholder')
+	mount = tmp_path / 'mount'
+	mount.mkdir()
+	images = [str(tmp_path / 'missing1.img'), str(tmp_path / 'missing2.img'), str(valid)]
+	original_images = images.copy()
+	src_paths, mounts, loops = [], [], []
+	def attach(image, read_only=False):
+		assert image == str(valid) and read_only
+		return '/dev/fake-loop'
+	monkeypatch.setattr(hpcp_mod, 'create_loop_device', attach)
+	monkeypatch.setattr(hpcp_mod, 'get_partitions', lambda device: [])
+	monkeypatch.setattr(hpcp_mod, 'tempfile', SimpleNamespace(mkdtemp=lambda: str(mount)))
+	monkeypatch.setattr(hpcp_mod, 'run_command_in_multicmd_with_path_check', lambda *a, **k: [])
+	monkeypatch.setattr(hpcp_mod.os.path, 'ismount', lambda path: path == str(mount))
+	assert hpcp_mod.mount_src_image(images, src_paths, mounts, loops) == 'valid.img'
+	assert src_paths == [str(mount) + os.sep]
+	assert loops == ['/dev/fake-loop']
+	assert images == original_images
