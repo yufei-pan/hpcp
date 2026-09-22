@@ -149,3 +149,63 @@ def test_no_link_tracking_still_creates_symlink(tmp_tree, hpcp_mod, reset_hpcp_g
 	hpcp_mod.hpcp(srcs, **opts)
 	assert (tmp_tree.dst / 'link').is_symlink()
 	assert os.readlink(tmp_tree.dst / 'link') == 'target.txt'
+
+
+def _fail_sparse_cp(real_run):
+	"""Wrap the command runner so `cp --sparse=...` fails like BSD / macOS cp."""
+	calls = []
+	def fake_run(command, *args, **kwargs):
+		calls.append(list(command))
+		if any(str(arg).startswith('--sparse') for arg in command):
+			raise RuntimeError("Task return code error: cp: illegal option -- -")
+		return real_run(command, *args, **kwargs)
+	return fake_run, calls
+
+
+def test_copy_file_reports_size_when_sparse_cp_fails(tmp_tree, hpcp_mod, reset_hpcp_globals, require_linux, monkeypatch):
+	src = tmp_tree.add_file('a.bin', os.urandom(300000))
+	dst = str(tmp_tree.dst / 'a.bin')
+	fake_run, calls = _fail_sparse_cp(hpcp_mod.run_command_in_multicmd_with_path_check)
+	monkeypatch.setattr(hpcp_mod, 'cp_supports_sparse', lambda: True)
+	monkeypatch.setattr(hpcp_mod, 'run_command_in_multicmd_with_path_check', fake_run)
+	size, _, _ = hpcp_mod.copy_file(src, [dst])
+	assert open(dst, 'rb').read() == open(src, 'rb').read()
+	assert size == hpcp_mod.get_file_size(dst) > 0
+	assert any('--sparse=always' in c for c in calls)
+	assert calls[-1][-2:] == [src, dst] and '--sparse=always' not in calls[-1]
+
+
+def test_copy_file_sparse_fallback_writes_only_one_dest(tmp_tree, hpcp_mod, reset_hpcp_globals, require_linux, monkeypatch):
+	src = tmp_tree.add_file('a.bin', os.urandom(4096))
+	alt = tmp_tree.root / 'dst2'
+	alt.mkdir()
+	d1 = str(tmp_tree.dst / 'a.bin')
+	d2 = str(alt / 'a.bin')
+	hpcp_mod.RANDOM_DESTINATION_SELECTION = False
+	fake_run, _ = _fail_sparse_cp(hpcp_mod.run_command_in_multicmd_with_path_check)
+	monkeypatch.setattr(hpcp_mod, 'cp_supports_sparse', lambda: True)
+	monkeypatch.setattr(hpcp_mod, 'run_command_in_multicmd_with_path_check', fake_run)
+	size, _, _ = hpcp_mod.copy_file(src, [d1, d2])
+	assert size > 0
+	assert os.path.isfile(d1)
+	assert not os.path.exists(d2)
+
+
+def test_copy_file_omits_sparse_flag_when_cp_lacks_it(tmp_tree, hpcp_mod, reset_hpcp_globals, require_linux, monkeypatch):
+	src = tmp_tree.add_file('a.bin', os.urandom(4096))
+	dst = str(tmp_tree.dst / 'a.bin')
+	fake_run, calls = _fail_sparse_cp(hpcp_mod.run_command_in_multicmd_with_path_check)
+	monkeypatch.setattr(hpcp_mod, 'cp_supports_sparse', lambda: False)
+	monkeypatch.setattr(hpcp_mod, 'run_command_in_multicmd_with_path_check', fake_run)
+	size, _, _ = hpcp_mod.copy_file(src, [dst])
+	assert size > 0
+	assert len(calls) == 1 and '--sparse=always' not in calls[0]
+
+
+def test_copy_file_skips_identical_small_file_on_rerun(tmp_tree, hpcp_mod, reset_hpcp_globals, require_linux):
+	# get_file_size reports allocated blocks; the identity check must still use the apparent size
+	src = tmp_tree.add_file('small.txt', 'tiny')
+	dst = str(tmp_tree.dst / 'small.txt')
+	hpcp_mod.HASH_SIZE = 65536
+	assert hpcp_mod.copy_file(src, [dst])[0] > 0
+	assert hpcp_mod.copy_file(src, [dst])[0] == 0

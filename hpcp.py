@@ -124,9 +124,9 @@ except ImportError:
 	hasher = hashlib.blake2b()
 	xxhash_available = False
 
-version = '9.62'
+version = '9.63'
 __version__ = version
-COMMIT_DATE = '2026-09-21'
+COMMIT_DATE = '2026-09-22'
 
 MAGIC_NUMBER = 1.61803398875
 RANDOM_DESTINATION_SELECTION = False
@@ -505,12 +505,30 @@ def get_free_space_bytes(path):
 	stat = os.statvfs(path)
 	return stat.f_bavail * stat.f_frsize  # available blocks * fragment size
 
+@functools.lru_cache(maxsize=None)
+def cp_supports_sparse():
+	"""
+	Whether the cp found on PATH accepts --sparse (GNU coreutils does, BSD / macOS cp does not).
+	"""
+	if os.name != 'posix':
+		return False
+	try:
+		task = multiCMD.run_commands([[_binPaths.get('cp', 'cp'), '--version']], timeout=10, quiet=True, return_object=True)[0]
+		return task.returncode == 0 and 'GNU' in '\n'.join(task.stdout)
+	except Exception:
+		return False
+
 def get_file_size(path):
+	"""
+	Get the on-disk (allocated) size of a file, falling back to the apparent size.
+	Use os.path.getsize() where the apparent size is needed, e.g. for content comparison.
+	"""
 	try:
 		st = os.stat(path,follow_symlinks=False)
-		if 'st_rsize' in st:
+		# stat_result is a tuple: `'st_blocks' in st` would compare against field values, not names
+		if hasattr(st, 'st_rsize'):
 			realSize = st.st_rsize
-		elif 'st_blocks' in st:
+		elif hasattr(st, 'st_blocks'):
 			realSize = st.st_blocks * 512
 		else:
 			realSize = st.st_size
@@ -2688,7 +2706,7 @@ def copy_file(src_path, dest_paths, full_hash=False, verbose=False, concurrent_p
 		src_size = get_file_size(src_path)
 		copiedSize = 0
 		for dest in dest_paths:
-			if os.path.exists(dest) and (not os.path.islink(src_path)) and is_file_identical(src_path, dest,src_size,full_hash):
+			if os.path.exists(dest) and (not os.path.islink(src_path)) and is_file_identical(src_path, dest,os.path.getsize(src_path),full_hash):
 				if not CONTENT_ONLY:
 					st = os.stat(src_path,follow_symlinks=False)
 					shutil.copystat(src_path, dest,follow_symlinks=False)
@@ -2745,8 +2763,10 @@ def copy_file(src_path, dest_paths, full_hash=False, verbose=False, concurrent_p
 						if not NO_CREATE_DIR:
 							os.makedirs(os.path.dirname(dest_path), exist_ok=True)
 						if os.name == 'posix':
-							cp_flags = "-f" if CONTENT_ONLY else "-af"
-							run_command_in_multicmd_with_path_check(["cp", cp_flags, "--sparse=always", src_path, dest_path],quiet=True,strict=True)
+							cp_command = ["cp", "-f" if CONTENT_ONLY else "-af"]
+							if cp_supports_sparse():
+								cp_command.append("--sparse=always")
+							run_command_in_multicmd_with_path_check(cp_command + [src_path, dest_path],quiet=True,strict=True)
 							copiedSize = get_file_size(dest_path)
 						else:
 							if CONTENT_ONLY:
@@ -2768,10 +2788,13 @@ def copy_file(src_path, dest_paths, full_hash=False, verbose=False, concurrent_p
 							if os.name == 'posix':
 								cp_flags = "-f" if CONTENT_ONLY else "-af"
 								run_command_in_multicmd_with_path_check(["cp", cp_flags, src_path, dest_path],quiet=True,strict=True)
+								copiedSize = get_file_size(dest_path)
 								#task_to_run = ["cp", "-af", src_path, dest_path]
 							elif os.name == 'nt':
 								run_command_in_multicmd_with_path_check(["xcopy", "/I", "/E", "/Y", "/c", "/q", "/k", "/r", "/h", "/x", src_path, dest_path],quiet=True,strict=True)
 								#task_to_run = ["xcopy", "/I", "/E", "/Y", "/c", "/q", "/k", "/r", "/h", "/x", src_path, dest_path]
+							copied = True
+							break
 						elif verbose:
 							eprint(f'Retrying with a different destination path in {dest_paths}')
 				except Exception as e:

@@ -107,8 +107,9 @@ def test_delete_files_parallel_init_size_spans_all_paths(
 ):
 	"""The progress-bar baseline must be the total over every path, not the last one."""
 	hpcp_mod.REMOVE_FILES_WHILE_LISTING = False
-	tmp_tree.add_file('one/a.txt', b'a' * 100)
-	tmp_tree.add_file('two/b.txt', b'b' * 5)
+	a = tmp_tree.add_file('one/a.txt', b'a' * 100)
+	b = tmp_tree.add_file('two/b.txt', b'b' * 5)
+	expected = hpcp_mod.get_file_size(a) + hpcp_mod.get_file_size(b)
 	seen = {}
 
 	def fake_delete(file_list, max_workers, *a, **k):
@@ -120,7 +121,7 @@ def test_delete_files_parallel_init_size_spans_all_paths(
 		[str(tmp_tree.src / 'one'), str(tmp_tree.src / 'two')],
 		max_workers=2, batch=True, parallel_file_listing=False,
 	)
-	assert seen['init_size'] == 105
+	assert seen['init_size'] == expected
 
 
 def test_cached_listing_still_removes_files(tmp_tree, hpcp_mod, reset_hpcp_globals):

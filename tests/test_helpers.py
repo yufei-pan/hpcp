@@ -30,3 +30,15 @@ def test_is_excluded_globs(hpcp_mod):
 	assert hpcp_mod.is_excluded('/data/tmp/cache', ['*/cache']) is True
 	assert hpcp_mod.is_excluded('/data/tmp/cache', ['*/logs']) is False
 	assert hpcp_mod.is_excluded('/data/tmp/cache', None) is False
+
+
+def test_get_file_size_reports_allocated_size_of_sparse_file(hpcp_mod, tmp_path):
+	path = tmp_path / 'sparse.img'
+	with open(path, 'wb') as f:
+		f.truncate(64 << 20)
+		f.write(b'x')
+	st = os.stat(path)
+	if not hasattr(st, 'st_blocks') or st.st_blocks * 512 >= st.st_size:
+		pytest.skip('filesystem does not report sparse allocation')
+	assert hpcp_mod.get_file_size(str(path)) == st.st_blocks * 512
+	assert hpcp_mod.get_file_size(str(path)) < st.st_size
