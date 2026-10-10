@@ -4267,13 +4267,30 @@ def make_patch_meta(rows, new_name, base_name, layout, full_hash=False):
 		'sections': [('root', '.', 'changes.tsv')],
 	}
 
+def _missing_payload(rows, volume_roots):
+	"""Paths of A / M file rows that no volume root holds as a regular file of the expected size."""
+	missing = []
+	for row in rows:
+		if row.op in ('A', 'M') and row.new.startswith('f:'):
+			size = decode_state(row.new)['size']
+			if not any(os.path.isfile(_key_path(volume_root, row.path)) and
+					os.path.getsize(_key_path(volume_root, row.path)) == size for volume_root in volume_roots):
+				missing.append(row.path)
+	return missing
+
 def write_patch_metadata(volume_roots, rows, meta):
-	"""Write .hpcp_diff/changes.tsv then .hpcp_diff/manifest on every volume (manifest last)."""
+	"""Write .hpcp_diff/changes.tsv on every volume first, then each volume's manifest (volume k/n).
+
+	All change lists are written before any manifest, so a manifest on any volume implies
+	every volume already has its change list.
+	"""
 	total = len(volume_roots)
-	for index, volume_root in enumerate(volume_roots, start=1):
+	for volume_root in volume_roots:
 		diff_dir = os.path.join(volume_root, DIFF_DIR_NAME)
 		os.makedirs(diff_dir, exist_ok=True)
 		write_changes(os.path.join(diff_dir, 'changes.tsv'), rows)
+	for index, volume_root in enumerate(volume_roots, start=1):
+		diff_dir = os.path.join(volume_root, DIFF_DIR_NAME)
 		volume_meta = dict(meta)
 		volume_meta['volume'] = f'{index}/{total}'
 		write_manifest(os.path.join(diff_dir, 'manifest'), volume_meta)
@@ -4306,6 +4323,10 @@ def build_patch_tree(rows, new_base, volume_roots, meta, max_workers=1, verbose=
 	# Directories last and deepest first, so later writes cannot disturb their mtimes.
 	for key in sorted(dir_keys, key=_key_depth, reverse=True):
 		sync_directory_metadata(_key_path(new_base, key), [_key_path(volume_root, key) for volume_root in volume_roots])
+	# copy_file_list_parallel reports failures only on stderr and skips full destinations, so check the result here.
+	missing = _missing_payload(payload, volume_roots)
+	if missing:
+		raise RuntimeError(f'Diff image error: payload incomplete for {len(missing)} file(s), e.g. {missing[0]}; patch metadata not written')
 	write_patch_metadata(volume_roots, rows, meta)
 
 #%% ---- Remove Extra ----

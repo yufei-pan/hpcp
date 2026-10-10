@@ -493,3 +493,37 @@ def test_build_patch_tree_rejects_reserved_name(trees, hpcp_mod, tmp_path):
 	_write(new / '.hpcp_diff' / 'x', 'nope')
 	with pytest.raises(RuntimeError, match='reserved'):
 		_patch_from(hpcp_mod, new, base, [tmp_path / 'vol'])
+
+
+def test_build_patch_tree_refuses_incomplete_payload(trees, hpcp_mod, tmp_path, monkeypatch):
+	new, base = trees
+	_write(new / 'add.txt', 'added')
+	monkeypatch.setattr(hpcp_mod, 'copy_file_list_parallel', lambda *a, **k: (0, 0, {}, frozenset()))
+	vol = tmp_path / 'vol'
+	with pytest.raises(RuntimeError, match='payload incomplete'):
+		_patch_from(hpcp_mod, new, base, [vol])
+	assert not (vol / '.hpcp_diff' / 'manifest').exists()
+
+
+def test_build_patch_tree_root_row_and_nested_symlink(trees, hpcp_mod, tmp_path):
+	new, base = trees
+	os.chmod(new, 0o700)
+	_write(new / 'x.txt', 'x')
+	_write(new / 'sub' / 'keep.txt', 'k')
+	os.symlink('../x.txt', new / 'sub' / 'ln')
+	vol = tmp_path / 'vol'
+	rows, _ = _patch_from(hpcp_mod, new, base, [vol])
+	assert any(row.path == './' and row.op == 'M' for row in rows)
+	assert stat.S_IMODE(os.stat(vol).st_mode) == 0o700
+	assert os.readlink(vol / 'sub' / 'ln') == '../x.txt'
+
+
+def test_build_patch_tree_syncs_directory_mtimes(trees, hpcp_mod, tmp_path):
+	new, base = trees
+	_write(new / 'deep' / 'er' / 'f.txt', 'deep')
+	os.utime(new / 'deep' / 'er', ns=(1717000000000000000, 1717000000000000000))
+	os.utime(new / 'deep', ns=(1717000001000000000, 1717000001000000000))
+	vol = tmp_path / 'vol'
+	_patch_from(hpcp_mod, new, base, [vol])
+	assert os.stat(vol / 'deep' / 'er').st_mtime_ns == os.stat(new / 'deep' / 'er').st_mtime_ns
+	assert os.stat(vol / 'deep').st_mtime_ns == os.stat(new / 'deep').st_mtime_ns
