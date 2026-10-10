@@ -173,3 +173,71 @@ def test_hpcp_diff_file_list_against_dest_reports_changes(tmp_tree, hpcp_mod, re
 	ops = {(r.op, r.path) for r in hpcp_mod.read_changes(diff)}
 	assert ops == {('A', 'only_src.txt'), ('M', 'changed.txt'), ('D', 'only_dst.txt')}
 	assert 'Modified:' in capsys.readouterr().out
+
+
+def test_diff_file_list_against_hashed_stored_list(tmp_tree, hpcp_mod, reset_hpcp_globals):
+	"""A live tree compared with a stored hashed list: only real changes produce rows."""
+	hpcp_mod.HASH_SIZE = 65536
+	tmp_tree.add_file('keep.txt', 'keep')
+	tmp_tree.add_file('changed.txt', 'before')
+	tmp_tree.add_symlink('ln', 'keep.txt')
+	out = str(tmp_tree.root / 'stored.txt')
+	src = str(tmp_tree.src) + os.sep
+	hpcp_mod.store_file_list(out, [src], parallel_file_listing=False, append_hash=True)
+	tmp_tree.add_file('changed.txt', 'after, longer')
+	os.remove(str(tmp_tree.src / 'ln'))
+	tmp_tree.add_symlink('ln', 'changed.txt')
+	tmp_tree.add_file('new.txt', 'n')
+	diff = str(tmp_tree.root / 'diff.tsv')
+	rc = hpcp_mod.hpcp([src], target_file_list=out, diff_file_list=diff, single_thread=True)
+	assert rc == 0
+	ops = {(r.op, r.path) for r in hpcp_mod.read_changes(diff)}
+	assert ops == {('M', 'changed.txt'), ('M', 'ln'), ('A', 'new.txt')}
+
+
+def _populate(root, files):
+	for rel, content in files.items():
+		path = os.path.join(str(root), rel)
+		os.makedirs(os.path.dirname(path), exist_ok=True)
+		with open(path, 'w') as f:
+			f.write(content)
+
+
+def test_process_compare_store_layout_limits_to_src_subtree(tmp_path, hpcp_mod, reset_hpcp_globals):
+	src = tmp_path / 'live'
+	store = tmp_path / 'store'
+	src.mkdir()
+	store.mkdir()
+	rel = os.path.relpath(str(src), os.sep)
+	_populate(src, {'same.txt': 's', 'changed.txt': 'new!!', 'only_src.txt': 'a'})
+	_populate(store / rel, {'changed.txt': 'old', 'only_store.txt': 'd', 'same.txt': 's'})
+	t = os.stat(str(src / 'same.txt')).st_mtime
+	os.utime(str(store / rel / 'same.txt'), (t, t))
+	_populate(store / 'unrelated', {'x.txt': 'x'})
+	diff = str(tmp_path / 'diff.tsv')
+	hpcp_mod.process_compare_file_list([str(src)], [str(store) + os.sep], max_workers=1, dest_image='store.img', diff_file_list=diff)
+	got = {(r.op, r.path) for r in hpcp_mod.read_changes(diff)}
+	prefix = rel.replace(os.sep, '/') + '/'
+	assert ('A', prefix + 'only_src.txt') in got
+	assert ('M', prefix + 'changed.txt') in got
+	assert ('D', prefix + 'only_store.txt') in got
+	assert not any(p.startswith('unrelated') for _, p in got)
+	assert all(p.startswith(prefix) or prefix.startswith(p) for _, p in got)
+	assert (('M', prefix + 'same.txt') not in got) and (('A', prefix + 'same.txt') not in got)
+
+
+def test_process_compare_src_image_root_layout_uses_relative_keys(tmp_path, hpcp_mod, reset_hpcp_globals):
+	src_root = tmp_path / 'srcimg'
+	store = tmp_path / 'store'
+	src_root.mkdir()
+	store.mkdir()
+	_populate(src_root, {'same.txt': 's', 'sub/changed.txt': 'new!!', 'only_src.txt': 'a'})
+	_populate(store, {'same.txt': 's', 'sub/changed.txt': 'old', 'only_store.txt': 'd'})
+	t = os.stat(str(src_root / 'same.txt')).st_mtime
+	os.utime(str(store / 'same.txt'), (t, t))
+	diff = str(tmp_path / 'diff.tsv')
+	root = str(src_root)
+	hpcp_mod.process_compare_file_list([root], [str(store) + os.sep], max_workers=1, dest_image='store.img',
+		diff_file_list=diff, src_image_roots=[root])
+	got = {(r.op, r.path) for r in hpcp_mod.read_changes(diff)}
+	assert got == {('A', 'only_src.txt'), ('M', 'sub/changed.txt'), ('D', 'only_store.txt')}
