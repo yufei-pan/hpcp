@@ -213,13 +213,11 @@ options:
   -L, -rl, --rate_limit RATE_LIMIT
                         Approximate a rate limit the copy speed in
                         bytes/second. Example: 10M for 10 MB/s, 1Gi for 1
-                        GiB/s. Note: do not work in single thread mode.
-                        Default is 0: no rate limit.
+                        GiB/s. Default is 0: no rate limit.
   -F, -frl, --file_rate_limit FILE_RATE_LIMIT
                         Approximate a rate limit the copy speed in
-                        files/second. Example: 10K for 10240 files/s, 1Mi for
-                        1024*1024*1024 files/s. Note: do not work in serial
-                        mode. Default is 0: no rate limit.
+                        files/second. Example: 10K for 10000 files/s, 1Ki for
+                        1024 files/s. Default is 0: no rate limit.
   -tfs, --target_file_system TARGET_FILE_SYSTEM
                         Specify the target file system type. Will abort if the
                         target file system type does not match. Example: ext4,
