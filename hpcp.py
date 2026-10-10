@@ -2280,7 +2280,7 @@ def hash_file(path,size = ...,full_hash=False):
 			hasher.update(chunk)
 	return hasher.hexdigest()
 
-def is_file_identical(src_path, dest_path,src_size,full_hash=False):
+def is_file_identical(src_path, dest_path,src_size,full_hash=False,compare_metadata=False):
 	dst_size = os.path.getsize(dest_path)
 	# try to find the mtime are different
 	if src_size != dst_size:
@@ -2293,7 +2293,18 @@ def is_file_identical(src_path, dest_path,src_size,full_hash=False):
 			return False
 	except Exception:
 		pass
-	return hash_file(src_path,src_size,full_hash) == hash_file(dest_path,dst_size,full_hash)
+	if hash_file(src_path,src_size,full_hash) != hash_file(dest_path,dst_size,full_hash):
+		return False
+	if compare_metadata:
+		src_st = os.lstat(src_path)
+		dst_st = os.lstat(dest_path)
+		if (src_st.st_mode, src_st.st_uid, src_st.st_gid) != (dst_st.st_mode, dst_st.st_uid, dst_st.st_gid):
+			return False
+		src_xattr = _xattr_digest(src_path)
+		dst_xattr = _xattr_digest(dest_path)
+		if src_xattr is not None and dst_xattr is not None and src_xattr != dst_xattr:
+			return False
+	return True
 
 def get_file_repr(filename,append_hash=False,full_hash=False):
 	if append_hash:
@@ -3813,6 +3824,59 @@ def states_equal(a, b, compare_hash=True):
 	if compare_hash and info_a['hash'] != info_b['hash']:
 		return False
 	return _mtime_ns_close(info_a['mtime_ns'], info_b['mtime_ns'])
+
+def _hash_algo_name():
+	return 'xxh64' if xxhash_available else 'blake2b'
+
+def _new_hasher():
+	return xxhash.xxh64() if xxhash_available else hashlib.blake2b()
+
+def _xattr_digest(path):
+	"""Hex digest of every readable xattr of path (symlinks not followed); ACLs are xattrs too.
+
+	Returns None when the platform or the filesystem does not support xattrs.
+	"""
+	if not hasattr(os, 'listxattr'):
+		return None
+	try:
+		names = os.listxattr(path, follow_symlinks=False)
+	except OSError as e:
+		if e.errno in (errno.ENOTSUP, errno.EOPNOTSUPP):
+			return None
+		raise
+	hasher = _new_hasher()
+	for name in sorted(names, key=os.fsencode):
+		try:
+			value = os.getxattr(path, name, follow_symlinks=False)
+		except OSError as e:
+			if e.errno in (errno.ENODATA, errno.EPERM, errno.EACCES, errno.ENOTSUP):
+				continue
+			raise
+		hasher.update(os.fsencode(name) + b'\0' + struct.pack('>Q', len(value)) + value)
+	return hasher.hexdigest()
+
+def get_entry_state(path, full_hash=False, read_xattrs=True):
+	"""State string of one path (see decode_state). Missing paths, including ones below a
+	regular file, are '-'; any other read failure is recorded with eprint and returns '-'."""
+	path = path.rstrip(os.sep) or os.sep
+	try:
+		st = os.lstat(path)
+		if stat.S_ISLNK(st.st_mode):
+			return encode_state({'type': 'l', 'target': os.readlink(path)})
+		xattr = (_xattr_digest(path) if read_xattrs else None) or '-'
+		if stat.S_ISDIR(st.st_mode):
+			return encode_state({'type': 'd', 'mode': st.st_mode, 'uid': st.st_uid, 'gid': st.st_gid, 'xattr': xattr})
+		if stat.S_ISREG(st.st_mode):
+			# hash_file is lru_cached and would return a stale hash for a same-size rewrite.
+			file_hash = hash_file.__wrapped__(path, st.st_size, full_hash) or '-'
+			return encode_state({'type': 'f', 'size': st.st_size, 'mtime_ns': st.st_mtime_ns, 'mode': st.st_mode,
+				'uid': st.st_uid, 'gid': st.st_gid, 'hash': file_hash, 'xattr': xattr})
+	except (FileNotFoundError, NotADirectoryError):
+		return '-'
+	except OSError as e:
+		eprint(f'Entry state error: cannot read {path}: {e}')
+		return '-'
+	return '-'
 
 #%% ---- Remove Extra ----
 def remove_extra_dirs(src_paths, dests,exclude=None):

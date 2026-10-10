@@ -56,3 +56,41 @@ def test_full_hash_sees_difference_partial_hash_misses(tmp_tree, hpcp_mod, reset
 	os.utime(dst, (t, t))
 	assert hpcp_mod.is_file_identical(src, dst, os.path.getsize(src), full_hash=False) is True
 	assert hpcp_mod.is_file_identical(src, dst, os.path.getsize(src), full_hash=True) is False
+
+
+def _identical_pair(tmp_tree):
+	src = tmp_tree.add_file('m.txt', 'same', under='src')
+	dst = tmp_tree.add_file('m.txt', 'same', under='dst')
+	t = time.time() - 1000
+	os.utime(src, (t, t))
+	os.utime(dst, (t, t))
+	return src, dst
+
+
+def test_is_file_identical_compare_metadata_sees_mode(tmp_tree, hpcp_mod, reset_hpcp_globals):
+	src, dst = _identical_pair(tmp_tree)
+	os.chmod(src, 0o644)
+	os.chmod(dst, 0o600)
+	hpcp_mod.HASH_SIZE = 65536
+	assert hpcp_mod.is_file_identical(src, dst, os.path.getsize(src)) is True
+	assert hpcp_mod.is_file_identical(src, dst, os.path.getsize(src), compare_metadata=True) is False
+
+
+@pytest.mark.skipif(os.name == 'nt' or os.geteuid() != 0, reason='chown needs root')
+def test_is_file_identical_compare_metadata_sees_owner(tmp_tree, hpcp_mod, reset_hpcp_globals):
+	src, dst = _identical_pair(tmp_tree)
+	os.chown(dst, 4321, 4321)
+	hpcp_mod.HASH_SIZE = 65536
+	assert hpcp_mod.is_file_identical(src, dst, os.path.getsize(src)) is True
+	assert hpcp_mod.is_file_identical(src, dst, os.path.getsize(src), compare_metadata=True) is False
+
+
+def test_is_file_identical_compare_metadata_sees_xattr(tmp_tree, hpcp_mod, reset_hpcp_globals):
+	src, dst = _identical_pair(tmp_tree)
+	try:
+		os.setxattr(dst, 'user.hpcp_test', b'1')
+	except (OSError, AttributeError) as e:
+		pytest.skip(f'user xattrs unsupported here: {e}')
+	hpcp_mod.HASH_SIZE = 65536
+	assert hpcp_mod.is_file_identical(src, dst, os.path.getsize(src)) is True
+	assert hpcp_mod.is_file_identical(src, dst, os.path.getsize(src), compare_metadata=True) is False
