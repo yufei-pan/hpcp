@@ -3967,6 +3967,7 @@ def write_manifest(target, meta):
 def read_manifest(source):
 	"""Read a manifest. Values are strings; unknown keys are kept and ignored by callers."""
 	meta = {'sections': []}
+	seen_keys = set()
 	with open(source, 'r', encoding='utf-8', errors='surrogateescape', newline='\n') as f:
 		for line in f:
 			line = line.rstrip('\n')
@@ -3977,9 +3978,25 @@ def read_manifest(source):
 			except ValueError as e:
 				raise RuntimeError(f'Patch format error: {source}: {e}')
 			if fields[0] == 'section' and len(fields) == 4:
+				name, payload_dir, changes_file = fields[1:]
+				try:
+					if not name or '/' in name:
+						raise ValueError('bad section name')
+					if payload_dir != '.':
+						_check_key(payload_dir)
+					if not changes_file or '/' in changes_file or changes_file in ('.', '..'):
+						raise ValueError('bad changes file')
+				except ValueError:
+					raise RuntimeError(f'Patch format error: {source} has an unsafe section line {line!r}')
 				meta['sections'].append(tuple(fields[1:]))
 			elif fields[0] != 'section' and len(fields) == 2:
-				meta[fields[0]] = fields[1]
+				key, value = fields
+				if key == 'sections':
+					raise RuntimeError(f'Patch format error: {source} uses reserved key sections')
+				if key in seen_keys:
+					raise RuntimeError(f'Patch format error: {source} has a duplicate key {key!r}')
+				seen_keys.add(key)
+				meta[key] = value
 			else:
 				raise RuntimeError(f'Patch format error: {source} has a malformed line {line!r}')
 	if meta.get('format') != 'hpcp-diff':

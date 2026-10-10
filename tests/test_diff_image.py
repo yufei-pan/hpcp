@@ -201,3 +201,22 @@ def test_read_manifest_rejects_foreign_or_newer(tmp_path, hpcp_mod):
 		hpcp_mod.read_manifest(str(path))
 	path.write_text('format\thpcp-diff\nformat_version\t1\nunknown_key\tfine\n')
 	assert hpcp_mod.read_manifest(str(path))['unknown_key'] == 'fine'
+
+
+def test_read_manifest_rejects_unsafe_sections_and_duplicate_keys(tmp_path, hpcp_mod):
+	path = tmp_path / 'manifest'
+	head = 'format\thpcp-diff\nformat_version\t1\n'
+	bad_bodies = [
+		'section\troot\t/etc\tchanges.tsv\n',
+		'section\troot\t.\t../../foo\n',
+		'section\troot\t.\tsub/changes.tsv\n',
+		'section\troot\t.\t..\n',
+		'sections\tfoo\n',
+		'patch_id\tabc\npatch_id\tdef\n',
+	]
+	for body in bad_bodies:
+		path.write_text(head + body)
+		with pytest.raises(RuntimeError, match='Patch format error'):
+			hpcp_mod.read_manifest(str(path))
+	path.write_text(head + 'section\troot\t.\tchanges.tsv\n')
+	assert hpcp_mod.read_manifest(str(path))['sections'] == [('root', '.', 'changes.tsv')]
