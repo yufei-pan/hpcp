@@ -422,3 +422,74 @@ def test_states_for_paths_parallel_reports_worker_errors(tmp_path, hpcp_mod, res
 	assert states[bad] == '?'
 	assert all(states[path].startswith('f:') for path in paths)
 	assert any(e.startswith('Entry state error') for e in hpcp_mod.ERRORS[before:])
+
+
+def _patch_from(hpcp_mod, new, base, volumes, layout='root'):
+	new_map, base_map = hpcp_mod.build_root_maps(str(new), str(base), max_workers=1)
+	rows = hpcp_mod.compute_changes(new_map, base_map, max_workers=1)
+	meta = hpcp_mod.make_patch_meta(rows, 'new', 'base', layout)
+	for volume in volumes:
+		os.makedirs(str(volume), exist_ok=True)
+	hpcp_mod.build_patch_tree(rows, str(new), [str(v) for v in volumes], meta, max_workers=1)
+	return rows, meta
+
+
+def test_make_patch_meta_counts(hpcp_mod):
+	R = hpcp_mod.ChangeRow
+	rows = [
+		R('A', 'a', '-', 'f:5:1:100644:0:0:aa:-'),
+		R('M', 'b', 'f:1:1:100644:0:0:aa:-', 'f:7:1:100644:0:0:bb:-'),
+		R('D', 'c', 'f:1:1:100644:0:0:aa:-', '-'),
+		R('A', 'd/', '-', 'd:40755:0:0:-'),
+	]
+	meta = hpcp_mod.make_patch_meta(rows, 'new', 'base', 'root')
+	assert (meta['added'], meta['modified'], meta['deleted'], meta['payload_bytes']) == (2, 1, 1, 12)
+	assert len(meta['patch_id']) == 32 and meta['hash_algo'] in ('xxh64', 'blake2b')
+	assert meta['sections'] == [('root', '.', 'changes.tsv')] and meta['layout'] == 'root'
+
+
+def test_build_patch_tree_writes_payload_and_metadata(trees, hpcp_mod, tmp_path):
+	new, base = trees
+	_write(new / 'add.txt', 'added')
+	_write(new / 'mod.txt', 'new content')
+	_write(base / 'mod.txt', 'old')
+	_write(base / 'gone.txt', 'bye')
+	_write(new / 'same.txt', 's')
+	_write(base / 'same.txt', 's')
+	_write(new / 'deep' / 'er' / 'f.txt', 'deep')
+	os.chmod(new / 'deep', 0o700)
+	os.symlink('add.txt', new / 'ln')
+	vol = tmp_path / 'vol'
+	rows, meta = _patch_from(hpcp_mod, new, base, [vol])
+	assert (vol / 'add.txt').read_text() == 'added'
+	assert (vol / 'mod.txt').read_text() == 'new content'
+	assert os.stat(vol / 'mod.txt').st_mtime_ns == os.stat(new / 'mod.txt').st_mtime_ns
+	assert (vol / 'deep' / 'er' / 'f.txt').read_text() == 'deep'
+	assert stat.S_IMODE(os.stat(vol / 'deep').st_mode) == 0o700
+	assert os.readlink(vol / 'ln') == 'add.txt'
+	assert not (vol / 'gone.txt').exists() and not (vol / 'same.txt').exists()
+	assert hpcp_mod.read_changes(str(vol / '.hpcp_diff' / 'changes.tsv')) == rows
+	got = hpcp_mod.read_manifest(str(vol / '.hpcp_diff' / 'manifest'))
+	assert got['volume'] == '1/1' and got['patch_id'] == meta['patch_id']
+	assert (got['added'], got['modified'], got['deleted']) == (str(meta['added']), str(meta['modified']), str(meta['deleted']))
+	assert got['layout'] == 'root' and got['sections'] == [('root', '.', 'changes.tsv')]
+
+
+def test_build_patch_tree_two_volumes_share_patch_id(trees, hpcp_mod, tmp_path):
+	new, base = trees
+	for i in range(6):
+		_write(new / f'f{i}.txt', f'file {i}')
+	volumes = [tmp_path / 'v1', tmp_path / 'v2']
+	_patch_from(hpcp_mod, new, base, volumes)
+	metas = [hpcp_mod.read_manifest(str(v / '.hpcp_diff' / 'manifest')) for v in volumes]
+	assert [m['volume'] for m in metas] == ['1/2', '2/2']
+	assert metas[0]['patch_id'] == metas[1]['patch_id']
+	for i in range(6):
+		assert sum((v / f'f{i}.txt').exists() for v in volumes) == 1
+
+
+def test_build_patch_tree_rejects_reserved_name(trees, hpcp_mod, tmp_path):
+	new, base = trees
+	_write(new / '.hpcp_diff' / 'x', 'nope')
+	with pytest.raises(RuntimeError, match='reserved'):
+		_patch_from(hpcp_mod, new, base, [tmp_path / 'vol'])

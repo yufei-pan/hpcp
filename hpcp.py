@@ -25,6 +25,7 @@ import sys
 import tempfile
 import threading
 import time
+import uuid
 from collections import deque, namedtuple
 from concurrent.futures import ProcessPoolExecutor
 from math import log
@@ -4207,6 +4208,105 @@ def _trim_prefix(path):
 		return ''
 	name = os.path.basename(os.path.normpath(path))
 	return '' if name in ('', '.') else name + '/'
+
+def _is_reserved_key(key):
+	return key in (DIFF_DIR_NAME, DIFF_DIR_NAME + '/') or key.startswith(DIFF_DIR_NAME + '/')
+
+def _key_path(root, key):
+	"""Absolute path of key under root ('./' is root itself)."""
+	parts = [part for part in key.rstrip('/').split('/') if part not in ('', '.')]
+	return os.path.normpath(os.path.join(root, *parts)) if parts else os.path.normpath(root)
+
+def _key_depth(key):
+	return 0 if key == './' else key.rstrip('/').count('/') + 1
+
+def _parent_keys(key):
+	"""Directory keys above key, shallowest first: 'a/b/c' -> ['a/', 'a/b/']."""
+	parts = key.rstrip('/').split('/')
+	return ['/'.join(parts[:index]) + '/' for index in range(1, len(parts))]
+
+def _remove_entry(path):
+	"""Remove a file, symlink or whole directory tree; a missing path is fine."""
+	try:
+		if os.path.isdir(path) and not os.path.islink(path):
+			shutil.rmtree(path)
+		else:
+			os.unlink(path)
+	except FileNotFoundError:
+		pass
+
+def _place_symlink(target, dest):
+	if os.path.lexists(dest):
+		_remove_entry(dest)
+	os.makedirs(os.path.dirname(dest), exist_ok=True)
+	os.symlink(target, dest)
+
+def _payload_bytes(rows):
+	return sum(decode_state(row.new)['size'] for row in rows if row.op in ('A', 'M') and row.new.startswith('f:'))
+
+def make_patch_meta(rows, new_name, base_name, layout, full_hash=False):
+	"""Manifest fields for a new patch; 'volume' is filled in per volume by write_patch_metadata()."""
+	return {
+		'format': 'hpcp-diff',
+		'format_version': DIFF_FORMAT_VERSION,
+		'patch_id': uuid.uuid4().hex,
+		'volume': '1/1',
+		'created': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+		'hpcp_version': version,
+		'new': new_name,
+		'base': base_name,
+		'hash_algo': _hash_algo_name(),
+		'hash_size': HASH_SIZE,
+		'full_hash': int(bool(full_hash)),
+		'xattrs': int(hasattr(os, 'listxattr')),
+		'layout': layout,
+		'added': sum(1 for row in rows if row.op == 'A'),
+		'modified': sum(1 for row in rows if row.op == 'M'),
+		'deleted': sum(1 for row in rows if row.op == 'D'),
+		'payload_bytes': _payload_bytes(rows),
+		'sections': [('root', '.', 'changes.tsv')],
+	}
+
+def write_patch_metadata(volume_roots, rows, meta):
+	"""Write .hpcp_diff/changes.tsv then .hpcp_diff/manifest on every volume (manifest last)."""
+	total = len(volume_roots)
+	for index, volume_root in enumerate(volume_roots, start=1):
+		diff_dir = os.path.join(volume_root, DIFF_DIR_NAME)
+		os.makedirs(diff_dir, exist_ok=True)
+		write_changes(os.path.join(diff_dir, 'changes.tsv'), rows)
+		volume_meta = dict(meta)
+		volume_meta['volume'] = f'{index}/{total}'
+		write_manifest(os.path.join(diff_dir, 'manifest'), volume_meta)
+
+def build_patch_tree(rows, new_base, volume_roots, meta, max_workers=1, verbose=False):
+	"""Copy the A / M payload of rows from new_base onto the volume roots, then write .hpcp_diff/.
+
+	Every map key is relpath(path, new_base), so new_base is '/' for store layout and the
+	new tree's root for root layout.
+	"""
+	for row in rows:
+		if _is_reserved_key(row.path):
+			raise RuntimeError(f'Diff image error: {row.path} uses the reserved name {DIFF_DIR_NAME}')
+	payload = [row for row in rows if row.op in ('A', 'M')]
+	dir_keys = set()
+	for row in payload:
+		dir_keys.update(_parent_keys(row.path))
+		if row.new.startswith('d:'):
+			dir_keys.add(row.path)
+	for key in sorted(dir_keys, key=_key_depth):
+		for volume_root in volume_roots:
+			os.makedirs(_key_path(volume_root, key), exist_ok=True)
+	files = [_key_path(new_base, row.path) for row in payload if row.new.startswith('f:')]
+	if files:
+		copy_file_list_parallel(files, [], new_base, list(volume_roots), max(1, max_workers), verbose=verbose,
+			estimated_size=meta.get('payload_bytes', 0))
+	for row in payload:
+		if row.new.startswith('l:'):
+			_place_symlink(decode_state(row.new)['target'], _key_path(volume_roots[0], row.path))
+	# Directories last and deepest first, so later writes cannot disturb their mtimes.
+	for key in sorted(dir_keys, key=_key_depth, reverse=True):
+		sync_directory_metadata(_key_path(new_base, key), [_key_path(volume_root, key) for volume_root in volume_roots])
+	write_patch_metadata(volume_roots, rows, meta)
 
 #%% ---- Remove Extra ----
 def remove_extra_dirs(src_paths, dests,exclude=None):
