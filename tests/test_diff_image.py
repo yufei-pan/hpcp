@@ -399,9 +399,17 @@ def test_compute_changes_skips_unreadable_entries(trees, hpcp_mod):
 	new_map['bad.txt'] = os.path.join(str(new), 'y' * 300)
 	base_map['bad.txt'] = os.path.join(str(base), 'y' * 300)
 	base_map['base_only_bad.txt'] = os.path.join(str(base), 'z' * 300)
+	# readable on one side, unreadable on the other: neither may become a D or A row
+	_write(base / 'bad_new.txt', 'real base file')
+	new_map['bad_new.txt'] = os.path.join(str(new), 'n' * 300)
+	base_map['bad_new.txt'] = str(base / 'bad_new.txt')
+	_write(new / 'bad_base.txt', 'real new file')
+	new_map['bad_base.txt'] = str(new / 'bad_base.txt')
+	base_map['bad_base.txt'] = os.path.join(str(base), 'b' * 300)
 	before = len(hpcp_mod.ERRORS)
 	rows = hpcp_mod.compute_changes(new_map, base_map, max_workers=1)
 	assert _ops(rows) == {('A', 'added.txt')}
+	assert not any(row.path in ('bad_new.txt', 'bad_base.txt') for row in rows)
 	assert any(e.startswith('Entry state error') for e in hpcp_mod.ERRORS[before:])
 
 
