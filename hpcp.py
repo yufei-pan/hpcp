@@ -25,7 +25,7 @@ import sys
 import tempfile
 import threading
 import time
-from collections import deque
+from collections import deque, namedtuple
 from concurrent.futures import ProcessPoolExecutor
 from math import log
 from pprint import pformat
@@ -207,6 +207,13 @@ ERROR_TO_RETURNCODE_TABLE = {
 	'DD source type error': 233,
 	'Source partition larger than destination partition': 234,
 	'No source paths': 240,
+	'Invalid arguments': 241,
+	'Diff image error': 242,
+	'Patch format error': 243,
+	'Incomplete patch': 244,
+	'Patch conflict': 245,
+	'Patch verify error': 246,
+	'Entry state error': 247,
 	# FS param mirroring warnings: each of these reports a successful copy that
 	# degraded to mkfs defaults (a probe/build failure, or mkfs rejecting the
 	# mirrored parameters), not a failed one, so they must not inflate the
@@ -3702,6 +3709,110 @@ def _compare_file_lists(file_list, file_list2,diff_file_list=None,tar_diff_file_
 
 # Preserve the public name while avoiding the boolean option's name in store_file_list.
 compare_file_list = _compare_file_lists
+
+#%% ---- Diff Image ----
+DIFF_DIR_NAME = '.hpcp_diff'
+DIFF_FORMAT_VERSION = 1
+CHANGES_HEADER = '#hpcp-changes'
+CHANGES_VERSION = 1
+ChangeRow = namedtuple('ChangeRow', 'op path old new')
+_FIELD_UNESCAPES = {'\\': '\\', 't': '\t', 'n': '\n', 'r': '\r'}
+
+def _escape_field(text):
+	"""Escape backslash, tab, newline and carriage return so text fits in one TSV field."""
+	return text.replace('\\', '\\\\').replace('\t', '\\t').replace('\n', '\\n').replace('\r', '\\r')
+
+def _unescape_field(text):
+	"""Exact inverse of _escape_field. Raises ValueError on an unknown or dangling escape."""
+	if '\\' not in text:
+		return text
+	out = []
+	index = 0
+	while index < len(text):
+		char = text[index]
+		if char != '\\':
+			out.append(char)
+			index += 1
+			continue
+		if index + 1 >= len(text) or text[index + 1] not in _FIELD_UNESCAPES:
+			raise ValueError(f'bad escape in {text!r}')
+		out.append(_FIELD_UNESCAPES[text[index + 1]])
+		index += 2
+	return ''.join(out)
+
+def decode_state(state):
+	"""Parse an entry state string.
+
+	Returns None for '-' (absent), {'type': '?'} for '?' (unknown), otherwise a dict:
+	files f:size:mtime_ns:mode:uid:gid:hash:xattr, directories d:mode:uid:gid:xattr,
+	symlinks l:target (target escaped). Raises ValueError on anything else.
+	"""
+	if state == '-':
+		return None
+	if state == '?':
+		return {'type': '?'}
+	kind, sep, rest = state.partition(':')
+	if not sep:
+		raise ValueError(f'bad entry state {state!r}')
+	if kind == 'l':
+		return {'type': 'l', 'target': _unescape_field(rest)}
+	fields = rest.split(':')
+	if kind == 'f' and len(fields) == 7:
+		size, mtime_ns, mode, uid, gid, file_hash, xattr = fields
+		return {'type': 'f', 'size': int(size), 'mtime_ns': int(mtime_ns), 'mode': int(mode, 8),
+			'uid': int(uid), 'gid': int(gid), 'hash': file_hash, 'xattr': xattr}
+	if kind == 'd' and len(fields) == 4:
+		mode, uid, gid, xattr = fields
+		return {'type': 'd', 'mode': int(mode, 8), 'uid': int(uid), 'gid': int(gid), 'xattr': xattr}
+	raise ValueError(f'bad entry state {state!r}')
+
+def encode_state(info):
+	"""Inverse of decode_state()."""
+	if info is None:
+		return '-'
+	kind = info['type']
+	if kind == '?':
+		return '?'
+	if kind == 'l':
+		return 'l:' + _escape_field(info['target'])
+	if kind == 'd':
+		return f"d:{info['mode']:o}:{info['uid']}:{info['gid']}:{info['xattr']}"
+	if kind == 'f':
+		return (f"f:{info['size']}:{info['mtime_ns']}:{info['mode']:o}:{info['uid']}:{info['gid']}:"
+			f"{info['hash']}:{info['xattr']}")
+	raise ValueError(f'bad entry state type {kind!r}')
+
+def _mtime_ns_close(a_ns, b_ns):
+	"""Same tolerance as is_file_identical(): 2 x the coarser timestamp precision."""
+	precision = max(get_timestamp_precision(a_ns / 1e9), get_timestamp_precision(b_ns / 1e9))
+	return abs(a_ns - b_ns) <= precision * 2 * 1e9
+
+def states_equal(a, b, compare_hash=True):
+	"""True when two entry states describe the same entry.
+
+	Directories ignore mtime; files allow the timestamp-precision tolerance; an xattr
+	digest of '-' on either side is not compared; '?' never equals anything.
+	"""
+	if a == '?' or b == '?':
+		return False
+	if a == b:
+		return True
+	info_a, info_b = decode_state(a), decode_state(b)
+	if info_a is None or info_b is None or info_a['type'] != info_b['type']:
+		return False
+	if info_a['type'] == 'l':
+		return info_a['target'] == info_b['target']
+	if (info_a['mode'], info_a['uid'], info_a['gid']) != (info_b['mode'], info_b['uid'], info_b['gid']):
+		return False
+	if info_a['xattr'] != '-' and info_b['xattr'] != '-' and info_a['xattr'] != info_b['xattr']:
+		return False
+	if info_a['type'] == 'd':
+		return True
+	if info_a['size'] != info_b['size']:
+		return False
+	if compare_hash and info_a['hash'] != info_b['hash']:
+		return False
+	return _mtime_ns_close(info_a['mtime_ns'], info_b['mtime_ns'])
 
 #%% ---- Remove Extra ----
 def remove_extra_dirs(src_paths, dests,exclude=None):
