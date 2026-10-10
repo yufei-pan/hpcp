@@ -384,3 +384,33 @@ def test_compute_changes_parallel_matches_serial(trees, hpcp_mod):
 	serial = hpcp_mod.compute_changes(new_map, base_map, max_workers=1)
 	parallel = hpcp_mod.compute_changes(new_map, base_map, max_workers=4)
 	assert serial == parallel and len(serial) == 100
+
+
+def test_get_entry_state_read_failure_is_unknown(tmp_path, hpcp_mod, reset_hpcp_globals):
+	path = os.path.join(str(tmp_path), 'x' * 300)  # ENAMETOOLONG is an unexpected read failure
+	assert hpcp_mod.get_entry_state(path) == '?'
+	assert any(e.startswith('Entry state error') for e in hpcp_mod.ERRORS)
+
+
+def test_compute_changes_skips_unreadable_entries(trees, hpcp_mod):
+	new, base = trees
+	_write(new / 'added.txt', 'a')
+	new_map, base_map = hpcp_mod.build_root_maps(str(new), str(base), max_workers=1)
+	new_map['bad.txt'] = os.path.join(str(new), 'y' * 300)
+	base_map['bad.txt'] = os.path.join(str(base), 'y' * 300)
+	base_map['base_only_bad.txt'] = os.path.join(str(base), 'z' * 300)
+	before = len(hpcp_mod.ERRORS)
+	rows = hpcp_mod.compute_changes(new_map, base_map, max_workers=1)
+	assert _ops(rows) == {('A', 'added.txt')}
+	assert any(e.startswith('Entry state error') for e in hpcp_mod.ERRORS[before:])
+
+
+def test_states_for_paths_parallel_reports_worker_errors(tmp_path, hpcp_mod, reset_hpcp_globals):
+	hpcp_mod.HASH_SIZE = 65536
+	paths = [_write(tmp_path / f'f{i}.txt', f'{i}') for i in range(300)]
+	bad = os.path.join(str(tmp_path), 'x' * 300)
+	before = len(hpcp_mod.ERRORS)
+	states = hpcp_mod._states_for_paths(paths + [bad], max_workers=2)
+	assert states[bad] == '?'
+	assert all(states[path].startswith('f:') for path in paths)
+	assert any(e.startswith('Entry state error') for e in hpcp_mod.ERRORS[before:])

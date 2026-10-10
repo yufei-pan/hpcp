@@ -3859,7 +3859,7 @@ def _xattr_digest(path):
 
 def get_entry_state(path, full_hash=False, read_xattrs=True):
 	"""State string of one path (see decode_state). Missing paths, including ones below a
-	regular file, are '-'; any other read failure is recorded with eprint and returns '-'."""
+	regular file, are '-'; any other read failure is recorded with eprint and returns '?' (unknown)."""
 	path = path.rstrip(os.sep) or os.sep
 	try:
 		st = os.lstat(path)
@@ -3877,7 +3877,7 @@ def get_entry_state(path, full_hash=False, read_xattrs=True):
 		return '-'
 	except OSError as e:
 		eprint(f'Entry state error: cannot read {path}: {e}')
-		return '-'
+		return '?'
 	return '-'
 
 def _remove_stale_xattrs(src, dest):
@@ -4117,6 +4117,9 @@ def compute_changes(new_map, base_map, full_hash=False, max_workers=multiprocess
 	for key in set(new_map) | set(base_map):
 		new_state = states[new_map[key]] if key in new_map else '-'
 		old_state = states[base_map[key]] if key in base_map else '-'
+		# The read failure is already recorded; a guessed row could delete or add real files.
+		if new_state == '?' or old_state == '?':
+			continue
 		if new_state == '-' and old_state == '-':
 			continue
 		if old_state == '-':
