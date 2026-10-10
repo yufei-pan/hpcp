@@ -582,3 +582,182 @@ def test_check_patch_target_skips_already_applied(trees, hpcp_mod, tmp_path):
 	target = tmp_path / 'target'
 	_clone(new, target)
 	assert set(_actions(hpcp_mod.check_patch_target(rows, str(target))).values()) == {'skip'}
+
+
+ODD_NAMES = ('with space.txt', 'tab\tname', 'new\nline', os.fsdecode(b'bad\xffbyte'), 'colon:name')
+
+
+def _build_scenario(new, base):
+	_write(new / 'same.txt', 'same')
+	_write(base / 'same.txt', 'same')
+	_write(new / 'mod.txt', 'new content')
+	_write(base / 'mod.txt', 'old')
+	_write(new / 'same_size.bin', b'NEW!')
+	_write(base / 'same_size.bin', b'OLD!')
+	_write(base / 'gone.txt', 'bye')
+	_write(base / 'olddir' / 'a.txt', 'a')
+	_write(base / 'olddir' / 'sub' / 'b.txt', 'b')
+	_write(new / 'newdir' / 'sub' / 'f.txt', 'fresh')
+	_write(new / 'run.sh', '#!/bin/sh')
+	_write(base / 'run.sh', '#!/bin/sh')
+	os.chmod(new / 'run.sh', 0o755)
+	os.chmod(base / 'run.sh', 0o644)
+	os.symlink('same.txt', new / 'ln')
+	os.symlink('mod.txt', base / 'ln')
+	_write(base / 'f2d', 'file')
+	_write(new / 'f2d' / 'child.txt', 'c')
+	_write(base / 'f2l', 'file')
+	os.symlink('same.txt', new / 'f2l')
+	_write(base / 'd2l' / 'inner.txt', 'i')
+	os.symlink('same.txt', new / 'd2l')
+	for name in ODD_NAMES:
+		_write(new / name, name)
+
+
+def test_apply_patch_tree_round_trip(trees, hpcp_mod, tmp_path):
+	"""Success criterion + Review Focus 3, 4, 5."""
+	new, base = trees
+	_build_scenario(new, base)
+	vol = tmp_path / 'vol'
+	_patch_from(hpcp_mod, new, base, [vol])
+	target = tmp_path / 'target'
+	_clone(base, target)
+	summary = hpcp_mod.apply_patch_tree([str(vol)], str(target), max_workers=1)
+	assert summary['failed'] == 0 and summary['forced'] == 0
+	assert _changes(hpcp_mod, new, target) == []
+	assert hpcp_mod.ERRORS == []
+
+
+def test_apply_patch_tree_is_idempotent(trees, hpcp_mod, tmp_path):
+	new, base = trees
+	_build_scenario(new, base)
+	vol = tmp_path / 'vol'
+	rows, _ = _patch_from(hpcp_mod, new, base, [vol])
+	target = tmp_path / 'target'
+	_clone(base, target)
+	hpcp_mod.apply_patch_tree([str(vol)], str(target), max_workers=1)
+	second = hpcp_mod.apply_patch_tree([str(vol)], str(target), max_workers=1)
+	assert (second['deleted'], second['added'], second['modified'], second['failed']) == (0, 0, 0, 0)
+	assert second['skipped'] == len(rows)
+
+
+class _FakeStdin:
+	def __init__(self, tty):
+		self._tty = tty
+
+	def isatty(self):
+		return self._tty
+
+	def close(self):
+		# multiprocessing workers call sys.stdin.close() on startup.
+		pass
+
+
+def _conflicted(hpcp_mod, new, base, tmp_path):
+	_write(new / 'mod.txt', 'new content')
+	_write(base / 'mod.txt', 'old')
+	_write(base / 'gone.txt', 'bye')
+	vol = tmp_path / 'vol'
+	_patch_from(hpcp_mod, new, base, [vol])
+	target = tmp_path / 'target'
+	_clone(base, target)
+	_write(target / 'mod.txt', 'local edit')
+	return vol, target
+
+
+def test_apply_aborts_on_conflict_without_tty(trees, hpcp_mod, tmp_path, monkeypatch):
+	new, base = trees
+	vol, target = _conflicted(hpcp_mod, new, base, tmp_path)
+	monkeypatch.setattr(sys, 'stdin', _FakeStdin(False))
+	with pytest.raises(RuntimeError, match='Patch conflict'):
+		hpcp_mod.apply_patch_tree([str(vol)], str(target), max_workers=1)
+	assert (target / 'gone.txt').exists()
+	assert (target / 'mod.txt').read_text() == 'local edit'
+
+
+def test_apply_prompt_defaults_to_abort(trees, hpcp_mod, tmp_path, monkeypatch):
+	new, base = trees
+	vol, target = _conflicted(hpcp_mod, new, base, tmp_path)
+	monkeypatch.setattr(sys, 'stdin', _FakeStdin(True))
+	monkeypatch.setattr(hpcp_mod.multiCMD, 'input_with_timeout_and_countdown', lambda timeout, prompt='': None)
+	with pytest.raises(RuntimeError, match='Patch conflict'):
+		hpcp_mod.apply_patch_tree([str(vol)], str(target), max_workers=1)
+	assert (target / 'gone.txt').exists()
+
+
+def test_apply_prompt_yes_applies(trees, hpcp_mod, tmp_path, monkeypatch, capsys):
+	new, base = trees
+	vol, target = _conflicted(hpcp_mod, new, base, tmp_path)
+	monkeypatch.setattr(sys, 'stdin', _FakeStdin(True))
+	monkeypatch.setattr(hpcp_mod.multiCMD, 'input_with_timeout_and_countdown', lambda timeout, prompt='': 'y')
+	summary = hpcp_mod.apply_patch_tree([str(vol)], str(target), max_workers=1)
+	assert summary['forced'] == 1
+	assert (target / 'mod.txt').read_text() == 'new content'
+	assert not (target / 'gone.txt').exists()
+	assert 'Warning: forcing M mod.txt' in capsys.readouterr().err
+
+
+def test_apply_force_applies_and_warns(trees, hpcp_mod, tmp_path, monkeypatch, capsys):
+	new, base = trees
+	vol, target = _conflicted(hpcp_mod, new, base, tmp_path)
+	monkeypatch.setattr(sys, 'stdin', _FakeStdin(False))
+	summary = hpcp_mod.apply_patch_tree([str(vol)], str(target), force=True, max_workers=1)
+	assert summary['forced'] == 1 and summary['failed'] == 0
+	assert 'Warning: forcing M mod.txt' in capsys.readouterr().err
+	assert _changes(hpcp_mod, new, target) == []
+
+
+def test_apply_rejects_incomplete_or_mixed_volumes(trees, hpcp_mod, tmp_path):
+	new, base = trees
+	for i in range(3):
+		_write(new / f'f{i}.txt', 'x')
+	v1, v2 = tmp_path / 'v1', tmp_path / 'v2'
+	_patch_from(hpcp_mod, new, base, [v1, v2])
+	target = tmp_path / 'target'
+	_clone(base, target)
+	with pytest.raises(RuntimeError, match=r'Incomplete patch: missing volume.*patch_1\.img'):
+		hpcp_mod.apply_patch_tree([str(v1)], str(target), volume_names=['/x/patch.img'])
+	other = tmp_path / 'other'
+	_patch_from(hpcp_mod, new, base, [other])
+	with pytest.raises(RuntimeError, match='different patches'):
+		hpcp_mod.apply_patch_tree([str(v1), str(other)], str(target))
+	os.unlink(v2 / '.hpcp_diff' / 'manifest')
+	with pytest.raises(RuntimeError, match='Incomplete patch'):
+		hpcp_mod.apply_patch_tree([str(v1), str(v2)], str(target))
+
+
+def test_apply_refuses_to_write_through_symlinked_parent(tmp_path, hpcp_mod, reset_hpcp_globals):
+	outside = tmp_path / 'outside'
+	outside.mkdir()
+	target = tmp_path / 'target'
+	target.mkdir()
+	os.symlink(str(outside), target / 'esc')
+	vol = tmp_path / 'vol'
+	_write(vol / 'esc' / 'x.txt', 'payload')
+	rows = [hpcp_mod.ChangeRow('A', 'esc/x.txt', '-', hpcp_mod.get_entry_state(str(vol / 'esc' / 'x.txt')))]
+	hpcp_mod.write_patch_metadata([str(vol)], rows, hpcp_mod.make_patch_meta(rows, 'n', 'b', 'root'))
+	hpcp_mod.apply_patch_tree([str(vol)], str(target), force=True, max_workers=1)
+	assert not (outside / 'x.txt').exists()
+	assert any(error.startswith('Patch format error') for error in hpcp_mod.ERRORS)
+
+
+def test_apply_store_layout_leaves_other_trees(tmp_path, hpcp_mod, reset_hpcp_globals):
+	hpcp_mod.HASH_SIZE = 65536
+	new = tmp_path / 'live' / 'a'
+	other = tmp_path / 'live' / 'b'
+	_write(new / 'f.txt', 'new')
+	_write(new / 'added.txt', 'added')
+	store = tmp_path / 'store'
+	rel_new = os.path.relpath(str(new), '/')
+	rel_other = os.path.relpath(str(other), '/')
+	_write(store / rel_new / 'f.txt', 'old')
+	_write(store / rel_new / 'gone.txt', 'bye')
+	_write(store / rel_other / 'g.txt', 'other tree')
+	new_map, base_map = hpcp_mod.build_store_maps(str(new), str(store), max_workers=1)
+	rows = hpcp_mod.compute_changes(new_map, base_map, max_workers=1)
+	vol = tmp_path / 'vol'
+	vol.mkdir()
+	hpcp_mod.build_patch_tree(rows, '/', [str(vol)], hpcp_mod.make_patch_meta(rows, 'a', 'store', 'store'), max_workers=1)
+	hpcp_mod.apply_patch_tree([str(vol)], str(store), max_workers=1)
+	assert (store / rel_other / 'g.txt').read_text() == 'other tree'
+	assert hpcp_mod.compute_changes(*hpcp_mod.build_store_maps(str(new), str(store), max_workers=1), max_workers=1) == []

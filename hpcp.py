@@ -4403,6 +4403,185 @@ def check_patch_target(rows, target_root, compare_hash=True, full_hash=False, ma
 			checks[row] = PatchCheck(row, 'conflict', found, 'missing on target' if found == '-' else 'changed on target')
 	return [checks[row] for row in rows]
 
+def load_patch_volumes(volume_roots, volume_names=None):
+	"""Read and cross-check every volume's manifest.
+
+	Returns (meta of volume 1, rows of volume 1, volume roots ordered by volume number).
+	volume_names (image paths, parallel to volume_roots) only improve error messages.
+	"""
+	names = list(volume_names) if volume_names else [str(root) for root in volume_roots]
+	metas = []
+	for volume_root, name in zip(volume_roots, names):
+		manifest = os.path.join(volume_root, DIFF_DIR_NAME, 'manifest')
+		if not os.path.isfile(manifest):
+			raise RuntimeError(f'Incomplete patch: {name} has no {DIFF_DIR_NAME}/manifest')
+		metas.append(read_manifest(manifest))
+	patch_ids = sorted({str(meta.get('patch_id')) for meta in metas})
+	if len(patch_ids) != 1:
+		raise RuntimeError(f'Incomplete patch: volumes belong to different patches ({", ".join(patch_ids)})')
+	by_number = {}
+	total = None
+	for volume_root, name, meta in zip(volume_roots, names, metas):
+		number, _, count = str(meta.get('volume', '')).partition('/')
+		try:
+			number, count = int(number), int(count)
+		except ValueError:
+			raise RuntimeError(f'Patch format error: {name} has a bad volume field {meta.get("volume")!r}')
+		if total is None:
+			total = count
+		elif count != total:
+			raise RuntimeError(f'Incomplete patch: volumes disagree on the volume count ({total} vs {count})')
+		by_number[number] = (volume_root, name, meta)
+	missing = [number for number in range(1, total + 1) if number not in by_number]
+	if missing:
+		if 1 in by_number:
+			expected = ', '.join(_split_dest_image_name(by_number[1][1], number - 1) for number in missing)
+		else:
+			expected = ', '.join(f'volume {number}' for number in missing)
+		raise RuntimeError(f'Incomplete patch: missing volume(s) {expected} of {total}')
+	ordered = [by_number[number] for number in range(1, total + 1)]
+	meta = ordered[0][2]
+	if meta['sections'] != [('root', '.', 'changes.tsv')]:
+		raise RuntimeError(f'Patch format error: unsupported sections {meta["sections"]}; this hpcp applies single-filesystem patches only')
+	rows = read_changes(os.path.join(ordered[0][0], DIFF_DIR_NAME, 'changes.tsv'))
+	return meta, rows, [entry[0] for entry in ordered]
+
+def _resolve_conflicts(conflicts, force):
+	"""Print conflicts, then prompt (default abort), abort without a tty, or force with warnings."""
+	print(f"{len(conflicts)} path(s) on the target differ from the state this patch expects:")
+	for check in conflicts:
+		expected = '-' if check.row.op == 'A' else check.row.old
+		print(f"  {check.row.op} {check.row.path!r}: {check.reason} (expected {expected}, found {check.found})")
+	if not force:
+		if not sys.stdin.isatty():
+			raise RuntimeError(f'Patch conflict: {len(conflicts)} conflicting path(s) and stdin is not a tty; nothing applied (use -fa to force)')
+		answer = multiCMD.input_with_timeout_and_countdown(60, 'Apply anyway? [y/N]')
+		if (answer or '').strip().lower() not in ('y', 'yes'):
+			raise RuntimeError(f'Patch conflict: {len(conflicts)} conflicting path(s); nothing applied')
+	for check in conflicts:
+		print(f"Warning: forcing {check.row.op} {check.row.path}: {check.reason}", file=sys.stderr)
+
+def _inside_root(root, path):
+	"""True when path's parent directory resolves inside root (no symlinked escape)."""
+	root_real = os.path.realpath(root)
+	parent_real = os.path.realpath(os.path.dirname(path))
+	return parent_real == root_real or parent_real.startswith(root_real.rstrip(os.sep) + os.sep)
+
+def _apply_rows(rows, volume_roots, target_root, max_workers=1, verbose=False):
+	"""Carry out checked rows: deletions, then directories, files, symlinks, directory metadata."""
+	def target_of(row):
+		path = _key_path(target_root, row.path)
+		if row.path != './' and not _inside_root(target_root, path):
+			eprint(f'Patch format error: {row.path} resolves outside {target_root}; skipped')
+			return None
+		return path
+	deletes = [row for row in rows if row.op == 'D']
+	payload = [row for row in rows if row.op in ('A', 'M')]
+	# Non-directories first, then directories deepest first.
+	for row in sorted(deletes, key=lambda r: (r.path.endswith('/'), -_key_depth(r.path))):
+		path = target_of(row)
+		if path is None:
+			continue
+		try:
+			_remove_entry(path)
+		except OSError as e:
+			eprint(f'Remove file failed: {row.path}: {e}')
+	targets = {}
+	for row in payload:
+		path = target_of(row)
+		if path is None:
+			continue
+		targets[row.path] = path
+		if not os.path.lexists(path):
+			continue
+		if row.new.startswith('d:') and os.path.isdir(path) and not os.path.islink(path):
+			continue
+		# Files are re-copied fresh (drops stale xattrs); wrong-type entries make way.
+		try:
+			_remove_entry(path)
+		except OSError as e:
+			eprint(f'Remove file failed: {row.path}: {e}')
+	dir_rows = [row for row in payload if row.new.startswith('d:') and row.path in targets]
+	for row in sorted(dir_rows, key=lambda r: _key_depth(r.path)):
+		os.makedirs(targets[row.path], exist_ok=True)
+	by_volume = {}
+	for row in payload:
+		if not row.new.startswith('f:') or row.path not in targets:
+			continue
+		for volume_root in volume_roots:
+			source = _key_path(volume_root, row.path)
+			if os.path.lexists(source):
+				by_volume.setdefault(volume_root, []).append(source)
+				break
+		else:
+			eprint(f'Incomplete patch: payload for {row.path} is missing from every volume')
+	for volume_root, files in by_volume.items():
+		copy_file_list_parallel(files, [], volume_root, [target_root], max(1, max_workers), verbose=verbose)
+	for row in payload:
+		if row.new.startswith('l:') and row.path in targets:
+			try:
+				_place_symlink(decode_state(row.new)['target'], targets[row.path])
+			except OSError as e:
+				eprint(f'Failed to create symbolic link: {row.path}: {e}')
+	for row in sorted(dir_rows, key=lambda r: _key_depth(r.path), reverse=True):
+		sync_directory_metadata(_key_path(volume_roots[0], row.path), [targets[row.path]])
+
+def _verify_rows(rows, target_root, compare_hash=True, full_hash=False, max_workers=1):
+	"""Re-read every applied path and compare with its final expected state; returns the failure count."""
+	final = {}
+	for row in sort_change_rows(rows):
+		# D sorts before A, so for a D + A pair on one name the A row decides the final state.
+		final[row.path.rstrip('/')] = row
+	paths = {name: _key_path(target_root, row.path) for name, row in final.items()}
+	states = _states_for_paths(set(paths.values()), full_hash=full_hash, max_workers=max_workers)
+	failed = 0
+	for name, row in final.items():
+		expected = '-' if row.op == 'D' else row.new
+		found = states[paths[name]]
+		ok = found == '-' if expected == '-' else states_equal(found, expected, compare_hash)
+		if not ok:
+			failed += 1
+			eprint(f'Patch verify error: {row.op} {row.path}: expected {expected}, found {found}')
+	return failed
+
+def apply_patch_tree(volume_roots, target_root, force=False, max_workers=1, verbose=False, volume_names=None, store_note=False):
+	"""Apply a patch whose volumes are mounted (or unpacked) at volume_roots onto directory target_root.
+
+	Returns {'deleted', 'added', 'modified', 'skipped', 'forced', 'failed'}. Raises RuntimeError
+	for a malformed or incomplete patch, or when conflicts are not overridden.
+	"""
+	global HASH_SIZE
+	meta, rows, volume_roots = load_patch_volumes(volume_roots, volume_names)
+	if store_note and meta.get('layout') == 'store':
+		example = rows[0].path if rows else ''
+		print(f"Note: this patch uses image-store layout; paths such as {example!r} are resolved under {target_root}")
+	compare_hash = meta.get('hash_algo') == _hash_algo_name()
+	if not compare_hash:
+		print(f"Warning: patch was hashed with {meta.get('hash_algo')}, which is not available here; file hashes are not compared", file=sys.stderr)
+	full_hash = meta.get('full_hash') == '1'
+	saved_hash_size = HASH_SIZE
+	try:
+		HASH_SIZE = int(meta.get('hash_size', HASH_SIZE))
+		checks = check_patch_target(rows, target_root, compare_hash, full_hash, max_workers)
+		conflicts = [check for check in checks if check.action == 'conflict']
+		if conflicts:
+			_resolve_conflicts(conflicts, force)
+		todo = [check.row for check in checks if check.action != 'skip']
+		_apply_rows(todo, volume_roots, target_root, max_workers, verbose)
+		failed = _verify_rows(todo, target_root, compare_hash, full_hash, max_workers)
+	finally:
+		HASH_SIZE = saved_hash_size
+	summary = {
+		'deleted': sum(1 for row in todo if row.op == 'D'),
+		'added': sum(1 for row in todo if row.op == 'A'),
+		'modified': sum(1 for row in todo if row.op == 'M'),
+		'skipped': len(checks) - len(todo),
+		'forced': len(conflicts),
+		'failed': failed,
+	}
+	print('Patch summary: ' + ', '.join(f'{key} {value}' for key, value in summary.items()))
+	return summary
+
 #%% ---- Remove Extra ----
 def remove_extra_dirs(src_paths, dests,exclude=None):
 	"""
