@@ -276,3 +276,53 @@ def test_successful_retry_preserves_prior_errors(
 	assert size > 0
 	assert (tmp_tree.dst / 'a.txt').read_text() == 'payload'
 	assert hpcp_mod.ERRORS == ['Copy failed: earlier file']
+
+
+def _set_xattr_or_skip(path, name, value=b'1'):
+	try:
+		os.setxattr(path, name, value, follow_symlinks=False)
+	except (OSError, AttributeError) as e:
+		pytest.skip(f'user xattrs unsupported here: {e}')
+
+
+def _xattr_names(path):
+	return set(os.listxattr(path, follow_symlinks=False))
+
+
+def _identical_files(tmp_tree):
+	src = tmp_tree.add_file('x.txt', 'same', under='src')
+	dst = tmp_tree.add_file('x.txt', 'same', under='dst')
+	t = time.time() - 1000
+	os.utime(src, (t, t))
+	os.utime(dst, (t, t))
+	return src, dst
+
+
+def test_copy_file_removes_stale_xattr_on_identical_file(tmp_tree, hpcp_mod, reset_hpcp_globals, require_linux):
+	src, dst = _identical_files(tmp_tree)
+	_set_xattr_or_skip(dst, 'user.stale')
+	_set_xattr_or_skip(src, 'user.keep')
+	hpcp_mod.CONTENT_ONLY = False
+	hpcp_mod.HASH_SIZE = 65536
+	hpcp_mod.copy_file(src, [dst])
+	names = _xattr_names(dst)
+	assert 'user.stale' not in names
+	assert 'user.keep' in names
+
+
+def test_copy_file_keeps_stale_xattr_under_content_only(tmp_tree, hpcp_mod, reset_hpcp_globals, require_linux):
+	src, dst = _identical_files(tmp_tree)
+	_set_xattr_or_skip(dst, 'user.stale')
+	hpcp_mod.CONTENT_ONLY = True
+	hpcp_mod.HASH_SIZE = 65536
+	hpcp_mod.copy_file(src, [dst])
+	assert 'user.stale' in _xattr_names(dst)
+
+
+def test_sync_directory_metadata_removes_stale_xattr(tmp_tree, hpcp_mod, reset_hpcp_globals, require_linux):
+	src = tmp_tree.add_dir('d', under='src')
+	dst = tmp_tree.add_dir('d', under='dst')
+	_set_xattr_or_skip(dst, 'user.stale')
+	hpcp_mod.CONTENT_ONLY = False
+	hpcp_mod.sync_directory_metadata(src, [dst])
+	assert 'user.stale' not in _xattr_names(dst)

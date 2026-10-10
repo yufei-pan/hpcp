@@ -2750,6 +2750,7 @@ def copy_file(src_path, dest_paths, full_hash=False, verbose=False, concurrent_p
 			if os.path.exists(dest) and (not os.path.islink(src_path)) and is_file_identical(src_path, dest,os.path.getsize(src_path),full_hash):
 				if not CONTENT_ONLY:
 					st = os.stat(src_path,follow_symlinks=False)
+					_remove_stale_xattrs(src_path, dest)
 					shutil.copystat(src_path, dest,follow_symlinks=False)
 					if os.name == 'posix':
 						os.chown(dest, st.st_uid, st.st_gid)
@@ -3394,6 +3395,7 @@ def sync_directory_metadata(src_path, dest_paths):
 			eprint(f"Destination path {dest_path} maybe a mounted dir, known issue with os.path.exists\nContinuing without creating dest folder...")
 		# Sync the metadata
 		if not CONTENT_ONLY:
+			_remove_stale_xattrs(src_path, dest_path)
 			shutil.copystat(src_path, dest_path)
 			if os.name == 'posix':
 				os.chown(dest_path, st.st_uid, st.st_gid)
@@ -3877,6 +3879,28 @@ def get_entry_state(path, full_hash=False, read_xattrs=True):
 		eprint(f'Entry state error: cannot read {path}: {e}')
 		return '-'
 	return '-'
+
+def _remove_stale_xattrs(src, dest):
+	"""Remove xattrs (ACLs included) that dest has and src does not.
+
+	shutil.copystat() copies and overwrites xattrs but never removes one.
+	Skipped under CONTENT_ONLY; unsupported or forbidden removals are ignored.
+	"""
+	if CONTENT_ONLY or not hasattr(os, 'listxattr'):
+		return
+	try:
+		src_names = set(os.listxattr(src, follow_symlinks=False))
+		dest_names = os.listxattr(dest, follow_symlinks=False)
+	except OSError:
+		return
+	for name in dest_names:
+		if name in src_names:
+			continue
+		try:
+			os.removexattr(dest, name, follow_symlinks=False)
+		except OSError as e:
+			if e.errno not in (errno.ENOTSUP, errno.EPERM, errno.ENODATA, errno.EACCES):
+				raise
 
 #%% ---- Remove Extra ----
 def remove_extra_dirs(src_paths, dests,exclude=None):
