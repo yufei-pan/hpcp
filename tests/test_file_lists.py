@@ -1,6 +1,12 @@
 import os
 import io
 import pytest
+import time
+
+
+def _h(hpcp_mod, char):
+	"""A digest-shaped string for the current hash algorithm."""
+	return char * (16 if hpcp_mod.xxhash_available else 128)
 
 
 def test_load_file_list_reads_lines(tmp_path, hpcp_mod, reset_hpcp_globals):
@@ -58,22 +64,22 @@ def test_hpcp_writes_target_file_list(tmp_tree, hpcp_mod, reset_hpcp_globals, co
 
 def test_compare_file_list_writes_diff(tmp_path, hpcp_mod, reset_hpcp_globals):
 	diff = tmp_path / 'diff.txt'
-	src = {'a.txt:h', 'only_src.txt:h'}
-	dst = {'a.txt:h', 'only_dst.txt:h'}
+	a = _h(hpcp_mod, 'a')
+	src = {f'a.txt:{a}', f'only_src.txt:{a}'}
+	dst = {f'a.txt:{a}', f'only_dst.txt:{a}'}
 	hpcp_mod.compare_file_list(src, dst, diff_file_list=str(diff), tar_diff_file_list=False)
-	text = diff.read_text()
-	assert 'only_dst.txt' in text
-	assert 'only_src.txt' in text
+	rows = hpcp_mod.read_changes(str(diff))
+	assert {(r.op, r.path) for r in rows} == {('A', 'only_src.txt'), ('D', 'only_dst.txt')}
 
 
 def test_tar_diff_file_list_is_new_or_updated_only(tmp_path, hpcp_mod, reset_hpcp_globals):
 	"""Help text: tar-compatible diff lists update/new files only (in src not dest)."""
 	diff = tmp_path / 'tar.txt'
-	src = {'new.txt:h', 'updated.txt:new', 'same.txt:h'}
-	dst = {'same.txt:h', 'updated.txt:old', 'extra.txt:h'}
+	a, b, c = _h(hpcp_mod, 'a'), _h(hpcp_mod, 'b'), _h(hpcp_mod, 'c')
+	src = {f'new.txt:{a}', f'updated.txt:{b}', f'same.txt:{a}'}
+	dst = {f'same.txt:{a}', f'updated.txt:{c}', f'extra.txt:{a}'}
 	hpcp_mod.compare_file_list(src, dst, diff_file_list=str(diff), tar_diff_file_list=True)
-	text = diff.read_text()
-	assert set(text.splitlines()) == {'new.txt', 'updated.txt'}
+	assert set(diff.read_text().splitlines()) == {'new.txt', 'updated.txt'}
 
 
 def test_hpcp_compare_file_list_with_dest(tmp_tree, hpcp_mod, reset_hpcp_globals, copy_args, require_linux):
@@ -122,4 +128,48 @@ def test_compare_stored_list_preserves_baseline_and_writes_diff(
 	)
 	assert rc == 0
 	assert baseline.read_text() == './\nsame.txt\n'
-	assert diff.read_bytes() == b'-\x00new.txt\n'
+	rows = hpcp_mod.read_changes(str(diff))
+	assert [(r.op, r.path) for r in rows] == [('A', 'new.txt')]
+	assert rows[0].new.startswith('f:')
+
+
+def test_diff_file_list_keeps_names_with_colons(tmp_tree, hpcp_mod, reset_hpcp_globals):
+	"""Regression: -dfl cut every entry at its last ':' (directory 'a:b/' became 'a')."""
+	tmp_tree.add_file('a:b/file:1.txt', 'x')
+	tmp_tree.add_file('plain.txt', 'p')
+	baseline = tmp_tree.root / 'baseline.txt'
+	baseline.write_text('./\nplain.txt\nold:dir/\n')
+	diff = tmp_tree.root / 'diff.tsv'
+	rc = hpcp_mod.hpcp(
+		[str(tmp_tree.src) + os.sep], target_file_list=str(baseline), diff_file_list=str(diff),
+		append_hash_to_file_list=False, single_thread=True,
+	)
+	assert rc == 0
+	ops = {(r.op, r.path) for r in hpcp_mod.read_changes(str(diff))}
+	assert ops == {('A', 'a:b/'), ('A', 'a:b/file:1.txt'), ('D', 'old:dir/')}
+
+
+def test_hashed_list_symlink_lines_parse_to_their_path(hpcp_mod, reset_hpcp_globals):
+	a = _h(hpcp_mod, 'a')
+	lines = [f'f.txt:{a}', 'ln:target:with:colons', 'dir/']
+	entries = hpcp_mod._parse_file_list_lines(lines)
+	assert entries == {'f.txt': a, 'ln': 'target:with:colons', 'dir/': None}
+	# a live key that itself contains ':' wins over the first-colon split
+	entries = hpcp_mod._parse_file_list_lines([f'f.txt:{a}', 'my:link:dest'], live_keys={'my:link'})
+	assert entries['my:link'] == 'dest'
+
+
+def test_hpcp_diff_file_list_against_dest_reports_changes(tmp_tree, hpcp_mod, reset_hpcp_globals, copy_args, require_linux, capsys):
+	t = time.time() - 1000
+	for path in (tmp_tree.add_file('keep.txt', 'k', under='src'), tmp_tree.add_file('keep.txt', 'k', under='dst')):
+		os.utime(path, (t, t))
+	tmp_tree.add_file('changed.txt', 'new!', under='src')
+	tmp_tree.add_file('changed.txt', 'old', under='dst')
+	tmp_tree.add_file('only_src.txt', 's', under='src')
+	tmp_tree.add_file('only_dst.txt', 'd', under='dst')
+	diff = str(tmp_tree.root / 'cmp.tsv')
+	srcs, opts = copy_args(diff_file_list=diff)
+	assert hpcp_mod.hpcp(srcs, **opts) == 0
+	ops = {(r.op, r.path) for r in hpcp_mod.read_changes(diff)}
+	assert ops == {('A', 'only_src.txt'), ('M', 'changed.txt'), ('D', 'only_dst.txt')}
+	assert 'Modified:' in capsys.readouterr().out

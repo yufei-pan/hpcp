@@ -3691,34 +3691,16 @@ def sync_directories_serial_batch(jobs,exclude=None):
 	return symLinks
 
 #%% ---- Compare Files ----
-def _compare_file_lists(file_list, file_list2,diff_file_list=None,tar_diff_file_list = False):
+def _compare_file_lists(file_list, file_list2, diff_file_list=None, tar_diff_file_list = False):
+	"""Compare two -fl style entry sets (src, dest) and report the rows that turn dest into src."""
+	new_entries = _parse_file_list_lines(file_list)
+	base_entries = _parse_file_list_lines(file_list2, live_keys=new_entries)
 	print('-'*80)
-	print(f"Number of files in src: {len(file_list)}")
-	print(f"Number of files in dest: {len(file_list2)}")
-	# Now we print out a detailed comparison
-	print('-'*80)
-	inSrcNotInDest = file_list - file_list2
-	inDestNotInSrc = file_list2 - file_list
-	print("Files in src but not in dest:")
-	for file in inSrcNotInDest:
-		print(file)
-	print('-'*80)
-	print("Files in dest but not in src:")
-	for file in inDestNotInSrc:
-		print(file)
-	print('-'*80)
-	print(f"Files in src but not in dest count: {len(inSrcNotInDest)}")
-	print(f"Files in dest but not in src count: {len(inDestNotInSrc)}")
-	if diff_file_list:
-		with open(diff_file_list,'w') as f:
-			entries = inSrcNotInDest if tar_diff_file_list else inDestNotInSrc
-			for file in entries:
-				f.write((file.rpartition(':')[0] if ':' in file else file)+'\n')
-			if inSrcNotInDest and not tar_diff_file_list:
-				#f.write('-\0'+'\n-\0'.join(inSrcNotInDest.rpartition(':')[0] if ':' in inSrcNotInDest else inSrcNotInDest)+ '\n') 
-				for file in inSrcNotInDest:
-					f.write('-\0'+(file.rpartition(':')[0] if ':' in file else file)+'\n')
-		print(f"Diff file list written to {diff_file_list}")
+	print(f"Number of files in src: {len(new_entries)}")
+	print(f"Number of files in dest: {len(base_entries)}")
+	rows = _rows_from_list_entries(new_entries, base_entries)
+	report_changes(rows, diff_file_list, tar_diff_file_list)
+	return rows
 
 # Preserve the public name while avoiding the boolean option's name in store_file_list.
 compare_file_list = _compare_file_lists
@@ -4133,6 +4115,99 @@ def compute_changes(new_map, base_map, full_hash=False, max_workers=multiprocess
 			rows.append(ChangeRow('M', key, old_state, new_state))
 	return sort_change_rows(rows)
 
+def report_changes(rows, diff_file_list=None, tar_diff_file_list=False):
+	"""Print the A / M / D lists and counts; optionally write diff_file_list.
+
+	The file is changes.tsv format, or with tar_diff_file_list a plain newline list of
+	added / modified paths for `tar -T` (the root './' is left out).
+	"""
+	labels = (('A', 'Added (in src, not in dest)'), ('M', 'Modified'), ('D', 'Deleted (in dest, not in src)'))
+	print('-'*80)
+	for op, label in labels:
+		print(f"{label}:")
+		for row in rows:
+			if row.op == op:
+				print(row.path)
+		print('-'*80)
+	for op, label in labels:
+		print(f"{label} count: {sum(1 for row in rows if row.op == op)}")
+	if diff_file_list:
+		if tar_diff_file_list:
+			with open(diff_file_list, 'w', encoding='utf-8', errors='surrogateescape', newline='\n') as f:
+				for row in rows:
+					if row.op in ('A', 'M') and row.path != './':
+						f.write(row.path + '\n')
+		else:
+			write_changes(diff_file_list, rows)
+		print(f"Diff file list written to {diff_file_list}")
+
+def _hash_hex_re():
+	return re.compile(r'[0-9a-f]{16}' if xxhash_available else r'[0-9a-f]{128}')
+
+def _parse_file_list_lines(lines, live_keys=()):
+	"""Parse -fl style lines into {key: value}.
+
+	value is the hash for files, the link target for symlinks, None when the list holds
+	neither. A line ending in '/' is a directory. A line ending in ':<digest>' is a file.
+	In a hashed list (any line has a digest) the remaining lines are symlinks 'path:target':
+	the longest live key followed by ':' is the path, else the text before the first ':'.
+	"""
+	hex_re = _hash_hex_re()
+	lines = [line for line in lines if line]
+	hashed = any(':' in line and not line.endswith('/') and hex_re.fullmatch(line.rpartition(':')[2]) for line in lines)
+	live_keys = set(live_keys)
+	entries = {}
+	for line in lines:
+		if line.endswith('/'):
+			entries[line] = None
+			continue
+		path, sep, tail = line.rpartition(':')
+		if sep and hex_re.fullmatch(tail):
+			entries[path] = tail
+			continue
+		if hashed and ':' in line:
+			key = None
+			for index, char in enumerate(line):
+				if char == ':' and line[:index] in live_keys:
+					key = line[:index]
+			if key is None:
+				key = line.partition(':')[0]
+			entries[key] = line[len(key) + 1:]
+			continue
+		entries[line] = None
+	return entries
+
+def _value_from_state(state):
+	"""What a -fl list records for an entry: file hash, link target, or None."""
+	info = decode_state(state)
+	if info is None or info['type'] in ('d', '?'):
+		return None
+	if info['type'] == 'l':
+		return info['target']
+	return None if info['hash'] == '-' else info['hash']
+
+def _rows_from_list_entries(new_entries, base_entries, new_states=None):
+	"""Rows from -fl style entries; base states are unknown ('?')."""
+	new_states = new_states or {}
+	rows = []
+	for key in set(new_entries) | set(base_entries):
+		if key not in base_entries:
+			rows.append(ChangeRow('A', key, '-', new_states.get(key, '?')))
+		elif key not in new_entries:
+			rows.append(ChangeRow('D', key, '?', '-'))
+		else:
+			new_value, base_value = new_entries[key], base_entries[key]
+			if new_value is not None and base_value is not None and new_value != base_value:
+				rows.append(ChangeRow('M', key, '?', new_states.get(key, '?')))
+	return sort_change_rows(rows)
+
+def _trim_prefix(path):
+	"""Key prefix matching trim_paths(): a path without a trailing separator contributes its folder name."""
+	if path.endswith(os.sep):
+		return ''
+	name = os.path.basename(os.path.normpath(path))
+	return '' if name in ('', '.') else name + '/'
+
 #%% ---- Remove Extra ----
 def remove_extra_dirs(src_paths, dests,exclude=None):
 	"""
@@ -4407,12 +4482,6 @@ def store_file_list(file_list, src_paths: list, single_thread=False, max_workers
 		else:
 			print("Currently only supports removing extra files for a single src_path when using file_list")
 		raise RuntimeError("Completed removing extra files, exiting")
-	fileList = set()
-	for src in src_paths:
-		files, links, _,folders  = get_file_list(src, max_workers=max_workers, exclude=exclude,append_hash=append_hash,full_hash=full_hash,parallel_file_listing=parallel_file_listing)
-		fileList.update(trim_paths(files, src))
-		fileList.update(trim_paths(links, src))
-		fileList.update([folder_path + os.path.sep for folder_path in trim_paths(folders, src)])
 	if compare_file_list or diff_file_list:
 		# This means we have a file_list and a src_path so we compare them
 		print(f"Comparing file list from {src_paths} with {file_list}")
@@ -4420,9 +4489,24 @@ def store_file_list(file_list, src_paths: list, single_thread=False, max_workers
 			if not src_str:
 				src_str = '-'.join([os.path.basename(os.path.realpath(src)) for src in src_paths])
 			diff_file_list = f'DIFF_{src_str}_TO_{os.path.basename(os.path.realpath(file_list))}_{int(time.time())}_{"tar_" if tar_diff_file_list else ""}file_list.txt'
-		fileList2 = load_file_list(file_list)
-		_compare_file_lists(fileList, fileList2,diff_file_list,tar_diff_file_list = tar_diff_file_list)
+		workers = 1 if single_thread else max_workers
+		new_map = {}
+		for src in src_paths:
+			new_map.update(build_entry_map(src, _trim_prefix(src), exclude=exclude, max_workers=workers, parallel_file_listing=parallel_file_listing))
+		states = _states_for_paths(set(new_map.values()), full_hash=full_hash, max_workers=workers)
+		new_states = {key: states[path] for key, path in new_map.items()}
+		new_entries = {key: _value_from_state(state) for key, state in new_states.items()}
+		base_entries = _parse_file_list_lines(load_file_list(file_list), live_keys=new_entries)
+		print(f"Number of entries in src: {len(new_entries)}")
+		print(f"Number of entries in {file_list}: {len(base_entries)}")
+		report_changes(_rows_from_list_entries(new_entries, base_entries, new_states), diff_file_list, tar_diff_file_list)
 	else:
+		fileList = set()
+		for src in src_paths:
+			files, links, _,folders  = get_file_list(src, max_workers=max_workers, exclude=exclude,append_hash=append_hash,full_hash=full_hash,parallel_file_listing=parallel_file_listing)
+			fileList.update(trim_paths(files, src))
+			fileList.update(trim_paths(links, src))
+			fileList.update([folder_path + os.path.sep for folder_path in trim_paths(folders, src)])
 		print(f"Number of files: {len(fileList)}")
 		print(f"Writing file list to {fileList}")
 		# sort the file list
@@ -4616,38 +4700,30 @@ def get_dests(dest_paths,dest_image,mount_points: list,loop_devices: list,src_pa
 	
 def process_compare_file_list(src_paths: list, dests, max_workers = multiprocessing.cpu_count(),
 							  parallel_file_listing = False,exclude=None,dest_image = None,diff_file_list = None,tar_diff_file_list = False,
-							  append_hash = True,full_hash = False):
-	# while os.path.basename(dest) == '':
-	#     dest = os.path.dirname(dest)
-	newDests = []
-	for dest in dests:
-		if dest and os.path.exists(dest) and os.path.isdir(dest):
-			newDests.append(dest)
-	dests = newDests
+							  append_hash = True,full_hash = False,src_image_roots = ()):
+	# append_hash is kept for signature compatibility: live comparisons always use full entry states.
+	dests = [dest for dest in dests if dest and os.path.exists(dest) and os.path.isdir(dest)]
 	if not dests:
 		raise RuntimeError(f"No destination paths in cpl: Destination image {dest_image} does not exist or dests {dests} is empty when comparing file lists, exiting")
 	print(f"Comparing file list from {src_paths} with {dests}")
-	file_list = set()
-	for src in src_paths:
-		print('-'*80)
-		files,links,_,folders  = get_file_list(src, max_workers=max_workers,exclude=exclude,append_hash=append_hash,full_hash=full_hash,parallel_file_listing=parallel_file_listing)
-		if dest_image:
-			# we use full path for src when comparing file list with dest image
-			file_list.update(trim_paths([os.path.abspath(file) for file in files],'/'))
-			file_list.update(trim_paths([os.path.abspath(link) for link in links],'/'))
-			file_list.update([folder_path + os.path.sep for folder_path in trim_paths([os.path.abspath(folder) for folder in folders],'/')])
-		else:
-			file_list.update(trim_paths(files,src))
-			file_list.update(trim_paths(links,src))
-			file_list.update([folder_path + os.path.sep for folder_path in trim_paths(folders, src)])
-	file_list2 = set()
+	new_map, base_map = {}, {}
+	if dest_image:
+		for src in src_paths:
+			if src in src_image_roots:
+				new_map.update(build_entry_map(src, '', exclude=exclude, max_workers=max_workers, parallel_file_listing=parallel_file_listing))
+				base_map.update(build_entry_map(dests[0], '', exclude=exclude, logical_root=os.path.abspath(src), max_workers=max_workers, parallel_file_listing=parallel_file_listing))
+			else:
+				src_new, src_base = build_store_maps(src, dests[0], exclude=exclude, max_workers=max_workers, parallel_file_listing=parallel_file_listing)
+				new_map.update(src_new)
+				base_map.update(src_base)
+	else:
+		for src in src_paths:
+			new_map.update(build_entry_map(src, _trim_prefix(src), exclude=exclude, max_workers=max_workers, parallel_file_listing=parallel_file_listing))
+		for dest in dests:
+			base_map.update(build_entry_map(dest, _trim_prefix(dest), exclude=exclude, max_workers=max_workers, parallel_file_listing=parallel_file_listing))
 	print('-'*80)
-	for dest in dests:
-		files,links,_,folders  = get_file_list(dest, max_workers=max_workers,exclude=exclude,append_hash=append_hash,full_hash=full_hash,parallel_file_listing=parallel_file_listing)
-		file_list2.update(trim_paths(files,dest))
-		file_list2.update(trim_paths(links,dest))
-		file_list2.update([folder_path + os.path.sep for folder_path in trim_paths(folders, dest)])
-	compare_file_list(file_list, file_list2, diff_file_list,tar_diff_file_list = tar_diff_file_list)
+	rows = compute_changes(new_map, base_map, full_hash=full_hash, max_workers=max_workers)
+	report_changes(rows, diff_file_list, tar_diff_file_list)
 
 def create_image(dest_image,target_mount_point,loop_devices: list,src_paths: list,mount_points, max_workers = multiprocessing.cpu_count(),
 				parallel_file_listing = False,exclude=None,dest_image_size=0):
@@ -5097,6 +5173,7 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = multipr
 	REMOVE_FILES_WHILE_LISTING = not do_not_remove_files_while_listing
 	print('-'*80)
 	src_paths = []
+	src_image_roots = []
 	mount_points = []
 	loop_devices = []
 	delayed_commands = []
@@ -5235,6 +5312,7 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = multipr
 				time.sleep(5)
 			src_images = expand_paths(src_image)
 			src_str = mount_src_image(src_images,src_paths,mount_points,loop_devices)
+			src_image_roots = list(src_paths)
 
 		if source_file_list:
 			src_paths.extend(load_file_list(source_file_list))
@@ -5268,7 +5346,7 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = multipr
 					src_str = '-'.join([os.path.basename(os.path.realpath(src)) for src in src_paths])
 				diff_file_list = f'DIFF_{src_str}_TO_{dest_folder_name}_{int(time.time())}_{"tar_" if tar_diff_file_list else ""}file_list.txt'
 			process_compare_file_list(src_paths, dests, max_workers=max_workers,parallel_file_listing=parallel_file_listing,
-							exclude=exclude,dest_image=dest_image,diff_file_list=diff_file_list,tar_diff_file_list=tar_diff_file_list,append_hash=append_hash_to_file_list,full_hash=full_hash)
+							exclude=exclude,dest_image=dest_image,diff_file_list=diff_file_list,tar_diff_file_list=tar_diff_file_list,append_hash=append_hash_to_file_list,full_hash=full_hash,src_image_roots=src_image_roots)
 			raise RuntimeError("Exiting after comparing file list.")
 		
 		dests_to_remove = []
