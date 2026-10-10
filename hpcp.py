@@ -4009,6 +4009,127 @@ def read_manifest(source):
 		raise RuntimeError(f'Patch format error: {source} uses format version {format_version}, newer than supported {DIFF_FORMAT_VERSION}')
 	return meta
 
+def _logically_excluded(rel, logical_root, exclude):
+	"""True when rel (relative to a listed root) or one of its ancestors matches exclude
+	once placed under logical_root."""
+	if rel in ('', '.'):
+		return False
+	parts = rel.split(os.sep)
+	for depth in range(1, len(parts) + 1):
+		if is_excluded(os.path.join(logical_root, *parts[:depth]), exclude):
+			return True
+	return False
+
+def build_entry_map(root, prefix='', parents=None, exclude=None, logical_root=None,
+		max_workers=multiprocessing.cpu_count(), parallel_file_listing=False):
+	"""Map patch keys to absolute paths for one side of a diff.
+
+	Keys are prefix + the path relative to root ('/'-separated, directories end with '/');
+	root itself is keyed prefix, or './' when prefix is empty. parents adds extra
+	{key: directory} entries (store-layout ancestors) when they exist. With logical_root,
+	exclude is matched against logical_root + relative path instead of the physical path,
+	so a base tree honours patterns written for the new tree. A missing root yields only
+	the existing parents.
+	"""
+	entries = {}
+	for key, path in (parents or {}).items():
+		if os.path.isdir(path) and not os.path.islink(path):
+			entries[key] = path
+	root = os.path.abspath(root)
+	if not os.path.isdir(root) or os.path.islink(root):
+		return entries
+	post_filter = bool(exclude) and logical_root is not None
+	files, links, _, folders = get_file_list(root, exclude=None if post_filter else exclude, max_workers=max_workers,
+		drop_cache=True, parallel_file_listing=parallel_file_listing)
+	entries[prefix or './'] = root
+	for paths, is_dir in ((files, False), (links, False), (folders, True)):
+		for path in paths:
+			rel = os.path.relpath(path, root)
+			if rel == '.':
+				continue
+			if post_filter and _logically_excluded(rel, logical_root, exclude):
+				continue
+			entries[prefix + rel.replace(os.sep, '/') + ('/' if is_dir else '')] = path
+	return entries
+
+def _store_layout_parents(new_dir, store_root):
+	"""Ancestors of new_dir except '/', as ({key: live directory}, {key: directory inside the store})."""
+	new_parents, base_parents = {}, {}
+	parent = os.path.dirname(os.path.abspath(new_dir))
+	while parent != os.path.dirname(parent):
+		rel = os.path.relpath(parent, os.sep)
+		key = rel.replace(os.sep, '/') + '/'
+		new_parents[key] = parent
+		base_parents[key] = os.path.join(store_root, rel)
+		parent = os.path.dirname(parent)
+	return new_parents, base_parents
+
+def build_store_maps(new_dir, store_root, exclude=None, max_workers=multiprocessing.cpu_count(), parallel_file_listing=False):
+	"""Entry maps for a directory against a -di image store mounted at store_root ('store' layout).
+
+	-di keeps files at their absolute source path, so keys are relative to '/' and the base
+	side is limited to new_dir's own subtree (plus its parent directories) inside the store.
+	"""
+	new_dir = os.path.abspath(new_dir)
+	rel = os.path.relpath(new_dir, os.sep)
+	prefix = '' if rel == '.' else rel.replace(os.sep, '/') + '/'
+	new_parents, base_parents = _store_layout_parents(new_dir, store_root)
+	new_map = build_entry_map(new_dir, prefix, new_parents, exclude, None, max_workers, parallel_file_listing)
+	base_root = store_root if rel == '.' else os.path.join(store_root, rel)
+	base_map = build_entry_map(base_root, prefix, base_parents, exclude, new_dir, max_workers, parallel_file_listing)
+	return new_map, base_map
+
+def build_root_maps(new_root, base_root, exclude=None, max_workers=multiprocessing.cpu_count(), parallel_file_listing=False):
+	"""Entry maps for two trees compared root to root ('root' layout)."""
+	new_map = build_entry_map(new_root, '', None, exclude, None, max_workers, parallel_file_listing)
+	base_map = build_entry_map(base_root, '', None, exclude, os.path.abspath(new_root), max_workers, parallel_file_listing)
+	return new_map, base_map
+
+def _states_chunk(paths, full_hash, read_xattrs):
+	"""Worker body for _states_for_paths: states plus the errors recorded while computing them."""
+	error_start = len(ERRORS)
+	states = {path: get_entry_state(path, full_hash, read_xattrs) for path in paths}
+	errors = ERRORS[error_start:]
+	del ERRORS[error_start:]
+	return states, errors
+
+def _states_for_paths(paths, full_hash=False, read_xattrs=True, max_workers=1):
+	"""{path: state} for every path; parallel chunks on a ProcessPoolExecutor for large sets."""
+	paths = list(paths)
+	if max_workers <= 1 or len(paths) < 256:
+		return {path: get_entry_state(path, full_hash, read_xattrs) for path in paths}
+	chunk_size = max(64, len(paths) // (max_workers * 4) + 1)
+	states = {}
+	with ProcessPoolExecutor(max_workers=max_workers) as executor:
+		futures = [executor.submit(_states_chunk, paths[index:index + chunk_size], full_hash, read_xattrs)
+			for index in range(0, len(paths), chunk_size)]
+		for future in concurrent.futures.as_completed(futures):
+			chunk_states, chunk_errors = future.result()
+			states.update(chunk_states)
+			ERRORS.extend(chunk_errors)
+	return states
+
+def compute_changes(new_map, base_map, full_hash=False, max_workers=multiprocessing.cpu_count(), read_xattrs=True):
+	"""Rows that turn base_map's tree into new_map's tree, sorted D / A / M."""
+	states = _states_for_paths(set(new_map.values()) | set(base_map.values()), full_hash=full_hash,
+		read_xattrs=read_xattrs, max_workers=max_workers)
+	rows = []
+	for key in set(new_map) | set(base_map):
+		new_state = states[new_map[key]] if key in new_map else '-'
+		old_state = states[base_map[key]] if key in base_map else '-'
+		if new_state == '-' and old_state == '-':
+			continue
+		if old_state == '-':
+			rows.append(ChangeRow('A', key, '-', new_state))
+		elif new_state == '-':
+			rows.append(ChangeRow('D', key, old_state, '-'))
+		elif old_state[0] != new_state[0]:
+			rows.append(ChangeRow('D', key, old_state, '-'))
+			rows.append(ChangeRow('A', key, '-', new_state))
+		elif not states_equal(old_state, new_state):
+			rows.append(ChangeRow('M', key, old_state, new_state))
+	return sort_change_rows(rows)
+
 #%% ---- Remove Extra ----
 def remove_extra_dirs(src_paths, dests,exclude=None):
 	"""

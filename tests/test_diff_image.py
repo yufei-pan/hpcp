@@ -220,3 +220,167 @@ def test_read_manifest_rejects_unsafe_sections_and_duplicate_keys(tmp_path, hpcp
 			hpcp_mod.read_manifest(str(path))
 	path.write_text(head + 'section\troot\t.\tchanges.tsv\n')
 	assert hpcp_mod.read_manifest(str(path))['sections'] == [('root', '.', 'changes.tsv')]
+
+
+T0 = 1700000000  # whole even second: predictable 4 s mtime tolerance
+
+
+def _write(path, data=b'x', mtime=T0):
+	path = str(path)
+	os.makedirs(os.path.dirname(path), exist_ok=True)
+	with open(path, 'wb') as f:
+		f.write(data if isinstance(data, bytes) else data.encode('utf-8', 'surrogateescape'))
+	os.utime(path, (mtime, mtime))
+	return path
+
+
+@pytest.fixture
+def trees(tmp_path, hpcp_mod, reset_hpcp_globals):
+	hpcp_mod.HASH_SIZE = 65536
+	new = tmp_path / 'new'
+	base = tmp_path / 'base'
+	new.mkdir()
+	base.mkdir()
+	return new, base
+
+
+def _changes(hpcp_mod, new, base, **kwargs):
+	new_map, base_map = hpcp_mod.build_root_maps(str(new), str(base), max_workers=1, **kwargs)
+	return hpcp_mod.compute_changes(new_map, base_map, max_workers=1)
+
+
+def _ops(rows):
+	return {(row.op, row.path) for row in rows}
+
+
+def test_build_entry_map_keys(tmp_path, hpcp_mod, reset_hpcp_globals):
+	root = tmp_path / 'r'
+	_write(root / 'a.txt', 'a')
+	_write(root / 'sub' / 'b.txt', 'b')
+	os.symlink('a.txt', root / 'ln')
+	assert set(hpcp_mod.build_entry_map(str(root), max_workers=1)) == {'./', 'a.txt', 'sub/', 'sub/b.txt', 'ln'}
+	prefixed = hpcp_mod.build_entry_map(str(root), prefix='data/r/', max_workers=1)
+	assert set(prefixed) == {'data/r/', 'data/r/a.txt', 'data/r/sub/', 'data/r/sub/b.txt', 'data/r/ln'}
+	assert prefixed['data/r/sub/b.txt'] == str(root / 'sub' / 'b.txt')
+
+
+def test_build_store_maps_parents_and_missing_subtree(tmp_path, hpcp_mod, reset_hpcp_globals):
+	new = tmp_path / 'live' / 'proj'
+	_write(new / 'a.txt', 'a')
+	store = tmp_path / 'store'
+	store.mkdir()
+	new_map, base_map = hpcp_mod.build_store_maps(str(new), str(store), max_workers=1)
+	prefix = os.path.relpath(str(new), '/').replace(os.sep, '/') + '/'
+	assert new_map[prefix] == str(new)
+	assert new_map[prefix + 'a.txt'] == str(new / 'a.txt')
+	expected_parents = set()
+	parent = os.path.dirname(str(new))
+	while parent != '/':
+		expected_parents.add(os.path.relpath(parent, '/') + '/')
+		parent = os.path.dirname(parent)
+	assert {key for key in new_map if not key.startswith(prefix)} == expected_parents
+	assert base_map == {}  # the empty store has neither the subtree nor its parents
+
+
+def test_compute_changes_add_modify_delete(trees, hpcp_mod):
+	new, base = trees
+	_write(new / 'same.txt', 'same')
+	_write(base / 'same.txt', 'same')
+	_write(new / 'mod.txt', 'new content')
+	_write(base / 'mod.txt', 'old')
+	_write(new / 'add.txt', 'added')
+	_write(base / 'gone.txt', 'bye')
+	rows = _changes(hpcp_mod, new, base)
+	assert _ops(rows) == {('A', 'add.txt'), ('M', 'mod.txt'), ('D', 'gone.txt')}
+	modified = [row for row in rows if row.op == 'M'][0]
+	assert hpcp_mod.decode_state(modified.old)['size'] == 3
+	assert hpcp_mod.decode_state(modified.new)['size'] == 11
+	assert [row.op for row in rows] == ['D', 'A', 'M']
+
+
+def test_compute_changes_metadata_only(trees, hpcp_mod):
+	new, base = trees
+	_write(new / 'mtime.txt', 'x', mtime=T0 + 100)
+	_write(base / 'mtime.txt', 'x')
+	_write(new / 'mode.sh', 'x')
+	_write(base / 'mode.sh', 'x')
+	os.chmod(new / 'mode.sh', 0o755)
+	os.chmod(base / 'mode.sh', 0o644)
+	(new / 'sub').mkdir()
+	(base / 'sub').mkdir()
+	os.chmod(new / 'sub', 0o700)
+	os.chmod(base / 'sub', 0o755)
+	# same size, same mtime, different bytes inside the hash window
+	_write(new / 'same_size.bin', b'AAAA')
+	_write(base / 'same_size.bin', b'BBBB')
+	rows = _changes(hpcp_mod, new, base)
+	assert _ops(rows) == {('M', 'mtime.txt'), ('M', 'mode.sh'), ('M', 'sub/'), ('M', 'same_size.bin')}
+
+
+def test_compute_changes_xattr_only(trees, hpcp_mod):
+	new, base = trees
+	_write(new / 'x.txt', 'x')
+	_write(base / 'x.txt', 'x')
+	_set_xattr_or_skip(str(new / 'x.txt'))
+	assert _ops(_changes(hpcp_mod, new, base)) == {('M', 'x.txt')}
+
+
+def test_compute_changes_type_changes(trees, hpcp_mod):
+	"""Review Focus 5: file <-> dir <-> symlink on one name."""
+	new, base = trees
+	_write(base / 'f2d', 'file')
+	_write(new / 'f2d' / 'child.txt', 'c')
+	_write(base / 'f2l', 'file')
+	os.symlink('target', new / 'f2l')
+	_write(base / 'd2l' / 'inner.txt', 'i')
+	os.symlink('elsewhere', new / 'd2l')
+	os.symlink('old', base / 'relink')
+	os.symlink('new', new / 'relink')
+	rows = _changes(hpcp_mod, new, base)
+	assert _ops(rows) == {
+		('D', 'f2d'), ('A', 'f2d/'), ('A', 'f2d/child.txt'),
+		('D', 'f2l'), ('A', 'f2l'),
+		('D', 'd2l/'), ('D', 'd2l/inner.txt'), ('A', 'd2l'),
+		('M', 'relink'),
+	}
+	relink = [row for row in rows if row.path == 'relink'][0]
+	assert (relink.old, relink.new) == ('l:old', 'l:new')
+
+
+def test_compute_changes_honours_exclude_on_both_sides(trees, hpcp_mod):
+	"""Review Focus 2: an absolute pattern written for the new tree also hides the base subtree."""
+	new, base = trees
+	_write(new / 'keep.txt', 'k')
+	_write(base / 'keep.txt', 'k')
+	_write(new / 'a.log', 'new log')
+	_write(base / 'b.log', 'old log')
+	_write(base / 'cache' / 'blob', 'cached')
+	exclude = hpcp_mod.format_exclude(['*.log', str(new / 'cache')])
+	assert _changes(hpcp_mod, new, base, exclude=exclude) == []
+
+
+def test_store_layout_ignores_other_trees(tmp_path, hpcp_mod, reset_hpcp_globals):
+	hpcp_mod.HASH_SIZE = 65536
+	new = tmp_path / 'live' / 'a'
+	other = tmp_path / 'live' / 'b'
+	_write(new / 'f.txt', 'new')
+	store = tmp_path / 'store'
+	rel_new = os.path.relpath(str(new), '/')
+	rel_other = os.path.relpath(str(other), '/')
+	_write(store / rel_new / 'f.txt', 'old')
+	_write(store / rel_other / 'g.txt', 'other tree')
+	new_map, base_map = hpcp_mod.build_store_maps(str(new), str(store), max_workers=1)
+	rows = hpcp_mod.compute_changes(new_map, base_map, max_workers=1)
+	assert ('M', rel_new.replace(os.sep, '/') + '/f.txt') in _ops(rows)
+	assert not any(row.path.startswith(rel_other.replace(os.sep, '/')) for row in rows)
+
+
+def test_compute_changes_parallel_matches_serial(trees, hpcp_mod):
+	new, base = trees
+	for i in range(300):
+		_write(new / f'f{i}.txt', f'new {i}')
+		_write(base / f'f{i}.txt', f'old {i}' if i % 3 == 0 else f'new {i}')
+	new_map, base_map = hpcp_mod.build_root_maps(str(new), str(base), max_workers=1)
+	serial = hpcp_mod.compute_changes(new_map, base_map, max_workers=1)
+	parallel = hpcp_mod.compute_changes(new_map, base_map, max_workers=4)
+	assert serial == parallel and len(serial) == 100
