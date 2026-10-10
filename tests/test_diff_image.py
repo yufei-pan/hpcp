@@ -136,3 +136,68 @@ def test_xattr_digest_reflects_xattrs(tmp_path, hpcp_mod, reset_hpcp_globals):
 	state = hpcp_mod.decode_state(hpcp_mod.get_entry_state(str(tagged)))
 	assert state['xattr'] == hpcp_mod._xattr_digest(str(tagged))
 	assert hpcp_mod.decode_state(hpcp_mod.get_entry_state(str(tagged), read_xattrs=False))['xattr'] == '-'
+
+
+def test_changes_round_trip_and_order(tmp_path, hpcp_mod):
+	R = hpcp_mod.ChangeRow
+	rows = [
+		R('M', 'b10.txt', 'f:1:1:100644:0:0:aa:-', 'f:2:1:100644:0:0:bb:-'),
+		R('A', 'dir/', '-', 'd:40755:0:0:-'),
+		R('D', 'odd\tname\nhere', 'f:1:1:100644:0:0:aa:-', '-'),
+		R('M', 'b9.txt', 'f:1:1:100644:0:0:aa:-', 'f:2:1:100644:0:0:bb:-'),
+		R('A', 'link', '-', 'l:tar\\tget'),
+		R('A', os.fsdecode(b'bad\xffbyte'), '-', 'f:1:1:100644:0:0:aa:-'),
+		R('M', './', 'd:40755:0:0:-', 'd:40700:0:0:-'),
+	]
+	out = tmp_path / 'changes.tsv'
+	hpcp_mod.write_changes(str(out), rows)
+	lines = out.read_bytes().split(b'\n')
+	assert lines[0] == b'#hpcp-changes\t1'
+	assert lines[1] == b'#op\tpath\told\tnew'
+	got = hpcp_mod.read_changes(str(out))
+	assert [r.op for r in got] == ['D', 'A', 'A', 'A', 'M', 'M', 'M']
+	assert [r.path for r in got if r.op == 'M'][-2:] == ['b9.txt', 'b10.txt']
+	assert set(got) == set(rows)
+
+
+def test_read_changes_rejects_bad_input(tmp_path, hpcp_mod):
+	path = tmp_path / 'c.tsv'
+
+	def read(text):
+		path.write_text(text)
+		return hpcp_mod.read_changes(str(path))
+
+	with pytest.raises(RuntimeError, match='Patch format error'):
+		read('not a change list\n')
+	with pytest.raises(RuntimeError, match='newer'):
+		read('#hpcp-changes\t2\n')
+	with pytest.raises(RuntimeError, match='Patch format error'):
+		read('#hpcp-changes\t1\nX\ta\t-\t-\n')
+	with pytest.raises(RuntimeError, match='Patch format error'):
+		read('#hpcp-changes\t1\nA\ta\t-\tz:1\n')
+	for unsafe in ['../x', '/etc/passwd', 'a//b', 'a/./b', 'a/../b', '']:
+		with pytest.raises(RuntimeError, match='Patch format error'):
+			read(f'#hpcp-changes\t1\nA\t{unsafe}\t-\tl:x\n')
+
+
+def test_manifest_round_trip(tmp_path, hpcp_mod):
+	meta = {'format': 'hpcp-diff', 'format_version': 1, 'patch_id': 'abc', 'volume': '1/2',
+		'new': 'name\twith tab', 'sections': [('root', '.', 'changes.tsv')]}
+	path = tmp_path / 'manifest'
+	hpcp_mod.write_manifest(str(path), meta)
+	got = hpcp_mod.read_manifest(str(path))
+	assert got['format'] == 'hpcp-diff' and got['format_version'] == '1'
+	assert got['new'] == 'name\twith tab' and got['volume'] == '1/2'
+	assert got['sections'] == [('root', '.', 'changes.tsv')]
+
+
+def test_read_manifest_rejects_foreign_or_newer(tmp_path, hpcp_mod):
+	path = tmp_path / 'manifest'
+	path.write_text('format\tsomething-else\nformat_version\t1\n')
+	with pytest.raises(RuntimeError, match='Patch format error'):
+		hpcp_mod.read_manifest(str(path))
+	path.write_text('format\thpcp-diff\nformat_version\t2\n')
+	with pytest.raises(RuntimeError, match='newer'):
+		hpcp_mod.read_manifest(str(path))
+	path.write_text('format\thpcp-diff\nformat_version\t1\nunknown_key\tfine\n')
+	assert hpcp_mod.read_manifest(str(path))['unknown_key'] == 'fine'

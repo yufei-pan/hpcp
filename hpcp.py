@@ -2168,7 +2168,11 @@ Skipping...""")
 		create_sym_links(nestedSymLinks,exclude=exclude,no_link_tracking=no_link_tracking)
 
 #%% -- File list --
-def natural_sort(L): 
+def _natural_key(text):
+	"""Sort key splitting digit runs into ints. Odd positions of re.split are always ASCII digit runs."""
+	return [int(part) if index % 2 else part.lower() for index, part in enumerate(re.split('([0-9]+)', text))]
+
+def natural_sort(L):
 	"""
 	Sorts a list of strings naturally, considering both numeric and alphabetic characters.
 
@@ -2182,11 +2186,7 @@ def natural_sort(L):
 		>>> natural_sort(['file10.txt', 'file2.txt', 'file1.txt'])
 		['file1.txt', 'file2.txt', 'file10.txt']
 	"""
-	def convert(text):
-		return int(text) if text.isdigit() else text.lower() 
-	def alphanum_key(key):
-		return [convert(c) for c in re.split('([0-9]+)', key)] 
-	return sorted(L, key=alphanum_key)
+	return sorted(L, key=_natural_key)
 
 #%% -- Format --
 def format_bytes(size, use_1024_bytes=None, to_int=False, to_str=False,str_format='.2f'):
@@ -3901,6 +3901,96 @@ def _remove_stale_xattrs(src, dest):
 		except OSError as e:
 			if e.errno not in (errno.ENOTSUP, errno.EPERM, errno.ENODATA, errno.EACCES):
 				raise
+
+_OP_ORDER = {'D': 0, 'A': 1, 'M': 2}
+
+def sort_change_rows(rows):
+	"""Deterministic order: D, then A, then M; natural path order within each op."""
+	return sorted(rows, key=lambda row: (_OP_ORDER[row.op], _natural_key(row.path)))
+
+def _check_key(key):
+	"""Reject keys that could escape the patch root."""
+	if key == './':
+		return
+	if not key or key.startswith('/') or '\0' in key:
+		raise ValueError(f'unsafe path {key!r}')
+	if any(part in ('', '.', '..') for part in key.rstrip('/').split('/')):
+		raise ValueError(f'unsafe path {key!r}')
+
+def write_changes(target, rows):
+	"""Write rows to target in changes.tsv format (also the -dfl output format)."""
+	with open(target, 'w', encoding='utf-8', errors='surrogateescape', newline='\n') as f:
+		f.write(f'{CHANGES_HEADER}\t{CHANGES_VERSION}\n')
+		f.write('#op\tpath\told\tnew\n')
+		for row in sort_change_rows(rows):
+			f.write(f'{row.op}\t{_escape_field(row.path)}\t{row.old}\t{row.new}\n')
+
+def read_changes(source):
+	"""Read a changes.tsv file into ChangeRows. Raises RuntimeError('Patch format error: ...')."""
+	rows = []
+	with open(source, 'r', encoding='utf-8', errors='surrogateescape', newline='\n') as f:
+		header = f.readline().rstrip('\n').split('\t')
+		if len(header) != 2 or header[0] != CHANGES_HEADER:
+			raise RuntimeError(f'Patch format error: {source} is not an hpcp change list')
+		try:
+			change_version = int(header[1])
+		except ValueError:
+			raise RuntimeError(f'Patch format error: {source} has a bad change list version {header[1]!r}')
+		if change_version > CHANGES_VERSION:
+			raise RuntimeError(f'Patch format error: {source} has change list version {change_version}, newer than supported {CHANGES_VERSION}')
+		for line_number, line in enumerate(f, start=2):
+			line = line.rstrip('\n')
+			if not line or line.startswith('#'):
+				continue
+			fields = line.split('\t')
+			if len(fields) != 4 or fields[0] not in _OP_ORDER:
+				raise RuntimeError(f'Patch format error: {source} line {line_number} is malformed')
+			try:
+				path = _unescape_field(fields[1])
+				_check_key(path)
+				decode_state(fields[2])
+				decode_state(fields[3])
+			except ValueError as e:
+				raise RuntimeError(f'Patch format error: {source} line {line_number}: {e}')
+			rows.append(ChangeRow(fields[0], path, fields[2], fields[3]))
+	return rows
+
+def write_manifest(target, meta):
+	"""Write meta (key -> value, plus 'sections': [(name, payload_dir, changes_file)]) as key/value TSV."""
+	with open(target, 'w', encoding='utf-8', errors='surrogateescape', newline='\n') as f:
+		for key, value in meta.items():
+			if key != 'sections':
+				f.write(f'{key}\t{_escape_field(str(value))}\n')
+		for name, payload_dir, changes_file in meta.get('sections', []):
+			f.write(f'section\t{_escape_field(name)}\t{_escape_field(payload_dir)}\t{_escape_field(changes_file)}\n')
+
+def read_manifest(source):
+	"""Read a manifest. Values are strings; unknown keys are kept and ignored by callers."""
+	meta = {'sections': []}
+	with open(source, 'r', encoding='utf-8', errors='surrogateescape', newline='\n') as f:
+		for line in f:
+			line = line.rstrip('\n')
+			if not line or line.startswith('#'):
+				continue
+			try:
+				fields = [_unescape_field(field) for field in line.split('\t')]
+			except ValueError as e:
+				raise RuntimeError(f'Patch format error: {source}: {e}')
+			if fields[0] == 'section' and len(fields) == 4:
+				meta['sections'].append(tuple(fields[1:]))
+			elif fields[0] != 'section' and len(fields) == 2:
+				meta[fields[0]] = fields[1]
+			else:
+				raise RuntimeError(f'Patch format error: {source} has a malformed line {line!r}')
+	if meta.get('format') != 'hpcp-diff':
+		raise RuntimeError(f'Patch format error: {source} is not an hpcp-diff manifest')
+	try:
+		format_version = int(meta.get('format_version', ''))
+	except ValueError:
+		raise RuntimeError(f'Patch format error: {source} has a bad format_version')
+	if format_version > DIFF_FORMAT_VERSION:
+		raise RuntimeError(f'Patch format error: {source} uses format version {format_version}, newer than supported {DIFF_FORMAT_VERSION}')
+	return meta
 
 #%% ---- Remove Extra ----
 def remove_extra_dirs(src_paths, dests,exclude=None):
