@@ -527,3 +527,58 @@ def test_build_patch_tree_syncs_directory_mtimes(trees, hpcp_mod, tmp_path):
 	_patch_from(hpcp_mod, new, base, [vol])
 	assert os.stat(vol / 'deep' / 'er').st_mtime_ns == os.stat(new / 'deep' / 'er').st_mtime_ns
 	assert os.stat(vol / 'deep').st_mtime_ns == os.stat(new / 'deep').st_mtime_ns
+
+
+def _clone(source, target):
+	shutil.copytree(str(source), str(target), symlinks=True)
+
+
+def _actions(checks):
+	return {(check.row.op, check.row.path): check.action for check in checks}
+
+
+def test_check_patch_target_classifies_rows(trees, hpcp_mod, tmp_path):
+	new, base = trees
+	_write(new / 'mod.txt', 'new content')
+	_write(base / 'mod.txt', 'old')
+	_write(base / 'gone.txt', 'bye')
+	_write(new / 'add.txt', 'added')
+	_write(base / 'f2d', 'file')
+	_write(new / 'f2d' / 'child.txt', 'c')
+	rows = _changes(hpcp_mod, new, base)
+	target = tmp_path / 'target'
+	_clone(base, target)
+	assert set(_actions(hpcp_mod.check_patch_target(rows, str(target))).values()) == {'apply'}
+	_write(target / 'mod.txt', 'local edit')
+	_write(target / 'add.txt', 'someone else')
+	os.unlink(target / 'gone.txt')
+	actions = _actions(hpcp_mod.check_patch_target(rows, str(target)))
+	assert actions[('M', 'mod.txt')] == 'conflict'
+	assert actions[('A', 'add.txt')] == 'conflict'
+	assert actions[('D', 'gone.txt')] == 'skip'
+	assert actions[('D', 'f2d')] == 'apply'
+	assert actions[('A', 'f2d/')] == 'apply' and actions[('A', 'f2d/child.txt')] == 'apply'
+
+
+def test_check_patch_target_flags_unlisted_children(trees, hpcp_mod, tmp_path):
+	new, base = trees
+	_write(base / 'olddir' / 'a.txt', 'a')
+	rows = _changes(hpcp_mod, new, base)
+	target = tmp_path / 'target'
+	_clone(base, target)
+	_write(target / 'olddir' / 'local.txt', 'mine')
+	actions = _actions(hpcp_mod.check_patch_target(rows, str(target)))
+	assert actions[('D', 'olddir/')] == 'conflict'
+	assert actions[('D', 'olddir/a.txt')] == 'apply'
+
+
+def test_check_patch_target_skips_already_applied(trees, hpcp_mod, tmp_path):
+	new, base = trees
+	_write(base / 'f2d', 'file')
+	_write(new / 'f2d' / 'child.txt', 'c')
+	_write(new / 'mod.txt', 'new content')
+	_write(base / 'mod.txt', 'old')
+	rows = _changes(hpcp_mod, new, base)
+	target = tmp_path / 'target'
+	_clone(new, target)
+	assert set(_actions(hpcp_mod.check_patch_target(rows, str(target))).values()) == {'skip'}

@@ -4329,6 +4329,80 @@ def build_patch_tree(rows, new_base, volume_roots, meta, max_workers=1, verbose=
 		raise RuntimeError(f'Diff image error: payload incomplete for {len(missing)} file(s), e.g. {missing[0]}; patch metadata not written')
 	write_patch_metadata(volume_roots, rows, meta)
 
+PatchCheck = namedtuple('PatchCheck', 'row action found reason')
+
+def _under_removed(key, removed_names):
+	"""True when key or one of its ancestors is a name some D row will remove."""
+	parts = key.rstrip('/').split('/')
+	return any('/'.join(parts[:index]) in removed_names for index in range(1, len(parts) + 1))
+
+def _unlisted_children(key, path, deleted_keys):
+	"""Children of directory path whose keys are not in deleted_keys."""
+	prefix = '' if key == './' else key
+	try:
+		names = os.listdir(path)
+	except OSError:
+		return []
+	unlisted = []
+	for name in names:
+		child = os.path.join(path, name)
+		child_key = prefix + name + ('/' if os.path.isdir(child) and not os.path.islink(child) else '')
+		if child_key not in deleted_keys:
+			unlisted.append(child_key)
+	return unlisted
+
+def check_patch_target(rows, target_root, compare_hash=True, full_hash=False, max_workers=1):
+	"""Classify every row against target_root as 'apply', 'skip' or 'conflict'.
+
+	D: target == old -> apply; absent, or already the replacing A row's state -> skip.
+	A: absent -> apply; == new -> skip. M: == old -> apply; == new -> skip.
+	Anything else is a conflict, as is a D directory holding entries the patch does not delete.
+	A and M rows are judged as the target will be after the applicable D rows: a name a D
+	row removes (with or without the trailing '/'), and everything below it, counts as absent.
+	"""
+	paths = {row.path: _key_path(target_root, row.path) for row in rows}
+	states = _states_for_paths(set(paths.values()), full_hash=full_hash, max_workers=max_workers)
+	added_by_name = {row.path.rstrip('/'): row for row in rows if row.op == 'A'}
+	deleted_keys = {row.path for row in rows if row.op == 'D'}
+	checks = {}
+	removed_names = set()
+	for row in rows:
+		if row.op != 'D':
+			continue
+		found = states[paths[row.path]]
+		replacement = added_by_name.get(row.path.rstrip('/'))
+		if found == '-':
+			checks[row] = PatchCheck(row, 'skip', found, 'already absent')
+			continue
+		if replacement is not None and states_equal(found, replacement.new, compare_hash):
+			checks[row] = PatchCheck(row, 'skip', found, 'already replaced')
+			continue
+		removed_names.add(row.path.rstrip('/'))
+		if not states_equal(found, row.old, compare_hash):
+			checks[row] = PatchCheck(row, 'conflict', found, 'changed on target')
+		elif found.startswith('d:') and _unlisted_children(row.path, paths[row.path], deleted_keys):
+			checks[row] = PatchCheck(row, 'conflict', found, 'directory holds entries the patch does not delete')
+		else:
+			checks[row] = PatchCheck(row, 'apply', found, '')
+	for row in rows:
+		if row.op == 'D':
+			continue
+		found = '-' if _under_removed(row.path, removed_names) else states[paths[row.path]]
+		if row.op == 'A':
+			if found == '-':
+				checks[row] = PatchCheck(row, 'apply', found, '')
+			elif states_equal(found, row.new, compare_hash):
+				checks[row] = PatchCheck(row, 'skip', found, 'already in new state')
+			else:
+				checks[row] = PatchCheck(row, 'conflict', found, 'already exists on target')
+		elif states_equal(found, row.old, compare_hash):
+			checks[row] = PatchCheck(row, 'apply', found, '')
+		elif states_equal(found, row.new, compare_hash):
+			checks[row] = PatchCheck(row, 'skip', found, 'already in new state')
+		else:
+			checks[row] = PatchCheck(row, 'conflict', found, 'missing on target' if found == '-' else 'changed on target')
+	return [checks[row] for row in rows]
+
 #%% ---- Remove Extra ----
 def remove_extra_dirs(src_paths, dests,exclude=None):
 	"""
