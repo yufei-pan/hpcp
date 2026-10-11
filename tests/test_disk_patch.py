@@ -1204,6 +1204,28 @@ def test_raw_area_too_large_for_one_volume_suggests_a_dis_that_passes(hpcp_mod, 
 	assert '/dev/new2' in hashed
 
 
+def test_raw_areas_are_stored_before_section_payloads_largest_first(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	"""Section payloads fill the first volume first; a large raw area stored after them could fail to fit late."""
+	parts = lambda side: {1: _part(fs_type='vfat', device=f'/dev/{side}1'), 2: _part(fs_type='', size=1 << 20, device=f'/dev/{side}2'),
+		5: _part(fs_type='', size=4 << 20, device=f'/dev/{side}5')}
+	_fake_generation(hpcp_mod, monkeypatch, parts('new'), parts('old'))
+	calls = []
+	monkeypatch.setattr(hpcp_mod, '_mount_partition', lambda device, read_only, mount_points, entries: str(tmp_path / device[5:]) + os.sep)
+	monkeypatch.setattr(hpcp_mod, '_release_mount', lambda mount_point, mount_points: None)
+	monkeypatch.setattr(hpcp_mod, '_live_mount', lambda *args: (None, False))
+	monkeypatch.setattr(hpcp_mod, '_partition_changes', lambda *args, **kwargs: _one_row(hpcp_mod))
+	monkeypatch.setattr(hpcp_mod, '_claim_volume_names', lambda output, count: [output])
+	monkeypatch.setattr(hpcp_mod, 'create_image', lambda *args, **kwargs: [str(tmp_path / 'vol')])
+	monkeypatch.setattr(hpcp_mod, '_build_payload', lambda rows, new_root, roots, *args: calls.append(('payload', new_root)))
+	monkeypatch.setattr(hpcp_mod, '_store_raw', lambda roots, raw_file, device, size, new_sha: calls.append(('raw', raw_file)))
+	monkeypatch.setattr(hpcp_mod, 'write_disk_patch_metadata', lambda *args: calls.append(('metadata',)))
+	monkeypatch.setattr(tempfile, 'tempdir', str(tmp_path))
+	out = str(tmp_path / 'patch.img')
+	assert hpcp_mod.process_get_disk_diff_image(['/x/new'], ['/x/old'], out, [], [], max_workers=1) == out
+	assert calls == [('raw', 'raw/part5.img'), ('raw', 'raw/part2.img'), ('raw', 'raw/mbr-bootcode.bin'),
+		('payload', str(tmp_path / 'new1') + os.sep), ('metadata',)]
+
+
 def _make_patch(hpcp_mod, tmp_path, **newer):
 	old, new, out = tmp_path / 'old.img', tmp_path / 'new.img', str(tmp_path / 'patch.img')
 	_make_golden(old)

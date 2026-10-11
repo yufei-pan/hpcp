@@ -6177,13 +6177,15 @@ def process_get_disk_diff_image(src_paths, dest_paths, output, mount_points, loo
 	_claim_volume_names(output, count)
 	volume_roots = create_image(output, target_mount_point, loop_devices, [], mount_points, max_workers=max_workers,
 		dest_image_size=dest_image_size, init_size=init_size)
+	# Raw areas first, largest first: each must fit whole in one volume, and section payloads
+	# copied before them would fill the first volume.
+	for (name, device, size, old_sha, new_sha), entry in sorted(zip(raws, raw_entries), key=lambda pair: (-pair[0][2], pair[0][0])):
+		_store_raw(volume_roots, entry[1], device, size, new_sha)
 	for number, new_root, rows in sections:
 		section_roots = [os.path.join(volume_root, f'part{number}') for volume_root in volume_roots]
 		for root in section_roots:
 			os.makedirs(root, exist_ok=True)
 		_build_payload(rows, new_root, section_roots, max_workers, verbose, _payload_bytes(rows), full_hash)
-	for (name, device, size, old_sha, new_sha), entry in zip(raws, raw_entries):
-		_store_raw(volume_roots, entry[1], device, size, new_sha)
 	write_disk_patch_metadata(volume_roots, section_rows, disk_rows, meta)
 	extra = f" (+{len(volume_roots) - 1} more volume(s))" if len(volume_roots) > 1 else ''
 	print(f"Disk patch image written to {output}{extra}")
