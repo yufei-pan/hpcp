@@ -225,6 +225,10 @@ ERROR_TO_RETURNCODE_TABLE = {
 	'Patch conflict': 245,
 	'Patch verify error': 246,
 	'Entry state error': 247,
+	'Disk layout mismatch': 248,
+	'Raw area error': 249,
+	'Identity change error': 250,
+	'Disk in use': 251,
 	# FS param mirroring warnings: each of these reports a successful copy that
 	# degraded to mkfs defaults (a probe/build failure, or mkfs rejecting the
 	# mirrored parameters), not a failed one, so they must not inflate the
@@ -428,7 +432,7 @@ _binCalled = {'lsblk', 'losetup', 'sgdisk', 'blkid', 'umount', 'mount','dd','cp'
 			  'fsck.fat', 'fsck.exfat', 'dump.exfat', 'fsck.hfsplus',
 			  'fsck.hfs', 'fsck.jfs', 'fsck.reiserfs', 'fsck.ufs', 'fsck.minix',
 			  'tune2fs', 'dumpe2fs', 'xfs_admin', 'exfatlabel', 'udflabel', 'udfinfo', 'jfs_tune',
-			  'reiserfstune', 'debugreiserfs', 'swaplabel', 'udevadm'}
+			  'reiserfstune', 'debugreiserfs', 'swaplabel', 'udevadm', 'e2label', 'fatlabel', 'ntfslabel', 'btrfstune', 'f2fslabel'}
 [check_path(program) for program in _binCalled]
 
 def run_command_in_multicmd_with_path_check(command, timeout=...,max_threads=1,quiet=False,dry_run=False,strict=False):
@@ -1809,8 +1813,7 @@ def write_partition_info(image, partition_infos, partition_name):
 					# copy dirties the superblock, so e2fsck -f must run first.
 					# These two delayed commands are an ordered pair; clean_up
 					# runs remaining delayed commands serially.
-					delayed_commands.append(_FS_FIX_COMMANDS[fs_type] + [target_partition])
-					delayed_commands.append(['tune2fs', '-U', fs_uuid, target_partition])
+					delayed_commands.extend(_fs_identity_commands(fs_type, target_partition, uuid=fs_uuid))
 				_run_mkfs_with_fallback(command, param_args, target_partition, fs_type)
 			elif fs_type == 'btrfs':
 				command = ['mkfs.btrfs']
@@ -1826,7 +1829,7 @@ def write_partition_info(image, partition_infos, partition_name):
 					command.extend(['-L', fs_label])
 				if fs_uuid:
 					#command.extend(['-m', f'uuid={fs_uuid}'])
-					delayed_commands.append(['xfs_admin', '-U', fs_uuid, target_partition])
+					delayed_commands.extend(_fs_identity_commands(fs_type, target_partition, uuid=fs_uuid))
 				_run_mkfs_with_fallback(command, param_args, target_partition, fs_type)
 			elif fs_type == 'f2fs':
 				command = ['mkfs.f2fs', '-f']
@@ -1857,7 +1860,7 @@ def write_partition_info(image, partition_infos, partition_name):
 				_run_mkfs_with_fallback(command, param_args, target_partition, fs_type)
 				if fs_uuid:
 					#run_command_in_multicmd_with_path_check(["exfatlabel", '-i', target_partition, fs_uuid],strict=False)
-					delayed_commands.append(['exfatlabel', '-i', target_partition, fs_uuid])
+					delayed_commands.extend(_fs_identity_commands(fs_type, target_partition, uuid=fs_uuid))
 			elif fs_type in ('hfsplus', 'hfs'):
 				command = [f'mkfs.{fs_type}']
 				if fs_label:
@@ -1872,7 +1875,7 @@ def write_partition_info(image, partition_infos, partition_name):
 					command.extend(['--label', fs_label])
 				if fs_uuid:
 					#command.extend(['--uuid', fs_uuid])
-					delayed_commands.append(['udflabel', '--uuid', fs_uuid, target_partition])
+					delayed_commands.extend(_fs_identity_commands(fs_type, target_partition, uuid=fs_uuid))
 				_run_mkfs_with_fallback(command, param_args, target_partition, fs_type)
 			elif fs_type == 'jfs':
 				command = ['mkfs.jfs']
@@ -1881,14 +1884,14 @@ def write_partition_info(image, partition_infos, partition_name):
 				_run_mkfs_with_fallback(command, param_args, target_partition, fs_type)
 				if fs_uuid:
 					#run_command_in_multicmd_with_path_check(["jfs_tune", '-U', fs_uuid, target_partition],strict=False)
-					delayed_commands.append(['jfs_tune', '-U', fs_uuid, target_partition])
+					delayed_commands.extend(_fs_identity_commands(fs_type, target_partition, uuid=fs_uuid))
 			elif fs_type == 'reiserfs':
 				command = ['mkfs.reiserfs']
 				if fs_label:
 					command.extend(['-l', fs_label])
 				if fs_uuid:
 					#command.extend(['-u', fs_uuid])
-					delayed_commands.append(['reiserfstune', '-u', fs_uuid, target_partition])
+					delayed_commands.extend(_fs_identity_commands(fs_type, target_partition, uuid=fs_uuid))
 				_run_mkfs_with_fallback(command, param_args, target_partition, fs_type)
 			elif fs_type == 'zfs':
 				eprint("Cannot create zfs file system: ZFS file system should be created using zpool command.")
@@ -1923,7 +1926,7 @@ def write_partition_info(image, partition_infos, partition_name):
 					command.extend(['-L', fs_label])
 				if fs_uuid:
 					#command.extend(['-U', fs_uuid])
-					delayed_commands.append(['swaplabel', '-U', fs_uuid, target_partition])
+					delayed_commands.extend(_fs_identity_commands(fs_type, target_partition, uuid=fs_uuid))
 				_run_mkfs_with_fallback(command, param_args, target_partition, fs_type)
 			elif fs_type == 'gpt':
 				eprint("Skip creating gpt padding.")
@@ -5506,6 +5509,139 @@ def _partition_in_use(device, devnum, entries, swaps, sys_block_path='/sys/class
 	except OSError:
 		pass
 	return ''
+
+
+_FAT_TYPES = ('fat32', 'fat16', 'fat12', 'fat', 'vfat', 'msdos')
+_IDENTITY_FIELDS = ('unique_guid', 'name', 'attrs', 'fs_uuid', 'fs_label')
+IdentityChange = namedtuple('IdentityChange', 'number field current new')
+
+def _fs_identity_commands(fs_type, device, uuid=None, label=None):
+	"""argv lists that set a filesystem's UUID and / or label on an unmounted device.
+
+	uuid / label None leave the value alone; label '' clears it. Returns None when fs_type
+	cannot have a requested value set without recreating it. dd mode's delayed UUID
+	commands (write_partition_info) come from this table too.
+	"""
+	commands = []
+	if uuid:
+		if fs_type in ('ext2', 'ext3', 'ext4'):
+			# tune2fs -U on a metadata_csum filesystem refuses unless it was freshly checked.
+			commands += [_FS_FIX_COMMANDS[fs_type] + [device], ['tune2fs', '-U', uuid, device]]
+		elif fs_type == 'xfs':
+			commands.append(['xfs_admin', '-U', uuid, device])
+		elif fs_type == 'btrfs':
+			commands.append(['btrfstune', '-f', '-U', uuid, device])
+		elif fs_type in _FAT_TYPES:
+			commands.append(['fatlabel', '-i', device, uuid.replace('-', '').upper()])
+		elif fs_type == 'exfat':
+			commands.append(['exfatlabel', '-i', device, uuid])
+		elif fs_type == 'udf':
+			commands.append(['udflabel', '--uuid', uuid, device])
+		elif fs_type == 'jfs':
+			commands.append(['jfs_tune', '-U', uuid, device])
+		elif fs_type == 'reiserfs':
+			commands.append(['reiserfstune', '-u', uuid, device])
+		elif fs_type == 'swap':
+			commands.append(['swaplabel', '-U', uuid, device])
+		else:
+			return None
+	if label is not None:
+		if fs_type in ('ext2', 'ext3', 'ext4'):
+			commands.append(['e2label', device, label])
+		elif fs_type == 'xfs':
+			commands.append(['xfs_admin', '-L', label or '--', device])
+		elif fs_type == 'btrfs':
+			commands.append(['btrfs', 'filesystem', 'label', device, label])
+		elif fs_type in _FAT_TYPES:
+			commands.append(['fatlabel', device, label])
+		elif fs_type == 'exfat':
+			commands.append(['exfatlabel', device, label])
+		elif fs_type == 'ntfs':
+			commands.append(['ntfslabel', device, label])
+		elif fs_type == 'f2fs':
+			commands.append(['f2fslabel', device, label])
+		elif fs_type == 'udf':
+			commands.append(['udflabel', device, label])
+		elif fs_type == 'jfs':
+			commands.append(['jfs_tune', '-L', label, device])
+		elif fs_type == 'reiserfs':
+			commands.append(['reiserfstune', '-l', label, device])
+		elif fs_type == 'swap':
+			commands.append(['swaplabel', '-L', label, device])
+		else:
+			return None
+	return commands
+
+def _gpt_identity_commands(disk, number=None, unique_guid=None, name=None, attrs=None, disk_guid=None):
+	"""sgdisk argv lists for a partition's unique GUID / name / attributes and the disk GUID."""
+	commands = []
+	if disk_guid:
+		commands.append(['sgdisk', f'--disk-guid={disk_guid}', disk])
+	if number is not None:
+		if unique_guid:
+			commands.append(['sgdisk', f'--partition-guid={number}:{unique_guid}', disk])
+		if name is not None:
+			commands.append(['sgdisk', f'--change-name={number}:{name}', disk])
+		if attrs:
+			commands.append(['sgdisk', f'--attributes={number}:=:{attrs}', disk])
+	return commands
+
+def _plan_identity(disk_rows, layout, in_use):
+	"""Identity values the patch changes on this target: (changes, refusals, warnings).
+
+	Values already new are skipped (re-runs). A target value that differs from the patch
+	base is a warning, not a conflict: node identities may legitimately differ. A change on
+	a partition that is in use is a refusal. The disk GUID only rewrites the GPT headers and
+	is changed even on a live disk. Raw areas carry their own filesystem identity.
+	"""
+	kinds = {row.number: row.new for row in disk_rows if row.kind == 'part' and row.field == 'kind'}
+	changes, refusals, warnings = [], [], []
+	for row in disk_rows:
+		if row.kind == 'disk':
+			if row.field != 'guid':
+				continue
+			number, current = None, str(layout['disk'].get('guid', ''))
+		else:
+			if row.field not in _IDENTITY_FIELDS:
+				continue
+			if kinds.get(row.number) == 'raw' and row.field in ('fs_uuid', 'fs_label'):
+				continue
+			number = int(row.number)
+			current = str(layout['parts'][number][row.field])
+		if row.old == row.new or current == row.new:
+			continue
+		where = 'disk' if number is None else f'partition {number}'
+		if current != row.old:
+			warnings.append(f'{where} {row.field} is {current!r}, the patch base had {row.old!r}; setting {row.new!r}')
+		if number is not None and in_use.get(number):
+			refusals.append(f'partition {number} is {in_use[number]} and its {row.field} changes')
+		changes.append(IdentityChange(number, row.field, current, row.new))
+	return changes, refusals, warnings
+
+def _identity_command_list(changes, layout, disk_device):
+	"""(commands, unsupported) for planned identity changes.
+
+	Filesystem UUID / label commands come first (per partition, UUID before label), then GPT
+	and disk GUID commands. unsupported lists (number, fields, text) that cannot be set.
+	"""
+	fs_fields, gpt_commands = {}, []
+	for change in changes:
+		if change.number is None:
+			gpt_commands += _gpt_identity_commands(disk_device, disk_guid=change.new)
+		elif change.field in ('fs_uuid', 'fs_label'):
+			fs_fields.setdefault(change.number, {})[change.field] = change.new
+		else:
+			gpt_commands += _gpt_identity_commands(disk_device, number=change.number, **{change.field: change.new})
+	commands, unsupported = [], []
+	for number, fields in sorted(fs_fields.items()):
+		part = layout['parts'][number]
+		fs_commands = _fs_identity_commands(part['fs_type'], part['device'], uuid=fields.get('fs_uuid'), label=fields.get('fs_label'))
+		if fs_commands is None:
+			names = tuple(sorted(fields))
+			unsupported.append((number, names, f"partition {number} ({part['fs_type'] or 'unknown'}) cannot have its {' / '.join(names)} set"))
+		else:
+			commands += fs_commands
+	return commands + gpt_commands, unsupported
 
 
 #%% ---- Remove Extra ----

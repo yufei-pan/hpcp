@@ -447,3 +447,100 @@ def test_malformed_mountinfo_line_is_skipped_not_fatal(tmp_path, hpcp_mod):
 	entries = hpcp_mod._mountinfo_entries(str(path))
 	assert [entry['mount_point'] for entry in entries] == ['/', '/mnt/with space']
 	assert hpcp_mod._live_mount((8, 5), entries) == ('/mnt/with space', True)
+
+
+def test_fs_identity_commands_match_dd_mode_uuid_commands(hpcp_mod):
+	"""dd mode's delayed UUID commands now come from this table; the argv must not change."""
+	dev, u = '/dev/x1', '1234-ABCD'
+	cmd = hpcp_mod._fs_identity_commands
+	assert cmd('ext4', dev, uuid=u) == [['e2fsck', '-f', '-y', dev], ['tune2fs', '-U', u, dev]]
+	assert cmd('xfs', dev, uuid=u) == [['xfs_admin', '-U', u, dev]]
+	assert cmd('exfat', dev, uuid=u) == [['exfatlabel', '-i', dev, u]]
+	assert cmd('udf', dev, uuid=u) == [['udflabel', '--uuid', u, dev]]
+	assert cmd('jfs', dev, uuid=u) == [['jfs_tune', '-U', u, dev]]
+	assert cmd('reiserfs', dev, uuid=u) == [['reiserfstune', '-u', u, dev]]
+	assert cmd('swap', dev, uuid=u) == [['swaplabel', '-U', u, dev]]
+
+
+def test_fs_identity_commands_labels_and_unsupported(hpcp_mod):
+	dev = '/dev/x1'
+	cmd = hpcp_mod._fs_identity_commands
+	assert cmd('ext4', dev, label='root2') == [['e2label', dev, 'root2']]
+	assert cmd('xfs', dev, label='') == [['xfs_admin', '-L', '--', dev]]
+	assert cmd('vfat', dev, uuid='ab12-cd34', label='ESP') == [['fatlabel', '-i', dev, 'AB12CD34'], ['fatlabel', dev, 'ESP']]
+	assert cmd('swap', dev, label='swap2') == [['swaplabel', '-L', 'swap2', dev]]
+	assert cmd('ntfs', dev, label='DATA') == [['ntfslabel', dev, 'DATA']]
+	assert cmd('ntfs', dev, uuid='X') is None
+	assert cmd('minix', dev, label='x') is None
+	assert cmd('ext4', dev) == []
+
+
+def test_gpt_identity_commands(hpcp_mod):
+	assert hpcp_mod._gpt_identity_commands('/dev/sda', 2, unique_guid='G', name='', attrs='8000000000000000') == [
+		['sgdisk', '--partition-guid=2:G', '/dev/sda'],
+		['sgdisk', '--change-name=2:', '/dev/sda'],
+		['sgdisk', '--attributes=2:=:8000000000000000', '/dev/sda']]
+	assert hpcp_mod._gpt_identity_commands('/dev/sda', disk_guid='D') == [['sgdisk', '--disk-guid=D', '/dev/sda']]
+
+
+def _identity_rows(hpcp_mod, **changes):
+	"""disk.tsv rows for partitions 1 (fs, vfat), 2 (raw) and 3 (fs, ext4) with the given (number, field) -> (old, new)."""
+	R = hpcp_mod.DiskRow
+	rows = [R('disk', '-', 'guid', 'D1', changes.get('disk_guid', 'D1')), R('disk', '-', 'sector_size', '512', '512')]
+	for number, kind, fs_type in (('1', 'fs', 'vfat'), ('2', 'raw', ''), ('3', 'fs', 'ext4')):
+		rows.append(R('part', number, 'kind', kind, kind))
+		rows.append(R('part', number, 'fs_type', fs_type, fs_type))
+		for field in ('unique_guid', 'name', 'attrs', 'fs_uuid', 'fs_label'):
+			old, new = changes.get(f'p{number}_{field}', ('v', 'v'))
+			rows.append(R('part', number, field, old, new))
+	return rows
+
+
+def _target(**current):
+	parts = {}
+	for number, fs_type in ((1, 'vfat'), (2, ''), (3, 'ext4')):
+		parts[number] = {'unique_guid': 'v', 'name': 'v', 'attrs': 'v', 'fs_uuid': 'v', 'fs_label': 'v', 'fs_type': fs_type, 'device': f'/dev/x{number}'}
+		for key, value in current.items():
+			if key.startswith(f'p{number}_'):
+				parts[number][key[3:]] = value
+	return {'disk': {'guid': current.get('disk_guid', 'D1')}, 'parts': parts}
+
+
+def test_plan_identity_applies_changes_and_refuses_in_use_partitions(hpcp_mod):
+	rows = _identity_rows(hpcp_mod, p3_fs_label=('v', 'root2'), p1_name=('v', 'ESP2'), disk_guid='D2')
+	changes, refusals, warnings = hpcp_mod._plan_identity(rows, _target(), {1: '', 2: '', 3: ''})
+	assert {(c.number, c.field, c.new) for c in changes} == {(3, 'fs_label', 'root2'), (1, 'name', 'ESP2'), (None, 'guid', 'D2')}
+	assert refusals == [] and warnings == []
+	_, refusals, _ = hpcp_mod._plan_identity(rows, _target(), {1: '', 2: '', 3: 'mounted'})
+	assert refusals == ['partition 3 is mounted and its fs_label changes']
+
+
+def test_plan_identity_warns_when_target_differs_from_base(hpcp_mod):
+	"""Review Focus 3: a node-specific value is a warning, and the new value is still set."""
+	rows = _identity_rows(hpcp_mod, p3_fs_uuid=('v', 'NEW-UUID'))
+	changes, refusals, warnings = hpcp_mod._plan_identity(rows, _target(p3_fs_uuid='NODE-UUID'), {})
+	assert [(c.number, c.field, c.current, c.new) for c in changes] == [(3, 'fs_uuid', 'NODE-UUID', 'NEW-UUID')]
+	assert refusals == [] and len(warnings) == 1 and 'NODE-UUID' in warnings[0]
+
+
+def test_plan_identity_skips_values_already_new(hpcp_mod):
+	"""Review Focus 5: a re-run after an interruption changes nothing that is already set."""
+	rows = _identity_rows(hpcp_mod, p3_fs_label=('v', 'root2'), disk_guid='D2')
+	changes, _, warnings = hpcp_mod._plan_identity(rows, _target(p3_fs_label='root2', disk_guid='D2'), {3: 'mounted'})
+	assert changes == [] and warnings == []
+
+
+def test_plan_identity_ignores_filesystem_fields_of_raw_areas(hpcp_mod):
+	rows = _identity_rows(hpcp_mod, p2_fs_uuid=('v', 'LVM-PV'), p2_name=('v', 'bios2'))
+	changes, _, _ = hpcp_mod._plan_identity(rows, _target(), {})
+	assert [(c.number, c.field) for c in changes] == [(2, 'name')]
+
+
+def test_identity_command_list_groups_and_flags_unsupported(hpcp_mod):
+	IC = hpcp_mod.IdentityChange
+	layout = {'disk': {}, 'parts': {1: {'fs_type': 'ntfs', 'device': '/dev/x1'}, 3: {'fs_type': 'ext4', 'device': '/dev/x3'}}}
+	changes = [IC(None, 'guid', 'D1', 'D2'), IC(3, 'fs_label', 'root', 'root2'), IC(3, 'name', 'root', 'root-v2'),
+		IC(1, 'fs_uuid', 'A', 'B')]
+	commands, unsupported = hpcp_mod._identity_command_list(changes, layout, '/dev/x')
+	assert commands == [['e2label', '/dev/x3', 'root2'], ['sgdisk', '--disk-guid=D2', '/dev/x'], ['sgdisk', '--change-name=3:root-v2', '/dev/x']]
+	assert [(number, fields) for number, fields, _ in unsupported] == [(1, ('fs_uuid',))]
