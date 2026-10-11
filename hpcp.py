@@ -4605,7 +4605,6 @@ def _apply_rows(rows, volume_roots, target_root, max_workers=1, verbose=False, f
 			eprint(f'Copy failed: {row.path}: {e}')
 			continue
 		dir_rows.append(row)
-		sync_dir(row)
 	by_volume = {}
 	for row in payload:
 		if not row.new.startswith('f:') or guarded(row) is None:
@@ -4671,6 +4670,8 @@ def apply_patch_tree(volume_roots, target_root, force=False, max_workers=1, verb
 	for a malformed or incomplete patch, or when conflicts are not overridden.
 	Another process modifying the target concurrently during an apply is out of scope
 	(residual race between the containment checks and the writes).
+	A hard kill mid-apply can leave new directories with default metadata (it is applied
+	only after every write); the re-run then reports those A rows as conflicts and needs -fa.
 	"""
 	global HASH_SIZE
 	meta, rows, volume_roots = load_patch_volumes(volume_roots, volume_names)

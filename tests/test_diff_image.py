@@ -1038,7 +1038,7 @@ def test_interrupted_copy_keeps_old_xattrs(trees, hpcp_mod, tmp_path, monkeypatc
 	assert (target / 'm.txt').read_text() == 'new content'
 
 
-def test_new_directory_metadata_survives_interruption(trees, hpcp_mod, tmp_path, monkeypatch):
+def test_directory_metadata_applied_after_files(trees, hpcp_mod, tmp_path, monkeypatch):
 	new, base = trees
 	_write(new / 'secret' / 'f.txt', 'inside')
 	os.chmod(new / 'secret', 0o700)
@@ -1046,14 +1046,18 @@ def test_new_directory_metadata_survives_interruption(trees, hpcp_mod, tmp_path,
 	_patch_from(hpcp_mod, new, base, [vol])
 	target = tmp_path / 'target'
 	_clone(base, target)
-	real = _fail_first_copy(hpcp_mod, monkeypatch)
-	first = hpcp_mod.apply_patch_tree([str(vol)], str(target), max_workers=1)
-	assert first['failed'] > 0
+	real = hpcp_mod.copy_file_list_parallel
+	modes = []
+
+	def recording(*args, **kwargs):
+		modes.append(stat.S_IMODE(os.stat(target / 'secret').st_mode))
+		return real(*args, **kwargs)
+
+	monkeypatch.setattr(hpcp_mod, 'copy_file_list_parallel', recording)
+	summary = hpcp_mod.apply_patch_tree([str(vol)], str(target), max_workers=1)
+	assert summary['failed'] == 0
+	assert modes and all(mode != 0o700 for mode in modes)
 	assert stat.S_IMODE(os.stat(target / 'secret').st_mode) == 0o700
-	monkeypatch.setattr(hpcp_mod, 'copy_file_list_parallel', real)
-	second = hpcp_mod.apply_patch_tree([str(vol)], str(target), max_workers=1)
-	assert second['failed'] == 0 and second['forced'] == 0
-	assert _changes(hpcp_mod, new, target) == []
 
 
 def test_apply_rejects_reserved_key(tmp_path, hpcp_mod, reset_hpcp_globals):
