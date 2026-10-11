@@ -4600,16 +4600,22 @@ def _discard_temp(path):
 def _finish_replace(job, target_root, wait):
 	"""Wait for one temporary copy, check it, and rename it over its destination.
 
+	The temporary file is created in the live directory, so it inherits that directory's
+	default ACL as an access ACL, which cp -af keeps when the payload has none. Portable
+	xattrs the payload lacks are removed from it and its mode is reset to the payload's
+	(removing an access ACL leaves the group bits at the old mask) before the rename.
 	Any failure is reported as 'Copy failed' and leaves the destination untouched; the
 	temporary file never outlives this call.
 	"""
-	row, dest, tmp = job
+	row, source, dest, tmp = job
 	try:
 		wait()
 		size = decode_state(row.new)['size']
 		info = os.lstat(tmp)
 		if not stat.S_ISREG(info.st_mode) or info.st_size != size:
 			raise RuntimeError(f'copied {info.st_size} bytes, expected {size}')
+		_remove_stale_xattrs(source, tmp)
+		os.chmod(tmp, stat.S_IMODE(os.lstat(source).st_mode))
 		reason = _unsafe_parent(target_root, dest)
 		if reason:
 			raise RuntimeError(reason)
@@ -4622,10 +4628,10 @@ def _finish_replace(job, target_root, wait):
 def _replace_files(files, target_root, max_workers=1, verbose=False, full_hash=False):
 	"""Copy each (row, source, dest) to a temporary sibling of dest, then rename it over dest.
 
-	copy_file (cp -af) preserves mode, owner, times and xattrs, and the temporary file is
-	new, so it carries no stale xattrs. Copies run on a process pool, or serially when
-	max_workers <= 1. A running process keeps the old inode, an interruption leaves dest
-	fully old or fully new, and hard links to the old file are broken.
+	copy_file (cp -af) preserves mode, owner, times and xattrs; _finish_replace strips what
+	the temporary file inherited from its directory (a default ACL). Copies run on a process
+	pool, or serially when max_workers <= 1. A running process keeps the old inode, an
+	interruption leaves dest fully old or fully new, and hard links to the old file are broken.
 	"""
 	jobs = []
 	for row, source, dest in files:
@@ -4638,12 +4644,13 @@ def _replace_files(files, target_root, max_workers=1, verbose=False, full_hash=F
 		return
 	print(f"Copying {len(jobs)} file(s) with {max(1, max_workers)} worker(s)")
 	if max_workers <= 1 or len(jobs) == 1:
-		for row, source, dest, tmp in jobs:
-			_finish_replace((row, dest, tmp), target_root,
+		for job in jobs:
+			row, source, dest, tmp = job
+			_finish_replace(job, target_root,
 				functools.partial(_call_raising_recorded_failures, copy_file, source, [tmp], full_hash, verbose))
 		return
 	with ProcessPoolExecutor(max_workers=max_workers) as executor:
-		futures = {executor.submit(_call_with_worker_init, copy_file, source, [tmp], full_hash, verbose): (row, dest, tmp)
+		futures = {executor.submit(_call_with_worker_init, copy_file, source, [tmp], full_hash, verbose): (row, source, dest, tmp)
 			for row, source, dest, tmp in jobs}
 		for future in concurrent.futures.as_completed(futures):
 			_finish_replace(futures[future], target_root, future.result)

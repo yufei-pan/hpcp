@@ -3,6 +3,7 @@ import hashlib
 import os
 import shutil
 import stat
+import struct
 import subprocess
 import sys
 import pytest
@@ -1223,6 +1224,39 @@ def test_apply_breaks_hard_links_instead_of_writing_through(trees, hpcp_mod, tmp
 	assert summary['failed'] == 0
 	assert (target / 'a').read_text() == 'new content'
 	assert ext.read_text() == 'old'
+
+
+# A default ACL: user::rwx, user:1234:r--, group::r-x, mask::r-x, other::r-x.
+_DEFAULT_ACL = struct.pack('<I', 2) + b''.join(struct.pack('<HHI', tag, perm, ident) for tag, perm, ident in [
+	(0x01, 7, 0xFFFFFFFF), (0x02, 4, 1234), (0x04, 5, 0xFFFFFFFF), (0x10, 5, 0xFFFFFFFF), (0x20, 5, 0xFFFFFFFF)])
+
+
+@pytest.mark.parametrize('workers', [1, 2])
+def test_apply_strips_inherited_default_acl(trees, hpcp_mod, tmp_path, workers):
+	"""G1: a temporary file created under a default ACL inherits an access ACL the payload does not have."""
+	new, base = trees
+	_write(new / 'shared' / 'mod.txt', 'new content')
+	_write(base / 'shared' / 'mod.txt', 'old')
+	_write(new / 'shared' / 'add.txt', 'added')
+	os.chmod(str(new / 'shared' / 'add.txt'), 0o640)
+	try:
+		# On both sides, so shared/ itself is unchanged; its files were created before the ACL and carry none.
+		for directory in (new / 'shared', base / 'shared'):
+			os.setxattr(str(directory), 'system.posix_acl_default', _DEFAULT_ACL)
+	except OSError as e:
+		pytest.skip(f'cannot set a default ACL here: {e}')
+	vol = tmp_path / 'vol'
+	rows, _ = _patch_from(hpcp_mod, new, base, [vol])
+	assert _ops(rows) == {('M', 'shared/mod.txt'), ('A', 'shared/add.txt')}
+	target = tmp_path / 'target'
+	_clone(base, target)
+	os.setxattr(str(target / 'shared'), 'system.posix_acl_default', _DEFAULT_ACL)
+	summary = hpcp_mod.apply_patch_tree([str(vol)], str(target), max_workers=workers)
+	assert summary['failed'] == 0
+	for name in ('mod.txt', 'add.txt'):
+		assert 'system.posix_acl_access' not in os.listxattr(str(target / 'shared' / name))
+	assert _changes(hpcp_mod, new, target) == []
+	assert _temp_leftovers(target) == []
 
 
 def _break_copies(hpcp_mod, monkeypatch):
