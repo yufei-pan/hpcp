@@ -157,6 +157,25 @@ def test_partition_devices_use_kernel_numbers(tmp_path, hpcp_mod, monkeypatch):
 	assert got == {1: '/dev/loop0p1', 11: '/dev/loop0p11', 2: '/dev/loop0p2'}
 
 
+def test_partition_devices_map_kernel_names_with_a_bang_to_dev_subdirectories(tmp_path, hpcp_mod):
+	"""sysfs spells the '/' of a kernel name as '!': a cciss disk is cciss!c0d0 there and /dev/cciss/c0d0 in
+	/dev, its partitions cciss!c0d0p1 and /dev/cciss/c0d0p1."""
+	for name, number in {'cciss!c0d0p1': '1', 'cciss!c0d0p2': '2'}.items():
+		(tmp_path / 'cciss!c0d0' / name).mkdir(parents=True)
+		(tmp_path / 'cciss!c0d0' / name / 'partition').write_text(number + '\n')
+	(tmp_path / 'cciss!c0d0' / 'queue').mkdir()
+	got = hpcp_mod._partition_devices('/dev/cciss/c0d0', sys_block_path=str(tmp_path))
+	assert got == {1: '/dev/cciss/c0d0p1', 2: '/dev/cciss/c0d0p2'}
+	assert hpcp_mod._sysfs_block_name('/dev/cciss/c0d0p1') == 'cciss!c0d0p1'
+	assert hpcp_mod._sysfs_block_name('/dev/sda1') == 'sda1'
+	# A holder of a cciss partition is found under its sysfs name too (the in-use check must not fail open).
+	(tmp_path / 'cciss!c0d0p1' / 'holders' / 'dm-0').mkdir(parents=True)
+	(tmp_path / 'cciss!c0d0p2' / 'holders').mkdir(parents=True)
+	check = lambda device: hpcp_mod._partition_in_use(device, (104, 1), [], set(), str(tmp_path))
+	assert check('/dev/cciss/c0d0p1') == 'held by another device'
+	assert check('/dev/cciss/c0d0p2') == ''
+
+
 def test_compare_disk_layouts_identical(hpcp_mod):
 	old = _layout({1: _part(fs_type='vfat', type_guid=hpcp_mod._ESP_TYPE_GUID), 3: _part()})
 	problems, rows = hpcp_mod.compare_disk_layouts(old, old)

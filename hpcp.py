@@ -5487,14 +5487,23 @@ def _validate_diff_args(get_diff_image, load_diff_image, force_apply, src_path, 
 #%% ---- Disk Patch ----
 _ESP_TYPE_GUID = 'C12A7328-F81F-11D2-BA4B-00A0C93EC93B'
 
+def _sysfs_block_name(device):
+	"""device's name in /sys/class/block: its real path below /dev with each '/' spelled '!', as the
+	kernel does (/dev/cciss/c0d0 is cciss!c0d0); the base name of a node outside /dev."""
+	real = os.path.realpath(device)
+	if real.startswith('/dev/'):
+		return real[len('/dev/'):].replace('/', '!')
+	return os.path.basename(real)
+
 def _partition_devices(disk, sys_block_path='/sys/class/block'):
 	"""{partition number: device path} for disk, using the kernel's partition number, not the name suffix.
 
 	Only the disk's own partitions count: the real child directories of its sysfs node that hold
 	a 'partition' file. Other descendants (a partitioned md array built on its partitions) do not.
+	A '!' in a sysfs name is a '/' in /dev (cciss!c0d0p1 is /dev/cciss/c0d0p1).
 	"""
 	result = {}
-	disk_dir = os.path.join(sys_block_path, os.path.basename(os.path.realpath(disk)))
+	disk_dir = os.path.join(sys_block_path, _sysfs_block_name(disk))
 	try:
 		children = os.listdir(disk_dir)
 	except OSError:
@@ -5505,7 +5514,7 @@ def _partition_devices(disk, sys_block_path='/sys/class/block'):
 			continue
 		try:
 			with open(os.path.join(child_dir, 'partition')) as f:
-				result[int(f.read().strip())] = '/dev/' + child
+				result[int(f.read().strip())] = '/dev/' + child.replace('!', '/')
 		except (OSError, ValueError):
 			continue
 	return result
@@ -5862,7 +5871,7 @@ def _partition_in_use(device, devnum, entries, swaps, sys_block_path='/sys/class
 	if os.path.realpath(device) in swaps:
 		return 'active swap'
 	try:
-		if os.listdir(os.path.join(sys_block_path, os.path.basename(os.path.realpath(device)), 'holders')):
+		if os.listdir(os.path.join(sys_block_path, _sysfs_block_name(device), 'holders')):
 			return 'held by another device'
 	except OSError:
 		pass
