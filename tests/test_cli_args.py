@@ -102,20 +102,34 @@ def test_remove_and_rate_limit_flags(hpcp_mod, restore_argv, reset_hpcp_globals)
 	assert args.exclude_file == '/tmp/ex.txt'
 
 
-def test_image_and_unimplemented_flags_parse(hpcp_mod, restore_argv, reset_hpcp_globals):
+def test_image_and_diff_flags_parse(hpcp_mod, restore_argv, reset_hpcp_globals):
 	args = _parse(hpcp_mod, [
 		'hpcp', '-si', '/tmp/src.img', '-siff', 'diff.img', '-diff',
 		'-dd', '-ddr', '10G', '-d', '/tmp/out.img', '/tmp/src.img',
 	])
 	assert args.src_image == ['/tmp/src.img']
 	assert args.load_diff_image == ['diff.img']
-	assert args.get_diff_image is True
+	assert args.get_diff_image == 'auto'
 	assert args.disk_dump is True
 	assert args.dd_resize == ['10G']
 
 
-def test_main_does_not_pass_unimplemented_image_flags(hpcp_mod):
+def test_diff_flag_takes_optional_patch_name(hpcp_mod, restore_argv, reset_hpcp_globals):
+	args = _parse(hpcp_mod, ['hpcp', '-diff', 'out.img', '/tmp/new', '-d', '/tmp/base'])
+	assert args.get_diff_image == 'out.img'
+	assert args.src_path == ['/tmp/new']
+	assert _parse(hpcp_mod, ['hpcp', '/tmp/new', '-d', '/tmp/base', '-diff']).get_diff_image == 'auto'
+	assert _parse(hpcp_mod, ['hpcp', '/tmp/new']).get_diff_image is None
+
+
+def test_force_apply_flag(hpcp_mod, restore_argv, reset_hpcp_globals):
+	args = _parse(hpcp_mod, ['hpcp', '-siff', 'p.img', '-fa', '-d', '/tmp/t'])
+	assert args.force_apply is True
+	assert _parse(hpcp_mod, ['hpcp', '/tmp/src']).force_apply is False
+
+
+def test_main_passes_diff_image_flags(hpcp_mod):
 	import inspect
 	src = inspect.getsource(hpcp_mod.main)
-	assert 'load_diff_image' not in src
-	assert 'get_diff_image' not in src
+	for text in ('get_diff_image = args.get_diff_image', 'load_diff_image = args.load_diff_image', 'force_apply = args.force_apply'):
+		assert text in src

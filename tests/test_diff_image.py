@@ -1267,3 +1267,47 @@ def test_cloned_image_mounts_for_diff(trees, hpcp_mod, tmp_path, reset_hpcp_glob
 	shutil.copyfile(base_img, clone)
 	with _mount_session(hpcp_mod) as (mount_points, loop_devices):
 		assert hpcp_mod.process_get_diff_image([], [clone], [], base_img, str(tmp_path / 'p.img'), mount_points, loop_devices, max_workers=1) is None
+
+
+def test_hpcp_rejects_bad_patch_arguments(tmp_path, hpcp_mod, reset_hpcp_globals, capsys):
+	new, base = str(tmp_path / 'new'), str(tmp_path / 'base')
+	os.makedirs(new)
+	os.makedirs(base)
+	cases = [
+		(dict(src_path=[new], dest_paths=[base], force_apply=True), '-fa'),
+		(dict(src_path=[new], dest_paths=[base], get_diff_image='auto', load_diff_image=['p.img']), 'cannot be used together'),
+		(dict(src_path=[new], dest_paths=[base], get_diff_image='auto', dd=True), '-dd'),
+		(dict(src_path=[], dest_paths=[base], load_diff_image=['p.img'], remove=True), '-rm'),
+		(dict(src_path=[new, base], dest_paths=[base], get_diff_image='auto'), 'exactly one source'),
+		(dict(src_path=[new], get_diff_image='auto'), 'exactly one base'),
+		(dict(src_path=[], load_diff_image=['p.img']), 'exactly one target'),
+		(dict(src_path=[new], dest_paths=[base], get_diff_image='auto', content_only=True), '-co'),
+	]
+	for kwargs, message in cases:
+		src_path = kwargs.pop('src_path')
+		rc = hpcp_mod.hpcp(src_path, single_thread=True, **kwargs)
+		err = capsys.readouterr().err
+		assert rc == 241, (kwargs, err)
+		assert 'Invalid arguments' in err and message in err, (kwargs, err)
+
+
+def test_diff_value_that_is_a_directory_becomes_the_source(tmp_path, hpcp_mod, reset_hpcp_globals):
+	"""Review Focus 1: `hpcp -diff /new -d /base` must not treat /new as the patch name."""
+	new = tmp_path / 'new'
+	new.mkdir()
+	got = hpcp_mod._validate_diff_args(str(new), None, False, [], None, [str(tmp_path)], None)
+	assert got == ('auto', [str(new)])
+
+
+@requires_root_and_image_tools
+@pytest.mark.root
+@pytest.mark.loop
+def test_hpcp_generates_and_applies_patch(trees, hpcp_mod, tmp_path):
+	new, base = trees
+	_build_scenario(new, base)
+	out = str(tmp_path / 'p.img')
+	assert hpcp_mod.hpcp([str(new)], dest_paths=[str(base)], get_diff_image=out, max_workers=2) == 0
+	target = tmp_path / 'target'
+	_clone(base, target)
+	assert hpcp_mod.hpcp([], dest_paths=[str(target)], load_diff_image=[out], max_workers=2) == 0
+	assert _changes(hpcp_mod, new, target) == []

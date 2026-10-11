@@ -4840,6 +4840,50 @@ def process_load_diff_image(load_diff_image, src_paths, dest_paths, dest_image, 
 	return apply_patch_tree(volume_roots, target_root, force=force, max_workers=max_workers, verbose=verbose,
 		volume_names=[os.path.abspath(image) for image in images], store_note=store_note)
 
+def _validate_diff_args(get_diff_image, load_diff_image, force_apply, src_path, src_image, dest_paths, dest_image,
+		dd=False, remove=False, remove_extra=False, target_file_list=None, compare_file_list=False,
+		diff_file_list=None, tar_diff_file_list=False, content_only=False):
+	"""Check -diff / -siff / -fa combinations before anything is mounted.
+
+	Returns (get_diff_image, src_path). A -diff value that is an existing directory is the
+	source path that argparse swallowed (`hpcp -diff /new -d /base`); it is moved back.
+	"""
+	src_path = list(src_path or [])
+	dest_paths = list(dest_paths or [])
+	if force_apply and not load_diff_image:
+		raise RuntimeError('Invalid arguments: -fa / --force_apply only applies together with -siff')
+	if get_diff_image and load_diff_image:
+		raise RuntimeError('Invalid arguments: -diff and -siff cannot be used together')
+	mode = '-siff' if load_diff_image else '-diff'
+	if dd:
+		raise RuntimeError(f'Invalid arguments: {mode} with -dd is not supported yet (dd-mode patches are planned)')
+	clashes = [flag for flag, enabled in (('-rm/-rf', remove), ('-rme', remove_extra), ('-fl', target_file_list),
+		('-cfl', compare_file_list), ('-dfl', diff_file_list), ('-tdfl', tar_diff_file_list), ('-co', content_only)) if enabled]
+	if clashes:
+		raise RuntimeError(f'Invalid arguments: {mode} cannot be combined with {", ".join(clashes)}')
+	if load_diff_image:
+		if src_image:
+			raise RuntimeError('Invalid arguments: -siff takes no -si image; give the patch volumes with -siff')
+		targets = (1 if dest_image else 0) + len(dest_paths)
+		if targets and src_path:
+			raise RuntimeError(f'Invalid arguments: -siff takes no source paths when -d / -di is given, got {src_path}')
+		if not targets:
+			targets = len(src_path)
+		if targets != 1:
+			raise RuntimeError(f'Invalid arguments: -siff needs exactly one target (-d DIR, -di IMG or one path), got {targets}')
+		return get_diff_image, src_path
+	if get_diff_image not in (None, 'auto') and os.path.isdir(os.path.expanduser(get_diff_image)):
+		print(f"Note: -diff value {get_diff_image} is an existing directory; using it as the source and generating the patch name")
+		src_path = [get_diff_image] + src_path
+		get_diff_image = 'auto'
+	sources = len(src_path) + len(src_image or [])
+	if sources != 1:
+		raise RuntimeError(f'Invalid arguments: -diff needs exactly one source (a directory or one -si image), got {sources}')
+	bases = (1 if dest_image else 0) + len(dest_paths)
+	if bases != 1:
+		raise RuntimeError(f'Invalid arguments: -diff needs exactly one base (-d DIR or -di IMG), got {bases}')
+	return get_diff_image, src_path
+
 #%% ---- Remove Extra ----
 def remove_extra_dirs(src_paths, dests,exclude=None):
 	"""
@@ -5713,12 +5757,13 @@ def get_args(args = None):
 	parser.add_argument('-pfl', '--parallel_file_listing', action='store_true', help='Use parallel processing for file listing')
 	parser.add_argument('src_path', nargs='*', type=str, help='Source Path')
 	parser.add_argument('-si','--src_image',action='append', type=str, help='Source Image, mount the image and copy the files from it.')
-	parser.add_argument('-siff','--load_diff_image',action='append', type=str, help='Not implemented. Load diff images and apply the changes to the destination.')
+	parser.add_argument('-siff','--load_diff_image',action='append', type=str, help='Apply a patch image made by -diff to the target (-d / -di or a single path). Repeat for each -dis volume. Every path the patch touches is checked first; conflicts prompt before being overridden.')
 	parser.add_argument('-d','-C','--dest_path',action='append', type=str, help='Destination Path')
 	parser.add_argument('-rds','--random_dest_selection', action='store_true', help='Randomly select destination path from the list of destination paths instead of filling round robin. Can speed up transfer if dests are on different devices. Warning: can cause unable to fit in big files as dests are filled up by smaller files.')
 	parser.add_argument('-di','--dest_image', type=str, help='Base name for destination Image, create a image file and copy the files into it.')
 	parser.add_argument('-dis','--dest_image_size', type=str, help='Destination Image Size, specify the size of the destination image to split into. Default is 0 (No split). Example: {10TiB} or {1G}', default='0')
-	parser.add_argument('-diff', '--get_diff_image', action='store_true', help='Not implemented. Compare the source and destination file list, create a diff image of that will update the destination to source.')
+	parser.add_argument('-diff', '--get_diff_image', type=str, nargs='?', const='auto', default=None, help='Generate a patch image that updates the base (-d / -di) to the source (src_path / -si): added and modified files in full plus a change list under .hpcp_diff/. Optionally name the output; default DIFF_<src>_TO_<base>_<time>.img. Honors -dis, -fh, -hs and -e.')
+	parser.add_argument('-fa', '--force_apply', action='store_true', help='With -siff, apply even when the target differs from the state the patch expects. Conflicts are still printed as warnings.')
 	parser.add_argument('-dd', '--disk_dump', action='store_true', help='Disk to Disk mirror, use this if you are backuping / deploying an OS from / to a disk. \
 					 Require 1 source, can be 1 src_path or 1 -si src_image, require 1 -di dest_image. Note: will only actually use dd if unable to mount / create a partition.')
 	parser.add_argument('-ddr', '--dd_resize', action='append', type=str, help='Resize the destination image to the specified size with -dd. Applies to biggest partiton first. Specify multiple -ddr to resize subsequent sized partitions. Example: {100GiB} or {200G}')
@@ -5765,7 +5810,8 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = multipr
 			exclude=None,exclude_file = None,dest_image = None,dest_image_size = '0', no_link_tracking = False,src_image = None,dd = False,dd_resize = 0,
 			batch = False, append_hash_to_file_list = True, hash_size = ..., source_file_list = None, random_destination_selection = False, 
 			bytes_rate_limit = None, files_rate_limit = None,target_file_system = None, no_create_dir = False, content_only = False, command_timeout_limit = 0,
-			exit_not_enough_space = False,do_not_remove_files_while_listing = False,no_fs_param_mirror = False):
+			exit_not_enough_space = False,do_not_remove_files_while_listing = False,no_fs_param_mirror = False,
+			get_diff_image = None, load_diff_image = None, force_apply = False):
 	global HASH_SIZE
 	global RANDOM_DESTINATION_SELECTION
 	global BYTES_RATE_LIMIT
@@ -5820,6 +5866,22 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = multipr
 	elif max_workers < 0:
 		max_workers = round(- max_workers * multiprocessing.cpu_count())
 	try:
+		if get_diff_image or load_diff_image or force_apply:
+			if os.name == 'nt':
+				raise RuntimeError("Platform error: patch images are not supported on Windows, exiting")
+			get_diff_image, src_path = _validate_diff_args(get_diff_image, load_diff_image, force_apply, src_path, src_image,
+				dest_paths, dest_image, dd=dd, remove=remove, remove_extra=remove_extra, target_file_list=target_file_list,
+				compare_file_list=compare_file_list, diff_file_list=diff_file_list, tar_diff_file_list=tar_diff_file_list,
+				content_only=content_only)
+			workers = 1 if single_thread else max_workers
+			if load_diff_image:
+				process_load_diff_image(load_diff_image, src_path, dest_paths, dest_image, mount_points, loop_devices,
+					force=force_apply, max_workers=workers, verbose=verbose)
+				raise RuntimeError("Exiting after applying patch image.")
+			process_get_diff_image(src_path, src_image, dest_paths, dest_image, get_diff_image, mount_points, loop_devices,
+				exclude=exclude, full_hash=full_hash, dest_image_size=dest_image_size, max_workers=workers,
+				parallel_file_listing=parallel_file_listing, verbose=verbose)
+			raise RuntimeError("Exiting after generating patch image.")
 		if dd:
 			if os.name == 'nt':
 				raise RuntimeError("Platform error: dd mode is not supported on Windows, exiting")
@@ -6179,7 +6241,8 @@ def main():
 			 random_destination_selection = args.random_dest_selection,bytes_rate_limit = args.rate_limit,files_rate_limit = args.file_rate_limit,
 			 target_file_system = args.target_file_system, no_create_dir = args.no_create_dir, content_only = args.content_only, command_timeout_limit = args.command_timeout_limit,
 			 exit_not_enough_space = args.exit_not_enough_space,do_not_remove_files_while_listing = args.do_not_remove_files_while_listing,
-			 no_fs_param_mirror = args.no_fs_param_mirror)
+			 no_fs_param_mirror = args.no_fs_param_mirror, get_diff_image = args.get_diff_image,
+			 load_diff_image = args.load_diff_image, force_apply = args.force_apply)
 		if rtnCode:
 			exit(rtnCode)
 		
