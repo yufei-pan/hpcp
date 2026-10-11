@@ -8,10 +8,12 @@
 # ///
 import argparse
 import concurrent.futures
+import contextlib
 import errno
 import fnmatch
 import functools
 import glob
+import hashlib
 import multiprocessing
 import os
 import pathlib
@@ -279,6 +281,10 @@ ERROR_TO_RETURNCODE_TABLE = {
 	'Patch conflict': 245,
 	'Patch verify error': 246,
 	'Entry state error': 247,
+	'Disk layout mismatch': 248,
+	'Raw area error': 249,
+	'Identity change error': 250,
+	'Disk in use': 251,
 	# FS param mirroring warnings: each of these reports a successful copy that
 	# degraded to mkfs defaults (a probe/build failure, or mkfs rejecting the
 	# mirrored parameters), not a failed one, so they must not inflate the
@@ -482,7 +488,7 @@ _binCalled = {'lsblk', 'losetup', 'sgdisk', 'blkid', 'umount', 'mount','dd','cp'
 			  'fsck.fat', 'fsck.exfat', 'dump.exfat', 'fsck.hfsplus',
 			  'fsck.hfs', 'fsck.jfs', 'fsck.reiserfs', 'fsck.ufs', 'fsck.minix',
 			  'tune2fs', 'dumpe2fs', 'xfs_admin', 'exfatlabel', 'udflabel', 'udfinfo', 'jfs_tune',
-			  'reiserfstune', 'debugreiserfs', 'swaplabel'}
+			  'reiserfstune', 'debugreiserfs', 'swaplabel', 'udevadm', 'e2label', 'fatlabel', 'ntfslabel', 'btrfstune', 'f2fslabel'}
 [check_path(program) for program in _binCalled]
 
 def run_command_in_multicmd_with_path_check(command, timeout=...,max_threads=1,quiet=False,dry_run=False,strict=False):
@@ -1723,7 +1729,10 @@ def get_partition_details(device, partition,sector_size=512):
 	# 		return rtnDic
 	# Get the fs type and uuid, use blkid
 	target_partition, loop_device = get_target_partition(device, partition)
-	result = run_command_in_multicmd_with_path_check(["blkid", '-o', 'export', target_partition])
+	# blkid exits 2 on a partition without a filesystem (BIOS boot, raw data): an answer, not an error.
+	error_count = len(ERRORS)
+	result = run_command_in_multicmd_with_path_check(["blkid", '-o', 'export', target_partition], quiet=True)
+	del ERRORS[error_count:]
 	for line in result:
 		if 'TYPE' in line.upper():
 			rtnDic['fs_type'] = line.split('=')[1].strip()
@@ -1860,8 +1869,7 @@ def write_partition_info(image, partition_infos, partition_name):
 					# copy dirties the superblock, so e2fsck -f must run first.
 					# These two delayed commands are an ordered pair; clean_up
 					# runs remaining delayed commands serially.
-					delayed_commands.append(_FS_FIX_COMMANDS[fs_type] + [target_partition])
-					delayed_commands.append(['tune2fs', '-U', fs_uuid, target_partition])
+					delayed_commands.extend(_fs_identity_commands(fs_type, target_partition, uuid=fs_uuid))
 				_run_mkfs_with_fallback(command, param_args, target_partition, fs_type)
 			elif fs_type == 'btrfs':
 				command = ['mkfs.btrfs']
@@ -1877,7 +1885,7 @@ def write_partition_info(image, partition_infos, partition_name):
 					command.extend(['-L', fs_label])
 				if fs_uuid:
 					#command.extend(['-m', f'uuid={fs_uuid}'])
-					delayed_commands.append(['xfs_admin', '-U', fs_uuid, target_partition])
+					delayed_commands.extend(_fs_identity_commands(fs_type, target_partition, uuid=fs_uuid))
 				_run_mkfs_with_fallback(command, param_args, target_partition, fs_type)
 			elif fs_type == 'f2fs':
 				command = ['mkfs.f2fs', '-f']
@@ -1908,7 +1916,7 @@ def write_partition_info(image, partition_infos, partition_name):
 				_run_mkfs_with_fallback(command, param_args, target_partition, fs_type)
 				if fs_uuid:
 					#run_command_in_multicmd_with_path_check(["exfatlabel", '-i', target_partition, fs_uuid],strict=False)
-					delayed_commands.append(['exfatlabel', '-i', target_partition, fs_uuid])
+					delayed_commands.extend(_fs_identity_commands(fs_type, target_partition, uuid=fs_uuid))
 			elif fs_type in ('hfsplus', 'hfs'):
 				command = [f'mkfs.{fs_type}']
 				if fs_label:
@@ -1923,7 +1931,7 @@ def write_partition_info(image, partition_infos, partition_name):
 					command.extend(['--label', fs_label])
 				if fs_uuid:
 					#command.extend(['--uuid', fs_uuid])
-					delayed_commands.append(['udflabel', '--uuid', fs_uuid, target_partition])
+					delayed_commands.extend(_fs_identity_commands(fs_type, target_partition, uuid=fs_uuid))
 				_run_mkfs_with_fallback(command, param_args, target_partition, fs_type)
 			elif fs_type == 'jfs':
 				command = ['mkfs.jfs']
@@ -1932,14 +1940,14 @@ def write_partition_info(image, partition_infos, partition_name):
 				_run_mkfs_with_fallback(command, param_args, target_partition, fs_type)
 				if fs_uuid:
 					#run_command_in_multicmd_with_path_check(["jfs_tune", '-U', fs_uuid, target_partition],strict=False)
-					delayed_commands.append(['jfs_tune', '-U', fs_uuid, target_partition])
+					delayed_commands.extend(_fs_identity_commands(fs_type, target_partition, uuid=fs_uuid))
 			elif fs_type == 'reiserfs':
 				command = ['mkfs.reiserfs']
 				if fs_label:
 					command.extend(['-l', fs_label])
 				if fs_uuid:
 					#command.extend(['-u', fs_uuid])
-					delayed_commands.append(['reiserfstune', '-u', fs_uuid, target_partition])
+					delayed_commands.extend(_fs_identity_commands(fs_type, target_partition, uuid=fs_uuid))
 				_run_mkfs_with_fallback(command, param_args, target_partition, fs_type)
 			elif fs_type == 'zfs':
 				eprint("Cannot create zfs file system: ZFS file system should be created using zpool command.")
@@ -1974,7 +1982,7 @@ def write_partition_info(image, partition_infos, partition_name):
 					command.extend(['-L', fs_label])
 				if fs_uuid:
 					#command.extend(['-U', fs_uuid])
-					delayed_commands.append(['swaplabel', '-U', fs_uuid, target_partition])
+					delayed_commands.extend(_fs_identity_commands(fs_type, target_partition, uuid=fs_uuid))
 				_run_mkfs_with_fallback(command, param_args, target_partition, fs_type)
 			elif fs_type == 'gpt':
 				eprint("Skip creating gpt padding.")
@@ -3777,7 +3785,9 @@ compare_file_list = _compare_file_lists
 
 #%% ---- Diff Image ----
 DIFF_DIR_NAME = '.hpcp_diff'
-DIFF_FORMAT_VERSION = 1
+DIFF_FORMAT_VERSION = 2
+# Single-filesystem patches keep the version hpcp 9.65 reads; disk patches (layout disk) are version 2.
+_SINGLE_FS_FORMAT_VERSION = 1
 CHANGES_HEADER = '#hpcp-changes'
 CHANGES_VERSION = 1
 ChangeRow = namedtuple('ChangeRow', 'op path old new')
@@ -3852,13 +3862,14 @@ def _mtime_ns_close(a_ns, b_ns):
 	precision = max(get_timestamp_precision(a_ns / 1e9), get_timestamp_precision(b_ns / 1e9))
 	return abs(a_ns - b_ns) <= precision * 2 * 1e9
 
-def states_equal(a, b, compare_hash=True):
+def states_equal(a, b, compare_hash=True, metadata=True):
 	"""True when two entry states describe the same entry.
 
 	Directories ignore mtime; files allow the timestamp-precision tolerance; an xattr
 	digest of '-' on either side is not compared; '?' never equals anything.
 	With compare_hash False neither the content hash nor the xattr digest is compared
-	(both come from the same hasher).
+	(both come from the same hasher). With metadata False mode, owner and xattrs are not
+	compared: on FAT, exFAT, NTFS and HFS they come from mount options, not the filesystem.
 	"""
 	if a == '?' or b == '?':
 		return False
@@ -3869,9 +3880,9 @@ def states_equal(a, b, compare_hash=True):
 		return False
 	if info_a['type'] == 'l':
 		return info_a['target'] == info_b['target']
-	if (info_a['mode'], info_a['uid'], info_a['gid']) != (info_b['mode'], info_b['uid'], info_b['gid']):
+	if metadata and (info_a['mode'], info_a['uid'], info_a['gid']) != (info_b['mode'], info_b['uid'], info_b['gid']):
 		return False
-	if compare_hash and info_a['xattr'] != '-' and info_b['xattr'] != '-' and info_a['xattr'] != info_b['xattr']:
+	if metadata and compare_hash and info_a['xattr'] != '-' and info_b['xattr'] != '-' and info_a['xattr'] != info_b['xattr']:
 		return False
 	if info_a['type'] == 'd':
 		return True
@@ -4022,18 +4033,47 @@ def read_changes(source):
 			rows.append(ChangeRow(fields[0], path, fields[2], fields[3]))
 	return rows
 
+_SECTION_NAME_RE = re.compile(r'part[1-9][0-9]*')
+_SHA256_RE = re.compile(r'[0-9a-f]{64}')
+_PART_NUMBER_RE = re.compile(r'[1-9][0-9]*')
+_ASCII_DIGITS_RE = re.compile(r'[0-9]+')
+
 def write_manifest(target, meta):
-	"""Write meta (key -> value, plus 'sections': [(name, payload_dir, changes_file)]) as key/value TSV."""
+	"""Write meta as key/value TSV.
+
+	'sections' is a list of (name, payload_dir, changes_file) and 'raws' a list of
+	(name, file, old_sha256, new_sha256, size); both are written as repeatable lines.
+	"""
 	with open(target, 'w', encoding='utf-8', errors='surrogateescape', newline='\n') as f:
 		for key, value in meta.items():
-			if key != 'sections':
+			if key not in ('sections', 'raws'):
 				f.write(f'{key}\t{_escape_field(str(value))}\n')
 		for name, payload_dir, changes_file in meta.get('sections', []):
 			f.write(f'section\t{_escape_field(name)}\t{_escape_field(payload_dir)}\t{_escape_field(changes_file)}\n')
+		for raw in meta.get('raws', []):
+			f.write('raw\t' + '\t'.join(_escape_field(str(field)) for field in raw) + '\n')
+
+def _check_raw_entry(fields):
+	"""Validate one manifest raw line (name, file, old, new, size); returns it with size as int."""
+	name, raw_file, old_sha, new_sha, size = fields
+	bare = raw_file[len('raw/'):] if raw_file.startswith('raw/') else ''
+	if not (name == 'mbr' or _SECTION_NAME_RE.fullmatch(name)):
+		raise ValueError(f'bad raw area name {name!r}')
+	if not bare or '/' in bare or bare in ('.', '..'):
+		raise ValueError(f'bad raw payload file {raw_file!r}')
+	if not (_SHA256_RE.fullmatch(old_sha) and _SHA256_RE.fullmatch(new_sha)):
+		raise ValueError('bad raw area hash')
+	if not _ASCII_DIGITS_RE.fullmatch(size):
+		raise ValueError(f'bad raw area size {size!r}')
+	return (name, raw_file, old_sha, new_sha, int(size))
 
 def read_manifest(source):
-	"""Read a manifest. Values are strings; unknown keys are kept and ignored by callers."""
-	meta = {'sections': []}
+	"""Read a manifest. Values are strings; 'sections' and 'raws' are lists of tuples.
+
+	Unknown keys are kept and ignored by callers. Raw entries and the disk table are only
+	valid in a layout disk manifest (format_version 2).
+	"""
+	meta = {'sections': [], 'raws': []}
 	seen_keys = set()
 	with open(source, 'r', encoding='utf-8', errors='surrogateescape', newline='\n') as f:
 		for line in f:
@@ -4056,10 +4096,15 @@ def read_manifest(source):
 				except ValueError:
 					raise RuntimeError(f'Patch format error: {source} has an unsafe section line {line!r}')
 				meta['sections'].append(tuple(fields[1:]))
-			elif fields[0] != 'section' and len(fields) == 2:
+			elif fields[0] == 'raw' and len(fields) == 6:
+				try:
+					meta['raws'].append(_check_raw_entry(fields[1:]))
+				except ValueError as e:
+					raise RuntimeError(f'Patch format error: {source} has an unsafe raw line {line!r}: {e}')
+			elif fields[0] not in ('section', 'raw') and len(fields) == 2:
 				key, value = fields
-				if key == 'sections':
-					raise RuntimeError(f'Patch format error: {source} uses reserved key sections')
+				if key in ('sections', 'raws'):
+					raise RuntimeError(f'Patch format error: {source} uses reserved key {key}')
 				if key in seen_keys:
 					raise RuntimeError(f'Patch format error: {source} has a duplicate key {key!r}')
 				seen_keys.add(key)
@@ -4074,7 +4119,62 @@ def read_manifest(source):
 		raise RuntimeError(f'Patch format error: {source} has a bad format_version')
 	if format_version > DIFF_FORMAT_VERSION:
 		raise RuntimeError(f'Patch format error: {source} uses format version {format_version}, newer than supported {DIFF_FORMAT_VERSION}')
+	if meta.get('layout') == 'disk':
+		if format_version < 2:
+			raise RuntimeError(f'Patch format error: {source} has layout disk but format version {format_version}')
+		for name, payload_dir, changes_file in meta['sections']:
+			if not _SECTION_NAME_RE.fullmatch(name) or payload_dir != name or changes_file != name + '.changes.tsv':
+				raise RuntimeError(f'Patch format error: {source} has a bad disk section {name!r}')
+		for kind, names in (('section', [section[0] for section in meta['sections']]), ('raw area', [raw[0] for raw in meta['raws']])):
+			if len(set(names)) != len(names):
+				raise RuntimeError(f'Patch format error: {source} names a {kind} twice')
+		disk_file = meta.get('disk', '')
+		if not disk_file or '/' in disk_file or disk_file in ('.', '..'):
+			raise RuntimeError(f'Patch format error: {source} has no valid disk table entry')
+	elif meta['raws'] or 'disk' in meta:
+		raise RuntimeError(f'Patch format error: {source} has raw areas or a disk table outside layout disk')
 	return meta
+
+DISK_HEADER = '#hpcp-disk'
+DISK_VERSION = 1
+DiskRow = namedtuple('DiskRow', 'kind number field old new')
+_DISK_FIELDS = ('guid', 'sector_size')
+_PART_FIELDS = ('kind', 'type_guid', 'unique_guid', 'name', 'attrs', 'size', 'fs_type', 'fs_uuid', 'fs_label', 'fs_params')
+
+def write_disk_tsv(target, rows):
+	"""Write disk.tsv: escaped kind / number / field / old / new rows."""
+	with open(target, 'w', encoding='utf-8', errors='surrogateescape', newline='\n') as f:
+		f.write(f'{DISK_HEADER}\t{DISK_VERSION}\n')
+		f.write('#kind\tnumber\tfield\told\tnew\n')
+		for row in rows:
+			f.write('\t'.join(_escape_field(str(value)) for value in row) + '\n')
+
+def read_disk_tsv(source):
+	"""Read disk.tsv into DiskRows. Raises RuntimeError('Patch format error: ...')."""
+	rows = []
+	with open(source, 'r', encoding='utf-8', errors='surrogateescape', newline='\n') as f:
+		header = f.readline().rstrip('\n').split('\t')
+		if len(header) != 2 or header[0] != DISK_HEADER or not _ASCII_DIGITS_RE.fullmatch(header[1]):
+			raise RuntimeError(f'Patch format error: {source} is not an hpcp disk table')
+		if int(header[1]) > DISK_VERSION:
+			raise RuntimeError(f'Patch format error: {source} has disk table version {header[1]}, newer than supported {DISK_VERSION}')
+		for line_number, line in enumerate(f, start=2):
+			line = line.rstrip('\n')
+			if not line or line.startswith('#'):
+				continue
+			try:
+				fields = [_unescape_field(field) for field in line.split('\t')]
+			except ValueError as e:
+				raise RuntimeError(f'Patch format error: {source} line {line_number}: {e}')
+			if len(fields) != 5:
+				raise RuntimeError(f'Patch format error: {source} line {line_number} is malformed')
+			kind, number, field = fields[:3]
+			ok = ((kind == 'disk' and number == '-' and field in _DISK_FIELDS) or
+				(kind == 'part' and _PART_NUMBER_RE.fullmatch(number) and field in _PART_FIELDS))
+			if not ok:
+				raise RuntimeError(f'Patch format error: {source} line {line_number} has an unknown row {kind} {number} {field}')
+			rows.append(DiskRow(*fields))
+	return rows
 
 def _logically_excluded(rel, logical_root, exclude):
 	"""True when rel (relative to a listed root) or one of its ancestors matches exclude
@@ -4188,10 +4288,13 @@ def _states_for_paths(paths, full_hash=False, read_xattrs=True, max_workers=1):
 			ERRORS.extend(chunk_errors)
 	return states
 
-def compute_changes(new_map, base_map, full_hash=False, max_workers=multiprocessing.cpu_count(), read_xattrs=True):
-	"""Rows that turn base_map's tree into new_map's tree, sorted D / A / M."""
+def compute_changes(new_map, base_map, full_hash=False, max_workers=multiprocessing.cpu_count(), read_xattrs=True, metadata=True):
+	"""Rows that turn base_map's tree into new_map's tree, sorted D / A / M.
+
+	With metadata False (see states_equal) a mode, owner or xattr difference alone is no change.
+	"""
 	states = _states_for_paths(set(new_map.values()) | set(base_map.values()), full_hash=full_hash,
-		read_xattrs=read_xattrs, max_workers=max_workers)
+		read_xattrs=read_xattrs and metadata, max_workers=max_workers)
 	rows = []
 	for key in set(new_map) | set(base_map):
 		new_state = states[new_map[key]] if key in new_map else '-'
@@ -4208,7 +4311,7 @@ def compute_changes(new_map, base_map, full_hash=False, max_workers=multiprocess
 		elif old_state[0] != new_state[0]:
 			rows.append(ChangeRow('D', key, old_state, '-'))
 			rows.append(ChangeRow('A', key, '-', new_state))
-		elif not states_equal(old_state, new_state):
+		elif not states_equal(old_state, new_state, metadata=metadata):
 			rows.append(ChangeRow('M', key, old_state, new_state))
 	return sort_change_rows(rows)
 
@@ -4351,7 +4454,7 @@ def make_patch_meta(rows, new_name, base_name, layout, full_hash=False):
 	"""Manifest fields for a new patch; 'volume' is filled in per volume by write_patch_metadata()."""
 	return {
 		'format': 'hpcp-diff',
-		'format_version': DIFF_FORMAT_VERSION,
+		'format_version': _SINGLE_FS_FORMAT_VERSION,
 		'patch_id': uuid.uuid4().hex,
 		'volume': '1/1',
 		'created': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
@@ -4370,16 +4473,64 @@ def make_patch_meta(rows, new_name, base_name, layout, full_hash=False):
 		'sections': [('root', '.', 'changes.tsv')],
 	}
 
-def _missing_payload(rows, volume_roots):
-	"""Paths of A / M file rows that no volume root holds as a regular file of the expected size."""
-	missing = []
+def _payload_allocation(rows):
+	"""Bytes a patch volume needs for rows: change list, allocation (not apparent size) and an inode each."""
+	size = 2 * sum(len(row.path) + len(row.old) + len(row.new) + 8 for row in rows)
 	for row in rows:
-		if row.op in ('A', 'M') and row.new.startswith('f:'):
-			size = decode_state(row.new)['size']
-			if not any(os.path.isfile(_key_path(volume_root, row.path)) and
-					os.path.getsize(_key_path(volume_root, row.path)) == size for volume_root in volume_roots):
-				missing.append(row.path)
-	return missing
+		if row.op in ('A', 'M'):
+			# Allocation, not apparent size, plus the inode each entry needs (512 bytes on xfs).
+			size += 512
+			if row.new.startswith('f:'):
+				size += _align_up(max(decode_state(row.new)['size'], 1))
+			else:
+				size += _IMAGE_BLOCK
+	return size
+
+def _claim_volume_names(output, count):
+	"""Create every planned volume file exclusively (O_EXCL, O_NOFOLLOW); on a clash remove what this call created."""
+	claimed = []
+	for name in [_split_dest_image_name(output, i) for i in range(count)]:
+		try:
+			os.close(os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600))
+		except FileExistsError:
+			for done in claimed:
+				try:
+					os.unlink(done)
+				except OSError:
+					pass
+			raise RuntimeError(f'Diff image error: output {name} already exists')
+		claimed.append(name)
+	return claimed
+
+def _check_payload(rows, volume_roots, full_hash=False, max_workers=1):
+	"""Raise RuntimeError('Diff image error: ...') unless every A / M file row's payload is on a volume
+	and still matches its row.
+
+	copy_file_list_parallel reports failures only on stderr and skips full destinations: a row
+	with no regular file on any volume is an incomplete payload. A live source can also change
+	between the change scan and the copy, even at the same size; that copy would fail every
+	apply's verify, so its size, hash (computed as the row's was, with HASH_SIZE and full_hash)
+	and mtime are compared with the row.
+	"""
+	missing, copies = [], {}
+	for row in rows:
+		if row.op not in ('A', 'M') or not row.new.startswith('f:'):
+			continue
+		found = [path for path in (_key_path(volume_root, row.path) for volume_root in volume_roots)
+			if os.path.isfile(path) and not os.path.islink(path)]
+		if not found:
+			missing.append(row.path)
+		else:
+			# The copy an apply would take (_payload_source), else one of another size.
+			copies[row] = _payload_source(volume_roots, row) or found[0]
+	if missing:
+		raise RuntimeError(f'Diff image error: payload incomplete for {len(missing)} file(s), e.g. {missing[0]}; patch metadata not written')
+	states = _states_for_paths(set(copies.values()), full_hash=full_hash, read_xattrs=False, max_workers=max_workers)
+	for row in sort_change_rows(copies):
+		# Size, hash and mtime, as an apply's verify compares them (mode and owner are not checked here).
+		if not states_equal(states[copies[row]], row.new, compare_hash=decode_state(row.new)['hash'] != '-', metadata=False):
+			raise RuntimeError(f'Diff image error: {row.path} changed while the patch was built; exclude it (-e) '
+				'or generate from an offline copy; patch metadata not written')
 
 def write_patch_metadata(volume_roots, rows, meta):
 	"""Write .hpcp_diff/changes.tsv on every volume first, then each volume's manifest (volume k/n).
@@ -4398,8 +4549,9 @@ def write_patch_metadata(volume_roots, rows, meta):
 		volume_meta['volume'] = f'{index}/{total}'
 		write_manifest(os.path.join(diff_dir, 'manifest'), volume_meta)
 
-def build_patch_tree(rows, new_base, volume_roots, meta, max_workers=1, verbose=False):
-	"""Copy the A / M payload of rows from new_base onto the volume roots, then write .hpcp_diff/.
+def _build_payload(rows, new_base, volume_roots, max_workers=1, verbose=False, estimated_size=0, full_hash=False):
+	"""Copy the A / M payload of rows from new_base onto the volume roots and check it landed
+	unchanged (_check_payload; full_hash as the rows were hashed).
 
 	Every map key is relpath(path, new_base), so new_base is '/' for store layout and the
 	new tree's root for root layout.
@@ -4419,7 +4571,7 @@ def build_patch_tree(rows, new_base, volume_roots, meta, max_workers=1, verbose=
 	files = [_key_path(new_base, row.path) for row in payload if row.new.startswith('f:')]
 	if files:
 		copy_file_list_parallel(files, [], new_base, list(volume_roots), max(1, max_workers), verbose=verbose,
-			estimated_size=meta.get('payload_bytes', 0))
+			estimated_size=estimated_size)
 	for row in payload:
 		if row.new.startswith('l:'):
 			_place_symlink(decode_state(row.new)['target'], _key_path(volume_roots[0], row.path))
@@ -4430,10 +4582,12 @@ def build_patch_tree(rows, new_base, volume_roots, meta, max_workers=1, verbose=
 			# A symlinked root is listed from its target (build_entry_map); take its metadata there too.
 			source = os.path.realpath(source)
 		sync_directory_metadata(source, [_key_path(volume_root, key) for volume_root in volume_roots])
-	# copy_file_list_parallel reports failures only on stderr and skips full destinations, so check the result here.
-	missing = _missing_payload(payload, volume_roots)
-	if missing:
-		raise RuntimeError(f'Diff image error: payload incomplete for {len(missing)} file(s), e.g. {missing[0]}; patch metadata not written')
+	_check_payload(payload, volume_roots, full_hash, max_workers)
+
+def build_patch_tree(rows, new_base, volume_roots, meta, max_workers=1, verbose=False):
+	"""Copy the A / M payload of rows from new_base onto the volume roots, then write .hpcp_diff/."""
+	_build_payload(rows, new_base, volume_roots, max_workers, verbose, meta.get('payload_bytes', 0),
+		str(meta.get('full_hash', 0)) == '1')
 	write_patch_metadata(volume_roots, rows, meta)
 
 PatchCheck = namedtuple('PatchCheck', 'row action found reason')
@@ -4458,7 +4612,7 @@ def _unlisted_children(key, path, deleted_keys):
 			unlisted.append(child_key)
 	return unlisted
 
-def check_patch_target(rows, target_root, compare_hash=True, full_hash=False, max_workers=1):
+def check_patch_target(rows, target_root, compare_hash=True, full_hash=False, max_workers=1, metadata=True):
 	"""Classify every row against target_root as 'apply', 'skip' or 'conflict'.
 
 	D: target == old -> apply; absent, or already the replacing A row's state -> skip.
@@ -4467,9 +4621,11 @@ def check_patch_target(rows, target_root, compare_hash=True, full_hash=False, ma
 	delete or one that cannot be listed.
 	A and M rows are judged as the target will be after the applicable D rows: a name a D
 	row removes (with or without the trailing '/'), and everything below it, counts as absent.
+	metadata False compares content only (see states_equal).
 	"""
 	paths = {row.path: _key_path(target_root, row.path) for row in rows}
-	states = _states_for_paths(set(paths.values()), full_hash=full_hash, max_workers=max_workers)
+	states = _states_for_paths(set(paths.values()), full_hash=full_hash, read_xattrs=metadata, max_workers=max_workers)
+	same = functools.partial(states_equal, compare_hash=compare_hash, metadata=metadata)
 	added_by_name = {row.path.rstrip('/'): row for row in rows if row.op == 'A'}
 	deleted_keys = {row.path for row in rows if row.op == 'D'}
 	checks = {}
@@ -4482,11 +4638,11 @@ def check_patch_target(rows, target_root, compare_hash=True, full_hash=False, ma
 		if found == '-':
 			checks[row] = PatchCheck(row, 'skip', found, 'already absent')
 			continue
-		if replacement is not None and states_equal(found, replacement.new, compare_hash):
+		if replacement is not None and same(found, replacement.new):
 			checks[row] = PatchCheck(row, 'skip', found, 'already replaced')
 			continue
 		removed_names.add(row.path.rstrip('/'))
-		if not states_equal(found, row.old, compare_hash):
+		if not same(found, row.old):
 			checks[row] = PatchCheck(row, 'conflict', found, 'changed on target')
 			continue
 		unlisted = _unlisted_children(row.path, paths[row.path], deleted_keys) if found.startswith('d:') else []
@@ -4503,13 +4659,13 @@ def check_patch_target(rows, target_root, compare_hash=True, full_hash=False, ma
 		if row.op == 'A':
 			if found == '-':
 				checks[row] = PatchCheck(row, 'apply', found, '')
-			elif states_equal(found, row.new, compare_hash):
+			elif same(found, row.new):
 				checks[row] = PatchCheck(row, 'skip', found, 'already in new state')
 			else:
 				checks[row] = PatchCheck(row, 'conflict', found, 'already exists on target')
-		elif states_equal(found, row.old, compare_hash):
+		elif same(found, row.old):
 			checks[row] = PatchCheck(row, 'apply', found, '')
-		elif states_equal(found, row.new, compare_hash):
+		elif same(found, row.new):
 			checks[row] = PatchCheck(row, 'skip', found, 'already in new state')
 		else:
 			checks[row] = PatchCheck(row, 'conflict', found, 'missing on target' if found == '-' else 'changed on target')
@@ -4548,11 +4704,11 @@ def _validate_patch_rows(rows):
 			if parent.rstrip('/') in symlinks:
 				raise RuntimeError(f'Patch format error: row {row.op} {row.path!r} lies under symlink {parent.rstrip("/")!r} created by the same patch')
 
-def load_patch_volumes(volume_roots, volume_names=None):
+def _load_patch(volume_roots, volume_names=None):
 	"""Read and cross-check every volume's manifest.
 
-	Returns (meta of volume 1, rows of volume 1, volume roots ordered by volume number).
-	volume_names (image paths, parallel to volume_roots) only improve error messages.
+	Returns (meta of volume 1, [(section name, payload dir, rows)], volume roots ordered by
+	volume number). volume_names (image paths, parallel to volume_roots) only improve error messages.
 	"""
 	names = list(volume_names) if volume_names else [str(root) for root in volume_roots]
 	metas = []
@@ -4589,26 +4745,57 @@ def load_patch_volumes(volume_roots, volume_names=None):
 		raise RuntimeError(f'Incomplete patch: missing volume(s) {expected} of {total}')
 	ordered = [by_number[number] for number in range(1, total + 1)]
 	meta = ordered[0][2]
-	if meta['sections'] != [('root', '.', 'changes.tsv')]:
-		raise RuntimeError(f'Patch format error: unsupported sections {meta["sections"]}; this hpcp applies single-filesystem patches only')
-	rows = read_changes(os.path.join(ordered[0][0], DIFF_DIR_NAME, 'changes.tsv'))
-	_validate_patch_rows(rows)
-	return meta, rows, [entry[0] for entry in ordered]
+	sections = []
+	for name, payload_dir, changes_file in meta['sections']:
+		rows = read_changes(os.path.join(ordered[0][0], DIFF_DIR_NAME, changes_file))
+		_validate_patch_rows(rows)
+		sections.append((name, payload_dir, rows))
+	return meta, sections, [entry[0] for entry in ordered]
 
-def _resolve_conflicts(conflicts, force):
-	"""Print conflicts, then prompt (default abort), abort without a tty, or force with warnings."""
-	print(f"{len(conflicts)} path(s) on the target differ from the state this patch expects:")
-	for check in conflicts:
+def load_patch_volumes(volume_roots, volume_names=None):
+	"""Single-filesystem patch: (meta, rows, volume roots ordered by volume number)."""
+	meta, sections, ordered = _load_patch(volume_roots, volume_names)
+	if meta.get('layout') == 'disk' or meta['sections'] != [('root', '.', 'changes.tsv')]:
+		raise RuntimeError(f"Patch format error: unsupported sections {meta['sections']}; disk patches apply to a whole disk (-siff PATCH -d DISK)")
+	return meta, sections[0][2], ordered
+
+def _section_volume_roots(volume_roots, payload_dir):
+	"""Where a section's payload lives on each volume.
+
+	A volume whose section directory is a symlink (or sits behind one) is left out, so the
+	payload containment root can never move outside the patch volume.
+	"""
+	if payload_dir == '.':
+		return list(volume_roots)
+	return [os.path.join(volume_root, payload_dir) for volume_root in volume_roots
+		if os.path.realpath(os.path.join(volume_root, payload_dir)) == os.path.join(os.path.realpath(volume_root), payload_dir)]
+
+def _conflict_lines(checks, prefix=''):
+	"""(detail, short) text per conflicting check, as printed in the conflict list and the forcing warnings."""
+	lines = []
+	for check in checks:
 		expected = '-' if check.row.op == 'A' else check.row.old
-		print(f"  {check.row.op} {check.row.path!r}: {check.reason} (expected {expected}, found {check.found})")
+		lines.append((f"{prefix}{check.row.op} {check.row.path!r}: {check.reason} (expected {expected}, found {check.found})",
+			f"{prefix}{check.row.op} {check.row.path}: {check.reason}"))
+	return lines
+
+def _resolve_conflict_lines(lines, force):
+	"""Print conflicts, then prompt (default abort), abort without a tty, or force with warnings."""
+	print(f"{len(lines)} path(s) on the target differ from the state this patch expects:")
+	for detail, _ in lines:
+		print(f"  {detail}")
 	if not force:
 		if not sys.stdin.isatty():
-			raise RuntimeError(f'Patch conflict: {len(conflicts)} conflicting path(s) and stdin is not a tty; nothing applied (use -fa to force)')
+			raise RuntimeError(f'Patch conflict: {len(lines)} conflicting path(s) and stdin is not a tty; nothing applied (use -fa to force)')
 		answer = multiCMD.input_with_timeout_and_countdown(60, 'Apply anyway? [y/N]')
 		if (answer or '').strip().lower() not in ('y', 'yes'):
-			raise RuntimeError(f'Patch conflict: {len(conflicts)} conflicting path(s); nothing applied')
-	for check in conflicts:
-		print(f"Warning: forcing {check.row.op} {check.row.path}: {check.reason}", file=sys.stderr)
+			raise RuntimeError(f'Patch conflict: {len(lines)} conflicting path(s); nothing applied')
+	for _, short in lines:
+		print(f"Warning: forcing {short}", file=sys.stderr)
+
+def _resolve_conflicts(conflicts, force):
+	"""Phase-1 entry point: one section's conflicting checks."""
+	_resolve_conflict_lines(_conflict_lines(conflicts), force)
 
 def _inside_root(root, path):
 	"""True when path's parent directory resolves inside root (no symlinked escape)."""
@@ -4688,7 +4875,7 @@ def _discard_temp(path):
 	except OSError as e:
 		print(f"Warning: cannot remove temporary file {path}: {e}", file=sys.stderr)
 
-def _finish_replace(job, target_root, wait):
+def _finish_replace(job, target_root, wait, metadata=True):
 	"""Wait for one temporary copy, check it, and rename it over its destination.
 
 	The temporary file is created in the live directory, so it inherits that directory's
@@ -4704,7 +4891,8 @@ def _finish_replace(job, target_root, wait):
 		info = os.lstat(tmp)
 		if not stat.S_ISREG(info.st_mode) or info.st_size != size:
 			raise RuntimeError(f'copied {info.st_size} bytes, expected {size}')
-		_remove_stale_xattrs(source, tmp)
+		if metadata:
+			_remove_stale_xattrs(source, tmp)
 		reason = _unsafe_parent(target_root, dest)
 		if reason:
 			raise RuntimeError(reason)
@@ -4714,14 +4902,24 @@ def _finish_replace(job, target_root, wait):
 	finally:
 		_discard_temp(tmp)
 
-def _replace_files(files, target_root, max_workers=1, verbose=False, full_hash=False):
+def _copy_content(src_path, dest_paths, full_hash=False, verbose=False):
+	"""copy_file for a target without POSIX metadata (FAT, exFAT, NTFS, HFS): the bytes and the
+	times only; mode and owner come from the target's mount options. Raises on failure."""
+	st = os.stat(src_path)
+	for dest in dest_paths:
+		shutil.copyfile(src_path, dest)
+		os.utime(dest, ns=(st.st_atime_ns, st.st_mtime_ns))
+
+def _replace_files(files, target_root, max_workers=1, verbose=False, full_hash=False, metadata=True):
 	"""Copy each (row, source, dest) to a temporary sibling of dest, then rename it over dest.
 
 	copy_file (cp -af) preserves mode, owner, times and xattrs; _finish_replace strips what
-	the temporary file inherited from its directory (a default ACL). Copies run on a process
+	the temporary file inherited from its directory (a default ACL). With metadata False only
+	the content and times are copied (_copy_content). Copies run on a process
 	pool, or serially when max_workers <= 1. A running process keeps the old inode, an
 	interruption leaves dest fully old or fully new, and hard links to the old file are broken.
 	"""
+	copy = copy_file if metadata else _copy_content
 	jobs = []
 	for row, source, dest in files:
 		reason = _unsafe_parent(target_root, dest)
@@ -4736,13 +4934,13 @@ def _replace_files(files, target_root, max_workers=1, verbose=False, full_hash=F
 		for job in jobs:
 			row, source, dest, tmp = job
 			_finish_replace(job, target_root,
-				functools.partial(_call_raising_recorded_failures, copy_file, source, [tmp], full_hash, verbose))
+				functools.partial(_call_raising_recorded_failures, copy, source, [tmp], full_hash, verbose), metadata)
 		return
 	with ProcessPoolExecutor(max_workers=max_workers) as executor:
-		futures = {executor.submit(_call_with_worker_init, copy_file, source, [tmp], full_hash, verbose): (row, source, dest, tmp)
+		futures = {executor.submit(_call_with_worker_init, copy, source, [tmp], full_hash, verbose): (row, source, dest, tmp)
 			for row, source, dest, tmp in jobs}
 		for future in concurrent.futures.as_completed(futures):
-			_finish_replace(futures[future], target_root, future.result)
+			_finish_replace(futures[future], target_root, future.result, metadata)
 
 def _replace_with_symlink(row, link_target, dest, target_root):
 	"""Create the symlink at a temporary sibling of dest and rename it over dest."""
@@ -4763,7 +4961,7 @@ def _replace_with_symlink(row, link_target, dest, target_root):
 		if tmp:
 			_discard_temp(tmp)
 
-def _apply_rows(rows, volume_roots, target_root, max_workers=1, verbose=False, full_hash=False, forced_rows=()):
+def _apply_rows(rows, volume_roots, target_root, max_workers=1, verbose=False, full_hash=False, forced_rows=(), metadata=True):
 	"""Carry out checked rows: deletions, then directories, files, symlinks, directory metadata.
 
 	Containment of every target path is re-checked immediately before each write, and the
@@ -4774,6 +4972,9 @@ def _apply_rows(rows, volume_roots, target_root, max_workers=1, verbose=False, f
 	existing file or symlink is never removed before its replacement exists. Only an entry
 	a rename cannot replace is removed first: a directory where a file or symlink goes, or
 	a file or symlink where a directory goes.
+	With metadata False (a FAT / exFAT / NTFS / HFS target) only content and file times are
+	written: no mode, owner, xattrs or directory metadata (new directories get the target's
+	default mode).
 	"""
 	root_norm = os.path.normpath(target_root)
 	forced_rows = set(forced_rows)
@@ -4845,7 +5046,8 @@ def _apply_rows(rows, volume_roots, target_root, max_workers=1, verbose=False, f
 		if path is None:
 			continue
 		try:
-			os.makedirs(path, mode=0o700, exist_ok=True)
+			# 0700 until sync_dir sets the payload's metadata; a content-only target keeps its default mode.
+			os.makedirs(path, mode=0o700 if metadata else 0o777, exist_ok=True)
 		except OSError as e:
 			eprint(f'Copy failed: {row.path}: {e}')
 			continue
@@ -4862,33 +5064,112 @@ def _apply_rows(rows, volume_roots, target_root, max_workers=1, verbose=False, f
 			eprint(f'Incomplete patch: payload for {row.path} is missing or unsafe in every volume')
 			continue
 		files.append((row, source, path))
-	_replace_files(files, target_root, max_workers, verbose, full_hash)
+	_replace_files(files, target_root, max_workers, verbose, full_hash, metadata)
 	for row in payload:
 		if not row.new.startswith('l:') or row.path == './':
 			continue
 		path = guarded(row, removing=True)
 		if path is not None:
 			_replace_with_symlink(row, decode_state(row.new)['target'], path, target_root)
+	if not metadata:
+		return
 	for row in sorted(dir_rows, key=lambda r: _key_depth(r.path), reverse=True):
 		sync_dir(row)
 
-def _verify_rows(rows, target_root, compare_hash=True, full_hash=False, max_workers=1):
-	"""Re-read every applied path and compare with its final expected state; returns the failure count."""
+def _verify_rows(rows, target_root, compare_hash=True, full_hash=False, max_workers=1, metadata=True):
+	"""Re-read every applied path and compare with its final expected state (content only with
+	metadata False); returns the failure count."""
 	final = {}
 	for row in sort_change_rows(rows):
 		# D sorts before A, so for a D + A pair on one name the A row decides the final state.
 		final[row.path.rstrip('/')] = row
 	paths = {name: _key_path(target_root, row.path) for name, row in final.items()}
-	states = _states_for_paths(set(paths.values()), full_hash=full_hash, max_workers=max_workers)
+	states = _states_for_paths(set(paths.values()), full_hash=full_hash, read_xattrs=metadata, max_workers=max_workers)
 	failed = 0
 	for name, row in final.items():
 		expected = '-' if row.op == 'D' else row.new
 		found = states[paths[name]]
-		ok = found == '-' if expected == '-' else states_equal(found, expected, compare_hash)
+		ok = found == '-' if expected == '-' else states_equal(found, expected, compare_hash, metadata)
 		if not ok:
 			failed += 1
 			eprint(f'Patch verify error: {row.op} {row.path}: expected {expected}, found {found}')
 	return failed
+
+# metadata False: a content-only section (see states_equal).
+SectionPlan = namedtuple('SectionPlan', 'name volume_roots target_root rows checks metadata')
+
+@contextlib.contextmanager
+def _patch_hash_settings(meta):
+	"""Use the patch's hash size while checking and verifying; yields (compare_hash, full_hash)."""
+	global HASH_SIZE
+	compare_hash = meta.get('hash_algo') == _hash_algo_name()
+	if not compare_hash:
+		print(f"Warning: patch was hashed with {meta.get('hash_algo')}, this system uses {_hash_algo_name()}; hashes and xattr digests are not compared", file=sys.stderr)
+	full_hash = meta.get('full_hash') == '1'
+	try:
+		patch_hash_size = int(meta.get('hash_size', HASH_SIZE))
+	except ValueError:
+		raise RuntimeError(f"Patch format error: bad hash_size {meta.get('hash_size')!r}")
+	saved_hash_size = HASH_SIZE
+	HASH_SIZE = patch_hash_size
+	try:
+		yield compare_hash, full_hash
+	finally:
+		HASH_SIZE = saved_hash_size
+
+def _plan_section(name, rows, volume_roots, target_root, compare_hash, full_hash, max_workers, metadata=True):
+	"""Check one section's rows against target_root; nothing changes."""
+	return SectionPlan(name, list(volume_roots), target_root, rows,
+		check_patch_target(rows, target_root, compare_hash, full_hash, max_workers, metadata), metadata)
+
+def _section_conflicts(plan):
+	return [check for check in plan.checks if check.action == 'conflict']
+
+def _section_todo(plan):
+	return [check.row for check in plan.checks if check.action != 'skip']
+
+def _resolve_section_conflicts(plans, force, extra_lines=()):
+	"""One conflict list and one prompt for every section (and extra lines such as raw areas)."""
+	lines = []
+	for plan in plans:
+		lines += _conflict_lines(_section_conflicts(plan), '' if plan.name == 'root' else f'[{plan.name}] ')
+	lines += list(extra_lines)
+	if lines:
+		_resolve_conflict_lines(lines, force)
+
+def _preflight_section(plan):
+	"""Refusals -fa cannot override, raised before anything changes."""
+	todo = _section_todo(plan)
+	# Not forceable: the deletes would run and the writes be refused, leaving the patch half applied.
+	escaping = _rows_escaping_target(todo, plan.target_root)
+	if escaping:
+		for row in escaping:
+			print(f"  {row.op} {row.path!r}: resolves outside {plan.target_root} through a symlink")
+		raise RuntimeError(f'Patch conflict: {len(escaping)} path(s) resolve outside the target through symlinks, e.g. {escaping[0].path}; nothing applied')
+	unsafe = [row for row in todo if row.op in ('A', 'M') and row.new.startswith('f:') and _payload_source(plan.volume_roots, row) is None]
+	if unsafe:
+		raise RuntimeError(f'Incomplete patch: payload missing or unsafe for {len(unsafe)} file(s), e.g. {unsafe[0].path}; nothing applied')
+
+def _apply_section(plan, max_workers, verbose, full_hash, compare_hash):
+	"""Apply a checked section and verify it; returns its summary."""
+	conflicts = _section_conflicts(plan)
+	todo = _section_todo(plan)
+	_apply_rows(todo, plan.volume_roots, plan.target_root, max_workers, verbose, full_hash,
+		forced_rows=[check.row for check in conflicts], metadata=plan.metadata)
+	verify = todo
+	if not plan.metadata:
+		# A content-only target (FAT, exFAT, ...) looks names up case-insensitively: an A / M row skipped as
+		# already done can still be lost to a D row on a name that differs only by case, so verify those too.
+		verify = todo + [check.row for check in plan.checks if check.action == 'skip' and check.row.op != 'D']
+	failed = _verify_rows(verify, plan.target_root, compare_hash, full_hash, max_workers, plan.metadata)
+	return {
+		'deleted': sum(1 for row in todo if row.op == 'D'),
+		'added': sum(1 for row in todo if row.op == 'A'),
+		'modified': sum(1 for row in todo if row.op == 'M'),
+		'skipped': len(plan.checks) - len(todo),
+		'forced': len(conflicts),
+		'failed': failed,
+	}
 
 def apply_patch_tree(volume_roots, target_root, force=False, max_workers=1, verbose=False, volume_names=None, store_note=False):
 	"""Apply a patch whose volumes are mounted (or unpacked) at volume_roots onto directory target_root.
@@ -4907,49 +5188,15 @@ def apply_patch_tree(volume_roots, target_root, force=False, max_workers=1, verb
 	A hard kill mid-apply can leave new directories with default metadata (it is applied
 	only after every write); the re-run then reports those A rows as conflicts and needs -fa.
 	"""
-	global HASH_SIZE
 	meta, rows, volume_roots = load_patch_volumes(volume_roots, volume_names)
 	if store_note and meta.get('layout') == 'store':
 		example = rows[0].path if rows else ''
 		print(f"Note: this patch uses image-store layout; paths such as {example!r} are resolved under {target_root}")
-	compare_hash = meta.get('hash_algo') == _hash_algo_name()
-	if not compare_hash:
-		print(f"Warning: patch was hashed with {meta.get('hash_algo')}, this system uses {_hash_algo_name()}; hashes and xattr digests are not compared", file=sys.stderr)
-	full_hash = meta.get('full_hash') == '1'
-	try:
-		patch_hash_size = int(meta.get('hash_size', HASH_SIZE))
-	except ValueError:
-		raise RuntimeError(f"Patch format error: bad hash_size {meta.get('hash_size')!r}")
-	saved_hash_size = HASH_SIZE
-	try:
-		HASH_SIZE = patch_hash_size
-		checks = check_patch_target(rows, target_root, compare_hash, full_hash, max_workers)
-		conflicts = [check for check in checks if check.action == 'conflict']
-		if conflicts:
-			_resolve_conflicts(conflicts, force)
-		todo = [check.row for check in checks if check.action != 'skip']
-		# Not forceable: the deletes would run and the writes be refused, leaving the patch half applied.
-		escaping = _rows_escaping_target(todo, target_root)
-		if escaping:
-			for row in escaping:
-				print(f"  {row.op} {row.path!r}: resolves outside {target_root} through a symlink")
-			raise RuntimeError(f'Patch conflict: {len(escaping)} path(s) resolve outside the target through symlinks, e.g. {escaping[0].path}; nothing applied')
-		unsafe = [row for row in todo if row.op in ('A', 'M') and row.new.startswith('f:') and _payload_source(volume_roots, row) is None]
-		if unsafe:
-			raise RuntimeError(f'Incomplete patch: payload missing or unsafe for {len(unsafe)} file(s), e.g. {unsafe[0].path}; nothing applied')
-		_apply_rows(todo, volume_roots, target_root, max_workers, verbose, full_hash,
-			forced_rows=[check.row for check in conflicts])
-		failed = _verify_rows(todo, target_root, compare_hash, full_hash, max_workers)
-	finally:
-		HASH_SIZE = saved_hash_size
-	summary = {
-		'deleted': sum(1 for row in todo if row.op == 'D'),
-		'added': sum(1 for row in todo if row.op == 'A'),
-		'modified': sum(1 for row in todo if row.op == 'M'),
-		'skipped': len(checks) - len(todo),
-		'forced': len(conflicts),
-		'failed': failed,
-	}
+	with _patch_hash_settings(meta) as (compare_hash, full_hash):
+		plan = _plan_section('root', rows, volume_roots, target_root, compare_hash, full_hash, max_workers)
+		_resolve_section_conflicts([plan], force)
+		_preflight_section(plan)
+		summary = _apply_section(plan, max_workers, verbose, full_hash, compare_hash)
 	print('Patch summary: ' + ', '.join(f'{key} {value}' for key, value in summary.items()))
 	return summary
 
@@ -4963,6 +5210,10 @@ def _probe_fs_type(device):
 	finally:
 		del ERRORS[error_count:]
 	return next((line.strip() for line in output if line.strip()), '')
+
+def _ro_mount_options(device):
+	"""Read-only mount options that also work for cloned (duplicate-UUID) xfs and dirty ext3/4 journals."""
+	return {'xfs': 'ro,nouuid,norecovery', 'ext3': 'ro,noload', 'ext4': 'ro,noload'}.get(_probe_fs_type(device), 'ro')
 
 def _mount_single_fs_image(image, read_only, mount_points, loop_devices):
 	"""Attach image, mount its largest partition (or the whole partitionless image), return the mount point + os.sep."""
@@ -4981,7 +5232,7 @@ def _mount_single_fs_image(image, read_only, mount_points, loop_devices):
 	mount_points.append(mount_point)
 	if read_only:
 		# lsblk reads udev's cache, which a fresh loop device may not have yet; blkid -p reads the device.
-		options = {'xfs': 'ro,nouuid,norecovery', 'ext3': 'ro,noload', 'ext4': 'ro,noload'}.get(_probe_fs_type(target), 'ro')
+		options = _ro_mount_options(target)
 		command = ['mount', '-o', options, target, mount_point]
 	else:
 		command = ['mount', target, mount_point]
@@ -5070,33 +5321,13 @@ def process_get_diff_image(src_paths, src_image, dest_paths, dest_image, output,
 	if not rows:
 		print(f"No differences between {new_root} and {base_root}; no patch image created.")
 		return None
-	change_list_bytes = sum(len(row.path) + len(row.old) + len(row.new) + 8 for row in rows)
-	init_size = 2 * change_list_bytes
-	for row in rows:
-		if row.op in ('A', 'M'):
-			# Allocation, not apparent size, plus the inode each entry needs (512 bytes on xfs).
-			init_size += 512
-			if row.new.startswith('f:'):
-				init_size += _align_up(max(decode_state(row.new)['size'], 1))
-			else:
-				init_size += _IMAGE_BLOCK
+	init_size = _payload_allocation(rows)
 	if os.geteuid() != 0:
 		print("Warning: creating a patch image usually needs root privileges (loop devices, mkfs, mount)", file=sys.stderr)
 	target_mount_point = tempfile.mkdtemp()
 	mount_points.append(target_mount_point)
 	count, _ = _plan_dest_images(init_size, dest_image_size)
-	claimed = []
-	for name in [_split_dest_image_name(output, i) for i in range(count)]:
-		try:
-			os.close(os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600))
-		except FileExistsError:
-			for done in claimed:
-				try:
-					os.unlink(done)
-				except OSError:
-					pass
-			raise RuntimeError(f'Diff image error: output {name} already exists')
-		claimed.append(name)
+	_claim_volume_names(output, count)
 	volume_roots = create_image(output, target_mount_point, loop_devices, [], mount_points, max_workers=max_workers,
 		dest_image_size=dest_image_size, init_size=init_size)
 	build_patch_tree(rows, new_base, volume_roots, meta, max_workers=max_workers, verbose=verbose)
@@ -5104,13 +5335,34 @@ def process_get_diff_image(src_paths, src_image, dest_paths, dest_image, output,
 	print(f"Patch image written to {output}{extra}")
 	return output
 
+def _patch_layout(volume_roots):
+	"""layout of the first readable manifest among the volumes ('root' when none can be read)."""
+	for volume_root in volume_roots:
+		try:
+			return read_manifest(os.path.join(volume_root, DIFF_DIR_NAME, 'manifest')).get('layout', 'root')
+		except (OSError, RuntimeError):
+			continue
+	return 'root'
+
 def process_load_diff_image(load_diff_image, src_paths, dest_paths, dest_image, mount_points, loop_devices,
-		force=False, max_workers=multiprocessing.cpu_count(), verbose=False):
-	"""Mount every -siff volume and apply the patch to -di IMG, -d DIR, or a single positional path."""
+		force=False, max_workers=multiprocessing.cpu_count(), verbose=False, dd=False):
+	"""Mount every -siff volume and apply the patch: a disk patch to -d DISK (or one path), a
+	single-filesystem patch to -di IMG, -d DIR, or a single positional path."""
 	images = expand_paths(load_diff_image)
 	if not images:
 		raise RuntimeError(f'Incomplete patch: no patch image found for {load_diff_image}')
 	volume_roots = [_mount_single_fs_image(image, True, mount_points, loop_devices) for image in images]
+	volume_names = [os.path.abspath(image) for image in images]
+	if _patch_layout(volume_roots) == 'disk':
+		if dest_image:
+			raise RuntimeError('Invalid arguments: disk patches take the target disk with -d (or a single path), not -di')
+		targets = expand_paths(dest_paths) if dest_paths else expand_paths(src_paths or [])
+		if len(targets) != 1 or os.path.isdir(targets[0]):
+			raise RuntimeError(f'Invalid arguments: a disk patch needs exactly one target disk (block device or disk image file), got {dest_paths or src_paths}')
+		return apply_disk_patch(volume_roots, targets[0], mount_points, loop_devices, force=force, max_workers=max_workers,
+			verbose=verbose, volume_names=volume_names)
+	if dd:
+		raise RuntimeError('Invalid arguments: -dd with -siff needs a disk patch; this is a single-filesystem patch')
 	if dest_image:
 		target_root = _mount_single_fs_image(dest_image, False, mount_points, loop_devices)
 		store_note = False
@@ -5121,7 +5373,7 @@ def process_load_diff_image(load_diff_image, src_paths, dest_paths, dest_image, 
 		target_root = os.path.abspath(targets[0])
 		store_note = target_root != os.path.abspath(os.sep)
 	return apply_patch_tree(volume_roots, target_root, force=force, max_workers=max_workers, verbose=verbose,
-		volume_names=[os.path.abspath(image) for image in images], store_note=store_note)
+		volume_names=volume_names, store_note=store_note)
 
 def _validate_diff_args(get_diff_image, load_diff_image, force_apply, src_path, src_image, dest_paths, dest_image,
 		dd=False, remove=False, remove_extra=False, target_file_list=None, compare_file_list=False,
@@ -5138,8 +5390,6 @@ def _validate_diff_args(get_diff_image, load_diff_image, force_apply, src_path, 
 	if get_diff_image and load_diff_image:
 		raise RuntimeError('Invalid arguments: -diff and -siff cannot be used together')
 	mode = '-siff' if load_diff_image else '-diff'
-	if dd:
-		raise RuntimeError(f'Invalid arguments: {mode} with -dd is not supported yet (dd-mode patches are planned)')
 	clashes = [flag for flag, enabled in (('-rm/-rf', remove), ('-rme', remove_extra), ('-fl', target_file_list),
 		('-cfl', compare_file_list), ('-dfl', diff_file_list), ('-tdfl', tar_diff_file_list), ('-co', content_only)) if enabled]
 	if clashes:
@@ -5155,6 +5405,19 @@ def _validate_diff_args(get_diff_image, load_diff_image, force_apply, src_path, 
 		if targets != 1:
 			raise RuntimeError(f'Invalid arguments: -siff needs exactly one target (-d DIR, -di IMG or one path), got {targets}')
 		return get_diff_image, src_path
+	if dd:
+		if src_image or dest_image:
+			raise RuntimeError('Invalid arguments: -dd -diff takes the new disk as a path and the old disk with -d (no -si / -di)')
+		if get_diff_image not in (None, 'auto') and os.path.lexists(os.path.expanduser(get_diff_image)):
+			# The output must not exist, so an existing path is the new disk argparse took as the patch name.
+			print(f"Note: -diff value {get_diff_image} exists; using it as the new disk and generating the patch name")
+			src_path = [get_diff_image] + src_path
+			get_diff_image = 'auto'
+		if len(src_path) != 1:
+			raise RuntimeError(f'Invalid arguments: -dd -diff needs exactly one new disk (a path), got {len(src_path)}')
+		if len(dest_paths) != 1:
+			raise RuntimeError(f'Invalid arguments: -dd -diff needs exactly one old disk (-d), got {len(dest_paths)}')
+		return get_diff_image, src_path
 	if get_diff_image not in (None, 'auto') and os.path.isdir(os.path.expanduser(get_diff_image)):
 		print(f"Note: -diff value {get_diff_image} is an existing directory; using it as the source and generating the patch name")
 		src_path = [get_diff_image] + src_path
@@ -5166,6 +5429,1047 @@ def _validate_diff_args(get_diff_image, load_diff_image, force_apply, src_path, 
 	if bases != 1:
 		raise RuntimeError(f'Invalid arguments: -diff needs exactly one base (-d DIR or -di IMG), got {bases}')
 	return get_diff_image, src_path
+
+#%% ---- Disk Patch ----
+_ESP_TYPE_GUID = 'C12A7328-F81F-11D2-BA4B-00A0C93EC93B'
+
+def _partition_devices(disk, sys_block_path='/sys/class/block'):
+	"""{partition number: device path} for disk, using the kernel's partition number, not the name suffix.
+
+	Only the disk's own partitions count: the real child directories of its sysfs node that hold
+	a 'partition' file. Other descendants (a partitioned md array built on its partitions) do not.
+	"""
+	result = {}
+	disk_dir = os.path.join(sys_block_path, os.path.basename(os.path.realpath(disk)))
+	try:
+		children = os.listdir(disk_dir)
+	except OSError:
+		return result
+	for child in children:
+		child_dir = os.path.join(disk_dir, child)
+		if os.path.islink(child_dir):
+			continue
+		try:
+			with open(os.path.join(child_dir, 'partition')) as f:
+				result[int(f.read().strip())] = '/dev/' + child
+		except (OSError, ValueError):
+			continue
+	return result
+
+def _udev_settle():
+	"""Wait until udev has handled its queued events (quietly; nothing when udevadm is missing)."""
+	if check_path('udevadm'):
+		error_count = len(ERRORS)
+		try:
+			run_command_in_multicmd_with_path_check(['udevadm', 'settle'], quiet=True)
+		finally:
+			del ERRORS[error_count:]
+
+def _settle_partitions(disk, numbers, timeout=10):
+	"""{number: device} once udev is idle and every partition in numbers has its device node.
+
+	udev re-reads a whole disk's partition table after the disk is closed from writing (a new
+	loop device, an MBR or GPT write), removing and re-adding the partition nodes meanwhile.
+	Raises RuntimeError('Disk layout mismatch: ...') when a node is still missing after timeout seconds.
+	"""
+	_udev_settle()
+	deadline = time.time() + timeout
+	while True:
+		devices = _partition_devices(disk)
+		missing = [number for number in numbers if number not in devices or not os.path.exists(devices[number])]
+		if not missing:
+			return devices
+		if time.time() >= deadline:
+			raise RuntimeError(f'Disk layout mismatch: the kernel shows no device for partition(s) {missing} of {disk}; re-read its partition table (partprobe) first')
+		time.sleep(0.1)
+
+def _stable_fs_params(value, key=''):
+	"""value without what differs between two copies of one filesystem: device paths (xfs_info's
+	meta-data=/dev/...) and ext runtime-state features (needs_recovery, orphan_present, ...)."""
+	if isinstance(value, dict):
+		return {name: _stable_fs_params(item, name) for name, item in value.items()
+			if not (isinstance(item, str) and item.startswith('/dev/'))}
+	if key == 'features' and isinstance(value, list):
+		return [feature for feature in value if feature not in _EXT_RUNTIME_FEATURES]
+	return value
+
+def _fs_params_text(params):
+	"""Stable text form of probe_fs_params() output for disk.tsv (see _stable_fs_params)."""
+	params = _stable_fs_params(params or {})
+	return ';'.join(f'{key}={params[key]}' for key in sorted(params))
+
+def _probe_identity(device):
+	"""(fs_type, fs_uuid, fs_label) of device from a low-level `blkid -p` probe ('' when nothing is found).
+
+	No blkid cache, so a label or UUID this run just changed reads back as it is on disk; exact
+	keys, so UUID_SUB (btrfs) and LABEL_FATBOOT (FAT) never stand in for UUID and LABEL.
+	"""
+	error_count = len(ERRORS)
+	try:
+		output = run_command_in_multicmd_with_path_check(['blkid', '-p', '-o', 'export', device], quiet=True)
+	finally:
+		# blkid exits 2 when it finds nothing (BIOS boot and other raw partitions).
+		del ERRORS[error_count:]
+	values = {}
+	for line in output:
+		key, sep, value = line.strip().partition('=')
+		if sep:
+			# -o export escapes shell-unsafe characters (a space in a label) with a backslash.
+			values[key] = re.sub(r'\\(.)', r'\1', value)
+	return values.get('TYPE', ''), values.get('UUID', ''), values.get('LABEL', '')
+
+def _partition_table_type(device):
+	"""Partition table type of device from a low-level `blkid -p` probe ('gpt', 'dos', ...; '' when it has none)."""
+	error_count = len(ERRORS)
+	try:
+		output = run_command_in_multicmd_with_path_check(['blkid', '-p', '-o', 'value', '-s', 'PTTYPE', device], quiet=True)
+	finally:
+		# blkid exits 2 when it finds nothing.
+		del ERRORS[error_count:]
+	return next((line.strip() for line in output if line.strip()), '')
+
+def read_disk_layout(device):
+	"""Fresh GPT + filesystem identity read of block device.
+
+	Returns {'disk': {'guid', 'sector_size', 'size'}, 'parts': {number: {'type_guid',
+	'unique_guid', 'name', 'attrs', 'size', 'fs_type', 'fs_uuid', 'fs_label', 'fs_params',
+	'device'}}}. The partition caches are cleared first: loop device names are reused.
+	Filesystem type, UUID and label come from _probe_identity, not the cached blkid read.
+	Raises RuntimeError('Disk layout mismatch: ...') unless the disk has a GPT partition table:
+	sgdisk reads an MBR disk as if it were GPT, and an identity change would convert it.
+	"""
+	pttype = _partition_table_type(device)
+	if pttype != 'gpt':
+		raise RuntimeError(f'Disk layout mismatch: {device} has no GPT partition table (found {pttype or "none"}); disk patches support GPT disks only')
+	get_partition_infos.cache_clear()
+	get_partition_details.cache_clear()
+	# A node udev is still re-adding would be probed with empty filesystem parameters.
+	_udev_settle()
+	infos = get_partition_infos(device)
+	devices = _settle_partitions(device, [int(key) for key, info in infos.items() if 'disk_identifier' not in info])
+	disk, parts = {}, {}
+	for key, info in infos.items():
+		if 'disk_identifier' in info:
+			disk = {'guid': info['disk_identifier'], 'sector_size': info['sector_size'], 'size': info['size']}
+			continue
+		number = int(key)
+		fs_type, fs_uuid, fs_label = _probe_identity(devices[number])
+		parts[number] = {
+			'type_guid': info['partition_guid_code'], 'unique_guid': info['unique_partition_guid'],
+			'name': info['partition_name'], 'attrs': info['partition_attrs'], 'size': info['size'],
+			'fs_type': fs_type, 'fs_uuid': fs_uuid, 'fs_label': fs_label,
+			'fs_params': _fs_params_text(info.get('fs_params')), 'device': devices[number],
+		}
+	return {'disk': disk, 'parts': parts}
+
+def _default_kind(part):
+	"""'swap' for swap, 'fs' when blkid found a filesystem, else 'raw' (generation may downgrade fs to raw)."""
+	if part['fs_type'] == 'swap':
+		return 'swap'
+	return 'fs' if part['fs_type'] else 'raw'
+
+def compare_disk_layouts(old, new, kinds=None):
+	"""(problems, rows): why a patch from old to new is impossible, and the disk.tsv rows.
+
+	Partition numbers, type GUIDs, filesystem types and the sector size must match; a raw
+	area must keep its size. kinds maps partition number -> 'fs' / 'swap' / 'raw'
+	(default: _default_kind of the new partition).
+	"""
+	problems = []
+	kinds = kinds or {}
+	if old['disk'].get('sector_size') != new['disk'].get('sector_size'):
+		problems.append(f"sector size {old['disk'].get('sector_size')} vs {new['disk'].get('sector_size')}")
+	if sorted(old['parts']) != sorted(new['parts']):
+		problems.append(f"partition numbers {sorted(old['parts'])} vs {sorted(new['parts'])}")
+		return problems, []
+	rows = [DiskRow('disk', '-', 'guid', str(old['disk'].get('guid', '')), str(new['disk'].get('guid', ''))),
+		DiskRow('disk', '-', 'sector_size', str(old['disk'].get('sector_size', '')), str(new['disk'].get('sector_size', '')))]
+	for number in sorted(new['parts']):
+		old_part, new_part = old['parts'][number], new['parts'][number]
+		kind = kinds.get(number) or _default_kind(new_part)
+		for field in ('type_guid', 'fs_type'):
+			if old_part[field] != new_part[field]:
+				problems.append(f'partition {number} {field} {old_part[field]!r} vs {new_part[field]!r}')
+		if kind == 'raw' and old_part['size'] != new_part['size']:
+			problems.append(f"partition {number} is a raw area and its size changed ({old_part['size']} vs {new_part['size']})")
+		rows.append(DiskRow('part', str(number), 'kind', kind, kind))
+		for field in _PART_FIELDS[1:]:
+			rows.append(DiskRow('part', str(number), field, str(old_part[field]), str(new_part[field])))
+	return problems, rows
+
+def match_target_layout(disk_rows, target):
+	"""Why target cannot take a patch with these disk.tsv rows (empty when it matches its base)."""
+	problems = []
+	parts = {}
+	for row in disk_rows:
+		if row.kind == 'disk' and row.field == 'sector_size' and str(target['disk'].get('sector_size')) != row.old:
+			problems.append(f"sector size {target['disk'].get('sector_size')}, patch expects {row.old}")
+		elif row.kind == 'part':
+			parts.setdefault(int(row.number), {})[row.field] = row
+	if sorted(parts) != sorted(target['parts']):
+		problems.append(f"partition numbers {sorted(target['parts'])}, patch expects {sorted(parts)}")
+		return problems
+	for number, fields in sorted(parts.items()):
+		missing = [field for field in _PART_FIELDS if field not in fields]
+		if missing:
+			raise RuntimeError(f"Patch format error: the disk table lacks {', '.join(missing)} for partition {number}")
+		part = target['parts'][number]
+		for field in ('type_guid', 'fs_type'):
+			if str(part[field]) != fields[field].old:
+				problems.append(f'partition {number} {field} is {part[field]!r}, patch expects {fields[field].old!r}')
+		if fields['kind'].old == 'raw' and str(part['size']) != fields['size'].old:
+			problems.append(f"partition {number} is a raw area of size {part['size']}, patch expects {fields['size'].old}")
+	return problems
+
+_MBR_BOOTCODE_SIZE = 440
+_AREA_CHUNK = 4 << 20
+
+def _hash_area(path, offset=0, length=None):
+	"""sha256 hex digest of length bytes of path from offset (to the end when length is None).
+
+	Raises OSError when path ends before offset + length.
+	"""
+	digest = hashlib.sha256()
+	remaining = length
+	with open(path, 'rb') as f:
+		f.seek(offset)
+		while remaining is None or remaining > 0:
+			chunk = f.read(_AREA_CHUNK if remaining is None else min(_AREA_CHUNK, remaining))
+			if not chunk:
+				break
+			digest.update(chunk)
+			if remaining is not None:
+				remaining -= len(chunk)
+	if remaining:
+		raise OSError(errno.EIO, f'{path} ends before byte {offset + length}')
+	return digest.hexdigest()
+
+def _copy_area(source, dest, offset, length):
+	"""Copy length bytes of source from offset into the new file dest (fsync'd); returns their sha256."""
+	digest = hashlib.sha256()
+	remaining = length
+	with open(source, 'rb') as src, open(dest, 'wb') as out:
+		src.seek(offset)
+		while remaining > 0:
+			chunk = src.read(min(_AREA_CHUNK, remaining))
+			if not chunk:
+				raise OSError(errno.EIO, f'{source} ends before byte {offset + length}')
+			out.write(chunk)
+			digest.update(chunk)
+			remaining -= len(chunk)
+		out.flush()
+		os.fsync(out.fileno())
+	return digest.hexdigest()
+
+def _write_area(target, payload, offset, length):
+	"""Write the first length bytes of payload into target at offset, then fsync.
+
+	Bytes of target outside [offset, offset + length) are left as they are (the MBR keeps its
+	disk signature, partition entries and boot signature).
+	"""
+	remaining = length
+	with open(payload, 'rb') as src, open(target, 'r+b') as out:
+		out.seek(offset)
+		while remaining > 0:
+			chunk = src.read(min(_AREA_CHUNK, remaining))
+			if not chunk:
+				raise OSError(errno.EIO, f'{payload} is shorter than {length} bytes')
+			out.write(chunk)
+			remaining -= len(chunk)
+		out.flush()
+		os.fsync(out.fileno())
+
+def _raw_payload(volume_roots, raw_file, new_sha, size):
+	"""Path of raw_file on a volume when it is a regular file inside that volume with the recorded
+	size and sha256; None when no volume holds an intact copy."""
+	for volume_root in volume_roots:
+		path = os.path.join(volume_root, raw_file)
+		if (_inside_root(volume_root, path) and os.path.isfile(path) and not os.path.islink(path)
+				and os.path.getsize(path) == size and _hash_area(path) == new_sha):
+			return path
+	return None
+
+def _plan_raw(old_sha, new_sha, found_sha):
+	"""'skip' when the area already holds the new content, 'apply' when it holds the old, else 'conflict'."""
+	if found_sha == new_sha:
+		return 'skip'
+	if found_sha == old_sha:
+		return 'apply'
+	return 'conflict'
+
+
+def _unescape_mount(text):
+	"""Undo the octal escapes (\\040 for a space, …) the kernel uses in mountinfo and /proc/swaps."""
+	return re.sub(r'\\([0-7]{3})', lambda match: chr(int(match.group(1), 8)), text)
+
+def _mountinfo_entries(mountinfo_path='/proc/self/mountinfo'):
+	"""Parsed mountinfo lines (an empty list when the file cannot be read)."""
+	entries = []
+	try:
+		f = open(mountinfo_path, encoding='utf-8', errors='surrogateescape')
+	except OSError:
+		return entries
+	with f:
+		for line in f:
+			fields = line.split()
+			if '-' not in fields or len(fields) < 7:
+				continue
+			try:
+				separator = fields.index('-')
+				major, _, minor = fields[2].partition(':')
+				entries.append({
+					'devnum': (int(major), int(minor)), 'root': _unescape_mount(fields[3]),
+					'mount_point': _unescape_mount(fields[4]), 'options': fields[5].split(','),
+					'fstype': fields[separator + 1] if len(fields) > separator + 1 else '',
+					'source': _unescape_mount(fields[separator + 2]) if len(fields) > separator + 2 else '',
+				})
+			except (ValueError, IndexError):
+				continue
+	return entries
+
+def _device_number(device):
+	"""(major, minor) of a block device node."""
+	st = os.stat(device)
+	return (os.major(st.st_rdev), os.minor(st.st_rdev))
+
+def _entry_matches(entry, devnum, device):
+	"""A mountinfo entry belongs to device: same device number, or (btrfs and other filesystems with
+	anonymous device numbers) the same source device path."""
+	if entry['devnum'] == devnum:
+		return True
+	return bool(device) and entry['source'].startswith('/') and os.path.realpath(entry['source']) == os.path.realpath(device)
+
+def _live_mount(devnum, entries, device=''):
+	"""(mount point, read_only) of the mount that shows device's whole filesystem (root '/'), or (None, False)."""
+	for entry in entries:
+		if entry['root'] == '/' and _entry_matches(entry, devnum, device):
+			return entry['mount_point'], 'ro' in entry['options']
+	return None, False
+
+def _is_mount_point(path):
+	"""True when path is a mount point, including a bind of a filesystem that path's parent also shows.
+
+	os.path.ismount compares st_dev with the parent, so it misses a bind mounted from the
+	same filesystem the directory lives on; mountinfo does not.
+	"""
+	path = path.rstrip(os.sep) or os.sep
+	if os.path.ismount(path):
+		return True
+	real = os.path.realpath(path)
+	return any(entry['mount_point'] == real for entry in _mountinfo_entries())
+
+def _swap_devices(swaps_path='/proc/swaps'):
+	"""Real paths of the active swap areas."""
+	result = set()
+	try:
+		with open(swaps_path, encoding='utf-8', errors='surrogateescape') as f:
+			next(f, None)
+			for line in f:
+				fields = line.split()
+				if fields:
+					result.add(os.path.realpath(_unescape_mount(fields[0])))
+	except OSError:
+		pass
+	return result
+
+def _partition_in_use(device, devnum, entries, swaps, sys_block_path='/sys/class/block'):
+	"""Why device is in use ('' when it is not): mounted, active swap, or held by LVM / md / dm."""
+	if any(_entry_matches(entry, devnum, device) for entry in entries):
+		return 'mounted'
+	if os.path.realpath(device) in swaps:
+		return 'active swap'
+	try:
+		if os.listdir(os.path.join(sys_block_path, os.path.basename(os.path.realpath(device)), 'holders')):
+			return 'held by another device'
+	except OSError:
+		pass
+	return ''
+
+
+_FAT_TYPES = ('fat32', 'fat16', 'fat12', 'fat', 'vfat', 'msdos')
+# Filesystems whose file modes and owners come from mount options (umask=, uid=), not the disk.
+_NO_POSIX_METADATA_TYPES = frozenset(_FAT_TYPES + ('exfat', 'ntfs', 'ntfs3', 'hfs', 'hfsplus'))
+
+def _has_posix_metadata(fs_type):
+	"""False for a filesystem whose sections are compared and applied by content only."""
+	return fs_type not in _NO_POSIX_METADATA_TYPES
+
+_IDENTITY_FIELDS = ('unique_guid', 'name', 'attrs', 'fs_uuid', 'fs_label')
+IdentityChange = namedtuple('IdentityChange', 'number field current new')
+
+def _fs_identity_commands(fs_type, device, uuid=None, label=None):
+	"""argv lists that set a filesystem's UUID and / or label on an unmounted device.
+
+	uuid / label None leave the value alone; label '' clears it. Returns None when fs_type
+	cannot have a requested value set without recreating it. dd mode's delayed UUID
+	commands (write_partition_info) come from this table too.
+	"""
+	commands = []
+	if uuid:
+		if fs_type in ('ext2', 'ext3', 'ext4'):
+			# tune2fs -U on a metadata_csum filesystem refuses unless it was freshly checked.
+			commands += [_FS_FIX_COMMANDS[fs_type] + [device], ['tune2fs', '-U', uuid, device]]
+		elif fs_type == 'xfs':
+			commands.append(['xfs_admin', '-U', uuid, device])
+		elif fs_type == 'btrfs':
+			commands.append(['btrfstune', '-f', '-U', uuid, device])
+		elif fs_type in _FAT_TYPES:
+			commands.append(['fatlabel', '-i', device, uuid.replace('-', '').upper()])
+		elif fs_type == 'exfat':
+			commands.append(['exfatlabel', '-i', device, uuid])
+		elif fs_type == 'udf':
+			commands.append(['udflabel', '--uuid', uuid, device])
+		elif fs_type == 'jfs':
+			commands.append(['jfs_tune', '-U', uuid, device])
+		elif fs_type == 'reiserfs':
+			commands.append(['reiserfstune', '-u', uuid, device])
+		elif fs_type == 'swap':
+			commands.append(['swaplabel', '-U', uuid, device])
+		else:
+			return None
+	if label is not None:
+		if fs_type in ('ext2', 'ext3', 'ext4'):
+			commands.append(['e2label', device, label])
+		elif fs_type == 'xfs':
+			commands.append(['xfs_admin', '-L', label or '--', device])
+		elif fs_type == 'btrfs':
+			commands.append(['btrfs', 'filesystem', 'label', device, label])
+		elif fs_type in _FAT_TYPES:
+			commands.append(['fatlabel', device, label])
+		elif fs_type == 'exfat':
+			commands.append(['exfatlabel', device, label])
+		elif fs_type == 'ntfs':
+			commands.append(['ntfslabel', device, label])
+		elif fs_type == 'f2fs':
+			commands.append(['f2fslabel', device, label])
+		elif fs_type == 'udf':
+			commands.append(['udflabel', device, label])
+		elif fs_type == 'jfs':
+			commands.append(['jfs_tune', '-L', label, device])
+		elif fs_type == 'reiserfs':
+			commands.append(['reiserfstune', '-l', label, device])
+		elif fs_type == 'swap':
+			commands.append(['swaplabel', '-L', label, device])
+		else:
+			return None
+	return commands
+
+def _gpt_identity_commands(disk, number=None, unique_guid=None, name=None, attrs=None, disk_guid=None):
+	"""sgdisk argv lists for a partition's unique GUID / name / attributes and the disk GUID."""
+	commands = []
+	if disk_guid:
+		commands.append(['sgdisk', f'--disk-guid={disk_guid}', disk])
+	if number is not None:
+		if unique_guid:
+			commands.append(['sgdisk', f'--partition-guid={number}:{unique_guid}', disk])
+		if name is not None:
+			commands.append(['sgdisk', f'--change-name={number}:{name}', disk])
+		if attrs:
+			commands.append(['sgdisk', f'--attributes={number}:=:{attrs}', disk])
+	return commands
+
+def _plan_identity(disk_rows, layout, in_use):
+	"""Identity values the patch changes on this target: (changes, refusals, warnings).
+
+	Values already new are skipped (re-runs). A target value that differs from the patch
+	base is a warning, not a conflict: node identities may legitimately differ. A change on
+	a partition that is in use is a refusal. The disk GUID only rewrites the GPT headers and
+	is changed even on a live disk. Raw areas carry their own filesystem identity.
+	"""
+	kinds = {row.number: row.new for row in disk_rows if row.kind == 'part' and row.field == 'kind'}
+	changes, refusals, warnings = [], [], []
+	for row in disk_rows:
+		if row.kind == 'disk':
+			if row.field != 'guid':
+				continue
+			number, current = None, str(layout['disk'].get('guid', ''))
+		else:
+			if row.field not in _IDENTITY_FIELDS:
+				continue
+			if kinds.get(row.number) == 'raw' and row.field in ('fs_uuid', 'fs_label'):
+				continue
+			number = int(row.number)
+			current = str(layout['parts'][number][row.field])
+		if row.old == row.new or current == row.new:
+			continue
+		where = 'disk' if number is None else f'partition {number}'
+		if current != row.old:
+			warnings.append(f'{where} {row.field} is {current!r}, the patch base had {row.old!r}; setting {row.new!r}')
+		if number is not None and in_use.get(number):
+			refusals.append(f'partition {number} is {in_use[number]} and its {row.field} changes')
+		changes.append(IdentityChange(number, row.field, current, row.new))
+	return changes, refusals, warnings
+
+def _identity_command_list(changes, layout, disk_device):
+	"""(commands, unsupported) for planned identity changes.
+
+	Filesystem UUID / label commands come first (per partition, UUID before label), then GPT
+	and disk GUID commands. unsupported lists (number, fields, text) that cannot be set.
+	"""
+	fs_fields, gpt_commands = {}, []
+	for change in changes:
+		if change.number is None:
+			gpt_commands += _gpt_identity_commands(disk_device, disk_guid=change.new)
+		elif change.field in ('fs_uuid', 'fs_label'):
+			fs_fields.setdefault(change.number, {})[change.field] = change.new
+		else:
+			gpt_commands += _gpt_identity_commands(disk_device, number=change.number, **{change.field: change.new})
+	commands, unsupported = [], []
+	for number, fields in sorted(fs_fields.items()):
+		part = layout['parts'][number]
+		fs_commands = _fs_identity_commands(part['fs_type'], part['device'], uuid=fields.get('fs_uuid'), label=fields.get('fs_label'))
+		if fs_commands is None:
+			names = tuple(sorted(fields))
+			unsupported.append((number, names, f"partition {number} ({part['fs_type'] or 'unknown'}) cannot have its {' / '.join(names)} set"))
+		else:
+			commands += fs_commands
+	return commands + gpt_commands, unsupported
+
+
+def _attach_disk(path, read_only, loop_devices):
+	"""Block device for path: itself when it is one, else a loop device over the disk-image file."""
+	path = os.path.abspath(os.path.expanduser(path))
+	if pathlib.Path(path).resolve().is_block_device():
+		return os.path.realpath(path)
+	if not os.path.isfile(path):
+		raise RuntimeError(f'Invalid arguments: {path} is not a block device or a disk image file')
+	loop_device = create_loop_device(path, read_only=read_only)
+	loop_devices.append(loop_device)
+	return loop_device
+
+def _release_mount(mount_point, mount_points):
+	"""Unmount one of this run's temp mounts and remove its directory (clean_up handles anything left)."""
+	path = mount_point.rstrip(os.sep)
+	if _is_mount_point(path):
+		run_command_in_multicmd_with_path_check(['umount', path], strict=False)
+	if not _is_mount_point(path):
+		try:
+			os.rmdir(path)
+		except OSError:
+			pass
+		if path in mount_points:
+			mount_points.remove(path)
+
+def _mount_partition(device, read_only, mount_points, entries):
+	"""Mount point (with a trailing separator) showing exactly device's filesystem, or None.
+
+	A partition that is already mounted is bind-mounted (non-recursively) from its live mount,
+	so filesystems mounted below it stay out of view; otherwise it is mounted directly
+	(read-only with _ro_mount_options). Nothing is recorded in ERRORS: a partition the kernel
+	cannot mount is an expected answer, and the caller decides what it means.
+	"""
+	live, _ = _live_mount(_device_number(device), entries, device)
+	mount_point = tempfile.mkdtemp()
+	mount_points.append(mount_point)
+	error_count = len(ERRORS)
+	if live:
+		run_command_in_multicmd_with_path_check(['mount', '--bind', live, mount_point], quiet=True)
+		if _is_mount_point(mount_point):
+			# Private, so mounts made later under the live filesystem do not propagate into this bind.
+			run_command_in_multicmd_with_path_check(['mount', '--make-private', mount_point], quiet=True)
+		if read_only and _is_mount_point(mount_point):
+			# Best effort: generation only reads through this bind mount.
+			run_command_in_multicmd_with_path_check(['mount', '-o', 'remount,bind,ro', mount_point], quiet=True)
+	elif read_only:
+		run_command_in_multicmd_with_path_check(['mount', '-o', _ro_mount_options(device), device, mount_point], quiet=True)
+	elif _probe_fs_type(device) == 'xfs':
+		# A clone of a mounted xfs carries the same UUID, which xfs refuses to mount twice.
+		run_command_in_multicmd_with_path_check(['mount', '-o', 'nouuid', device, mount_point], quiet=True)
+	else:
+		run_command_in_multicmd_with_path_check(['mount', device, mount_point], quiet=True)
+	del ERRORS[error_count:]
+	if not _is_mount_point(mount_point):
+		_release_mount(mount_point, mount_points)
+		return None
+	return mount_point + os.sep
+
+def _case_folded_names(entry_map, label):
+	"""{casefolded name: key} of an entry map (a name is a key without its trailing '/').
+
+	Raises RuntimeError('Diff image error: ...') when two keys differ only by case: a
+	case-insensitive filesystem (FAT, exFAT) cannot hold both, so they cannot be paired.
+	"""
+	names = {}
+	for key in sorted(entry_map, key=lambda key: (_key_depth(key), key)):
+		other = names.setdefault(key.rstrip('/').casefold(), key)
+		if other != key:
+			first, second = sorted((other, key))
+			raise RuntimeError(f'Diff image error: {label} has names that differ only by case ({first}, {second}); '
+				'a case-insensitive filesystem cannot hold both')
+	return names
+
+def _fold_case_keys(new_map, base_map, labels=('new', 'old')):
+	"""base_map re-keyed to new_map's spelling wherever a name (or an ancestor) differs only by case.
+
+	For content-only sections (FAT, exFAT, NTFS, HFS), whose lookups are case-insensitive: a
+	case-only rename then pairs the old and new entry (an M row in the new spelling, or no row),
+	instead of a D + A pair whose A rows the target would skip as present and whose D rows would
+	then delete those very entries. labels name the new and old side for the refusal of names
+	that differ only by case (see _case_folded_names).
+	"""
+	new_names = _case_folded_names(new_map, labels[0])
+	_case_folded_names(base_map, labels[1])
+	respelled = {}
+	for key, path in base_map.items():
+		name = key.rstrip('/')
+		# casefold() works per character and never adds or removes a '/': the components line up.
+		spelled, folded = [], ''
+		for part, folded_part in zip(name.split('/'), name.casefold().split('/')):
+			folded = folded + '/' + folded_part if spelled else folded_part
+			match = new_names.get(folded)
+			spelled = match.rstrip('/').split('/') if match is not None else spelled + [part]
+		respelled['/'.join(spelled) + ('/' if key.endswith('/') else '')] = path
+	return new_map, respelled
+
+def _case_collision(rows):
+	"""(D path, A / M path) of the first pair whose names are equal, or one the other's ancestor, only
+	when compared case-insensitively; None when there is none.
+
+	On a case-insensitive target such a pair deletes what the patch writes (or skips as present).
+	A pair on exactly one name, or exactly nested, is an ordinary type change.
+	"""
+	deleted, written = {}, {}
+	for row in rows:
+		name = row.path.rstrip('/')
+		(deleted if row.op == 'D' else written).setdefault(name.casefold(), []).append((name, row.path))
+	def prefixes(name):
+		parts = name.split('/')
+		return ['/'.join(parts[:depth]) for depth in range(1, len(parts) + 1)]
+	for row in sort_change_rows(rows):
+		if row.op == 'D':
+			continue
+		# A deleted name equal to (or an ancestor of) this written one, only case-insensitively.
+		for prefix in prefixes(row.path.rstrip('/')):
+			for name, path in deleted.get(prefix.casefold(), ()):
+				if name != prefix:
+					return path, row.path
+	for row in sort_change_rows(rows):
+		if row.op != 'D':
+			continue
+		# A written name that is an ancestor of this deleted one, only case-insensitively.
+		for prefix in prefixes(row.path.rstrip('/'))[:-1]:
+			for name, path in written.get(prefix.casefold(), ()):
+				if name != prefix:
+					return row.path, path
+	return None
+
+def _partition_changes(new_root, old_root, mount_points, live_mounts, exclude, full_hash, max_workers, parallel_file_listing,
+		input_files=(), metadata=True, labels=('new', 'old')):
+	"""Change rows of one filesystem partition (root to root; lost+found, this run's mounts and
+	its input disk-image files left out). metadata False: content-only rows (see states_equal),
+	with names paired case-insensitively (see _fold_case_keys; labels name the two sides)."""
+	matched = os.path.abspath(new_root)
+	patterns = _mount_point_excludes(mount_points, (new_root, old_root), matched)
+	for live_mount in live_mounts:
+		if not live_mount:
+			continue
+		# A live filesystem holds the (empty) directories of this run's other temp mount points,
+		# and may hold the disk images this run compares (the old golden image on the new golden).
+		live_real = os.path.realpath(live_mount)
+		for path in list(mount_points) + list(input_files):
+			path_real = os.path.realpath(path)
+			if path_real.startswith(live_real.rstrip(os.sep) + os.sep):
+				patterns.add(glob.escape(os.path.join(matched, os.path.relpath(path_real, live_real))))
+	new_map, base_map = build_root_maps(new_root, old_root, frozenset(exclude or ()) | patterns, max_workers, parallel_file_listing)
+	new_map, base_map = _drop_lost_found(new_map), _drop_lost_found(base_map)
+	if any(_is_reserved_key(key) for key in new_map):
+		raise RuntimeError(f'Diff image error: {new_root} contains {DIFF_DIR_NAME}, which hpcp reserves for patch metadata')
+	if not metadata:
+		new_map, base_map = _fold_case_keys(new_map, base_map, labels)
+	rows = compute_changes(new_map, base_map, full_hash=full_hash, max_workers=max_workers, metadata=metadata)
+	_validate_patch_rows(rows)
+	return rows
+
+def _refuse_raw_in_use(number, disks, entries, swaps):
+	"""Raise 'Disk in use' when partition number, to be compared as a raw area, is in use on any
+	of disks ([(name, layout)]): a raw area that changes while it is hashed and copied fails late,
+	after a full copy. Swap partitions are identity-only and never come here."""
+	for name, layout in disks:
+		device = layout['parts'][number]['device']
+		reason = _partition_in_use(device, _device_number(device), entries, swaps)
+		if reason:
+			raise RuntimeError(f'Disk in use: partition {number} of {name} is {reason}; a raw area cannot be copied while it is in use; generate from an offline copy')
+
+def _is_identity_change(row, kinds):
+	"""A disk.tsv row whose value the patch would set on a target."""
+	if row.old == row.new:
+		return False
+	if row.kind == 'disk':
+		return row.field == 'guid'
+	if row.field not in _IDENTITY_FIELDS:
+		return False
+	return not (kinds.get(int(row.number)) == 'raw' and row.field in ('fs_uuid', 'fs_label'))
+
+def make_disk_patch_meta(sections, raws, new_name, base_name, full_hash=False):
+	"""Manifest fields for a disk patch; sections = [(number, rows)], raws = [(name, file, old, new, size)]."""
+	meta = make_patch_meta([row for _, rows in sections for row in rows], new_name, base_name, 'disk', full_hash)
+	meta['format_version'] = DIFF_FORMAT_VERSION
+	meta['sections'] = [(f'part{number}', f'part{number}', f'part{number}.changes.tsv') for number, _ in sections]
+	meta['raws'] = list(raws)
+	meta['disk'] = 'disk.tsv'
+	meta['raw_bytes'] = sum(raw[4] for raw in raws)
+	return meta
+
+def write_disk_patch_metadata(volume_roots, sections, disk_rows, meta):
+	"""Write every change list and disk.tsv on every volume first, then each volume's manifest (volume k/n)."""
+	total = len(volume_roots)
+	for volume_root in volume_roots:
+		diff_dir = os.path.join(volume_root, DIFF_DIR_NAME)
+		os.makedirs(diff_dir, exist_ok=True)
+		for number, rows in sections:
+			write_changes(os.path.join(diff_dir, f'part{number}.changes.tsv'), rows)
+		write_disk_tsv(os.path.join(diff_dir, meta['disk']), disk_rows)
+	for index, volume_root in enumerate(volume_roots, start=1):
+		volume_meta = dict(meta)
+		volume_meta['volume'] = f'{index}/{total}'
+		write_manifest(os.path.join(volume_root, DIFF_DIR_NAME, 'manifest'), volume_meta)
+
+def _store_raw(volume_roots, raw_file, device, size, new_sha):
+	"""Copy a raw area (the first size bytes of device) into raw_file on a volume with room."""
+	for volume_root in volume_roots:
+		if shutil.disk_usage(volume_root).free > size + (1 << 20):
+			dest = os.path.join(volume_root, raw_file)
+			os.makedirs(os.path.dirname(dest), exist_ok=True)
+			if _copy_area(device, dest, 0, size) != new_sha:
+				raise RuntimeError(f'Raw area error: {raw_file} changed while it was copied; patch metadata not written')
+			return dest
+	raise RuntimeError(f'Diff image error: no patch volume has room for {raw_file} ({format_bytes(size)}B); use a larger -dis')
+
+def process_get_disk_diff_image(src_paths, dest_paths, output, mount_points, loop_devices, exclude=None,
+		full_hash=False, dest_image_size=0, max_workers=multiprocessing.cpu_count(), parallel_file_listing=False, verbose=False):
+	"""Write a disk patch image that turns a disk laid out like the old disk (-d) into the new disk.
+
+	Both disks are GPT block devices or disk-image files and are only read. Returns the
+	patch path, or None when the disks do not differ (no image is created).
+	"""
+	sources, bases = expand_paths(src_paths or []), expand_paths(dest_paths or [])
+	if len(sources) != 1 or len(bases) != 1:
+		raise RuntimeError(f'Invalid arguments: -dd -diff needs exactly one new disk and one old disk (-d), got {src_paths} and {dest_paths}')
+	new_name, base_name = os.path.basename(sources[0]), os.path.basename(bases[0])
+	if not output or output == 'auto':
+		output = f'DIFF_{new_name}_TO_{base_name}_{int(time.time())}.img'
+	output = os.path.abspath(os.path.expanduser(output))
+	if os.path.lexists(output):
+		raise RuntimeError(f'Diff image error: output {output} already exists')
+	new_disk = _attach_disk(sources[0], True, loop_devices)
+	old_disk = _attach_disk(bases[0], True, loop_devices)
+	new_layout, old_layout = read_disk_layout(new_disk), read_disk_layout(old_disk)
+	problems, _ = compare_disk_layouts(old_layout, new_layout)
+	if problems:
+		raise RuntimeError('Disk layout mismatch: ' + '; '.join(problems) + '; re-clone instead')
+	# Disk-image files (not block devices) that may lie on a live partition being compared.
+	input_files = [os.path.realpath(path) for path in (sources[0], bases[0]) if os.path.isfile(path)]
+	entries = _mountinfo_entries()
+	swaps = _swap_devices()
+	disks = ((sources[0], new_layout), (bases[0], old_layout))
+	for number in sorted(new_layout['parts']):
+		if _default_kind(new_layout['parts'][number]) == 'raw':
+			_refuse_raw_in_use(number, disks, entries, swaps)
+	kinds, sections, raws = {}, [], []
+	for number in sorted(new_layout['parts']):
+		new_part, old_part = new_layout['parts'][number], old_layout['parts'][number]
+		kind = _default_kind(new_part)
+		if kind == 'fs':
+			new_root = _mount_partition(new_part['device'], True, mount_points, entries)
+			old_root = _mount_partition(old_part['device'], True, mount_points, entries)
+			if new_root and old_root:
+				lives = [_live_mount(_device_number(part['device']), entries, part['device'])[0] for part in (new_part, old_part)]
+				rows = _partition_changes(new_root, old_root, mount_points, lives, exclude, full_hash, max_workers, parallel_file_listing,
+					input_files, _has_posix_metadata(new_part['fs_type']), (f'part{number} of {sources[0]}', f'part{number} of {bases[0]}'))
+				_release_mount(old_root, mount_points)
+				if rows:
+					# Kept mounted: its payload is copied once the patch image exists.
+					sections.append((number, new_root, rows))
+				else:
+					_release_mount(new_root, mount_points)
+			else:
+				for root in (new_root, old_root):
+					if root:
+						_release_mount(root, mount_points)
+				failed = ' and '.join(side for side, root in (('new', new_root), ('old', old_root)) if not root)
+				print(f"Warning: partition {number} ({new_part['fs_type']}) could not be mounted on the {failed} side; comparing it as a raw area", file=sys.stderr)
+				_refuse_raw_in_use(number, disks, entries, swaps)
+				kind = 'raw'
+		if kind == 'raw':
+			if new_part['size'] != old_part['size']:
+				raise RuntimeError(f"Disk layout mismatch: partition {number} is a raw area and its size changed ({old_part['size']} vs {new_part['size']}); re-clone instead")
+			old_sha, new_sha = _hash_area(old_part['device'], 0, old_part['size']), _hash_area(new_part['device'], 0, new_part['size'])
+			if old_sha != new_sha:
+				raws.append((f'part{number}', new_part['device'], new_part['size'], old_sha, new_sha))
+		kinds[number] = kind
+	old_mbr, new_mbr = _hash_area(old_disk, 0, _MBR_BOOTCODE_SIZE), _hash_area(new_disk, 0, _MBR_BOOTCODE_SIZE)
+	if old_mbr != new_mbr:
+		raws.append(('mbr', new_disk, _MBR_BOOTCODE_SIZE, old_mbr, new_mbr))
+	_, disk_rows = compare_disk_layouts(old_layout, new_layout, kinds)
+	for row in disk_rows:
+		if row.field == 'fs_params' and row.old != row.new:
+			print(f"Warning: partition {row.number} was created with different mkfs parameters ({row.old} -> {row.new}); a patch cannot change them", file=sys.stderr)
+	identity = [row for row in disk_rows if _is_identity_change(row, kinds)]
+	raw_entries = [(name, 'raw/mbr-bootcode.bin' if name == 'mbr' else f'raw/{name}.img', old_sha, new_sha, size)
+		for name, _, size, old_sha, new_sha in raws]
+	section_rows = [(number, rows) for number, _, rows in sections]
+	meta = make_disk_patch_meta(section_rows, raw_entries, new_name, base_name, full_hash)
+	print(f"Disk changes: {len(sections)} filesystem section(s), {len(raws)} raw area(s), {len(identity)} identity value(s); "
+		f"{meta['added']} added, {meta['modified']} modified, {meta['deleted']} deleted; "
+		f"payload {format_bytes(meta['payload_bytes'])}B, raw {format_bytes(meta['raw_bytes'])}B")
+	if not sections and not raws and not identity:
+		print(f"No differences between {sources[0]} and {bases[0]}; no patch image created.")
+		return None
+	init_size = (sum(_payload_allocation(rows) for _, rows in section_rows) + sum(_align_up(raw[2]) for raw in raws)
+		+ 64 * 1024 * (len(sections) + 1))
+	count, volume_size = _plan_dest_images(init_size, dest_image_size)
+	largest_raw = max((raw[2] for raw in raws), default=0)
+	# Same usable-space estimate as _plan_dest_images uses for split volumes.
+	if count > 1 and largest_raw > int(volume_size * 0.90) - (16 << 20):
+		needed = _align_up(int((largest_raw + (16 << 20)) / 0.90) + 1)
+		# Whole MiB, rounded up, in a form the -dis parser reads exactly ('M' alone is 10^6 bytes).
+		needed_mib = (needed + (1 << 20) - 1) >> 20
+		raise RuntimeError(f'Diff image error: a raw area of {format_bytes(largest_raw)}B must fit in one patch volume; use -dis {needed_mib}MiB or larger')
+	if os.geteuid() != 0:
+		print("Warning: creating a patch image usually needs root privileges (loop devices, mkfs, mount)", file=sys.stderr)
+	target_mount_point = tempfile.mkdtemp()
+	mount_points.append(target_mount_point)
+	_claim_volume_names(output, count)
+	volume_roots = create_image(output, target_mount_point, loop_devices, [], mount_points, max_workers=max_workers,
+		dest_image_size=dest_image_size, init_size=init_size)
+	# Raw areas first, largest first: each must fit whole in one volume, and section payloads
+	# copied before them would fill the first volume.
+	for (name, device, size, old_sha, new_sha), entry in sorted(zip(raws, raw_entries), key=lambda pair: (-pair[0][2], pair[0][0])):
+		_store_raw(volume_roots, entry[1], device, size, new_sha)
+	for number, new_root, rows in sections:
+		section_roots = [os.path.join(volume_root, f'part{number}') for volume_root in volume_roots]
+		for root in section_roots:
+			os.makedirs(root, exist_ok=True)
+		_build_payload(rows, new_root, section_roots, max_workers, verbose, _payload_bytes(rows), full_hash)
+	write_disk_patch_metadata(volume_roots, section_rows, disk_rows, meta)
+	extra = f" (+{len(volume_roots) - 1} more volume(s))" if len(volume_roots) > 1 else ''
+	print(f"Disk patch image written to {output}{extra}")
+	return output
+
+def _check_disk_entries(meta, disk_rows):
+	"""Raise RuntimeError('Patch format error: ...') unless the manifest's sections and raw areas
+	agree with disk.tsv.
+
+	Patch images are untrusted input: a section must be a partition of kind fs, a raw partition
+	area a partition of kind raw of exactly its recorded size, and the mbr area exactly the boot
+	code (a longer one would write into the partition table). No partition may change its kind.
+	"""
+	parts = {}
+	for row in disk_rows:
+		if row.kind == 'part':
+			parts.setdefault(row.number, {})[row.field] = row
+	for number, fields in sorted(parts.items(), key=lambda item: int(item[0])):
+		kind = fields.get('kind')
+		if kind is not None and kind.old != kind.new:
+			raise RuntimeError(f'Patch format error: the disk table changes the kind of partition {number} ({kind.old} -> {kind.new})')
+
+	def partition(entry, name, wanted, label):
+		"""disk.tsv fields of the partition entry name refers to, which must be of kind wanted."""
+		number = name[len('part'):]
+		if number not in parts:
+			raise RuntimeError(f'Patch format error: {entry} {name} is for partition {number}, which the disk table does not list')
+		kind = parts[number]['kind'].old if 'kind' in parts[number] else 'no kind'
+		if kind != wanted:
+			raise RuntimeError(f'Patch format error: {entry} {name} is for partition {number}, which the disk table records as {kind}, not {label}')
+		return number, parts[number]
+
+	for name, _, _ in meta['sections']:
+		partition('section', name, 'fs', 'a filesystem')
+	for name, _, _, _, size in meta['raws']:
+		if name == 'mbr':
+			if size != _MBR_BOOTCODE_SIZE:
+				raise RuntimeError(f'Patch format error: raw area mbr is {size} bytes; the MBR boot code area is {_MBR_BOOTCODE_SIZE} bytes')
+			continue
+		number, fields = partition('raw area', name, 'raw', 'a raw area')
+		recorded = fields['size'].old if 'size' in fields else 'no size'
+		if str(size) != recorded or 'size' in fields and fields['size'].new != recorded:
+			raise RuntimeError(f'Patch format error: raw area {name} is {size} bytes; the disk table records {recorded} for partition {number}')
+
+def _refuse_if_image_in_use(image):
+	"""Refuse an image-file target that is already attached to any loop device.
+
+	A second read-write loop over the same file would leave the first one's page cache stale, and
+	swap or a dm/LVM/md holder on the first one would not be seen as in use.
+	"""
+	error_count = len(ERRORS)
+	try:
+		output = run_command_in_multicmd_with_path_check(['losetup', '-j', image], quiet=True)
+	finally:
+		del ERRORS[error_count:]
+	for line in output:
+		loop = line.partition(':')[0].strip()
+		if not loop:
+			continue
+		raise RuntimeError(f'Disk in use: {image} is attached as {loop}; detach it (losetup -d {loop}) or apply the patch to {loop}')
+
+def apply_disk_patch(volume_roots, target, mount_points, loop_devices, force=False, max_workers=1, verbose=False, volume_names=None):
+	"""Apply a disk patch (layout disk) to target: a GPT block device or disk-image file.
+
+	Everything is checked before anything changes: the layout, which partitions are in use,
+	every section's paths, the raw areas and the identity values. Filesystem sections are
+	applied first (partition order, ESP last), then raw partition areas, the MBR boot code
+	and identity changes; then everything is verified. A section that fails stops the apply
+	there: later sections, raw areas, boot code and identity changes are left for a re-run.
+	So does a raw area that cannot be written: later raw areas, the boot code and identity changes.
+	Returns {'sections', 'raw_written', 'raw_skipped', 'identity_changed', 'forced', 'failed'}.
+	"""
+	meta, sections, volume_roots = _load_patch(volume_roots, volume_names)
+	if meta.get('layout') != 'disk':
+		raise RuntimeError('Invalid arguments: this is a single-filesystem patch; apply it to a directory or a filesystem image')
+	disk_rows = read_disk_tsv(os.path.join(volume_roots[0], DIFF_DIR_NAME, meta['disk']))
+	_check_disk_entries(meta, disk_rows)
+	fs_types = {row.number: row.old for row in disk_rows if row.kind == 'part' and row.field == 'fs_type'}
+	for name, _, rows in sections:
+		# Patches from older hpcp turned a case-only rename into a D + A pair, which deletes the files on FAT.
+		collision = None if _has_posix_metadata(fs_types.get(name[len('part'):], '')) else _case_collision(rows)
+		if collision:
+			raise RuntimeError(f'Patch format error: section {name} deletes and writes {collision[0]} and {collision[1]} '
+				'differing only by case; regenerate the patch with this hpcp')
+	target = os.path.abspath(os.path.expanduser(target))
+	entries = _mountinfo_entries()
+	if not pathlib.Path(target).resolve().is_block_device():
+		_refuse_if_image_in_use(target)
+	disk = _attach_disk(target, False, loop_devices)
+	if not _partition_table_type(disk):
+		raise RuntimeError(f'Invalid arguments: {target} is not a partitioned disk; a disk patch needs a whole GPT disk (block device or disk image)')
+	layout = read_disk_layout(disk)
+	problems = match_target_layout(disk_rows, layout)
+	if problems:
+		raise RuntimeError('Disk layout mismatch: ' + '; '.join(problems) + '; nothing applied')
+	swaps = _swap_devices()
+	in_use = {number: _partition_in_use(part['device'], _device_number(part['device']), entries, swaps)
+		for number, part in layout['parts'].items()}
+	changes, refusals, warnings = _plan_identity(disk_rows, layout, in_use)
+	raw_plan = []
+	for name, raw_file, old_sha, new_sha, size in meta['raws']:
+		number = None if name == 'mbr' else int(name[len('part'):])
+		if number is not None and in_use.get(number):
+			# Refused without reading it: a live area (an LVM PV, say) can be hundreds of GB.
+			refusals.append(f'partition {number} is {in_use[number]} and its raw area changes')
+			continue
+		device = disk if number is None else layout['parts'][number]['device']
+		found = _hash_area(device, 0, size)
+		action = _plan_raw(old_sha, new_sha, found)
+		payload = None
+		if action != 'skip':
+			payload = _raw_payload(volume_roots, raw_file, new_sha, size)
+			if payload is None:
+				raise RuntimeError(f'Incomplete patch: raw payload {raw_file} is missing or damaged; nothing applied')
+		raw_plan.append({'name': name, 'device': device, 'size': size, 'payload': payload, 'action': action,
+			'found': found, 'new': new_sha})
+	for name, _, _ in sections:
+		part = layout['parts'][int(name[len('part'):])]
+		live, live_read_only = _live_mount(_device_number(part['device']), entries, part['device'])
+		if live and live_read_only:
+			refusals.append(f'partition {name[len("part"):]} is mounted read-only at {live}')
+	if refusals:
+		raise RuntimeError('Disk in use: ' + '; '.join(refusals) + '; apply this patch offline')
+	commands, unsupported = _identity_command_list(changes, layout, disk)
+	if unsupported and not force:
+		raise RuntimeError('Identity change error: ' + '; '.join(text for _, _, text in unsupported) + '; nothing applied (use -fa to apply the rest)')
+	for _, _, text in unsupported:
+		print(f'Warning: {text}; skipped', file=sys.stderr)
+	for text in warnings:
+		print(f'Warning: {text}', file=sys.stderr)
+	skipped_identity = {(number, field) for number, fields, _ in unsupported for field in fields}
+	with _patch_hash_settings(meta) as (compare_hash, full_hash):
+		plans = []
+		for name, payload_dir, rows in sections:
+			part = layout['parts'][int(name[len('part'):])]
+			root = _mount_partition(part['device'], False, mount_points, entries)
+			if root is None:
+				raise RuntimeError(f"Disk layout mismatch: partition {name[len('part'):]} ({part['fs_type']}) cannot be mounted read-write; nothing applied")
+			plans.append(_plan_section(name, rows, _section_volume_roots(volume_roots, payload_dir), root, compare_hash, full_hash, max_workers,
+				_has_posix_metadata(fs_types.get(name[len('part'):], ''))))
+		raw_conflicts = [entry for entry in raw_plan if entry['action'] == 'conflict']
+		extra = [(f"raw {entry['name']}: content matches neither the patch base nor the new state (found {entry['found'][:12]})",
+			f"raw {entry['name']}: content differs") for entry in raw_conflicts]
+		_resolve_section_conflicts(plans, force, extra)
+		for plan in plans:
+			_preflight_section(plan)
+		summaries = {}
+		stopped = None
+		order = sorted(plans, key=lambda plan: (layout['parts'][int(plan.name[len('part'):])]['type_guid'].upper() == _ESP_TYPE_GUID,
+			int(plan.name[len('part'):])))
+		for plan in order:
+			# A failed section (ENOSPC on the root, say) stops everything after it: the ESP, raw areas,
+			# boot code and identity changes could otherwise leave the node unbootable.
+			if stopped is None:
+				summaries[plan.name] = _apply_section(plan, max_workers, verbose, full_hash, compare_hash)
+				if summaries[plan.name]['failed']:
+					stopped = plan.name
+			_release_mount(plan.target_root, mount_points)
+	failed = sum(summary['failed'] for summary in summaries.values())
+	pending = [entry for entry in raw_plan if entry['action'] != 'skip'] if stopped is None else []
+	attempted = []
+	raw_stopped = None
+	# Partition areas first, the MBR boot code last. A write that fails stops the rest and the identity
+	# changes: boot code pointing at a core image that is not there would leave the node unbootable.
+	for entry in sorted(pending, key=lambda entry: entry['name'] == 'mbr'):
+		attempted.append(entry)
+		try:
+			_write_area(entry['device'], entry['payload'], 0, entry['size'])
+		except OSError as e:
+			entry['error'] = str(e)
+			raw_stopped = entry['name']
+			break
+	if stopped is None:
+		# udev re-reads the partition table after the disk device was closed from writing (MBR write, sgdisk).
+		_settle_partitions(disk, sorted(layout['parts']))
+		if raw_stopped is None:
+			for command in commands:
+				run_command_in_multicmd_with_path_check(command, strict=False)
+			_settle_partitions(disk, sorted(layout['parts']))
+	# Verify after the identity commands: sgdisk rewriting the GPT must not have undone a raw write.
+	written = 0
+	for entry in attempted:
+		reason = entry.get('error')
+		if not reason:
+			try:
+				if _hash_area(entry['device'], 0, entry['size']) == entry['new']:
+					written += 1
+					continue
+				reason = 'does not hold the new content after writing'
+			except OSError as e:
+				reason = str(e)
+		failed += 1
+		eprint(f"Raw area error: {entry['name']}: {reason}")
+	changed = 0
+	applied = ([change for change in changes if (change.number, change.field) not in skipped_identity]
+		if stopped is None and raw_stopped is None else [])
+	if applied:
+		after = read_disk_layout(disk)
+		for change in applied:
+			current = str(after['disk'].get('guid', '')) if change.number is None else str(after['parts'][change.number][change.field])
+			if current == change.new:
+				changed += 1
+			else:
+				failed += 1
+				where = 'disk' if change.number is None else f'partition {change.number}'
+				eprint(f'Identity change error: {where} {change.field} is {current!r}, expected {change.new!r}')
+	for name in sorted(summaries, key=lambda name: int(name[len('part'):])):
+		item = summaries[name]
+		print(f"Section {name}: deleted {item['deleted']}, added {item['added']}, modified {item['modified']}, "
+			f"skipped {item['skipped']}, forced {item['forced']}, failed {item['failed']}")
+	summary = {
+		'sections': summaries,
+		'raw_written': written,
+		'raw_skipped': sum(1 for entry in raw_plan if entry['action'] == 'skip'),
+		'identity_changed': changed,
+		'forced': sum(summary['forced'] for summary in summaries.values()) + sum(1 for entry in attempted if entry['action'] == 'conflict'),
+		'failed': failed,
+	}
+	print(f"Disk patch summary: {len(summaries)} section(s), added {sum(item['added'] for item in summaries.values())}, "
+		f"modified {sum(item['modified'] for item in summaries.values())}, deleted {sum(item['deleted'] for item in summaries.values())}, raw written {written}, raw skipped {summary['raw_skipped']}, "
+		f"identity changed {changed}, forced {summary['forced']}, failed {failed}")
+	if stopped is not None:
+		# Same category as the section's own failures (_verify_rows); a re-run skips what is done.
+		eprint(f'Patch verify error: stopping: section {stopped} failed; later sections, raw areas, boot code and identity changes '
+			f'were not applied; fix the cause and re-run')
+	elif raw_stopped is not None:
+		later = 'the identity changes were' if raw_stopped == 'mbr' else 'later raw areas, the boot code and identity changes were'
+		eprint(f'Raw area error: stopping: raw area {raw_stopped} could not be written; {later} not applied; fix the cause and re-run')
+	return summary
 
 #%% ---- Remove Extra ----
 def remove_extra_dirs(src_paths, dests,exclude=None):
@@ -5970,7 +7274,7 @@ def clean_up(mount_points: list,loop_devices: list, delayed_commands: list = Non
 	for mount_point in list(mount_points):
 		print(f"Unmounting {mount_point}")
 		run_command_in_multicmd_with_path_check(["umount",mount_point],strict=False)
-		if os.path.ismount(mount_point):
+		if _is_mount_point(mount_point):
 			# Still busy; sync and retry once before leaving it for loop detach retries.
 			try:
 				os.sync()
@@ -6040,12 +7344,12 @@ def get_args(args = None):
 	parser.add_argument('-pfl', '--parallel_file_listing', action='store_true', help='Use parallel processing for file listing')
 	parser.add_argument('src_path', nargs='*', type=str, help='Source Path')
 	parser.add_argument('-si','--src_image',action='append', type=str, help='Source Image, mount the image and copy the files from it.')
-	parser.add_argument('-siff','--load_diff_image',action='append', type=str, help='Apply a patch image made by -diff to the target (-d / -di or a single path). Repeat for each -dis volume. Every path the patch touches is checked first; conflicts prompt before being overridden.')
+	parser.add_argument('-siff','--load_diff_image',action='append', type=str, help='Apply a patch image made by -diff to the target (-d / -di or a single path). Repeat for each -dis volume. Every path the patch touches is checked first; conflicts prompt before being overridden. A disk patch (made with -dd -diff) takes the target disk with -d.')
 	parser.add_argument('-d','-C','--dest_path',action='append', type=str, help='Destination Path')
 	parser.add_argument('-rds','--random_dest_selection', action='store_true', help='Randomly select destination path from the list of destination paths instead of filling round robin. Can speed up transfer if dests are on different devices. Warning: can cause unable to fit in big files as dests are filled up by smaller files.')
 	parser.add_argument('-di','--dest_image', type=str, help='Base name for destination Image, create a image file and copy the files into it.')
 	parser.add_argument('-dis','--dest_image_size', type=str, help='Destination Image Size, specify the size of the destination image to split into. Default is 0 (No split). Example: {10TiB} or {1G}', default='0')
-	parser.add_argument('-diff', '--get_diff_image', type=str, nargs='?', const='auto', default=None, help='Generate a patch image that updates the base (-d / -di) to the source (src_path / -si): added and modified files in full plus a change list under .hpcp_diff/. Optionally name the output; default DIFF_<src>_TO_<base>_<time>.img. Honors -dis, -fh, -hs and -e.')
+	parser.add_argument('-diff', '--get_diff_image', type=str, nargs='?', const='auto', default=None, help='Generate a patch image that updates the base (-d / -di) to the source (src_path / -si): added and modified files in full plus a change list under .hpcp_diff/. Optionally name the output; default DIFF_<src>_TO_<base>_<time>.img. Honors -dis, -fh, -hs and -e. With -dd, compares whole GPT disks: the new disk as the path and the old disk with -d.')
 	parser.add_argument('-fa', '--force_apply', action='store_true', help='With -siff, apply even when the target differs from the state the patch expects. Conflicts are still printed as warnings.')
 	parser.add_argument('-dd', '--disk_dump', action='store_true', help='Disk to Disk mirror, use this if you are backuping / deploying an OS from / to a disk. \
 					 Require 1 source, can be 1 src_path or 1 -si src_image, require 1 -di dest_image. Note: will only actually use dd if unable to mount / create a partition.')
@@ -6159,8 +7463,13 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = multipr
 			workers = 1 if single_thread else max_workers
 			if load_diff_image:
 				process_load_diff_image(load_diff_image, src_path, dest_paths, dest_image, mount_points, loop_devices,
-					force=force_apply, max_workers=workers, verbose=verbose)
+					force=force_apply, max_workers=workers, verbose=verbose, dd=dd)
 				raise RuntimeError("Exiting after applying patch image.")
+			if dd:
+				process_get_disk_diff_image(src_path, dest_paths, get_diff_image, mount_points, loop_devices,
+					exclude=exclude, full_hash=full_hash, dest_image_size=dest_image_size, max_workers=workers,
+					parallel_file_listing=parallel_file_listing, verbose=verbose)
+				raise RuntimeError("Exiting after generating disk patch image.")
 			process_get_diff_image(src_path, src_image, dest_paths, dest_image, get_diff_image, mount_points, loop_devices,
 				exclude=exclude, full_hash=full_hash, dest_image_size=dest_image_size, max_workers=workers,
 				parallel_file_listing=parallel_file_listing, verbose=verbose)

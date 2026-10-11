@@ -245,7 +245,7 @@ def test_read_manifest_rejects_foreign_or_newer(tmp_path, hpcp_mod):
 	path.write_text('format\tsomething-else\nformat_version\t1\n')
 	with pytest.raises(RuntimeError, match='Patch format error'):
 		hpcp_mod.read_manifest(str(path))
-	path.write_text('format\thpcp-diff\nformat_version\t2\n')
+	path.write_text('format\thpcp-diff\nformat_version\t3\n')
 	with pytest.raises(RuntimeError, match='newer'):
 		hpcp_mod.read_manifest(str(path))
 	path.write_text('format\thpcp-diff\nformat_version\t1\nunknown_key\tfine\n')
@@ -616,6 +616,68 @@ def test_build_patch_tree_refuses_incomplete_payload(trees, hpcp_mod, tmp_path, 
 	with pytest.raises(RuntimeError, match='payload incomplete'):
 		_patch_from(hpcp_mod, new, base, [vol])
 	assert not (vol / '.hpcp_diff' / 'manifest').exists()
+
+
+_CHANGED_WHILE_BUILT = (r'^Diff image error: live\.log changed while the patch was built; exclude it \(-e\) or generate '
+	r'from an offline copy; patch metadata not written$')
+
+
+@pytest.mark.parametrize('change', ['same-size rewrite', 'touch', 'size'])
+def test_build_patch_tree_refuses_a_source_changed_after_the_scan(trees, hpcp_mod, tmp_path, change):
+	"""A live file rewritten between the change scan and the payload copy would make a patch every node fails to verify."""
+	new, base = trees
+	_write(new / 'live.log', 'version 1')
+	_write(new / 'calm.txt', 'calm')
+	new_map, base_map = hpcp_mod.build_root_maps(str(new), str(base), max_workers=1)
+	rows = hpcp_mod.compute_changes(new_map, base_map, max_workers=1)
+	assert _ops(rows) == {('A', 'live.log'), ('A', 'calm.txt')}
+	if change == 'same-size rewrite':
+		_write(new / 'live.log', 'version 2')
+	elif change == 'touch':
+		os.utime(str(new / 'live.log'), (T0 + 60, T0 + 60))
+	else:
+		_write(new / 'live.log', 'version 10')
+	vol = tmp_path / 'vol'
+	vol.mkdir()
+	with pytest.raises(RuntimeError, match=_CHANGED_WHILE_BUILT):
+		hpcp_mod.build_patch_tree(rows, str(new), [str(vol)], hpcp_mod.make_patch_meta(rows, 'n', 'b', 'root'), max_workers=1)
+	assert not (vol / '.hpcp_diff').exists()
+
+
+@pytest.mark.parametrize('full_hash', [False, True])
+def test_payload_check_hashes_like_the_rows(trees, hpcp_mod, tmp_path, full_hash):
+	"""The payload is hashed with the rows' settings: a change outside the hashed tail is caught only with a full hash."""
+	new, base = trees
+	hpcp_mod.HASH_SIZE = 16
+	_write(new / 'live.log', b'H' * 64)
+	new_map, base_map = hpcp_mod.build_root_maps(str(new), str(base), max_workers=1)
+	rows = hpcp_mod.compute_changes(new_map, base_map, full_hash=full_hash, max_workers=1)
+	_write(new / 'live.log', b'h' + b'H' * 63)
+	vol = tmp_path / 'vol'
+	vol.mkdir()
+	meta = hpcp_mod.make_patch_meta(rows, 'n', 'b', 'root', full_hash=full_hash)
+	if full_hash:
+		with pytest.raises(RuntimeError, match=_CHANGED_WHILE_BUILT):
+			hpcp_mod.build_patch_tree(rows, str(new), [str(vol)], meta, max_workers=1)
+		assert not (vol / '.hpcp_diff').exists()
+	else:
+		hpcp_mod.build_patch_tree(rows, str(new), [str(vol)], meta, max_workers=1)
+		assert (vol / '.hpcp_diff' / 'manifest').exists()
+
+
+def test_payload_check_runs_in_parallel_for_many_files(trees, hpcp_mod, tmp_path):
+	new, base = trees
+	for index in range(300):
+		_write(new / 'many' / f'f{index:03}.txt', f'file {index:03}')
+	_write(new / 'live.log', 'version 1')
+	new_map, base_map = hpcp_mod.build_root_maps(str(new), str(base), max_workers=1)
+	rows = hpcp_mod.compute_changes(new_map, base_map, max_workers=2)
+	_write(new / 'live.log', 'version 2')
+	vol = tmp_path / 'vol'
+	vol.mkdir()
+	with pytest.raises(RuntimeError, match=_CHANGED_WHILE_BUILT):
+		hpcp_mod.build_patch_tree(rows, str(new), [str(vol)], hpcp_mod.make_patch_meta(rows, 'n', 'b', 'root'), max_workers=2)
+	assert not (vol / '.hpcp_diff').exists()
 
 
 def test_build_patch_tree_root_row_and_nested_symlink(trees, hpcp_mod, tmp_path):
@@ -1827,7 +1889,7 @@ def test_hpcp_rejects_bad_patch_arguments(tmp_path, hpcp_mod, reset_hpcp_globals
 	cases = [
 		(dict(src_path=[new], dest_paths=[base], force_apply=True), '-fa'),
 		(dict(src_path=[new], dest_paths=[base], get_diff_image='auto', load_diff_image=['p.img']), 'cannot be used together'),
-		(dict(src_path=[new], dest_paths=[base], get_diff_image='auto', dd=True), '-dd'),
+		(dict(src_path=[new], dest_paths=[base], get_diff_image='auto', dd=True, src_image=['x.img']), '-dd'),
 		(dict(src_path=[], dest_paths=[base], load_diff_image=['p.img'], remove=True), '-rm'),
 		(dict(src_path=[new, base], dest_paths=[base], get_diff_image='auto'), 'exactly one source'),
 		(dict(src_path=[new], get_diff_image='auto'), 'exactly one base'),

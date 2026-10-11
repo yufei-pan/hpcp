@@ -81,7 +81,7 @@ turn mirroring off entirely.
 
 Only available on Linux (loop devices and mounts, so usually root).
 
-`-diff [PATCH.img]` compares a new tree (a directory, or a single-filesystem image with `-si`) against a base (`-d DIR` or `-di IMG`) and writes a patch image. The patch is an ordinary xfs/ext4 image, split with `-dis` like `-di` output. It holds every added or modified file **whole** at its real path, plus `.hpcp_diff/manifest` and `.hpcp_diff/changes.tsv`, which list every added, modified and deleted path with its before and after state. A moved file appears as one delete plus one add. A file counts as modified when its content, size, mtime, mode, owner, ACLs, file capabilities or user xattrs change; a directory when its mode, owner, ACLs or user xattrs change; a symlink when its target changes. Other xattrs (such as `trusted.*`, `security.selinux` or filesystem-internal ones) are ignored. Without a value the patch is named `DIFF_<src>_TO_<base>_<time>.img`.
+`-diff [PATCH.img]` compares a new tree (a directory, or a single-filesystem image with `-si`) against a base (`-d DIR` or `-di IMG`) and writes a patch image. The patch is an ordinary xfs/ext4 image, split with `-dis` like `-di` output. It holds every added or modified file **whole** at its real path, plus `.hpcp_diff/manifest` and `.hpcp_diff/changes.tsv`, which list every added, modified and deleted path with its before and after state. A moved file appears as one delete plus one add. A file counts as modified when its content, size, mtime, mode, owner, ACLs, file capabilities or user xattrs change; a directory when its mode, owner, ACLs or user xattrs change; a symlink when its target changes. Other xattrs (such as `trusted.*`, `security.selinux` or filesystem-internal ones) are ignored. Without a value the patch is named `DIFF_<src>_TO_<base>_<time>.img`. A file that changes between the comparison and the payload copy (on a live source) stops generation before any manifest is written; exclude it with `-e` or generate from an offline copy.
 
 A `-di` image store keeps files at their absolute source path. When the base is such a store, a directory is compared only with its own subtree inside the store, and the patch uses the same layout. So `hpcp -siff patch.img -di store.img` updates the store in place, and `hpcp -siff patch.img -d /` updates the live system.
 
@@ -110,6 +110,19 @@ Limitations:
 - Even a small patch is an image of roughly 50 MiB.
 - Generating and applying a patch need root (loop devices, mkfs, mount).
 - Nothing else may modify the target while a patch is applied.
+
+### Disk patches (`-dd`)
+
+`hpcp -dd -diff [PATCH.img] NEW_DISK -d OLD_DISK` patches whole GPT disks — for rolling a new golden image out to nodes cloned from the previous one. Both disks are block devices or disk-image files and are only read; MBR (msdos) disks are refused. The patch holds one section per filesystem partition (the same change list and payload as a single-filesystem patch), raw copies of areas that cannot be patched file by file when they changed (BIOS-boot and unknown-filesystem partitions, the MBR boot code), and the identity values that changed (filesystem UUID / label, GPT partition GUID / name / attributes, disk GUID). Swap contents are never carried. `-e` patterns are matched against the temporary paths hpcp mounts each partition at, so start them with `*/` (e.g. `-e '*/var/log/*'`).
+
+`hpcp -siff PATCH.img -d TARGET_DISK` applies it to a node disk — a block device (a symlink such as `/dev/disk/by-id/...` is fine) or a disk-image file — offline or live:
+
+- The target must have the base's layout: the same partition numbers, type GUIDs and filesystem types (sizes may differ, except raw areas). Layout changes need a re-clone.
+- On a live disk, mounted partitions are patched through their live mount. Raw writes and identity changes to a partition that is mounted, active swap or held by LVM/md are refused before anything changes — apply such patches offline.
+- FAT, exFAT, NTFS and HFS sections (the ESP) are compared and applied by content only: their permissions and owners come from mount options, so differences there are ignored. Their names are matched case-insensitively, so a case-only rename (`EFI/BOOT` to `EFI/Boot`) is not a delete plus an add; names on one disk that differ only by case refuse generation.
+- Filesystem sections are applied first (ESP last), then raw areas, the MBR boot code, and identity changes; everything is verified afterwards. A section that fails stops the apply before any later section, raw area, boot code or identity change, and a raw area that cannot be written stops it before any later raw area, the boot code and identity changes: fix the cause and re-run, and the re-run skips what is already done. Apply prints one line per section and a total.
+- A node's filesystem UUID or label that differs from the golden base is warned about and replaced only when the patch changes that value; otherwise the node keeps its own.
+- An image file that is already attached to a loop device is refused (`Disk in use`); apply to that loop device or detach it first.
 
 ## Remove Extra Feature Note
 
@@ -213,7 +226,8 @@ options:
                         Apply a patch image made by -diff to the target (-d /
                         -di or a single path). Repeat for each -dis volume.
                         Every path the patch touches is checked first;
-                        conflicts prompt before being overridden.
+                        conflicts prompt before being overridden. A disk patch
+                        (made with -dd -diff) takes the target disk with -d.
   -d, -C, --dest_path DEST_PATH
                         Destination Path
   -rds, --random_dest_selection
@@ -235,7 +249,8 @@ options:
                         modified files in full plus a change list under
                         .hpcp_diff/. Optionally name the output; default
                         DIFF_<src>_TO_<base>_<time>.img. Honors -dis, -fh, -hs
-                        and -e.
+                        and -e. With -dd, compares whole GPT disks: the new
+                        disk as the path and the old disk with -d.
   -fa, --force_apply    With -siff, apply even when the target differs from
                         the state the patch expects. Conflicts are still
                         printed as warnings.
