@@ -5196,18 +5196,26 @@ def _apply_section(plan, max_workers, verbose, full_hash, compare_hash):
 
 def _refuse_case_only_renames(rows, target_root, fs_type, below):
 	"""Refuse, even forced, rows that delete and write names differing only by case (see _case_collision)
-	on target_root's filesystem (fs_type) or on one mounted below it (below; see _path_mounts) that looks
-	names up case-insensitively: the writes would find the old entries and be skipped as done, then the
-	deletes remove them."""
+	on target_root's filesystem (fs_type) or on one mounted below it (below; see _path_mounts) unless that
+	filesystem is known to be case-sensitive (_CASE_SENSITIVE_TYPES). Where names are looked up
+	case-insensitively the writes would find the old entries and be skipped as done, then the deletes
+	remove them; so this fails closed for any other type: exFAT through FUSE (fuseblk), CIFS / SMB,
+	vboxsf, ntfs3 (its nocase option), or '' when mountinfo shows none.
+	Not detected: case-insensitive directories or datasets on a listed type (ext4 / f2fs casefold
+	directories, chattr +F; zfs casesensitivity=insensitive or mixed; jfs made with mkfs.jfs -O)."""
 	for prefix, where, scope_type in [('', target_root, fs_type)] + list(below):
-		if not _has_case_insensitive_names(scope_type):
+		if scope_type in _CASE_SENSITIVE_TYPES:
 			continue
 		scoped = rows if not prefix else [row for row in rows if row.path.rstrip('/') == prefix or row.path.startswith(prefix + '/')]
 		collision = _case_collision(scoped)
-		if collision:
+		if not collision:
+			continue
+		if _has_case_insensitive_names(scope_type):
 			raise RuntimeError(f'Patch conflict: {collision[0]!r} and {collision[1]!r} differ only by case and {where} is a '
 				f'case-insensitive {scope_type} filesystem; applying would delete what it writes; nothing applied '
 				'(regenerate with -dd from whole disks, or remove the case-only rename)')
+		raise RuntimeError(f'Patch conflict: {collision[0]!r} and {collision[1]!r} differ only by case and the filesystem holding '
+			f'{where} ({scope_type or "unknown"}) is not known to be case-sensitive; applying could delete what it writes; nothing applied')
 
 def apply_patch_tree(volume_roots, target_root, force=False, max_workers=1, verbose=False, volume_names=None, store_note=False):
 	"""Apply a patch whose volumes are mounted (or unpacked) at volume_roots onto directory target_root.
@@ -5226,9 +5234,10 @@ def apply_patch_tree(volume_roots, target_root, force=False, max_workers=1, verb
 	A hard kill mid-apply can leave new directories with default metadata (it is applied
 	only after every write); the re-run then reports those A rows as conflicts and needs -fa.
 	Rows that delete and write names differing only by case are refused, even forced, where they
-	land on a filesystem that looks names up case-insensitively (FAT, exFAT, HFS+): the target's
-	own (from mountinfo) or one mounted below it. A target on such a filesystem also verifies
-	the A / M rows skipped as already done (see _apply_section).
+	land on a filesystem not known to be case-sensitive (FAT, exFAT, HFS+, or a type it does not
+	know; see _refuse_case_only_renames): the target's own (from mountinfo) or one mounted below
+	it. A FAT, exFAT or HFS+ target also verifies the A / M rows skipped as already done
+	(see _apply_section).
 	"""
 	meta, rows, volume_roots = load_patch_volumes(volume_roots, volume_names)
 	if store_note and meta.get('layout') == 'store':
@@ -5866,6 +5875,10 @@ _NO_POSIX_METADATA_TYPES = frozenset(_FAT_TYPES + ('exfat', 'ntfs', 'ntfs3'))
 # Filesystems whose Linux drivers look names up case-insensitively (ntfs3 and ntfs-3g use the exact case;
 # hfsplus folds case but keeps owner, group and mode on disk).
 _CASE_INSENSITIVE_TYPES = frozenset(_FAT_TYPES + ('exfat', 'hfs', 'hfsplus'))
+# mountinfo types known to look names up by exact case: the only targets a single-filesystem patch may
+# apply a case-only rename (a D + A pair) onto (see _refuse_case_only_renames).
+_CASE_SENSITIVE_TYPES = frozenset(('ext2', 'ext3', 'ext4', 'xfs', 'btrfs', 'tmpfs', 'zfs', 'f2fs', 'nfs', 'nfs4', 'lustre',
+	'gpfs', 'ceph', 'overlay', 'beegfs', 'jfs', 'reiserfs', 'bcachefs', 'nilfs2', 'ramfs'))
 
 def _has_posix_metadata(fs_type):
 	"""False for a filesystem whose sections are compared and applied by content only."""
