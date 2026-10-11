@@ -111,6 +111,18 @@ Limitations:
 - Generating and applying a patch need root (loop devices, mkfs, mount).
 - Nothing else may modify the target while a patch is applied.
 
+### Disk patches (`-dd`)
+
+`hpcp -dd -diff [PATCH.img] NEW_DISK -d OLD_DISK` patches whole GPT disks — for rolling a new golden image out to nodes cloned from the previous one. Both disks are block devices or disk-image files and are only read. The patch holds one section per filesystem partition (the same change list and payload as a single-filesystem patch), raw copies of areas that cannot be patched file by file when they changed (BIOS-boot and unknown-filesystem partitions, the MBR boot code), and the identity values that changed (filesystem UUID / label, GPT partition GUID / name / attributes, disk GUID). Swap contents are never carried.
+
+`hpcp -siff PATCH.img -d TARGET_DISK` applies it to a node disk, offline or live:
+
+- The target must have the base's layout: the same partition numbers, type GUIDs and filesystem types (sizes may differ, except raw areas). Layout changes need a re-clone.
+- On a live disk, mounted partitions are patched through their live mount. Raw writes and identity changes to a partition that is mounted, active swap or held by LVM/md are refused before anything changes — apply such patches offline.
+- Filesystem sections are applied first (ESP last), then raw areas, the MBR boot code, and identity changes; everything is verified afterwards, and a re-run skips what is already done.
+- A node whose UUID or label differs from the golden base gets a warning and the new value.
+- An image file that is already attached to a loop device is refused (`Disk in use`); apply to that loop device or detach it first.
+
 ## Remove Extra Feature Note
 
 `-rme --remove_extra`: Especially when combined with `-rf`, **PLEASE PAY CLOSE ATTENTION TO YOUR TARGET DIRECTORY!**  
@@ -213,7 +225,8 @@ options:
                         Apply a patch image made by -diff to the target (-d /
                         -di or a single path). Repeat for each -dis volume.
                         Every path the patch touches is checked first;
-                        conflicts prompt before being overridden.
+                        conflicts prompt before being overridden. A disk patch
+                        (made with -dd -diff) takes the target disk with -d.
   -d, -C, --dest_path DEST_PATH
                         Destination Path
   -rds, --random_dest_selection
@@ -235,7 +248,8 @@ options:
                         modified files in full plus a change list under
                         .hpcp_diff/. Optionally name the output; default
                         DIFF_<src>_TO_<base>_<time>.img. Honors -dis, -fh, -hs
-                        and -e.
+                        and -e. With -dd, compares whole GPT disks: the new
+                        disk as the path and the old disk with -d.
   -fa, --force_apply    With -siff, apply even when the target differs from
                         the state the patch expects. Conflicts are still
                         printed as warnings.
