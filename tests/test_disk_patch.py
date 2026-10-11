@@ -1417,7 +1417,7 @@ def test_disk_apply_plans_each_section_by_filesystem_class(tmp_path, hpcp_mod, r
 	def stop(plans, force, extra_lines=()):
 		planned.extend(plans)
 		raise Planned()
-	monkeypatch.setattr(hpcp_mod, '_resolve_section_conflicts', stop)
+	monkeypatch.setattr(hpcp_mod, '_preflight_section', lambda plan: stop([plan], False))
 	with pytest.raises(Planned):
 		hpcp_mod.apply_disk_patch([volume], str(tmp_path / 'node.img'), [], [])
 	assert [(plan.name, plan.metadata, plan.case_insensitive) for plan in planned] == [('part1', metadata, case_insensitive)]

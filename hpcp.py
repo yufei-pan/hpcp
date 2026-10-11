@@ -26,7 +26,6 @@ import sys
 import tempfile
 import threading
 import time
-import unicodedata
 import uuid
 from collections import deque, namedtuple
 from concurrent.futures import ProcessPoolExecutor
@@ -4947,73 +4946,6 @@ def _rows_escaping_target(rows, target_root):
 			escaping.append(row)
 	return escaping
 
-def _caseless(name):
-	"""name as a filesystem that ignores case and Unicode normalization compares it."""
-	return unicodedata.normalize('NFD', unicodedata.normalize('NFD', name).casefold())
-
-def _same_entry_pair(plan):
-	"""(D row key, A / M row key) of the first pair that reach one entry on plan's target, else None.
-
-	The filesystem-agnostic net under _refuse_case_only_renames: where a written name finds the entry a D row
-	deletes (a case-insensitive lookup the filesystem type does not reveal, such as NFS from a case-insensitive
-	server or an ext4 / f2fs / tmpfs casefold directory, or a symlinked directory alias inside the target), the A
-	row is skipped as done and the D row then removes it. Paths resolve as the apply resolves them: parents
-	followed, the final component not. Only D rows that run count; every A / M row counts, skipped or not: its
-	own entry, and, when it exists, each existing ancestor directory below the target root (a D row that
-	removes a directory the row lies in). Rows on one name are a type change, and rows below a name the patch
-	removes first are written into a new directory (_names_removed_first). Hard links are distinct entries:
-	a non-directory with more than one link counts only when both names are in one directory and equal
-	ignoring case and normalization. Nothing is stat'ed when no D row runs.
-	"""
-	todo = _section_todo(plan)
-	deleted = {}
-	for row in todo:
-		if row.op != 'D':
-			continue
-		path = _key_path(plan.target_root, row.path)
-		try:
-			info = os.lstat(path)
-		except OSError:
-			continue
-		deleted.setdefault((info.st_dev, info.st_ino), []).append((row, path))
-	if not deleted:
-		return None
-	directories = {}
-
-	def directory(path):
-		"""(st_dev, st_ino) of the directory path leads to (symlinks followed), else None; each path stat'ed once."""
-		if path not in directories:
-			try:
-				info = os.stat(path)
-				directories[path] = (info.st_dev, info.st_ino) if stat.S_ISDIR(info.st_mode) else None
-			except OSError:
-				directories[path] = None
-		return directories[path]
-
-	removed_first = _names_removed_first(todo, plan.target_root)
-	for row in plan.rows:
-		if row.op == 'D' or row.path == './':
-			continue
-		parents = _parent_keys(row.path)
-		if any(key.rstrip('/') in removed_first for key in parents):
-			continue
-		path = _key_path(plan.target_root, row.path)
-		try:
-			info = os.lstat(path)
-		except OSError:
-			continue
-		for deleted_row, deleted_path in deleted.get((info.st_dev, info.st_ino), ()):
-			if deleted_row.path.rstrip('/') == row.path.rstrip('/'):
-				continue
-			if (stat.S_ISDIR(info.st_mode) or info.st_nlink == 1
-					or (directory(os.path.dirname(deleted_path)) == directory(os.path.dirname(path))
-						and _caseless(os.path.basename(deleted_path)) == _caseless(os.path.basename(path)))):
-				return deleted_row.path, row.path
-		for key in parents:
-			for deleted_row, _ in deleted.get(directory(_key_path(plan.target_root, key)), ()):
-				return deleted_row.path, row.path
-	return None
-
 def _discard_temp(path):
 	"""Remove a temporary entry that was not renamed into place; a missing one is fine."""
 	try:
@@ -5376,33 +5308,10 @@ def _apply_section(plan, max_workers, verbose, full_hash, compare_hash):
 		'failed': failed,
 	}
 
-def _refuse_case_only_renames(rows, target_root, fs_type, below):
-	"""Refuse, even forced, rows that delete and write names differing only by case (see _case_collision)
-	on target_root's filesystem (fs_type) or on one mounted below it (below; see _path_mounts) unless that
-	filesystem is known to be case-sensitive (_CASE_SENSITIVE_TYPES). Where names are looked up
-	case-insensitively the writes would find the old entries and be skipped as done, then the deletes
-	remove them; so this fails closed for any other type: exFAT through FUSE (fuseblk), CIFS / SMB,
-	vboxsf, ntfs3 (its nocase option), or '' when mountinfo shows none.
-	Not detected: case-insensitive directories or datasets on a listed type (ext4 / f2fs casefold
-	directories, chattr +F; zfs casesensitivity=insensitive or mixed; jfs made with mkfs.jfs -O)."""
-	for prefix, where, scope_type in [('', target_root, fs_type)] + list(below):
-		if scope_type in _CASE_SENSITIVE_TYPES:
-			continue
-		scoped = rows if not prefix else [row for row in rows if row.path.rstrip('/') == prefix or row.path.startswith(prefix + '/')]
-		collision = _case_collision(scoped)
-		if not collision:
-			continue
-		if _has_case_insensitive_names(scope_type):
-			raise RuntimeError(f'Patch conflict: {collision[0]!r} and {collision[1]!r} differ only by case and {where} is a '
-				f'case-insensitive {scope_type} filesystem; applying would delete what it writes; nothing applied '
-				'(regenerate with -dd from whole disks, or remove the case-only rename)')
-		raise RuntimeError(f'Patch conflict: {collision[0]!r} and {collision[1]!r} differ only by case and the filesystem holding '
-			f'{where} ({scope_type or "unknown"}) is not known to be case-sensitive; applying could delete what it writes; nothing applied')
-
 def apply_patch_tree(volume_roots, target_root, force=False, max_workers=1, verbose=False, volume_names=None, store_note=False):
 	"""Apply a patch whose volumes are mounted (or unpacked) at volume_roots onto directory target_root.
 
-	Returns {'deleted', 'added', 'modified', 'skipped', 'forced', 'failed'}. Raises RuntimeError
+	Returns {'deleted', 'added', 'modified', 'skipped', 'restored', 'forced', 'failed'}. Raises RuntimeError
 	for a malformed or incomplete patch, or when conflicts are not overridden.
 	Another process modifying the target concurrently during an apply is out of scope
 	(residual race between the containment checks and the writes).
@@ -5410,30 +5319,32 @@ def apply_patch_tree(volume_roots, target_root, force=False, max_workers=1, verb
 	so running processes keep the old file and every target ends either old or new.
 	Paths are followed through symlinked directories that resolve inside target_root, for
 	deletions and writes alike; a patch that would delete or write through a symlink leading
-	outside it is refused before anything changes, even when forced.
+	outside it is refused before anything changes, even when forced (and before any conflict prompt).
 	Only conflicts the user forced may have a whole directory tree removed.
 	An interrupted apply leaves new directories 0700 and root-owned.
 	A hard kill mid-apply can leave new directories with default metadata (it is applied
 	only after every write); the re-run then reports those A rows as conflicts and needs -fa.
-	Rows that delete and write names differing only by case are refused, even forced, where they
-	land on a filesystem not known to be case-sensitive (FAT, exFAT, HFS+, or a type it does not
-	know; see _refuse_case_only_renames): the target's own (from mountinfo) or one mounted below
-	it. A FAT, exFAT or HFS+ target also verifies the A / M rows skipped as already done
-	(see _apply_section). Whatever the filesystem type, a D row and an A / M row that reach one entry on
-	the target (or a directory the A / M row lies in) are refused, even forced (see _same_entry_pair).
+	Rows are planned per mount (the target's own, and each filesystem mounted below it, from
+	/proc/self/mountinfo): on FAT, exFAT or NTFS by content only, on FAT, exFAT or HFS+ (not HFSX) with
+	names matched case-insensitively (see check_patch_target). A write skipped as already done that a
+	delete then takes away (a case-insensitive filesystem hpcp does not recognise, a symlinked directory
+	alias) is written again and counted as restored (see _apply_rows).
 	"""
 	meta, rows, volume_roots = load_patch_volumes(volume_roots, volume_names)
 	if store_note and meta.get('layout') == 'store':
 		example = rows[0].path if rows else ''
 		print(f"Note: this patch uses image-store layout; paths such as {example!r} are resolved under {target_root}")
-	fs_type, below = _path_mounts(target_root, _mountinfo_entries())
-	_refuse_case_only_renames(rows, target_root, fs_type, below)
+	scopes = _mount_scopes(target_root, _mountinfo_entries())
+	grouped = _rows_by_scope(rows, scopes)
 	with _patch_hash_settings(meta) as (compare_hash, full_hash):
-		plan = _plan_section('root', rows, volume_roots, target_root, compare_hash, full_hash, max_workers,
-			case_insensitive=_has_case_insensitive_names(fs_type))
-		_resolve_section_conflicts([plan], force)
-		_preflight_section(plan)
-		summary = _apply_section(plan, max_workers, verbose, full_hash, compare_hash)
+		plans = [_plan_section(prefix or 'root', grouped.get(prefix, []), volume_roots, target_root, compare_hash, full_hash,
+				max_workers, _has_posix_metadata(fs_type), _has_case_insensitive_names(fs_type, source))
+			for prefix, fs_type, source in scopes if not prefix or prefix in grouped]
+		for plan in plans:
+			_preflight_section(plan)
+		_resolve_section_conflicts(plans, force)
+		summaries = [_apply_section(plan, max_workers, verbose, full_hash, compare_hash) for plan in plans]
+	summary = {key: sum(part[key] for part in summaries) for key in summaries[0]}
 	print('Patch summary: ' + ', '.join(f'{key} {value}' for key, value in summary.items()))
 	return summary
 
@@ -5550,7 +5461,9 @@ def process_get_diff_image(src_paths, src_image, dest_paths, dest_image, output,
 	output = os.path.abspath(os.path.expanduser(output))
 	if os.path.lexists(output):
 		raise RuntimeError(f'Diff image error: output {output} already exists')
-	rows = compute_changes(new_map, base_map, full_hash=full_hash, max_workers=max_workers)
+	# Modes and owners on FAT, exFAT and NTFS come from mount options: compare content only when either side is one.
+	metadata = _compare_metadata((new_root, base_root), _mountinfo_entries())
+	rows = compute_changes(new_map, base_map, full_hash=full_hash, max_workers=max_workers, metadata=metadata)
 	# Fail here, before any image exists, on rows every apply would reject.
 	_validate_patch_rows(rows)
 	meta = make_patch_meta(rows, new_name, base_name, layout, full_hash)
@@ -6014,24 +5927,43 @@ def _is_mount_point(path):
 	real = os.path.realpath(path)
 	return any(entry['mount_point'] == real for entry in _mountinfo_entries())
 
-def _path_mounts(path, entries):
-	"""(fstype of the mount holding path, [(key prefix, mount point, fstype) of each mount below path]).
-
-	The mount holding path is the entry with the longest mount point that is path's real path or one
-	of its ancestors; of entries on one mount point, the later (on top). fstype '' when none holds it.
-	A key prefix is the mount point relative to path's real path.
-	"""
-	real = os.path.realpath(path)
-	inside = real.rstrip(os.sep) + os.sep
-	fs_type, depth, below = '', -1, []
+def _mount_scopes(path, entries):
+	"""[(key prefix, fstype, source)] for path: first ('', ...) for the mount holding path's real path, then one per
+	mount below it, deepest last. A mount listed later (in mountinfo order) on the same or a parent mount point hides
+	earlier ones, as on the system; hidden mounts are left out. fstype and source '' when no mount holds path."""
+	visible = []
 	for entry in entries:
-		mount_point = entry['mount_point']
-		if inside.startswith(mount_point.rstrip(os.sep) + os.sep):
-			if len(mount_point) >= depth:
-				fs_type, depth = entry['fstype'], len(mount_point)
-		elif mount_point.startswith(inside):
-			below.append((os.path.relpath(mount_point, real), mount_point, entry['fstype']))
-	return fs_type, below
+		inside = entry['mount_point'].rstrip(os.sep) + os.sep
+		visible = [other for other in visible if not (other['mount_point'].rstrip(os.sep) + os.sep).startswith(inside)]
+		visible.append(entry)
+	real = os.path.realpath(path)
+	real_inside = real.rstrip(os.sep) + os.sep
+	holder, depth, below = None, -1, []
+	for entry in visible:
+		inside = entry['mount_point'].rstrip(os.sep) + os.sep
+		if real_inside.startswith(inside):
+			if len(inside) > depth:
+				holder, depth = entry, len(inside)
+		elif inside.startswith(real_inside):
+			below.append((os.path.relpath(entry['mount_point'], real), entry['fstype'], entry.get('source', '')))
+	below.sort(key=lambda scope: (scope[0].count('/'), scope[0]))
+	own = ('', holder['fstype'], holder.get('source', '')) if holder else ('', '', '')
+	return [own] + below
+
+def _rows_by_scope(rows, scopes):
+	"""{key prefix: rows}: each row under the deepest scope prefix it lies in ('' for the target's own)."""
+	prefixes = sorted((prefix for prefix, _, _ in scopes if prefix), key=len, reverse=True)
+	grouped = {}
+	for row in rows:
+		name = row.path.rstrip('/')
+		scope = next((prefix for prefix in prefixes if name == prefix or name.startswith(prefix + '/')), '')
+		grouped.setdefault(scope, []).append(row)
+	return grouped
+
+def _compare_metadata(roots, entries):
+	"""False when any of roots sits on a filesystem whose modes and owners come from mount options (FAT, exFAT,
+	NTFS): a single-filesystem patch between such trees compares content only (see states_equal)."""
+	return all(_has_posix_metadata(_mount_scopes(root, entries)[0][1]) for root in roots)
 
 def _swap_devices(swaps_path='/proc/swaps'):
 	"""Real paths of the active swap areas."""
@@ -6067,11 +5999,6 @@ _NO_POSIX_METADATA_TYPES = frozenset(_FAT_TYPES + ('exfat', 'ntfs', 'ntfs3'))
 # Filesystems whose Linux drivers look names up case-insensitively (ntfs3 and ntfs-3g use the exact case;
 # hfsplus folds case unless it is HFSX, and keeps owner, group and mode on disk).
 _CASE_INSENSITIVE_TYPES = frozenset(_FAT_TYPES + ('exfat', 'hfs', 'hfsplus'))
-# mountinfo types known to look names up by exact case: the only targets a single-filesystem patch may
-# apply a case-only rename (a D + A pair) onto (see _refuse_case_only_renames).
-_CASE_SENSITIVE_TYPES = frozenset(('ext2', 'ext3', 'ext4', 'xfs', 'btrfs', 'tmpfs', 'zfs', 'f2fs', 'nfs', 'nfs4', 'lustre',
-	'gpfs', 'ceph', 'overlay', 'beegfs', 'jfs', 'reiserfs', 'bcachefs', 'nilfs2', 'ramfs'))
-
 def _has_posix_metadata(fs_type):
 	"""False for a filesystem whose sections are compared and applied by content only."""
 	return fs_type not in _NO_POSIX_METADATA_TYPES
@@ -6279,38 +6206,6 @@ def _mount_partition(device, read_only, mount_points, entries):
 		_release_mount(mount_point, mount_points)
 		return None
 	return mount_point + os.sep
-
-def _case_collision(rows):
-	"""(D path, A / M path) of the first pair whose names are equal, or one the other's ancestor, only
-	when compared case-insensitively; None when there is none.
-
-	On a case-insensitive target such a pair deletes what the patch writes (or skips as present).
-	A pair on exactly one name, or exactly nested, is an ordinary type change.
-	"""
-	deleted, written = {}, {}
-	for row in rows:
-		name = row.path.rstrip('/')
-		(deleted if row.op == 'D' else written).setdefault(name.casefold(), []).append((name, row.path))
-	def prefixes(name):
-		parts = name.split('/')
-		return ['/'.join(parts[:depth]) for depth in range(1, len(parts) + 1)]
-	for row in sort_change_rows(rows):
-		if row.op == 'D':
-			continue
-		# A deleted name equal to (or an ancestor of) this written one, only case-insensitively.
-		for prefix in prefixes(row.path.rstrip('/')):
-			for name, path in deleted.get(prefix.casefold(), ()):
-				if name != prefix:
-					return path, row.path
-	for row in sort_change_rows(rows):
-		if row.op != 'D':
-			continue
-		# A written name that is an ancestor of this deleted one, only case-insensitively.
-		for prefix in prefixes(row.path.rstrip('/'))[:-1]:
-			for name, path in written.get(prefix.casefold(), ()):
-				if name != prefix:
-					return row.path, path
-	return None
 
 def _partition_changes(new_root, old_root, mount_points, live_mounts, exclude, full_hash, max_workers, parallel_file_listing,
 		input_files=(), metadata=True):
@@ -6643,9 +6538,9 @@ def apply_disk_patch(volume_roots, target, mount_points, loop_devices, force=Fal
 		raw_conflicts = [entry for entry in raw_plan if entry['action'] == 'conflict']
 		extra = [(f"raw {entry['name']}: content matches neither the patch base nor the new state (found {entry['found'][:12]})",
 			f"raw {entry['name']}: content differs") for entry in raw_conflicts]
-		_resolve_section_conflicts(plans, force, extra)
 		for plan in plans:
 			_preflight_section(plan)
+		_resolve_section_conflicts(plans, force, extra)
 		summaries = {}
 		stopped = None
 		order = sorted(plans, key=lambda plan: (layout['parts'][int(plan.name[len('part'):])]['type_guid'].upper() == _ESP_TYPE_GUID,
