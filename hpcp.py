@@ -5331,13 +5331,24 @@ def _validate_diff_args(get_diff_image, load_diff_image, force_apply, src_path, 
 _ESP_TYPE_GUID = 'C12A7328-F81F-11D2-BA4B-00A0C93EC93B'
 
 def _partition_devices(disk, sys_block_path='/sys/class/block'):
-	"""{partition number: device path} for disk, using the kernel's partition number, not the name suffix."""
+	"""{partition number: device path} for disk, using the kernel's partition number, not the name suffix.
+
+	Only the disk's own partitions count: the real child directories of its sysfs node that hold
+	a 'partition' file. Other descendants (a partitioned md array built on its partitions) do not.
+	"""
 	result = {}
-	for path in get_partitions(disk):
-		name = os.path.basename(path)
+	disk_dir = os.path.join(sys_block_path, os.path.basename(os.path.realpath(disk)))
+	try:
+		children = os.listdir(disk_dir)
+	except OSError:
+		return result
+	for child in children:
+		child_dir = os.path.join(disk_dir, child)
+		if os.path.islink(child_dir):
+			continue
 		try:
-			with open(os.path.join(sys_block_path, name, 'partition')) as f:
-				result[int(f.read().strip())] = path
+			with open(os.path.join(child_dir, 'partition')) as f:
+				result[int(f.read().strip())] = '/dev/' + child
 		except (OSError, ValueError):
 			continue
 	return result

@@ -132,12 +132,24 @@ def _layout(parts, guid='DISK-GUID', sector_size=512):
 
 
 def test_partition_devices_use_kernel_numbers(tmp_path, hpcp_mod, monkeypatch):
-	"""Review Focus 1: loop0p1 and loop0p11 must not be confused by name suffix."""
+	"""Review Focus 1: loop0p1 and loop0p11 must not be confused by name suffix.
+
+	Only the disk's own sysfs children count: a partitioned md array built on the disk's
+	partitions (md127p1, also partition 1) is a descendant lsblk lists, not a partition of the disk.
+	"""
 	names = {'loop0p1': '1', 'loop0p11': '11', 'loop0p2': '2'}
 	for name, number in names.items():
-		(tmp_path / name).mkdir()
-		(tmp_path / name / 'partition').write_text(number + '\n')
-	monkeypatch.setattr(hpcp_mod, 'get_partitions', lambda disk: ['/dev/' + name for name in names])
+		(tmp_path / 'loop0' / name).mkdir(parents=True)
+		(tmp_path / 'loop0' / name / 'partition').write_text(number + '\n')
+	(tmp_path / 'loop0' / 'holders' / 'md127').mkdir(parents=True)
+	(tmp_path / 'loop0' / 'queue').mkdir()
+	(tmp_path / 'md127' / 'md127p1').mkdir(parents=True)
+	(tmp_path / 'md127' / 'md127p1' / 'partition').write_text('1\n')
+	(tmp_path / 'md127p1').mkdir()
+	(tmp_path / 'md127p1' / 'partition').write_text('1\n')
+	# A symlinked child (bdi, subsystem, device) is never a partition of the disk.
+	os.symlink(str(tmp_path / 'md127' / 'md127p1'), str(tmp_path / 'loop0' / 'md127p1'))
+	monkeypatch.setattr(hpcp_mod, 'get_partitions', lambda disk: ['/dev/loop0p1', '/dev/md127p1', '/dev/loop0p11', '/dev/loop0p2'])
 	got = hpcp_mod._partition_devices('/dev/loop0', sys_block_path=str(tmp_path))
 	assert got == {1: '/dev/loop0p1', 11: '/dev/loop0p11', 2: '/dev/loop0p2'}
 
