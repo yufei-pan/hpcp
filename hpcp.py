@@ -5353,6 +5353,15 @@ def _partition_devices(disk, sys_block_path='/sys/class/block'):
 			continue
 	return result
 
+def _udev_settle():
+	"""Wait until udev has handled its queued events (quietly; nothing when udevadm is missing)."""
+	if check_path('udevadm'):
+		error_count = len(ERRORS)
+		try:
+			run_command_in_multicmd_with_path_check(['udevadm', 'settle'], quiet=True)
+		finally:
+			del ERRORS[error_count:]
+
 def _settle_partitions(disk, numbers, timeout=10):
 	"""{number: device} once udev is idle and every partition in numbers has its device node.
 
@@ -5360,12 +5369,7 @@ def _settle_partitions(disk, numbers, timeout=10):
 	loop device, an MBR or GPT write), removing and re-adding the partition nodes meanwhile.
 	Raises RuntimeError('Disk layout mismatch: ...') when a node is still missing after timeout seconds.
 	"""
-	if check_path('udevadm'):
-		error_count = len(ERRORS)
-		try:
-			run_command_in_multicmd_with_path_check(['udevadm', 'settle'], quiet=True)
-		finally:
-			del ERRORS[error_count:]
+	_udev_settle()
 	deadline = time.time() + timeout
 	while True:
 		devices = _partition_devices(disk)
@@ -5400,6 +5404,16 @@ def _probe_identity(device):
 			values[key] = re.sub(r'\\(.)', r'\1', value)
 	return values.get('TYPE', ''), values.get('UUID', ''), values.get('LABEL', '')
 
+def _partition_table_type(device):
+	"""Partition table type of device from a low-level `blkid -p` probe ('gpt', 'dos', ...; '' when it has none)."""
+	error_count = len(ERRORS)
+	try:
+		output = run_command_in_multicmd_with_path_check(['blkid', '-p', '-o', 'value', '-s', 'PTTYPE', device], quiet=True)
+	finally:
+		# blkid exits 2 when it finds nothing.
+		del ERRORS[error_count:]
+	return next((line.strip() for line in output if line.strip()), '')
+
 def read_disk_layout(device):
 	"""Fresh GPT + filesystem identity read of block device.
 
@@ -5407,7 +5421,12 @@ def read_disk_layout(device):
 	'unique_guid', 'name', 'attrs', 'size', 'fs_type', 'fs_uuid', 'fs_label', 'fs_params',
 	'device'}}}. The partition caches are cleared first: loop device names are reused.
 	Filesystem type, UUID and label come from _probe_identity, not the cached blkid read.
+	Raises RuntimeError('Disk layout mismatch: ...') unless the disk has a GPT partition table:
+	sgdisk reads an MBR disk as if it were GPT, and an identity change would convert it.
 	"""
+	pttype = _partition_table_type(device)
+	if pttype != 'gpt':
+		raise RuntimeError(f'Disk layout mismatch: {device} has no GPT partition table (found {pttype or "none"}); disk patches support GPT disks only')
 	get_partition_infos.cache_clear()
 	get_partition_details.cache_clear()
 	infos = get_partition_infos(device)
@@ -6039,6 +6058,8 @@ def apply_disk_patch(volume_roots, target, mount_points, loop_devices, force=Fal
 	if not pathlib.Path(target).resolve().is_block_device():
 		_refuse_if_image_in_use(target, entries)
 	disk = _attach_disk(target, False, loop_devices)
+	if not _partition_table_type(disk):
+		raise RuntimeError(f'Invalid arguments: {target} is not a partitioned disk; a disk patch needs a whole GPT disk (block device or disk image)')
 	layout = read_disk_layout(disk)
 	problems = match_target_layout(disk_rows, layout)
 	if problems:

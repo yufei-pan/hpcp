@@ -219,6 +219,56 @@ def test_settle_partitions_gives_up(hpcp_mod, monkeypatch):
 		hpcp_mod._settle_partitions('/dev/x', [2], timeout=0.3)
 
 
+def _fake_blkid_pttype(monkeypatch, hpcp_mod, pttype_lines, calls=None):
+	"""Answer `blkid -p ... PTTYPE` with pttype_lines (and record a failure like blkid's exit 2 when empty)."""
+	def fake(argv, **kwargs):
+		if calls is not None:
+			calls.append(list(argv))
+		assert argv[:2] == ['blkid', '-p'] and 'PTTYPE' in argv, argv
+		if not pttype_lines:
+			hpcp_mod.ERRORS.append('Task return code error: blkid exited 2')
+		return list(pttype_lines)
+	monkeypatch.setattr(hpcp_mod, 'run_command_in_multicmd_with_path_check', fake)
+
+
+@pytest.mark.parametrize('lines, found', [(['dos'], 'dos'), ([], 'none'), (['PMBR'], 'PMBR')])
+def test_read_disk_layout_refuses_a_disk_without_gpt(hpcp_mod, reset_hpcp_globals, monkeypatch, lines, found):
+	"""sgdisk reads an MBR disk as if it were GPT; a GPT identity change would then convert it."""
+	_fake_blkid_pttype(monkeypatch, hpcp_mod, lines)
+	def must_not_read(device):
+		raise AssertionError('the GPT was read before the partition table type was checked')
+	must_not_read.cache_clear = lambda: None
+	monkeypatch.setattr(hpcp_mod, 'get_partition_infos', must_not_read)
+	with pytest.raises(RuntimeError, match=rf'^Disk layout mismatch: /dev/x has no GPT partition table \(found {found}\); disk patches support GPT disks only$'):
+		hpcp_mod.read_disk_layout('/dev/x')
+	assert hpcp_mod.ERRORS == []
+
+
+def test_partition_table_type_is_quiet(hpcp_mod, reset_hpcp_globals, monkeypatch):
+	_fake_blkid_pttype(monkeypatch, hpcp_mod, ['gpt\n'])
+	assert hpcp_mod._partition_table_type('/dev/x') == 'gpt'
+	_fake_blkid_pttype(monkeypatch, hpcp_mod, [])
+	assert hpcp_mod._partition_table_type('/dev/x') == ''
+	assert hpcp_mod.ERRORS == []
+
+
+def test_disk_apply_to_a_target_without_a_partition_table(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	"""No partition table at all is a wrong target (Invalid arguments); an MBR disk is a layout mismatch."""
+	meta = {'layout': 'disk', 'disk': 'disk.tsv', 'raws': []}
+	monkeypatch.setattr(hpcp_mod, '_load_patch', lambda roots, names=None: (meta, [], list(roots)))
+	monkeypatch.setattr(hpcp_mod, 'read_disk_tsv', lambda path: [])
+	monkeypatch.setattr(hpcp_mod, '_refuse_if_image_in_use', lambda image, entries: None)
+	monkeypatch.setattr(hpcp_mod, '_attach_disk', lambda path, ro, loops: '/dev/fake')
+	target = tmp_path / 'fs.img'
+	target.write_bytes(b'')
+	_fake_blkid_pttype(monkeypatch, hpcp_mod, [])
+	with pytest.raises(RuntimeError, match=rf'^Invalid arguments: {target} is not a partitioned disk; a disk patch needs a whole GPT disk \(block device or disk image\)$'):
+		hpcp_mod.apply_disk_patch(['/vol'], str(target), [], [])
+	_fake_blkid_pttype(monkeypatch, hpcp_mod, ['dos'])
+	with pytest.raises(RuntimeError, match=r'^Disk layout mismatch: /dev/fake has no GPT partition table \(found dos\)'):
+		hpcp_mod.apply_disk_patch(['/vol'], str(target), [], [])
+
+
 # ---- root + loop fixtures (GPT disk images) ----
 
 _DISK_TOOLS = ('losetup', 'sgdisk', 'mkfs.vfat', 'mkfs.ext4', 'mkswap', 'mount', 'umount', 'lsblk', 'blkid', 'e2label')
@@ -826,6 +876,31 @@ def test_disk_apply_refuses_a_different_layout(tmp_path, hpcp_mod, reset_hpcp_gl
 	with pytest.raises(RuntimeError, match='Disk layout mismatch'):
 		_apply(hpcp_mod, patch, target)
 	assert _sha(target.read_bytes()) == before
+
+
+@requires_root_and_disk_tools
+@pytest.mark.root
+@pytest.mark.loop
+def test_disk_apply_refuses_mbr_and_partitionless_targets(tmp_path, hpcp_mod, reset_hpcp_globals):
+	old, new, patch = _make_patch(hpcp_mod, tmp_path)
+	fs_image = tmp_path / 'fs.img'
+	with open(str(fs_image), 'wb') as f:
+		f.truncate(16 << 20)
+	_run('mkfs.ext4', '-q', '-F', fs_image)
+	with pytest.raises(RuntimeError, match=r'Invalid arguments: .*fs\.img is not a partitioned disk'):
+		_apply(hpcp_mod, patch, fs_image)
+	# sgdisk would read this MBR disk as GPT, and the GPT name change would convert it.
+	mbr_image = tmp_path / 'mbr.img'
+	shutil.copyfile(str(old), str(mbr_image))
+	_run('sgdisk', '--gpttombr=1:2:3:4', mbr_image)
+	before = _sha(mbr_image.read_bytes())
+	with pytest.raises(RuntimeError, match=r'Disk layout mismatch: .* has no GPT partition table \(found dos\)'):
+		_apply(hpcp_mod, patch, mbr_image)
+	assert _sha(mbr_image.read_bytes()) == before
+	with _session(hpcp_mod) as (mount_points, loop_devices):
+		with pytest.raises(RuntimeError, match=r'has no GPT partition table \(found dos\)'):
+			hpcp_mod.process_get_disk_diff_image([str(new)], [str(mbr_image)], str(tmp_path / 'x.img'), mount_points, loop_devices, max_workers=1)
+	assert not (tmp_path / 'x.img').exists()
 
 
 @requires_root_and_disk_tools
