@@ -6355,12 +6355,14 @@ def apply_disk_patch(volume_roots, target, mount_points, loop_devices, force=Fal
 	in_use = {number: _partition_in_use(part['device'], _device_number(part['device']), entries, swaps)
 		for number, part in layout['parts'].items()}
 	changes, refusals, warnings = _plan_identity(disk_rows, layout, in_use)
-	raw_plan = []
+	raw_plan, raw_refusals = [], []
 	for name, raw_file, old_sha, new_sha, size in meta['raws']:
 		number = None if name == 'mbr' else int(name[len('part'):])
 		if number is not None and in_use.get(number):
-			# Refused without reading it: a live area (an LVM PV, say) can be hundreds of GB.
-			refusals.append(f'partition {number} is {in_use[number]} and its raw area changes')
+			# Refused without reading it: a live area (an LVM PV, say) can be hundreds of GB. So whether it
+			# already holds the new content (a live re-run) is not known either.
+			raw_refusals.append(f'partition {number} is {in_use[number]}; this patch carries its raw area, '
+				'which cannot be checked or written while it is in use')
 			continue
 		device = disk if number is None else layout['parts'][number]['device']
 		found = _hash_area(device, 0, size)
@@ -6377,6 +6379,10 @@ def apply_disk_patch(volume_roots, target, mount_points, loop_devices, force=Fal
 		live, live_read_only = _live_mount(_device_number(part['device']), entries, part['device'])
 		if live and live_read_only:
 			refusals.append(f'partition {name[len("part"):]} is mounted read-only at {live}')
+	if raw_refusals:
+		done = 'it if it is' if len(raw_refusals) == 1 else 'each one that is'
+		raise RuntimeError('Disk in use: ' + '; '.join(refusals + raw_refusals)
+			+ f'; apply the patch offline (an offline apply skips {done} already done)')
 	if refusals:
 		raise RuntimeError('Disk in use: ' + '; '.join(refusals) + '; apply this patch offline')
 	commands, unsupported = _identity_command_list(changes, layout, disk)

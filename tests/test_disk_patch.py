@@ -397,9 +397,38 @@ def test_in_use_raw_partition_is_refused_before_it_is_hashed(tmp_path, hpcp_mod,
 	# The disk's boot code is already new (skip); the area on the partition still holds the old bytes.
 	answers = {'/dev/fake': _D, '/dev/fake2': _A, payload: _B}
 	monkeypatch.setattr(hpcp_mod, '_hash_area', lambda path, offset=0, length=None: hashed.append(path) or answers[path])
-	with pytest.raises(RuntimeError, match=r'^Disk in use: partition 2 is held by another device and its raw area changes; apply this patch offline$'):
+	# Not "its raw area changes": unread, the area may already hold the new content (a live re-run).
+	with pytest.raises(RuntimeError, match='^' + re.escape('Disk in use: partition 2 is held by another device; this patch carries its raw area, '
+			'which cannot be checked or written while it is in use; apply the patch offline (an offline apply skips it if it is already done)') + '$'):
 		hpcp_mod.apply_disk_patch([volume], str(tmp_path / 'node.img'), [], [])
 	assert '/dev/fake2' not in hashed and hashed == ['/dev/fake']
+
+
+def test_several_in_use_raw_partitions_and_other_refusals_share_one_message(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	kinds = {1: ('fs', 'vfat', 32 << 20), 2: ('raw', '', 1 << 20), 5: ('raw', '', 1 << 20)}
+	raws = [('part2', 'raw/part2.img', _A, _B, 1 << 20), ('part5', 'raw/part5.img', _A, _B, 1 << 20)]
+	volume, layout = _hand_made_disk_patch(hpcp_mod, tmp_path, monkeypatch, raws=raws, kinds=kinds, open_target=True)
+	# The patch also renames partition 1, which is mounted.
+	path = os.path.join(volume, '.hpcp_diff', 'disk.tsv')
+	rows = [row._replace(new='ESP') if (row.number, row.field) == ('1', 'name') else row for row in hpcp_mod.read_disk_tsv(path)]
+	hpcp_mod.write_disk_tsv(path, rows)
+	monkeypatch.setattr(hpcp_mod, '_refuse_if_image_in_use', lambda image: None)
+	monkeypatch.setattr(hpcp_mod, '_attach_disk', lambda path, ro, loops: '/dev/fake')
+	monkeypatch.setattr(hpcp_mod, '_partition_table_type', lambda device: 'gpt')
+	monkeypatch.setattr(hpcp_mod, 'read_disk_layout', lambda disk: layout)
+	monkeypatch.setattr(hpcp_mod, '_mountinfo_entries', lambda: [])
+	monkeypatch.setattr(hpcp_mod, '_swap_devices', lambda: set())
+	monkeypatch.setattr(hpcp_mod, '_device_number', lambda device: (7, 0))
+	busy = {'/dev/fake1': 'mounted at /boot/efi', '/dev/fake2': 'held by another device', '/dev/fake5': 'active swap'}
+	monkeypatch.setattr(hpcp_mod, '_partition_in_use', lambda device, devnum, entries, swaps: busy.get(device, ''))
+	hashed = []
+	monkeypatch.setattr(hpcp_mod, '_hash_area', lambda path, offset=0, length=None: hashed.append(path) or _A)
+	with pytest.raises(RuntimeError, match='^' + re.escape('Disk in use: partition 1 is mounted at /boot/efi and its name changes; '
+			'partition 2 is held by another device; this patch carries its raw area, which cannot be checked or written while it is in use; '
+			'partition 5 is active swap; this patch carries its raw area, which cannot be checked or written while it is in use; '
+			'apply the patch offline (an offline apply skips each one that is already done)') + '$'):
+		hpcp_mod.apply_disk_patch([volume], str(tmp_path / 'node.img'), [], [])
+	assert hashed == []
 
 
 # ---- root + loop fixtures (GPT disk images) ----
