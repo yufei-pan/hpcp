@@ -3,6 +3,7 @@ import hashlib
 import os
 import shutil
 import stat
+import subprocess
 import sys
 import pytest
 
@@ -309,6 +310,70 @@ def test_build_entry_map_keys(tmp_path, hpcp_mod, reset_hpcp_globals):
 	prefixed = hpcp_mod.build_entry_map(str(root), prefix='data/r/', max_workers=1)
 	assert set(prefixed) == {'data/r/', 'data/r/a.txt', 'data/r/sub/', 'data/r/sub/b.txt', 'data/r/ln'}
 	assert prefixed['data/r/sub/b.txt'] == str(root / 'sub' / 'b.txt')
+
+
+def test_build_entry_map_lists_through_a_symlinked_root(tmp_path, hpcp_mod, reset_hpcp_globals):
+	"""F2: a root that is a symlink to a directory is listed from its target, keyed from the given path."""
+	real = tmp_path / 'real'
+	_write(real / 'a.txt', 'a')
+	_write(real / 'sub' / 'b.txt', 'b')
+	os.symlink('real', tmp_path / 'link')
+	got = hpcp_mod.build_entry_map(str(tmp_path / 'link'), prefix='data/link/', max_workers=1)
+	assert set(got) == {'data/link/', 'data/link/a.txt', 'data/link/sub/', 'data/link/sub/b.txt'}
+	assert hpcp_mod.get_entry_state(got['data/link/']).startswith('d:')
+	os.symlink('real/a.txt', tmp_path / 'filelink')
+	assert hpcp_mod.build_entry_map(str(tmp_path / 'filelink'), prefix='x/', max_workers=1) == {}
+
+
+def test_store_maps_for_a_symlinked_source_keep_the_stored_subtree(tmp_path, hpcp_mod, reset_hpcp_globals):
+	"""F2: `-diff /data/link -di store.img` compares contents instead of deleting what -di stored."""
+	hpcp_mod.HASH_SIZE = 65536
+	real = tmp_path / 'real'
+	_write(real / 'a.txt', 'a')
+	_write(real / 'sub' / 'b.txt', 'b')
+	link = tmp_path / 'link'
+	os.symlink('real', link)
+	store = tmp_path / 'store'
+	shutil.copytree(str(real), str(store / os.path.relpath(str(link), '/')))
+	rows = hpcp_mod.compute_changes(*hpcp_mod.build_store_maps(str(link), str(store), max_workers=1), max_workers=1)
+	assert [row for row in rows if row.op != 'M'] == []
+
+
+def test_patch_from_a_symlinked_new_root_round_trips(trees, hpcp_mod, tmp_path):
+	"""F2: the root directory's metadata comes from the symlink's target, not the symlink."""
+	_, base = trees
+	real = tmp_path / 'real'
+	_write(real / 'a.txt', 'a')
+	os.chmod(str(real), 0o700)
+	link = tmp_path / 'link'
+	os.symlink('real', link)
+	rows = hpcp_mod.compute_changes(*hpcp_mod.build_root_maps(str(link), str(base), max_workers=1), max_workers=1)
+	assert ('M', './') in _ops(rows)
+	vol = tmp_path / 'vol'
+	vol.mkdir()
+	hpcp_mod.build_patch_tree(rows, str(link), [str(vol)], hpcp_mod.make_patch_meta(rows, 'n', 'b', 'root'), max_workers=1)
+	target = tmp_path / 'target'
+	_clone(base, target)
+	summary = hpcp_mod.apply_patch_tree([str(vol)], str(target), max_workers=1)
+	assert summary['failed'] == 0
+	assert stat.S_IMODE(os.stat(str(target)).st_mode) == 0o700
+
+
+def test_process_get_diff_image_validates_rows_before_creating_images(trees, hpcp_mod, tmp_path, monkeypatch):
+	"""F2: rows that any apply would reject fail before an output name is claimed or mkfs runs."""
+	new, base = trees
+	_write(new / 'a.txt', 'a')
+	_, dstate, _ = _states(hpcp_mod, tmp_path)
+	monkeypatch.setattr(hpcp_mod, 'compute_changes', lambda *a, **k: [hpcp_mod.ChangeRow('D', './', dstate, '-')])
+
+	def fail(*args, **kwargs):
+		raise AssertionError('create_image must not be reached')
+
+	monkeypatch.setattr(hpcp_mod, 'create_image', fail)
+	out = tmp_path / 'p.img'
+	with pytest.raises(RuntimeError, match='Patch format error'):
+		hpcp_mod.process_get_diff_image([str(new)], None, [str(base)], None, str(out), [], [], max_workers=1)
+	assert not out.exists()
 
 
 def test_build_store_maps_parents_and_missing_subtree(tmp_path, hpcp_mod, reset_hpcp_globals):
@@ -1403,6 +1468,119 @@ def test_process_get_diff_image_sizes_volumes_by_allocation(trees, hpcp_mod, tmp
 	with pytest.raises(Sentinel):
 		hpcp_mod.process_get_diff_image([str(new)], None, [str(base)], None, str(tmp_path / 'p.img'), [], [], max_workers=1)
 	assert captured['init_size'] >= 200 * 4096
+	# F9: every A/M row also reserves 512 bytes of inode overhead (xfs).
+	rows = _changes(hpcp_mod, new, base)
+	payload = [row for row in rows if row.op in ('A', 'M')]
+	allocation = sum(hpcp_mod._align_up(max(hpcp_mod.decode_state(row.new)['size'], 1)) if row.new.startswith('f:')
+		else hpcp_mod._IMAGE_BLOCK for row in payload)
+	listing = 2 * sum(len(row.path) + len(row.old) + len(row.new) + 8 for row in rows)
+	assert captured['init_size'] == allocation + listing + 512 * len(payload)
+
+
+def _fake_image_mounts(hpcp_mod, monkeypatch, roots):
+	"""Make _mount_single_fs_image 'mount' image i at the prepared directory roots[image path]."""
+	def fake_mount(image, read_only, mount_points, loop_devices):
+		root = str(roots[os.path.abspath(image)])
+		mount_points.append(root)
+		return root + os.sep
+	monkeypatch.setattr(hpcp_mod, '_mount_single_fs_image', fake_mount)
+
+
+def _rows_before_mkfs(hpcp_mod, monkeypatch, *args, **kwargs):
+	"""The rows process_get_diff_image would write, captured before anything is created."""
+	captured = {}
+
+	class Sentinel(Exception):
+		pass
+
+	def capture(rows, *rest, **options):
+		captured['rows'] = rows
+		raise Sentinel()
+
+	monkeypatch.setattr(hpcp_mod, 'make_patch_meta', capture)
+	with pytest.raises(Sentinel):
+		hpcp_mod.process_get_diff_image(*args, **kwargs)
+	return captured['rows']
+
+
+def test_image_roots_ignore_lost_and_found(trees, hpcp_mod, tmp_path, monkeypatch):
+	"""F10: an ext4 image's lost+found/ is not part of the tree it holds."""
+	new, base = trees
+	image_root = tmp_path / 'image_root'
+	_write(image_root / 'a.txt', 'a')
+	_write(image_root / 'lost+found' / '#1234', 'orphan')
+	_write(base / 'a.txt', 'a')
+	image = tmp_path / 'new.img'
+	image.write_bytes(b'')
+	_fake_image_mounts(hpcp_mod, monkeypatch, {str(image): image_root})
+	rows = _rows_before_mkfs(hpcp_mod, monkeypatch, [], [str(image)], [str(base)], None, str(tmp_path / 'p.img'), [], [], max_workers=1)
+	assert not [row for row in rows if row.path.startswith('lost+found')]
+	assert hpcp_mod._drop_lost_found({'./': '/m', 'lost+found/': '/m/lost+found', 'lost+found/x': '/m/lost+found/x',
+		'lost+foundling': '/m/lost+foundling'}) == {'./': '/m', 'lost+foundling': '/m/lost+foundling'}
+
+
+def test_diff_ignores_its_own_image_mounted_inside_the_base(trees, hpcp_mod, tmp_path, monkeypatch):
+	"""F14: `-si new.img -d /` must not list new.img's own mount point as part of the base."""
+	new, base = trees
+	_write(base / 'keep.txt', 'k')
+	mounted = base / 'tmpmnt'
+	_write(mounted / 'keep.txt', 'k')
+	_write(mounted / 'inside.txt', 'image content')
+	os.utime(str(mounted / 'keep.txt'), ns=(os.stat(str(base / 'keep.txt')).st_atime_ns, os.stat(str(base / 'keep.txt')).st_mtime_ns))
+	image = tmp_path / 'new.img'
+	image.write_bytes(b'')
+	_fake_image_mounts(hpcp_mod, monkeypatch, {str(image): mounted})
+	rows = _rows_before_mkfs(hpcp_mod, monkeypatch, [], [str(image)], [str(base)], None, str(tmp_path / 'p.img'), [], [], max_workers=1)
+	assert not [row for row in rows if row.path.startswith('tmpmnt')]
+	assert ('A', 'inside.txt') in _ops(rows)
+
+
+def test_diff_ignores_the_store_mounted_inside_the_source(trees, hpcp_mod, tmp_path, monkeypatch):
+	"""F14: `-diff / -di store.img` must not list the store's own mount point as part of the source."""
+	new, base = trees
+	_write(new / 'a.txt', 'a')
+	store_root = new / 'storemnt'
+	_write(store_root / os.path.relpath(str(new), '/') / 'a.txt', 'a')
+	image = tmp_path / 'store.img'
+	image.write_bytes(b'')
+	_fake_image_mounts(hpcp_mod, monkeypatch, {str(image): store_root})
+	rows = _rows_before_mkfs(hpcp_mod, monkeypatch, [str(new)], None, [], str(image), str(tmp_path / 'p.img'), [], [], max_workers=1)
+	prefix = os.path.relpath(str(new), '/').replace(os.sep, '/') + '/'
+	assert not [row for row in rows if row.path.startswith(prefix + 'storemnt')]
+
+
+def test_mount_single_fs_image_probes_type_with_blkid(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	"""F7: the read-only options come from blkid -p; a failed probe falls back to plain ro and records nothing."""
+	image = tmp_path / 'fs.img'
+	image.write_bytes(b'')
+	monkeypatch.setattr(hpcp_mod, 'create_loop_device', lambda path, read_only=False: '/dev/loop-fake')
+	monkeypatch.setattr(hpcp_mod, 'get_partitions', lambda device: [])
+	monkeypatch.setattr(os.path, 'ismount', lambda path: True)
+	commands = []
+	blkid = {}
+
+	def fake_run(command, *args, **kwargs):
+		commands.append(list(command))
+		if command[0] == 'blkid':
+			if blkid.get('fail'):
+				hpcp_mod.ERRORS.append(f"Task return code error: Command '{command}' failed with return code 2.")
+				raise RuntimeError('blkid failed')
+			return ['xfs']
+		return ['']
+
+	monkeypatch.setattr(hpcp_mod, 'run_command_in_multicmd_with_path_check', fake_run)
+	mount_points = []
+	try:
+		hpcp_mod._mount_single_fs_image(str(image), True, mount_points, [])
+		assert ['blkid', '-p', '-s', 'TYPE', '-o', 'value', '/dev/loop-fake'] in commands
+		assert commands[-1][:3] == ['mount', '-o', 'ro,nouuid,norecovery']
+		blkid['fail'] = True
+		hpcp_mod._mount_single_fs_image(str(image), True, mount_points, [])
+		assert commands[-1][:3] == ['mount', '-o', 'ro']
+		assert hpcp_mod.ERRORS == []
+	finally:
+		for mount_point in mount_points:
+			os.rmdir(mount_point)
 
 
 @requires_root_and_image_tools
@@ -1420,6 +1598,59 @@ def test_cloned_image_mounts_for_diff(trees, hpcp_mod, tmp_path, reset_hpcp_glob
 	shutil.copyfile(base_img, clone)
 	with _mount_session(hpcp_mod) as (mount_points, loop_devices):
 		assert hpcp_mod.process_get_diff_image([], [clone], [], base_img, str(tmp_path / 'p.img'), mount_points, loop_devices, max_workers=1) is None
+
+
+def _make_xfs_image(hpcp_mod, path, populate):
+	"""A sparse 320 MiB xfs image (hpcp formats images above 300 MiB as xfs) whose root holds populate(root)."""
+	with open(path, 'wb') as f:
+		f.truncate(320 * 1024 * 1024)
+	subprocess.run(['mkfs.xfs', '-f', '-q', path], check=True)
+	_change_image(hpcp_mod, path, populate)
+
+
+def _change_image(hpcp_mod, path, change):
+	"""Mount path read-write, run change(root), unmount."""
+	with _mount_session(hpcp_mod) as (mount_points, loop_devices):
+		change(hpcp_mod._mount_single_fs_image(path, False, mount_points, loop_devices))
+
+
+@requires_root_and_image_tools
+@pytest.mark.skipif(shutil.which('mkfs.xfs') is None, reason='needs mkfs.xfs')
+@pytest.mark.root
+@pytest.mark.loop
+def test_xfs_image_to_image_patch_applies_to_the_base_image(tmp_path, hpcp_mod, reset_hpcp_globals):
+	"""F4: -si new.img -di base.img on byte-identical xfs clones (same UUID), then -siff onto base.img."""
+	hpcp_mod.HASH_SIZE = 65536
+	base_img, new_img, out = str(tmp_path / 'base.img'), str(tmp_path / 'new.img'), str(tmp_path / 'patch.img')
+
+	def populate(root):
+		_write(os.path.join(root, 'keep.txt'), 'keep')
+		_write(os.path.join(root, 'mod.txt'), 'old')
+		_write(os.path.join(root, 'gone.txt'), 'bye')
+		_write(os.path.join(root, 'olddir', 'a.txt'), 'a')
+		_write(os.path.join(root, 'sub', 'x.txt'), 'x')
+
+	def change(root):
+		_write(os.path.join(root, 'mod.txt'), 'new content', mtime=T0 + 100)
+		_write(os.path.join(root, 'add.txt'), 'added')
+		os.unlink(os.path.join(root, 'gone.txt'))
+		shutil.rmtree(os.path.join(root, 'olddir'))
+		_write(os.path.join(root, 'newdir', 'f.txt'), 'fresh')
+		os.chmod(os.path.join(root, 'sub'), 0o700)
+
+	_make_xfs_image(hpcp_mod, base_img, populate)
+	subprocess.run(['cp', '--sparse=always', base_img, new_img], check=True)
+	_change_image(hpcp_mod, new_img, change)
+	with _mount_session(hpcp_mod) as (mount_points, loop_devices):
+		assert hpcp_mod.process_get_diff_image([], [new_img], [], base_img, out, mount_points, loop_devices, max_workers=2) == out
+	with _mount_session(hpcp_mod) as (mount_points, loop_devices):
+		summary = hpcp_mod.process_load_diff_image([out], [], [], base_img, mount_points, loop_devices, max_workers=2)
+	assert summary['failed'] == 0
+	assert (summary['added'], summary['deleted'], summary['modified']) == (3, 3, 2)
+	with _mount_session(hpcp_mod) as (mount_points, loop_devices):
+		new_root = hpcp_mod._mount_single_fs_image(new_img, True, mount_points, loop_devices)
+		base_root = hpcp_mod._mount_single_fs_image(base_img, True, mount_points, loop_devices)
+		assert hpcp_mod.compute_changes(*hpcp_mod.build_root_maps(new_root, base_root, max_workers=1), max_workers=1) == []
 
 
 def test_hpcp_rejects_bad_patch_arguments(tmp_path, hpcp_mod, reset_hpcp_globals, capsys):

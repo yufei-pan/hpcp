@@ -4031,7 +4031,9 @@ def build_entry_map(root, prefix='', parents=None, exclude=None, logical_root=No
 	root itself is keyed prefix, or './' when prefix is empty. parents adds extra
 	{key: directory} entries (store-layout ancestors) when they exist. With logical_root,
 	exclude is matched against logical_root + relative path instead of the physical path,
-	so a base tree honours patterns written for the new tree. A missing root yields only
+	so a base tree honours patterns written for the new tree. A root that is a symlink to a
+	directory is listed from its target (keys stay relative, exclude is still matched
+	against the given path). A missing root, or a symlink to anything else, yields only
 	the existing parents.
 	"""
 	entries = {}
@@ -4039,6 +4041,10 @@ def build_entry_map(root, prefix='', parents=None, exclude=None, logical_root=No
 		if os.path.isdir(path) and not os.path.islink(path):
 			entries[key] = path
 	root = os.path.abspath(root)
+	if os.path.islink(root) and os.path.isdir(root):
+		if logical_root is None:
+			logical_root = root
+		root = os.path.realpath(root)
 	if not os.path.isdir(root) or os.path.islink(root):
 		return entries
 	post_filter = bool(exclude) and logical_root is not None
@@ -4348,7 +4354,11 @@ def build_patch_tree(rows, new_base, volume_roots, meta, max_workers=1, verbose=
 			_place_symlink(decode_state(row.new)['target'], _key_path(volume_roots[0], row.path))
 	# Directories last and deepest first, so later writes cannot disturb their mtimes.
 	for key in sorted(dir_keys, key=_key_depth, reverse=True):
-		sync_directory_metadata(_key_path(new_base, key), [_key_path(volume_root, key) for volume_root in volume_roots])
+		source = _key_path(new_base, key)
+		if os.path.islink(source) and os.path.isdir(source):
+			# A symlinked root is listed from its target (build_entry_map); take its metadata there too.
+			source = os.path.realpath(source)
+		sync_directory_metadata(source, [_key_path(volume_root, key) for volume_root in volume_roots])
 	# copy_file_list_parallel reports failures only on stderr and skips full destinations, so check the result here.
 	missing = _missing_payload(payload, volume_roots)
 	if missing:
@@ -4830,6 +4840,17 @@ def apply_patch_tree(volume_roots, target_root, force=False, max_workers=1, verb
 	print('Patch summary: ' + ', '.join(f'{key} {value}' for key, value in summary.items()))
 	return summary
 
+def _probe_fs_type(device):
+	"""Filesystem type of device from `blkid -p` ('' when unknown). A failed probe leaves nothing in ERRORS."""
+	error_count = len(ERRORS)
+	try:
+		output = run_command_in_multicmd_with_path_check(['blkid', '-p', '-s', 'TYPE', '-o', 'value', device], quiet=True)
+	except Exception:
+		output = []
+	finally:
+		del ERRORS[error_count:]
+	return next((line.strip() for line in output if line.strip()), '')
+
 def _mount_single_fs_image(image, read_only, mount_points, loop_devices):
 	"""Attach image, mount its largest partition (or the whole partitionless image), return the mount point + os.sep."""
 	image = os.path.abspath(os.path.expanduser(image))
@@ -4846,11 +4867,8 @@ def _mount_single_fs_image(image, read_only, mount_points, loop_devices):
 	mount_point = tempfile.mkdtemp()
 	mount_points.append(mount_point)
 	if read_only:
-		try:
-			fs_type = get_fs_type(target)
-		except Exception:
-			fs_type = ''
-		options = {'xfs': 'ro,nouuid,norecovery', 'ext3': 'ro,noload', 'ext4': 'ro,noload'}.get(fs_type, 'ro')
+		# lsblk reads udev's cache, which a fresh loop device may not have yet; blkid -p reads the device.
+		options = {'xfs': 'ro,nouuid,norecovery', 'ext3': 'ro,noload', 'ext4': 'ro,noload'}.get(_probe_fs_type(target), 'ro')
 		command = ['mount', '-o', options, target, mount_point]
 	else:
 		command = ['mount', target, mount_point]
@@ -4859,11 +4877,34 @@ def _mount_single_fs_image(image, read_only, mount_points, loop_devices):
 		raise RuntimeError(f'Diff image error: cannot mount {target} from {image}')
 	return mount_point + os.sep
 
+def _drop_lost_found(entry_map):
+	"""entry_map without lost+found/ and everything under it (mkfs.ext4 puts one on every image root)."""
+	return {key: path for key, path in entry_map.items() if not key.startswith('lost+found/')}
+
+def _mount_point_excludes(mount_points, listed_roots, matched_root):
+	"""Exclude patterns that keep this run's mount points out of the listings of listed_roots.
+
+	Both listings match exclude patterns against matched_root + relative path (the new
+	side's path; see build_entry_map's logical_root), so a mount point strictly inside a
+	listed root is excluded at matched_root + its path relative to that root. A listed root
+	itself is never excluded.
+	"""
+	patterns = set()
+	for mount_point in mount_points:
+		mount_real = os.path.realpath(mount_point)
+		for root in listed_roots:
+			root_real = os.path.realpath(root)
+			if mount_real.startswith(root_real.rstrip(os.sep) + os.sep):
+				patterns.add(glob.escape(os.path.join(matched_root, os.path.relpath(mount_real, root_real))))
+	return patterns
+
 def process_get_diff_image(src_paths, src_image, dest_paths, dest_image, output, mount_points, loop_devices,
 		exclude=None, full_hash=False, dest_image_size=0, max_workers=multiprocessing.cpu_count(),
 		parallel_file_listing=False, verbose=False):
 	"""Write a patch image that turns the base (-d DIR / -di IMG) into the new tree (src_path DIR / -si IMG).
 
+	This run's own mount points are left out of both listings, and so is lost+found/ at the
+	root of an image side compared root to root.
 	Returns the patch path, or None when the trees do not differ (no image is created).
 	"""
 	if src_image:
@@ -4887,12 +4928,20 @@ def process_get_diff_image(src_paths, src_image, dest_paths, dest_image, output,
 			raise RuntimeError(f'Invalid arguments: -diff needs exactly one existing base directory (-d), got {dest_paths}')
 		base_root = os.path.abspath(bases[0])
 		base_name, base_is_image = os.path.basename(os.path.normpath(base_root)) or 'root', False
-	if new_is_dir and base_is_image:
+	layout = 'store' if new_is_dir and base_is_image else 'root'
+	# Store layout lists only the new tree's own subtree inside the store (see build_store_maps).
+	base_listed = os.path.join(base_root, os.path.relpath(os.path.abspath(new_root), os.sep)) if layout == 'store' else base_root
+	exclude = frozenset(exclude or ()) | _mount_point_excludes(mount_points, (new_root, base_listed), os.path.abspath(new_root))
+	if layout == 'store':
 		new_map, base_map = build_store_maps(new_root, base_root, exclude, max_workers, parallel_file_listing)
-		new_base, layout = os.sep, 'store'
+		new_base = os.sep
 	else:
 		new_map, base_map = build_root_maps(new_root, base_root, exclude, max_workers, parallel_file_listing)
-		new_base, layout = new_root, 'root'
+		new_base = new_root
+		if src_image:
+			new_map = _drop_lost_found(new_map)
+		if dest_image:
+			base_map = _drop_lost_found(base_map)
 	if any(_is_reserved_key(key) for key in new_map):
 		raise RuntimeError(f'Diff image error: {new_root} contains {DIFF_DIR_NAME}, which hpcp reserves for patch metadata')
 	if not output or output == 'auto':
@@ -4901,6 +4950,8 @@ def process_get_diff_image(src_paths, src_image, dest_paths, dest_image, output,
 	if os.path.lexists(output):
 		raise RuntimeError(f'Diff image error: output {output} already exists')
 	rows = compute_changes(new_map, base_map, full_hash=full_hash, max_workers=max_workers)
+	# Fail here, before any image exists, on rows every apply would reject.
+	_validate_patch_rows(rows)
 	meta = make_patch_meta(rows, new_name, base_name, layout, full_hash)
 	print(f"Changes: {meta['added']} added, {meta['modified']} modified, {meta['deleted']} deleted; payload {format_bytes(meta['payload_bytes'])}B")
 	if not rows:
@@ -4910,6 +4961,8 @@ def process_get_diff_image(src_paths, src_image, dest_paths, dest_image, output,
 	init_size = 2 * change_list_bytes
 	for row in rows:
 		if row.op in ('A', 'M'):
+			# Allocation, not apparent size, plus the inode each entry needs (512 bytes on xfs).
+			init_size += 512
 			if row.new.startswith('f:'):
 				init_size += _align_up(max(decode_state(row.new)['size'], 1))
 			else:
