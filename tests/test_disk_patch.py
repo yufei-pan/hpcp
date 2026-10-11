@@ -760,3 +760,116 @@ def test_unmountable_filesystem_is_compared_as_raw_with_a_warning(hpcp_mod, monk
 	monkeypatch.setattr(hpcp_mod, 'expand_paths', lambda paths: list(paths))
 	assert hpcp_mod.process_get_disk_diff_image(['/x/new'], ['/x/old'], '/x/out', [], [], max_workers=1) is None
 	assert 'partition 1 (ext4) could not be mounted on the new and old side; comparing it as a raw area' in capsys.readouterr().err
+
+
+def _make_patch(hpcp_mod, tmp_path, **newer):
+	old, new, out = tmp_path / 'old.img', tmp_path / 'new.img', str(tmp_path / 'patch.img')
+	_make_golden(old)
+	_make_newer(old, new, **newer)
+	with _session(hpcp_mod) as (mount_points, loop_devices):
+		assert hpcp_mod.process_get_disk_diff_image([str(new)], [str(old)], out, mount_points, loop_devices, max_workers=1) == out
+	return old, new, out
+
+
+def _apply(hpcp_mod, patch, target, force=False):
+	with _session(hpcp_mod) as (mount_points, loop_devices):
+		volume = hpcp_mod._mount_single_fs_image(patch, True, mount_points, loop_devices)
+		return hpcp_mod.apply_disk_patch([volume], str(target), mount_points, loop_devices, force=force, max_workers=1)
+
+
+def _no_differences(hpcp_mod, tmp_path, new, target):
+	with _session(hpcp_mod) as (mount_points, loop_devices):
+		return hpcp_mod.process_get_disk_diff_image([str(new)], [str(target)], str(tmp_path / 'check.img'),
+			mount_points, loop_devices, max_workers=1) is None
+
+
+@requires_root_and_disk_tools
+@pytest.mark.root
+@pytest.mark.loop
+def test_disk_apply_round_trip_and_rerun(tmp_path, hpcp_mod, reset_hpcp_globals):
+	"""Success criterion + Review Focus 5."""
+	old, new, patch = _make_patch(hpcp_mod, tmp_path)
+	target = tmp_path / 'node.img'
+	shutil.copyfile(str(old), str(target))
+	summary = _apply(hpcp_mod, patch, target)
+	assert summary['failed'] == 0 and summary['raw_written'] == 2 and summary['identity_changed'] == 2
+	assert _no_differences(hpcp_mod, tmp_path, new, target)
+	again = _apply(hpcp_mod, patch, target)
+	assert again['failed'] == 0 and again['raw_written'] == 0 and again['identity_changed'] == 0
+	assert all(s['added'] + s['modified'] + s['deleted'] == 0 for s in again['sections'].values())
+
+
+@requires_root_and_disk_tools
+@pytest.mark.root
+@pytest.mark.loop
+def test_disk_apply_refuses_a_different_layout(tmp_path, hpcp_mod, reset_hpcp_globals):
+	old, new, patch = _make_patch(hpcp_mod, tmp_path)
+	target = tmp_path / 'node.img'
+	shutil.copyfile(str(old), str(target))
+	_run('sgdisk', '-n5:0:+4M', '-t5:8300', target)
+	before = _sha(target.read_bytes())
+	with pytest.raises(RuntimeError, match='Disk layout mismatch'):
+		_apply(hpcp_mod, patch, target)
+	assert _sha(target.read_bytes()) == before
+
+
+@requires_root_and_disk_tools
+@pytest.mark.root
+@pytest.mark.loop
+def test_live_disk_identity_change_on_a_mounted_partition_is_refused(tmp_path, hpcp_mod, reset_hpcp_globals):
+	old, new, patch = _make_patch(hpcp_mod, tmp_path)
+	target = tmp_path / 'node.img'
+	shutil.copyfile(str(old), str(target))
+	with _attached(target) as loop:
+		with _mounted(loop + 'p3') as live_root:
+			with pytest.raises(RuntimeError, match='Disk in use: .*partition 3 is mounted'):
+				_apply(hpcp_mod, patch, loop)
+			with open(os.path.join(live_root, 'etc', 'os-release'), 'rb') as f:
+				assert f.read() == b'v1'
+
+
+@requires_root_and_disk_tools
+@pytest.mark.root
+@pytest.mark.loop
+def test_live_disk_files_apply_through_the_live_mount(tmp_path, hpcp_mod, reset_hpcp_globals):
+	old, new, patch = _make_patch(hpcp_mod, tmp_path, label=None, raw=False, mbr=False, gpt_name=None)
+	target = tmp_path / 'node.img'
+	shutil.copyfile(str(old), str(target))
+	with _attached(target) as loop:
+		with _mounted(loop + 'p3') as live_root:
+			summary = _apply(hpcp_mod, patch, loop)
+			assert summary['failed'] == 0
+			with open(os.path.join(live_root, 'etc', 'os-release'), 'rb') as f:
+				assert f.read() == b'v2'
+			assert os.path.ismount(live_root)
+
+
+@requires_root_and_disk_tools
+@pytest.mark.root
+@pytest.mark.loop
+def test_image_target_attached_and_mounted_elsewhere_is_refused(tmp_path, hpcp_mod, reset_hpcp_globals):
+	old, new, patch = _make_patch(hpcp_mod, tmp_path)
+	target = tmp_path / 'node.img'
+	shutil.copyfile(str(old), str(target))
+	with _attached(target) as loop:
+		with _mounted(loop + 'p1'):
+			with pytest.raises(RuntimeError, match='Disk in use'):
+				_apply(hpcp_mod, patch, target)
+
+
+@requires_root_and_disk_tools
+@pytest.mark.root
+@pytest.mark.loop
+def test_damaged_raw_payload_is_refused_up_front(tmp_path, hpcp_mod, reset_hpcp_globals):
+	"""Review Focus 4."""
+	old, new, patch = _make_patch(hpcp_mod, tmp_path)
+	with _attached(patch) as loop:
+		with _mounted(loop) as root:
+			with open(os.path.join(root, 'raw', 'part2.img'), 'r+b') as f:
+				f.write(b'BITROT!!')
+	target = tmp_path / 'node.img'
+	shutil.copyfile(str(old), str(target))
+	before = _sha(target.read_bytes())
+	with pytest.raises(RuntimeError, match='Incomplete patch: raw payload'):
+		_apply(hpcp_mod, patch, target)
+	assert _sha(target.read_bytes()) == before

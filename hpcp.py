@@ -5958,6 +5958,152 @@ def process_get_disk_diff_image(src_paths, dest_paths, output, mount_points, loo
 	print(f"Disk patch image written to {output}{extra}")
 	return output
 
+def _refuse_if_image_in_use(image, entries):
+	"""Refuse an image-file target that is attached to a loop device with something mounted from it."""
+	error_count = len(ERRORS)
+	try:
+		output = run_command_in_multicmd_with_path_check(['losetup', '-j', image], quiet=True)
+	finally:
+		del ERRORS[error_count:]
+	for line in output:
+		loop = line.partition(':')[0].strip()
+		if not loop:
+			continue
+		for device in [loop] + get_partitions(loop):
+			try:
+				devnum = _device_number(device)
+			except OSError:
+				continue
+			if any(_entry_matches(entry, devnum, device) for entry in entries):
+				raise RuntimeError(f'Disk in use: {image} is attached as {loop} and {device} is mounted; unmount it first or apply to the device')
+
+def apply_disk_patch(volume_roots, target, mount_points, loop_devices, force=False, max_workers=1, verbose=False, volume_names=None):
+	"""Apply a disk patch (layout disk) to target: a GPT block device or disk-image file.
+
+	Everything is checked before anything changes: the layout, which partitions are in use,
+	every section's paths, the raw areas and the identity values. Filesystem sections are
+	applied first (partition order, ESP last), then raw partition areas, the MBR boot code
+	and identity changes; then everything is verified.
+	Returns {'sections', 'raw_written', 'raw_skipped', 'identity_changed', 'forced', 'failed'}.
+	"""
+	meta, sections, volume_roots = _load_patch(volume_roots, volume_names)
+	if meta.get('layout') != 'disk':
+		raise RuntimeError('Invalid arguments: this is a single-filesystem patch; apply it to a directory or a filesystem image')
+	disk_rows = read_disk_tsv(os.path.join(volume_roots[0], DIFF_DIR_NAME, meta['disk']))
+	target = os.path.abspath(os.path.expanduser(target))
+	entries = _mountinfo_entries()
+	if not pathlib.Path(target).resolve().is_block_device():
+		_refuse_if_image_in_use(target, entries)
+	disk = _attach_disk(target, False, loop_devices)
+	layout = read_disk_layout(disk)
+	problems = match_target_layout(disk_rows, layout)
+	if problems:
+		raise RuntimeError('Disk layout mismatch: ' + '; '.join(problems) + '; nothing applied')
+	swaps = _swap_devices()
+	in_use = {number: _partition_in_use(part['device'], _device_number(part['device']), entries, swaps)
+		for number, part in layout['parts'].items()}
+	changes, refusals, warnings = _plan_identity(disk_rows, layout, in_use)
+	raw_plan = []
+	for name, raw_file, old_sha, new_sha, size in meta['raws']:
+		number = None if name == 'mbr' else int(name[len('part'):])
+		device = disk if number is None else layout['parts'][number]['device']
+		found = _hash_area(device, 0, size)
+		action = _plan_raw(old_sha, new_sha, found)
+		payload = None
+		if action != 'skip':
+			if number is not None and in_use.get(number):
+				refusals.append(f'partition {number} is {in_use[number]} and its raw area changes')
+			payload = _raw_payload(volume_roots, raw_file, new_sha, size)
+			if payload is None:
+				raise RuntimeError(f'Incomplete patch: raw payload {raw_file} is missing or damaged; nothing applied')
+		raw_plan.append({'name': name, 'device': device, 'size': size, 'payload': payload, 'action': action,
+			'found': found, 'new': new_sha})
+	for name, _, _ in sections:
+		part = layout['parts'][int(name[len('part'):])]
+		live, live_read_only = _live_mount(_device_number(part['device']), entries, part['device'])
+		if live and live_read_only:
+			refusals.append(f'partition {name[len("part"):]} is mounted read-only at {live}')
+	if refusals:
+		raise RuntimeError('Disk in use: ' + '; '.join(refusals) + '; apply this patch offline')
+	commands, unsupported = _identity_command_list(changes, layout, disk)
+	if unsupported and not force:
+		raise RuntimeError('Identity change error: ' + '; '.join(text for _, _, text in unsupported) + '; nothing applied (use -fa to apply the rest)')
+	for _, _, text in unsupported:
+		print(f'Warning: {text}; skipped', file=sys.stderr)
+	for text in warnings:
+		print(f'Warning: {text}', file=sys.stderr)
+	skipped_identity = {(number, field) for number, fields, _ in unsupported for field in fields}
+	with _patch_hash_settings(meta) as (compare_hash, full_hash):
+		plans = []
+		for name, payload_dir, rows in sections:
+			part = layout['parts'][int(name[len('part'):])]
+			root = _mount_partition(part['device'], False, mount_points, entries)
+			if root is None:
+				raise RuntimeError(f"Disk layout mismatch: partition {name[len('part'):]} ({part['fs_type']}) cannot be mounted read-write; nothing applied")
+			plans.append(_plan_section(name, rows, _section_volume_roots(volume_roots, payload_dir), root, compare_hash, full_hash, max_workers))
+		raw_conflicts = [entry for entry in raw_plan if entry['action'] == 'conflict']
+		extra = [(f"raw {entry['name']}: content matches neither the patch base nor the new state (found {entry['found'][:12]})",
+			f"raw {entry['name']}: content differs") for entry in raw_conflicts]
+		_resolve_section_conflicts(plans, force, extra)
+		for plan in plans:
+			_preflight_section(plan)
+		summaries = {}
+		order = sorted(plans, key=lambda plan: (layout['parts'][int(plan.name[len('part'):])]['type_guid'].upper() == _ESP_TYPE_GUID,
+			int(plan.name[len('part'):])))
+		for plan in order:
+			summaries[plan.name] = _apply_section(plan, max_workers, verbose, full_hash, compare_hash)
+			_release_mount(plan.target_root, mount_points)
+	failed = sum(summary['failed'] for summary in summaries.values())
+	pending = [entry for entry in raw_plan if entry['action'] != 'skip']
+	# Partition areas first, the MBR boot code last.
+	for entry in sorted(pending, key=lambda entry: entry['name'] == 'mbr'):
+		try:
+			_write_area(entry['device'], entry['payload'], 0, entry['size'])
+		except OSError as e:
+			entry['error'] = str(e)
+	# udev re-reads the partition table after the disk device was closed from writing (MBR write, sgdisk).
+	_settle_partitions(disk, sorted(layout['parts']))
+	for command in commands:
+		run_command_in_multicmd_with_path_check(command, strict=False)
+	_settle_partitions(disk, sorted(layout['parts']))
+	# Verify after the identity commands: sgdisk rewriting the GPT must not have undone a raw write.
+	written = 0
+	for entry in pending:
+		reason = entry.get('error')
+		if not reason:
+			try:
+				if _hash_area(entry['device'], 0, entry['size']) == entry['new']:
+					written += 1
+					continue
+				reason = 'does not hold the new content after writing'
+			except OSError as e:
+				reason = str(e)
+		failed += 1
+		eprint(f"Raw area error: {entry['name']}: {reason}")
+	changed = 0
+	applied = [change for change in changes if (change.number, change.field) not in skipped_identity]
+	if applied:
+		after = read_disk_layout(disk)
+		for change in applied:
+			current = str(after['disk'].get('guid', '')) if change.number is None else str(after['parts'][change.number][change.field])
+			if current == change.new:
+				changed += 1
+			else:
+				failed += 1
+				where = 'disk' if change.number is None else f'partition {change.number}'
+				eprint(f'Identity change error: {where} {change.field} is {current!r}, expected {change.new!r}')
+	summary = {
+		'sections': summaries,
+		'raw_written': written,
+		'raw_skipped': sum(1 for entry in raw_plan if entry['action'] == 'skip'),
+		'identity_changed': changed,
+		'forced': sum(summary['forced'] for summary in summaries.values()) + len(raw_conflicts),
+		'failed': failed,
+	}
+	print(f"Disk patch summary: {len(summaries)} section(s), raw written {written}, raw skipped {summary['raw_skipped']}, "
+		f"identity changed {changed}, forced {summary['forced']}, failed {failed}")
+	return summary
+
 #%% ---- Remove Extra ----
 def remove_extra_dirs(src_paths, dests,exclude=None):
 	"""
