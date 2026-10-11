@@ -272,23 +272,4 @@ options:
                         instead of continuing (Note: Default is continue as in
                         compressed fs copy can be down even if source is
                         bigger than free space).
-
-Found bins: ['/usr/sbin/mkswap', '/usr/sbin/exfatlabel',
-'/usr/sbin/reiserfstune', '/usr/sbin/jfs_tune', '/usr/sbin/fsck.minix',
-'/usr/sbin/sgdisk', '/usr/sbin/debugreiserfs', '/usr/bin/ntfsinfo',
-'/usr/sbin/fsck.hfsplus', '/usr/sbin/mkfs.minix', '/usr/bin/udfinfo',
-'/usr/sbin/mkfs.ntfs', '/usr/bin/cp', '/usr/bin/truncate',
-'/usr/sbin/mkfs.xfs', '/usr/sbin/mkudffs', '/usr/sbin/mkfs.bfs',
-'/usr/sbin/fsck.jfs', '/usr/sbin/tune2fs', '/usr/sbin/mkfs.exfat',
-'/usr/sbin/dumpe2fs', '/usr/sbin/udflabel', '/usr/sbin/fsck.reiserfs',
-'/usr/sbin/mkfs.btrfs', '/usr/bin/dd', '/usr/sbin/swaplabel',
-'/usr/sbin/losetup', '/usr/sbin/e2fsck', '/usr/bin/ntfsfix',
-'/usr/bin/umount', '/usr/sbin/xfs_admin', '/usr/sbin/mkfs.reiserfs',
-'/usr/bin/mount', '/usr/sbin/dump.f2fs', '/usr/sbin/fsck.hfs',
-'/usr/sbin/xfs_repair', '/usr/sbin/mkfs.f2fs', '/usr/sbin/mkfs.vfat',
-'/usr/sbin/fsck.exfat', '/usr/sbin/fsck.fat', '/usr/bin/btrfs',
-'/usr/bin/lsblk', '/usr/sbin/blkid', '/usr/sbin/mkfs.hfsplus',
-'/usr/sbin/dump.exfat', '/usr/sbin/fsck.f2fs', '/usr/sbin/mkfs',
-'/usr/sbin/xfs_info', '/usr/sbin/mkfs.jfs'] Missing bins: {'newfs',
-'fsck.ufs', 'xcopy'}
 ```
