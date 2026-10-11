@@ -907,6 +907,29 @@ def test_case_collision_finds_deletes_and_writes_that_differ_only_by_case(hpcp_m
 	assert hpcp_mod._case_collision(rows[1:]) is None
 
 
+def test_directory_delete_matches_children_case_insensitively_on_case_insensitive_targets(tmp_path, hpcp_mod, reset_hpcp_globals):
+	"""A FAT target keeps its old spelling when a case-only rename made no row; a later patch that deletes
+	the directory names its children in the new spelling, which must not count as unlisted entries."""
+	hpcp_mod.HASH_SIZE = 65536
+	target = tmp_path / 'target'
+	_write(target / 'EFI' / 'old' / 'Grub.CFG', 'cfg')
+	_write(target / 'EFI' / 'old' / 'sub' / 'X.efi', 'x')
+	R = hpcp_mod.ChangeRow
+	directory, file = 'd:40755:0:0:-', f'f:3:{T0}000000000:100644:0:0:-:-'
+	rows = [R('D', 'EFI/old/', directory, '-'), R('D', 'EFI/old/grub.cfg', file, '-'),
+		R('D', 'EFI/old/SUB/', directory, '-'), R('D', 'EFI/old/SUB/x.efi', file, '-')]
+	def directory_check(**kwargs):
+		(check,) = [check for check in hpcp_mod.check_patch_target(rows, str(target), metadata=False, **kwargs) if check.row.path == 'EFI/old/']
+		return check.action, check.reason
+	assert directory_check(case_insensitive=True) == ('apply', '')
+	assert directory_check() == ('conflict', 'directory holds entries the patch does not delete')
+	plan = hpcp_mod._plan_section('part1', rows, [str(tmp_path / 'vol')], str(target), True, False, 1, metadata=False, case_insensitive=True)
+	assert [check.action for check in plan.checks if check.row.path == 'EFI/old/'] == ['apply']
+	# An entry the patch does not delete is still one, whatever its case.
+	_write(target / 'EFI' / 'old' / 'Extra.efi', 'e')
+	assert directory_check(case_insensitive=True) == ('conflict', 'directory holds entries the patch does not delete')
+
+
 def test_content_only_verify_covers_rows_skipped_as_done(tmp_path, hpcp_mod, reset_hpcp_globals):
 	"""A row skipped as already done that the apply then loses (a D row on a name that differs only by
 	case, on FAT or HFS+) must be a verify failure in a section with case-insensitive names; other

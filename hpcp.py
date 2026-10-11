@@ -4597,8 +4597,12 @@ def _under_removed(key, removed_names):
 	parts = key.rstrip('/').split('/')
 	return any('/'.join(parts[:index]) in removed_names for index in range(1, len(parts) + 1))
 
-def _unlisted_children(key, path, deleted_keys):
-	"""Children of directory path whose keys are not in deleted_keys; None when path cannot be listed."""
+def _unlisted_children(key, path, deleted_keys, case_insensitive=False):
+	"""Children of directory path whose keys are not in deleted_keys; None when path cannot be listed.
+
+	case_insensitive: deleted_keys are casefolded and so is each child's key (a target that looks
+	names up case-insensitively may still spell an entry as it did before a case-only rename).
+	"""
 	prefix = '' if key == './' else key
 	try:
 		names = os.listdir(path)
@@ -4608,11 +4612,11 @@ def _unlisted_children(key, path, deleted_keys):
 	for name in names:
 		child = os.path.join(path, name)
 		child_key = prefix + name + ('/' if os.path.isdir(child) and not os.path.islink(child) else '')
-		if child_key not in deleted_keys:
+		if (child_key.casefold() if case_insensitive else child_key) not in deleted_keys:
 			unlisted.append(child_key)
 	return unlisted
 
-def check_patch_target(rows, target_root, compare_hash=True, full_hash=False, max_workers=1, metadata=True):
+def check_patch_target(rows, target_root, compare_hash=True, full_hash=False, max_workers=1, metadata=True, case_insensitive=False):
 	"""Classify every row against target_root as 'apply', 'skip' or 'conflict'.
 
 	D: target == old -> apply; absent, or already the replacing A row's state -> skip.
@@ -4621,13 +4625,14 @@ def check_patch_target(rows, target_root, compare_hash=True, full_hash=False, ma
 	delete or one that cannot be listed.
 	A and M rows are judged as the target will be after the applicable D rows: a name a D
 	row removes (with or without the trailing '/'), and everything below it, counts as absent.
-	metadata False compares content only (see states_equal).
+	metadata False compares content only (see states_equal). case_insensitive (a FAT, exFAT or HFS+
+	target) matches a D directory's entries with the deleted names case-insensitively.
 	"""
 	paths = {row.path: _key_path(target_root, row.path) for row in rows}
 	states = _states_for_paths(set(paths.values()), full_hash=full_hash, read_xattrs=metadata, max_workers=max_workers)
 	same = functools.partial(states_equal, compare_hash=compare_hash, metadata=metadata)
 	added_by_name = {row.path.rstrip('/'): row for row in rows if row.op == 'A'}
-	deleted_keys = {row.path for row in rows if row.op == 'D'}
+	deleted_keys = {row.path.casefold() if case_insensitive else row.path for row in rows if row.op == 'D'}
 	checks = {}
 	removed_names = set()
 	for row in rows:
@@ -4645,7 +4650,7 @@ def check_patch_target(rows, target_root, compare_hash=True, full_hash=False, ma
 		if not same(found, row.old):
 			checks[row] = PatchCheck(row, 'conflict', found, 'changed on target')
 			continue
-		unlisted = _unlisted_children(row.path, paths[row.path], deleted_keys) if found.startswith('d:') else []
+		unlisted = _unlisted_children(row.path, paths[row.path], deleted_keys, case_insensitive) if found.startswith('d:') else []
 		if unlisted is None:
 			checks[row] = PatchCheck(row, 'conflict', found, 'cannot list directory')
 		elif unlisted:
@@ -5121,7 +5126,7 @@ def _patch_hash_settings(meta):
 def _plan_section(name, rows, volume_roots, target_root, compare_hash, full_hash, max_workers, metadata=True, case_insensitive=False):
 	"""Check one section's rows against target_root; nothing changes."""
 	return SectionPlan(name, list(volume_roots), target_root, rows,
-		check_patch_target(rows, target_root, compare_hash, full_hash, max_workers, metadata), metadata, case_insensitive)
+		check_patch_target(rows, target_root, compare_hash, full_hash, max_workers, metadata, case_insensitive), metadata, case_insensitive)
 
 def _section_conflicts(plan):
 	return [check for check in plan.checks if check.action == 'conflict']
