@@ -3788,6 +3788,8 @@ def states_equal(a, b, compare_hash=True):
 
 	Directories ignore mtime; files allow the timestamp-precision tolerance; an xattr
 	digest of '-' on either side is not compared; '?' never equals anything.
+	With compare_hash False neither the content hash nor the xattr digest is compared
+	(both come from the same hasher).
 	"""
 	if a == '?' or b == '?':
 		return False
@@ -3800,7 +3802,7 @@ def states_equal(a, b, compare_hash=True):
 		return info_a['target'] == info_b['target']
 	if (info_a['mode'], info_a['uid'], info_a['gid']) != (info_b['mode'], info_b['uid'], info_b['gid']):
 		return False
-	if info_a['xattr'] != '-' and info_b['xattr'] != '-' and info_a['xattr'] != info_b['xattr']:
+	if compare_hash and info_a['xattr'] != '-' and info_b['xattr'] != '-' and info_a['xattr'] != info_b['xattr']:
 		return False
 	if info_a['type'] == 'd':
 		return True
@@ -4403,6 +4405,37 @@ def check_patch_target(rows, target_root, compare_hash=True, full_hash=False, ma
 			checks[row] = PatchCheck(row, 'conflict', found, 'missing on target' if found == '-' else 'changed on target')
 	return [checks[row] for row in rows]
 
+def _validate_patch_rows(rows):
+	"""Reject rows whose op, states and key shape disagree, or that nest under a symlink the patch creates."""
+	symlinks = set()
+	for row in rows:
+		old, new = row.old, row.new
+		where = f'{row.op} {row.path!r}'
+		unset = ('-', '?')
+		if row.op == 'A':
+			ok = old == '-' and new not in unset
+		elif row.op == 'D':
+			ok = new == '-' and old not in unset
+		elif row.op == 'M':
+			ok = old not in unset and new not in unset and old[0] == new[0]
+		else:
+			ok = False
+		if not ok:
+			raise RuntimeError(f'Patch format error: row {where} has inconsistent states ({old} -> {new})')
+		if row.path == './' and not (row.op == 'M' and old.startswith('d:') and new.startswith('d:')):
+			raise RuntimeError(f'Patch format error: row {where} may only modify the root directory metadata')
+		for state in (old, new):
+			if state != '-' and row.path.endswith('/') != state.startswith('d:'):
+				raise RuntimeError(f'Patch format error: row {where} has a state of the wrong type for its key')
+		if row.op in ('A', 'M') and new.startswith('l:'):
+			symlinks.add(row.path)
+	for row in rows:
+		if row.op == 'D':
+			continue
+		for parent in _parent_keys(row.path):
+			if parent.rstrip('/') in symlinks:
+				raise RuntimeError(f'Patch format error: row {row.op} {row.path!r} lies under symlink {parent.rstrip("/")!r} created by the same patch')
+
 def load_patch_volumes(volume_roots, volume_names=None):
 	"""Read and cross-check every volume's manifest.
 
@@ -4416,7 +4449,10 @@ def load_patch_volumes(volume_roots, volume_names=None):
 		if not os.path.isfile(manifest):
 			raise RuntimeError(f'Incomplete patch: {name} has no {DIFF_DIR_NAME}/manifest')
 		metas.append(read_manifest(manifest))
-	patch_ids = sorted({str(meta.get('patch_id')) for meta in metas})
+	for name, meta in zip(names, metas):
+		if not meta.get('patch_id'):
+			raise RuntimeError(f'Incomplete patch: {name} has no patch_id')
+	patch_ids = sorted({meta['patch_id'] for meta in metas})
 	if len(patch_ids) != 1:
 		raise RuntimeError(f'Incomplete patch: volumes belong to different patches ({", ".join(patch_ids)})')
 	by_number = {}
@@ -4444,6 +4480,7 @@ def load_patch_volumes(volume_roots, volume_names=None):
 	if meta['sections'] != [('root', '.', 'changes.tsv')]:
 		raise RuntimeError(f'Patch format error: unsupported sections {meta["sections"]}; this hpcp applies single-filesystem patches only')
 	rows = read_changes(os.path.join(ordered[0][0], DIFF_DIR_NAME, 'changes.tsv'))
+	_validate_patch_rows(rows)
 	return meta, rows, [entry[0] for entry in ordered]
 
 def _resolve_conflicts(conflicts, force):
@@ -4467,64 +4504,122 @@ def _inside_root(root, path):
 	parent_real = os.path.realpath(os.path.dirname(path))
 	return parent_real == root_real or parent_real.startswith(root_real.rstrip(os.sep) + os.sep)
 
+def _payload_location(volume_roots, row):
+	"""(volume root, path) of row's payload in the first volume holding a safe copy, else None.
+
+	Safe means inside its volume root (no symlinked parent), a regular non-symlink file
+	of the recorded size.
+	"""
+	size = decode_state(row.new)['size']
+	for volume_root in volume_roots:
+		source = _key_path(volume_root, row.path)
+		try:
+			info = os.lstat(source)
+		except OSError:
+			continue
+		if stat.S_ISREG(info.st_mode) and info.st_size == size and _inside_root(volume_root, source):
+			return volume_root, source
+	return None
+
+def _payload_source(volume_roots, row):
+	"""Path of row's safe payload file, or None."""
+	location = _payload_location(volume_roots, row)
+	return location[1] if location else None
+
 def _apply_rows(rows, volume_roots, target_root, max_workers=1, verbose=False):
-	"""Carry out checked rows: deletions, then directories, files, symlinks, directory metadata."""
-	def target_of(row):
+	"""Carry out checked rows: deletions, then directories, files, symlinks, directory metadata.
+
+	Containment of every target path is re-checked immediately before each write, and the
+	target root itself is never removed. Existing regular files are overwritten in place by
+	the copy (so an interrupted apply leaves un-copied files in their old state).
+	"""
+	root_norm = os.path.normpath(target_root)
+
+	def guarded(row, removing=False):
+		"""Target path for row, or None (with an error) when it must not be touched."""
 		path = _key_path(target_root, row.path)
+		if removing and os.path.normpath(path) == root_norm:
+			eprint(f'Patch format error: {row.path} would remove the target root; skipped')
+			return None
 		if row.path != './' and not _inside_root(target_root, path):
 			eprint(f'Patch format error: {row.path} resolves outside {target_root}; skipped')
 			return None
 		return path
+
+	def remove(row):
+		path = guarded(row, removing=True)
+		if path is None:
+			return
+		try:
+			_remove_entry(path)
+		except OSError as e:
+			eprint(f'Remove file failed: {row.path}: {e}')
+
+	def has_new_type(row, path):
+		"""True when the existing entry already has the row's new file/directory type."""
+		if os.path.islink(path):
+			return False
+		if row.new.startswith('d:'):
+			return os.path.isdir(path)
+		return row.new.startswith('f:') and os.path.isfile(path)
+
 	deletes = [row for row in rows if row.op == 'D']
 	payload = [row for row in rows if row.op in ('A', 'M')]
 	# Non-directories first, then directories deepest first.
 	for row in sorted(deletes, key=lambda r: (r.path.endswith('/'), -_key_depth(r.path))):
-		path = target_of(row)
-		if path is None:
-			continue
-		try:
-			_remove_entry(path)
-		except OSError as e:
-			eprint(f'Remove file failed: {row.path}: {e}')
-	targets = {}
+		remove(row)
 	for row in payload:
-		path = target_of(row)
-		if path is None:
+		if row.path == './':
 			continue
-		targets[row.path] = path
-		if not os.path.lexists(path):
-			continue
-		if row.new.startswith('d:') and os.path.isdir(path) and not os.path.islink(path):
-			continue
-		# Files are re-copied fresh (drops stale xattrs); wrong-type entries make way.
-		try:
-			_remove_entry(path)
-		except OSError as e:
-			eprint(f'Remove file failed: {row.path}: {e}')
-	dir_rows = [row for row in payload if row.new.startswith('d:') and row.path in targets]
-	for row in sorted(dir_rows, key=lambda r: _key_depth(r.path)):
-		os.makedirs(targets[row.path], exist_ok=True)
+		path = guarded(row)
+		if path is not None and os.path.lexists(path) and not has_new_type(row, path):
+			remove(row)
+	dir_rows = []
+	for row in sorted((r for r in payload if r.new.startswith('d:')), key=lambda r: _key_depth(r.path)):
+		path = guarded(row)
+		if path is not None:
+			os.makedirs(path, exist_ok=True)
+			dir_rows.append(row)
 	by_volume = {}
 	for row in payload:
-		if not row.new.startswith('f:') or row.path not in targets:
+		if not row.new.startswith('f:') or guarded(row) is None:
 			continue
-		for volume_root in volume_roots:
-			source = _key_path(volume_root, row.path)
-			if os.path.lexists(source):
-				by_volume.setdefault(volume_root, []).append(source)
-				break
-		else:
-			eprint(f'Incomplete patch: payload for {row.path} is missing from every volume')
-	for volume_root, files in by_volume.items():
-		copy_file_list_parallel(files, [], volume_root, [target_root], max(1, max_workers), verbose=verbose)
+		location = _payload_location(volume_roots, row)
+		if location is None:
+			eprint(f'Incomplete patch: payload for {row.path} is missing or unsafe in every volume')
+			continue
+		by_volume.setdefault(location[0], []).append((location[1], row))
+	for volume_root, entries in by_volume.items():
+		try:
+			copy_file_list_parallel([source for source, _ in entries], [], volume_root, [target_root], max(1, max_workers), verbose=verbose)
+		except RuntimeError as e:
+			eprint(f'Copy failed: {e}')
+		for source, row in entries:
+			path = _key_path(target_root, row.path)
+			if os.path.isfile(path) and not os.path.islink(path):
+				_remove_stale_xattrs(source, path)
 	for row in payload:
-		if row.new.startswith('l:') and row.path in targets:
-			try:
-				_place_symlink(decode_state(row.new)['target'], targets[row.path])
-			except OSError as e:
-				eprint(f'Failed to create symbolic link: {row.path}: {e}')
+		if not row.new.startswith('l:'):
+			continue
+		path = guarded(row)
+		if path is None:
+			continue
+		try:
+			_place_symlink(decode_state(row.new)['target'], path)
+		except OSError as e:
+			eprint(f'Failed to create symbolic link: {row.path}: {e}')
 	for row in sorted(dir_rows, key=lambda r: _key_depth(r.path), reverse=True):
-		sync_directory_metadata(_key_path(volume_roots[0], row.path), [targets[row.path]])
+		path = guarded(row)
+		if path is None:
+			continue
+		if row.path != './' and (os.path.islink(path) or not os.path.isdir(path)):
+			eprint(f'Patch format error: {row.path} is not a real directory on the target; metadata skipped')
+			continue
+		source = _key_path(volume_roots[0], row.path)
+		if row.path != './' and (os.path.islink(source) or not os.path.isdir(source) or not _inside_root(volume_roots[0], source)):
+			eprint(f'Patch format error: directory metadata source for {row.path} is not a real directory in volume 1; skipped')
+			continue
+		sync_directory_metadata(source, [path])
 
 def _verify_rows(rows, target_root, compare_hash=True, full_hash=False, max_workers=1):
 	"""Re-read every applied path and compare with its final expected state; returns the failure count."""
@@ -4549,6 +4644,8 @@ def apply_patch_tree(volume_roots, target_root, force=False, max_workers=1, verb
 
 	Returns {'deleted', 'added', 'modified', 'skipped', 'forced', 'failed'}. Raises RuntimeError
 	for a malformed or incomplete patch, or when conflicts are not overridden.
+	Another process modifying the target concurrently during an apply is out of scope
+	(residual race between the containment checks and the writes).
 	"""
 	global HASH_SIZE
 	meta, rows, volume_roots = load_patch_volumes(volume_roots, volume_names)
@@ -4557,16 +4654,23 @@ def apply_patch_tree(volume_roots, target_root, force=False, max_workers=1, verb
 		print(f"Note: this patch uses image-store layout; paths such as {example!r} are resolved under {target_root}")
 	compare_hash = meta.get('hash_algo') == _hash_algo_name()
 	if not compare_hash:
-		print(f"Warning: patch was hashed with {meta.get('hash_algo')}, which is not available here; file hashes are not compared", file=sys.stderr)
+		print(f"Warning: patch was hashed with {meta.get('hash_algo')}, this system uses {_hash_algo_name()}; hashes and xattr digests are not compared", file=sys.stderr)
 	full_hash = meta.get('full_hash') == '1'
+	try:
+		patch_hash_size = int(meta.get('hash_size', HASH_SIZE))
+	except ValueError:
+		raise RuntimeError(f"Patch format error: bad hash_size {meta.get('hash_size')!r}")
 	saved_hash_size = HASH_SIZE
 	try:
-		HASH_SIZE = int(meta.get('hash_size', HASH_SIZE))
+		HASH_SIZE = patch_hash_size
 		checks = check_patch_target(rows, target_root, compare_hash, full_hash, max_workers)
 		conflicts = [check for check in checks if check.action == 'conflict']
 		if conflicts:
 			_resolve_conflicts(conflicts, force)
 		todo = [check.row for check in checks if check.action != 'skip']
+		unsafe = [row for row in todo if row.op in ('A', 'M') and row.new.startswith('f:') and _payload_source(volume_roots, row) is None]
+		if unsafe:
+			raise RuntimeError(f'Incomplete patch: payload missing or unsafe for {len(unsafe)} file(s), e.g. {unsafe[0].path}; nothing applied')
 		_apply_rows(todo, volume_roots, target_root, max_workers, verbose)
 		failed = _verify_rows(todo, target_root, compare_hash, full_hash, max_workers)
 	finally:

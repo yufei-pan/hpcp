@@ -761,3 +761,161 @@ def test_apply_store_layout_leaves_other_trees(tmp_path, hpcp_mod, reset_hpcp_gl
 	hpcp_mod.apply_patch_tree([str(vol)], str(store), max_workers=1)
 	assert (store / rel_other / 'g.txt').read_text() == 'other tree'
 	assert hpcp_mod.compute_changes(*hpcp_mod.build_store_maps(str(new), str(store), max_workers=1), max_workers=1) == []
+
+
+def _states(hpcp_mod, tmp_path):
+	"""A (file, dir, symlink) state triple taken from real entries."""
+	scratch = tmp_path / 'scratch'
+	_write(scratch / 'f.txt', 'payload')
+	(scratch / 'd').mkdir()
+	os.symlink('/nonexistent', scratch / 'l')
+	return tuple(hpcp_mod.get_entry_state(str(scratch / name)) for name in ('f.txt', 'd', 'l'))
+
+
+def _snapshot(root):
+	return sorted((os.path.relpath(os.path.join(d, n), str(root)), os.path.islink(os.path.join(d, n)))
+		for d, dirs, files in os.walk(str(root)) for n in dirs + files)
+
+
+@pytest.mark.parametrize('case', ['root_symlink', 'slash_with_link', 'nonslash_with_dir', 'add_with_old',
+	'modify_changes_type', 'nested_under_symlink', 'metadata_escape'])
+def test_apply_rejects_malformed_rows(case, tmp_path, hpcp_mod, reset_hpcp_globals):
+	fstate, dstate, lstate = _states(hpcp_mod, tmp_path)
+	R = hpcp_mod.ChangeRow
+	rows = {
+		'root_symlink': [R('M', './', dstate, lstate)],
+		'slash_with_link': [R('A', 'x/', '-', lstate)],
+		'nonslash_with_dir': [R('A', 'x', '-', dstate)],
+		'add_with_old': [R('A', 'x', fstate, fstate)],
+		'modify_changes_type': [R('M', 'x', fstate, lstate)],
+		'nested_under_symlink': [R('A', 'a', '-', lstate), R('A', 'a/f.txt', '-', fstate)],
+		'metadata_escape': [R('A', 'a', '-', lstate), R('A', 'a/sub/', '-', dstate)],
+	}[case]
+	vol = tmp_path / 'vol'
+	vol.mkdir()
+	hpcp_mod.write_patch_metadata([str(vol)], rows, hpcp_mod.make_patch_meta(rows, 'n', 'b', 'root'))
+	target = tmp_path / 'target'
+	_write(target / 'keep.txt', 'keep')
+	before = _snapshot(target)
+	with pytest.raises(RuntimeError, match='Patch format error'):
+		hpcp_mod.apply_patch_tree([str(vol)], str(target), force=True, max_workers=1)
+	assert _snapshot(target) == before and (target / 'keep.txt').read_text() == 'keep'
+
+
+def test_apply_refuses_symlinked_parent_inside_patch_volume(tmp_path, hpcp_mod, reset_hpcp_globals):
+	outside = tmp_path / 'outside'
+	_write(outside / 'x.txt', 'secret')
+	state = hpcp_mod.get_entry_state(str(outside / 'x.txt'))
+	vol = tmp_path / 'vol'
+	vol.mkdir()
+	os.symlink(str(outside), vol / 'etc')
+	rows = [hpcp_mod.ChangeRow('A', 'etc/x.txt', '-', state)]
+	hpcp_mod.write_patch_metadata([str(vol)], rows, hpcp_mod.make_patch_meta(rows, 'n', 'b', 'root'))
+	target = tmp_path / 'target'
+	target.mkdir()
+	with pytest.raises(RuntimeError, match='Incomplete patch'):
+		hpcp_mod.apply_patch_tree([str(vol)], str(target), force=True, max_workers=1)
+	assert os.listdir(str(target)) == []
+
+
+def test_apply_refuses_payload_missing_from_every_volume(trees, hpcp_mod, tmp_path):
+	new, base = trees
+	vol, target = _conflicted(hpcp_mod, new, base, tmp_path)
+	_write(target / 'mod.txt', 'old')
+	os.unlink(vol / 'mod.txt')
+	with pytest.raises(RuntimeError, match='Incomplete patch'):
+		hpcp_mod.apply_patch_tree([str(vol)], str(target), force=True, max_workers=1)
+	assert (target / 'mod.txt').read_text() == 'old' and (target / 'gone.txt').exists()
+
+
+def test_apply_multi_volume_out_of_order(trees, hpcp_mod, tmp_path):
+	new, base = trees
+	_build_scenario(new, base)
+	for i in range(6):
+		_write(new / f'extra{i}.txt', f'extra {i}')
+	v1, v2 = tmp_path / 'v1', tmp_path / 'v2'
+	_patch_from(hpcp_mod, new, base, [v1, v2])
+	target = tmp_path / 'target'
+	_clone(base, target)
+	summary = hpcp_mod.apply_patch_tree([str(v2), str(v1)], str(target), max_workers=1)
+	assert summary['failed'] == 0
+	assert _changes(hpcp_mod, new, target) == []
+
+
+def test_apply_hash_algo_mismatch_still_applies(trees, hpcp_mod, tmp_path, capsys):
+	new, base = trees
+	_build_scenario(new, base)
+	vol = tmp_path / 'vol'
+	_patch_from(hpcp_mod, new, base, [vol])
+	other = 'blake2b' if hpcp_mod._hash_algo_name() == 'xxh64' else 'xxh64'
+	manifest = str(vol / '.hpcp_diff' / 'manifest')
+	meta = hpcp_mod.read_manifest(manifest)
+	meta['hash_algo'] = other
+	hpcp_mod.write_manifest(manifest, meta)
+	target = tmp_path / 'target'
+	_clone(base, target)
+	summary = hpcp_mod.apply_patch_tree([str(vol)], str(target), max_workers=1)
+	assert summary['failed'] == 0 and summary['forced'] == 0
+	assert 'xattr digests are not compared' in capsys.readouterr().err
+
+
+def test_apply_restores_hash_size_after_exception(trees, hpcp_mod, tmp_path, monkeypatch):
+	new, base = trees
+	hpcp_mod.HASH_SIZE = 65536
+	vol, target = _conflicted(hpcp_mod, new, base, tmp_path)
+	hpcp_mod.HASH_SIZE = 1234
+	monkeypatch.setattr(sys, 'stdin', _FakeStdin(False))
+	with pytest.raises(RuntimeError, match='Patch conflict'):
+		hpcp_mod.apply_patch_tree([str(vol)], str(target), max_workers=1)
+	assert hpcp_mod.HASH_SIZE == 1234
+
+
+def test_apply_rerun_after_interrupted_copy(trees, hpcp_mod, tmp_path, monkeypatch):
+	new, base = trees
+	_build_scenario(new, base)
+	vol = tmp_path / 'vol'
+	_patch_from(hpcp_mod, new, base, [vol])
+	target = tmp_path / 'target'
+	_clone(base, target)
+	real = hpcp_mod.copy_file_list_parallel
+	calls = []
+
+	def flaky(*args, **kwargs):
+		calls.append(1)
+		if len(calls) == 1:
+			raise RuntimeError('simulated copy failure')
+		return real(*args, **kwargs)
+
+	monkeypatch.setattr(hpcp_mod, 'copy_file_list_parallel', flaky)
+	monkeypatch.setattr(sys, 'stdin', _FakeStdin(False))
+	first = hpcp_mod.apply_patch_tree([str(vol)], str(target), max_workers=1)
+	assert first['failed'] > 0
+	assert (target / 'mod.txt').read_text() == 'old'
+	monkeypatch.setattr(hpcp_mod, 'copy_file_list_parallel', real)
+	second = hpcp_mod.apply_patch_tree([str(vol)], str(target), max_workers=1)
+	assert second['failed'] == 0 and second['forced'] == 0
+	assert _changes(hpcp_mod, new, target) == []
+
+
+def test_apply_forced_delete_of_directory_with_unlisted_entries(trees, hpcp_mod, tmp_path):
+	new, base = trees
+	_write(base / 'olddir' / 'a.txt', 'a')
+	_write(new / 'other.txt', 'o')
+	vol = tmp_path / 'vol'
+	_patch_from(hpcp_mod, new, base, [vol])
+	target = tmp_path / 'target'
+	_clone(base, target)
+	_write(target / 'olddir' / 'unlisted.txt', 'extra')
+	summary = hpcp_mod.apply_patch_tree([str(vol)], str(target), force=True, max_workers=1)
+	assert summary['failed'] == 0
+	assert not (target / 'olddir').exists()
+
+
+def test_apply_rows_never_removes_target_root(tmp_path, hpcp_mod, reset_hpcp_globals):
+	fstate, dstate, _ = _states(hpcp_mod, tmp_path)
+	target = tmp_path / 'target'
+	_write(target / 'keep.txt', 'keep')
+	rows = [hpcp_mod.ChangeRow('D', './', dstate, '-')]
+	hpcp_mod._apply_rows(rows, [str(tmp_path / 'vol')], str(target))
+	assert (target / 'keep.txt').exists()
+	assert any(error.startswith('Patch format error') for error in hpcp_mod.ERRORS)
