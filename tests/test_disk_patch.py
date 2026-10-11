@@ -185,6 +185,28 @@ def test_match_target_layout(hpcp_mod):
 	assert any('sector size' in p for p in hpcp_mod.match_target_layout(rows, _layout({1: _part(fs_type='', size=1048576), 3: _part()}, sector_size=4096)))
 
 
+def test_settle_partitions_waits_for_late_nodes(tmp_path, hpcp_mod, monkeypatch):
+	nodes = {}
+	for number in (1, 2):
+		nodes[number] = str(tmp_path / f'p{number}')
+		(tmp_path / f'p{number}').write_text('')
+	calls = []
+	def fake(disk):
+		calls.append(disk)
+		return dict(nodes) if len(calls) > 3 else {1: nodes[1]}
+	monkeypatch.setattr(hpcp_mod, '_partition_devices', fake)
+	monkeypatch.setattr(hpcp_mod, 'check_path', lambda name: False)
+	assert hpcp_mod._settle_partitions('/dev/x', [1, 2]) == nodes
+	assert len(calls) == 4
+
+
+def test_settle_partitions_gives_up(hpcp_mod, monkeypatch):
+	monkeypatch.setattr(hpcp_mod, '_partition_devices', lambda disk: {})
+	monkeypatch.setattr(hpcp_mod, 'check_path', lambda name: False)
+	with pytest.raises(RuntimeError, match=r'Disk layout mismatch.*\[2\]'):
+		hpcp_mod._settle_partitions('/dev/x', [2], timeout=0.3)
+
+
 # ---- root + loop fixtures (GPT disk images) ----
 
 _DISK_TOOLS = ('losetup', 'sgdisk', 'mkfs.vfat', 'mkfs.ext4', 'mkswap', 'mount', 'umount', 'lsblk', 'blkid', 'e2label')

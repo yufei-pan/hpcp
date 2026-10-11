@@ -428,7 +428,7 @@ _binCalled = {'lsblk', 'losetup', 'sgdisk', 'blkid', 'umount', 'mount','dd','cp'
 			  'fsck.fat', 'fsck.exfat', 'dump.exfat', 'fsck.hfsplus',
 			  'fsck.hfs', 'fsck.jfs', 'fsck.reiserfs', 'fsck.ufs', 'fsck.minix',
 			  'tune2fs', 'dumpe2fs', 'xfs_admin', 'exfatlabel', 'udflabel', 'udfinfo', 'jfs_tune',
-			  'reiserfstune', 'debugreiserfs', 'swaplabel'}
+			  'reiserfstune', 'debugreiserfs', 'swaplabel', 'udevadm'}
 [check_path(program) for program in _binCalled]
 
 def run_command_in_multicmd_with_path_check(command, timeout=...,max_threads=1,quiet=False,dry_run=False,strict=False):
@@ -5222,6 +5222,29 @@ def _partition_devices(disk, sys_block_path='/sys/class/block'):
 			continue
 	return result
 
+def _settle_partitions(disk, numbers, timeout=10):
+	"""{number: device} once udev is idle and every partition in numbers has its device node.
+
+	udev re-reads a whole disk's partition table after the disk is closed from writing (a new
+	loop device, an MBR or GPT write), removing and re-adding the partition nodes meanwhile.
+	Raises RuntimeError('Disk layout mismatch: ...') when a node is still missing after timeout seconds.
+	"""
+	if check_path('udevadm'):
+		error_count = len(ERRORS)
+		try:
+			run_command_in_multicmd_with_path_check(['udevadm', 'settle'], quiet=True)
+		finally:
+			del ERRORS[error_count:]
+	deadline = time.time() + timeout
+	while True:
+		devices = _partition_devices(disk)
+		missing = [number for number in numbers if number not in devices or not os.path.exists(devices[number])]
+		if not missing:
+			return devices
+		if time.time() >= deadline:
+			raise RuntimeError(f'Disk layout mismatch: the kernel shows no device for partition(s) {missing} of {disk}; re-read its partition table (partprobe) first')
+		time.sleep(0.1)
+
 def _fs_params_text(params):
 	"""Stable text form of probe_fs_params() output for disk.tsv."""
 	return ';'.join(f'{key}={(params or {})[key]}' for key in sorted(params or {}))
@@ -5257,15 +5280,13 @@ def read_disk_layout(device):
 	get_partition_infos.cache_clear()
 	get_partition_details.cache_clear()
 	infos = get_partition_infos(device)
-	devices = _partition_devices(device)
+	devices = _settle_partitions(device, [int(key) for key, info in infos.items() if 'disk_identifier' not in info])
 	disk, parts = {}, {}
 	for key, info in infos.items():
 		if 'disk_identifier' in info:
 			disk = {'guid': info['disk_identifier'], 'sector_size': info['sector_size'], 'size': info['size']}
 			continue
 		number = int(key)
-		if number not in devices:
-			raise RuntimeError(f'Disk layout mismatch: the kernel shows no device for partition {number} of {device}; re-read its partition table (partprobe) first')
 		fs_type, fs_uuid, fs_label = _probe_identity(devices[number])
 		parts[number] = {
 			'type_guid': info['partition_guid_code'], 'unique_guid': info['unique_partition_guid'],
