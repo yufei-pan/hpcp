@@ -705,3 +705,58 @@ def test_live_partition_hides_nested_mounts(tmp_path, hpcp_mod, reset_hpcp_globa
 	paths = {row.path for row in part3}
 	assert 'mnt/leak.txt' not in paths and 'mnt/' not in paths
 	assert ('M', 'etc/os-release') in {(row.op, row.path) for row in part3}
+
+
+def _mounts_under(prefix):
+	with open('/proc/self/mountinfo') as f:
+		return [line for line in f if prefix in line.split()[4]]
+
+
+def _read_part3_patch(hpcp_mod, out):
+	with _session(hpcp_mod) as (mount_points, loop_devices):
+		root = hpcp_mod._mount_single_fs_image(out, True, mount_points, loop_devices)
+		meta = hpcp_mod.read_manifest(os.path.join(root, '.hpcp_diff', 'manifest'))
+		rows = hpcp_mod.read_changes(os.path.join(root, '.hpcp_diff', 'part3.changes.tsv'))
+	return meta, rows
+
+
+@requires_root_and_disk_tools
+@pytest.mark.root
+@pytest.mark.loop
+@pytest.mark.parametrize('live_side', ['new', 'old'])
+def test_live_partition_with_temp_dirs_on_the_live_filesystem(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch, live_side):
+	"""Binds of a live filesystem onto a directory of that same filesystem are real mounts and stay out of the patch."""
+	old, new, out = tmp_path / 'old.img', tmp_path / 'new.img', str(tmp_path / 'patch.img')
+	_make_golden(old)
+	_make_newer(old, new, label=None, raw=False, mbr=False, gpt_name=None)
+	live_image = new if live_side == 'new' else old
+	with _attached(live_image, read_only=False) as loop:
+		with _mounted(loop + 'p3') as live_root:
+			temp_dir = os.path.join(live_root, 'tmpdir')
+			os.makedirs(temp_dir)
+			monkeypatch.setattr(tempfile, 'tempdir', temp_dir)
+			with _session(hpcp_mod) as (mount_points, loop_devices):
+				args = ([loop], [str(old)]) if live_side == 'new' else ([str(new)], [loop])
+				assert hpcp_mod.process_get_disk_diff_image(args[0], args[1], out, mount_points, loop_devices, max_workers=1) == out
+			assert _mounts_under(temp_dir) == []
+			monkeypatch.setattr(tempfile, 'tempdir', None)
+	meta, part3 = _read_part3_patch(hpcp_mod, out)
+	assert 'part3' in [section[0] for section in meta['sections']]
+	assert 'part3' not in [raw[0] for raw in meta['raws']]
+	assert ('M', 'etc/os-release') in {(row.op, row.path) for row in part3}
+	# tmpdir/ itself exists on the live side only; nothing below it (this run's mount-point dirs) may appear.
+	assert [row.path for row in part3 if row.path.startswith('tmpdir') and row.path != 'tmpdir/'] == []
+
+
+def test_unmountable_filesystem_is_compared_as_raw_with_a_warning(hpcp_mod, monkeypatch, capsys):
+	device = '/dev/none'
+	parts = {1: _part(number=1, device=device, fs_type='ext4')}
+	layout = _layout(parts)
+	monkeypatch.setattr(hpcp_mod, '_attach_disk', lambda path, ro, loops: path)
+	monkeypatch.setattr(hpcp_mod, 'read_disk_layout', lambda disk: layout)
+	monkeypatch.setattr(hpcp_mod, '_mountinfo_entries', lambda: [])
+	monkeypatch.setattr(hpcp_mod, '_mount_partition', lambda *a: None)
+	monkeypatch.setattr(hpcp_mod, '_hash_area', lambda *a: 'h')
+	monkeypatch.setattr(hpcp_mod, 'expand_paths', lambda paths: list(paths))
+	assert hpcp_mod.process_get_disk_diff_image(['/x/new'], ['/x/old'], '/x/out', [], [], max_workers=1) is None
+	assert 'partition 1 (ext4) could not be mounted on the new and old side; comparing it as a raw area' in capsys.readouterr().err

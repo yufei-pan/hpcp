@@ -5568,6 +5568,18 @@ def _live_mount(devnum, entries, device=''):
 			return entry['mount_point'], 'ro' in entry['options']
 	return None, False
 
+def _is_mount_point(path):
+	"""True when path is a mount point, including a bind of a filesystem that path's parent also shows.
+
+	os.path.ismount compares st_dev with the parent, so it misses a bind mounted from the
+	same filesystem the directory lives on; mountinfo does not.
+	"""
+	path = path.rstrip(os.sep) or os.sep
+	if os.path.ismount(path):
+		return True
+	real = os.path.realpath(path)
+	return any(entry['mount_point'] == real for entry in _mountinfo_entries())
+
 def _swap_devices(swaps_path='/proc/swaps'):
 	"""Real paths of the active swap areas."""
 	result = set()
@@ -5743,9 +5755,9 @@ def _attach_disk(path, read_only, loop_devices):
 def _release_mount(mount_point, mount_points):
 	"""Unmount one of this run's temp mounts and remove its directory (clean_up handles anything left)."""
 	path = mount_point.rstrip(os.sep)
-	if os.path.ismount(path):
+	if _is_mount_point(path):
 		run_command_in_multicmd_with_path_check(['umount', path], strict=False)
-	if not os.path.ismount(path):
+	if not _is_mount_point(path):
 		try:
 			os.rmdir(path)
 		except OSError:
@@ -5767,7 +5779,10 @@ def _mount_partition(device, read_only, mount_points, entries):
 	error_count = len(ERRORS)
 	if live:
 		run_command_in_multicmd_with_path_check(['mount', '--bind', live, mount_point], quiet=True)
-		if read_only and os.path.ismount(mount_point):
+		if _is_mount_point(mount_point):
+			# Private, so mounts made later under the live filesystem do not propagate into this bind.
+			run_command_in_multicmd_with_path_check(['mount', '--make-private', mount_point], quiet=True)
+		if read_only and _is_mount_point(mount_point):
 			# Best effort: generation only reads through this bind mount.
 			run_command_in_multicmd_with_path_check(['mount', '-o', 'remount,bind,ro', mount_point], quiet=True)
 	elif read_only:
@@ -5775,17 +5790,19 @@ def _mount_partition(device, read_only, mount_points, entries):
 	else:
 		run_command_in_multicmd_with_path_check(['mount', device, mount_point], quiet=True)
 	del ERRORS[error_count:]
-	if not os.path.ismount(mount_point):
+	if not _is_mount_point(mount_point):
 		_release_mount(mount_point, mount_points)
 		return None
 	return mount_point + os.sep
 
-def _partition_changes(new_root, old_root, mount_points, live_mount, exclude, full_hash, max_workers, parallel_file_listing):
+def _partition_changes(new_root, old_root, mount_points, live_mounts, exclude, full_hash, max_workers, parallel_file_listing):
 	"""Change rows of one filesystem partition (root to root, lost+found and this run's mounts left out)."""
 	matched = os.path.abspath(new_root)
 	patterns = _mount_point_excludes(mount_points, (new_root, old_root), matched)
-	if live_mount:
-		# The live filesystem holds the (empty) directories of this run's other temp mount points.
+	for live_mount in live_mounts:
+		if not live_mount:
+			continue
+		# A live filesystem holds the (empty) directories of this run's other temp mount points.
 		live_real = os.path.realpath(live_mount)
 		for mount_point in mount_points:
 			mount_real = os.path.realpath(mount_point)
@@ -5873,10 +5890,10 @@ def process_get_disk_diff_image(src_paths, dest_paths, output, mount_points, loo
 		kind = _default_kind(new_part)
 		if kind == 'fs':
 			new_root = _mount_partition(new_part['device'], True, mount_points, entries)
-			old_root = _mount_partition(old_part['device'], True, mount_points, entries) if new_root else None
+			old_root = _mount_partition(old_part['device'], True, mount_points, entries)
 			if new_root and old_root:
-				live, _ = _live_mount(_device_number(new_part['device']), entries, new_part['device'])
-				rows = _partition_changes(new_root, old_root, mount_points, live, exclude, full_hash, max_workers, parallel_file_listing)
+				lives = [_live_mount(_device_number(part['device']), entries, part['device'])[0] for part in (new_part, old_part)]
+				rows = _partition_changes(new_root, old_root, mount_points, lives, exclude, full_hash, max_workers, parallel_file_listing)
 				_release_mount(old_root, mount_points)
 				if rows:
 					# Kept mounted: its payload is copied once the patch image exists.
@@ -5887,6 +5904,8 @@ def process_get_disk_diff_image(src_paths, dest_paths, output, mount_points, loo
 				for root in (new_root, old_root):
 					if root:
 						_release_mount(root, mount_points)
+				failed = ' and '.join(side for side, root in (('new', new_root), ('old', old_root)) if not root)
+				print(f"Warning: partition {number} ({new_part['fs_type']}) could not be mounted on the {failed} side; comparing it as a raw area", file=sys.stderr)
 				kind = 'raw'
 		if kind == 'raw':
 			if new_part['size'] != old_part['size']:
@@ -6742,7 +6761,7 @@ def clean_up(mount_points: list,loop_devices: list, delayed_commands: list = Non
 	for mount_point in list(mount_points):
 		print(f"Unmounting {mount_point}")
 		run_command_in_multicmd_with_path_check(["umount",mount_point],strict=False)
-		if os.path.ismount(mount_point):
+		if _is_mount_point(mount_point):
 			# Still busy; sync and retry once before leaving it for loop detach retries.
 			try:
 				os.sync()
