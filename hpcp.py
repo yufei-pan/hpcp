@@ -4502,35 +4502,52 @@ def _claim_volume_names(output, count):
 		claimed.append(name)
 	return claimed
 
-def _check_payload(rows, volume_roots, full_hash=False, max_workers=1):
+def _source_resized(new_base, row):
+	"""True when row's source under new_base is gone or no longer a regular file of the recorded size."""
+	try:
+		info = os.lstat(_key_path(new_base, row.path))
+	except OSError:
+		return True
+	return not stat.S_ISREG(info.st_mode) or info.st_size != decode_state(row.new)['size']
+
+def _check_payload(rows, volume_roots, full_hash=False, max_workers=1, new_base=None):
 	"""Raise RuntimeError('Diff image error: ...') unless every A / M file row's payload is on a volume
-	and still matches its row.
+	and still matches its row; every failing row is checked and reported in one error.
 
 	copy_file_list_parallel reports failures only on stderr and skips full destinations: a row
-	with no regular file on any volume is an incomplete payload. A live source can also change
-	between the change scan and the copy, even at the same size; that copy would fail every
-	apply's verify, so its size, hash (computed as the row's was, with HASH_SIZE and full_hash)
-	and mtime are compared with the row.
+	with no copy of the recorded size on any volume is an incomplete payload, unless its source
+	under new_base no longer has that size either (a live file that grew or went away). A live
+	source can also change between the change scan and the copy at the same size; that copy
+	would fail every apply's verify, so its hash (computed as the row's was, with HASH_SIZE and
+	full_hash) and mtime are compared with the row.
 	"""
-	missing, copies = [], {}
+	incomplete, changed, copies = [], [], {}
 	for row in rows:
 		if row.op not in ('A', 'M') or not row.new.startswith('f:'):
 			continue
-		found = [path for path in (_key_path(volume_root, row.path) for volume_root in volume_roots)
-			if os.path.isfile(path) and not os.path.islink(path)]
-		if not found:
-			missing.append(row.path)
+		# The copy an apply would take.
+		copy = _payload_source(volume_roots, row)
+		if copy is not None:
+			copies[row] = copy
+		elif new_base is not None and _source_resized(new_base, row):
+			changed.append(row)
 		else:
-			# The copy an apply would take (_payload_source), else one of another size.
-			copies[row] = _payload_source(volume_roots, row) or found[0]
-	if missing:
-		raise RuntimeError(f'Diff image error: payload incomplete for {len(missing)} file(s), e.g. {missing[0]}; patch metadata not written')
+			incomplete.append(row.path)
 	states = _states_for_paths(set(copies.values()), full_hash=full_hash, read_xattrs=False, max_workers=max_workers)
-	for row in sort_change_rows(copies):
-		# Size, hash and mtime, as an apply's verify compares them (mode and owner are not checked here).
-		if not states_equal(states[copies[row]], row.new, compare_hash=decode_state(row.new)['hash'] != '-', metadata=False):
-			raise RuntimeError(f'Diff image error: {row.path} changed while the patch was built; exclude it (-e) '
-				'or generate from an offline copy; patch metadata not written')
+	for row, copy in copies.items():
+		# Hash and mtime, as an apply's verify compares them (mode and owner are not checked here).
+		if not states_equal(states[copy], row.new, compare_hash=decode_state(row.new)['hash'] != '-', metadata=False):
+			changed.append(row)
+	problems = []
+	if incomplete:
+		problems.append(f'payload incomplete for {len(incomplete)} file(s), e.g. {incomplete[0]}')
+	if changed:
+		paths = [row.path for row in sort_change_rows(changed)]
+		shown = ', '.join(paths[:10]) + (f' and {len(paths) - 10} more' if len(paths) > 10 else '')
+		problems.append(f'{len(paths)} file(s) changed while the patch was built (e.g. {shown}); '
+			'exclude them (-e) or generate from an offline copy')
+	if problems:
+		raise RuntimeError('Diff image error: ' + '; '.join(problems) + '; patch metadata not written')
 
 def write_patch_metadata(volume_roots, rows, meta):
 	"""Write .hpcp_diff/changes.tsv on every volume first, then each volume's manifest (volume k/n).
@@ -4582,7 +4599,7 @@ def _build_payload(rows, new_base, volume_roots, max_workers=1, verbose=False, e
 			# A symlinked root is listed from its target (build_entry_map); take its metadata there too.
 			source = os.path.realpath(source)
 		sync_directory_metadata(source, [_key_path(volume_root, key) for volume_root in volume_roots])
-	_check_payload(payload, volume_roots, full_hash, max_workers)
+	_check_payload(payload, volume_roots, full_hash, max_workers, new_base)
 
 def build_patch_tree(rows, new_base, volume_roots, meta, max_workers=1, verbose=False):
 	"""Copy the A / M payload of rows from new_base onto the volume roots, then write .hpcp_diff/."""

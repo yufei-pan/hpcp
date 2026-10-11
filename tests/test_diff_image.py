@@ -618,13 +618,15 @@ def test_build_patch_tree_refuses_incomplete_payload(trees, hpcp_mod, tmp_path, 
 	assert not (vol / '.hpcp_diff' / 'manifest').exists()
 
 
-_CHANGED_WHILE_BUILT = (r'^Diff image error: live\.log changed while the patch was built; exclude it \(-e\) or generate '
-	r'from an offline copy; patch metadata not written$')
+_CHANGED_WHILE_BUILT = (r'^Diff image error: 1 file\(s\) changed while the patch was built \(e\.g\. live\.log\); exclude them \(-e\) '
+	r'or generate from an offline copy; patch metadata not written$')
 
 
 @pytest.mark.parametrize('change', ['same-size rewrite', 'touch', 'size'])
 def test_build_patch_tree_refuses_a_source_changed_after_the_scan(trees, hpcp_mod, tmp_path, change):
-	"""A live file rewritten between the change scan and the payload copy would make a patch every node fails to verify."""
+	"""A live file rewritten between the change scan and the payload copy would make a patch every node fails to verify.
+
+	A copy of another size whose source no longer has the recorded size (a growing log) is a change, not an incomplete payload."""
 	new, base = trees
 	_write(new / 'live.log', 'version 1')
 	_write(new / 'calm.txt', 'calm')
@@ -642,6 +644,75 @@ def test_build_patch_tree_refuses_a_source_changed_after_the_scan(trees, hpcp_mo
 	with pytest.raises(RuntimeError, match=_CHANGED_WHILE_BUILT):
 		hpcp_mod.build_patch_tree(rows, str(new), [str(vol)], hpcp_mod.make_patch_meta(rows, 'n', 'b', 'root'), max_workers=1)
 	assert not (vol / '.hpcp_diff').exists()
+
+
+def _scan_then(hpcp_mod, new, base, tmp_path, change, monkeypatch=None, after_copy=None):
+	"""Rows of new vs base, then change() the sources and build the patch (after_copy() runs after the payload copy)."""
+	new_map, base_map = hpcp_mod.build_root_maps(str(new), str(base), max_workers=1)
+	rows = hpcp_mod.compute_changes(new_map, base_map, max_workers=1)
+	change()
+	if after_copy:
+		real_copy = hpcp_mod.copy_file_list_parallel
+		def copy(*args, **kwargs):
+			result = real_copy(*args, **kwargs)
+			after_copy()
+			return result
+		monkeypatch.setattr(hpcp_mod, 'copy_file_list_parallel', copy)
+	vol = tmp_path / 'vol'
+	vol.mkdir()
+	hpcp_mod.build_patch_tree(rows, str(new), [str(vol)], hpcp_mod.make_patch_meta(rows, 'n', 'b', 'root'), max_workers=1)
+
+
+def test_payload_check_names_every_changed_file_at_once(trees, hpcp_mod, tmp_path):
+	"""One rebuild per changed file would mean a full copy for each; all of them are named in one error."""
+	new, base = trees
+	for name in ('a.log', 'b.log', 'calm.txt'):
+		_write(new / name, 'version 1')
+	def change():
+		_write(new / 'b.log', 'version 2')
+		os.utime(str(new / 'a.log'), (T0 + 60, T0 + 60))
+	with pytest.raises(RuntimeError, match=r'^Diff image error: 2 file\(s\) changed while the patch was built \(e\.g\. a\.log, b\.log\); '
+			r'exclude them \(-e\) or generate from an offline copy; patch metadata not written$'):
+		_scan_then(hpcp_mod, new, base, tmp_path, change)
+	assert not (tmp_path / 'vol' / '.hpcp_diff').exists()
+
+
+def test_payload_check_lists_ten_changed_files_and_counts_the_rest(trees, hpcp_mod, tmp_path):
+	new, base = trees
+	for index in range(13):
+		_write(new / f'f{index:02}.log', 'version 1')
+	def change():
+		for index in range(13):
+			_write(new / f'f{index:02}.log', 'version 2')
+	shown = ', '.join(f'f{index:02}\\.log' for index in range(10))
+	with pytest.raises(RuntimeError, match=rf'^Diff image error: 13 file\(s\) changed while the patch was built \(e\.g\. {shown} and 3 more\); '):
+		_scan_then(hpcp_mod, new, base, tmp_path, change)
+
+
+def test_payload_check_reports_a_truncated_copy_as_incomplete(trees, hpcp_mod, tmp_path, monkeypatch):
+	"""A copy cut short (a full patch volume) whose source still matches its row is an incomplete payload,
+	not a file that changed while the patch was built (which would point at -e)."""
+	new, base = trees
+	_write(new / 'big.bin', b'B' * 4096)
+	_write(new / 'calm.txt', 'calm')
+	with pytest.raises(RuntimeError, match=r'^Diff image error: payload incomplete for 1 file\(s\), e\.g\. big\.bin; patch metadata not written$'):
+		_scan_then(hpcp_mod, new, base, tmp_path, lambda: None, monkeypatch, lambda: os.truncate(str(tmp_path / 'vol' / 'big.bin'), 1000))
+	assert not (tmp_path / 'vol' / '.hpcp_diff').exists()
+
+
+def test_payload_check_reports_incomplete_and_changed_files_together(trees, hpcp_mod, tmp_path, monkeypatch):
+	new, base = trees
+	_write(new / 'big.bin', b'B' * 4096)
+	_write(new / 'live.log', 'version 1')
+	_write(new / 'more.log', 'version 1')
+	def change():
+		_write(new / 'live.log', 'version 2')
+		_write(new / 'more.log', 'version 10')
+	with pytest.raises(RuntimeError, match=r'^Diff image error: payload incomplete for 1 file\(s\), e\.g\. big\.bin; '
+			r'2 file\(s\) changed while the patch was built \(e\.g\. live\.log, more\.log\); '
+			r'exclude them \(-e\) or generate from an offline copy; patch metadata not written$'):
+		_scan_then(hpcp_mod, new, base, tmp_path, change, monkeypatch, lambda: os.truncate(str(tmp_path / 'vol' / 'big.bin'), 1000))
+	assert not (tmp_path / 'vol' / '.hpcp_diff').exists()
 
 
 @pytest.mark.parametrize('full_hash', [False, True])
