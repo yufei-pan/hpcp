@@ -138,6 +138,53 @@ def test_xattr_digest_reflects_xattrs(tmp_path, hpcp_mod, reset_hpcp_globals):
 	assert hpcp_mod.decode_state(hpcp_mod.get_entry_state(str(tagged), read_xattrs=False))['xattr'] == '-'
 
 
+def test_xattr_digest_and_stale_removal_ignore_non_portable_names(tmp_path, hpcp_mod, reset_hpcp_globals):
+	"""F5: trusted.* (like NFSv4 / Lustre internals) is neither hashed nor removed; user.* still is."""
+	plain = tmp_path / 'plain.txt'
+	tagged = tmp_path / 'tagged.txt'
+	plain.write_text('x')
+	tagged.write_text('x')
+	try:
+		os.setxattr(str(tagged), 'trusted.hpcp_test', b'1', follow_symlinks=False)
+	except (OSError, AttributeError) as e:
+		pytest.skip(f'trusted xattrs unsupported here (needs root): {e}')
+	assert hpcp_mod._xattr_digest(str(tagged)) == hpcp_mod._xattr_digest(str(plain))
+	_set_xattr_or_skip(str(tagged), 'user.stale')
+	hpcp_mod._remove_stale_xattrs(str(plain), str(tagged))
+	names = os.listxattr(str(tagged), follow_symlinks=False)
+	assert 'trusted.hpcp_test' in names and 'user.stale' not in names
+
+
+def test_special_file_at_added_path_is_a_conflict(tmp_path, hpcp_mod, reset_hpcp_globals):
+	"""F6: a FIFO where the patch adds a file is not 'absent'."""
+	if not hasattr(os, 'mkfifo'):
+		pytest.skip('no FIFOs on this platform')
+	hpcp_mod.HASH_SIZE = 65536
+	rows = [hpcp_mod.ChangeRow('A', 'pipe', '-', hpcp_mod.get_entry_state(_write(tmp_path / 'new' / 'pipe', 'regular')))]
+	target = tmp_path / 'target'
+	target.mkdir()
+	os.mkfifo(str(target / 'pipe'))
+	assert hpcp_mod.get_entry_state(str(target / 'pipe')) == '?'
+	checks = hpcp_mod.check_patch_target(rows, str(target))
+	assert {(check.row.op, check.row.path): check.action for check in checks} == {('A', 'pipe'): 'conflict'}
+	assert hpcp_mod.ERRORS == []
+
+
+def test_states_for_paths_workers_use_callers_hash_size(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	"""F15: workers that do not inherit module globals (spawn) still hash with the caller's HASH_SIZE."""
+	import functools
+	import multiprocessing
+	hpcp_mod.HASH_SIZE = 4
+	paths = [str(tmp_path / f'f{i:03d}') for i in range(300)]
+	for i, path in enumerate(paths):
+		with open(path, 'w') as f:
+			f.write(f'{i:03d}-differing-head-same-tail')
+	serial = hpcp_mod._states_for_paths(paths, max_workers=1)
+	spawn_pool = functools.partial(hpcp_mod.ProcessPoolExecutor, mp_context=multiprocessing.get_context('spawn'))
+	monkeypatch.setattr(hpcp_mod, 'ProcessPoolExecutor', spawn_pool)
+	assert hpcp_mod._states_for_paths(paths, max_workers=2) == serial
+
+
 def test_changes_round_trip_and_order(tmp_path, hpcp_mod):
 	R = hpcp_mod.ChangeRow
 	rows = [

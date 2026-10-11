@@ -3818,8 +3818,18 @@ def _hash_algo_name():
 def _new_hasher():
 	return xxhash.xxh64() if xxhash_available else hashlib.blake2b()
 
+_PORTABLE_SYSTEM_XATTRS = frozenset(('system.posix_acl_access', 'system.posix_acl_default', 'security.capability'))
+
+def _is_portable_xattr(name):
+	"""True for xattrs a copy or a patch image can carry: user.*, POSIX ACLs and file capabilities.
+
+	Filesystem-synthesized names (system.nfs4_acl, lustre.*, trusted.*, security.selinux, ...)
+	are not portable and are ignored.
+	"""
+	return name.startswith('user.') or name in _PORTABLE_SYSTEM_XATTRS
+
 def _xattr_digest(path):
-	"""Hex digest of every readable xattr of path (symlinks not followed); ACLs are xattrs too.
+	"""Hex digest of the portable xattrs of path (see _is_portable_xattr; symlinks not followed).
 
 	Returns None when the platform or the filesystem does not support xattrs.
 	"""
@@ -3832,7 +3842,7 @@ def _xattr_digest(path):
 			return None
 		raise
 	hasher = _new_hasher()
-	for name in sorted(names, key=os.fsencode):
+	for name in sorted((name for name in names if _is_portable_xattr(name)), key=os.fsencode):
 		try:
 			value = os.getxattr(path, name, follow_symlinks=False)
 		except OSError as e:
@@ -3844,7 +3854,9 @@ def _xattr_digest(path):
 
 def get_entry_state(path, full_hash=False, read_xattrs=True):
 	"""State string of one path (see decode_state). Missing paths, including ones below a
-	regular file, are '-'; any other read failure is recorded with eprint and returns '?' (unknown)."""
+	regular file, are '-'; any other read failure is recorded with eprint and returns '?' (unknown).
+	An existing entry that is not a regular file, directory or symlink (FIFO, socket, device)
+	is '?' too, without an error: hpcp ignores special files, but they are not absent."""
 	path = path.rstrip(os.sep) or os.sep
 	try:
 		st = os.lstat(path)
@@ -3863,13 +3875,14 @@ def get_entry_state(path, full_hash=False, read_xattrs=True):
 	except OSError as e:
 		eprint(f'Entry state error: cannot read {path}: {e}')
 		return '?'
-	return '-'
+	return '?'
 
 def _remove_stale_xattrs(src, dest):
-	"""Remove xattrs (ACLs included) that dest has and src does not.
+	"""Remove portable xattrs (user.*, POSIX ACLs, capabilities) that dest has and src does not.
 
-	shutil.copystat() copies and overwrites xattrs but never removes one.
-	Skipped under CONTENT_ONLY; unsupported or forbidden removals are ignored.
+	shutil.copystat() copies and overwrites xattrs but never removes one. Non-portable,
+	filesystem-internal names are never removed. Skipped under CONTENT_ONLY; unsupported,
+	forbidden or already-gone removals are ignored.
 	"""
 	if CONTENT_ONLY or not hasattr(os, 'listxattr'):
 		return
@@ -3879,12 +3892,12 @@ def _remove_stale_xattrs(src, dest):
 	except OSError:
 		return
 	for name in dest_names:
-		if name in src_names:
+		if name in src_names or not _is_portable_xattr(name):
 			continue
 		try:
 			os.removexattr(dest, name, follow_symlinks=False)
 		except OSError as e:
-			if e.errno not in (errno.ENOTSUP, errno.EPERM, errno.ENODATA, errno.EACCES):
+			if e.errno not in (errno.ENOTSUP, errno.EPERM, errno.ENODATA, errno.EACCES, errno.EINVAL, errno.ENOENT):
 				raise
 
 _OP_ORDER = {'D': 0, 'A': 1, 'M': 2}
@@ -4070,8 +4083,14 @@ def build_root_maps(new_root, base_root, exclude=None, max_workers=multiprocessi
 	base_map = build_entry_map(base_root, '', None, exclude, os.path.abspath(new_root), max_workers, parallel_file_listing)
 	return new_map, base_map
 
-def _states_chunk(paths, full_hash, read_xattrs):
-	"""Worker body for _states_for_paths: states plus the errors recorded while computing them."""
+def _states_chunk(paths, full_hash, read_xattrs, hash_size):
+	"""Worker body for _states_for_paths: states plus the errors recorded while computing them.
+
+	hash_size is the caller's HASH_SIZE; a worker that did not fork from the caller
+	(spawn / forkserver) would otherwise hash with the module default.
+	"""
+	global HASH_SIZE
+	HASH_SIZE = hash_size
 	error_start = len(ERRORS)
 	states = {path: get_entry_state(path, full_hash, read_xattrs) for path in paths}
 	errors = ERRORS[error_start:]
@@ -4086,7 +4105,7 @@ def _states_for_paths(paths, full_hash=False, read_xattrs=True, max_workers=1):
 	chunk_size = max(64, len(paths) // (max_workers * 4) + 1)
 	states = {}
 	with ProcessPoolExecutor(max_workers=max_workers) as executor:
-		futures = [executor.submit(_states_chunk, paths[index:index + chunk_size], full_hash, read_xattrs)
+		futures = [executor.submit(_states_chunk, paths[index:index + chunk_size], full_hash, read_xattrs, HASH_SIZE)
 			for index in range(0, len(paths), chunk_size)]
 		for future in concurrent.futures.as_completed(futures):
 			chunk_states, chunk_errors = future.result()
@@ -4102,7 +4121,7 @@ def compute_changes(new_map, base_map, full_hash=False, max_workers=multiprocess
 	for key in set(new_map) | set(base_map):
 		new_state = states[new_map[key]] if key in new_map else '-'
 		old_state = states[base_map[key]] if key in base_map else '-'
-		# The read failure is already recorded; a guessed row could delete or add real files.
+		# A read failure (already recorded) or a special file: a guessed row could delete or add real files.
 		if new_state == '?' or old_state == '?':
 			continue
 		if new_state == '-' and old_state == '-':
