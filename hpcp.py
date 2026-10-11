@@ -13,6 +13,7 @@ import errno
 import fnmatch
 import functools
 import glob
+import hashlib
 import multiprocessing
 import os
 import pathlib
@@ -5332,6 +5333,83 @@ def match_target_layout(disk_rows, target):
 		if fields['kind'].old == 'raw' and str(part['size']) != fields['size'].old:
 			problems.append(f"partition {number} is a raw area of size {part['size']}, patch expects {fields['size'].old}")
 	return problems
+
+_MBR_BOOTCODE_SIZE = 440
+_AREA_CHUNK = 4 << 20
+
+def _hash_area(path, offset=0, length=None):
+	"""sha256 hex digest of length bytes of path from offset (to the end when length is None).
+
+	Raises OSError when path ends before offset + length.
+	"""
+	digest = hashlib.sha256()
+	remaining = length
+	with open(path, 'rb') as f:
+		f.seek(offset)
+		while remaining is None or remaining > 0:
+			chunk = f.read(_AREA_CHUNK if remaining is None else min(_AREA_CHUNK, remaining))
+			if not chunk:
+				break
+			digest.update(chunk)
+			if remaining is not None:
+				remaining -= len(chunk)
+	if remaining:
+		raise OSError(errno.EIO, f'{path} ends before byte {offset + length}')
+	return digest.hexdigest()
+
+def _copy_area(source, dest, offset, length):
+	"""Copy length bytes of source from offset into the new file dest (fsync'd); returns their sha256."""
+	digest = hashlib.sha256()
+	remaining = length
+	with open(source, 'rb') as src, open(dest, 'wb') as out:
+		src.seek(offset)
+		while remaining > 0:
+			chunk = src.read(min(_AREA_CHUNK, remaining))
+			if not chunk:
+				raise OSError(errno.EIO, f'{source} ends before byte {offset + length}')
+			out.write(chunk)
+			digest.update(chunk)
+			remaining -= len(chunk)
+		out.flush()
+		os.fsync(out.fileno())
+	return digest.hexdigest()
+
+def _write_area(target, payload, offset, length):
+	"""Write the first length bytes of payload into target at offset, then fsync.
+
+	Bytes of target outside [offset, offset + length) are left as they are (the MBR keeps its
+	disk signature, partition entries and boot signature).
+	"""
+	remaining = length
+	with open(payload, 'rb') as src, open(target, 'r+b') as out:
+		out.seek(offset)
+		while remaining > 0:
+			chunk = src.read(min(_AREA_CHUNK, remaining))
+			if not chunk:
+				raise OSError(errno.EIO, f'{payload} is shorter than {length} bytes')
+			out.write(chunk)
+			remaining -= len(chunk)
+		out.flush()
+		os.fsync(out.fileno())
+
+def _raw_payload(volume_roots, raw_file, new_sha, size):
+	"""Path of raw_file on a volume when it is a regular file inside that volume with the recorded
+	size and sha256; None when no volume holds an intact copy."""
+	for volume_root in volume_roots:
+		path = os.path.join(volume_root, raw_file)
+		if (_inside_root(volume_root, path) and os.path.isfile(path) and not os.path.islink(path)
+				and os.path.getsize(path) == size and _hash_area(path) == new_sha):
+			return path
+	return None
+
+def _plan_raw(old_sha, new_sha, found_sha):
+	"""'skip' when the area already holds the new content, 'apply' when it holds the old, else 'conflict'."""
+	if found_sha == new_sha:
+		return 'skip'
+	if found_sha == old_sha:
+		return 'apply'
+	return 'conflict'
+
 
 #%% ---- Remove Extra ----
 def remove_extra_dirs(src_paths, dests,exclude=None):

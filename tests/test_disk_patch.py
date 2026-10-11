@@ -311,3 +311,55 @@ def test_read_disk_layout_sees_a_label_changed_a_moment_ago(tmp_path, hpcp_mod, 
 		assert hpcp_mod.read_disk_layout(loop)['parts'][3]['fs_label'] == 'root'
 		_run('e2label', loop + 'p3', 'fresh')
 		assert hpcp_mod.read_disk_layout(loop)['parts'][3]['fs_label'] == 'fresh'
+
+
+import hashlib as _hashlib
+
+
+def _sha(data):
+	return _hashlib.sha256(data).hexdigest()
+
+
+def test_hash_area_ranges_and_short_files(tmp_path, hpcp_mod):
+	path = tmp_path / 'disk'
+	path.write_bytes(b'0123456789' * 1000)
+	assert hpcp_mod._hash_area(str(path)) == _sha(b'0123456789' * 1000)
+	assert hpcp_mod._hash_area(str(path), 10, 5) == _sha(b'01234')
+	with pytest.raises(OSError):
+		hpcp_mod._hash_area(str(path), 9990, 20)
+
+
+def test_copy_and_write_area_keep_bytes_outside_the_range(tmp_path, hpcp_mod):
+	source = tmp_path / 'source'
+	source.write_bytes(b'N' * 440 + b'SIGNATURE' + b'\x55\xaa')
+	payload = tmp_path / 'payload'
+	assert hpcp_mod._copy_area(str(source), str(payload), 0, 440) == _sha(b'N' * 440)
+	target = tmp_path / 'target'
+	target.write_bytes(b'O' * 440 + b'KEEPTHIS!' + b'\x55\xaa')
+	hpcp_mod._write_area(str(target), str(payload), 0, 440)
+	assert target.read_bytes() == b'N' * 440 + b'KEEPTHIS!' + b'\x55\xaa'
+	with pytest.raises(OSError):
+		hpcp_mod._write_area(str(target), str(payload), 0, 441)
+
+
+def test_raw_payload_rejects_damaged_or_escaping_files(tmp_path, hpcp_mod):
+	"""Review Focus 4: a payload whose bytes do not hash to the recorded value is never used."""
+	data = b'GRUBCOR2' * 128
+	v1, v2 = tmp_path / 'v1', tmp_path / 'v2'
+	_write(v1 / 'raw' / 'part2.img', b'GRUBCOR2' * 127 + b'BITROT!!')
+	_write(v2 / 'raw' / 'part2.img', data)
+	assert hpcp_mod._raw_payload([str(v1), str(v2)], 'raw/part2.img', _sha(data), len(data)) == str(v2 / 'raw' / 'part2.img')
+	assert hpcp_mod._raw_payload([str(v1)], 'raw/part2.img', _sha(data), len(data)) is None
+	outside = tmp_path / 'outside'
+	_write(outside / 'part2.img', data)
+	v3 = tmp_path / 'v3'
+	v3.mkdir()
+	os.symlink(str(outside), str(v3 / 'raw'))
+	assert hpcp_mod._raw_payload([str(v3)], 'raw/part2.img', _sha(data), len(data)) is None
+
+
+def test_plan_raw_actions(hpcp_mod):
+	"""Review Focus 5: an area already holding the new content is skipped on a re-run."""
+	assert hpcp_mod._plan_raw(_A, _B, _B) == 'skip'
+	assert hpcp_mod._plan_raw(_A, _B, _A) == 'apply'
+	assert hpcp_mod._plan_raw(_A, _B, _C) == 'conflict'
