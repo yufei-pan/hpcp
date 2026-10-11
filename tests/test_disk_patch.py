@@ -887,82 +887,9 @@ def test_content_only_section_round_trip(tmp_path, hpcp_mod, reset_hpcp_globals)
 	assert hpcp_mod._verify_rows(rows, str(target)) > 0
 
 
-def _case_changes(hpcp_mod, new, base, metadata=False, case_insensitive=True):
-	"""Rows of a FAT-like section by default (content only, names paired case-insensitively)."""
-	rows = hpcp_mod._partition_changes(str(new), str(base), [], [], None, False, 1, False, metadata=metadata,
-		labels=('part1 of new.img', 'part1 of old.img'), case_insensitive=case_insensitive)
-	return {(row.op, row.path) for row in rows}
-
-
-def test_content_only_sections_pair_names_case_insensitively(tmp_path, hpcp_mod, reset_hpcp_globals):
-	"""A case-only rename on FAT must not become a D + A pair: the target's case-insensitive lookup finds
-	the A rows already present (skip), then the D rows delete those very files."""
-	hpcp_mod.HASH_SIZE = 65536
-	new, base = tmp_path / 'new', tmp_path / 'base'
-	_write(base / 'EFI' / 'BOOT' / 'bootx64.efi', 'shim')
-	_write(base / 'EFI' / 'BOOT' / 'grubx64.efi', 'old')
-	_write(base / 'EFI' / 'BOOT' / 'old.efi', 'gone soon')
-	_write(base / 'efi.cfg', 'was a file')
-	_write(new / 'EFI' / 'Boot' / 'BOOTX64.EFI', 'shim')
-	_write(new / 'EFI' / 'Boot' / 'GRUBX64.efi', 'new content')
-	_write(new / 'EFI.CFG' / 'now.cfg', 'now a directory')
-	# Same content: no row. New content: an M row in the new spelling. Deleted below a renamed directory:
-	# a D row in the new spelling. A type change keeps its D + A pair on one (new) spelling.
-	assert _case_changes(hpcp_mod, new, base) == {('M', 'EFI/Boot/GRUBX64.efi'), ('D', 'EFI/Boot/old.efi'),
-		('D', 'EFI.CFG'), ('A', 'EFI.CFG/'), ('A', 'EFI.CFG/now.cfg')}
-	# Sections whose names are case-sensitive (POSIX, NTFS) are not paired.
-	for metadata in (True, False):
-		exact = _case_changes(hpcp_mod, new, base, metadata=metadata, case_insensitive=False)
-		assert {('D', 'EFI/BOOT/'), ('A', 'EFI/Boot/'), ('D', 'efi.cfg')} <= exact
-	# HFS+ (POSIX metadata, case-insensitive names) pairs them and still compares modes.
-	os.chmod(str(new / 'EFI' / 'Boot' / 'BOOTX64.EFI'), 0o700)
-	assert _case_changes(hpcp_mod, new, base) == {('M', 'EFI/Boot/GRUBX64.efi'), ('D', 'EFI/Boot/old.efi'),
-		('D', 'EFI.CFG'), ('A', 'EFI.CFG/'), ('A', 'EFI.CFG/now.cfg')}
-	assert _case_changes(hpcp_mod, new, base, metadata=True) == {('M', 'EFI/Boot/BOOTX64.EFI'), ('M', 'EFI/Boot/GRUBX64.efi'),
-		('D', 'EFI/Boot/old.efi'), ('D', 'EFI.CFG'), ('A', 'EFI.CFG/'), ('A', 'EFI.CFG/now.cfg')}
-
-
-@pytest.mark.parametrize('side', ['new', 'old'])
-def test_names_differing_only_by_case_refuse_content_only_generation(tmp_path, hpcp_mod, reset_hpcp_globals, side):
-	hpcp_mod.HASH_SIZE = 65536
-	new, base = tmp_path / 'new', tmp_path / 'base'
-	_write(new / 'EFI' / 'x.efi', 'x')
-	_write(base / 'EFI' / 'x.efi', 'x')
-	crowded = new if side == 'new' else base
-	_write(crowded / 'EFI' / 'Boot' / 'a.efi', 'a')
-	_write(crowded / 'EFI' / 'BOOT' / 'a.efi', 'A')
-	with pytest.raises(RuntimeError, match=rf'^Diff image error: part1 of {side}\.img has names that differ only by case '
-			r'\(EFI/BOOT/, EFI/Boot/\); a case-insensitive filesystem cannot hold both$'):
-		_case_changes(hpcp_mod, new, base)
-	with pytest.raises(RuntimeError, match='a case-insensitive filesystem cannot hold both'):
-		_case_changes(hpcp_mod, new, base, metadata=True)
-	# A section with case-sensitive names (POSIX, NTFS) may hold both.
-	for metadata in (True, False):
-		assert ('A' if side == 'new' else 'D', 'EFI/BOOT/a.efi') in _case_changes(hpcp_mod, new, base, metadata=metadata, case_insensitive=False)
-
-
 def _patch_row(hpcp_mod, op, path):
 	state = 'd:40755:0:0:-' if path.endswith('/') else f'f:1:{T0}000000000:100644:0:0:-:-'
 	return hpcp_mod.ChangeRow(op, path, '-' if op == 'A' else state, '-' if op == 'D' else state)
-
-
-@pytest.mark.parametrize('deleted, written, refused', [
-	('EFI/BOOT/', 'EFI/Boot/', True),
-	('EFI/BOOT/grubx64.efi', 'EFI/BOOT/GRUBX64.EFI', True),
-	('EFI/BOOT/grubx64.efi', 'EFI/BOOT/GRUBX64.EFI M', True),
-	('EFI/BOOT/', 'EFI/Boot/grubx64.efi', True),
-	('EFI/BOOT/grubx64.efi', 'EFI/boot/', True),
-	('x', 'x/', False),
-	('x', 'x/child', False),
-	('EFI/BOOT/old.efi', 'EFI/Boot/new.efi', False),
-	('EFI/BOOT/old.efi', 'EFI/BOOT/new.efi', False),
-])
-def test_case_collision_finds_deletes_and_writes_that_differ_only_by_case(hpcp_mod, deleted, written, refused):
-	op = 'M' if written.endswith(' M') else 'A'
-	written = written[:-2] if op == 'M' else written
-	rows = [_patch_row(hpcp_mod, 'D', deleted), _patch_row(hpcp_mod, op, written)]
-	assert hpcp_mod._case_collision(rows) == ((deleted, written) if refused else None)
-	assert hpcp_mod._case_collision(rows[1:]) is None
 
 
 def test_directory_delete_matches_children_case_insensitively_on_case_insensitive_targets(tmp_path, hpcp_mod, reset_hpcp_globals):
@@ -986,25 +913,6 @@ def test_directory_delete_matches_children_case_insensitively_on_case_insensitiv
 	# An entry the patch does not delete is still one, whatever its case.
 	_write(target / 'EFI' / 'old' / 'Extra.efi', 'e')
 	assert directory_check(case_insensitive=True) == ('conflict', 'directory holds entries the patch does not delete')
-
-
-def test_section_preflight_refuses_a_delete_and_a_write_of_one_entry(tmp_path, hpcp_mod, reset_hpcp_globals):
-	"""Disk sections run the same pre-flight as single-filesystem patches: a section that deletes x/f and writes y/f,
-	where y is a symlink to x on the target, is refused before any section is applied, whatever its filesystem."""
-	hpcp_mod.HASH_SIZE = 65536
-	target, volume = tmp_path / 'target', tmp_path / 'vol'
-	_write(target / 'x' / 'f', 'moved')
-	os.symlink('x', str(target / 'y'))
-	_write(volume / 'y' / 'f', 'moved')
-	state = hpcp_mod.get_entry_state
-	R = hpcp_mod.ChangeRow
-	rows = [R('D', 'x/f', state(str(target / 'x' / 'f')), '-'), R('A', 'y/f', '-', state(str(volume / 'y' / 'f')))]
-	for metadata in (True, False):
-		plan = hpcp_mod._plan_section('part1', rows, [str(volume)], str(target), True, False, 1, metadata=metadata)
-		assert {check.row.path: check.action for check in plan.checks} == {'x/f': 'apply', 'y/f': 'skip'}
-		with pytest.raises(RuntimeError, match=r"^Patch conflict: 'x/f' \(deleted\) and 'y/f' \(written\) are the same entry "):
-			hpcp_mod._preflight_section(plan)
-	assert (target / 'x' / 'f').read_text() == 'moved'
 
 
 def test_sections_share_one_conflict_prompt(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch, capsys):
@@ -1315,13 +1223,13 @@ def test_raw_areas_are_stored_before_section_payloads_largest_first(tmp_path, hp
 
 
 @pytest.mark.parametrize('fs_type, expected', [
-	# FAT: content only, names paired case-insensitively.
-	('vfat', {('M', 'changed.txt')}),
-	# NTFS: content only, but ntfs3 / ntfs-3g look names up by exact case: a case-only rename stays D + A.
-	('ntfs', {('M', 'changed.txt'), ('D', 'Docs/'), ('D', 'Docs/readme.txt'), ('A', 'DOCS/'), ('A', 'DOCS/readme.txt')}),
-	('ntfs3', {('M', 'changed.txt'), ('D', 'Docs/'), ('D', 'Docs/readme.txt'), ('A', 'DOCS/'), ('A', 'DOCS/readme.txt')}),
-	# HFS+: names paired case-insensitively, and hfsplus keeps modes on disk, so a chmod is a change.
-	('hfsplus', {('M', 'changed.txt'), ('M', 'tool.sh')}),
+	# Names are compared by exact case in every section: a case-only rename is a D + A pair.
+	# FAT, NTFS: content only.
+	('vfat', {('M', 'changed.txt')} | {('D', 'Docs/'), ('D', 'Docs/readme.txt'), ('A', 'DOCS/'), ('A', 'DOCS/readme.txt')}),
+	('ntfs', {('M', 'changed.txt')} | {('D', 'Docs/'), ('D', 'Docs/readme.txt'), ('A', 'DOCS/'), ('A', 'DOCS/readme.txt')}),
+	('ntfs3', {('M', 'changed.txt')} | {('D', 'Docs/'), ('D', 'Docs/readme.txt'), ('A', 'DOCS/'), ('A', 'DOCS/readme.txt')}),
+	# HFS+ keeps modes on disk, so a chmod is a change.
+	('hfsplus', {('M', 'changed.txt'), ('M', 'tool.sh')} | {('D', 'Docs/'), ('D', 'Docs/readme.txt'), ('A', 'DOCS/'), ('A', 'DOCS/readme.txt')}),
 ])
 def test_generation_classifies_sections_by_filesystem_type(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch, fs_type, expected):
 	hpcp_mod.HASH_SIZE = 65536
@@ -1349,19 +1257,77 @@ def test_generation_classifies_sections_by_filesystem_type(tmp_path, hpcp_mod, r
 	assert sections == [expected]
 
 
-@pytest.mark.parametrize('fs_type, refused', [('vfat', True), ('exfat', True), ('hfsplus', True), ('hfs', True),
-	('ntfs', False), ('ntfs3', False), ('ext4', False)])
-def test_case_colliding_rows_are_refused_only_on_case_insensitive_filesystems(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch, fs_type, refused):
-	"""On NTFS (exact-case lookups) a delete of EFI/BOOT/x.efi and an add of EFI/Boot/x.efi are two names."""
+@pytest.mark.parametrize('fs_type', ['vfat', 'exfat', 'hfsplus', 'ntfs', 'ext4'])
+def test_case_only_rename_rows_pass_the_disk_patch_checks(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch, fs_type):
+	"""A delete of EFI/BOOT/x.efi and an add of EFI/Boot/x.efi is an ordinary case-only rename: no refusal before the
+	target is opened, whatever the section's filesystem."""
 	rows = [_patch_row(hpcp_mod, 'D', 'EFI/BOOT/x.efi'), _patch_row(hpcp_mod, 'A', 'EFI/Boot/x.efi')]
 	volume, _ = _hand_made_disk_patch(hpcp_mod, tmp_path, monkeypatch, sections=[('part1', rows)], kinds={1: ('fs', fs_type, 32 << 20)})
-	if refused:
-		with pytest.raises(RuntimeError, match=r'^Patch format error: section part1 deletes and writes EFI/BOOT/x\.efi and EFI/Boot/x\.efi'):
-			hpcp_mod.apply_disk_patch([volume], str(tmp_path / 'node.img'), [], [])
-	else:
-		# Past the format checks: the next step opens the target.
-		with pytest.raises(AssertionError, match='the target was opened before the patch was checked'):
-			hpcp_mod.apply_disk_patch([volume], str(tmp_path / 'node.img'), [], [])
+	with pytest.raises(AssertionError, match='the target was opened before the patch was checked'):
+		hpcp_mod.apply_disk_patch([volume], str(tmp_path / 'node.img'), [], [])
+
+
+def test_generation_pairs_names_by_exact_case_in_every_section(tmp_path, hpcp_mod, reset_hpcp_globals):
+	"""A case-only rename is a delete plus an add, for content-only (FAT) and POSIX sections alike."""
+	hpcp_mod.HASH_SIZE = 65536
+	new, base = tmp_path / 'new', tmp_path / 'base'
+	_write(base / 'EFI' / 'BOOT' / 'bootx64.efi', 'shim')
+	_write(new / 'EFI' / 'Boot' / 'BOOTX64.EFI', 'shim')
+	for metadata in (True, False):
+		rows = hpcp_mod._partition_changes(str(new), str(base), [], [], None, False, 1, False, metadata=metadata)
+		assert {(row.op, row.path) for row in rows} == {('D', 'EFI/BOOT/'), ('D', 'EFI/BOOT/bootx64.efi'),
+			('A', 'EFI/Boot/'), ('A', 'EFI/Boot/BOOTX64.EFI')}
+
+
+def test_spelled_on_disk_reads_the_targets_own_spelling(tmp_path, hpcp_mod):
+	_write(tmp_path / 'EFI' / 'Boot' / 'BOOTX64.EFI', 'x')
+	listings = {}
+	assert hpcp_mod._spelled_on_disk(str(tmp_path), 'efi/BOOT/bootx64.efi', listings) == 'EFI/Boot/BOOTX64.EFI'
+	assert hpcp_mod._spelled_on_disk(str(tmp_path), 'EFI/missing', listings) is None
+
+
+def test_case_insensitive_planning_writes_where_a_differently_spelled_name_is_deleted(tmp_path, hpcp_mod, reset_hpcp_globals):
+	"""On FAT the add of EFI/Boot/x.efi finds the old file under the other spelling. Matched case-insensitively, the
+	delete of EFI/BOOT/x.efi removes that name first, so the add counts as absent: a write, not an 'already exists'
+	conflict. (A case-sensitive test directory holds both spellings to show the matching.)"""
+	hpcp_mod.HASH_SIZE = 65536
+	target, vol = tmp_path / 'target', tmp_path / 'vol'
+	_write(target / 'EFI' / 'BOOT' / 'x.efi', 'old')
+	_write(target / 'EFI' / 'Boot' / 'x.efi', 'old')
+	_write(vol / 'EFI' / 'Boot' / 'x.efi', 'new content')
+	state = hpcp_mod.get_entry_state
+	R = hpcp_mod.ChangeRow
+	rows = [R('D', 'EFI/BOOT/x.efi', state(str(target / 'EFI' / 'BOOT' / 'x.efi')), '-'),
+		R('A', 'EFI/Boot/x.efi', '-', state(str(vol / 'EFI' / 'Boot' / 'x.efi')))]
+
+	def actions(case_insensitive):
+		checks = hpcp_mod.check_patch_target(rows, str(target), case_insensitive=case_insensitive)
+		return {check.row.path: (check.action, check.reason) for check in checks}
+
+	assert actions(True) == {'EFI/BOOT/x.efi': ('apply', ''), 'EFI/Boot/x.efi': ('apply', '')}
+	assert actions(False)['EFI/Boot/x.efi'] == ('conflict', 'already exists on target')
+
+
+def test_hfsx_is_case_sensitive(tmp_path, hpcp_mod):
+	device = tmp_path / 'hfs.img'
+	device.write_bytes(b'\0' * 1024 + b'HX' + b'\0' * 510)
+	assert hpcp_mod._has_case_insensitive_names('hfsplus', str(device)) is False
+	device.write_bytes(b'\0' * 1024 + b'H+' + b'\0' * 510)
+	assert hpcp_mod._has_case_insensitive_names('hfsplus', str(device)) is True
+	assert hpcp_mod._has_case_insensitive_names('hfsplus', str(tmp_path / 'missing')) is True
+	assert hpcp_mod._has_case_insensitive_names('hfsplus') is True
+	assert hpcp_mod._has_case_insensitive_names('vfat', str(device)) is True
+	assert hpcp_mod._has_case_insensitive_names('ext4', str(device)) is False
+
+
+@pytest.mark.skipif(shutil.which('mkfs.hfsplus') is None, reason='needs mkfs.hfsplus')
+def test_hfsx_made_by_mkfs_is_case_sensitive(tmp_path, hpcp_mod):
+	for flags, insensitive in (([], True), (['-s'], False)):
+		image = tmp_path / f'hfs{len(flags)}.img'
+		with open(str(image), 'wb') as f:
+			f.truncate(32 << 20)
+		subprocess.run(['mkfs.hfsplus'] + flags + [str(image)], check=True, stdout=subprocess.DEVNULL)
+		assert hpcp_mod._has_case_insensitive_names('hfsplus', str(image)) is insensitive
 
 
 @pytest.mark.parametrize('fs_type, metadata, case_insensitive', [('vfat', False, True), ('exfat', False, True), ('ntfs', False, False),
@@ -1524,9 +1490,9 @@ def _esp_files(image):
 @requires_root_and_disk_tools
 @pytest.mark.root
 @pytest.mark.loop
-def test_esp_case_only_rename_keeps_the_files(tmp_path, hpcp_mod, reset_hpcp_globals):
-	"""Finding: EFI/BOOT -> EFI/Boot made D + A rows; the A rows were skipped as already present on the
-	case-insensitive target and the D rows then deleted the boot files (exit 0, empty EFI/)."""
+def test_esp_case_only_rename_applies_with_the_new_spelling(tmp_path, hpcp_mod, reset_hpcp_globals):
+	"""EFI/BOOT -> EFI/Boot (and two file renames by case) is a delete plus an add per entry. On the node's vfat ESP,
+	matched case-insensitively, the deletes run and the adds write the new spelling; a re-run skips every row."""
 	old, new, out = tmp_path / 'old.img', tmp_path / 'new.img', str(tmp_path / 'patch.img')
 	_make_golden(old)
 	_add_esp_file(old, 'EFI/BOOT/bootx64.efi', b'shim-v1')
@@ -1537,22 +1503,25 @@ def test_esp_case_only_rename_keeps_the_files(tmp_path, hpcp_mod, reset_hpcp_glo
 	with _session(hpcp_mod) as (mount_points, loop_devices):
 		assert hpcp_mod.process_get_disk_diff_image([str(new)], [str(old)], out, mount_points, loop_devices, max_workers=1) == out
 	_, part1 = _read_part3_patch(hpcp_mod, out, 'part1')
-	assert {(row.op, row.path) for row in part1} == {('M', 'EFI/Boot/GRUBX64.efi')}
+	assert {(row.op, row.path) for row in part1} == {('D', 'EFI/BOOT/'), ('D', 'EFI/BOOT/bootx64.efi'), ('D', 'EFI/BOOT/grubx64.efi'),
+		('A', 'EFI/Boot/'), ('A', 'EFI/Boot/BOOTX64.EFI'), ('A', 'EFI/Boot/GRUBX64.efi')}
 	target = tmp_path / 'node.img'
 	shutil.copyfile(str(old), str(target))
 	summary = _apply(hpcp_mod, out, target)
 	assert summary['failed'] == 0 and hpcp_mod.ERRORS == []
-	assert summary['sections']['part1'] == {'deleted': 0, 'added': 0, 'modified': 1, 'skipped': 0, 'forced': 0, 'failed': 0}
-	files = {name.lower(): data for name, data in _esp_files(target).items()}
-	assert files == {'efi/boot/bootx64.efi': b'shim-v1', 'efi/boot/grubx64.efi': b'new-efi-binary'}
+	assert summary['sections']['part1'] == {'deleted': 3, 'added': 3, 'modified': 0, 'skipped': 0, 'restored': 0, 'forced': 0, 'failed': 0}
+	assert _esp_files(target) == {'EFI/Boot/BOOTX64.EFI': b'shim-v1', 'EFI/Boot/GRUBX64.efi': b'new-efi-binary'}
+	again = _apply(hpcp_mod, out, target)
+	assert again['failed'] == 0 and again['sections']['part1']['skipped'] == 6
 	assert _no_differences(hpcp_mod, tmp_path, new, target)
 
 
 @requires_root_and_disk_tools
 @pytest.mark.root
 @pytest.mark.loop
-def test_hand_made_case_colliding_delete_and_add_is_refused_before_anything_changes(tmp_path, hpcp_mod, reset_hpcp_globals):
-	"""A patch from older code (or a crafted one) that deletes EFI/BOOT/grubx64.efi and adds EFI/Boot/grubx64.efi."""
+def test_hand_made_case_only_rename_with_new_content_applies_on_the_esp(tmp_path, hpcp_mod, reset_hpcp_globals):
+	"""A patch that deletes EFI/BOOT/grubx64.efi and adds EFI/Boot/grubx64.efi with new content (older hpcp, or written
+	by hand): on the vfat ESP the add is planned as a write after the delete, not an 'already exists' conflict."""
 	old, new, patch = _make_patch(hpcp_mod, tmp_path)
 	with _attached(patch) as loop:
 		with _mounted(loop) as root:
@@ -1561,13 +1530,16 @@ def test_hand_made_case_colliding_delete_and_add_is_refused_before_anything_chan
 			assert (row.op, row.path) == ('M', 'EFI/BOOT/grubx64.efi')
 			R = hpcp_mod.ChangeRow
 			hpcp_mod.write_changes(changes, [R('D', row.path, row.old, '-'), R('A', 'EFI/Boot/grubx64.efi', '-', row.new)])
+			# The patch volume is case-sensitive: the add's payload lives under its own spelling.
+			os.makedirs(os.path.join(root, 'part1', 'EFI', 'Boot'))
+			os.rename(os.path.join(root, 'part1', 'EFI', 'BOOT', 'grubx64.efi'), os.path.join(root, 'part1', 'EFI', 'Boot', 'grubx64.efi'))
 	target = tmp_path / 'node.img'
 	shutil.copyfile(str(old), str(target))
-	before = _sha(target.read_bytes())
-	with pytest.raises(RuntimeError, match=r'^Patch format error: section part1 deletes and writes EFI/BOOT/grubx64\.efi and '
-			r'EFI/Boot/grubx64\.efi differing only by case; regenerate the patch with this hpcp$'):
-		_apply(hpcp_mod, patch, target)
-	assert _sha(target.read_bytes()) == before
+	summary = _apply(hpcp_mod, patch, target)
+	assert summary['failed'] == 0 and hpcp_mod.ERRORS == []
+	assert (summary['sections']['part1']['deleted'], summary['sections']['part1']['added']) == (1, 1)
+	files = {name.lower(): data for name, data in _esp_files(target).items()}
+	assert files['efi/boot/grubx64.efi'] == b'new-efi-binary'
 
 
 @requires_root_and_disk_tools
