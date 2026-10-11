@@ -627,3 +627,81 @@ def test_section_volume_roots_drop_a_symlinked_section_directory(tmp_path, hpcp_
 	roots = hpcp_mod._section_volume_roots([str(bad), str(good)], 'part1')
 	assert roots == [str(good / 'part1')] and hpcp_mod._payload_source(roots, row) == str(good / 'part1' / 'a.txt')
 	assert hpcp_mod._section_volume_roots([str(bad)], '.') == [str(bad)]
+
+
+@requires_root_and_disk_tools
+@pytest.mark.root
+@pytest.mark.loop
+def test_disk_patch_generation_records_sections_raw_and_identity(tmp_path, hpcp_mod, reset_hpcp_globals):
+	old, new, out = tmp_path / 'old.img', tmp_path / 'new.img', str(tmp_path / 'patch.img')
+	_make_golden(old)
+	_make_newer(old, new)
+	with _session(hpcp_mod) as (mount_points, loop_devices):
+		assert hpcp_mod.process_get_disk_diff_image([str(new)], [str(old)], out, mount_points, loop_devices, max_workers=1) == out
+	with _session(hpcp_mod) as (mount_points, loop_devices):
+		root = hpcp_mod._mount_single_fs_image(out, True, mount_points, loop_devices)
+		meta = hpcp_mod.read_manifest(os.path.join(root, '.hpcp_diff', 'manifest'))
+		assert (meta['layout'], meta['format_version']) == ('disk', '2')
+		assert [section[0] for section in meta['sections']] == ['part1', 'part3']
+		assert sorted(raw[0] for raw in meta['raws']) == ['mbr', 'part2']
+		rows = hpcp_mod.read_disk_tsv(os.path.join(root, '.hpcp_diff', 'disk.tsv'))
+		changed = {(row.number, row.field): (row.old, row.new) for row in rows if row.old != row.new}
+		assert changed[('3', 'fs_label')] == ('root', 'root2') and changed[('1', 'name')] == ('ESP', 'ESP-v2')
+		part3 = hpcp_mod.read_changes(os.path.join(root, '.hpcp_diff', 'part3.changes.tsv'))
+		assert {(r.op, r.path) for r in part3} >= {('M', 'etc/os-release'), ('A', 'usr/bin/tool'), ('D', 'etc/obsolete.conf')}
+		assert not any(r.path.startswith('lost+found') for r in part3)
+		with open(os.path.join(root, 'part3', 'etc', 'os-release'), 'rb') as f:
+			assert f.read() == b'v2'
+		with open(os.path.join(root, 'raw', 'part2.img'), 'rb') as f:
+			assert f.read(16) == b'GRUBCOR2GRUBCOR2'
+
+
+@requires_root_and_disk_tools
+@pytest.mark.root
+@pytest.mark.loop
+def test_disk_patch_generation_without_differences_creates_nothing(tmp_path, hpcp_mod, reset_hpcp_globals):
+	old, new, out = tmp_path / 'old.img', tmp_path / 'new.img', tmp_path / 'patch.img'
+	_make_golden(old)
+	shutil.copyfile(str(old), str(new))
+	with _session(hpcp_mod) as (mount_points, loop_devices):
+		assert hpcp_mod.process_get_disk_diff_image([str(new)], [str(old)], str(out), mount_points, loop_devices, max_workers=1) is None
+	assert not out.exists()
+
+
+@requires_root_and_disk_tools
+@pytest.mark.root
+@pytest.mark.loop
+def test_disk_patch_generation_refuses_layout_changes(tmp_path, hpcp_mod, reset_hpcp_globals):
+	old, new, out = tmp_path / 'old.img', tmp_path / 'new.img', tmp_path / 'patch.img'
+	_make_golden(old)
+	_make_newer(old, new, extra_partition=True)
+	with _session(hpcp_mod) as (mount_points, loop_devices):
+		with pytest.raises(RuntimeError, match='Disk layout mismatch'):
+			hpcp_mod.process_get_disk_diff_image([str(new)], [str(old)], str(out), mount_points, loop_devices, max_workers=1)
+	assert not out.exists()
+
+
+@requires_root_and_disk_tools
+@pytest.mark.root
+@pytest.mark.loop
+def test_live_partition_hides_nested_mounts(tmp_path, hpcp_mod, reset_hpcp_globals):
+	"""Review Focus 2: a filesystem mounted below a live partition stays out of that partition's section."""
+	old, new, out = tmp_path / 'old.img', tmp_path / 'new.img', str(tmp_path / 'patch.img')
+	_make_golden(old)
+	_make_newer(old, new, label=None, raw=False, mbr=False, gpt_name=None)
+	with _attached(new, read_only=False) as loop:
+		with _mounted(loop + 'p3') as live_root:
+			nested = os.path.join(live_root, 'mnt')
+			_run('mount', '-t', 'tmpfs', 'tmpfs', nested)
+			try:
+				_write(os.path.join(nested, 'leak.txt'), b'must not appear')
+				with _session(hpcp_mod) as (mount_points, loop_devices):
+					hpcp_mod.process_get_disk_diff_image([loop], [str(old)], out, mount_points, loop_devices, max_workers=1)
+			finally:
+				subprocess.run(['umount', nested], capture_output=True)
+	with _session(hpcp_mod) as (mount_points, loop_devices):
+		root = hpcp_mod._mount_single_fs_image(out, True, mount_points, loop_devices)
+		part3 = hpcp_mod.read_changes(os.path.join(root, '.hpcp_diff', 'part3.changes.tsv'))
+	paths = {row.path for row in part3}
+	assert 'mnt/leak.txt' not in paths and 'mnt/' not in paths
+	assert ('M', 'etc/os-release') in {(row.op, row.path) for row in part3}

@@ -4414,6 +4414,35 @@ def make_patch_meta(rows, new_name, base_name, layout, full_hash=False):
 		'sections': [('root', '.', 'changes.tsv')],
 	}
 
+def _payload_allocation(rows):
+	"""Bytes a patch volume needs for rows: change list, allocation (not apparent size) and an inode each."""
+	size = 2 * sum(len(row.path) + len(row.old) + len(row.new) + 8 for row in rows)
+	for row in rows:
+		if row.op in ('A', 'M'):
+			# Allocation, not apparent size, plus the inode each entry needs (512 bytes on xfs).
+			size += 512
+			if row.new.startswith('f:'):
+				size += _align_up(max(decode_state(row.new)['size'], 1))
+			else:
+				size += _IMAGE_BLOCK
+	return size
+
+def _claim_volume_names(output, count):
+	"""Create every planned volume file exclusively (O_EXCL, O_NOFOLLOW); on a clash remove what this call created."""
+	claimed = []
+	for name in [_split_dest_image_name(output, i) for i in range(count)]:
+		try:
+			os.close(os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600))
+		except FileExistsError:
+			for done in claimed:
+				try:
+					os.unlink(done)
+				except OSError:
+					pass
+			raise RuntimeError(f'Diff image error: output {name} already exists')
+		claimed.append(name)
+	return claimed
+
 def _missing_payload(rows, volume_roots):
 	"""Paths of A / M file rows that no volume root holds as a regular file of the expected size."""
 	missing = []
@@ -4442,8 +4471,8 @@ def write_patch_metadata(volume_roots, rows, meta):
 		volume_meta['volume'] = f'{index}/{total}'
 		write_manifest(os.path.join(diff_dir, 'manifest'), volume_meta)
 
-def build_patch_tree(rows, new_base, volume_roots, meta, max_workers=1, verbose=False):
-	"""Copy the A / M payload of rows from new_base onto the volume roots, then write .hpcp_diff/.
+def _build_payload(rows, new_base, volume_roots, max_workers=1, verbose=False, estimated_size=0):
+	"""Copy the A / M payload of rows from new_base onto the volume roots and check it landed.
 
 	Every map key is relpath(path, new_base), so new_base is '/' for store layout and the
 	new tree's root for root layout.
@@ -4463,7 +4492,7 @@ def build_patch_tree(rows, new_base, volume_roots, meta, max_workers=1, verbose=
 	files = [_key_path(new_base, row.path) for row in payload if row.new.startswith('f:')]
 	if files:
 		copy_file_list_parallel(files, [], new_base, list(volume_roots), max(1, max_workers), verbose=verbose,
-			estimated_size=meta.get('payload_bytes', 0))
+			estimated_size=estimated_size)
 	for row in payload:
 		if row.new.startswith('l:'):
 			_place_symlink(decode_state(row.new)['target'], _key_path(volume_roots[0], row.path))
@@ -4478,6 +4507,10 @@ def build_patch_tree(rows, new_base, volume_roots, meta, max_workers=1, verbose=
 	missing = _missing_payload(payload, volume_roots)
 	if missing:
 		raise RuntimeError(f'Diff image error: payload incomplete for {len(missing)} file(s), e.g. {missing[0]}; patch metadata not written')
+
+def build_patch_tree(rows, new_base, volume_roots, meta, max_workers=1, verbose=False):
+	"""Copy the A / M payload of rows from new_base onto the volume roots, then write .hpcp_diff/."""
+	_build_payload(rows, new_base, volume_roots, max_workers, verbose, meta.get('payload_bytes', 0))
 	write_patch_metadata(volume_roots, rows, meta)
 
 PatchCheck = namedtuple('PatchCheck', 'row action found reason')
@@ -5075,6 +5108,10 @@ def _probe_fs_type(device):
 		del ERRORS[error_count:]
 	return next((line.strip() for line in output if line.strip()), '')
 
+def _ro_mount_options(device):
+	"""Read-only mount options that also work for cloned (duplicate-UUID) xfs and dirty ext3/4 journals."""
+	return {'xfs': 'ro,nouuid,norecovery', 'ext3': 'ro,noload', 'ext4': 'ro,noload'}.get(_probe_fs_type(device), 'ro')
+
 def _mount_single_fs_image(image, read_only, mount_points, loop_devices):
 	"""Attach image, mount its largest partition (or the whole partitionless image), return the mount point + os.sep."""
 	image = os.path.abspath(os.path.expanduser(image))
@@ -5092,7 +5129,7 @@ def _mount_single_fs_image(image, read_only, mount_points, loop_devices):
 	mount_points.append(mount_point)
 	if read_only:
 		# lsblk reads udev's cache, which a fresh loop device may not have yet; blkid -p reads the device.
-		options = {'xfs': 'ro,nouuid,norecovery', 'ext3': 'ro,noload', 'ext4': 'ro,noload'}.get(_probe_fs_type(target), 'ro')
+		options = _ro_mount_options(target)
 		command = ['mount', '-o', options, target, mount_point]
 	else:
 		command = ['mount', target, mount_point]
@@ -5181,33 +5218,13 @@ def process_get_diff_image(src_paths, src_image, dest_paths, dest_image, output,
 	if not rows:
 		print(f"No differences between {new_root} and {base_root}; no patch image created.")
 		return None
-	change_list_bytes = sum(len(row.path) + len(row.old) + len(row.new) + 8 for row in rows)
-	init_size = 2 * change_list_bytes
-	for row in rows:
-		if row.op in ('A', 'M'):
-			# Allocation, not apparent size, plus the inode each entry needs (512 bytes on xfs).
-			init_size += 512
-			if row.new.startswith('f:'):
-				init_size += _align_up(max(decode_state(row.new)['size'], 1))
-			else:
-				init_size += _IMAGE_BLOCK
+	init_size = _payload_allocation(rows)
 	if os.geteuid() != 0:
 		print("Warning: creating a patch image usually needs root privileges (loop devices, mkfs, mount)", file=sys.stderr)
 	target_mount_point = tempfile.mkdtemp()
 	mount_points.append(target_mount_point)
 	count, _ = _plan_dest_images(init_size, dest_image_size)
-	claimed = []
-	for name in [_split_dest_image_name(output, i) for i in range(count)]:
-		try:
-			os.close(os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600))
-		except FileExistsError:
-			for done in claimed:
-				try:
-					os.unlink(done)
-				except OSError:
-					pass
-			raise RuntimeError(f'Diff image error: output {name} already exists')
-		claimed.append(name)
+	_claim_volume_names(output, count)
 	volume_roots = create_image(output, target_mount_point, loop_devices, [], mount_points, max_workers=max_workers,
 		dest_image_size=dest_image_size, init_size=init_size)
 	build_patch_tree(rows, new_base, volume_roots, meta, max_workers=max_workers, verbose=verbose)
@@ -5711,6 +5728,216 @@ def _identity_command_list(changes, layout, disk_device):
 			commands += fs_commands
 	return commands + gpt_commands, unsupported
 
+
+def _attach_disk(path, read_only, loop_devices):
+	"""Block device for path: itself when it is one, else a loop device over the disk-image file."""
+	path = os.path.abspath(os.path.expanduser(path))
+	if pathlib.Path(path).resolve().is_block_device():
+		return path
+	if not os.path.isfile(path):
+		raise RuntimeError(f'Invalid arguments: {path} is not a block device or a disk image file')
+	loop_device = create_loop_device(path, read_only=read_only)
+	loop_devices.append(loop_device)
+	return loop_device
+
+def _release_mount(mount_point, mount_points):
+	"""Unmount one of this run's temp mounts and remove its directory (clean_up handles anything left)."""
+	path = mount_point.rstrip(os.sep)
+	if os.path.ismount(path):
+		run_command_in_multicmd_with_path_check(['umount', path], strict=False)
+	if not os.path.ismount(path):
+		try:
+			os.rmdir(path)
+		except OSError:
+			pass
+		if path in mount_points:
+			mount_points.remove(path)
+
+def _mount_partition(device, read_only, mount_points, entries):
+	"""Mount point (with a trailing separator) showing exactly device's filesystem, or None.
+
+	A partition that is already mounted is bind-mounted (non-recursively) from its live mount,
+	so filesystems mounted below it stay out of view; otherwise it is mounted directly
+	(read-only with _ro_mount_options). Nothing is recorded in ERRORS: a partition the kernel
+	cannot mount is an expected answer, and the caller decides what it means.
+	"""
+	live, _ = _live_mount(_device_number(device), entries, device)
+	mount_point = tempfile.mkdtemp()
+	mount_points.append(mount_point)
+	error_count = len(ERRORS)
+	if live:
+		run_command_in_multicmd_with_path_check(['mount', '--bind', live, mount_point], quiet=True)
+		if read_only and os.path.ismount(mount_point):
+			# Best effort: generation only reads through this bind mount.
+			run_command_in_multicmd_with_path_check(['mount', '-o', 'remount,bind,ro', mount_point], quiet=True)
+	elif read_only:
+		run_command_in_multicmd_with_path_check(['mount', '-o', _ro_mount_options(device), device, mount_point], quiet=True)
+	else:
+		run_command_in_multicmd_with_path_check(['mount', device, mount_point], quiet=True)
+	del ERRORS[error_count:]
+	if not os.path.ismount(mount_point):
+		_release_mount(mount_point, mount_points)
+		return None
+	return mount_point + os.sep
+
+def _partition_changes(new_root, old_root, mount_points, live_mount, exclude, full_hash, max_workers, parallel_file_listing):
+	"""Change rows of one filesystem partition (root to root, lost+found and this run's mounts left out)."""
+	matched = os.path.abspath(new_root)
+	patterns = _mount_point_excludes(mount_points, (new_root, old_root), matched)
+	if live_mount:
+		# The live filesystem holds the (empty) directories of this run's other temp mount points.
+		live_real = os.path.realpath(live_mount)
+		for mount_point in mount_points:
+			mount_real = os.path.realpath(mount_point)
+			if mount_real.startswith(live_real.rstrip(os.sep) + os.sep):
+				patterns.add(glob.escape(os.path.join(matched, os.path.relpath(mount_real, live_real))))
+	new_map, base_map = build_root_maps(new_root, old_root, frozenset(exclude or ()) | patterns, max_workers, parallel_file_listing)
+	new_map, base_map = _drop_lost_found(new_map), _drop_lost_found(base_map)
+	if any(_is_reserved_key(key) for key in new_map):
+		raise RuntimeError(f'Diff image error: {new_root} contains {DIFF_DIR_NAME}, which hpcp reserves for patch metadata')
+	rows = compute_changes(new_map, base_map, full_hash=full_hash, max_workers=max_workers)
+	_validate_patch_rows(rows)
+	return rows
+
+def _is_identity_change(row, kinds):
+	"""A disk.tsv row whose value the patch would set on a target."""
+	if row.old == row.new:
+		return False
+	if row.kind == 'disk':
+		return row.field == 'guid'
+	if row.field not in _IDENTITY_FIELDS:
+		return False
+	return not (kinds.get(int(row.number)) == 'raw' and row.field in ('fs_uuid', 'fs_label'))
+
+def make_disk_patch_meta(sections, raws, new_name, base_name, full_hash=False):
+	"""Manifest fields for a disk patch; sections = [(number, rows)], raws = [(name, file, old, new, size)]."""
+	meta = make_patch_meta([row for _, rows in sections for row in rows], new_name, base_name, 'disk', full_hash)
+	meta['format_version'] = DIFF_FORMAT_VERSION
+	meta['sections'] = [(f'part{number}', f'part{number}', f'part{number}.changes.tsv') for number, _ in sections]
+	meta['raws'] = list(raws)
+	meta['disk'] = 'disk.tsv'
+	meta['raw_bytes'] = sum(raw[4] for raw in raws)
+	return meta
+
+def write_disk_patch_metadata(volume_roots, sections, disk_rows, meta):
+	"""Write every change list and disk.tsv on every volume first, then each volume's manifest (volume k/n)."""
+	total = len(volume_roots)
+	for volume_root in volume_roots:
+		diff_dir = os.path.join(volume_root, DIFF_DIR_NAME)
+		os.makedirs(diff_dir, exist_ok=True)
+		for number, rows in sections:
+			write_changes(os.path.join(diff_dir, f'part{number}.changes.tsv'), rows)
+		write_disk_tsv(os.path.join(diff_dir, meta['disk']), disk_rows)
+	for index, volume_root in enumerate(volume_roots, start=1):
+		volume_meta = dict(meta)
+		volume_meta['volume'] = f'{index}/{total}'
+		write_manifest(os.path.join(volume_root, DIFF_DIR_NAME, 'manifest'), volume_meta)
+
+def _store_raw(volume_roots, raw_file, device, size, new_sha):
+	"""Copy a raw area (the first size bytes of device) into raw_file on a volume with room."""
+	for volume_root in volume_roots:
+		if shutil.disk_usage(volume_root).free > size + (1 << 20):
+			dest = os.path.join(volume_root, raw_file)
+			os.makedirs(os.path.dirname(dest), exist_ok=True)
+			if _copy_area(device, dest, 0, size) != new_sha:
+				raise RuntimeError(f'Raw area error: {raw_file} changed while it was copied; patch metadata not written')
+			return dest
+	raise RuntimeError(f'Diff image error: no patch volume has room for {raw_file} ({format_bytes(size)}B); use a larger -dis')
+
+def process_get_disk_diff_image(src_paths, dest_paths, output, mount_points, loop_devices, exclude=None,
+		full_hash=False, dest_image_size=0, max_workers=multiprocessing.cpu_count(), parallel_file_listing=False, verbose=False):
+	"""Write a disk patch image that turns a disk laid out like the old disk (-d) into the new disk.
+
+	Both disks are GPT block devices or disk-image files and are only read. Returns the
+	patch path, or None when the disks do not differ (no image is created).
+	"""
+	sources, bases = expand_paths(src_paths or []), expand_paths(dest_paths or [])
+	if len(sources) != 1 or len(bases) != 1:
+		raise RuntimeError(f'Invalid arguments: -dd -diff needs exactly one new disk and one old disk (-d), got {src_paths} and {dest_paths}')
+	new_name, base_name = os.path.basename(sources[0]), os.path.basename(bases[0])
+	if not output or output == 'auto':
+		output = f'DIFF_{new_name}_TO_{base_name}_{int(time.time())}.img'
+	output = os.path.abspath(os.path.expanduser(output))
+	if os.path.lexists(output):
+		raise RuntimeError(f'Diff image error: output {output} already exists')
+	new_disk = _attach_disk(sources[0], True, loop_devices)
+	old_disk = _attach_disk(bases[0], True, loop_devices)
+	new_layout, old_layout = read_disk_layout(new_disk), read_disk_layout(old_disk)
+	problems, _ = compare_disk_layouts(old_layout, new_layout)
+	if problems:
+		raise RuntimeError('Disk layout mismatch: ' + '; '.join(problems) + '; re-clone instead')
+	entries = _mountinfo_entries()
+	kinds, sections, raws = {}, [], []
+	for number in sorted(new_layout['parts']):
+		new_part, old_part = new_layout['parts'][number], old_layout['parts'][number]
+		kind = _default_kind(new_part)
+		if kind == 'fs':
+			new_root = _mount_partition(new_part['device'], True, mount_points, entries)
+			old_root = _mount_partition(old_part['device'], True, mount_points, entries) if new_root else None
+			if new_root and old_root:
+				live, _ = _live_mount(_device_number(new_part['device']), entries, new_part['device'])
+				rows = _partition_changes(new_root, old_root, mount_points, live, exclude, full_hash, max_workers, parallel_file_listing)
+				_release_mount(old_root, mount_points)
+				if rows:
+					# Kept mounted: its payload is copied once the patch image exists.
+					sections.append((number, new_root, rows))
+				else:
+					_release_mount(new_root, mount_points)
+			else:
+				for root in (new_root, old_root):
+					if root:
+						_release_mount(root, mount_points)
+				kind = 'raw'
+		if kind == 'raw':
+			if new_part['size'] != old_part['size']:
+				raise RuntimeError(f"Disk layout mismatch: partition {number} is a raw area and its size changed ({old_part['size']} vs {new_part['size']}); re-clone instead")
+			old_sha, new_sha = _hash_area(old_part['device'], 0, old_part['size']), _hash_area(new_part['device'], 0, new_part['size'])
+			if old_sha != new_sha:
+				raws.append((f'part{number}', new_part['device'], new_part['size'], old_sha, new_sha))
+		kinds[number] = kind
+	old_mbr, new_mbr = _hash_area(old_disk, 0, _MBR_BOOTCODE_SIZE), _hash_area(new_disk, 0, _MBR_BOOTCODE_SIZE)
+	if old_mbr != new_mbr:
+		raws.append(('mbr', new_disk, _MBR_BOOTCODE_SIZE, old_mbr, new_mbr))
+	_, disk_rows = compare_disk_layouts(old_layout, new_layout, kinds)
+	for row in disk_rows:
+		if row.field == 'fs_params' and row.old != row.new:
+			print(f"Warning: partition {row.number} was created with different mkfs parameters ({row.old} -> {row.new}); a patch cannot change them", file=sys.stderr)
+	identity = [row for row in disk_rows if _is_identity_change(row, kinds)]
+	raw_entries = [(name, 'raw/mbr-bootcode.bin' if name == 'mbr' else f'raw/{name}.img', old_sha, new_sha, size)
+		for name, _, size, old_sha, new_sha in raws]
+	section_rows = [(number, rows) for number, _, rows in sections]
+	meta = make_disk_patch_meta(section_rows, raw_entries, new_name, base_name, full_hash)
+	print(f"Disk changes: {len(sections)} filesystem section(s), {len(raws)} raw area(s), {len(identity)} identity value(s); "
+		f"{meta['added']} added, {meta['modified']} modified, {meta['deleted']} deleted")
+	if not sections and not raws and not identity:
+		print(f"No differences between {sources[0]} and {bases[0]}; no patch image created.")
+		return None
+	init_size = (sum(_payload_allocation(rows) for _, rows in section_rows) + sum(_align_up(raw[2]) for raw in raws)
+		+ 64 * 1024 * (len(sections) + 1))
+	count, volume_size = _plan_dest_images(init_size, dest_image_size)
+	largest_raw = max((raw[2] for raw in raws), default=0)
+	# Same usable-space estimate as _plan_dest_images uses for split volumes.
+	if count > 1 and largest_raw > int(volume_size * 0.90) - (16 << 20):
+		needed = _align_up(int((largest_raw + (16 << 20)) / 0.90) + 1)
+		raise RuntimeError(f'Diff image error: a raw area of {format_bytes(largest_raw)}B must fit in one patch volume; use -dis {format_bytes(needed)}B or larger')
+	if os.geteuid() != 0:
+		print("Warning: creating a patch image usually needs root privileges (loop devices, mkfs, mount)", file=sys.stderr)
+	target_mount_point = tempfile.mkdtemp()
+	mount_points.append(target_mount_point)
+	_claim_volume_names(output, count)
+	volume_roots = create_image(output, target_mount_point, loop_devices, [], mount_points, max_workers=max_workers,
+		dest_image_size=dest_image_size, init_size=init_size)
+	for number, new_root, rows in sections:
+		section_roots = [os.path.join(volume_root, f'part{number}') for volume_root in volume_roots]
+		for root in section_roots:
+			os.makedirs(root, exist_ok=True)
+		_build_payload(rows, new_root, section_roots, max_workers, verbose, _payload_bytes(rows))
+	for (name, device, size, old_sha, new_sha), entry in zip(raws, raw_entries):
+		_store_raw(volume_roots, entry[1], device, size, new_sha)
+	write_disk_patch_metadata(volume_roots, section_rows, disk_rows, meta)
+	extra = f" (+{len(volume_roots) - 1} more volume(s))" if len(volume_roots) > 1 else ''
+	print(f"Disk patch image written to {output}{extra}")
+	return output
 
 #%% ---- Remove Extra ----
 def remove_extra_dirs(src_paths, dests,exclude=None):
