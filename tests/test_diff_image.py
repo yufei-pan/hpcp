@@ -1,7 +1,6 @@
 import contextlib
 import hashlib
 import os
-import re
 import shutil
 import stat
 import struct
@@ -2216,29 +2215,135 @@ def test_single_fs_case_only_rename_applies_whatever_the_reported_type(trees, hp
 	assert _changes(hpcp_mod, new, target) == []
 
 
-def _mount_entry(point, fs_type, source='none'):
-	return {'devnum': (0, 1), 'root': '/', 'mount_point': os.path.realpath(str(point)), 'options': ['rw'],
+def _mount_entry(point, fs_type, source='none', ids=None):
+	entry = {'devnum': (0, 1), 'root': '/', 'mount_point': os.path.realpath(str(point)), 'options': ['rw'],
 		'fstype': fs_type, 'source': source}
+	if ids:
+		entry['mount_id'], entry['parent_id'] = ids
+	return entry
 
 
 def test_mount_scopes_follow_mountinfo_order(tmp_path, hpcp_mod):
-	"""The deepest visible mount holding the real path is the target's; of two on one mount point the later is on top,
-	and a later mount on a parent hides earlier ones below it. Mounts below the target come after, deepest last."""
+	"""The deepest visible mount holding the real path is the target's. A mount is hidden only by one made on its
+	place (its mount point or a parent path) that it does not sit on in the parent chain. Mounts below the target
+	come after, deepest last. Entries without ids are never hidden."""
 	scopes = hpcp_mod._mount_scopes
 	esp = tmp_path / 'mnt' / 'esp'
 	esp.mkdir(parents=True)
 	link = tmp_path / 'link'
 	os.symlink(str(esp), str(link))
+	# Without ids: nothing is hidden; of equal depth the later one wins; a link is looked up by its real path.
 	assert scopes(str(link), [_mount_entry('/', 'ext4'), _mount_entry(tmp_path / 'mnt', 'xfs'), _mount_entry(esp, 'vfat')])[0][1] == 'vfat'
 	assert scopes(str(esp), [_mount_entry('/', 'ext4'), _mount_entry(esp, 'ext4'), _mount_entry(esp, 'vfat')])[0][1] == 'vfat'
-	# The xfs on mnt, mounted later, hides the vfat at mnt/esp.
-	assert scopes(str(esp), [_mount_entry('/', 'ext4'), _mount_entry(esp, 'vfat'), _mount_entry(tmp_path / 'mnt', 'xfs')])[0][1] == 'xfs'
+	assert scopes(str(esp), [_mount_entry('/', 'ext4'), _mount_entry(esp, 'vfat'), _mount_entry(tmp_path / 'mnt', 'xfs')])[0][1] == 'vfat'
+	# (b) A true overmount: the xfs on mnt (parent: the root) is made over the vfat on mnt/esp, whose parent is the root too.
+	entries = [_mount_entry('/', 'ext4', ids=(1, 0)), _mount_entry(esp, 'vfat', ids=(2, 1)), _mount_entry(tmp_path / 'mnt', 'xfs', ids=(3, 1))]
+	assert scopes(str(esp), entries)[0][1] == 'xfs'
+	# ... but a vfat made on the xfs (its parent) is visible.
+	entries = [_mount_entry('/', 'ext4', ids=(1, 0)), _mount_entry(tmp_path / 'mnt', 'xfs', ids=(3, 1)), _mount_entry(esp, 'vfat', ids=(2, 3))]
+	assert scopes(str(esp), entries)[0][1] == 'vfat'
+	# (c) Two mounts on one mount point, the second made on the first: the second is on top.
+	entries = [_mount_entry('/', 'ext4', ids=(1, 0)), _mount_entry(esp, 'ext4', ids=(2, 1)), _mount_entry(esp, 'vfat', ids=(3, 2))]
+	assert scopes(str(esp), entries)[0][1] == 'vfat'
+	# (a) initramfs style: mounts made before the root switch are listed before the root they sit on.
+	sys_like = tmp_path / 'sys-like'
+	sys_like.mkdir()
+	entries = [_mount_entry(sys_like, 'sysfs', ids=(20, 35)), _mount_entry(tmp_path / 'run', 'tmpfs', ids=(21, 35)),
+		_mount_entry('/', 'ext4', ids=(35, 1))]
+	assert scopes(str(sys_like), entries)[0][1] == 'sysfs'
+	assert scopes('/', entries)[0][1] == 'ext4'
+	assert [scope[1] for scope in scopes(str(tmp_path), [_mount_entry(tmp_path, 'ext4', ids=(35, 1))] + entries[:1])] == ['ext4', 'sysfs']
 	entries = [_mount_entry(tmp_path, 'ext4', '/dev/sda2'), _mount_entry(tmp_path / 'boot' / 'efi', 'vfat', '/dev/sda1'),
 		_mount_entry(tmp_path / 'boot' / 'efi' / 'deeper', 'exfat'), _mount_entry(tmp_path / 'a' / 'b', 'vfat'),
 		_mount_entry(tmp_path / 'a', 'tmpfs')]
-	assert scopes(str(tmp_path), entries) == [('', 'ext4', '/dev/sda2'), ('a', 'tmpfs', 'none'), ('boot/efi', 'vfat', '/dev/sda1'),
-		('boot/efi/deeper', 'exfat', 'none')]
+	assert scopes(str(tmp_path), entries) == [('', 'ext4', '/dev/sda2'), ('a', 'tmpfs', 'none'), ('a/b', 'vfat', 'none'),
+		('boot/efi', 'vfat', '/dev/sda1'), ('boot/efi/deeper', 'exfat', 'none')]
 	assert scopes(str(tmp_path), []) == [('', '', '')]
+
+
+def test_mountinfo_entries_parse_the_mount_and_parent_ids(tmp_path, hpcp_mod):
+	path = tmp_path / 'mountinfo'
+	path.write_text('35 1 8:2 / / rw,relatime shared:1 - ext4 /dev/sda2 rw\n'
+		'20 35 0:5 / /sys rw,nosuid shared:7 - sysfs sysfs rw\n'
+		'garbage\n')
+	entries = hpcp_mod._mountinfo_entries(str(path))
+	assert [(e['mount_id'], e['parent_id'], e['mount_point'], e['fstype'], e['source'], e['devnum']) for e in entries] == [
+		(35, 1, '/', 'ext4', '/dev/sda2', (8, 2)), (20, 35, '/sys', 'sysfs', 'sysfs', (0, 5))]
+
+
+def test_mount_scopes_classify_fuseblk_by_what_the_device_holds(tmp_path, hpcp_mod, monkeypatch):
+	probed = []
+	def probe(device):
+		probed.append(device)
+		return 'ntfs'
+	monkeypatch.setattr(hpcp_mod, '_probe_fs_type', probe)
+	new, base = tmp_path / 'new', tmp_path / 'base'
+	new.mkdir()
+	base.mkdir()
+	entries = [_mount_entry('/', 'ext4'), _mount_entry(new, 'fuseblk', '/dev/fakeX')]
+	assert hpcp_mod._mount_scopes(str(new), entries)[0][1] == 'ntfs'
+	assert hpcp_mod._compare_metadata((str(new), str(base)), entries) is False
+	entries = [_mount_entry('/', 'ext4'), _mount_entry(new, 'fuseblk.exfat', '/dev/fakeX')]
+	assert hpcp_mod._mount_scopes(str(new), entries)[0][1] == 'ntfs'
+	probed.clear()
+	assert hpcp_mod._mount_scopes(str(new), [_mount_entry(new, 'fuseblk', 'none')])[0][1] == 'fuseblk'
+	assert probed == []
+
+
+def test_apply_stops_after_a_scope_that_failed(trees, hpcp_mod, tmp_path, reset_hpcp_globals, monkeypatch):
+	new, base = trees
+	_write(new / 'etc' / 'conf', 'new conf')
+	_write(base / 'etc' / 'conf', 'old conf')
+	_write(new / 'boot' / 'efi' / 'grub.cfg', 'new cfg')
+	_write(base / 'boot' / 'efi' / 'grub.cfg', 'old cfg')
+	vol = tmp_path / 'vol'
+	_patch_from(hpcp_mod, new, base, [vol])
+	target = tmp_path / 'target'
+	_clone(base, target)
+	_fake_mounts(hpcp_mod, monkeypatch, (target, 'ext4'), (target / 'boot' / 'efi', 'vfat'))
+	applied = []
+	real_apply_section = hpcp_mod._apply_section
+	def apply_section(plan, *args):
+		applied.append(plan.name)
+		summary = real_apply_section(plan, *args)
+		if plan.name == 'root':
+			summary['failed'] = 1
+		return summary
+	monkeypatch.setattr(hpcp_mod, '_apply_section', apply_section)
+	summary = hpcp_mod.apply_patch_tree([str(vol)], str(target), max_workers=1)
+	assert applied == ['root'] and summary['failed'] == 1
+	assert (target / 'boot' / 'efi' / 'grub.cfg').read_text() == 'old cfg'
+	assert any(error.startswith('Patch verify error: stopping: scope root failed') for error in hpcp_mod.ERRORS)
+
+
+@pytest.mark.parametrize('new_type, base_type, rows', [('vfat', 'ext4', 0), ('ext4', 'exfat', 0), ('ext4', 'ext4', 1)])
+def test_process_get_diff_image_compares_content_only_when_a_side_is_fat(trees, hpcp_mod, tmp_path, reset_hpcp_globals,
+		monkeypatch, capsys, new_type, base_type, rows):
+	"""Two trees that differ only in a file's mode: no rows when either side is FAT / exFAT, an M row otherwise."""
+	new, base = trees
+	_write(new / 'f', 'same')
+	_write(base / 'f', 'same')
+	os.chmod(str(new / 'f'), 0o755)
+	os.chmod(str(base / 'f'), 0o644)
+	_fake_mounts(hpcp_mod, monkeypatch, (new, new_type), (base, base_type))
+	seen = []
+	real_compute = hpcp_mod.compute_changes
+	def compute(*args, **kwargs):
+		seen.append(real_compute(*args, **kwargs))
+		return seen[-1]
+	monkeypatch.setattr(hpcp_mod, 'compute_changes', compute)
+	class Stop(Exception):
+		pass
+	def stop(*args, **kwargs):
+		raise Stop()
+	monkeypatch.setattr(hpcp_mod, 'create_image', stop)
+	monkeypatch.setattr(hpcp_mod, '_plan_dest_images', lambda init_size, dest_image_size=0: (1, 1 << 20))
+	try:
+		result = hpcp_mod.process_get_diff_image([str(new)], None, [str(base)], None, str(tmp_path / 'p.img'), [], [], max_workers=1)
+		assert result is None
+	except Stop:
+		pass
+	assert [len(r) for r in seen] == [rows]
 
 
 def test_rows_by_scope_uses_the_deepest_mount(hpcp_mod):
@@ -2275,7 +2380,7 @@ def test_rows_under_a_content_only_mount_below_the_target_are_content_only(trees
 	monkeypatch.setattr(hpcp_mod, '_plan_section', plan_section)
 	summary = hpcp_mod.apply_patch_tree([str(vol)], str(target), max_workers=1)
 	assert (summary['modified'], summary['forced'], summary['failed']) == (2, 0, 0)
-	assert [(plan.name, plan.metadata, plan.case_insensitive) for plan in planned] == [('root', True, False), ('boot/efi', False, True)]
+	assert [(plan.name, plan.metadata, plan.case_insensitive) for plan in planned] == [('root', True, False), ('boot/efi/', False, True)]
 	assert (target / 'boot' / 'efi' / 'EFI' / 'grub.cfg').read_text() == 'new cfg'
 	assert (target / 'etc' / 'conf').read_text() == 'new conf'
 

@@ -5337,15 +5337,23 @@ def apply_patch_tree(volume_roots, target_root, force=False, max_workers=1, verb
 	scopes = _mount_scopes(target_root, _mountinfo_entries())
 	grouped = _rows_by_scope(rows, scopes)
 	with _patch_hash_settings(meta) as (compare_hash, full_hash):
-		plans = [_plan_section(prefix or 'root', grouped.get(prefix, []), volume_roots, target_root, compare_hash, full_hash,
+		plans = [_plan_section(prefix + '/' if prefix else 'root', grouped.get(prefix, []), volume_roots, target_root, compare_hash, full_hash,
 				max_workers, _has_posix_metadata(fs_type), _has_case_insensitive_names(fs_type, source))
 			for prefix, fs_type, source in scopes if not prefix or prefix in grouped]
 		for plan in plans:
 			_preflight_section(plan)
 		_resolve_section_conflicts(plans, force)
-		summaries = [_apply_section(plan, max_workers, verbose, full_hash, compare_hash) for plan in plans]
+		summaries, stopped = [], None
+		for plan in plans:
+			summaries.append(_apply_section(plan, max_workers, verbose, full_hash, compare_hash))
+			if summaries[-1]['failed']:
+				stopped = plan.name
+				break
 	summary = {key: sum(part[key] for part in summaries) for key in summaries[0]}
 	print('Patch summary: ' + ', '.join(f'{key} {value}' for key, value in summary.items()))
+	if stopped is not None and len(summaries) < len(plans):
+		eprint(f'Patch verify error: stopping: scope {stopped} failed; the filesystems mounted below were not patched; '
+			'fix the cause and re-run')
 	return summary
 
 def _probe_fs_type(device):
@@ -5887,6 +5895,7 @@ def _mountinfo_entries(mountinfo_path='/proc/self/mountinfo'):
 				separator = fields.index('-')
 				major, _, minor = fields[2].partition(':')
 				entries.append({
+					'mount_id': int(fields[0]), 'parent_id': int(fields[1]),
 					'devnum': (int(major), int(minor)), 'root': _unescape_mount(fields[3]),
 					'mount_point': _unescape_mount(fields[4]), 'options': fields[5].split(','),
 					'fstype': fields[separator + 1] if len(fields) > separator + 1 else '',
@@ -5927,28 +5936,60 @@ def _is_mount_point(path):
 	real = os.path.realpath(path)
 	return any(entry['mount_point'] == real for entry in _mountinfo_entries())
 
+def _hidden_mounts(entries):
+	"""Indexes (into entries) of the mounts another mount covers: M1 is covered by an M2 whose mount point is M1's or
+	one of its parent paths and that is not an ancestor of M1 in mountinfo's parent chain (a mount made on top of
+	M1's place, not one M1 sits on: initramfs-time mounts are listed before the root they end up on). An entry
+	without ids (a test double) is never hidden and hides nothing."""
+	by_id = {entry['mount_id']: entry for entry in entries if 'mount_id' in entry}
+	by_point = {}
+	for index, entry in enumerate(entries):
+		if 'mount_id' in entry:
+			by_point.setdefault(entry['mount_point'].rstrip(os.sep) or os.sep, []).append(index)
+	hidden = set()
+	for index, entry in enumerate(entries):
+		if 'mount_id' not in entry:
+			continue
+		ancestors, current = set(), entry
+		while current is not None and current['parent_id'] not in ancestors:
+			ancestors.add(current['parent_id'])
+			current = by_id.get(current['parent_id'])
+		point = entry['mount_point'].rstrip(os.sep) or os.sep
+		while True:
+			if any(other != index and entries[other]['mount_id'] not in ancestors for other in by_point.get(point, ())):
+				hidden.add(index)
+				break
+			parent = os.path.dirname(point)
+			if parent == point:
+				break
+			point = parent
+	return hidden
+
 def _mount_scopes(path, entries):
 	"""[(key prefix, fstype, source)] for path: first ('', ...) for the mount holding path's real path, then one per
-	mount below it, deepest last. A mount listed later (in mountinfo order) on the same or a parent mount point hides
-	earlier ones, as on the system; hidden mounts are left out. fstype and source '' when no mount holds path."""
-	visible = []
-	for entry in entries:
-		inside = entry['mount_point'].rstrip(os.sep) + os.sep
-		visible = [other for other in visible if not (other['mount_point'].rstrip(os.sep) + os.sep).startswith(inside)]
-		visible.append(entry)
+	mount below it, deepest last. A mount another one covers (see _hidden_mounts) is left out, as on the system.
+	fstype and source '' when no mount holds path. A fuseblk type (ntfs-3g, exFAT through FUSE) is replaced by
+	what the device holds (_probe_fs_type) when that is known."""
+	hidden = _hidden_mounts(entries)
+	visible = [entry for index, entry in enumerate(entries) if index not in hidden]
 	real = os.path.realpath(path)
 	real_inside = real.rstrip(os.sep) + os.sep
 	holder, depth, below = None, -1, []
 	for entry in visible:
 		inside = entry['mount_point'].rstrip(os.sep) + os.sep
 		if real_inside.startswith(inside):
-			if len(inside) > depth:
+			if len(inside) >= depth:
 				holder, depth = entry, len(inside)
 		elif inside.startswith(real_inside):
 			below.append((os.path.relpath(entry['mount_point'], real), entry['fstype'], entry.get('source', '')))
 	below.sort(key=lambda scope: (scope[0].count('/'), scope[0]))
 	own = ('', holder['fstype'], holder.get('source', '')) if holder else ('', '', '')
-	return [own] + below
+	scopes = []
+	for prefix, fs_type, source in [own] + below:
+		if (fs_type == 'fuseblk' or fs_type.startswith('fuseblk.')) and source.startswith('/dev/'):
+			fs_type = _probe_fs_type(source) or fs_type
+		scopes.append((prefix, fs_type, source))
+	return scopes
 
 def _rows_by_scope(rows, scopes):
 	"""{key prefix: rows}: each row under the deepest scope prefix it lies in ('' for the target's own)."""
