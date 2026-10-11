@@ -5083,7 +5083,12 @@ def _apply_section(plan, max_workers, verbose, full_hash, compare_hash):
 	todo = _section_todo(plan)
 	_apply_rows(todo, plan.volume_roots, plan.target_root, max_workers, verbose, full_hash,
 		forced_rows=[check.row for check in conflicts], metadata=plan.metadata)
-	failed = _verify_rows(todo, plan.target_root, compare_hash, full_hash, max_workers, plan.metadata)
+	verify = todo
+	if not plan.metadata:
+		# A content-only target (FAT, exFAT, ...) looks names up case-insensitively: an A / M row skipped as
+		# already done can still be lost to a D row on a name that differs only by case, so verify those too.
+		verify = todo + [check.row for check in plan.checks if check.action == 'skip' and check.row.op != 'D']
+	failed = _verify_rows(verify, plan.target_root, compare_hash, full_hash, max_workers, plan.metadata)
 	return {
 		'deleted': sum(1 for row in todo if row.op == 'D'),
 		'added': sum(1 for row in todo if row.op == 'A'),
@@ -5905,10 +5910,81 @@ def _mount_partition(device, read_only, mount_points, entries):
 		return None
 	return mount_point + os.sep
 
+def _case_folded_names(entry_map, label):
+	"""{casefolded name: key} of an entry map (a name is a key without its trailing '/').
+
+	Raises RuntimeError('Diff image error: ...') when two keys differ only by case: a
+	case-insensitive filesystem (FAT, exFAT) cannot hold both, so they cannot be paired.
+	"""
+	names = {}
+	for key in sorted(entry_map, key=lambda key: (_key_depth(key), key)):
+		other = names.setdefault(key.rstrip('/').casefold(), key)
+		if other != key:
+			first, second = sorted((other, key))
+			raise RuntimeError(f'Diff image error: {label} has names that differ only by case ({first}, {second}); '
+				'a case-insensitive filesystem cannot hold both')
+	return names
+
+def _fold_case_keys(new_map, base_map, labels=('new', 'old')):
+	"""base_map re-keyed to new_map's spelling wherever a name (or an ancestor) differs only by case.
+
+	For content-only sections (FAT, exFAT, NTFS, HFS), whose lookups are case-insensitive: a
+	case-only rename then pairs the old and new entry (an M row in the new spelling, or no row),
+	instead of a D + A pair whose A rows the target would skip as present and whose D rows would
+	then delete those very entries. labels name the new and old side for the refusal of names
+	that differ only by case (see _case_folded_names).
+	"""
+	new_names = _case_folded_names(new_map, labels[0])
+	_case_folded_names(base_map, labels[1])
+	respelled = {}
+	for key, path in base_map.items():
+		name = key.rstrip('/')
+		# casefold() works per character and never adds or removes a '/': the components line up.
+		spelled, folded = [], ''
+		for part, folded_part in zip(name.split('/'), name.casefold().split('/')):
+			folded = folded + '/' + folded_part if spelled else folded_part
+			match = new_names.get(folded)
+			spelled = match.rstrip('/').split('/') if match is not None else spelled + [part]
+		respelled['/'.join(spelled) + ('/' if key.endswith('/') else '')] = path
+	return new_map, respelled
+
+def _case_collision(rows):
+	"""(D path, A / M path) of the first pair whose names are equal, or one the other's ancestor, only
+	when compared case-insensitively; None when there is none.
+
+	On a case-insensitive target such a pair deletes what the patch writes (or skips as present).
+	A pair on exactly one name, or exactly nested, is an ordinary type change.
+	"""
+	deleted, written = {}, {}
+	for row in rows:
+		name = row.path.rstrip('/')
+		(deleted if row.op == 'D' else written).setdefault(name.casefold(), []).append((name, row.path))
+	def prefixes(name):
+		parts = name.split('/')
+		return ['/'.join(parts[:depth]) for depth in range(1, len(parts) + 1)]
+	for row in sort_change_rows(rows):
+		if row.op == 'D':
+			continue
+		# A deleted name equal to (or an ancestor of) this written one, only case-insensitively.
+		for prefix in prefixes(row.path.rstrip('/')):
+			for name, path in deleted.get(prefix.casefold(), ()):
+				if name != prefix:
+					return path, row.path
+	for row in sort_change_rows(rows):
+		if row.op != 'D':
+			continue
+		# A written name that is an ancestor of this deleted one, only case-insensitively.
+		for prefix in prefixes(row.path.rstrip('/'))[:-1]:
+			for name, path in written.get(prefix.casefold(), ()):
+				if name != prefix:
+					return row.path, path
+	return None
+
 def _partition_changes(new_root, old_root, mount_points, live_mounts, exclude, full_hash, max_workers, parallel_file_listing,
-		input_files=(), metadata=True):
+		input_files=(), metadata=True, labels=('new', 'old')):
 	"""Change rows of one filesystem partition (root to root; lost+found, this run's mounts and
-	its input disk-image files left out). metadata False: content-only rows (see states_equal)."""
+	its input disk-image files left out). metadata False: content-only rows (see states_equal),
+	with names paired case-insensitively (see _fold_case_keys; labels name the two sides)."""
 	matched = os.path.abspath(new_root)
 	patterns = _mount_point_excludes(mount_points, (new_root, old_root), matched)
 	for live_mount in live_mounts:
@@ -5925,6 +6001,8 @@ def _partition_changes(new_root, old_root, mount_points, live_mounts, exclude, f
 	new_map, base_map = _drop_lost_found(new_map), _drop_lost_found(base_map)
 	if any(_is_reserved_key(key) for key in new_map):
 		raise RuntimeError(f'Diff image error: {new_root} contains {DIFF_DIR_NAME}, which hpcp reserves for patch metadata')
+	if not metadata:
+		new_map, base_map = _fold_case_keys(new_map, base_map, labels)
 	rows = compute_changes(new_map, base_map, full_hash=full_hash, max_workers=max_workers, metadata=metadata)
 	_validate_patch_rows(rows)
 	return rows
@@ -6024,7 +6102,7 @@ def process_get_disk_diff_image(src_paths, dest_paths, output, mount_points, loo
 			if new_root and old_root:
 				lives = [_live_mount(_device_number(part['device']), entries, part['device'])[0] for part in (new_part, old_part)]
 				rows = _partition_changes(new_root, old_root, mount_points, lives, exclude, full_hash, max_workers, parallel_file_listing,
-					input_files, _has_posix_metadata(new_part['fs_type']))
+					input_files, _has_posix_metadata(new_part['fs_type']), (f'part{number} of {sources[0]}', f'part{number} of {bases[0]}'))
 				_release_mount(old_root, mount_points)
 				if rows:
 					# Kept mounted: its payload is copied once the patch image exists.
@@ -6125,6 +6203,12 @@ def apply_disk_patch(volume_roots, target, mount_points, loop_devices, force=Fal
 		raise RuntimeError('Invalid arguments: this is a single-filesystem patch; apply it to a directory or a filesystem image')
 	disk_rows = read_disk_tsv(os.path.join(volume_roots[0], DIFF_DIR_NAME, meta['disk']))
 	fs_types = {row.number: row.old for row in disk_rows if row.kind == 'part' and row.field == 'fs_type'}
+	for name, _, rows in sections:
+		# Patches from older hpcp turned a case-only rename into a D + A pair, which deletes the files on FAT.
+		collision = None if _has_posix_metadata(fs_types.get(name[len('part'):], '')) else _case_collision(rows)
+		if collision:
+			raise RuntimeError(f'Patch format error: section {name} deletes and writes {collision[0]} and {collision[1]} '
+				'differing only by case; regenerate the patch with this hpcp')
 	target = os.path.abspath(os.path.expanduser(target))
 	entries = _mountinfo_entries()
 	if not pathlib.Path(target).resolve().is_block_device():
