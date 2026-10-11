@@ -1611,9 +1611,11 @@ def test_failed_section_stops_before_esp_raw_boot_code_and_identity(tmp_path, hp
 @requires_root_and_disk_tools
 @pytest.mark.root
 @pytest.mark.loop
-def test_failed_raw_write_stops_before_boot_code_and_identity(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch, capsys):
+@pytest.mark.parametrize('failure', ['error', 'silent'])
+def test_failed_raw_write_stops_before_boot_code_and_identity(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch, capsys, failure):
 	"""A raw partition area that cannot be written (the BIOS boot core image) must not be followed by MBR boot
-	code pointing at it, or by identity changes."""
+	code pointing at it, or by identity changes. Nor must one written without an error that does not hold the
+	new content when read back (silent): each raw write is verified before the next step."""
 	old, new, patch = _make_patch(hpcp_mod, tmp_path)
 	target = tmp_path / 'node.img'
 	shutil.copyfile(str(old), str(target))
@@ -1621,19 +1623,23 @@ def test_failed_raw_write_stops_before_boot_code_and_identity(tmp_path, hpcp_mod
 	attempted = []
 	def failing(device, payload, offset, length):
 		attempted.append(device)
-		if device.endswith('p2'):
+		# Partition 2 (/dev/loopNp2), not a whole disk that happens to be /dev/loop2.
+		if re.search(r'\dp2$', device):
+			if failure == 'silent':
+				return None
 			raise OSError(errno.EIO, 'simulated write failure')
 		return real_write_area(device, payload, offset, length)
 	monkeypatch.setattr(hpcp_mod, '_write_area', failing)
 	capsys.readouterr()
 	summary = _apply(hpcp_mod, patch, target)
-	assert len(attempted) == 1 and attempted[0].endswith('p2')
+	assert len(attempted) == 1 and re.search(r'\dp2$', attempted[0])
 	assert summary['failed'] == 1 and summary['raw_written'] == 0 and summary['identity_changed'] == 0
 	assert sorted(summary['sections']) == ['part1', 'part3'] and all(s['failed'] == 0 for s in summary['sections'].values())
 	captured = capsys.readouterr()
 	assert 'Section part3:' in captured.out and 'Disk patch summary:' in captured.out
+	reason = '[Errno 5] simulated write failure' if failure == 'error' else 'does not hold the new content after writing'
 	assert [error for error in hpcp_mod.ERRORS if error.startswith('Raw area error: ')] == [
-		'Raw area error: part2: [Errno 5] simulated write failure',
+		f'Raw area error: part2: {reason}',
 		'Raw area error: stopping: raw area part2 could not be written; later raw areas, the boot code and identity changes '
 		'were not applied; fix the cause and re-run']
 	assert len(hpcp_mod.ERRORS) == 2
@@ -1650,6 +1656,45 @@ def test_failed_raw_write_stops_before_boot_code_and_identity(tmp_path, hpcp_mod
 	again = _apply(hpcp_mod, patch, target)
 	assert again['failed'] == 0 and again['raw_written'] == 2 and again['identity_changed'] == 2 and hpcp_mod.ERRORS == []
 	assert _no_differences(hpcp_mod, tmp_path, new, target)
+
+
+@requires_root_and_disk_tools
+@pytest.mark.root
+@pytest.mark.loop
+def test_boot_code_not_read_back_after_writing_stops_identity_changes(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch, capsys):
+	"""The MBR boot code is read back right after its write too: one that does not hold the new content stops the
+	identity changes, as a failed write does."""
+	old, new, patch = _make_patch(hpcp_mod, tmp_path)
+	target = tmp_path / 'node.img'
+	shutil.copyfile(str(old), str(target))
+	real_write_area = hpcp_mod._write_area
+	attempted = []
+	def dropping_boot_code(device, payload, offset, length):
+		attempted.append(length)
+		if length == hpcp_mod._MBR_BOOTCODE_SIZE:
+			return None
+		return real_write_area(device, payload, offset, length)
+	monkeypatch.setattr(hpcp_mod, '_write_area', dropping_boot_code)
+	capsys.readouterr()
+	summary = _apply(hpcp_mod, patch, target)
+	assert attempted == [1 << 20, hpcp_mod._MBR_BOOTCODE_SIZE]
+	assert summary['failed'] == 1 and summary['raw_written'] == 1 and summary['identity_changed'] == 0
+	assert 'Disk patch summary:' in capsys.readouterr().out
+	assert hpcp_mod.ERRORS == [
+		'Raw area error: mbr: does not hold the new content after writing',
+		'Raw area error: stopping: raw area mbr could not be written; the identity changes were not applied; fix the cause and re-run']
+	with open(str(target), 'rb') as f:
+		assert f.read(14) == b'\xeb\x63OLD-BOOTCODE'
+	with _attached(target, read_only=True) as loop:
+		layout = hpcp_mod.read_disk_layout(loop)
+		assert layout['parts'][1]['name'] == 'ESP' and layout['parts'][3]['fs_label'] == 'root'
+		with open(loop + 'p2', 'rb') as f:
+			assert f.read(8) == b'GRUBCOR2'
+	monkeypatch.setattr(hpcp_mod, '_write_area', real_write_area)
+	hpcp_mod.ERRORS.clear()
+	again = _apply(hpcp_mod, patch, target)
+	assert again['failed'] == 0 and again['raw_written'] == 1 and again['raw_skipped'] == 1 and again['identity_changed'] == 2
+	assert hpcp_mod.ERRORS == [] and _no_differences(hpcp_mod, tmp_path, new, target)
 
 
 @requires_root_and_disk_tools

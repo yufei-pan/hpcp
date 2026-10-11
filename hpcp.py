@@ -6406,7 +6406,8 @@ def apply_disk_patch(volume_roots, target, mount_points, loop_devices, force=Fal
 	applied first (partition order, ESP last), then raw partition areas, the MBR boot code
 	and identity changes; then everything is verified. A section that fails stops the apply
 	there: later sections, raw areas, boot code and identity changes are left for a re-run.
-	So does a raw area that cannot be written: later raw areas, the boot code and identity changes.
+	So does a raw area that cannot be written, or that does not hold the new content when read back
+	right after its write: later raw areas, the boot code and identity changes.
 	Returns {'sections', 'raw_written', 'raw_skipped', 'identity_changed', 'forced', 'failed'}.
 	"""
 	meta, sections, volume_roots = _load_patch(volume_roots, volume_names)
@@ -6508,12 +6509,16 @@ def apply_disk_patch(volume_roots, target, mount_points, loop_devices, force=Fal
 	raw_stopped = None
 	# Partition areas first, the MBR boot code last. A write that fails stops the rest and the identity
 	# changes: boot code pointing at a core image that is not there would leave the node unbootable.
+	# So does one that raised no error but does not hold the new content when read back.
 	for entry in sorted(pending, key=lambda entry: entry['name'] == 'mbr'):
 		attempted.append(entry)
 		try:
 			_write_area(entry['device'], entry['payload'], 0, entry['size'])
+			if _hash_area(entry['device'], 0, entry['size']) != entry['new']:
+				entry['error'] = 'does not hold the new content after writing'
 		except OSError as e:
 			entry['error'] = str(e)
+		if entry.get('error'):
 			raw_stopped = entry['name']
 			break
 	if stopped is None:
