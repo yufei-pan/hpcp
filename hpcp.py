@@ -1668,7 +1668,10 @@ def get_partition_details(device, partition,sector_size=512):
 	# 		return rtnDic
 	# Get the fs type and uuid, use blkid
 	target_partition, loop_device = get_target_partition(device, partition)
-	result = run_command_in_multicmd_with_path_check(["blkid", '-o', 'export', target_partition])
+	# blkid exits 2 on a partition without a filesystem (BIOS boot, raw data): an answer, not an error.
+	error_count = len(ERRORS)
+	result = run_command_in_multicmd_with_path_check(["blkid", '-o', 'export', target_partition], quiet=True)
+	del ERRORS[error_count:]
 	for line in result:
 		if 'TYPE' in line.upper():
 			rtnDic['fs_type'] = line.split('=')[1].strip()
@@ -5202,6 +5205,133 @@ def _validate_diff_args(get_diff_image, load_diff_image, force_apply, src_path, 
 	if bases != 1:
 		raise RuntimeError(f'Invalid arguments: -diff needs exactly one base (-d DIR or -di IMG), got {bases}')
 	return get_diff_image, src_path
+
+#%% ---- Disk Patch ----
+_ESP_TYPE_GUID = 'C12A7328-F81F-11D2-BA4B-00A0C93EC93B'
+
+def _partition_devices(disk, sys_block_path='/sys/class/block'):
+	"""{partition number: device path} for disk, using the kernel's partition number, not the name suffix."""
+	result = {}
+	for path in get_partitions(disk):
+		name = os.path.basename(path)
+		try:
+			with open(os.path.join(sys_block_path, name, 'partition')) as f:
+				result[int(f.read().strip())] = path
+		except (OSError, ValueError):
+			continue
+	return result
+
+def _fs_params_text(params):
+	"""Stable text form of probe_fs_params() output for disk.tsv."""
+	return ';'.join(f'{key}={(params or {})[key]}' for key in sorted(params or {}))
+
+def _probe_identity(device):
+	"""(fs_type, fs_uuid, fs_label) of device from a low-level `blkid -p` probe ('' when nothing is found).
+
+	No blkid cache, so a label or UUID this run just changed reads back as it is on disk; exact
+	keys, so UUID_SUB (btrfs) and LABEL_FATBOOT (FAT) never stand in for UUID and LABEL.
+	"""
+	error_count = len(ERRORS)
+	try:
+		output = run_command_in_multicmd_with_path_check(['blkid', '-p', '-o', 'export', device], quiet=True)
+	finally:
+		# blkid exits 2 when it finds nothing (BIOS boot and other raw partitions).
+		del ERRORS[error_count:]
+	values = {}
+	for line in output:
+		key, sep, value = line.strip().partition('=')
+		if sep:
+			# -o export escapes shell-unsafe characters (a space in a label) with a backslash.
+			values[key] = re.sub(r'\\(.)', r'\1', value)
+	return values.get('TYPE', ''), values.get('UUID', ''), values.get('LABEL', '')
+
+def read_disk_layout(device):
+	"""Fresh GPT + filesystem identity read of block device.
+
+	Returns {'disk': {'guid', 'sector_size', 'size'}, 'parts': {number: {'type_guid',
+	'unique_guid', 'name', 'attrs', 'size', 'fs_type', 'fs_uuid', 'fs_label', 'fs_params',
+	'device'}}}. The partition caches are cleared first: loop device names are reused.
+	Filesystem type, UUID and label come from _probe_identity, not the cached blkid read.
+	"""
+	get_partition_infos.cache_clear()
+	get_partition_details.cache_clear()
+	infos = get_partition_infos(device)
+	devices = _partition_devices(device)
+	disk, parts = {}, {}
+	for key, info in infos.items():
+		if 'disk_identifier' in info:
+			disk = {'guid': info['disk_identifier'], 'sector_size': info['sector_size'], 'size': info['size']}
+			continue
+		number = int(key)
+		if number not in devices:
+			raise RuntimeError(f'Disk layout mismatch: the kernel shows no device for partition {number} of {device}; re-read its partition table (partprobe) first')
+		fs_type, fs_uuid, fs_label = _probe_identity(devices[number])
+		parts[number] = {
+			'type_guid': info['partition_guid_code'], 'unique_guid': info['unique_partition_guid'],
+			'name': info['partition_name'], 'attrs': info['partition_attrs'], 'size': info['size'],
+			'fs_type': fs_type, 'fs_uuid': fs_uuid, 'fs_label': fs_label,
+			'fs_params': _fs_params_text(info.get('fs_params')), 'device': devices[number],
+		}
+	return {'disk': disk, 'parts': parts}
+
+def _default_kind(part):
+	"""'swap' for swap, 'fs' when blkid found a filesystem, else 'raw' (generation may downgrade fs to raw)."""
+	if part['fs_type'] == 'swap':
+		return 'swap'
+	return 'fs' if part['fs_type'] else 'raw'
+
+def compare_disk_layouts(old, new, kinds=None):
+	"""(problems, rows): why a patch from old to new is impossible, and the disk.tsv rows.
+
+	Partition numbers, type GUIDs, filesystem types and the sector size must match; a raw
+	area must keep its size. kinds maps partition number -> 'fs' / 'swap' / 'raw'
+	(default: _default_kind of the new partition).
+	"""
+	problems = []
+	kinds = kinds or {}
+	if old['disk'].get('sector_size') != new['disk'].get('sector_size'):
+		problems.append(f"sector size {old['disk'].get('sector_size')} vs {new['disk'].get('sector_size')}")
+	if sorted(old['parts']) != sorted(new['parts']):
+		problems.append(f"partition numbers {sorted(old['parts'])} vs {sorted(new['parts'])}")
+		return problems, []
+	rows = [DiskRow('disk', '-', 'guid', str(old['disk'].get('guid', '')), str(new['disk'].get('guid', ''))),
+		DiskRow('disk', '-', 'sector_size', str(old['disk'].get('sector_size', '')), str(new['disk'].get('sector_size', '')))]
+	for number in sorted(new['parts']):
+		old_part, new_part = old['parts'][number], new['parts'][number]
+		kind = kinds.get(number) or _default_kind(new_part)
+		for field in ('type_guid', 'fs_type'):
+			if old_part[field] != new_part[field]:
+				problems.append(f'partition {number} {field} {old_part[field]!r} vs {new_part[field]!r}')
+		if kind == 'raw' and old_part['size'] != new_part['size']:
+			problems.append(f"partition {number} is a raw area and its size changed ({old_part['size']} vs {new_part['size']})")
+		rows.append(DiskRow('part', str(number), 'kind', kind, kind))
+		for field in _PART_FIELDS[1:]:
+			rows.append(DiskRow('part', str(number), field, str(old_part[field]), str(new_part[field])))
+	return problems, rows
+
+def match_target_layout(disk_rows, target):
+	"""Why target cannot take a patch with these disk.tsv rows (empty when it matches its base)."""
+	problems = []
+	parts = {}
+	for row in disk_rows:
+		if row.kind == 'disk' and row.field == 'sector_size' and str(target['disk'].get('sector_size')) != row.old:
+			problems.append(f"sector size {target['disk'].get('sector_size')}, patch expects {row.old}")
+		elif row.kind == 'part':
+			parts.setdefault(int(row.number), {})[row.field] = row
+	if sorted(parts) != sorted(target['parts']):
+		problems.append(f"partition numbers {sorted(target['parts'])}, patch expects {sorted(parts)}")
+		return problems
+	for number, fields in sorted(parts.items()):
+		missing = [field for field in _PART_FIELDS if field not in fields]
+		if missing:
+			raise RuntimeError(f"Patch format error: the disk table lacks {', '.join(missing)} for partition {number}")
+		part = target['parts'][number]
+		for field in ('type_guid', 'fs_type'):
+			if str(part[field]) != fields[field].old:
+				problems.append(f'partition {number} {field} is {part[field]!r}, patch expects {fields[field].old!r}')
+		if fields['kind'].old == 'raw' and str(part['size']) != fields['size'].old:
+			problems.append(f"partition {number} is a raw area of size {part['size']}, patch expects {fields['size'].old}")
+	return problems
 
 #%% ---- Remove Extra ----
 def remove_extra_dirs(src_paths, dests,exclude=None):
