@@ -50,6 +50,7 @@ _DISK_HEAD = 'format\thpcp-diff\nformat_version\t2\nlayout\tdisk\ndisk\tdisk.tsv
 	f'raw\tpart0\traw/x.img\t{_A}\t{_B}\t1',
 	f'raw\tpart2\traw/x.img\tzz\t{_B}\t1',
 	f'raw\tpart2\traw/x.img\t{_A}\t{_B}\t-1',
+	f'raw\tpart2\traw/x.img\t{_A}\t{_B}\t\u00b2',
 	'section\tpart1\tother\tpart1.changes.tsv',
 	'section\tpart1\tpart1\tchanges.tsv',
 	'section\troot\t.\tchanges.tsv',
@@ -103,10 +104,15 @@ def test_disk_tsv_round_trip(tmp_path, hpcp_mod):
 	'disk\t-\tname\ta\tb\n',
 	'part\t1\tname\ta\n',
 	'part\t1\tname\ta\\q\tb\n',
+	'part\t\u00b2\tname\ta\tb\n',
+	'part\t\u0663\tname\ta\tb\n',
 ])
 def test_disk_tsv_rejects_bad_rows(tmp_path, hpcp_mod, body):
 	path = tmp_path / 'disk.tsv'
 	path.write_text('#hpcp-disk\t1\n' + body)
+	with pytest.raises(RuntimeError, match='Patch format error'):
+		hpcp_mod.read_disk_tsv(str(path))
+	path.write_text('#hpcp-disk\t\u00b2\n')
 	with pytest.raises(RuntimeError, match='Patch format error'):
 		hpcp_mod.read_disk_tsv(str(path))
 	path.write_text('#hpcp-disk\t2\n')

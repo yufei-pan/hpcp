@@ -3971,6 +3971,8 @@ def read_changes(source):
 
 _SECTION_NAME_RE = re.compile(r'part[1-9][0-9]*')
 _SHA256_RE = re.compile(r'[0-9a-f]{64}')
+_PART_NUMBER_RE = re.compile(r'[1-9][0-9]*')
+_ASCII_DIGITS_RE = re.compile(r'[0-9]+')
 
 def write_manifest(target, meta):
 	"""Write meta as key/value TSV.
@@ -3997,7 +3999,7 @@ def _check_raw_entry(fields):
 		raise ValueError(f'bad raw payload file {raw_file!r}')
 	if not (_SHA256_RE.fullmatch(old_sha) and _SHA256_RE.fullmatch(new_sha)):
 		raise ValueError('bad raw area hash')
-	if not size.isdigit():
+	if not _ASCII_DIGITS_RE.fullmatch(size):
 		raise ValueError(f'bad raw area size {size!r}')
 	return (name, raw_file, old_sha, new_sha, int(size))
 
@@ -4088,7 +4090,7 @@ def read_disk_tsv(source):
 	rows = []
 	with open(source, 'r', encoding='utf-8', errors='surrogateescape', newline='\n') as f:
 		header = f.readline().rstrip('\n').split('\t')
-		if len(header) != 2 or header[0] != DISK_HEADER or not header[1].isdigit():
+		if len(header) != 2 or header[0] != DISK_HEADER or not _ASCII_DIGITS_RE.fullmatch(header[1]):
 			raise RuntimeError(f'Patch format error: {source} is not an hpcp disk table')
 		if int(header[1]) > DISK_VERSION:
 			raise RuntimeError(f'Patch format error: {source} has disk table version {header[1]}, newer than supported {DISK_VERSION}')
@@ -4104,7 +4106,7 @@ def read_disk_tsv(source):
 				raise RuntimeError(f'Patch format error: {source} line {line_number} is malformed')
 			kind, number, field = fields[:3]
 			ok = ((kind == 'disk' and number == '-' and field in _DISK_FIELDS) or
-				(kind == 'part' and number.isdigit() and int(number) > 0 and field in _PART_FIELDS))
+				(kind == 'part' and _PART_NUMBER_RE.fullmatch(number) and field in _PART_FIELDS))
 			if not ok:
 				raise RuntimeError(f'Patch format error: {source} line {line_number} has an unknown row {kind} {number} {field}')
 			rows.append(DiskRow(*fields))
