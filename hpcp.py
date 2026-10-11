@@ -2,7 +2,6 @@
 # /// script
 # requires-python = ">=3.6"
 # dependencies = [
-#     "argparse",
 #     "xxhash",
 #     "multiCMD>1.19",
 # ]
