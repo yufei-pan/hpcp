@@ -6113,7 +6113,8 @@ def apply_disk_patch(volume_roots, target, mount_points, loop_devices, force=Fal
 	Everything is checked before anything changes: the layout, which partitions are in use,
 	every section's paths, the raw areas and the identity values. Filesystem sections are
 	applied first (partition order, ESP last), then raw partition areas, the MBR boot code
-	and identity changes; then everything is verified.
+	and identity changes; then everything is verified. A section that fails stops the apply
+	there: later sections, raw areas, boot code and identity changes are left for a re-run.
 	Returns {'sections', 'raw_written', 'raw_skipped', 'identity_changed', 'forced', 'failed'}.
 	"""
 	meta, sections, volume_roots = _load_patch(volume_roots, volume_names)
@@ -6182,24 +6183,31 @@ def apply_disk_patch(volume_roots, target, mount_points, loop_devices, force=Fal
 		for plan in plans:
 			_preflight_section(plan)
 		summaries = {}
+		stopped = None
 		order = sorted(plans, key=lambda plan: (layout['parts'][int(plan.name[len('part'):])]['type_guid'].upper() == _ESP_TYPE_GUID,
 			int(plan.name[len('part'):])))
 		for plan in order:
-			summaries[plan.name] = _apply_section(plan, max_workers, verbose, full_hash, compare_hash)
+			# A failed section (ENOSPC on the root, say) stops everything after it: the ESP, raw areas,
+			# boot code and identity changes could otherwise leave the node unbootable.
+			if stopped is None:
+				summaries[plan.name] = _apply_section(plan, max_workers, verbose, full_hash, compare_hash)
+				if summaries[plan.name]['failed']:
+					stopped = plan.name
 			_release_mount(plan.target_root, mount_points)
 	failed = sum(summary['failed'] for summary in summaries.values())
-	pending = [entry for entry in raw_plan if entry['action'] != 'skip']
+	pending = [entry for entry in raw_plan if entry['action'] != 'skip'] if stopped is None else []
 	# Partition areas first, the MBR boot code last.
 	for entry in sorted(pending, key=lambda entry: entry['name'] == 'mbr'):
 		try:
 			_write_area(entry['device'], entry['payload'], 0, entry['size'])
 		except OSError as e:
 			entry['error'] = str(e)
-	# udev re-reads the partition table after the disk device was closed from writing (MBR write, sgdisk).
-	_settle_partitions(disk, sorted(layout['parts']))
-	for command in commands:
-		run_command_in_multicmd_with_path_check(command, strict=False)
-	_settle_partitions(disk, sorted(layout['parts']))
+	if stopped is None:
+		# udev re-reads the partition table after the disk device was closed from writing (MBR write, sgdisk).
+		_settle_partitions(disk, sorted(layout['parts']))
+		for command in commands:
+			run_command_in_multicmd_with_path_check(command, strict=False)
+		_settle_partitions(disk, sorted(layout['parts']))
 	# Verify after the identity commands: sgdisk rewriting the GPT must not have undone a raw write.
 	written = 0
 	for entry in pending:
@@ -6215,7 +6223,7 @@ def apply_disk_patch(volume_roots, target, mount_points, loop_devices, force=Fal
 		failed += 1
 		eprint(f"Raw area error: {entry['name']}: {reason}")
 	changed = 0
-	applied = [change for change in changes if (change.number, change.field) not in skipped_identity]
+	applied = [change for change in changes if (change.number, change.field) not in skipped_identity] if stopped is None else []
 	if applied:
 		after = read_disk_layout(disk)
 		for change in applied:
@@ -6235,12 +6243,16 @@ def apply_disk_patch(volume_roots, target, mount_points, loop_devices, force=Fal
 		'raw_written': written,
 		'raw_skipped': sum(1 for entry in raw_plan if entry['action'] == 'skip'),
 		'identity_changed': changed,
-		'forced': sum(summary['forced'] for summary in summaries.values()) + len(raw_conflicts),
+		'forced': sum(summary['forced'] for summary in summaries.values()) + (len(raw_conflicts) if stopped is None else 0),
 		'failed': failed,
 	}
 	print(f"Disk patch summary: {len(summaries)} section(s), added {sum(item['added'] for item in summaries.values())}, "
 		f"modified {sum(item['modified'] for item in summaries.values())}, deleted {sum(item['deleted'] for item in summaries.values())}, raw written {written}, raw skipped {summary['raw_skipped']}, "
 		f"identity changed {changed}, forced {summary['forced']}, failed {failed}")
+	if stopped is not None:
+		# Same category as the section's own failures (_verify_rows); a re-run skips what is done.
+		eprint(f'Patch verify error: stopping: section {stopped} failed; later sections, raw areas, boot code and identity changes '
+			f'were not applied; fix the cause and re-run')
 	return summary
 
 #%% ---- Remove Extra ----

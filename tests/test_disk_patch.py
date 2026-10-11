@@ -1120,6 +1120,51 @@ def test_offline_patch_applies_to_an_esp_live_mounted_with_umask(tmp_path, hpcp_
 @requires_root_and_disk_tools
 @pytest.mark.root
 @pytest.mark.loop
+def test_failed_section_stops_before_esp_raw_boot_code_and_identity(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch, capsys):
+	"""A root section that fails (ENOSPC, say) must not be followed by the ESP, raw areas, boot code or identity changes."""
+	old, new, patch = _make_patch(hpcp_mod, tmp_path)
+	target = tmp_path / 'node.img'
+	shutil.copyfile(str(old), str(target))
+	real_apply_section = hpcp_mod._apply_section
+	applied = []
+	def failing(plan, *args):
+		applied.append(plan.name)
+		if plan.name == 'part3':
+			hpcp_mod.eprint('Patch verify error: M etc/os-release: simulated failure')
+			return {'deleted': 0, 'added': 0, 'modified': 1, 'skipped': 0, 'forced': 0, 'failed': 1}
+		return real_apply_section(plan, *args)
+	monkeypatch.setattr(hpcp_mod, '_apply_section', failing)
+	capsys.readouterr()
+	summary = _apply(hpcp_mod, patch, target)
+	assert applied == ['part3']
+	assert summary['failed'] == 1 and summary['raw_written'] == 0 and summary['identity_changed'] == 0
+	assert list(summary['sections']) == ['part3']
+	captured = capsys.readouterr()
+	assert 'Section part3:' in captured.out and 'Section part1:' not in captured.out and 'Disk patch summary:' in captured.out
+	stop = [error for error in hpcp_mod.ERRORS if 'section part3 failed' in error]
+	assert len(stop) == 1 and stop[0].startswith('Patch verify error: ') and stop[0] in captured.err
+	assert 'later sections, raw areas, boot code and identity changes were not applied' in stop[0]
+	with open(str(target), 'rb') as f:
+		assert f.read(14) == b'\xeb\x63OLD-BOOTCODE'
+	with _attached(target, read_only=True) as loop:
+		layout = hpcp_mod.read_disk_layout(loop)
+		assert layout['parts'][1]['name'] == 'ESP' and layout['parts'][3]['fs_label'] == 'root'
+		with open(loop + 'p2', 'rb') as f:
+			assert f.read(8) == b'GRUBCORE'
+		with _mounted(loop + 'p1', options='ro') as esp:
+			with open(os.path.join(esp, 'EFI', 'BOOT', 'grubx64.efi'), 'rb') as f:
+				assert f.read() == b'old-efi'
+	# Once the cause is fixed, a re-run completes the patch.
+	monkeypatch.setattr(hpcp_mod, '_apply_section', real_apply_section)
+	hpcp_mod.ERRORS.clear()
+	again = _apply(hpcp_mod, patch, target)
+	assert again['failed'] == 0 and again['raw_written'] == 2 and again['identity_changed'] == 2 and hpcp_mod.ERRORS == []
+	assert _no_differences(hpcp_mod, tmp_path, new, target)
+
+
+@requires_root_and_disk_tools
+@pytest.mark.root
+@pytest.mark.loop
 def test_disk_apply_refuses_a_different_layout(tmp_path, hpcp_mod, reset_hpcp_globals):
 	old, new, patch = _make_patch(hpcp_mod, tmp_path)
 	target = tmp_path / 'node.img'
