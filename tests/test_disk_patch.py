@@ -1019,6 +1019,25 @@ def test_content_only_verify_covers_rows_skipped_as_done(tmp_path, hpcp_mod, res
 			assert len(hpcp_mod.ERRORS) == 1 and hpcp_mod.ERRORS[0].startswith('Patch verify error: A EFI/keep.efi: expected f:')
 
 
+def test_section_preflight_refuses_a_delete_and_a_write_of_one_entry(tmp_path, hpcp_mod, reset_hpcp_globals):
+	"""Disk sections run the same pre-flight as single-filesystem patches: a section that deletes x/f and writes y/f,
+	where y is a symlink to x on the target, is refused before any section is applied, whatever its filesystem."""
+	hpcp_mod.HASH_SIZE = 65536
+	target, volume = tmp_path / 'target', tmp_path / 'vol'
+	_write(target / 'x' / 'f', 'moved')
+	os.symlink('x', str(target / 'y'))
+	_write(volume / 'y' / 'f', 'moved')
+	state = hpcp_mod.get_entry_state
+	R = hpcp_mod.ChangeRow
+	rows = [R('D', 'x/f', state(str(target / 'x' / 'f')), '-'), R('A', 'y/f', '-', state(str(volume / 'y' / 'f')))]
+	for metadata in (True, False):
+		plan = hpcp_mod._plan_section('part1', rows, [str(volume)], str(target), True, False, 1, metadata=metadata)
+		assert {check.row.path: check.action for check in plan.checks} == {'x/f': 'apply', 'y/f': 'skip'}
+		with pytest.raises(RuntimeError, match=r"^Patch conflict: 'x/f' \(deleted\) and 'y/f' \(written\) are the same entry "):
+			hpcp_mod._preflight_section(plan)
+	assert (target / 'x' / 'f').read_text() == 'moved'
+
+
 def test_sections_share_one_conflict_prompt(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch, capsys):
 	sections = _two_sections(hpcp_mod, tmp_path)
 	plans = [hpcp_mod._plan_section(name, rows, roots, target, True, False, 1) for name, rows, roots, target, _ in sections]

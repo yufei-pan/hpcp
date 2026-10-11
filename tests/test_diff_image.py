@@ -1419,6 +1419,106 @@ def test_single_fs_apply_on_case_insensitive_target_verifies_rows_skipped_as_don
 		assert summary['failed'] == 0 and hpcp_mod.ERRORS == []
 
 
+def _same_entry_conflict(deleted, written):
+	return (rf'^Patch conflict: {re.escape(repr(deleted))} \(deleted\) and {re.escape(repr(written))} \(written\) are the same '
+		r'entry on the target - a case-insensitive or aliased filesystem; applying would delete what it writes; nothing applied$')
+
+
+def _moved_file(new, base):
+	"""new moves base's x/f to y/f (both directories exist on both sides): a D x/f + A y/f pair."""
+	(new / 'x').mkdir()
+	_write(new / 'y' / 'f', 'moved')
+	_write(base / 'x' / 'f', 'moved')
+	(base / 'y').mkdir()
+
+
+@pytest.mark.parametrize('case', ['plain', 'forced', 'hard_linked'])
+def test_apply_refuses_to_delete_and_write_one_entry_reached_through_an_alias(trees, hpcp_mod, tmp_path, case):
+	"""On a target where y is a symlink to x, y/f is x/f: the A row is skipped as already done and the D row
+	deletes it, and the apply reports success. Whatever the filesystem type, refused before anything changes, even
+	with -fa, also when the file has another hard link. Where y is a real directory the patch applies as before."""
+	new, base = trees
+	_moved_file(new, base)
+	vol = tmp_path / 'vol'
+	rows, _ = _patch_from(hpcp_mod, new, base, [vol])
+	assert _ops(rows) == {('D', 'x/f'), ('A', 'y/f')}
+	target = tmp_path / 'target'
+	_clone(base, target)
+	(target / 'y').rmdir()
+	os.symlink('x', str(target / 'y'))
+	if case == 'hard_linked':
+		os.link(str(target / 'x' / 'f'), str(target / 'x' / 'g'))
+	before = _snapshot(target)
+	with pytest.raises(RuntimeError, match=_same_entry_conflict('x/f', 'y/f')):
+		hpcp_mod.apply_patch_tree([str(vol)], str(target), force=case == 'forced', max_workers=1)
+	assert _snapshot(target) == before and (target / 'x' / 'f').read_text() == 'moved'
+	plain = tmp_path / 'plain'
+	_clone(base, plain)
+	summary = hpcp_mod.apply_patch_tree([str(vol)], str(plain), max_workers=1)
+	assert (summary['deleted'], summary['added'], summary['failed']) == (1, 1, 0)
+	assert _changes(hpcp_mod, new, plain) == []
+
+
+def test_apply_refuses_to_write_into_a_directory_it_deletes_through_an_alias(tmp_path, hpcp_mod, reset_hpcp_globals):
+	"""A forced delete of directory x (it holds an entry the patch does not delete) and a write of y/g where y is a
+	symlink to x: the write's directory is the one deleted. Refused before anything changes."""
+	target = tmp_path / 'target'
+	_write(target / 'x' / 'f', 'f')
+	_write(target / 'x' / 'g', 'old g')
+	os.symlink('x', str(target / 'y'))
+	vol = tmp_path / 'vol'
+	_write(vol / 'y' / 'g', 'new g')
+	R = hpcp_mod.ChangeRow
+	state = hpcp_mod.get_entry_state
+	rows = [
+		R('D', 'x/', state(str(target / 'x')), '-'),
+		R('D', 'x/f', state(str(target / 'x' / 'f')), '-'),
+		R('M', 'y/g', state(str(target / 'x' / 'g')), state(str(vol / 'y' / 'g'))),
+	]
+	hpcp_mod.write_patch_metadata([str(vol)], rows, hpcp_mod.make_patch_meta(rows, 'n', 'b', 'root'))
+	before = _snapshot(target)
+	with pytest.raises(RuntimeError, match=_same_entry_conflict('x/', 'y/g')):
+		hpcp_mod.apply_patch_tree([str(vol)], str(target), force=True, max_workers=1)
+	assert _snapshot(target) == before and (target / 'x' / 'g').read_text() == 'old g'
+
+
+def test_apply_deletes_one_hard_link_and_writes_another(trees, hpcp_mod, tmp_path):
+	"""Hard links are separate entries of one inode: deleting one name and writing another (git's linked commands
+	when one is dropped) is not one entry reached twice, and applies."""
+	new, base = trees
+	_write(new / 'bin' / 'git', 'v2')
+	_write(base / 'bin' / 'git', 'v1')
+	os.link(str(base / 'bin' / 'git'), str(base / 'bin' / 'git-old'))
+	vol = tmp_path / 'vol'
+	rows, _ = _patch_from(hpcp_mod, new, base, [vol])
+	assert _ops(rows) == {('D', 'bin/git-old'), ('M', 'bin/git')}
+	target = tmp_path / 'target'
+	_clone(base, target)
+	os.unlink(str(target / 'bin' / 'git-old'))
+	os.link(str(target / 'bin' / 'git'), str(target / 'bin' / 'git-old'))
+	summary = hpcp_mod.apply_patch_tree([str(vol)], str(target), max_workers=1)
+	assert (summary['deleted'], summary['modified'], summary['failed']) == (1, 1, 0)
+	assert _changes(hpcp_mod, new, target) == []
+
+
+def test_apply_replaces_a_symlink_into_a_deleted_directory_with_a_directory(trees, hpcp_mod, tmp_path):
+	"""base has y -> x and x/f; new has a real directory y with y/f and no x. y/f reaches x/f through the symlink
+	today, but the patch removes y first and writes y/f into a new directory: applies, not refused."""
+	new, base = trees
+	_write(new / 'y' / 'f', 'moved')
+	_write(base / 'x' / 'f', 'moved')
+	os.symlink('x', str(base / 'y'))
+	vol = tmp_path / 'vol'
+	rows, _ = _patch_from(hpcp_mod, new, base, [vol])
+	assert _ops(rows) == {('D', 'x/'), ('D', 'x/f'), ('D', 'y'), ('A', 'y/'), ('A', 'y/f')}
+	target = tmp_path / 'target'
+	_clone(base, target)
+	summary = hpcp_mod.apply_patch_tree([str(vol)], str(target), max_workers=1)
+	assert summary['failed'] == 0
+	assert (target / 'y').is_dir() and not (target / 'y').is_symlink() and not os.path.lexists(str(target / 'x'))
+	assert _changes(hpcp_mod, new, target) == []
+
+
 def test_apply_refuses_symlinked_parent_inside_patch_volume(tmp_path, hpcp_mod, reset_hpcp_globals):
 	outside = tmp_path / 'outside'
 	_write(outside / 'x.txt', 'secret')
@@ -2111,6 +2211,40 @@ def test_case_only_rename_patch_is_refused_on_a_vfat_image(tmp_path, hpcp_mod, r
 		with pytest.raises(RuntimeError, match=r"^Patch conflict: 'EFI/BOOT/' and 'EFI/Boot/' differ only by case and /\S+ "
 				r'is a case-insensitive vfat filesystem; applying would delete what it writes; nothing applied'):
 			hpcp_mod.process_load_diff_image([out], [], [], node, mount_points, loop_devices, force=True, max_workers=1)
+	with _mount_session(hpcp_mod) as (mount_points, loop_devices):
+		root = hpcp_mod._mount_single_fs_image(node, True, mount_points, loop_devices)
+		assert os.listdir(os.path.join(root, 'EFI')) == ['BOOT']
+		with open(os.path.join(root, 'EFI', 'BOOT', 'BOOTX64.EFI')) as f:
+			assert f.read() == 'loader'
+
+
+@requires_root_and_image_tools
+@pytest.mark.skipif(shutil.which('mkfs.vfat') is None, reason='needs mkfs.vfat')
+@pytest.mark.root
+@pytest.mark.loop
+def test_case_only_rename_is_refused_on_a_vfat_image_whatever_its_reported_type(tmp_path, hpcp_mod, reset_hpcp_globals,
+		monkeypatch):
+	"""The filesystem type can mislead (NFS from a case-insensitive server, ext4 casefold): with the vfat target
+	reported as nfs4, the type check lets the case-only rename through and the A rows are skipped as present;
+	the same-entry check still refuses it before the D rows delete the boot loader, even with -fa."""
+	hpcp_mod.HASH_SIZE = 65536
+	golden, node, out = str(tmp_path / 'golden.img'), str(tmp_path / 'node.img'), str(tmp_path / 'patch.img')
+	for image, name in ((golden, 'Boot'), (node, 'BOOT')):
+		with open(image, 'wb') as f:
+			f.truncate(32 << 20)
+		subprocess.run(['mkfs.vfat', image], check=True, stdout=subprocess.DEVNULL)
+		_change_image(hpcp_mod, image, lambda root, name=name: _write(os.path.join(root, 'EFI', name, 'BOOTX64.EFI'), 'loader'))
+	with _mount_session(hpcp_mod) as (mount_points, loop_devices):
+		assert hpcp_mod.process_get_diff_image([], [golden], [], node, out, mount_points, loop_devices, max_workers=1) == out
+	reported = []
+	def path_mounts(path, entries):
+		reported.append(path)
+		return 'nfs4', []
+	monkeypatch.setattr(hpcp_mod, '_path_mounts', path_mounts)
+	with _mount_session(hpcp_mod) as (mount_points, loop_devices):
+		with pytest.raises(RuntimeError, match=_same_entry_conflict('EFI/BOOT/', 'EFI/Boot/')):
+			hpcp_mod.process_load_diff_image([out], [], [], node, mount_points, loop_devices, force=True, max_workers=1)
+	assert len(reported) == 1
 	with _mount_session(hpcp_mod) as (mount_points, loop_devices):
 		root = hpcp_mod._mount_single_fs_image(node, True, mount_points, loop_devices)
 		assert os.listdir(os.path.join(root, 'EFI')) == ['BOOT']

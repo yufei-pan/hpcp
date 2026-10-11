@@ -26,6 +26,7 @@ import sys
 import tempfile
 import threading
 import time
+import unicodedata
 import uuid
 from collections import deque, namedtuple
 from concurrent.futures import ProcessPoolExecutor
@@ -4862,6 +4863,17 @@ def _unsafe_parent(target_root, dest):
 		return f'{parent} is not a directory'
 	return None
 
+def _names_removed_first(rows, target_root):
+	"""Names (keys without the trailing '/') that rows remove before anything is written below them:
+	a D row's, or a directory row's over a non-directory (a symlink, say) on the target."""
+	replaced = {row.path.rstrip('/') for row in rows if row.op == 'D'}
+	for row in rows:
+		if row.op != 'D' and row.new.startswith('d:') and row.path != './':
+			path = _key_path(target_root, row.path)
+			if os.path.lexists(path) and (os.path.islink(path) or not os.path.isdir(path)):
+				replaced.add(row.path.rstrip('/'))
+	return replaced
+
 def _rows_escaping_target(rows, target_root):
 	"""Rows whose parent exists now (a dangling symlink counts) and resolves outside target_root.
 
@@ -4870,12 +4882,7 @@ def _rows_escaping_target(rows, target_root):
 	write-time check, like a row whose parent does not exist yet: by then that name is a
 	new directory, not the symlink it is now.
 	"""
-	replaced = {row.path.rstrip('/') for row in rows if row.op == 'D'}
-	for row in rows:
-		if row.op != 'D' and row.new.startswith('d:') and row.path != './':
-			path = _key_path(target_root, row.path)
-			if os.path.lexists(path) and (os.path.islink(path) or not os.path.isdir(path)):
-				replaced.add(row.path.rstrip('/'))
+	replaced = _names_removed_first(rows, target_root)
 	escaping = []
 	for row in rows:
 		if row.path == './':
@@ -4887,6 +4894,73 @@ def _rows_escaping_target(rows, target_root):
 		if os.path.lexists(os.path.dirname(path)) and not _inside_root(target_root, path):
 			escaping.append(row)
 	return escaping
+
+def _caseless(name):
+	"""name as a filesystem that ignores case and Unicode normalization compares it."""
+	return unicodedata.normalize('NFD', unicodedata.normalize('NFD', name).casefold())
+
+def _same_entry_pair(plan):
+	"""(D row key, A / M row key) of the first pair that reach one entry on plan's target, else None.
+
+	The filesystem-agnostic net under _refuse_case_only_renames: where a written name finds the entry a D row
+	deletes (a case-insensitive lookup the filesystem type does not reveal, such as NFS from a case-insensitive
+	server or an ext4 / f2fs / tmpfs casefold directory, or a symlinked directory alias inside the target), the A
+	row is skipped as done and the D row then removes it. Paths resolve as the apply resolves them: parents
+	followed, the final component not. Only D rows that run count; every A / M row counts, skipped or not: its
+	own entry, and, when it exists, each existing ancestor directory below the target root (a D row that
+	removes a directory the row lies in). Rows on one name are a type change, and rows below a name the patch
+	removes first are written into a new directory (_names_removed_first). Hard links are distinct entries:
+	a non-directory with more than one link counts only when both names are in one directory and equal
+	ignoring case and normalization. Nothing is stat'ed when no D row runs.
+	"""
+	todo = _section_todo(plan)
+	deleted = {}
+	for row in todo:
+		if row.op != 'D':
+			continue
+		path = _key_path(plan.target_root, row.path)
+		try:
+			info = os.lstat(path)
+		except OSError:
+			continue
+		deleted.setdefault((info.st_dev, info.st_ino), []).append((row, path))
+	if not deleted:
+		return None
+	directories = {}
+
+	def directory(path):
+		"""(st_dev, st_ino) of the directory path leads to (symlinks followed), else None; each path stat'ed once."""
+		if path not in directories:
+			try:
+				info = os.stat(path)
+				directories[path] = (info.st_dev, info.st_ino) if stat.S_ISDIR(info.st_mode) else None
+			except OSError:
+				directories[path] = None
+		return directories[path]
+
+	removed_first = _names_removed_first(todo, plan.target_root)
+	for row in plan.rows:
+		if row.op == 'D' or row.path == './':
+			continue
+		parents = _parent_keys(row.path)
+		if any(key.rstrip('/') in removed_first for key in parents):
+			continue
+		path = _key_path(plan.target_root, row.path)
+		try:
+			info = os.lstat(path)
+		except OSError:
+			continue
+		for deleted_row, deleted_path in deleted.get((info.st_dev, info.st_ino), ()):
+			if deleted_row.path.rstrip('/') == row.path.rstrip('/'):
+				continue
+			if (stat.S_ISDIR(info.st_mode) or info.st_nlink == 1
+					or (directory(os.path.dirname(deleted_path)) == directory(os.path.dirname(path))
+						and _caseless(os.path.basename(deleted_path)) == _caseless(os.path.basename(path)))):
+				return deleted_row.path, row.path
+		for key in parents:
+			for deleted_row, _ in deleted.get(directory(_key_path(plan.target_root, key)), ()):
+				return deleted_row.path, row.path
+	return None
 
 def _discard_temp(path):
 	"""Remove a temporary entry that was not renamed into place; a missing one is fine."""
@@ -5172,6 +5246,10 @@ def _preflight_section(plan):
 	unsafe = [row for row in todo if row.op in ('A', 'M') and row.new.startswith('f:') and _payload_source(plan.volume_roots, row) is None]
 	if unsafe:
 		raise RuntimeError(f'Incomplete patch: payload missing or unsafe for {len(unsafe)} file(s), e.g. {unsafe[0].path}; nothing applied')
+	pair = _same_entry_pair(plan)
+	if pair:
+		raise RuntimeError(f'Patch conflict: {pair[0]!r} (deleted) and {pair[1]!r} (written) are the same entry on the target - '
+			'a case-insensitive or aliased filesystem; applying would delete what it writes; nothing applied')
 
 def _apply_section(plan, max_workers, verbose, full_hash, compare_hash):
 	"""Apply a checked section and verify it; returns its summary."""
@@ -5237,7 +5315,8 @@ def apply_patch_tree(volume_roots, target_root, force=False, max_workers=1, verb
 	land on a filesystem not known to be case-sensitive (FAT, exFAT, HFS+, or a type it does not
 	know; see _refuse_case_only_renames): the target's own (from mountinfo) or one mounted below
 	it. A FAT, exFAT or HFS+ target also verifies the A / M rows skipped as already done
-	(see _apply_section).
+	(see _apply_section). Whatever the filesystem type, a D row and an A / M row that reach one entry on
+	the target (or a directory the A / M row lies in) are refused, even forced (see _same_entry_pair).
 	"""
 	meta, rows, volume_roots = load_patch_volumes(volume_roots, volume_names)
 	if store_note and meta.get('layout') == 'store':
