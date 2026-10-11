@@ -922,3 +922,42 @@ def test_read_write_mount_of_xfs_uses_nouuid(hpcp_mod, reset_hpcp_globals, monke
 		for path in mount_points:
 			os.rmdir(path)
 	assert calls[0][:3] == ['mount', '-o', 'nouuid'] and calls[0][3] == '/dev/fake1'
+
+
+def test_validate_dd_diff_arguments(tmp_path, hpcp_mod):
+	v = hpcp_mod._validate_diff_args
+	assert v('out.img', None, False, ['/dev/sdb'], None, ['old.img'], None, dd=True) == ('out.img', ['/dev/sdb'])
+	existing = tmp_path / 'new.img'
+	existing.write_bytes(b'')
+	assert v(str(existing), None, False, [], None, ['old.img'], None, dd=True) == ('auto', [str(existing)])
+	for kwargs, message in (
+		(dict(src_path=['a', 'b'], dest_paths=['old.img']), 'exactly one new disk'),
+		(dict(src_path=['a'], dest_paths=[]), 'exactly one old disk'),
+		(dict(src_path=['a'], dest_paths=['old.img'], dest_image='x.img'), 'no -si / -di'),
+	):
+		with pytest.raises(RuntimeError, match=message):
+			v('auto', None, False, kwargs['src_path'], None, kwargs['dest_paths'], kwargs.get('dest_image'), dd=True)
+	assert v(None, ['p.img'], False, [], None, ['/dev/sdb'], None, dd=True) == (None, [])
+
+
+def test_patch_layout_reads_the_manifest(tmp_path, hpcp_mod):
+	volume = tmp_path / 'vol'
+	(volume / '.hpcp_diff').mkdir(parents=True)
+	assert hpcp_mod._patch_layout([str(volume)]) == 'root'
+	hpcp_mod.write_manifest(str(volume / '.hpcp_diff' / 'manifest'), _disk_meta())
+	assert hpcp_mod._patch_layout([str(volume)]) == 'disk'
+
+
+@requires_root_and_disk_tools
+@pytest.mark.root
+@pytest.mark.loop
+def test_hpcp_cli_generates_and_applies_a_disk_patch(tmp_path, hpcp_mod, reset_hpcp_globals):
+	old, new, out = tmp_path / 'old.img', tmp_path / 'new.img', str(tmp_path / 'p.img')
+	_make_golden(old)
+	_make_newer(old, new)
+	assert hpcp_mod.hpcp([str(new)], dest_paths=[str(old)], get_diff_image=out, dd=True, max_workers=1) == 0
+	target = tmp_path / 'node.img'
+	shutil.copyfile(str(old), str(target))
+	assert hpcp_mod.hpcp([], dest_paths=[str(target)], load_diff_image=[out], max_workers=1) == 0
+	assert _no_differences(hpcp_mod, tmp_path, new, target)
+	assert hpcp_mod.hpcp([], dest_paths=[str(tmp_path)], load_diff_image=[out], max_workers=1) == 241

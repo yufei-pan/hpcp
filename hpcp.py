@@ -5232,13 +5232,34 @@ def process_get_diff_image(src_paths, src_image, dest_paths, dest_image, output,
 	print(f"Patch image written to {output}{extra}")
 	return output
 
+def _patch_layout(volume_roots):
+	"""layout of the first readable manifest among the volumes ('root' when none can be read)."""
+	for volume_root in volume_roots:
+		try:
+			return read_manifest(os.path.join(volume_root, DIFF_DIR_NAME, 'manifest')).get('layout', 'root')
+		except (OSError, RuntimeError):
+			continue
+	return 'root'
+
 def process_load_diff_image(load_diff_image, src_paths, dest_paths, dest_image, mount_points, loop_devices,
-		force=False, max_workers=multiprocessing.cpu_count(), verbose=False):
-	"""Mount every -siff volume and apply the patch to -di IMG, -d DIR, or a single positional path."""
+		force=False, max_workers=multiprocessing.cpu_count(), verbose=False, dd=False):
+	"""Mount every -siff volume and apply the patch: a disk patch to -d DISK (or one path), a
+	single-filesystem patch to -di IMG, -d DIR, or a single positional path."""
 	images = expand_paths(load_diff_image)
 	if not images:
 		raise RuntimeError(f'Incomplete patch: no patch image found for {load_diff_image}')
 	volume_roots = [_mount_single_fs_image(image, True, mount_points, loop_devices) for image in images]
+	volume_names = [os.path.abspath(image) for image in images]
+	if _patch_layout(volume_roots) == 'disk':
+		if dest_image:
+			raise RuntimeError('Invalid arguments: disk patches take the target disk with -d (or a single path), not -di')
+		targets = expand_paths(dest_paths) if dest_paths else expand_paths(src_paths or [])
+		if len(targets) != 1 or os.path.isdir(targets[0]):
+			raise RuntimeError(f'Invalid arguments: a disk patch needs exactly one target disk (block device or disk image file), got {dest_paths or src_paths}')
+		return apply_disk_patch(volume_roots, targets[0], mount_points, loop_devices, force=force, max_workers=max_workers,
+			verbose=verbose, volume_names=volume_names)
+	if dd:
+		raise RuntimeError('Invalid arguments: -dd with -siff needs a disk patch; this is a single-filesystem patch')
 	if dest_image:
 		target_root = _mount_single_fs_image(dest_image, False, mount_points, loop_devices)
 		store_note = False
@@ -5249,7 +5270,7 @@ def process_load_diff_image(load_diff_image, src_paths, dest_paths, dest_image, 
 		target_root = os.path.abspath(targets[0])
 		store_note = target_root != os.path.abspath(os.sep)
 	return apply_patch_tree(volume_roots, target_root, force=force, max_workers=max_workers, verbose=verbose,
-		volume_names=[os.path.abspath(image) for image in images], store_note=store_note)
+		volume_names=volume_names, store_note=store_note)
 
 def _validate_diff_args(get_diff_image, load_diff_image, force_apply, src_path, src_image, dest_paths, dest_image,
 		dd=False, remove=False, remove_extra=False, target_file_list=None, compare_file_list=False,
@@ -5266,8 +5287,6 @@ def _validate_diff_args(get_diff_image, load_diff_image, force_apply, src_path, 
 	if get_diff_image and load_diff_image:
 		raise RuntimeError('Invalid arguments: -diff and -siff cannot be used together')
 	mode = '-siff' if load_diff_image else '-diff'
-	if dd:
-		raise RuntimeError(f'Invalid arguments: {mode} with -dd is not supported yet (dd-mode patches are planned)')
 	clashes = [flag for flag, enabled in (('-rm/-rf', remove), ('-rme', remove_extra), ('-fl', target_file_list),
 		('-cfl', compare_file_list), ('-dfl', diff_file_list), ('-tdfl', tar_diff_file_list), ('-co', content_only)) if enabled]
 	if clashes:
@@ -5282,6 +5301,19 @@ def _validate_diff_args(get_diff_image, load_diff_image, force_apply, src_path, 
 			targets = len(src_path)
 		if targets != 1:
 			raise RuntimeError(f'Invalid arguments: -siff needs exactly one target (-d DIR, -di IMG or one path), got {targets}')
+		return get_diff_image, src_path
+	if dd:
+		if src_image or dest_image:
+			raise RuntimeError('Invalid arguments: -dd -diff takes the new disk as a path and the old disk with -d (no -si / -di)')
+		if get_diff_image not in (None, 'auto') and os.path.lexists(os.path.expanduser(get_diff_image)):
+			# The output must not exist, so an existing path is the new disk argparse took as the patch name.
+			print(f"Note: -diff value {get_diff_image} exists; using it as the new disk and generating the patch name")
+			src_path = [get_diff_image] + src_path
+			get_diff_image = 'auto'
+		if len(src_path) != 1:
+			raise RuntimeError(f'Invalid arguments: -dd -diff needs exactly one new disk (a path), got {len(src_path)}')
+		if len(dest_paths) != 1:
+			raise RuntimeError(f'Invalid arguments: -dd -diff needs exactly one old disk (-d), got {len(dest_paths)}')
 		return get_diff_image, src_path
 	if get_diff_image not in (None, 'auto') and os.path.isdir(os.path.expanduser(get_diff_image)):
 		print(f"Note: -diff value {get_diff_image} is an existing directory; using it as the source and generating the patch name")
@@ -6983,12 +7015,12 @@ def get_args(args = None):
 	parser.add_argument('-pfl', '--parallel_file_listing', action='store_true', help='Use parallel processing for file listing')
 	parser.add_argument('src_path', nargs='*', type=str, help='Source Path')
 	parser.add_argument('-si','--src_image',action='append', type=str, help='Source Image, mount the image and copy the files from it.')
-	parser.add_argument('-siff','--load_diff_image',action='append', type=str, help='Apply a patch image made by -diff to the target (-d / -di or a single path). Repeat for each -dis volume. Every path the patch touches is checked first; conflicts prompt before being overridden.')
+	parser.add_argument('-siff','--load_diff_image',action='append', type=str, help='Apply a patch image made by -diff to the target (-d / -di or a single path). Repeat for each -dis volume. Every path the patch touches is checked first; conflicts prompt before being overridden. A disk patch (made with -dd -diff) takes the target disk with -d.')
 	parser.add_argument('-d','-C','--dest_path',action='append', type=str, help='Destination Path')
 	parser.add_argument('-rds','--random_dest_selection', action='store_true', help='Randomly select destination path from the list of destination paths instead of filling round robin. Can speed up transfer if dests are on different devices. Warning: can cause unable to fit in big files as dests are filled up by smaller files.')
 	parser.add_argument('-di','--dest_image', type=str, help='Base name for destination Image, create a image file and copy the files into it.')
 	parser.add_argument('-dis','--dest_image_size', type=str, help='Destination Image Size, specify the size of the destination image to split into. Default is 0 (No split). Example: {10TiB} or {1G}', default='0')
-	parser.add_argument('-diff', '--get_diff_image', type=str, nargs='?', const='auto', default=None, help='Generate a patch image that updates the base (-d / -di) to the source (src_path / -si): added and modified files in full plus a change list under .hpcp_diff/. Optionally name the output; default DIFF_<src>_TO_<base>_<time>.img. Honors -dis, -fh, -hs and -e.')
+	parser.add_argument('-diff', '--get_diff_image', type=str, nargs='?', const='auto', default=None, help='Generate a patch image that updates the base (-d / -di) to the source (src_path / -si): added and modified files in full plus a change list under .hpcp_diff/. Optionally name the output; default DIFF_<src>_TO_<base>_<time>.img. Honors -dis, -fh, -hs and -e. With -dd, compares whole GPT disks: the new disk as the path and the old disk with -d.')
 	parser.add_argument('-fa', '--force_apply', action='store_true', help='With -siff, apply even when the target differs from the state the patch expects. Conflicts are still printed as warnings.')
 	parser.add_argument('-dd', '--disk_dump', action='store_true', help='Disk to Disk mirror, use this if you are backuping / deploying an OS from / to a disk. \
 					 Require 1 source, can be 1 src_path or 1 -si src_image, require 1 -di dest_image. Note: will only actually use dd if unable to mount / create a partition.')
@@ -7102,8 +7134,13 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = multipr
 			workers = 1 if single_thread else max_workers
 			if load_diff_image:
 				process_load_diff_image(load_diff_image, src_path, dest_paths, dest_image, mount_points, loop_devices,
-					force=force_apply, max_workers=workers, verbose=verbose)
+					force=force_apply, max_workers=workers, verbose=verbose, dd=dd)
 				raise RuntimeError("Exiting after applying patch image.")
+			if dd:
+				process_get_disk_diff_image(src_path, dest_paths, get_diff_image, mount_points, loop_devices,
+					exclude=exclude, full_hash=full_hash, dest_image_size=dest_image_size, max_workers=workers,
+					parallel_file_listing=parallel_file_listing, verbose=verbose)
+				raise RuntimeError("Exiting after generating disk patch image.")
 			process_get_diff_image(src_path, src_image, dest_paths, dest_image, get_diff_image, mount_points, loop_devices,
 				exclude=exclude, full_hash=full_hash, dest_image_size=dest_image_size, max_workers=workers,
 				parallel_file_listing=parallel_file_listing, verbose=verbose)

@@ -1827,7 +1827,7 @@ def test_hpcp_rejects_bad_patch_arguments(tmp_path, hpcp_mod, reset_hpcp_globals
 	cases = [
 		(dict(src_path=[new], dest_paths=[base], force_apply=True), '-fa'),
 		(dict(src_path=[new], dest_paths=[base], get_diff_image='auto', load_diff_image=['p.img']), 'cannot be used together'),
-		(dict(src_path=[new], dest_paths=[base], get_diff_image='auto', dd=True), '-dd'),
+		(dict(src_path=[new], dest_paths=[base], get_diff_image='auto', dd=True, src_image=['x.img']), '-dd'),
 		(dict(src_path=[], dest_paths=[base], load_diff_image=['p.img'], remove=True), '-rm'),
 		(dict(src_path=[new, base], dest_paths=[base], get_diff_image='auto'), 'exactly one source'),
 		(dict(src_path=[new], get_diff_image='auto'), 'exactly one base'),
