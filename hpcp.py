@@ -4648,8 +4648,15 @@ def load_patch_volumes(volume_roots, volume_names=None):
 	return meta, sections[0][2], ordered
 
 def _section_volume_roots(volume_roots, payload_dir):
-	"""Where a section's payload lives on each volume."""
-	return list(volume_roots) if payload_dir == '.' else [os.path.join(volume_root, payload_dir) for volume_root in volume_roots]
+	"""Where a section's payload lives on each volume.
+
+	A volume whose section directory is a symlink (or sits behind one) is left out, so the
+	payload containment root can never move outside the patch volume.
+	"""
+	if payload_dir == '.':
+		return list(volume_roots)
+	return [os.path.join(volume_root, payload_dir) for volume_root in volume_roots
+		if os.path.realpath(os.path.join(volume_root, payload_dir)) == os.path.join(os.path.realpath(volume_root), payload_dir)]
 
 def _conflict_lines(checks, prefix=''):
 	"""(detail, short) text per conflicting check, as printed in the conflict list and the forcing warnings."""

@@ -611,3 +611,19 @@ def test_load_patch_returns_sections_and_single_filesystem_loader_refuses_disk_p
 	assert got_meta['layout'] == 'disk' and sections == [('part1', 'part1', rows)] and roots == [str(volume)]
 	with pytest.raises(RuntimeError, match='disk patches'):
 		hpcp_mod.load_patch_volumes([str(volume)])
+
+
+def test_section_volume_roots_drop_a_symlinked_section_directory(tmp_path, hpcp_mod):
+	outside = tmp_path / 'outside'
+	_write(outside / 'a.txt', 'hello')
+	row = hpcp_mod.ChangeRow('A', 'a.txt', '-', 'f:5:1:100644:0:0:-:-')
+	bad = tmp_path / 'bad'
+	bad.mkdir()
+	os.symlink(str(outside), str(bad / 'part1'))
+	good = tmp_path / 'good'
+	_write(good / 'part1' / 'a.txt', 'hello')
+	roots = hpcp_mod._section_volume_roots([str(bad)], 'part1')
+	assert roots == [] and hpcp_mod._payload_source(roots, row) is None
+	roots = hpcp_mod._section_volume_roots([str(bad), str(good)], 'part1')
+	assert roots == [str(good / 'part1')] and hpcp_mod._payload_source(roots, row) == str(good / 'part1' / 'a.txt')
+	assert hpcp_mod._section_volume_roots([str(bad)], '.') == [str(bad)]
