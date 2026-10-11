@@ -1041,7 +1041,7 @@ def test_interrupted_copy_keeps_old_xattrs(trees, hpcp_mod, tmp_path, monkeypatc
 def test_directory_metadata_applied_after_files(trees, hpcp_mod, tmp_path, monkeypatch):
 	new, base = trees
 	_write(new / 'secret' / 'f.txt', 'inside')
-	os.chmod(new / 'secret', 0o700)
+	os.chmod(new / 'secret', 0o755)
 	vol = tmp_path / 'vol'
 	_patch_from(hpcp_mod, new, base, [vol])
 	target = tmp_path / 'target'
@@ -1056,8 +1056,8 @@ def test_directory_metadata_applied_after_files(trees, hpcp_mod, tmp_path, monke
 	monkeypatch.setattr(hpcp_mod, 'copy_file_list_parallel', recording)
 	summary = hpcp_mod.apply_patch_tree([str(vol)], str(target), max_workers=1)
 	assert summary['failed'] == 0
-	assert modes and all(mode != 0o700 for mode in modes)
-	assert stat.S_IMODE(os.stat(target / 'secret').st_mode) == 0o700
+	assert modes and all(mode == 0o700 for mode in modes)
+	assert stat.S_IMODE(os.stat(target / 'secret').st_mode) == 0o755
 
 
 def test_apply_rejects_reserved_key(tmp_path, hpcp_mod, reset_hpcp_globals):
@@ -1202,3 +1202,68 @@ def test_split_patch_needs_every_volume(trees, hpcp_mod, tmp_path):
 		summary = hpcp_mod.process_load_diff_image([out, second], [], [str(target)], None, mount_points, loop_devices, max_workers=2)
 	assert summary['failed'] == 0
 	assert _changes(hpcp_mod, new, target) == []
+
+
+def test_process_get_diff_image_refuses_unchanged_reserved_name(trees, hpcp_mod, tmp_path):
+	new, base = trees
+	_write(new / '.hpcp_diff' / 'x', 'x')
+	_write(base / '.hpcp_diff' / 'x', 'x')
+	_write(new / 'a.txt', 'a')
+	out = tmp_path / 'p.img'
+	with pytest.raises(RuntimeError, match='reserves'):
+		hpcp_mod.process_get_diff_image([str(new)], None, [str(base)], None, str(out), [], [], max_workers=1)
+	assert not out.exists()
+
+
+def test_process_get_diff_image_claims_every_volume_name(trees, hpcp_mod, tmp_path, monkeypatch):
+	new, base = trees
+	_write(new / 'a.txt', 'a')
+	out = tmp_path / 'p.img'
+	second = tmp_path / 'p_1.img'
+	second.write_text('keep me')
+	monkeypatch.setattr(hpcp_mod, '_plan_dest_images', lambda init_size, dest_image_size=0: (2, 1 << 20))
+
+	def fail(*args, **kwargs):
+		raise AssertionError('create_image must not be reached')
+
+	monkeypatch.setattr(hpcp_mod, 'create_image', fail)
+	with pytest.raises(RuntimeError, match=r'p_1\.img already exists'):
+		hpcp_mod.process_get_diff_image([str(new)], None, [str(base)], None, str(out), [], [], max_workers=1)
+	assert second.read_text() == 'keep me'
+	assert not out.exists()
+
+
+def test_process_get_diff_image_sizes_volumes_by_allocation(trees, hpcp_mod, tmp_path, monkeypatch):
+	new, base = trees
+	for i in range(200):
+		_write(new / f'f{i:03d}', 'x')
+	captured = {}
+
+	class Sentinel(Exception):
+		pass
+
+	def capture(*args, **kwargs):
+		captured['init_size'] = kwargs['init_size']
+		raise Sentinel()
+
+	monkeypatch.setattr(hpcp_mod, 'create_image', capture)
+	with pytest.raises(Sentinel):
+		hpcp_mod.process_get_diff_image([str(new)], None, [str(base)], None, str(tmp_path / 'p.img'), [], [], max_workers=1)
+	assert captured['init_size'] >= 200 * 4096
+
+
+@requires_root_and_image_tools
+@pytest.mark.root
+@pytest.mark.loop
+def test_cloned_image_mounts_for_diff(trees, hpcp_mod, tmp_path, reset_hpcp_globals):
+	hpcp_mod.HASH_SIZE = 65536
+	tree = tmp_path / 'live' / 'a'
+	_write(tree / 'f.txt', 'v1')
+	base_img = str(tmp_path / 'base.img')
+	rc = hpcp_mod.hpcp([str(tree)], dest_image=base_img, single_thread=True, max_workers=1,
+		batch=True, do_not_remove_files_while_listing=True)
+	assert rc in (None, 0)
+	clone = str(tmp_path / 'clone.img')
+	shutil.copyfile(base_img, clone)
+	with _mount_session(hpcp_mod) as (mount_points, loop_devices):
+		assert hpcp_mod.process_get_diff_image([], [clone], [], base_img, str(tmp_path / 'p.img'), mount_points, loop_devices, max_workers=1) is None

@@ -4600,7 +4600,7 @@ def _apply_rows(rows, volume_roots, target_root, max_workers=1, verbose=False, f
 		if path is None:
 			continue
 		try:
-			os.makedirs(path, exist_ok=True)
+			os.makedirs(path, mode=0o700, exist_ok=True)
 		except OSError as e:
 			eprint(f'Copy failed: {row.path}: {e}')
 			continue
@@ -4670,6 +4670,7 @@ def apply_patch_tree(volume_roots, target_root, force=False, max_workers=1, verb
 	for a malformed or incomplete patch, or when conflicts are not overridden.
 	Another process modifying the target concurrently during an apply is out of scope
 	(residual race between the containment checks and the writes).
+	An interrupted apply leaves new directories 0700 and root-owned.
 	A hard kill mid-apply can leave new directories with default metadata (it is applied
 	only after every write); the re-run then reports those A rows as conflicts and needs -fa.
 	"""
@@ -4727,7 +4728,15 @@ def _mount_single_fs_image(image, read_only, mount_points, loop_devices):
 	target = get_largest_partition(loop_device) if partitions else loop_device
 	mount_point = tempfile.mkdtemp()
 	mount_points.append(mount_point)
-	command = ['mount', '-o', 'ro', target, mount_point] if read_only else ['mount', target, mount_point]
+	if read_only:
+		try:
+			fs_type = get_fs_type(target)
+		except Exception:
+			fs_type = ''
+		options = {'xfs': 'ro,nouuid,norecovery', 'ext3': 'ro,noload', 'ext4': 'ro,noload'}.get(fs_type, 'ro')
+		command = ['mount', '-o', options, target, mount_point]
+	else:
+		command = ['mount', target, mount_point]
 	run_command_in_multicmd_with_path_check(command, strict=False)
 	if not os.path.ismount(mount_point):
 		raise RuntimeError(f'Diff image error: cannot mount {target} from {image}')
@@ -4781,12 +4790,32 @@ def process_get_diff_image(src_paths, src_image, dest_paths, dest_image, output,
 		print(f"No differences between {new_root} and {base_root}; no patch image created.")
 		return None
 	change_list_bytes = sum(len(row.path) + len(row.old) + len(row.new) + 8 for row in rows)
+	init_size = 2 * change_list_bytes
+	for row in rows:
+		if row.op in ('A', 'M'):
+			if row.new.startswith('f:'):
+				init_size += _align_up(max(decode_state(row.new)['size'], 1))
+			else:
+				init_size += _IMAGE_BLOCK
 	if os.geteuid() != 0:
 		print("Warning: creating a patch image usually needs root privileges (loop devices, mkfs, mount)", file=sys.stderr)
 	target_mount_point = tempfile.mkdtemp()
 	mount_points.append(target_mount_point)
+	count, _ = _plan_dest_images(init_size, dest_image_size)
+	claimed = []
+	for name in [_split_dest_image_name(output, i) for i in range(count)]:
+		try:
+			os.close(os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600))
+		except FileExistsError:
+			for done in claimed:
+				try:
+					os.unlink(done)
+				except OSError:
+					pass
+			raise RuntimeError(f'Diff image error: output {name} already exists')
+		claimed.append(name)
 	volume_roots = create_image(output, target_mount_point, loop_devices, [], mount_points, max_workers=max_workers,
-		dest_image_size=dest_image_size, init_size=meta['payload_bytes'] + 2 * change_list_bytes)
+		dest_image_size=dest_image_size, init_size=init_size)
 	build_patch_tree(rows, new_base, volume_roots, meta, max_workers=max_workers, verbose=verbose)
 	extra = f" (+{len(volume_roots) - 1} more volume(s))" if len(volume_roots) > 1 else ''
 	print(f"Patch image written to {output}{extra}")
