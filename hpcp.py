@@ -6358,12 +6358,13 @@ def apply_disk_patch(volume_roots, target, mount_points, loop_devices, force=Fal
 			entry['error'] = str(e)
 			raw_stopped = entry['name']
 			break
-	if stopped is None and raw_stopped is None:
+	if stopped is None:
 		# udev re-reads the partition table after the disk device was closed from writing (MBR write, sgdisk).
 		_settle_partitions(disk, sorted(layout['parts']))
-		for command in commands:
-			run_command_in_multicmd_with_path_check(command, strict=False)
-		_settle_partitions(disk, sorted(layout['parts']))
+		if raw_stopped is None:
+			for command in commands:
+				run_command_in_multicmd_with_path_check(command, strict=False)
+			_settle_partitions(disk, sorted(layout['parts']))
 	# Verify after the identity commands: sgdisk rewriting the GPT must not have undone a raw write.
 	written = 0
 	for entry in attempted:
