@@ -847,6 +847,27 @@ def test_live_partition_with_temp_dirs_on_the_live_filesystem(tmp_path, hpcp_mod
 	assert [row.path for row in part3 if row.path.startswith('tmpdir') and row.path != 'tmpdir/'] == []
 
 
+@requires_root_and_disk_tools
+@pytest.mark.root
+@pytest.mark.loop
+def test_input_disk_image_on_a_live_partition_stays_out_of_the_patch(tmp_path, hpcp_mod, reset_hpcp_globals):
+	"""/root/golden-v1.img on the golden's live root must not become an A row installed on every node."""
+	old, new, out = tmp_path / 'old.img', tmp_path / 'new.img', str(tmp_path / 'patch.img')
+	_make_golden(old)
+	_make_newer(old, new, label=None, raw=False, mbr=False, gpt_name=None)
+	with _attached(new) as loop:
+		with _mounted(loop + 'p3') as live_root:
+			inside = os.path.join(live_root, 'root', 'golden-v1.img')
+			os.makedirs(os.path.dirname(inside))
+			_run('cp', '--sparse=always', old, inside)
+			with _session(hpcp_mod) as (mount_points, loop_devices):
+				assert hpcp_mod.process_get_disk_diff_image([loop], [inside], out, mount_points, loop_devices, max_workers=1) == out
+	_, part3 = _read_part3_patch(hpcp_mod, out)
+	paths = {row.path for row in part3}
+	assert 'root/golden-v1.img' not in paths
+	assert 'root/' in paths and ('M', 'etc/os-release') in {(row.op, row.path) for row in part3}
+
+
 def test_unmountable_filesystem_is_compared_as_raw_with_a_warning(hpcp_mod, monkeypatch, capsys):
 	device = '/dev/none'
 	parts = {1: _part(number=1, device=device, fs_type='ext4')}

@@ -5873,19 +5873,22 @@ def _mount_partition(device, read_only, mount_points, entries):
 		return None
 	return mount_point + os.sep
 
-def _partition_changes(new_root, old_root, mount_points, live_mounts, exclude, full_hash, max_workers, parallel_file_listing):
-	"""Change rows of one filesystem partition (root to root, lost+found and this run's mounts left out)."""
+def _partition_changes(new_root, old_root, mount_points, live_mounts, exclude, full_hash, max_workers, parallel_file_listing,
+		input_files=()):
+	"""Change rows of one filesystem partition (root to root; lost+found, this run's mounts and
+	its input disk-image files left out)."""
 	matched = os.path.abspath(new_root)
 	patterns = _mount_point_excludes(mount_points, (new_root, old_root), matched)
 	for live_mount in live_mounts:
 		if not live_mount:
 			continue
-		# A live filesystem holds the (empty) directories of this run's other temp mount points.
+		# A live filesystem holds the (empty) directories of this run's other temp mount points,
+		# and may hold the disk images this run compares (the old golden image on the new golden).
 		live_real = os.path.realpath(live_mount)
-		for mount_point in mount_points:
-			mount_real = os.path.realpath(mount_point)
-			if mount_real.startswith(live_real.rstrip(os.sep) + os.sep):
-				patterns.add(glob.escape(os.path.join(matched, os.path.relpath(mount_real, live_real))))
+		for path in list(mount_points) + list(input_files):
+			path_real = os.path.realpath(path)
+			if path_real.startswith(live_real.rstrip(os.sep) + os.sep):
+				patterns.add(glob.escape(os.path.join(matched, os.path.relpath(path_real, live_real))))
 	new_map, base_map = build_root_maps(new_root, old_root, frozenset(exclude or ()) | patterns, max_workers, parallel_file_listing)
 	new_map, base_map = _drop_lost_found(new_map), _drop_lost_found(base_map)
 	if any(_is_reserved_key(key) for key in new_map):
@@ -5971,6 +5974,8 @@ def process_get_disk_diff_image(src_paths, dest_paths, output, mount_points, loo
 	problems, _ = compare_disk_layouts(old_layout, new_layout)
 	if problems:
 		raise RuntimeError('Disk layout mismatch: ' + '; '.join(problems) + '; re-clone instead')
+	# Disk-image files (not block devices) that may lie on a live partition being compared.
+	input_files = [os.path.realpath(path) for path in (sources[0], bases[0]) if os.path.isfile(path)]
 	entries = _mountinfo_entries()
 	swaps = _swap_devices()
 	disks = ((sources[0], new_layout), (bases[0], old_layout))
@@ -5986,7 +5991,8 @@ def process_get_disk_diff_image(src_paths, dest_paths, output, mount_points, loo
 			old_root = _mount_partition(old_part['device'], True, mount_points, entries)
 			if new_root and old_root:
 				lives = [_live_mount(_device_number(part['device']), entries, part['device'])[0] for part in (new_part, old_part)]
-				rows = _partition_changes(new_root, old_root, mount_points, lives, exclude, full_hash, max_workers, parallel_file_listing)
+				rows = _partition_changes(new_root, old_root, mount_points, lives, exclude, full_hash, max_workers, parallel_file_listing,
+					input_files)
 				_release_mount(old_root, mount_points)
 				if rows:
 					# Kept mounted: its payload is copied once the patch image exists.
