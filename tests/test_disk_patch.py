@@ -244,6 +244,42 @@ def test_read_disk_layout_refuses_a_disk_without_gpt(hpcp_mod, reset_hpcp_global
 	assert hpcp_mod.ERRORS == []
 
 
+def test_fs_params_text_ignores_device_paths(hpcp_mod):
+	"""xfs_info names the device it read ('meta-data=/dev/loop3p3'); old and new always differ there."""
+	def xfs(device):
+		return {'meta-data': {'meta-data': device, 'isize': '512', 'agcount': '4'}, 'data': {'bsize': '4096', 'blocks': '10240'},
+			'naming': {'version': '2', 'bsize': '4096'}}
+	text = hpcp_mod._fs_params_text(xfs('/dev/loop3p3'))
+	assert text == hpcp_mod._fs_params_text(xfs('/dev/loop9p3'))
+	assert '/dev/' not in text and 'isize' in text and 'bsize' in text
+	assert hpcp_mod._fs_params_text({'device': '/dev/sda1', 'block_size': 4096}) == 'block_size=4096'
+
+
+def test_fs_params_text_ignores_ext_runtime_features(hpcp_mod):
+	"""A live or dirty ext4 reports needs_recovery / orphan_present; they are state, not mkfs parameters."""
+	clean = {'features': ['has_journal', 'ext_attr', 'extent', 'metadata_csum'], 'block_size': 4096, 'inode_size': 256}
+	dirty = dict(clean, features=['has_journal', 'ext_attr', 'needs_recovery', 'extent', 'orphan_present', 'metadata_csum'])
+	assert hpcp_mod._fs_params_text(dirty) == hpcp_mod._fs_params_text(clean)
+	assert 'needs_recovery' not in hpcp_mod._fs_params_text(dirty)
+	assert hpcp_mod._fs_params_text(dict(clean, features=['has_journal'])) != hpcp_mod._fs_params_text(clean)
+	assert hpcp_mod._fs_params_text({}) == hpcp_mod._fs_params_text(None) == ''
+
+
+def test_read_disk_layout_settles_udev_before_reading(hpcp_mod, monkeypatch):
+	"""A node udev is still re-adding would otherwise probe its filesystem parameters as empty."""
+	calls = []
+	monkeypatch.setattr(hpcp_mod, '_partition_table_type', lambda device: 'gpt')
+	monkeypatch.setattr(hpcp_mod, '_udev_settle', lambda: calls.append('settle'))
+	def infos(device):
+		calls.append('infos')
+		return {'x': {'disk_identifier': 'G', 'sector_size': 512, 'size': 1 << 20}}
+	infos.cache_clear = lambda: None
+	monkeypatch.setattr(hpcp_mod, 'get_partition_infos', infos)
+	monkeypatch.setattr(hpcp_mod, '_settle_partitions', lambda disk, numbers: calls.append('partitions') or {})
+	assert hpcp_mod.read_disk_layout('/dev/x') == {'disk': {'guid': 'G', 'sector_size': 512, 'size': 1 << 20}, 'parts': {}}
+	assert calls == ['settle', 'infos', 'partitions']
+
+
 def test_partition_table_type_is_quiet(hpcp_mod, reset_hpcp_globals, monkeypatch):
 	_fake_blkid_pttype(monkeypatch, hpcp_mod, ['gpt\n'])
 	assert hpcp_mod._partition_table_type('/dev/x') == 'gpt'

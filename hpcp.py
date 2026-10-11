@@ -5380,9 +5380,20 @@ def _settle_partitions(disk, numbers, timeout=10):
 			raise RuntimeError(f'Disk layout mismatch: the kernel shows no device for partition(s) {missing} of {disk}; re-read its partition table (partprobe) first')
 		time.sleep(0.1)
 
+def _stable_fs_params(value, key=''):
+	"""value without what differs between two copies of one filesystem: device paths (xfs_info's
+	meta-data=/dev/...) and ext runtime-state features (needs_recovery, orphan_present, ...)."""
+	if isinstance(value, dict):
+		return {name: _stable_fs_params(item, name) for name, item in value.items()
+			if not (isinstance(item, str) and item.startswith('/dev/'))}
+	if key == 'features' and isinstance(value, list):
+		return [feature for feature in value if feature not in _EXT_RUNTIME_FEATURES]
+	return value
+
 def _fs_params_text(params):
-	"""Stable text form of probe_fs_params() output for disk.tsv."""
-	return ';'.join(f'{key}={(params or {})[key]}' for key in sorted(params or {}))
+	"""Stable text form of probe_fs_params() output for disk.tsv (see _stable_fs_params)."""
+	params = _stable_fs_params(params or {})
+	return ';'.join(f'{key}={params[key]}' for key in sorted(params))
 
 def _probe_identity(device):
 	"""(fs_type, fs_uuid, fs_label) of device from a low-level `blkid -p` probe ('' when nothing is found).
@@ -5429,6 +5440,8 @@ def read_disk_layout(device):
 		raise RuntimeError(f'Disk layout mismatch: {device} has no GPT partition table (found {pttype or "none"}); disk patches support GPT disks only')
 	get_partition_infos.cache_clear()
 	get_partition_details.cache_clear()
+	# A node udev is still re-adding would be probed with empty filesystem parameters.
+	_udev_settle()
 	infos = get_partition_infos(device)
 	devices = _settle_partitions(device, [int(key) for key, info in infos.items() if 'disk_identifier' not in info])
 	disk, parts = {}, {}
