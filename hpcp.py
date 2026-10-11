@@ -9,6 +9,7 @@
 # ///
 import argparse
 import concurrent.futures
+import contextlib
 import errno
 import fnmatch
 import functools
@@ -4591,11 +4592,11 @@ def _validate_patch_rows(rows):
 			if parent.rstrip('/') in symlinks:
 				raise RuntimeError(f'Patch format error: row {row.op} {row.path!r} lies under symlink {parent.rstrip("/")!r} created by the same patch')
 
-def load_patch_volumes(volume_roots, volume_names=None):
+def _load_patch(volume_roots, volume_names=None):
 	"""Read and cross-check every volume's manifest.
 
-	Returns (meta of volume 1, rows of volume 1, volume roots ordered by volume number).
-	volume_names (image paths, parallel to volume_roots) only improve error messages.
+	Returns (meta of volume 1, [(section name, payload dir, rows)], volume roots ordered by
+	volume number). volume_names (image paths, parallel to volume_roots) only improve error messages.
 	"""
 	names = list(volume_names) if volume_names else [str(root) for root in volume_roots]
 	metas = []
@@ -4632,26 +4633,50 @@ def load_patch_volumes(volume_roots, volume_names=None):
 		raise RuntimeError(f'Incomplete patch: missing volume(s) {expected} of {total}')
 	ordered = [by_number[number] for number in range(1, total + 1)]
 	meta = ordered[0][2]
-	if meta['sections'] != [('root', '.', 'changes.tsv')]:
-		raise RuntimeError(f'Patch format error: unsupported sections {meta["sections"]}; this hpcp applies single-filesystem patches only')
-	rows = read_changes(os.path.join(ordered[0][0], DIFF_DIR_NAME, 'changes.tsv'))
-	_validate_patch_rows(rows)
-	return meta, rows, [entry[0] for entry in ordered]
+	sections = []
+	for name, payload_dir, changes_file in meta['sections']:
+		rows = read_changes(os.path.join(ordered[0][0], DIFF_DIR_NAME, changes_file))
+		_validate_patch_rows(rows)
+		sections.append((name, payload_dir, rows))
+	return meta, sections, [entry[0] for entry in ordered]
 
-def _resolve_conflicts(conflicts, force):
-	"""Print conflicts, then prompt (default abort), abort without a tty, or force with warnings."""
-	print(f"{len(conflicts)} path(s) on the target differ from the state this patch expects:")
-	for check in conflicts:
+def load_patch_volumes(volume_roots, volume_names=None):
+	"""Single-filesystem patch: (meta, rows, volume roots ordered by volume number)."""
+	meta, sections, ordered = _load_patch(volume_roots, volume_names)
+	if meta.get('layout') == 'disk' or meta['sections'] != [('root', '.', 'changes.tsv')]:
+		raise RuntimeError(f"Patch format error: unsupported sections {meta['sections']}; disk patches apply to a whole disk (-siff PATCH -d DISK)")
+	return meta, sections[0][2], ordered
+
+def _section_volume_roots(volume_roots, payload_dir):
+	"""Where a section's payload lives on each volume."""
+	return list(volume_roots) if payload_dir == '.' else [os.path.join(volume_root, payload_dir) for volume_root in volume_roots]
+
+def _conflict_lines(checks, prefix=''):
+	"""(detail, short) text per conflicting check, as printed in the conflict list and the forcing warnings."""
+	lines = []
+	for check in checks:
 		expected = '-' if check.row.op == 'A' else check.row.old
-		print(f"  {check.row.op} {check.row.path!r}: {check.reason} (expected {expected}, found {check.found})")
+		lines.append((f"{prefix}{check.row.op} {check.row.path!r}: {check.reason} (expected {expected}, found {check.found})",
+			f"{prefix}{check.row.op} {check.row.path}: {check.reason}"))
+	return lines
+
+def _resolve_conflict_lines(lines, force):
+	"""Print conflicts, then prompt (default abort), abort without a tty, or force with warnings."""
+	print(f"{len(lines)} path(s) on the target differ from the state this patch expects:")
+	for detail, _ in lines:
+		print(f"  {detail}")
 	if not force:
 		if not sys.stdin.isatty():
-			raise RuntimeError(f'Patch conflict: {len(conflicts)} conflicting path(s) and stdin is not a tty; nothing applied (use -fa to force)')
+			raise RuntimeError(f'Patch conflict: {len(lines)} conflicting path(s) and stdin is not a tty; nothing applied (use -fa to force)')
 		answer = multiCMD.input_with_timeout_and_countdown(60, 'Apply anyway? [y/N]')
 		if (answer or '').strip().lower() not in ('y', 'yes'):
-			raise RuntimeError(f'Patch conflict: {len(conflicts)} conflicting path(s); nothing applied')
-	for check in conflicts:
-		print(f"Warning: forcing {check.row.op} {check.row.path}: {check.reason}", file=sys.stderr)
+			raise RuntimeError(f'Patch conflict: {len(lines)} conflicting path(s); nothing applied')
+	for _, short in lines:
+		print(f"Warning: forcing {short}", file=sys.stderr)
+
+def _resolve_conflicts(conflicts, force):
+	"""Phase-1 entry point: one section's conflicting checks."""
+	_resolve_conflict_lines(_conflict_lines(conflicts), force)
 
 def _inside_root(root, path):
 	"""True when path's parent directory resolves inside root (no symlinked escape)."""
@@ -4933,6 +4958,76 @@ def _verify_rows(rows, target_root, compare_hash=True, full_hash=False, max_work
 			eprint(f'Patch verify error: {row.op} {row.path}: expected {expected}, found {found}')
 	return failed
 
+SectionPlan = namedtuple('SectionPlan', 'name volume_roots target_root rows checks')
+
+@contextlib.contextmanager
+def _patch_hash_settings(meta):
+	"""Use the patch's hash size while checking and verifying; yields (compare_hash, full_hash)."""
+	global HASH_SIZE
+	compare_hash = meta.get('hash_algo') == _hash_algo_name()
+	if not compare_hash:
+		print(f"Warning: patch was hashed with {meta.get('hash_algo')}, this system uses {_hash_algo_name()}; hashes and xattr digests are not compared", file=sys.stderr)
+	full_hash = meta.get('full_hash') == '1'
+	try:
+		patch_hash_size = int(meta.get('hash_size', HASH_SIZE))
+	except ValueError:
+		raise RuntimeError(f"Patch format error: bad hash_size {meta.get('hash_size')!r}")
+	saved_hash_size = HASH_SIZE
+	HASH_SIZE = patch_hash_size
+	try:
+		yield compare_hash, full_hash
+	finally:
+		HASH_SIZE = saved_hash_size
+
+def _plan_section(name, rows, volume_roots, target_root, compare_hash, full_hash, max_workers):
+	"""Check one section's rows against target_root; nothing changes."""
+	return SectionPlan(name, list(volume_roots), target_root, rows,
+		check_patch_target(rows, target_root, compare_hash, full_hash, max_workers))
+
+def _section_conflicts(plan):
+	return [check for check in plan.checks if check.action == 'conflict']
+
+def _section_todo(plan):
+	return [check.row for check in plan.checks if check.action != 'skip']
+
+def _resolve_section_conflicts(plans, force, extra_lines=()):
+	"""One conflict list and one prompt for every section (and extra lines such as raw areas)."""
+	lines = []
+	for plan in plans:
+		lines += _conflict_lines(_section_conflicts(plan), '' if plan.name == 'root' else f'[{plan.name}] ')
+	lines += list(extra_lines)
+	if lines:
+		_resolve_conflict_lines(lines, force)
+
+def _preflight_section(plan):
+	"""Refusals -fa cannot override, raised before anything changes."""
+	todo = _section_todo(plan)
+	# Not forceable: the deletes would run and the writes be refused, leaving the patch half applied.
+	escaping = _rows_escaping_target(todo, plan.target_root)
+	if escaping:
+		for row in escaping:
+			print(f"  {row.op} {row.path!r}: resolves outside {plan.target_root} through a symlink")
+		raise RuntimeError(f'Patch conflict: {len(escaping)} path(s) resolve outside the target through symlinks, e.g. {escaping[0].path}; nothing applied')
+	unsafe = [row for row in todo if row.op in ('A', 'M') and row.new.startswith('f:') and _payload_source(plan.volume_roots, row) is None]
+	if unsafe:
+		raise RuntimeError(f'Incomplete patch: payload missing or unsafe for {len(unsafe)} file(s), e.g. {unsafe[0].path}; nothing applied')
+
+def _apply_section(plan, max_workers, verbose, full_hash, compare_hash):
+	"""Apply a checked section and verify it; returns its summary."""
+	conflicts = _section_conflicts(plan)
+	todo = _section_todo(plan)
+	_apply_rows(todo, plan.volume_roots, plan.target_root, max_workers, verbose, full_hash,
+		forced_rows=[check.row for check in conflicts])
+	failed = _verify_rows(todo, plan.target_root, compare_hash, full_hash, max_workers)
+	return {
+		'deleted': sum(1 for row in todo if row.op == 'D'),
+		'added': sum(1 for row in todo if row.op == 'A'),
+		'modified': sum(1 for row in todo if row.op == 'M'),
+		'skipped': len(plan.checks) - len(todo),
+		'forced': len(conflicts),
+		'failed': failed,
+	}
+
 def apply_patch_tree(volume_roots, target_root, force=False, max_workers=1, verbose=False, volume_names=None, store_note=False):
 	"""Apply a patch whose volumes are mounted (or unpacked) at volume_roots onto directory target_root.
 
@@ -4950,49 +5045,15 @@ def apply_patch_tree(volume_roots, target_root, force=False, max_workers=1, verb
 	A hard kill mid-apply can leave new directories with default metadata (it is applied
 	only after every write); the re-run then reports those A rows as conflicts and needs -fa.
 	"""
-	global HASH_SIZE
 	meta, rows, volume_roots = load_patch_volumes(volume_roots, volume_names)
 	if store_note and meta.get('layout') == 'store':
 		example = rows[0].path if rows else ''
 		print(f"Note: this patch uses image-store layout; paths such as {example!r} are resolved under {target_root}")
-	compare_hash = meta.get('hash_algo') == _hash_algo_name()
-	if not compare_hash:
-		print(f"Warning: patch was hashed with {meta.get('hash_algo')}, this system uses {_hash_algo_name()}; hashes and xattr digests are not compared", file=sys.stderr)
-	full_hash = meta.get('full_hash') == '1'
-	try:
-		patch_hash_size = int(meta.get('hash_size', HASH_SIZE))
-	except ValueError:
-		raise RuntimeError(f"Patch format error: bad hash_size {meta.get('hash_size')!r}")
-	saved_hash_size = HASH_SIZE
-	try:
-		HASH_SIZE = patch_hash_size
-		checks = check_patch_target(rows, target_root, compare_hash, full_hash, max_workers)
-		conflicts = [check for check in checks if check.action == 'conflict']
-		if conflicts:
-			_resolve_conflicts(conflicts, force)
-		todo = [check.row for check in checks if check.action != 'skip']
-		# Not forceable: the deletes would run and the writes be refused, leaving the patch half applied.
-		escaping = _rows_escaping_target(todo, target_root)
-		if escaping:
-			for row in escaping:
-				print(f"  {row.op} {row.path!r}: resolves outside {target_root} through a symlink")
-			raise RuntimeError(f'Patch conflict: {len(escaping)} path(s) resolve outside the target through symlinks, e.g. {escaping[0].path}; nothing applied')
-		unsafe = [row for row in todo if row.op in ('A', 'M') and row.new.startswith('f:') and _payload_source(volume_roots, row) is None]
-		if unsafe:
-			raise RuntimeError(f'Incomplete patch: payload missing or unsafe for {len(unsafe)} file(s), e.g. {unsafe[0].path}; nothing applied')
-		_apply_rows(todo, volume_roots, target_root, max_workers, verbose, full_hash,
-			forced_rows=[check.row for check in conflicts])
-		failed = _verify_rows(todo, target_root, compare_hash, full_hash, max_workers)
-	finally:
-		HASH_SIZE = saved_hash_size
-	summary = {
-		'deleted': sum(1 for row in todo if row.op == 'D'),
-		'added': sum(1 for row in todo if row.op == 'A'),
-		'modified': sum(1 for row in todo if row.op == 'M'),
-		'skipped': len(checks) - len(todo),
-		'forced': len(conflicts),
-		'failed': failed,
-	}
+	with _patch_hash_settings(meta) as (compare_hash, full_hash):
+		plan = _plan_section('root', rows, volume_roots, target_root, compare_hash, full_hash, max_workers)
+		_resolve_section_conflicts([plan], force)
+		_preflight_section(plan)
+		summary = _apply_section(plan, max_workers, verbose, full_hash, compare_hash)
 	print('Patch summary: ' + ', '.join(f'{key} {value}' for key, value in summary.items()))
 	return summary
 

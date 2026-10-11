@@ -544,3 +544,70 @@ def test_identity_command_list_groups_and_flags_unsupported(hpcp_mod):
 	commands, unsupported = hpcp_mod._identity_command_list(changes, layout, '/dev/x')
 	assert commands == [['e2label', '/dev/x3', 'root2'], ['sgdisk', '--disk-guid=D2', '/dev/x'], ['sgdisk', '--change-name=3:root-v2', '/dev/x']]
 	assert [(number, fields) for number, fields, _ in unsupported] == [(1, ('fs_uuid',))]
+
+
+class _FakeStdin:
+	def __init__(self, tty):
+		self._tty = tty
+
+	def isatty(self):
+		return self._tty
+
+	def close(self):
+		pass
+
+
+def _two_sections(hpcp_mod, tmp_path):
+	"""Two partition-like trees with one modified file each; targets have a local edit on that file."""
+	hpcp_mod.HASH_SIZE = 65536
+	plans_input = []
+	for name, filename in (('part1', 'efi.bin'), ('part3', 'os-release')):
+		new, base, target = tmp_path / f'{name}-new', tmp_path / f'{name}-base', tmp_path / f'{name}-target'
+		_write(new / filename, f'{name} new content')
+		_write(base / filename, f'{name} old')
+		shutil.copytree(str(base), str(target), symlinks=True)
+		_write(target / filename, f'{name} local edit')
+		new_map, base_map = hpcp_mod.build_root_maps(str(new), str(base), max_workers=1)
+		rows = hpcp_mod.compute_changes(new_map, base_map, max_workers=1)
+		volume = tmp_path / 'vol'
+		shutil.copytree(str(new), str(volume / name))
+		plans_input.append((name, rows, [str(volume / name)], str(target), filename))
+	return plans_input
+
+
+def test_sections_share_one_conflict_prompt(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch, capsys):
+	sections = _two_sections(hpcp_mod, tmp_path)
+	plans = [hpcp_mod._plan_section(name, rows, roots, target, True, False, 1) for name, rows, roots, target, _ in sections]
+	monkeypatch.setattr(sys, 'stdin', _FakeStdin(False))
+	with pytest.raises(RuntimeError, match='Patch conflict: 2 conflicting path'):
+		hpcp_mod._resolve_section_conflicts(plans, False)
+	out = capsys.readouterr().out
+	assert "[part1] M 'efi.bin'" in out and "[part3] M 'os-release'" in out
+	calls = []
+	monkeypatch.setattr(sys, 'stdin', _FakeStdin(True))
+	monkeypatch.setattr(hpcp_mod.multiCMD, 'input_with_timeout_and_countdown', lambda timeout, prompt='': calls.append(prompt) or 'y')
+	hpcp_mod._resolve_section_conflicts(plans, False, extra_lines=[('raw part2: content differs', 'raw part2: content differs')])
+	assert len(calls) == 1
+	assert 'Warning: forcing raw part2' in capsys.readouterr().err
+	for plan in plans:
+		hpcp_mod._preflight_section(plan)
+	summaries = [hpcp_mod._apply_section(plan, 1, False, False, True) for plan in plans]
+	assert [s['forced'] for s in summaries] == [1, 1] and all(s['failed'] == 0 for s in summaries)
+	for name, _, _, target, filename in sections:
+		assert open(os.path.join(target, filename)).read() == f'{name} new content'
+
+
+def test_load_patch_returns_sections_and_single_filesystem_loader_refuses_disk_patches(tmp_path, hpcp_mod, reset_hpcp_globals):
+	R = hpcp_mod.ChangeRow
+	volume = tmp_path / 'vol'
+	diff_dir = volume / '.hpcp_diff'
+	diff_dir.mkdir(parents=True)
+	rows = [R('A', 'a.txt', '-', 'f:1:1:100644:0:0:-:-')]
+	hpcp_mod.write_changes(str(diff_dir / 'part1.changes.tsv'), rows)
+	hpcp_mod.write_disk_tsv(str(diff_dir / 'disk.tsv'), [])
+	meta = dict(_disk_meta(), patch_id='p1', sections=[('part1', 'part1', 'part1.changes.tsv')], raws=[])
+	hpcp_mod.write_manifest(str(diff_dir / 'manifest'), meta)
+	got_meta, sections, roots = hpcp_mod._load_patch([str(volume)])
+	assert got_meta['layout'] == 'disk' and sections == [('part1', 'part1', rows)] and roots == [str(volume)]
+	with pytest.raises(RuntimeError, match='disk patches'):
+		hpcp_mod.load_patch_volumes([str(volume)])
