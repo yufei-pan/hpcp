@@ -2367,3 +2367,41 @@ def test_fold_name_keeps_names_fat_keeps_apart(hpcp_mod):
 	assert fold('EFI/Boot/bootx64.efi') == fold('efi/BOOT/BOOTX64.EFI') == 'EFI/BOOT/BOOTX64.EFI'
 	# 'ß'.upper() is 'SS' (two characters): kept, so 'Straße' and 'STRASSE' stay two names, as FAT keeps them.
 	assert fold('Straße') == 'STRAßE' != fold('STRASSE')
+
+
+def test_repair_leaves_surviving_skipped_rows_alone(tmp_path, hpcp_mod, reset_hpcp_globals):
+	"""A delete really removes something, but the skipped row's file survives: it is not restored (not rewritten)."""
+	hpcp_mod.HASH_SIZE = 65536
+	target, vol = tmp_path / 'target', tmp_path / 'vol'
+	_write(target / 'gone.txt', 'bye')
+	_write(target / 'keep.txt', 'keep')
+	_write(vol / 'keep.txt', 'keep')
+	state = hpcp_mod.get_entry_state
+	R = hpcp_mod.ChangeRow
+	rows = [R('D', 'gone.txt', state(str(target / 'gone.txt')), '-'), R('A', 'keep.txt', '-', state(str(vol / 'keep.txt')))]
+	before = os.stat(str(target / 'keep.txt'))
+	plan = hpcp_mod._plan_section('root', rows, [str(vol)], str(target), True, False, 1)
+	assert {check.row.path: check.action for check in plan.checks} == {'gone.txt': 'apply', 'keep.txt': 'skip'}
+	summary = hpcp_mod._apply_section(plan, 1, False, False, True)
+	assert summary == {'deleted': 1, 'added': 0, 'modified': 0, 'skipped': 1, 'restored': 0, 'forced': 0, 'failed': 0}
+	after = os.stat(str(target / 'keep.txt'))
+	assert (after.st_ino, after.st_mtime_ns) == (before.st_ino, before.st_mtime_ns)
+	assert not (target / 'gone.txt').exists()
+
+
+def test_failed_forced_rmtree_still_runs_the_repair_step(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	hpcp_mod.HASH_SIZE = 65536
+	target, vol = tmp_path / 'target', tmp_path / 'vol'
+	_write(target / 'd' / 'a', 'a')
+	_write(target / 'keep.txt', 'k')
+	_write(vol / 'keep.txt', 'k')
+	state = hpcp_mod.get_entry_state
+	R = hpcp_mod.ChangeRow
+	row = R('D', 'd/', state(str(target / 'd')), '-')
+	skipped = R('A', 'keep.txt', '-', state(str(vol / 'keep.txt')))
+	def partial_rmtree(path, *args, **kwargs):
+		os.unlink(str(target / 'keep.txt'))
+		raise OSError('boom')
+	monkeypatch.setattr(hpcp_mod.shutil, 'rmtree', partial_rmtree)
+	restored = hpcp_mod._apply_rows([row], [str(vol)], str(target), forced_rows=[row], skipped=[skipped])
+	assert restored == [skipped] and (target / 'keep.txt').read_text() == 'k'

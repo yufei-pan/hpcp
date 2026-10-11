@@ -5133,6 +5133,9 @@ def _apply_rows(rows, volume_roots, target_root, max_workers=1, verbose=False, f
 		directory = is_real_dir(path)
 		try:
 			if directory and row in forced_rows:
+				# Recorded before the call: an rmtree that fails partway may already have removed entries,
+				# so the repair step must still check the skipped rows.
+				removed.append(row.path)
 				shutil.rmtree(path)
 			elif directory:
 				os.rmdir(path)
