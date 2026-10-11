@@ -4900,7 +4900,8 @@ def _apply_rows(rows, volume_roots, target_root, max_workers=1, verbose=False, f
 	a rename cannot replace is removed first: a directory where a file or symlink goes, or
 	a file or symlink where a directory goes.
 	With metadata False (a FAT / exFAT / NTFS / HFS target) only content and file times are
-	written: no mode, owner, xattrs or directory metadata.
+	written: no mode, owner, xattrs or directory metadata (new directories get the target's
+	default mode).
 	"""
 	root_norm = os.path.normpath(target_root)
 	forced_rows = set(forced_rows)
@@ -4972,7 +4973,8 @@ def _apply_rows(rows, volume_roots, target_root, max_workers=1, verbose=False, f
 		if path is None:
 			continue
 		try:
-			os.makedirs(path, mode=0o700, exist_ok=True)
+			# 0700 until sync_dir sets the payload's metadata; a content-only target keeps its default mode.
+			os.makedirs(path, mode=0o700 if metadata else 0o777, exist_ok=True)
 		except OSError as e:
 			eprint(f'Copy failed: {row.path}: {e}')
 			continue
@@ -5713,6 +5715,7 @@ _NO_POSIX_METADATA_TYPES = frozenset(_FAT_TYPES + ('exfat', 'ntfs', 'ntfs3', 'hf
 def _has_posix_metadata(fs_type):
 	"""False for a filesystem whose sections are compared and applied by content only."""
 	return fs_type not in _NO_POSIX_METADATA_TYPES
+
 _IDENTITY_FIELDS = ('unique_guid', 'name', 'attrs', 'fs_uuid', 'fs_label')
 IdentityChange = namedtuple('IdentityChange', 'number field current new')
 

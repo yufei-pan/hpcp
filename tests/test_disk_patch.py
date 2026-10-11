@@ -719,8 +719,11 @@ def test_content_only_section_round_trip(tmp_path, hpcp_mod, reset_hpcp_globals)
 	for rel, data in (('EFI/BOOT/grubx64.efi', 'new content'), ('EFI/vendor/a.efi', 'a.efi'), ('EFI/vendor/b.efi', 'b.efi')):
 		path = target / rel
 		assert path.read_text() == data and os.stat(str(path)).st_mtime == T0
-		# Modes are the target's own, not the payload's 0600.
+		# Modes are the target's own, not the payload's 0600 (or 0700 for the new directory).
 		assert stat.S_IMODE(os.stat(str(path)).st_mode) != 0o600
+	umask = os.umask(0o022)
+	os.umask(umask)
+	assert stat.S_IMODE(os.stat(str(target / 'EFI' / 'vendor')).st_mode) == 0o777 & ~umask
 	assert hpcp_mod._verify_rows(rows, str(target), metadata=False) == 0
 	assert hpcp_mod._verify_rows(rows, str(target)) > 0
 
