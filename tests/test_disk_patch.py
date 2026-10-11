@@ -363,3 +363,44 @@ def test_plan_raw_actions(hpcp_mod):
 	assert hpcp_mod._plan_raw(_A, _B, _B) == 'skip'
 	assert hpcp_mod._plan_raw(_A, _B, _A) == 'apply'
 	assert hpcp_mod._plan_raw(_A, _B, _C) == 'conflict'
+
+
+_MOUNTINFO = '\n'.join([
+	'36 25 8:3 / / rw,relatime shared:1 - ext4 /dev/sda3 rw',
+	'37 36 8:1 / /boot/efi rw,relatime shared:2 - vfat /dev/sda1 rw',
+	'38 36 8:3 /srv /mnt/bind rw,relatime shared:1 - ext4 /dev/sda3 rw',
+	'39 36 8:5 / /mnt/with\\040space ro,relatime - ext4 /dev/sda5 ro',
+	'40 36 0:50 / /btr rw,relatime - btrfs /dev/sda6 rw',
+]) + '\n'
+
+
+def test_mountinfo_parsing_and_live_mounts(tmp_path, hpcp_mod):
+	path = tmp_path / 'mountinfo'
+	path.write_text(_MOUNTINFO)
+	entries = hpcp_mod._mountinfo_entries(str(path))
+	assert len(entries) == 5
+	assert entries[3]['mount_point'] == '/mnt/with space' and entries[3]['devnum'] == (8, 5)
+	assert hpcp_mod._live_mount((8, 3), entries) == ('/', False)
+	assert hpcp_mod._live_mount((8, 5), entries) == ('/mnt/with space', True)
+	assert hpcp_mod._live_mount((8, 9), entries) == (None, False)
+	# btrfs reports an anonymous device number; the source path still identifies it
+	assert hpcp_mod._live_mount((8, 6), entries, '/dev/sda6') == ('/btr', False)
+	assert hpcp_mod._mountinfo_entries(str(tmp_path / 'missing')) == []
+
+
+def test_partition_in_use_reasons(tmp_path, hpcp_mod):
+	mountinfo = tmp_path / 'mountinfo'
+	mountinfo.write_text(_MOUNTINFO)
+	swaps = tmp_path / 'swaps'
+	swaps.write_text('Filename\tType\tSize\tUsed\tPriority\n/dev/sda4 partition 8388604 0 -2\n')
+	sys_block = tmp_path / 'sys'
+	(sys_block / 'sda7' / 'holders' / 'dm-0').mkdir(parents=True)
+	(sys_block / 'sda8' / 'holders').mkdir(parents=True)
+	entries = hpcp_mod._mountinfo_entries(str(mountinfo))
+	swap_set = hpcp_mod._swap_devices(str(swaps))
+	assert swap_set == {os.path.realpath('/dev/sda4')}
+	check = lambda device, devnum: hpcp_mod._partition_in_use(device, devnum, entries, swap_set, str(sys_block))
+	assert check('/dev/sda1', (8, 1)) == 'mounted'
+	assert check('/dev/sda4', (8, 4)) == 'active swap'
+	assert check('/dev/sda7', (8, 7)) == 'held by another device'
+	assert check('/dev/sda8', (8, 8)) == ''

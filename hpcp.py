@@ -5411,6 +5411,78 @@ def _plan_raw(old_sha, new_sha, found_sha):
 	return 'conflict'
 
 
+def _unescape_mount(text):
+	"""Undo the octal escapes (\\040 for a space, …) the kernel uses in mountinfo and /proc/swaps."""
+	return re.sub(r'\\([0-7]{3})', lambda match: chr(int(match.group(1), 8)), text)
+
+def _mountinfo_entries(mountinfo_path='/proc/self/mountinfo'):
+	"""Parsed mountinfo lines (an empty list when the file cannot be read)."""
+	entries = []
+	try:
+		with open(mountinfo_path, encoding='utf-8', errors='surrogateescape') as f:
+			for line in f:
+				fields = line.split()
+				if '-' not in fields or len(fields) < 7:
+					continue
+				separator = fields.index('-')
+				major, _, minor = fields[2].partition(':')
+				entries.append({
+					'devnum': (int(major), int(minor)), 'root': _unescape_mount(fields[3]),
+					'mount_point': _unescape_mount(fields[4]), 'options': fields[5].split(','),
+					'fstype': fields[separator + 1] if len(fields) > separator + 1 else '',
+					'source': _unescape_mount(fields[separator + 2]) if len(fields) > separator + 2 else '',
+				})
+	except (OSError, ValueError):
+		pass
+	return entries
+
+def _device_number(device):
+	"""(major, minor) of a block device node."""
+	st = os.stat(device)
+	return (os.major(st.st_rdev), os.minor(st.st_rdev))
+
+def _entry_matches(entry, devnum, device):
+	"""A mountinfo entry belongs to device: same device number, or (btrfs and other filesystems with
+	anonymous device numbers) the same source device path."""
+	if entry['devnum'] == devnum:
+		return True
+	return bool(device) and entry['source'].startswith('/') and os.path.realpath(entry['source']) == os.path.realpath(device)
+
+def _live_mount(devnum, entries, device=''):
+	"""(mount point, read_only) of the mount that shows device's whole filesystem (root '/'), or (None, False)."""
+	for entry in entries:
+		if entry['root'] == '/' and _entry_matches(entry, devnum, device):
+			return entry['mount_point'], 'ro' in entry['options']
+	return None, False
+
+def _swap_devices(swaps_path='/proc/swaps'):
+	"""Real paths of the active swap areas."""
+	result = set()
+	try:
+		with open(swaps_path, encoding='utf-8', errors='surrogateescape') as f:
+			next(f, None)
+			for line in f:
+				fields = line.split()
+				if fields:
+					result.add(os.path.realpath(_unescape_mount(fields[0])))
+	except OSError:
+		pass
+	return result
+
+def _partition_in_use(device, devnum, entries, swaps, sys_block_path='/sys/class/block'):
+	"""Why device is in use ('' when it is not): mounted, active swap, or held by LVM / md / dm."""
+	if any(_entry_matches(entry, devnum, device) for entry in entries):
+		return 'mounted'
+	if os.path.realpath(device) in swaps:
+		return 'active swap'
+	try:
+		if os.listdir(os.path.join(sys_block_path, os.path.basename(os.path.realpath(device)), 'holders')):
+			return 'held by another device'
+	except OSError:
+		pass
+	return ''
+
+
 #%% ---- Remove Extra ----
 def remove_extra_dirs(src_paths, dests,exclude=None):
 	"""
