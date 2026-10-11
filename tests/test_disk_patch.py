@@ -292,10 +292,10 @@ def test_partition_table_type_is_quiet(hpcp_mod, reset_hpcp_globals, monkeypatch
 
 def test_disk_apply_to_a_target_without_a_partition_table(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
 	"""No partition table at all is a wrong target (Invalid arguments); an MBR disk is a layout mismatch."""
-	meta = {'layout': 'disk', 'disk': 'disk.tsv', 'raws': []}
+	meta = {'layout': 'disk', 'disk': 'disk.tsv', 'sections': [], 'raws': []}
 	monkeypatch.setattr(hpcp_mod, '_load_patch', lambda roots, names=None: (meta, [], list(roots)))
 	monkeypatch.setattr(hpcp_mod, 'read_disk_tsv', lambda path: [])
-	monkeypatch.setattr(hpcp_mod, '_refuse_if_image_in_use', lambda image, entries: None)
+	monkeypatch.setattr(hpcp_mod, '_refuse_if_image_in_use', lambda image: None)
 	monkeypatch.setattr(hpcp_mod, '_attach_disk', lambda path, ro, loops: '/dev/fake')
 	target = tmp_path / 'fs.img'
 	target.write_bytes(b'')
@@ -305,6 +305,100 @@ def test_disk_apply_to_a_target_without_a_partition_table(tmp_path, hpcp_mod, re
 	_fake_blkid_pttype(monkeypatch, hpcp_mod, ['dos'])
 	with pytest.raises(RuntimeError, match=r'^Disk layout mismatch: /dev/fake has no GPT partition table \(found dos\)'):
 		hpcp_mod.apply_disk_patch(['/vol'], str(target), [], [])
+
+
+# number: (kind, fs_type, size) of the golden layout _make_golden builds.
+_GOLDEN_KINDS = {1: ('fs', 'vfat', 32 << 20), 2: ('raw', '', 1 << 20), 3: ('fs', 'ext4', 40 << 20), 4: ('swap', 'swap', 8 << 20)}
+
+
+def _hand_made_disk_patch(hpcp_mod, tmp_path, monkeypatch, sections=(), raws=(), kinds=None, open_target=False):
+	"""A disk patch volume written by hand (a directory, no image) and the target layout it matches.
+
+	sections are (name, [ChangeRow]); raws are manifest raw entries. Unless open_target, opening
+	the target fails the test: these patches must be refused before the target is touched.
+	"""
+	kinds = kinds or _GOLDEN_KINDS
+	volume = tmp_path / 'vol'
+	diff_dir = volume / '.hpcp_diff'
+	diff_dir.mkdir(parents=True)
+	R = hpcp_mod.DiskRow
+	disk_rows = [R('disk', '-', 'guid', 'G', 'G'), R('disk', '-', 'sector_size', '512', '512')]
+	parts = {}
+	for number, (kind, fs_type, size) in sorted(kinds.items()):
+		values = {'kind': kind, 'type_guid': f'T{number}', 'unique_guid': f'U{number}', 'name': f'n{number}', 'attrs': '0',
+			'size': str(size), 'fs_type': fs_type, 'fs_uuid': '', 'fs_label': '', 'fs_params': ''}
+		disk_rows += [R('part', str(number), field, values[field], values[field]) for field in hpcp_mod._PART_FIELDS]
+		parts[number] = dict(values, size=size, device=f'/dev/fake{number}')
+	hpcp_mod.write_disk_tsv(str(diff_dir / 'disk.tsv'), disk_rows)
+	for name, rows in sections:
+		hpcp_mod.write_changes(str(diff_dir / f'{name}.changes.tsv'), rows)
+	meta = {'format': 'hpcp-diff', 'format_version': 2, 'layout': 'disk', 'patch_id': 'p', 'volume': '1/1',
+		'hash_algo': hpcp_mod._hash_algo_name(), 'hash_size': 65536, 'full_hash': 0, 'disk': 'disk.tsv',
+		'sections': [(name, name, f'{name}.changes.tsv') for name, _ in sections], 'raws': list(raws)}
+	hpcp_mod.write_manifest(str(diff_dir / 'manifest'), meta)
+	if not open_target:
+		def must_not_open(*args, **kwargs):
+			raise AssertionError('the target was opened before the patch was checked')
+		monkeypatch.setattr(hpcp_mod, '_attach_disk', must_not_open)
+		monkeypatch.setattr(hpcp_mod, '_refuse_if_image_in_use', must_not_open)
+	return str(volume), {'disk': {'guid': 'G', 'sector_size': 512, 'size': 96 << 20}, 'parts': parts}
+
+
+def _one_row(hpcp_mod):
+	return [hpcp_mod.ChangeRow('A', 'a.txt', '-', f'f:1:{T0}000000000:100644:0:0:-:-')]
+
+
+@pytest.mark.parametrize('section, raw, message', [
+	(None, ('mbr', 'raw/mbr-bootcode.bin', _C, _D, 512), 'raw area mbr is 512 bytes; the MBR boot code area is 440 bytes'),
+	(None, ('part1', 'raw/part1.img', _A, _B, 32 << 20), 'raw area part1 is for partition 1, which the disk table records as fs, not a raw area'),
+	(None, ('part4', 'raw/part4.img', _A, _B, 8 << 20), 'raw area part4 is for partition 4, which the disk table records as swap, not a raw area'),
+	(None, ('part2', 'raw/part2.img', _A, _B, 2 << 20), 'raw area part2 is 2097152 bytes; the disk table records 1048576 for partition 2'),
+	(None, ('part9', 'raw/part9.img', _A, _B, 1 << 20), 'raw area part9 is for partition 9, which the disk table does not list'),
+	('part2', None, 'section part2 is for partition 2, which the disk table records as raw, not a filesystem'),
+	('part4', None, 'section part4 is for partition 4, which the disk table records as swap, not a filesystem'),
+	('part7', None, 'section part7 is for partition 7, which the disk table does not list'),
+])
+def test_disk_manifest_entries_must_match_the_disk_table(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch, section, raw, message):
+	"""Patch images are untrusted: a 512-byte mbr entry would write past the boot code into the partition table,
+	and an entry for the wrong kind of partition was a KeyError traceback."""
+	volume, _ = _hand_made_disk_patch(hpcp_mod, tmp_path, monkeypatch, sections=[(section, _one_row(hpcp_mod))] if section else (),
+		raws=[raw] if raw else ())
+	with pytest.raises(RuntimeError, match='^Patch format error: ' + re.escape(message) + '$'):
+		hpcp_mod.apply_disk_patch([volume], str(tmp_path / 'node.img'), [], [])
+
+
+def test_disk_table_kind_must_not_change(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	volume, _ = _hand_made_disk_patch(hpcp_mod, tmp_path, monkeypatch)
+	path = os.path.join(volume, '.hpcp_diff', 'disk.tsv')
+	rows = [row._replace(old='raw') if (row.number, row.field) == ('3', 'kind') else row for row in hpcp_mod.read_disk_tsv(path)]
+	hpcp_mod.write_disk_tsv(path, rows)
+	with pytest.raises(RuntimeError, match=r'^Patch format error: the disk table changes the kind of partition 3 \(raw -> fs\)$'):
+		hpcp_mod.apply_disk_patch([volume], str(tmp_path / 'node.img'), [], [])
+
+
+def test_in_use_raw_partition_is_refused_before_it_is_hashed(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	"""A live LVM PV (hundreds of GB) must not be read in full only to be refused."""
+	raws = [('part2', 'raw/part2.img', _A, _B, 1 << 20), ('mbr', 'raw/mbr-bootcode.bin', _C, _D, 440)]
+	volume, layout = _hand_made_disk_patch(hpcp_mod, tmp_path, monkeypatch, raws=raws, open_target=True)
+	payload = os.path.join(volume, 'raw', 'part2.img')
+	os.makedirs(os.path.dirname(payload))
+	with open(payload, 'wb') as f:
+		f.truncate(1 << 20)
+	monkeypatch.setattr(hpcp_mod, '_refuse_if_image_in_use', lambda image: None)
+	monkeypatch.setattr(hpcp_mod, '_attach_disk', lambda path, ro, loops: '/dev/fake')
+	monkeypatch.setattr(hpcp_mod, '_partition_table_type', lambda device: 'gpt')
+	monkeypatch.setattr(hpcp_mod, 'read_disk_layout', lambda disk: layout)
+	monkeypatch.setattr(hpcp_mod, '_mountinfo_entries', lambda: [])
+	monkeypatch.setattr(hpcp_mod, '_swap_devices', lambda: set())
+	monkeypatch.setattr(hpcp_mod, '_device_number', lambda device: (7, 0))
+	monkeypatch.setattr(hpcp_mod, '_partition_in_use', lambda device, devnum, entries, swaps: 'held by another device' if device == '/dev/fake2' else '')
+	hashed = []
+	# The disk's boot code is already new (skip); the area on the partition still holds the old bytes.
+	answers = {'/dev/fake': _D, '/dev/fake2': _A, payload: _B}
+	monkeypatch.setattr(hpcp_mod, '_hash_area', lambda path, offset=0, length=None: hashed.append(path) or answers[path])
+	with pytest.raises(RuntimeError, match=r'^Disk in use: partition 2 is held by another device and its raw area changes; apply this patch offline$'):
+		hpcp_mod.apply_disk_patch([volume], str(tmp_path / 'node.img'), [], [])
+	assert '/dev/fake2' not in hashed and hashed == ['/dev/fake']
 
 
 # ---- root + loop fixtures (GPT disk images) ----

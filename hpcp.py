@@ -6189,11 +6189,50 @@ def process_get_disk_diff_image(src_paths, dest_paths, output, mount_points, loo
 	print(f"Disk patch image written to {output}{extra}")
 	return output
 
-def _refuse_if_image_in_use(image, entries):
+def _check_disk_entries(meta, disk_rows):
+	"""Raise RuntimeError('Patch format error: ...') unless the manifest's sections and raw areas
+	agree with disk.tsv.
+
+	Patch images are untrusted input: a section must be a partition of kind fs, a raw partition
+	area a partition of kind raw of exactly its recorded size, and the mbr area exactly the boot
+	code (a longer one would write into the partition table). No partition may change its kind.
+	"""
+	parts = {}
+	for row in disk_rows:
+		if row.kind == 'part':
+			parts.setdefault(row.number, {})[row.field] = row
+	for number, fields in sorted(parts.items(), key=lambda item: int(item[0])):
+		kind = fields.get('kind')
+		if kind is not None and kind.old != kind.new:
+			raise RuntimeError(f'Patch format error: the disk table changes the kind of partition {number} ({kind.old} -> {kind.new})')
+
+	def partition(entry, name, wanted, label):
+		"""disk.tsv fields of the partition entry name refers to, which must be of kind wanted."""
+		number = name[len('part'):]
+		if number not in parts:
+			raise RuntimeError(f'Patch format error: {entry} {name} is for partition {number}, which the disk table does not list')
+		kind = parts[number]['kind'].old if 'kind' in parts[number] else 'no kind'
+		if kind != wanted:
+			raise RuntimeError(f'Patch format error: {entry} {name} is for partition {number}, which the disk table records as {kind}, not {label}')
+		return number, parts[number]
+
+	for name, _, _ in meta['sections']:
+		partition('section', name, 'fs', 'a filesystem')
+	for name, _, _, _, size in meta['raws']:
+		if name == 'mbr':
+			if size != _MBR_BOOTCODE_SIZE:
+				raise RuntimeError(f'Patch format error: raw area mbr is {size} bytes; the MBR boot code area is {_MBR_BOOTCODE_SIZE} bytes')
+			continue
+		number, fields = partition('raw area', name, 'raw', 'a raw area')
+		recorded = fields['size'].old if 'size' in fields else 'no size'
+		if str(size) != recorded or 'size' in fields and fields['size'].new != recorded:
+			raise RuntimeError(f'Patch format error: raw area {name} is {size} bytes; the disk table records {recorded} for partition {number}')
+
+def _refuse_if_image_in_use(image):
 	"""Refuse an image-file target that is already attached to any loop device.
 
 	A second read-write loop over the same file would leave the first one's page cache stale, and
-	swap or a dm/LVM/md holder on the first one would not be seen as in use. (entries is unused.)
+	swap or a dm/LVM/md holder on the first one would not be seen as in use.
 	"""
 	error_count = len(ERRORS)
 	try:
@@ -6220,6 +6259,7 @@ def apply_disk_patch(volume_roots, target, mount_points, loop_devices, force=Fal
 	if meta.get('layout') != 'disk':
 		raise RuntimeError('Invalid arguments: this is a single-filesystem patch; apply it to a directory or a filesystem image')
 	disk_rows = read_disk_tsv(os.path.join(volume_roots[0], DIFF_DIR_NAME, meta['disk']))
+	_check_disk_entries(meta, disk_rows)
 	fs_types = {row.number: row.old for row in disk_rows if row.kind == 'part' and row.field == 'fs_type'}
 	for name, _, rows in sections:
 		# Patches from older hpcp turned a case-only rename into a D + A pair, which deletes the files on FAT.
@@ -6230,7 +6270,7 @@ def apply_disk_patch(volume_roots, target, mount_points, loop_devices, force=Fal
 	target = os.path.abspath(os.path.expanduser(target))
 	entries = _mountinfo_entries()
 	if not pathlib.Path(target).resolve().is_block_device():
-		_refuse_if_image_in_use(target, entries)
+		_refuse_if_image_in_use(target)
 	disk = _attach_disk(target, False, loop_devices)
 	if not _partition_table_type(disk):
 		raise RuntimeError(f'Invalid arguments: {target} is not a partitioned disk; a disk patch needs a whole GPT disk (block device or disk image)')
@@ -6245,13 +6285,15 @@ def apply_disk_patch(volume_roots, target, mount_points, loop_devices, force=Fal
 	raw_plan = []
 	for name, raw_file, old_sha, new_sha, size in meta['raws']:
 		number = None if name == 'mbr' else int(name[len('part'):])
+		if number is not None and in_use.get(number):
+			# Refused without reading it: a live area (an LVM PV, say) can be hundreds of GB.
+			refusals.append(f'partition {number} is {in_use[number]} and its raw area changes')
+			continue
 		device = disk if number is None else layout['parts'][number]['device']
 		found = _hash_area(device, 0, size)
 		action = _plan_raw(old_sha, new_sha, found)
 		payload = None
 		if action != 'skip':
-			if number is not None and in_use.get(number):
-				refusals.append(f'partition {number} is {in_use[number]} and its raw area changes')
 			payload = _raw_payload(volume_roots, raw_file, new_sha, size)
 			if payload is None:
 				raise RuntimeError(f'Incomplete patch: raw payload {raw_file} is missing or damaged; nothing applied')
