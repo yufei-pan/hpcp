@@ -3807,13 +3807,14 @@ def _mtime_ns_close(a_ns, b_ns):
 	precision = max(get_timestamp_precision(a_ns / 1e9), get_timestamp_precision(b_ns / 1e9))
 	return abs(a_ns - b_ns) <= precision * 2 * 1e9
 
-def states_equal(a, b, compare_hash=True):
+def states_equal(a, b, compare_hash=True, metadata=True):
 	"""True when two entry states describe the same entry.
 
 	Directories ignore mtime; files allow the timestamp-precision tolerance; an xattr
 	digest of '-' on either side is not compared; '?' never equals anything.
 	With compare_hash False neither the content hash nor the xattr digest is compared
-	(both come from the same hasher).
+	(both come from the same hasher). With metadata False mode, owner and xattrs are not
+	compared: on FAT, exFAT, NTFS and HFS they come from mount options, not the filesystem.
 	"""
 	if a == '?' or b == '?':
 		return False
@@ -3824,9 +3825,9 @@ def states_equal(a, b, compare_hash=True):
 		return False
 	if info_a['type'] == 'l':
 		return info_a['target'] == info_b['target']
-	if (info_a['mode'], info_a['uid'], info_a['gid']) != (info_b['mode'], info_b['uid'], info_b['gid']):
+	if metadata and (info_a['mode'], info_a['uid'], info_a['gid']) != (info_b['mode'], info_b['uid'], info_b['gid']):
 		return False
-	if compare_hash and info_a['xattr'] != '-' and info_b['xattr'] != '-' and info_a['xattr'] != info_b['xattr']:
+	if metadata and compare_hash and info_a['xattr'] != '-' and info_b['xattr'] != '-' and info_a['xattr'] != info_b['xattr']:
 		return False
 	if info_a['type'] == 'd':
 		return True
@@ -4232,10 +4233,13 @@ def _states_for_paths(paths, full_hash=False, read_xattrs=True, max_workers=1):
 			ERRORS.extend(chunk_errors)
 	return states
 
-def compute_changes(new_map, base_map, full_hash=False, max_workers=multiprocessing.cpu_count(), read_xattrs=True):
-	"""Rows that turn base_map's tree into new_map's tree, sorted D / A / M."""
+def compute_changes(new_map, base_map, full_hash=False, max_workers=multiprocessing.cpu_count(), read_xattrs=True, metadata=True):
+	"""Rows that turn base_map's tree into new_map's tree, sorted D / A / M.
+
+	With metadata False (see states_equal) a mode, owner or xattr difference alone is no change.
+	"""
 	states = _states_for_paths(set(new_map.values()) | set(base_map.values()), full_hash=full_hash,
-		read_xattrs=read_xattrs, max_workers=max_workers)
+		read_xattrs=read_xattrs and metadata, max_workers=max_workers)
 	rows = []
 	for key in set(new_map) | set(base_map):
 		new_state = states[new_map[key]] if key in new_map else '-'
@@ -4252,7 +4256,7 @@ def compute_changes(new_map, base_map, full_hash=False, max_workers=multiprocess
 		elif old_state[0] != new_state[0]:
 			rows.append(ChangeRow('D', key, old_state, '-'))
 			rows.append(ChangeRow('A', key, '-', new_state))
-		elif not states_equal(old_state, new_state):
+		elif not states_equal(old_state, new_state, metadata=metadata):
 			rows.append(ChangeRow('M', key, old_state, new_state))
 	return sort_change_rows(rows)
 
@@ -4535,7 +4539,7 @@ def _unlisted_children(key, path, deleted_keys):
 			unlisted.append(child_key)
 	return unlisted
 
-def check_patch_target(rows, target_root, compare_hash=True, full_hash=False, max_workers=1):
+def check_patch_target(rows, target_root, compare_hash=True, full_hash=False, max_workers=1, metadata=True):
 	"""Classify every row against target_root as 'apply', 'skip' or 'conflict'.
 
 	D: target == old -> apply; absent, or already the replacing A row's state -> skip.
@@ -4544,9 +4548,11 @@ def check_patch_target(rows, target_root, compare_hash=True, full_hash=False, ma
 	delete or one that cannot be listed.
 	A and M rows are judged as the target will be after the applicable D rows: a name a D
 	row removes (with or without the trailing '/'), and everything below it, counts as absent.
+	metadata False compares content only (see states_equal).
 	"""
 	paths = {row.path: _key_path(target_root, row.path) for row in rows}
-	states = _states_for_paths(set(paths.values()), full_hash=full_hash, max_workers=max_workers)
+	states = _states_for_paths(set(paths.values()), full_hash=full_hash, read_xattrs=metadata, max_workers=max_workers)
+	same = functools.partial(states_equal, compare_hash=compare_hash, metadata=metadata)
 	added_by_name = {row.path.rstrip('/'): row for row in rows if row.op == 'A'}
 	deleted_keys = {row.path for row in rows if row.op == 'D'}
 	checks = {}
@@ -4559,11 +4565,11 @@ def check_patch_target(rows, target_root, compare_hash=True, full_hash=False, ma
 		if found == '-':
 			checks[row] = PatchCheck(row, 'skip', found, 'already absent')
 			continue
-		if replacement is not None and states_equal(found, replacement.new, compare_hash):
+		if replacement is not None and same(found, replacement.new):
 			checks[row] = PatchCheck(row, 'skip', found, 'already replaced')
 			continue
 		removed_names.add(row.path.rstrip('/'))
-		if not states_equal(found, row.old, compare_hash):
+		if not same(found, row.old):
 			checks[row] = PatchCheck(row, 'conflict', found, 'changed on target')
 			continue
 		unlisted = _unlisted_children(row.path, paths[row.path], deleted_keys) if found.startswith('d:') else []
@@ -4580,13 +4586,13 @@ def check_patch_target(rows, target_root, compare_hash=True, full_hash=False, ma
 		if row.op == 'A':
 			if found == '-':
 				checks[row] = PatchCheck(row, 'apply', found, '')
-			elif states_equal(found, row.new, compare_hash):
+			elif same(found, row.new):
 				checks[row] = PatchCheck(row, 'skip', found, 'already in new state')
 			else:
 				checks[row] = PatchCheck(row, 'conflict', found, 'already exists on target')
-		elif states_equal(found, row.old, compare_hash):
+		elif same(found, row.old):
 			checks[row] = PatchCheck(row, 'apply', found, '')
-		elif states_equal(found, row.new, compare_hash):
+		elif same(found, row.new):
 			checks[row] = PatchCheck(row, 'skip', found, 'already in new state')
 		else:
 			checks[row] = PatchCheck(row, 'conflict', found, 'missing on target' if found == '-' else 'changed on target')
@@ -4796,7 +4802,7 @@ def _discard_temp(path):
 	except OSError as e:
 		print(f"Warning: cannot remove temporary file {path}: {e}", file=sys.stderr)
 
-def _finish_replace(job, target_root, wait):
+def _finish_replace(job, target_root, wait, metadata=True):
 	"""Wait for one temporary copy, check it, and rename it over its destination.
 
 	The temporary file is created in the live directory, so it inherits that directory's
@@ -4812,7 +4818,8 @@ def _finish_replace(job, target_root, wait):
 		info = os.lstat(tmp)
 		if not stat.S_ISREG(info.st_mode) or info.st_size != size:
 			raise RuntimeError(f'copied {info.st_size} bytes, expected {size}')
-		_remove_stale_xattrs(source, tmp)
+		if metadata:
+			_remove_stale_xattrs(source, tmp)
 		reason = _unsafe_parent(target_root, dest)
 		if reason:
 			raise RuntimeError(reason)
@@ -4822,14 +4829,24 @@ def _finish_replace(job, target_root, wait):
 	finally:
 		_discard_temp(tmp)
 
-def _replace_files(files, target_root, max_workers=1, verbose=False, full_hash=False):
+def _copy_content(src_path, dest_paths, full_hash=False, verbose=False):
+	"""copy_file for a target without POSIX metadata (FAT, exFAT, NTFS, HFS): the bytes and the
+	times only; mode and owner come from the target's mount options. Raises on failure."""
+	st = os.stat(src_path)
+	for dest in dest_paths:
+		shutil.copyfile(src_path, dest)
+		os.utime(dest, ns=(st.st_atime_ns, st.st_mtime_ns))
+
+def _replace_files(files, target_root, max_workers=1, verbose=False, full_hash=False, metadata=True):
 	"""Copy each (row, source, dest) to a temporary sibling of dest, then rename it over dest.
 
 	copy_file (cp -af) preserves mode, owner, times and xattrs; _finish_replace strips what
-	the temporary file inherited from its directory (a default ACL). Copies run on a process
+	the temporary file inherited from its directory (a default ACL). With metadata False only
+	the content and times are copied (_copy_content). Copies run on a process
 	pool, or serially when max_workers <= 1. A running process keeps the old inode, an
 	interruption leaves dest fully old or fully new, and hard links to the old file are broken.
 	"""
+	copy = copy_file if metadata else _copy_content
 	jobs = []
 	for row, source, dest in files:
 		reason = _unsafe_parent(target_root, dest)
@@ -4844,13 +4861,13 @@ def _replace_files(files, target_root, max_workers=1, verbose=False, full_hash=F
 		for job in jobs:
 			row, source, dest, tmp = job
 			_finish_replace(job, target_root,
-				functools.partial(_call_raising_recorded_failures, copy_file, source, [tmp], full_hash, verbose))
+				functools.partial(_call_raising_recorded_failures, copy, source, [tmp], full_hash, verbose), metadata)
 		return
 	with ProcessPoolExecutor(max_workers=max_workers) as executor:
-		futures = {executor.submit(_call_with_worker_init, copy_file, source, [tmp], full_hash, verbose): (row, source, dest, tmp)
+		futures = {executor.submit(_call_with_worker_init, copy, source, [tmp], full_hash, verbose): (row, source, dest, tmp)
 			for row, source, dest, tmp in jobs}
 		for future in concurrent.futures.as_completed(futures):
-			_finish_replace(futures[future], target_root, future.result)
+			_finish_replace(futures[future], target_root, future.result, metadata)
 
 def _replace_with_symlink(row, link_target, dest, target_root):
 	"""Create the symlink at a temporary sibling of dest and rename it over dest."""
@@ -4871,7 +4888,7 @@ def _replace_with_symlink(row, link_target, dest, target_root):
 		if tmp:
 			_discard_temp(tmp)
 
-def _apply_rows(rows, volume_roots, target_root, max_workers=1, verbose=False, full_hash=False, forced_rows=()):
+def _apply_rows(rows, volume_roots, target_root, max_workers=1, verbose=False, full_hash=False, forced_rows=(), metadata=True):
 	"""Carry out checked rows: deletions, then directories, files, symlinks, directory metadata.
 
 	Containment of every target path is re-checked immediately before each write, and the
@@ -4882,6 +4899,8 @@ def _apply_rows(rows, volume_roots, target_root, max_workers=1, verbose=False, f
 	existing file or symlink is never removed before its replacement exists. Only an entry
 	a rename cannot replace is removed first: a directory where a file or symlink goes, or
 	a file or symlink where a directory goes.
+	With metadata False (a FAT / exFAT / NTFS / HFS target) only content and file times are
+	written: no mode, owner, xattrs or directory metadata.
 	"""
 	root_norm = os.path.normpath(target_root)
 	forced_rows = set(forced_rows)
@@ -4970,35 +4989,39 @@ def _apply_rows(rows, volume_roots, target_root, max_workers=1, verbose=False, f
 			eprint(f'Incomplete patch: payload for {row.path} is missing or unsafe in every volume')
 			continue
 		files.append((row, source, path))
-	_replace_files(files, target_root, max_workers, verbose, full_hash)
+	_replace_files(files, target_root, max_workers, verbose, full_hash, metadata)
 	for row in payload:
 		if not row.new.startswith('l:') or row.path == './':
 			continue
 		path = guarded(row, removing=True)
 		if path is not None:
 			_replace_with_symlink(row, decode_state(row.new)['target'], path, target_root)
+	if not metadata:
+		return
 	for row in sorted(dir_rows, key=lambda r: _key_depth(r.path), reverse=True):
 		sync_dir(row)
 
-def _verify_rows(rows, target_root, compare_hash=True, full_hash=False, max_workers=1):
-	"""Re-read every applied path and compare with its final expected state; returns the failure count."""
+def _verify_rows(rows, target_root, compare_hash=True, full_hash=False, max_workers=1, metadata=True):
+	"""Re-read every applied path and compare with its final expected state (content only with
+	metadata False); returns the failure count."""
 	final = {}
 	for row in sort_change_rows(rows):
 		# D sorts before A, so for a D + A pair on one name the A row decides the final state.
 		final[row.path.rstrip('/')] = row
 	paths = {name: _key_path(target_root, row.path) for name, row in final.items()}
-	states = _states_for_paths(set(paths.values()), full_hash=full_hash, max_workers=max_workers)
+	states = _states_for_paths(set(paths.values()), full_hash=full_hash, read_xattrs=metadata, max_workers=max_workers)
 	failed = 0
 	for name, row in final.items():
 		expected = '-' if row.op == 'D' else row.new
 		found = states[paths[name]]
-		ok = found == '-' if expected == '-' else states_equal(found, expected, compare_hash)
+		ok = found == '-' if expected == '-' else states_equal(found, expected, compare_hash, metadata)
 		if not ok:
 			failed += 1
 			eprint(f'Patch verify error: {row.op} {row.path}: expected {expected}, found {found}')
 	return failed
 
-SectionPlan = namedtuple('SectionPlan', 'name volume_roots target_root rows checks')
+# metadata False: a content-only section (see states_equal).
+SectionPlan = namedtuple('SectionPlan', 'name volume_roots target_root rows checks metadata')
 
 @contextlib.contextmanager
 def _patch_hash_settings(meta):
@@ -5019,10 +5042,10 @@ def _patch_hash_settings(meta):
 	finally:
 		HASH_SIZE = saved_hash_size
 
-def _plan_section(name, rows, volume_roots, target_root, compare_hash, full_hash, max_workers):
+def _plan_section(name, rows, volume_roots, target_root, compare_hash, full_hash, max_workers, metadata=True):
 	"""Check one section's rows against target_root; nothing changes."""
 	return SectionPlan(name, list(volume_roots), target_root, rows,
-		check_patch_target(rows, target_root, compare_hash, full_hash, max_workers))
+		check_patch_target(rows, target_root, compare_hash, full_hash, max_workers, metadata), metadata)
 
 def _section_conflicts(plan):
 	return [check for check in plan.checks if check.action == 'conflict']
@@ -5057,8 +5080,8 @@ def _apply_section(plan, max_workers, verbose, full_hash, compare_hash):
 	conflicts = _section_conflicts(plan)
 	todo = _section_todo(plan)
 	_apply_rows(todo, plan.volume_roots, plan.target_root, max_workers, verbose, full_hash,
-		forced_rows=[check.row for check in conflicts])
-	failed = _verify_rows(todo, plan.target_root, compare_hash, full_hash, max_workers)
+		forced_rows=[check.row for check in conflicts], metadata=plan.metadata)
+	failed = _verify_rows(todo, plan.target_root, compare_hash, full_hash, max_workers, plan.metadata)
 	return {
 		'deleted': sum(1 for row in todo if row.op == 'D'),
 		'added': sum(1 for row in todo if row.op == 'A'),
@@ -5684,6 +5707,12 @@ def _partition_in_use(device, devnum, entries, swaps, sys_block_path='/sys/class
 
 
 _FAT_TYPES = ('fat32', 'fat16', 'fat12', 'fat', 'vfat', 'msdos')
+# Filesystems whose file modes and owners come from mount options (umask=, uid=), not the disk.
+_NO_POSIX_METADATA_TYPES = frozenset(_FAT_TYPES + ('exfat', 'ntfs', 'ntfs3', 'hfs', 'hfsplus'))
+
+def _has_posix_metadata(fs_type):
+	"""False for a filesystem whose sections are compared and applied by content only."""
+	return fs_type not in _NO_POSIX_METADATA_TYPES
 _IDENTITY_FIELDS = ('unique_guid', 'name', 'attrs', 'fs_uuid', 'fs_label')
 IdentityChange = namedtuple('IdentityChange', 'number field current new')
 
@@ -5874,9 +5903,9 @@ def _mount_partition(device, read_only, mount_points, entries):
 	return mount_point + os.sep
 
 def _partition_changes(new_root, old_root, mount_points, live_mounts, exclude, full_hash, max_workers, parallel_file_listing,
-		input_files=()):
+		input_files=(), metadata=True):
 	"""Change rows of one filesystem partition (root to root; lost+found, this run's mounts and
-	its input disk-image files left out)."""
+	its input disk-image files left out). metadata False: content-only rows (see states_equal)."""
 	matched = os.path.abspath(new_root)
 	patterns = _mount_point_excludes(mount_points, (new_root, old_root), matched)
 	for live_mount in live_mounts:
@@ -5893,7 +5922,7 @@ def _partition_changes(new_root, old_root, mount_points, live_mounts, exclude, f
 	new_map, base_map = _drop_lost_found(new_map), _drop_lost_found(base_map)
 	if any(_is_reserved_key(key) for key in new_map):
 		raise RuntimeError(f'Diff image error: {new_root} contains {DIFF_DIR_NAME}, which hpcp reserves for patch metadata')
-	rows = compute_changes(new_map, base_map, full_hash=full_hash, max_workers=max_workers)
+	rows = compute_changes(new_map, base_map, full_hash=full_hash, max_workers=max_workers, metadata=metadata)
 	_validate_patch_rows(rows)
 	return rows
 
@@ -5992,7 +6021,7 @@ def process_get_disk_diff_image(src_paths, dest_paths, output, mount_points, loo
 			if new_root and old_root:
 				lives = [_live_mount(_device_number(part['device']), entries, part['device'])[0] for part in (new_part, old_part)]
 				rows = _partition_changes(new_root, old_root, mount_points, lives, exclude, full_hash, max_workers, parallel_file_listing,
-					input_files)
+					input_files, _has_posix_metadata(new_part['fs_type']))
 				_release_mount(old_root, mount_points)
 				if rows:
 					# Kept mounted: its payload is copied once the patch image exists.
@@ -6091,6 +6120,7 @@ def apply_disk_patch(volume_roots, target, mount_points, loop_devices, force=Fal
 	if meta.get('layout') != 'disk':
 		raise RuntimeError('Invalid arguments: this is a single-filesystem patch; apply it to a directory or a filesystem image')
 	disk_rows = read_disk_tsv(os.path.join(volume_roots[0], DIFF_DIR_NAME, meta['disk']))
+	fs_types = {row.number: row.old for row in disk_rows if row.kind == 'part' and row.field == 'fs_type'}
 	target = os.path.abspath(os.path.expanduser(target))
 	entries = _mountinfo_entries()
 	if not pathlib.Path(target).resolve().is_block_device():
@@ -6143,7 +6173,8 @@ def apply_disk_patch(volume_roots, target, mount_points, loop_devices, force=Fal
 			root = _mount_partition(part['device'], False, mount_points, entries)
 			if root is None:
 				raise RuntimeError(f"Disk layout mismatch: partition {name[len('part'):]} ({part['fs_type']}) cannot be mounted read-write; nothing applied")
-			plans.append(_plan_section(name, rows, _section_volume_roots(volume_roots, payload_dir), root, compare_hash, full_hash, max_workers))
+			plans.append(_plan_section(name, rows, _section_volume_roots(volume_roots, payload_dir), root, compare_hash, full_hash, max_workers,
+				_has_posix_metadata(fs_types.get(name[len('part'):], ''))))
 		raw_conflicts = [entry for entry in raw_plan if entry['action'] == 'conflict']
 		extra = [(f"raw {entry['name']}: content matches neither the patch base nor the new state (found {entry['found'][:12]})",
 			f"raw {entry['name']}: content differs") for entry in raw_conflicts]

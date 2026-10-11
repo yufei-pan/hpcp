@@ -2,6 +2,7 @@ import contextlib
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -341,9 +342,9 @@ def _attached(image, read_only=False):
 
 
 @contextlib.contextmanager
-def _mounted(device, fstype=None):
+def _mounted(device, fstype=None, options=None):
 	mount_point = tempfile.mkdtemp()
-	_run(*(['mount'] + (['-t', fstype] if fstype else []) + [device, mount_point]))
+	_run(*(['mount'] + (['-t', fstype] if fstype else []) + (['-o', options] if options else []) + [device, mount_point]))
 	try:
 		yield mount_point
 	finally:
@@ -674,6 +675,56 @@ def _two_sections(hpcp_mod, tmp_path):
 	return plans_input
 
 
+def test_permissionless_filesystems_are_content_only(hpcp_mod):
+	assert [hpcp_mod._has_posix_metadata(t) for t in ('vfat', 'fat32', 'msdos', 'exfat', 'ntfs', 'ntfs3', 'hfs', 'hfsplus')] == [False] * 8
+	assert [hpcp_mod._has_posix_metadata(t) for t in ('ext4', 'xfs', 'btrfs', '')] == [True] * 4
+	eq = hpcp_mod.states_equal
+	base = 'f:10:1717000000000000000:100755:0:0:aaaa:1234'
+	assert eq(base, 'f:10:1717000000000000000:100700:1000:1000:aaaa:5678', metadata=False)
+	assert not eq(base, 'f:10:1717000000000000000:100700:0:0:aaaa:1234')
+	assert not eq(base, 'f:11:1717000000000000000:100755:0:0:aaaa:1234', metadata=False)
+	assert not eq(base, 'f:10:1717000000000000000:100755:0:0:bbbb:1234', metadata=False)
+	assert not eq(base, 'f:10:1717000100000000000:100755:0:0:aaaa:1234', metadata=False)
+	assert eq('d:40755:0:0:-', 'd:40700:1000:0:9999', metadata=False)
+	assert not eq('d:40755:0:0:-', base, metadata=False) and not eq('?', '?', metadata=False)
+
+
+def test_content_only_section_round_trip(tmp_path, hpcp_mod, reset_hpcp_globals):
+	"""Mode-only differences make no rows; apply writes content and times but no mode; verify ignores modes."""
+	hpcp_mod.HASH_SIZE = 65536
+	new, base, volume, target = (tmp_path / name for name in ('new', 'base', 'vol', 'target'))
+	for tree in (new, base):
+		_write(tree / 'EFI' / 'BOOT' / 'same.efi', 'same')
+		_write(tree / 'EFI' / 'BOOT' / 'grubx64.efi', 'old')
+	_write(new / 'EFI' / 'BOOT' / 'grubx64.efi', 'new content')
+	for name in ('a.efi', 'b.efi'):
+		_write(new / 'EFI' / 'vendor' / name, name)
+	for path in (new, new / 'EFI', new / 'EFI' / 'BOOT', new / 'EFI' / 'vendor'):
+		os.chmod(str(path), 0o700)
+	for path in (new / 'EFI' / 'BOOT' / 'same.efi', new / 'EFI' / 'vendor' / 'a.efi', new / 'EFI' / 'vendor' / 'b.efi'):
+		os.chmod(str(path), 0o600)
+	new_map, base_map = hpcp_mod.build_root_maps(str(new), str(base), max_workers=1)
+	assert len(hpcp_mod.compute_changes(new_map, base_map, max_workers=1)) == 8
+	rows = hpcp_mod.compute_changes(new_map, base_map, max_workers=1, metadata=False)
+	assert {(row.op, row.path) for row in rows} == {('M', 'EFI/BOOT/grubx64.efi'), ('A', 'EFI/vendor/'),
+		('A', 'EFI/vendor/a.efi'), ('A', 'EFI/vendor/b.efi')}
+	shutil.copytree(str(new), str(volume))
+	shutil.copytree(str(base), str(target))
+	os.chmod(str(target / 'EFI' / 'BOOT' / 'grubx64.efi'), 0o640)
+	assert any(check.action == 'conflict' for check in hpcp_mod.check_patch_target(rows, str(target)))
+	plan = hpcp_mod._plan_section('part1', rows, [str(volume)], str(target), True, False, 2, metadata=False)
+	assert [check.action for check in plan.checks] == ['apply'] * 4
+	summary = hpcp_mod._apply_section(plan, 2, False, False, True)
+	assert summary['failed'] == 0 and summary['added'] == 3 and hpcp_mod.ERRORS == []
+	for rel, data in (('EFI/BOOT/grubx64.efi', 'new content'), ('EFI/vendor/a.efi', 'a.efi'), ('EFI/vendor/b.efi', 'b.efi')):
+		path = target / rel
+		assert path.read_text() == data and os.stat(str(path)).st_mtime == T0
+		# Modes are the target's own, not the payload's 0600.
+		assert stat.S_IMODE(os.stat(str(path)).st_mode) != 0o600
+	assert hpcp_mod._verify_rows(rows, str(target), metadata=False) == 0
+	assert hpcp_mod._verify_rows(rows, str(target)) > 0
+
+
 def test_sections_share_one_conflict_prompt(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch, capsys):
 	sections = _two_sections(hpcp_mod, tmp_path)
 	plans = [hpcp_mod._plan_section(name, rows, roots, target, True, False, 1) for name, rows, roots, target, _ in sections]
@@ -811,11 +862,11 @@ def _mounts_under(prefix):
 		return [line for line in f if prefix in line.split()[4]]
 
 
-def _read_part3_patch(hpcp_mod, out):
+def _read_part3_patch(hpcp_mod, out, section='part3'):
 	with _session(hpcp_mod) as (mount_points, loop_devices):
 		root = hpcp_mod._mount_single_fs_image(out, True, mount_points, loop_devices)
 		meta = hpcp_mod.read_manifest(os.path.join(root, '.hpcp_diff', 'manifest'))
-		rows = hpcp_mod.read_changes(os.path.join(root, '.hpcp_diff', 'part3.changes.tsv'))
+		rows = hpcp_mod.read_changes(os.path.join(root, '.hpcp_diff', f'{section}.changes.tsv'))
 	return meta, rows
 
 
@@ -997,6 +1048,73 @@ def test_disk_apply_round_trip_and_rerun(tmp_path, hpcp_mod, reset_hpcp_globals,
 	again = _apply(hpcp_mod, patch, target)
 	assert again['failed'] == 0 and again['raw_written'] == 0 and again['identity_changed'] == 0
 	assert all(s['added'] + s['modified'] + s['deleted'] == 0 for s in again['sections'].values())
+
+
+def _add_esp_file(image, rel, data):
+	with _attached(image) as loop:
+		with _mounted(loop + 'p1') as esp:
+			_write(os.path.join(esp, rel), data)
+
+
+@requires_root_and_disk_tools
+@pytest.mark.root
+@pytest.mark.loop
+def test_esp_live_mounted_with_umask_gives_content_only_rows(tmp_path, hpcp_mod, reset_hpcp_globals):
+	"""FAT modes come from mount options: the live golden's ESP (umask=0077) against an image ESP hpcp
+	mounts with defaults must not make a mode-only row, and the patch must apply and verify offline."""
+	old, new, out = tmp_path / 'old.img', tmp_path / 'new.img', str(tmp_path / 'patch.img')
+	_make_golden(old)
+	_make_newer(old, new)
+	with _attached(new) as loop:
+		with _mounted(loop + 'p1', options='umask=0077') as esp:
+			assert stat.S_IMODE(os.stat(os.path.join(esp, 'EFI', 'BOOT', 'grubx64.efi')).st_mode) == 0o700
+			with _session(hpcp_mod) as (mount_points, loop_devices):
+				assert hpcp_mod.process_get_disk_diff_image([loop], [str(old)], out, mount_points, loop_devices, max_workers=1) == out
+	assert hpcp_mod.ERRORS == []
+	_, part1 = _read_part3_patch(hpcp_mod, out, 'part1')
+	assert {(row.op, row.path) for row in part1} == {('M', 'EFI/BOOT/grubx64.efi')}
+	_, part3 = _read_part3_patch(hpcp_mod, out)
+	assert ('M', 'etc/os-release') in {(row.op, row.path) for row in part3}
+	target = tmp_path / 'node.img'
+	shutil.copyfile(str(old), str(target))
+	summary = _apply(hpcp_mod, out, target)
+	assert summary['failed'] == 0 and hpcp_mod.ERRORS == []
+	assert summary['sections']['part1']['modified'] == 1
+	assert _no_differences(hpcp_mod, tmp_path, new, target)
+
+
+@requires_root_and_disk_tools
+@pytest.mark.root
+@pytest.mark.loop
+def test_offline_patch_applies_to_an_esp_live_mounted_with_umask(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	"""An offline-generated patch (ESP modes 0755) against a node whose ESP is live at umask=0077:
+	no conflict for content the patch expects, no prompt without a tty, content applied and verified."""
+	old, new, out = tmp_path / 'old.img', tmp_path / 'new.img', str(tmp_path / 'patch.img')
+	_make_golden(old)
+	_make_newer(old, new, label=None, raw=False, mbr=False, gpt_name=None)
+	_add_esp_file(new, 'EFI/vendor/shim.efi', b'shim')
+	with _session(hpcp_mod) as (mount_points, loop_devices):
+		assert hpcp_mod.process_get_disk_diff_image([str(new)], [str(old)], out, mount_points, loop_devices, max_workers=1) == out
+	_, part1 = _read_part3_patch(hpcp_mod, out, 'part1')
+	assert {(row.op, row.path) for row in part1} == {('M', 'EFI/BOOT/grubx64.efi'), ('A', 'EFI/vendor/'), ('A', 'EFI/vendor/shim.efi')}
+	target = tmp_path / 'node.img'
+	shutil.copyfile(str(old), str(target))
+	monkeypatch.setattr(sys, 'stdin', _FakeStdin(False))
+	with _attached(target) as loop:
+		with _mounted(loop + 'p1', options='umask=0077') as esp:
+			summary = _apply(hpcp_mod, out, loop)
+			assert summary['failed'] == 0 and summary['forced'] == 0 and hpcp_mod.ERRORS == []
+			assert summary['sections']['part1']['modified'] == 1 and summary['sections']['part1']['added'] == 2
+			efi = os.path.join(esp, 'EFI', 'BOOT', 'grubx64.efi')
+			with open(efi, 'rb') as f:
+				assert f.read() == b'new-efi-binary'
+			assert os.stat(efi).st_mtime == T0
+			with open(os.path.join(esp, 'EFI', 'vendor', 'shim.efi'), 'rb') as f:
+				assert f.read() == b'shim'
+			# A re-run finds everything already done.
+			again = _apply(hpcp_mod, out, loop)
+			assert again['failed'] == 0 and again['sections']['part1']['skipped'] == 3
+	assert _no_differences(hpcp_mod, tmp_path, new, target)
 
 
 @requires_root_and_disk_tools
