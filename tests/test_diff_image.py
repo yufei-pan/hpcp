@@ -1023,6 +1023,26 @@ def test_apply_refuses_symlinked_parent_outside_target_up_front(tmp_path, hpcp_m
 	assert _snapshot(target) == before
 
 
+@pytest.mark.parametrize('force', [False, True])
+def test_apply_refuses_dangling_symlink_parent_outside_up_front(tmp_path, hpcp_mod, reset_hpcp_globals, force):
+	"""G2 follow-up: a parent that is a dangling symlink leading outside the target is refused before any delete."""
+	target = tmp_path / 'target'
+	_write(target / 'keep' / 'x.txt', 'still here')
+	os.symlink(str(tmp_path / 'missing_outside'), target / 'esc')
+	vol = tmp_path / 'vol'
+	_write(vol / 'esc' / 'new.txt', 'payload')
+	R = hpcp_mod.ChangeRow
+	rows = [
+		R('D', 'keep/x.txt', hpcp_mod.get_entry_state(str(target / 'keep' / 'x.txt')), '-'),
+		R('A', 'esc/new.txt', '-', hpcp_mod.get_entry_state(str(vol / 'esc' / 'new.txt'))),
+	]
+	hpcp_mod.write_patch_metadata([str(vol)], rows, hpcp_mod.make_patch_meta(rows, 'n', 'b', 'root'))
+	with pytest.raises(RuntimeError, match='resolve outside the target'):
+		hpcp_mod.apply_patch_tree([str(vol)], str(target), force=force, max_workers=1)
+	assert (target / 'keep' / 'x.txt').read_text() == 'still here'
+	assert not os.path.lexists(str(tmp_path / 'missing_outside'))
+
+
 @pytest.mark.parametrize('case', ['patch_deletes_link', 'forced_over_link'])
 def test_apply_replaces_an_outside_symlink_with_a_directory(trees, hpcp_mod, tmp_path, case):
 	"""G2 guard: rows below a symlink the patch removes first are judged after that removal, not through the old link.

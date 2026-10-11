@@ -4590,7 +4590,7 @@ def _unsafe_parent(target_root, dest):
 	return None
 
 def _rows_escaping_target(rows, target_root):
-	"""Rows whose parent directory exists now and resolves outside target_root through a symlink.
+	"""Rows whose parent exists now (a dangling symlink counts) and resolves outside target_root.
 
 	D rows are judged against the target as it is. An A or M row below a name the patch
 	first removes (a D row, or a directory row over a non-directory) is left to the
@@ -4610,7 +4610,8 @@ def _rows_escaping_target(rows, target_root):
 		if row.op != 'D' and any(key.rstrip('/') in replaced for key in _parent_keys(row.path)):
 			continue
 		path = _key_path(target_root, row.path)
-		if os.path.exists(os.path.dirname(path)) and not _inside_root(target_root, path):
+		# lexists: a dangling symlink parent that points outside is refused too.
+		if os.path.lexists(os.path.dirname(path)) and not _inside_root(target_root, path):
 			escaping.append(row)
 	return escaping
 
@@ -4628,9 +4629,8 @@ def _finish_replace(job, target_root, wait):
 
 	The temporary file is created in the live directory, so it inherits that directory's
 	default ACL as an access ACL, which cp -af keeps when the payload has none. Portable
-	xattrs the payload lacks are removed from it and its mode is reset to the payload's
-	(removing an access ACL leaves the group bits at the old mask) before the rename.
-	Any failure is reported as 'Copy failed' and leaves the destination untouched; the
+	xattrs the payload lacks are removed from it before the rename (cp -af already set the
+	payload's mode, and with it the ACL mask, so the group bits stay right). Any failure is reported as 'Copy failed' and leaves the destination untouched; the
 	temporary file never outlives this call.
 	"""
 	row, source, dest, tmp = job
@@ -4641,7 +4641,6 @@ def _finish_replace(job, target_root, wait):
 		if not stat.S_ISREG(info.st_mode) or info.st_size != size:
 			raise RuntimeError(f'copied {info.st_size} bytes, expected {size}')
 		_remove_stale_xattrs(source, tmp)
-		os.chmod(tmp, stat.S_IMODE(os.lstat(source).st_mode))
 		reason = _unsafe_parent(target_root, dest)
 		if reason:
 			raise RuntimeError(reason)
