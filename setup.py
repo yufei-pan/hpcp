@@ -17,7 +17,6 @@ setup(
         ],
     },
     install_requires=[
-        'argparse',
 		'xxhash',
 		'multiCMD>=1.35',
     ],
