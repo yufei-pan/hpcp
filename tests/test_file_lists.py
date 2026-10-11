@@ -82,6 +82,36 @@ def test_tar_diff_file_list_is_new_or_updated_only(tmp_path, hpcp_mod, reset_hpc
 	assert set(diff.read_text().splitlines()) == {'new.txt', 'updated.txt'}
 
 
+def test_tar_diff_file_list_skips_directory_metadata_rows(tmp_path, hpcp_mod, reset_hpcp_globals):
+	"""F11: an M row for a directory would make `tar -T` archive its whole subtree; added directories stay."""
+	R = hpcp_mod.ChangeRow
+	d, f = 'd:40755:0:0:-', 'f:1:1:100644:0:0:aa:-'
+	rows = [R('A', 'newdir/', '-', d), R('A', 'newdir/f.txt', '-', f), R('M', 'olddir/', 'd:40700:0:0:-', d),
+		R('M', 'mod.txt', f, 'f:2:1:100644:0:0:bb:-'), R('M', './', 'd:40700:0:0:-', d), R('D', 'gone.txt', f, '-')]
+	out = tmp_path / 'tar.txt'
+	hpcp_mod.report_changes(rows, str(out), tar_diff_file_list=True)
+	assert set(out.read_text().splitlines()) == {'newdir/', 'newdir/f.txt', 'mod.txt'}
+
+
+@pytest.mark.parametrize('tar', [False, True])
+def test_report_changes_survives_non_utf8_names(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch, tar):
+	"""F8: the list file is written before printing, and printing a non-UTF-8 name never raises."""
+	name = os.fsdecode(b'bad\xffname')
+	rows = [hpcp_mod.ChangeRow('A', name, '-', 'l:x')]
+	out = tmp_path / 'diff.tsv'
+	strict = io.TextIOWrapper(io.BytesIO(), encoding='utf-8', errors='strict')
+	monkeypatch.setattr('sys.stdout', strict)
+	hpcp_mod.report_changes(rows, str(out), tar_diff_file_list=tar)
+	strict.flush()
+	printed = strict.buffer.getvalue()
+	monkeypatch.undo()
+	if tar:
+		assert out.read_bytes() == b'bad\xffname\n'
+	else:
+		assert hpcp_mod.read_changes(str(out)) == rows
+	assert b'bad\\xffname' in printed
+
+
 def test_hpcp_compare_file_list_with_dest(tmp_tree, hpcp_mod, reset_hpcp_globals, copy_args, require_linux):
 	tmp_tree.add_file('keep.txt', 'k', under='src')
 	tmp_tree.add_file('keep.txt', 'k', under='dst')

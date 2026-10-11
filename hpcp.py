@@ -4148,30 +4148,37 @@ def compute_changes(new_map, base_map, full_hash=False, max_workers=multiprocess
 			rows.append(ChangeRow('M', key, old_state, new_state))
 	return sort_change_rows(rows)
 
+def _printable_path(path):
+	"""path for a terminal: undecodable bytes (surrogate-escaped) shown as backslash escapes."""
+	return path.encode('utf-8', 'surrogateescape').decode('utf-8', 'backslashreplace')
+
 def report_changes(rows, diff_file_list=None, tar_diff_file_list=False):
-	"""Print the A / M / D lists and counts; optionally write diff_file_list.
+	"""Write diff_file_list (if given), then print the A / M / D lists and counts.
 
 	The file is changes.tsv format, or with tar_diff_file_list a plain newline list of
-	added / modified paths for `tar -T` (the root './' is left out).
+	added / modified paths for `tar -T`; the root './' and modified directories are left
+	out there, since tar would archive their whole subtree. The file is written first so a
+	name the terminal cannot show never costs the list.
 	"""
+	if diff_file_list:
+		if tar_diff_file_list:
+			with open(diff_file_list, 'w', encoding='utf-8', errors='surrogateescape', newline='\n') as f:
+				for row in rows:
+					if (row.op == 'A' and row.path != './') or (row.op == 'M' and not row.path.endswith('/')):
+						f.write(row.path + '\n')
+		else:
+			write_changes(diff_file_list, rows)
 	labels = (('A', 'Added (in src, not in dest)'), ('M', 'Modified'), ('D', 'Deleted (in dest, not in src)'))
 	print('-'*80)
 	for op, label in labels:
 		print(f"{label}:")
 		for row in rows:
 			if row.op == op:
-				print(row.path)
+				print(_printable_path(row.path))
 		print('-'*80)
 	for op, label in labels:
 		print(f"{label} count: {sum(1 for row in rows if row.op == op)}")
 	if diff_file_list:
-		if tar_diff_file_list:
-			with open(diff_file_list, 'w', encoding='utf-8', errors='surrogateescape', newline='\n') as f:
-				for row in rows:
-					if row.op in ('A', 'M') and row.path != './':
-						f.write(row.path + '\n')
-		else:
-			write_changes(diff_file_list, rows)
 		print(f"Diff file list written to {diff_file_list}")
 
 def _hash_hex_re():
