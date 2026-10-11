@@ -1,5 +1,6 @@
 import contextlib
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -858,6 +859,47 @@ def test_unmountable_filesystem_is_compared_as_raw_with_a_warning(hpcp_mod, monk
 	monkeypatch.setattr(hpcp_mod, 'expand_paths', lambda paths: list(paths))
 	assert hpcp_mod.process_get_disk_diff_image(['/x/new'], ['/x/old'], '/x/out', [], [], max_workers=1) is None
 	assert 'partition 1 (ext4) could not be mounted on the new and old side; comparing it as a raw area' in capsys.readouterr().err
+
+
+def _fake_generation(hpcp_mod, monkeypatch, new_parts, old_parts, in_use=None):
+	"""Stub the disk side of process_get_disk_diff_image for disks /x/new and /x/old.
+
+	Raw areas hash to their device path (so old and new always differ); returns the list of
+	hashed devices. in_use maps a partition device to _partition_in_use's answer.
+	"""
+	layouts = {'/x/new': _layout(new_parts), '/x/old': _layout(old_parts)}
+	monkeypatch.setattr(hpcp_mod, '_attach_disk', lambda path, ro, loops: path)
+	monkeypatch.setattr(hpcp_mod, 'read_disk_layout', lambda disk: layouts[disk])
+	monkeypatch.setattr(hpcp_mod, '_mountinfo_entries', lambda: [])
+	monkeypatch.setattr(hpcp_mod, '_swap_devices', lambda: set())
+	monkeypatch.setattr(hpcp_mod, '_device_number', lambda device: (7, 0))
+	monkeypatch.setattr(hpcp_mod, '_partition_in_use', lambda device, devnum, entries, swaps: (in_use or {}).get(device, ''))
+	monkeypatch.setattr(hpcp_mod, '_mount_partition', lambda *a: None)
+	monkeypatch.setattr(hpcp_mod, 'expand_paths', lambda paths: list(paths))
+	hashed = []
+	monkeypatch.setattr(hpcp_mod, '_hash_area', lambda path, offset=0, length=None: hashed.append(path) or path)
+	return hashed
+
+
+def test_raw_area_too_large_for_one_volume_suggests_a_dis_that_passes(hpcp_mod, reset_hpcp_globals, monkeypatch, capsys):
+	"""The suggested -dis is a whole number of MiB the -dis parser reads back, and it is large enough."""
+	size = (1 << 30) + 12345 * 512
+	hashed = _fake_generation(hpcp_mod, monkeypatch, {2: _part(fs_type='', size=size, device='/dev/new2')},
+		{2: _part(fs_type='', size=size, device='/dev/old2')})
+	with pytest.raises(RuntimeError, match=r'must fit in one patch volume') as error:
+		hpcp_mod.process_get_disk_diff_image(['/x/new'], ['/x/old'], '/x/out', [], [], max_workers=1, dest_image_size=256 << 20)
+	match = re.search(r'use -dis (\d+)MiB or larger$', str(error.value))
+	assert match, str(error.value)
+	suggested = hpcp_mod.format_bytes(f'{match.group(1)}MiB', to_int=True)
+	assert suggested == int(match.group(1)) << 20
+	count, volume_size = hpcp_mod._plan_dest_images(size + 440, suggested)
+	assert count == 1 or size <= int(volume_size * 0.90) - (16 << 20)
+	# One MiB less would not always do: the suggestion is rounded up, never down.
+	assert int(hpcp_mod._align_up(suggested - (1 << 20)) * 0.90) - (16 << 20) < size
+	# The planned sizes are printed before any volume is created.
+	assert re.search(r'Disk changes: 0 filesystem section\(s\), 2 raw area\(s\), 0 identity value\(s\); 0 added, 0 modified, 0 deleted; '
+		r'payload 0\.00 B, raw 1\.\d\d GiB', capsys.readouterr().out)
+	assert '/dev/new2' in hashed
 
 
 def _make_patch(hpcp_mod, tmp_path, **newer):

@@ -6005,7 +6005,8 @@ def process_get_disk_diff_image(src_paths, dest_paths, output, mount_points, loo
 	section_rows = [(number, rows) for number, _, rows in sections]
 	meta = make_disk_patch_meta(section_rows, raw_entries, new_name, base_name, full_hash)
 	print(f"Disk changes: {len(sections)} filesystem section(s), {len(raws)} raw area(s), {len(identity)} identity value(s); "
-		f"{meta['added']} added, {meta['modified']} modified, {meta['deleted']} deleted")
+		f"{meta['added']} added, {meta['modified']} modified, {meta['deleted']} deleted; "
+		f"payload {format_bytes(meta['payload_bytes'])}B, raw {format_bytes(meta['raw_bytes'])}B")
 	if not sections and not raws and not identity:
 		print(f"No differences between {sources[0]} and {bases[0]}; no patch image created.")
 		return None
@@ -6016,7 +6017,9 @@ def process_get_disk_diff_image(src_paths, dest_paths, output, mount_points, loo
 	# Same usable-space estimate as _plan_dest_images uses for split volumes.
 	if count > 1 and largest_raw > int(volume_size * 0.90) - (16 << 20):
 		needed = _align_up(int((largest_raw + (16 << 20)) / 0.90) + 1)
-		raise RuntimeError(f'Diff image error: a raw area of {format_bytes(largest_raw)}B must fit in one patch volume; use -dis {format_bytes(needed)}B or larger')
+		# Whole MiB, rounded up, in a form the -dis parser reads exactly ('M' alone is 10^6 bytes).
+		needed_mib = (needed + (1 << 20) - 1) >> 20
+		raise RuntimeError(f'Diff image error: a raw area of {format_bytes(largest_raw)}B must fit in one patch volume; use -dis {needed_mib}MiB or larger')
 	if os.geteuid() != 0:
 		print("Warning: creating a patch image usually needs root privileges (loop devices, mkfs, mount)", file=sys.stderr)
 	target_mount_point = tempfile.mkdtemp()
