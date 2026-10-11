@@ -81,11 +81,13 @@ turn mirroring off entirely.
 
 Only available on Linux (loop devices and mounts, so usually root).
 
-`-diff [PATCH.img]` compares a new tree (a directory, or a single-filesystem image with `-si`) against a base (`-d DIR` or `-di IMG`) and writes a patch image. The patch is an ordinary xfs/ext4 image, split with `-dis` like `-di` output. It holds every added or modified file **whole** at its real path, plus `.hpcp_diff/manifest` and `.hpcp_diff/changes.tsv`, which list every added, modified and deleted path with its before and after state. A moved file appears as one delete plus one add. Any metadata change (mode, owner, mtime, ACL or xattr) counts as a modification. Without a value the patch is named `DIFF_<src>_TO_<base>_<time>.img`.
+`-diff [PATCH.img]` compares a new tree (a directory, or a single-filesystem image with `-si`) against a base (`-d DIR` or `-di IMG`) and writes a patch image. The patch is an ordinary xfs/ext4 image, split with `-dis` like `-di` output. It holds every added or modified file **whole** at its real path, plus `.hpcp_diff/manifest` and `.hpcp_diff/changes.tsv`, which list every added, modified and deleted path with its before and after state. A moved file appears as one delete plus one add. A file counts as modified when its content, size, mtime, mode, owner, ACLs, file capabilities or user xattrs change; a directory when its mode, owner, ACLs or user xattrs change; a symlink when its target changes. Other xattrs (such as `trusted.*`, `security.selinux` or filesystem-internal ones) are ignored. Without a value the patch is named `DIFF_<src>_TO_<base>_<time>.img`.
 
 A `-di` image store keeps files at their absolute source path. When the base is such a store, a directory is compared only with its own subtree inside the store, and the patch uses the same layout. So `hpcp -siff patch.img -di store.img` updates the store in place, and `hpcp -siff patch.img -d /` updates the live system.
 
 `-siff PATCH.img` applies a patch to `-d DIR`, `-di IMG` or a single path. Repeat it for every `-dis` volume. It first checks every path the patch touches. If the target differs from what the patch expects, it lists the conflicts and asks `Apply anyway? [y/N]`; the default, and any non-interactive run, aborts. `-fa --force_apply` applies anyway and prints each conflict as a warning. Re-running a patch is safe because already-updated paths are skipped, and every touched path is verified afterwards.
+
+Files and symlinks are replaced atomically: the new version is written next to the old one and renamed over it, so running processes keep the old file and an interrupted apply leaves each file either old or new. A directory the patch deletes is removed only if it is empty once the patch's own deletions are done; whole trees are removed only for conflicts forced with `-fa`.
 
 An apply that is killed partway leaves directories it created private (mode 0700, owned by root) until the final metadata pass runs. Re-running the same patch then reports those directories as conflicts; re-run with `-fa` to finish.
 
@@ -100,6 +102,14 @@ M	link	l:old-target	l:new-target
 ```
 
 Paths escape `\`, tab, newline and carriage return as `\\`, `\t`, `\n`, `\r`.
+
+Limitations:
+
+- Hard links are not preserved; applying a patch breaks them.
+- Special files (FIFOs, sockets, devices) are ignored.
+- Even a small patch is an image of roughly 50 MiB.
+- Generating and applying a patch need root (loop devices, mkfs, mount).
+- Nothing else may modify the target while a patch is applied.
 
 ## Remove Extra Feature Note
 
