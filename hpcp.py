@@ -4610,6 +4610,11 @@ def build_patch_tree(rows, new_base, volume_roots, meta, max_workers=1, verbose=
 
 PatchCheck = namedtuple('PatchCheck', 'row action found reason')
 
+def _fold_name(name):
+	"""name as a case-insensitive filesystem (FAT, exFAT, HFS+) compares it: each character upper-cased when that
+	gives exactly one character, otherwise kept, so 'ß' stays apart from 'SS' as FAT keeps them."""
+	return ''.join(char.upper() if len(char.upper()) == 1 else char for char in name)
+
 def _under_removed(key, removed_names):
 	"""True when key or one of its ancestors is a name some D row will remove."""
 	parts = key.rstrip('/').split('/')
@@ -5057,7 +5062,33 @@ def _replace_with_symlink(row, link_target, dest, target_root):
 		if tmp:
 			_discard_temp(tmp)
 
-def _apply_rows(rows, volume_roots, target_root, max_workers=1, verbose=False, full_hash=False, forced_rows=(), metadata=True):
+def _holds_type(path, state):
+	"""True when path exists (its last component not followed) with the entry type of state: 'd:', 'f:' or 'l:'."""
+	try:
+		mode = os.lstat(path).st_mode
+	except OSError:
+		return False
+	return {'d': stat.S_ISDIR, 'f': stat.S_ISREG, 'l': stat.S_ISLNK}[state[0]](mode)
+
+def _same_entry(path, others):
+	"""True when path and one of others are one entry: same st_dev and st_ino (last components not followed)."""
+	try:
+		info = os.lstat(path)
+	except OSError:
+		return False
+	for other in others:
+		if other == path:
+			continue
+		try:
+			found = os.lstat(other)
+		except OSError:
+			continue
+		if (found.st_dev, found.st_ino) == (info.st_dev, info.st_ino):
+			return True
+	return False
+
+def _apply_rows(rows, volume_roots, target_root, max_workers=1, verbose=False, full_hash=False, forced_rows=(), metadata=True,
+		skipped=()):
 	"""Carry out checked rows: deletions, then directories, files, symlinks, directory metadata.
 
 	Containment of every target path is re-checked immediately before each write, and the
@@ -5068,12 +5099,17 @@ def _apply_rows(rows, volume_roots, target_root, max_workers=1, verbose=False, f
 	existing file or symlink is never removed before its replacement exists. Only an entry
 	a rename cannot replace is removed first: a directory where a file or symlink goes, or
 	a file or symlink where a directory goes.
+	skipped: the A / M rows check_patch_target found already done. When the removals took anything
+	away, each one whose target is now missing or of another type (a delete that reached it through a
+	name differing only by case, or through a symlinked directory) is written again like any row.
+	Returns those restored rows.
 	With metadata False (a FAT / exFAT / NTFS target) only content and file times are
 	written: no mode, owner, xattrs or directory metadata (new directories get the target's
 	default mode).
 	"""
 	root_norm = os.path.normpath(target_root)
 	forced_rows = set(forced_rows)
+	removed = []
 
 	def guarded(row, removing=False):
 		"""Target path for row, or None (with an error) when it must not be touched."""
@@ -5102,10 +5138,19 @@ def _apply_rows(rows, volume_roots, target_root, max_workers=1, verbose=False, f
 				os.rmdir(path)
 			else:
 				os.unlink(path)
+			removed.append(row.path)
 		except FileNotFoundError:
 			pass
 		except OSError as e:
 			eprint(f"Remove {'directory' if directory else 'file'} failed: {row.path}: {e}")
+
+	def remove_other_type(row):
+		"""Remove what a rename cannot replace: a directory where a file or symlink goes, or the reverse."""
+		if row.path == './':
+			return
+		path = guarded(row)
+		if path is not None and os.path.lexists(path) and row.new.startswith('d:') != is_real_dir(path):
+			remove(row)
 
 	def sync_dir(row):
 		"""Copy volume 1's directory metadata onto the target directory, with containment checks."""
@@ -5130,12 +5175,17 @@ def _apply_rows(rows, volume_roots, target_root, max_workers=1, verbose=False, f
 	for row in sorted(deletes, key=lambda r: (r.path.endswith('/'), -_key_depth(r.path))):
 		remove(row)
 	for row in payload:
-		if row.path == './':
-			continue
-		path = guarded(row)
-		# A rename replaces a file or symlink in place; only a type it cannot replace goes first.
-		if path is not None and os.path.lexists(path) and row.new.startswith('d:') != is_real_dir(path):
-			remove(row)
+		remove_other_type(row)
+	restored = []
+	if removed:
+		restored = [row for row in skipped if row.op != 'D' and row.path != './'
+			and not _holds_type(_key_path(target_root, row.path), row.new)]
+		for row in restored:
+			remove_other_type(row)
+		if restored:
+			print(f"Restoring {len(restored)} entr{'y' if len(restored) == 1 else 'ies'} skipped as already done that a removal "
+				f"took away, e.g. {restored[0].path}")
+		payload = payload + restored
 	dir_rows = []
 	for row in sorted((r for r in payload if r.new.startswith('d:')), key=lambda r: _key_depth(r.path)):
 		path = guarded(row)
@@ -5167,25 +5217,36 @@ def _apply_rows(rows, volume_roots, target_root, max_workers=1, verbose=False, f
 		path = guarded(row, removing=True)
 		if path is not None:
 			_replace_with_symlink(row, decode_state(row.new)['target'], path, target_root)
-	if not metadata:
-		return
-	for row in sorted(dir_rows, key=lambda r: _key_depth(r.path), reverse=True):
-		sync_dir(row)
+	if metadata:
+		for row in sorted(dir_rows, key=lambda r: _key_depth(r.path), reverse=True):
+			sync_dir(row)
+	return restored
 
 def _verify_rows(rows, target_root, compare_hash=True, full_hash=False, max_workers=1, metadata=True):
 	"""Re-read every applied path and compare with its final expected state (content only with
-	metadata False); returns the failure count."""
+	metadata False); returns the failure count.
+
+	A D row whose path still exists passes when an A / M row's name differs from it only by case
+	(_fold_name) and both paths are one entry (same st_dev / st_ino): a case-only rename on a
+	case-insensitive target, whether or not hpcp recognised the filesystem as one.
+	"""
 	final = {}
 	for row in sort_change_rows(rows):
 		# D sorts before A, so for a D + A pair on one name the A row decides the final state.
 		final[row.path.rstrip('/')] = row
 	paths = {name: _key_path(target_root, row.path) for name, row in final.items()}
 	states = _states_for_paths(set(paths.values()), full_hash=full_hash, read_xattrs=metadata, max_workers=max_workers)
+	written = {}
+	for name, row in final.items():
+		if row.op != 'D':
+			written.setdefault(_fold_name(name), []).append(paths[name])
 	failed = 0
 	for name, row in final.items():
 		expected = '-' if row.op == 'D' else row.new
 		found = states[paths[name]]
 		ok = found == '-' if expected == '-' else states_equal(found, expected, compare_hash, metadata)
+		if not ok and expected == '-' and _same_entry(paths[name], written.get(_fold_name(name), ())):
+			ok = True
 		if not ok:
 			failed += 1
 			eprint(f'Patch verify error: {row.op} {row.path}: expected {expected}, found {found}')
@@ -5252,22 +5313,19 @@ def _preflight_section(plan):
 			'a case-insensitive or aliased filesystem; applying would delete what it writes; nothing applied')
 
 def _apply_section(plan, max_workers, verbose, full_hash, compare_hash):
-	"""Apply a checked section and verify it; returns its summary."""
+	"""Apply a checked section and verify it (with the rows the repair step restored); returns its summary."""
 	conflicts = _section_conflicts(plan)
 	todo = _section_todo(plan)
-	_apply_rows(todo, plan.volume_roots, plan.target_root, max_workers, verbose, full_hash,
-		forced_rows=[check.row for check in conflicts], metadata=plan.metadata)
-	verify = todo
-	if plan.case_insensitive:
-		# A target that looks names up case-insensitively (FAT, exFAT, HFS+): an A / M row skipped as
-		# already done can still be lost to a D row on a name that differs only by case, so verify those too.
-		verify = todo + [check.row for check in plan.checks if check.action == 'skip' and check.row.op != 'D']
-	failed = _verify_rows(verify, plan.target_root, compare_hash, full_hash, max_workers, plan.metadata)
+	skipped = [check.row for check in plan.checks if check.action == 'skip' and check.row.op != 'D']
+	restored = _apply_rows(todo, plan.volume_roots, plan.target_root, max_workers, verbose, full_hash,
+		forced_rows=[check.row for check in conflicts], metadata=plan.metadata, skipped=skipped)
+	failed = _verify_rows(todo + restored, plan.target_root, compare_hash, full_hash, max_workers, plan.metadata)
 	return {
 		'deleted': sum(1 for row in todo if row.op == 'D'),
 		'added': sum(1 for row in todo if row.op == 'A'),
 		'modified': sum(1 for row in todo if row.op == 'M'),
-		'skipped': len(plan.checks) - len(todo),
+		'skipped': len(plan.checks) - len(todo) - len(restored),
+		'restored': len(restored),
 		'forced': len(conflicts),
 		'failed': failed,
 	}
@@ -6646,7 +6704,7 @@ def apply_disk_patch(volume_roots, target, mount_points, loop_devices, force=Fal
 	for name in sorted(summaries, key=lambda name: int(name[len('part'):])):
 		item = summaries[name]
 		print(f"Section {name}: deleted {item['deleted']}, added {item['added']}, modified {item['modified']}, "
-			f"skipped {item['skipped']}, forced {item['forced']}, failed {item['failed']}")
+			f"skipped {item['skipped']}, restored {item.get('restored', 0)}, forced {item['forced']}, failed {item['failed']}")
 	summary = {
 		'sections': summaries,
 		'raw_written': written,

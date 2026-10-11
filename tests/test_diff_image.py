@@ -1390,35 +1390,6 @@ def test_single_fs_apply_refuses_case_only_rename_under_a_case_insensitive_mount
 	assert _changes(hpcp_mod, new2, target2) == []
 
 
-@pytest.mark.parametrize('fs_type, verified', [('vfat', True), ('ext4', False)])
-def test_single_fs_apply_on_case_insensitive_target_verifies_rows_skipped_as_done(trees, hpcp_mod, tmp_path, reset_hpcp_globals,
-		monkeypatch, fs_type, verified):
-	"""As in disk sections with case-insensitive names: an A / M row skipped as already done that the apply then
-	loses is a verify failure on a FAT, exFAT or HFS+ target."""
-	new, base = trees
-	_write(new / 'EFI' / 'keep.efi', 'keep')
-	_write(new / 'EFI' / 'mod.efi', 'new')
-	_write(base / 'EFI' / 'mod.efi', 'old')
-	vol = tmp_path / 'vol'
-	_patch_from(hpcp_mod, new, base, [vol])
-	target = tmp_path / 'target'
-	_clone(base, target)
-	_write(target / 'EFI' / 'keep.efi', 'keep')
-	_fake_mounts(hpcp_mod, monkeypatch, (target, fs_type))
-	real_apply_rows = hpcp_mod._apply_rows
-	def losing_apply_rows(*args, **kwargs):
-		real_apply_rows(*args, **kwargs)
-		os.unlink(str(target / 'EFI' / 'keep.efi'))
-	monkeypatch.setattr(hpcp_mod, '_apply_rows', losing_apply_rows)
-	summary = hpcp_mod.apply_patch_tree([str(vol)], str(target), max_workers=1)
-	assert (target / 'EFI' / 'mod.efi').read_text() == 'new' and summary['skipped'] == 1
-	if verified:
-		assert summary['failed'] == 1
-		assert len(hpcp_mod.ERRORS) == 1 and hpcp_mod.ERRORS[0].startswith('Patch verify error: A EFI/keep.efi: expected f:')
-	else:
-		assert summary['failed'] == 0 and hpcp_mod.ERRORS == []
-
-
 def _same_entry_conflict(deleted, written):
 	return (rf'^Patch conflict: {re.escape(repr(deleted))} \(deleted\) and {re.escape(repr(written))} \(written\) are the same '
 		r'entry on the target - a case-insensitive or aliased filesystem; applying would delete what it writes; nothing applied$')
@@ -2294,3 +2265,105 @@ def test_hpcp_generates_and_applies_patch(trees, hpcp_mod, tmp_path):
 	_clone(base, target)
 	assert hpcp_mod.hpcp([], dest_paths=[str(target)], load_diff_image=[out], max_workers=2) == 0
 	assert _changes(hpcp_mod, new, target) == []
+
+
+def _restore_scenario(hpcp_mod, tmp_path):
+	"""The target spells EFI/BOOT/x.efi, and EFI/Boot is a symlink to BOOT: a lookup of EFI/Boot/x.efi finds the
+	same file, as on a case-insensitive filesystem. The patch deletes EFI/BOOT/x.efi and adds EFI/Boot/x.efi with
+	the same content (a case-only rename)."""
+	target, vol = tmp_path / 'target', tmp_path / 'vol'
+	_write(target / 'EFI' / 'BOOT' / 'x.efi', 'loader')
+	os.symlink('BOOT', str(target / 'EFI' / 'Boot'))
+	_write(vol / 'EFI' / 'Boot' / 'x.efi', 'loader')
+	state = hpcp_mod.get_entry_state
+	R = hpcp_mod.ChangeRow
+	rows = [R('D', 'EFI/BOOT/x.efi', state(str(target / 'EFI' / 'BOOT' / 'x.efi')), '-'),
+		R('A', 'EFI/Boot/x.efi', '-', state(str(vol / 'EFI' / 'Boot' / 'x.efi')))]
+	return target, vol, rows
+
+
+def test_apply_restores_a_skipped_entry_a_delete_took_away(tmp_path, hpcp_mod, reset_hpcp_globals):
+	"""The add is skipped as already done (the file is there under the other spelling), then the delete removes that
+	very file. The repair step writes the add again; verify accepts the deleted name because it is the same entry as
+	the written one, differing only by case."""
+	hpcp_mod.HASH_SIZE = 65536
+	target, vol, rows = _restore_scenario(hpcp_mod, tmp_path)
+	plan = hpcp_mod._plan_section('root', rows, [str(vol)], str(target), True, False, 1)
+	assert {check.row.path: check.action for check in plan.checks} == {'EFI/BOOT/x.efi': 'apply', 'EFI/Boot/x.efi': 'skip'}
+	summary = hpcp_mod._apply_section(plan, 1, False, False, True)
+	assert summary == {'deleted': 1, 'added': 0, 'modified': 0, 'skipped': 0, 'restored': 1, 'forced': 0, 'failed': 0}
+	assert hpcp_mod.ERRORS == []
+	assert (target / 'EFI' / 'Boot' / 'x.efi').read_text() == 'loader'
+
+
+def test_contradictory_patch_on_an_aliased_target_fails_at_verify(tmp_path, hpcp_mod, reset_hpcp_globals):
+	"""D x/f + A y/f where y is a symlink to x: names that differ by more than case. The write is restored (the content
+	is kept) and the delete's verify fails: loud, not silent."""
+	hpcp_mod.HASH_SIZE = 65536
+	target, vol = tmp_path / 'target', tmp_path / 'vol'
+	_write(target / 'x' / 'f', 'moved')
+	os.symlink('x', str(target / 'y'))
+	_write(vol / 'y' / 'f', 'moved')
+	state = hpcp_mod.get_entry_state
+	R = hpcp_mod.ChangeRow
+	rows = [R('D', 'x/f', state(str(target / 'x' / 'f')), '-'), R('A', 'y/f', '-', state(str(vol / 'y' / 'f')))]
+	plan = hpcp_mod._plan_section('root', rows, [str(vol)], str(target), True, False, 1)
+	summary = hpcp_mod._apply_section(plan, 1, False, False, True)
+	assert summary['restored'] == 1 and summary['failed'] == 1
+	assert (target / 'x' / 'f').read_text() == 'moved'
+	assert len(hpcp_mod.ERRORS) == 1 and hpcp_mod.ERRORS[0].startswith('Patch verify error: D x/f: expected -')
+
+
+def test_entry_lost_to_a_forced_type_change_is_reported(tmp_path, hpcp_mod, reset_hpcp_globals):
+	"""-fa replacing directory x with a file removes x's tree; y/g, reached through the symlink y -> x and skipped as
+	already done, goes with it and cannot be restored (y now points at a file): a failure, not a silent loss."""
+	hpcp_mod.HASH_SIZE = 65536
+	target, vol = tmp_path / 'target', tmp_path / 'vol'
+	_write(target / 'x' / 'g', 'g')
+	os.symlink('x', str(target / 'y'))
+	_write(vol / 'x', 'now a file')
+	_write(vol / 'y' / 'g', 'g')
+	state = hpcp_mod.get_entry_state
+	R = hpcp_mod.ChangeRow
+	rows = [R('A', 'x', '-', state(str(vol / 'x'))), R('A', 'y/g', '-', state(str(vol / 'y' / 'g')))]
+	plan = hpcp_mod._plan_section('root', rows, [str(vol)], str(target), True, False, 1)
+	assert {check.row.path: check.action for check in plan.checks} == {'x': 'conflict', 'y/g': 'skip'}
+	summary = hpcp_mod._apply_section(plan, 1, False, False, True)
+	assert summary['forced'] == 1 and summary['restored'] == 1 and summary['failed'] >= 1
+	assert (target / 'x').read_text() == 'now a file'
+	assert any('y/g' in error for error in hpcp_mod.ERRORS)
+
+
+def test_restore_without_a_payload_is_a_failure(tmp_path, hpcp_mod, reset_hpcp_globals):
+	"""Review Focus 2: a skipped row's payload is not pre-checked (nothing is written for it normally); when it must be
+	restored and the volume lacks it, that is an error and a verify failure."""
+	hpcp_mod.HASH_SIZE = 65536
+	target, vol, rows = _restore_scenario(hpcp_mod, tmp_path)
+	os.unlink(str(vol / 'EFI' / 'Boot' / 'x.efi'))
+	plan = hpcp_mod._plan_section('root', rows, [str(vol)], str(target), True, False, 1)
+	summary = hpcp_mod._apply_section(plan, 1, False, False, True)
+	assert summary['restored'] == 1 and summary['failed'] == 1
+	assert any(error.startswith('Incomplete patch: payload for EFI/Boot/x.efi') for error in hpcp_mod.ERRORS)
+
+
+def test_rerun_after_a_completed_apply_restores_nothing(trees, hpcp_mod, tmp_path):
+	new, base = trees
+	_write(base / 'gone.txt', 'bye')
+	_write(new / 'kept.txt', 'kept')
+	_write(base / 'kept.txt', 'kept')
+	_write(new / 'add.txt', 'add')
+	vol = tmp_path / 'vol'
+	_patch_from(hpcp_mod, new, base, [vol])
+	target = tmp_path / 'target'
+	_clone(base, target)
+	first = hpcp_mod.apply_patch_tree([str(vol)], str(target), max_workers=1)
+	assert (first['deleted'], first['added'], first['restored'], first['failed']) == (1, 1, 0, 0)
+	again = hpcp_mod.apply_patch_tree([str(vol)], str(target), max_workers=1)
+	assert (again['deleted'], again['added'], again['restored'], again['failed']) == (0, 0, 0, 0)
+
+
+def test_fold_name_keeps_names_fat_keeps_apart(hpcp_mod):
+	fold = hpcp_mod._fold_name
+	assert fold('EFI/Boot/bootx64.efi') == fold('efi/BOOT/BOOTX64.EFI') == 'EFI/BOOT/BOOTX64.EFI'
+	# 'ß'.upper() is 'SS' (two characters): kept, so 'Straße' and 'STRASSE' stay two names, as FAT keeps them.
+	assert fold('Straße') == 'STRAßE' != fold('STRASSE')

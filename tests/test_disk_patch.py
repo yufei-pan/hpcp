@@ -988,37 +988,6 @@ def test_directory_delete_matches_children_case_insensitively_on_case_insensitiv
 	assert directory_check(case_insensitive=True) == ('conflict', 'directory holds entries the patch does not delete')
 
 
-def test_content_only_verify_covers_rows_skipped_as_done(tmp_path, hpcp_mod, reset_hpcp_globals):
-	"""A row skipped as already done that the apply then loses (a D row on a name that differs only by
-	case, on FAT or HFS+) must be a verify failure in a section with case-insensitive names; other
-	sections (POSIX, NTFS) verify what they apply."""
-	hpcp_mod.HASH_SIZE = 65536
-	new, base, volume = tmp_path / 'new', tmp_path / 'base', tmp_path / 'vol'
-	_write(new / 'EFI' / 'keep.efi', 'keep')
-	_write(new / 'EFI' / 'mod.efi', 'new')
-	_write(base / 'EFI' / 'mod.efi', 'old')
-	new_map, base_map = hpcp_mod.build_root_maps(str(new), str(base), max_workers=1)
-	rows = hpcp_mod.compute_changes(new_map, base_map, max_workers=1, metadata=False)
-	assert {(row.op, row.path) for row in rows} == {('A', 'EFI/keep.efi'), ('M', 'EFI/mod.efi')}
-	shutil.copytree(str(new), str(volume))
-	for metadata, case_insensitive in ((False, True), (False, False), (True, True), (True, False)):
-		target = tmp_path / f'target-{metadata}-{case_insensitive}'
-		shutil.copytree(str(base), str(target))
-		_write(target / 'EFI' / 'keep.efi', 'keep')
-		plan = hpcp_mod._plan_section('part1', rows, [str(volume)], str(target), True, False, 1, metadata=metadata,
-			case_insensitive=case_insensitive)
-		assert {check.row.path: check.action for check in plan.checks} == {'EFI/keep.efi': 'skip', 'EFI/mod.efi': 'apply'}
-		os.unlink(str(target / 'EFI' / 'keep.efi'))
-		hpcp_mod.ERRORS.clear()
-		summary = hpcp_mod._apply_section(plan, 1, False, False, True)
-		assert (target / 'EFI' / 'mod.efi').read_text() == 'new'
-		if not case_insensitive:
-			assert summary['failed'] == 0 and hpcp_mod.ERRORS == []
-		else:
-			assert summary['failed'] == 1 and summary['skipped'] == 1
-			assert len(hpcp_mod.ERRORS) == 1 and hpcp_mod.ERRORS[0].startswith('Patch verify error: A EFI/keep.efi: expected f:')
-
-
 def test_section_preflight_refuses_a_delete_and_a_write_of_one_entry(tmp_path, hpcp_mod, reset_hpcp_globals):
 	"""Disk sections run the same pre-flight as single-filesystem patches: a section that deletes x/f and writes y/f,
 	where y is a symlink to x on the target, is refused before any section is applied, whatever its filesystem."""
