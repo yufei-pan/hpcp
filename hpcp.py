@@ -4578,15 +4578,41 @@ def _temp_sibling(dest):
 def _unsafe_parent(target_root, dest):
 	"""Why dest must not be written right now, or None.
 
-	dest must resolve inside target_root and its directory must be a real directory, not a
-	symlink (target_root itself, chosen by the user, may be one).
+	Writes follow the rule deletions follow (_inside_root): dest's parent must be a directory
+	whose real path lies inside target_root. A symlinked ancestor that resolves inside the
+	target is followed; one that leads outside it is refused.
 	"""
 	if not _inside_root(target_root, dest):
 		return f'resolves outside {target_root}'
 	parent = os.path.dirname(dest)
-	if not os.path.isdir(parent) or (os.path.islink(parent) and os.path.normpath(parent) != os.path.normpath(target_root)):
-		return f'{parent} is not a real directory'
+	if not os.path.isdir(parent):
+		return f'{parent} is not a directory'
 	return None
+
+def _rows_escaping_target(rows, target_root):
+	"""Rows whose parent directory exists now and resolves outside target_root through a symlink.
+
+	D rows are judged against the target as it is. An A or M row below a name the patch
+	first removes (a D row, or a directory row over a non-directory) is left to the
+	write-time check, like a row whose parent does not exist yet: by then that name is a
+	new directory, not the symlink it is now.
+	"""
+	replaced = {row.path.rstrip('/') for row in rows if row.op == 'D'}
+	for row in rows:
+		if row.op != 'D' and row.new.startswith('d:') and row.path != './':
+			path = _key_path(target_root, row.path)
+			if os.path.lexists(path) and (os.path.islink(path) or not os.path.isdir(path)):
+				replaced.add(row.path.rstrip('/'))
+	escaping = []
+	for row in rows:
+		if row.path == './':
+			continue
+		if row.op != 'D' and any(key.rstrip('/') in replaced for key in _parent_keys(row.path)):
+			continue
+		path = _key_path(target_root, row.path)
+		if os.path.exists(os.path.dirname(path)) and not _inside_root(target_root, path):
+			escaping.append(row)
+	return escaping
 
 def _discard_temp(path):
 	"""Remove a temporary entry that was not renamed into place; a missing one is fine."""
@@ -4810,6 +4836,9 @@ def apply_patch_tree(volume_roots, target_root, force=False, max_workers=1, verb
 	(residual race between the containment checks and the writes).
 	Files and symlinks are replaced atomically (a temporary sibling renamed over the target),
 	so running processes keep the old file and every target ends either old or new.
+	Paths are followed through symlinked directories that resolve inside target_root, for
+	deletions and writes alike; a patch that would delete or write through a symlink leading
+	outside it is refused before anything changes, even when forced.
 	Only conflicts the user forced may have a whole directory tree removed.
 	An interrupted apply leaves new directories 0700 and root-owned.
 	A hard kill mid-apply can leave new directories with default metadata (it is applied
@@ -4836,6 +4865,12 @@ def apply_patch_tree(volume_roots, target_root, force=False, max_workers=1, verb
 		if conflicts:
 			_resolve_conflicts(conflicts, force)
 		todo = [check.row for check in checks if check.action != 'skip']
+		# Not forceable: the deletes would run and the writes be refused, leaving the patch half applied.
+		escaping = _rows_escaping_target(todo, target_root)
+		if escaping:
+			for row in escaping:
+				print(f"  {row.op} {row.path!r}: resolves outside {target_root} through a symlink")
+			raise RuntimeError(f'Patch conflict: {len(escaping)} path(s) resolve outside the target through symlinks, e.g. {escaping[0].path}; nothing applied')
 		unsafe = [row for row in todo if row.op in ('A', 'M') and row.new.startswith('f:') and _payload_source(volume_roots, row) is None]
 		if unsafe:
 			raise RuntimeError(f'Incomplete patch: payload missing or unsafe for {len(unsafe)} file(s), e.g. {unsafe[0].path}; nothing applied')

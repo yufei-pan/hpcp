@@ -966,9 +966,105 @@ def test_apply_refuses_to_write_through_symlinked_parent(tmp_path, hpcp_mod, res
 	_write(vol / 'esc' / 'x.txt', 'payload')
 	rows = [hpcp_mod.ChangeRow('A', 'esc/x.txt', '-', hpcp_mod.get_entry_state(str(vol / 'esc' / 'x.txt')))]
 	hpcp_mod.write_patch_metadata([str(vol)], rows, hpcp_mod.make_patch_meta(rows, 'n', 'b', 'root'))
-	hpcp_mod.apply_patch_tree([str(vol)], str(target), force=True, max_workers=1)
+	with pytest.raises(RuntimeError, match='Patch conflict: 1 path\\(s\\) resolve outside the target'):
+		hpcp_mod.apply_patch_tree([str(vol)], str(target), force=True, max_workers=1)
 	assert not (outside / 'x.txt').exists()
-	assert any(error.startswith('Patch format error') for error in hpcp_mod.ERRORS)
+
+
+def test_apply_through_symlinked_parent_inside_target(tmp_path, hpcp_mod, reset_hpcp_globals):
+	"""G2: a symlinked directory that resolves inside the target is written through, as it is deleted through."""
+	target = tmp_path / 'target'
+	_write(target / 'real' / 'mod.txt', 'old')
+	_write(target / 'real' / 'gone.txt', 'bye')
+	os.symlink('real', target / 'link')
+	vol = tmp_path / 'vol'
+	_write(vol / 'link' / 'mod.txt', 'new content')
+	_write(vol / 'link' / 'add.txt', 'added')
+	R = hpcp_mod.ChangeRow
+	state = hpcp_mod.get_entry_state
+	rows = [
+		R('D', 'link/gone.txt', state(str(target / 'real' / 'gone.txt')), '-'),
+		R('A', 'link/add.txt', '-', state(str(vol / 'link' / 'add.txt'))),
+		R('M', 'link/mod.txt', state(str(target / 'real' / 'mod.txt')), state(str(vol / 'link' / 'mod.txt'))),
+	]
+	hpcp_mod.write_patch_metadata([str(vol)], rows, hpcp_mod.make_patch_meta(rows, 'n', 'b', 'root'))
+	summary = hpcp_mod.apply_patch_tree([str(vol)], str(target), max_workers=1)
+	assert summary['failed'] == 0 and summary['forced'] == 0
+	assert (target / 'real' / 'mod.txt').read_text() == 'new content'
+	assert (target / 'real' / 'add.txt').read_text() == 'added'
+	assert not (target / 'real' / 'gone.txt').exists()
+	assert os.readlink(str(target / 'link')) == 'real'
+	assert hpcp_mod.ERRORS == [] and _temp_leftovers(target) == []
+
+
+@pytest.mark.parametrize('force', [False, True])
+def test_apply_refuses_symlinked_parent_outside_target_up_front(tmp_path, hpcp_mod, reset_hpcp_globals, force):
+	"""G2: a delete or write through a symlink leaving the target refuses the whole patch; -fa cannot force it."""
+	outside = tmp_path / 'outside'
+	_write(outside / 'old.txt', 'secret')
+	target = tmp_path / 'target'
+	_write(target / 'keep.txt', 'keep')
+	os.symlink(str(outside), target / 'esc')
+	vol = tmp_path / 'vol'
+	_write(vol / 'esc' / 'new.txt', 'payload')
+	R = hpcp_mod.ChangeRow
+	rows = [
+		R('D', 'esc/old.txt', hpcp_mod.get_entry_state(str(outside / 'old.txt')), '-'),
+		R('A', 'esc/new.txt', '-', hpcp_mod.get_entry_state(str(vol / 'esc' / 'new.txt'))),
+	]
+	hpcp_mod.write_patch_metadata([str(vol)], rows, hpcp_mod.make_patch_meta(rows, 'n', 'b', 'root'))
+	if force:
+		# Make the D row a conflict, so -fa really forces something before the refusal.
+		_write(outside / 'old.txt', 'changed since the patch was made')
+	before = _snapshot(target)
+	with pytest.raises(RuntimeError, match=r'Patch conflict: 2 path\(s\) resolve outside the target through symlinks'):
+		hpcp_mod.apply_patch_tree([str(vol)], str(target), force=force, max_workers=1)
+	assert (outside / 'old.txt').exists() and not (outside / 'new.txt').exists()
+	assert _snapshot(target) == before
+
+
+@pytest.mark.parametrize('case', ['patch_deletes_link', 'forced_over_link'])
+def test_apply_replaces_an_outside_symlink_with_a_directory(trees, hpcp_mod, tmp_path, case):
+	"""G2 guard: rows below a symlink the patch removes first are judged after that removal, not through the old link.
+
+	patch_deletes_link: the base had the symlink (D data + A data/). forced_over_link: the
+	target has a symlink where the patch adds a directory, and the conflict is forced.
+	"""
+	new, base = trees
+	outside = tmp_path / 'outside'
+	outside.mkdir()
+	if case == 'patch_deletes_link':
+		os.symlink(str(outside), base / 'data')
+	_write(new / 'data' / 'f.txt', 'now a real directory')
+	vol = tmp_path / 'vol'
+	rows, _ = _patch_from(hpcp_mod, new, base, [vol])
+	expected = {('A', 'data/'), ('A', 'data/f.txt')}
+	assert _ops(rows) == (expected | {('D', 'data')} if case == 'patch_deletes_link' else expected)
+	target = tmp_path / 'target'
+	_clone(base, target)
+	if case == 'forced_over_link':
+		os.symlink(str(outside), target / 'data')
+	summary = hpcp_mod.apply_patch_tree([str(vol)], str(target), force=case == 'forced_over_link', max_workers=1)
+	assert summary['failed'] == 0
+	assert summary['forced'] == (1 if case == 'forced_over_link' else 0)
+	assert (target / 'data').is_dir() and not (target / 'data').is_symlink()
+	assert os.listdir(str(outside)) == []
+	assert _changes(hpcp_mod, new, target) == []
+
+
+def test_unsafe_parent_allows_only_directories_inside_the_target(tmp_path, hpcp_mod):
+	"""G2: the write-time check follows a symlinked parent that stays inside the target, and nothing else."""
+	target = tmp_path / 'target'
+	(target / 'real').mkdir(parents=True)
+	(tmp_path / 'outside').mkdir()
+	os.symlink('real', target / 'link')
+	os.symlink(str(tmp_path / 'outside'), target / 'esc')
+	_write(target / 'file', 'f')
+	assert hpcp_mod._unsafe_parent(str(target), str(target / 'real' / 'x')) is None
+	assert hpcp_mod._unsafe_parent(str(target), str(target / 'link' / 'x')) is None
+	assert 'resolves outside' in hpcp_mod._unsafe_parent(str(target), str(target / 'esc' / 'x'))
+	assert 'not a directory' in hpcp_mod._unsafe_parent(str(target), str(target / 'file' / 'x'))
+	assert 'not a directory' in hpcp_mod._unsafe_parent(str(target), str(target / 'missing' / 'x'))
 
 
 def test_apply_store_layout_leaves_other_trees(tmp_path, hpcp_mod, reset_hpcp_globals):
