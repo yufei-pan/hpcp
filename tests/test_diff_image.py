@@ -717,10 +717,10 @@ def test_payload_check_reports_incomplete_and_changed_files_together(trees, hpcp
 
 
 @pytest.mark.parametrize('full_hash', [False, True])
-def test_payload_check_hashes_like_the_rows(trees, hpcp_mod, tmp_path, full_hash):
+def test_payload_check_hashes_like_the_rows(trees, hpcp_mod, tmp_path, monkeypatch, full_hash):
 	"""The payload is hashed with the rows' settings: a change outside the hashed tail is caught only with a full hash."""
 	new, base = trees
-	hpcp_mod.HASH_SIZE = 16
+	monkeypatch.setattr(hpcp_mod, 'HASH_SIZE', 16)
 	_write(new / 'live.log', b'H' * 64)
 	new_map, base_map = hpcp_mod.build_root_maps(str(new), str(base), max_workers=1)
 	rows = hpcp_mod.compute_changes(new_map, base_map, full_hash=full_hash, max_workers=1)
@@ -1465,9 +1465,9 @@ def test_apply_hash_algo_mismatch_still_applies(trees, hpcp_mod, tmp_path, capsy
 
 def test_apply_restores_hash_size_after_exception(trees, hpcp_mod, tmp_path, monkeypatch):
 	new, base = trees
-	hpcp_mod.HASH_SIZE = 65536
+	monkeypatch.setattr(hpcp_mod, 'HASH_SIZE', 65536)
 	vol, target = _conflicted(hpcp_mod, new, base, tmp_path)
-	hpcp_mod.HASH_SIZE = 1234
+	monkeypatch.setattr(hpcp_mod, 'HASH_SIZE', 1234)
 	monkeypatch.setattr(sys, 'stdin', _FakeStdin(False))
 	with pytest.raises(RuntimeError, match='Patch conflict'):
 		hpcp_mod.apply_patch_tree([str(vol)], str(target), max_workers=1)
@@ -1564,9 +1564,9 @@ def test_apply_rejects_missing_patch_id_and_bad_hash_size(trees, hpcp_mod, tmp_p
 	assert _snapshot(target) == before and (target / 'mod.txt').read_text() == 'local edit'
 
 
-def test_apply_full_hash_same_size_same_mtime_change(trees, hpcp_mod, tmp_path):
+def test_apply_full_hash_same_size_same_mtime_change(trees, hpcp_mod, tmp_path, monkeypatch):
 	new, base = trees
-	hpcp_mod.HASH_SIZE = 4
+	monkeypatch.setattr(hpcp_mod, 'HASH_SIZE', 4)
 	_write(new / 'big.bin', b'N' + b'x' * 200000)
 	_write(base / 'big.bin', b'O' + b'x' * 200000)
 	for root in (new, base):
