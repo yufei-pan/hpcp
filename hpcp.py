@@ -664,6 +664,10 @@ def _call_with_worker_init(func, *args, **kwargs):
 		_worker_initialized = True
 	# ERRORS is process-local. Send failures back through the future instead of
 	# leaving the parent to report success after a worker logged a failed copy.
+	return _call_raising_recorded_failures(func, *args, **kwargs)
+
+def _call_raising_recorded_failures(func, *args, **kwargs):
+	"""Run func; the failures it records in ERRORS are taken out of ERRORS and raised as one RuntimeError."""
 	error_start = len(ERRORS)
 	try:
 		result = func(*args, **kwargs)
@@ -673,7 +677,8 @@ def _call_with_worker_init(func, *args, **kwargs):
 			raise RuntimeError('\n'.join(failures))
 		return result
 	finally:
-		# A reused worker must not carry this task's errors into its next job.
+		# A reused worker must not carry this task's errors into its next job;
+		# an in-process caller reports the raised failures itself.
 		del ERRORS[error_start:]
 
 #%% -- Exclude --
@@ -4358,12 +4363,12 @@ def _under_removed(key, removed_names):
 	return any('/'.join(parts[:index]) in removed_names for index in range(1, len(parts) + 1))
 
 def _unlisted_children(key, path, deleted_keys):
-	"""Children of directory path whose keys are not in deleted_keys."""
+	"""Children of directory path whose keys are not in deleted_keys; None when path cannot be listed."""
 	prefix = '' if key == './' else key
 	try:
 		names = os.listdir(path)
 	except OSError:
-		return []
+		return None
 	unlisted = []
 	for name in names:
 		child = os.path.join(path, name)
@@ -4377,7 +4382,8 @@ def check_patch_target(rows, target_root, compare_hash=True, full_hash=False, ma
 
 	D: target == old -> apply; absent, or already the replacing A row's state -> skip.
 	A: absent -> apply; == new -> skip. M: == old -> apply; == new -> skip.
-	Anything else is a conflict, as is a D directory holding entries the patch does not delete.
+	Anything else is a conflict, as is a D directory holding entries the patch does not
+	delete or one that cannot be listed.
 	A and M rows are judged as the target will be after the applicable D rows: a name a D
 	row removes (with or without the trailing '/'), and everything below it, counts as absent.
 	"""
@@ -4401,7 +4407,11 @@ def check_patch_target(rows, target_root, compare_hash=True, full_hash=False, ma
 		removed_names.add(row.path.rstrip('/'))
 		if not states_equal(found, row.old, compare_hash):
 			checks[row] = PatchCheck(row, 'conflict', found, 'changed on target')
-		elif found.startswith('d:') and _unlisted_children(row.path, paths[row.path], deleted_keys):
+			continue
+		unlisted = _unlisted_children(row.path, paths[row.path], deleted_keys) if found.startswith('d:') else []
+		if unlisted is None:
+			checks[row] = PatchCheck(row, 'conflict', found, 'cannot list directory')
+		elif unlisted:
 			checks[row] = PatchCheck(row, 'conflict', found, 'directory holds entries the patch does not delete')
 		else:
 			checks[row] = PatchCheck(row, 'apply', found, '')
@@ -4525,8 +4535,8 @@ def _inside_root(root, path):
 	parent_real = os.path.realpath(os.path.dirname(path))
 	return parent_real == root_real or parent_real.startswith(root_real.rstrip(os.sep) + os.sep)
 
-def _payload_location(volume_roots, row):
-	"""(volume root, path) of row's payload in the first volume holding a safe copy, else None.
+def _payload_source(volume_roots, row):
+	"""Path of row's payload in the first volume holding a safe copy, else None.
 
 	Safe means inside its volume root (no symlinked parent), a regular non-symlink file
 	of the recorded size.
@@ -4539,23 +4549,120 @@ def _payload_location(volume_roots, row):
 		except OSError:
 			continue
 		if stat.S_ISREG(info.st_mode) and info.st_size == size and _inside_root(volume_root, source):
-			return volume_root, source
+			return source
 	return None
 
-def _payload_source(volume_roots, row):
-	"""Path of row's safe payload file, or None."""
-	location = _payload_location(volume_roots, row)
-	return location[1] if location else None
+_TEMP_PREFIX = '.hpcp_tmp_'
 
-def _apply_rows(rows, volume_roots, target_root, max_workers=1, verbose=False, full_hash=False):
+def _temp_sibling(dest):
+	"""A fresh temporary name in dest's directory (no basename in it, so NAME_MAX cannot overflow)."""
+	return os.path.join(os.path.dirname(dest), _TEMP_PREFIX + uuid.uuid4().hex[:16])
+
+def _unsafe_parent(target_root, dest):
+	"""Why dest must not be written right now, or None.
+
+	dest must resolve inside target_root and its directory must be a real directory, not a
+	symlink (target_root itself, chosen by the user, may be one).
+	"""
+	if not _inside_root(target_root, dest):
+		return f'resolves outside {target_root}'
+	parent = os.path.dirname(dest)
+	if not os.path.isdir(parent) or (os.path.islink(parent) and os.path.normpath(parent) != os.path.normpath(target_root)):
+		return f'{parent} is not a real directory'
+	return None
+
+def _discard_temp(path):
+	"""Remove a temporary entry that was not renamed into place; a missing one is fine."""
+	try:
+		os.unlink(path)
+	except FileNotFoundError:
+		pass
+	except OSError as e:
+		print(f"Warning: cannot remove temporary file {path}: {e}", file=sys.stderr)
+
+def _finish_replace(job, target_root, wait):
+	"""Wait for one temporary copy, check it, and rename it over its destination.
+
+	Any failure is reported as 'Copy failed' and leaves the destination untouched; the
+	temporary file never outlives this call.
+	"""
+	row, dest, tmp = job
+	try:
+		wait()
+		size = decode_state(row.new)['size']
+		info = os.lstat(tmp)
+		if not stat.S_ISREG(info.st_mode) or info.st_size != size:
+			raise RuntimeError(f'copied {info.st_size} bytes, expected {size}')
+		reason = _unsafe_parent(target_root, dest)
+		if reason:
+			raise RuntimeError(reason)
+		os.replace(tmp, dest)
+	except Exception as e:
+		eprint(f'Copy failed: {row.path}: {e}')
+	finally:
+		_discard_temp(tmp)
+
+def _replace_files(files, target_root, max_workers=1, verbose=False, full_hash=False):
+	"""Copy each (row, source, dest) to a temporary sibling of dest, then rename it over dest.
+
+	copy_file (cp -af) preserves mode, owner, times and xattrs, and the temporary file is
+	new, so it carries no stale xattrs. Copies run on a process pool, or serially when
+	max_workers <= 1. A running process keeps the old inode, an interruption leaves dest
+	fully old or fully new, and hard links to the old file are broken.
+	"""
+	jobs = []
+	for row, source, dest in files:
+		reason = _unsafe_parent(target_root, dest)
+		if reason:
+			eprint(f'Copy failed: {row.path}: {reason}; skipped')
+			continue
+		jobs.append((row, source, dest, _temp_sibling(dest)))
+	if not jobs:
+		return
+	print(f"Copying {len(jobs)} file(s) with {max(1, max_workers)} worker(s)")
+	if max_workers <= 1 or len(jobs) == 1:
+		for row, source, dest, tmp in jobs:
+			_finish_replace((row, dest, tmp), target_root,
+				functools.partial(_call_raising_recorded_failures, copy_file, source, [tmp], full_hash, verbose))
+		return
+	with ProcessPoolExecutor(max_workers=max_workers) as executor:
+		futures = {executor.submit(_call_with_worker_init, copy_file, source, [tmp], full_hash, verbose): (row, dest, tmp)
+			for row, source, dest, tmp in jobs}
+		for future in concurrent.futures.as_completed(futures):
+			_finish_replace(futures[future], target_root, future.result)
+
+def _replace_with_symlink(row, link_target, dest, target_root):
+	"""Create the symlink at a temporary sibling of dest and rename it over dest."""
+	tmp = None
+	try:
+		reason = _unsafe_parent(target_root, dest)
+		if reason:
+			raise RuntimeError(reason)
+		tmp = _temp_sibling(dest)
+		os.symlink(link_target, tmp)
+		reason = _unsafe_parent(target_root, dest)
+		if reason:
+			raise RuntimeError(reason)
+		os.replace(tmp, dest)
+	except (OSError, RuntimeError) as e:
+		eprint(f'Failed to create symbolic link: {row.path}: {e}')
+	finally:
+		if tmp:
+			_discard_temp(tmp)
+
+def _apply_rows(rows, volume_roots, target_root, max_workers=1, verbose=False, full_hash=False, forced_rows=()):
 	"""Carry out checked rows: deletions, then directories, files, symlinks, directory metadata.
 
 	Containment of every target path is re-checked immediately before each write, and the
-	target root itself is never removed. Existing regular files are overwritten in place by
-	the copy (so an interrupted apply leaves un-copied files in their old state); files with
-	several hard links are unlinked first so the content is never written through a link.
+	target root itself is never removed. A directory is removed with rmdir, so an entry that
+	appeared after the check survives (and verify reports the row); only a row in
+	forced_rows (a conflict the user forced) may remove a whole tree. Files and symlinks are
+	built at a temporary sibling and renamed over the target (see _replace_files), so an
+	existing file or symlink is never removed first; only a directory standing where a file
+	or symlink goes is.
 	"""
 	root_norm = os.path.normpath(target_root)
+	forced_rows = set(forced_rows)
 
 	def guarded(row, removing=False):
 		"""Target path for row, or None (with an error) when it must not be touched."""
@@ -4568,33 +4675,37 @@ def _apply_rows(rows, volume_roots, target_root, max_workers=1, verbose=False, f
 			return None
 		return path
 
+	def is_real_dir(path):
+		return os.path.isdir(path) and not os.path.islink(path)
+
 	def remove(row):
+		"""Unlink row's target, rmdir it, or (forced rows only) remove its whole tree."""
 		path = guarded(row, removing=True)
 		if path is None:
 			return
+		directory = is_real_dir(path)
 		try:
-			_remove_entry(path)
+			if directory and row in forced_rows:
+				shutil.rmtree(path)
+			elif directory:
+				os.rmdir(path)
+			else:
+				os.unlink(path)
+		except FileNotFoundError:
+			pass
 		except OSError as e:
-			eprint(f'Remove file failed: {row.path}: {e}')
-
-	def has_new_type(row, path):
-		"""True when the existing entry already has the row's new file/directory type."""
-		if os.path.islink(path):
-			return False
-		if row.new.startswith('d:'):
-			return os.path.isdir(path)
-		return row.new.startswith('f:') and os.path.isfile(path)
+			eprint(f"Remove {'directory' if directory else 'file'} failed: {row.path}: {e}")
 
 	def sync_dir(row):
 		"""Copy volume 1's directory metadata onto the target directory, with containment checks."""
 		path = guarded(row)
 		if path is None:
 			return
-		if row.path != './' and (os.path.islink(path) or not os.path.isdir(path)):
+		if row.path != './' and not is_real_dir(path):
 			eprint(f'Patch format error: {row.path} is not a real directory on the target; metadata skipped')
 			return
 		source = _key_path(volume_roots[0], row.path)
-		if row.path != './' and (os.path.islink(source) or not os.path.isdir(source) or not _inside_root(volume_roots[0], source)):
+		if row.path != './' and (not is_real_dir(source) or not _inside_root(volume_roots[0], source)):
 			eprint(f'Patch format error: directory metadata source for {row.path} is not a real directory in volume 1; skipped')
 			return
 		try:
@@ -4611,7 +4722,8 @@ def _apply_rows(rows, volume_roots, target_root, max_workers=1, verbose=False, f
 		if row.path == './':
 			continue
 		path = guarded(row)
-		if path is not None and os.path.lexists(path) and not has_new_type(row, path):
+		# A rename replaces a file or symlink in place; only a type it cannot replace goes first.
+		if path is not None and os.path.lexists(path) and row.new.startswith('d:') != is_real_dir(path):
 			remove(row)
 	dir_rows = []
 	for row in sorted((r for r in payload if r.new.startswith('d:')), key=lambda r: _key_depth(r.path)):
@@ -4624,43 +4736,25 @@ def _apply_rows(rows, volume_roots, target_root, max_workers=1, verbose=False, f
 			eprint(f'Copy failed: {row.path}: {e}')
 			continue
 		dir_rows.append(row)
-	by_volume = {}
+	files = []
 	for row in payload:
-		if not row.new.startswith('f:') or guarded(row) is None:
+		if not row.new.startswith('f:'):
 			continue
-		location = _payload_location(volume_roots, row)
-		if location is None:
+		path = guarded(row)
+		if path is None:
+			continue
+		source = _payload_source(volume_roots, row)
+		if source is None:
 			eprint(f'Incomplete patch: payload for {row.path} is missing or unsafe in every volume')
 			continue
-		by_volume.setdefault(location[0], []).append((location[1], row))
-	for volume_root, entries in by_volume.items():
-		for _, row in entries:
-			path = _key_path(target_root, row.path)
-			try:
-				info = os.lstat(path)
-			except OSError:
-				continue
-			if stat.S_ISREG(info.st_mode) and info.st_nlink > 1:
-				remove(row)
-		try:
-			copy_file_list_parallel([source for source, _ in entries], [], volume_root, [target_root], max(1, max_workers), full_hash=full_hash, verbose=verbose)
-		except RuntimeError as e:
-			eprint(f'Copy failed: {e}')
-			continue
-		for source, row in entries:
-			path = _key_path(target_root, row.path)
-			if os.path.isfile(path) and not os.path.islink(path):
-				_remove_stale_xattrs(source, path)
+		files.append((row, source, path))
+	_replace_files(files, target_root, max_workers, verbose, full_hash)
 	for row in payload:
 		if not row.new.startswith('l:') or row.path == './':
 			continue
 		path = guarded(row, removing=True)
-		if path is None:
-			continue
-		try:
-			_place_symlink(decode_state(row.new)['target'], path)
-		except OSError as e:
-			eprint(f'Failed to create symbolic link: {row.path}: {e}')
+		if path is not None:
+			_replace_with_symlink(row, decode_state(row.new)['target'], path, target_root)
 	for row in sorted(dir_rows, key=lambda r: _key_depth(r.path), reverse=True):
 		sync_dir(row)
 
@@ -4689,6 +4783,9 @@ def apply_patch_tree(volume_roots, target_root, force=False, max_workers=1, verb
 	for a malformed or incomplete patch, or when conflicts are not overridden.
 	Another process modifying the target concurrently during an apply is out of scope
 	(residual race between the containment checks and the writes).
+	Files and symlinks are replaced atomically (a temporary sibling renamed over the target),
+	so running processes keep the old file and every target ends either old or new.
+	Only conflicts the user forced may have a whole directory tree removed.
 	An interrupted apply leaves new directories 0700 and root-owned.
 	A hard kill mid-apply can leave new directories with default metadata (it is applied
 	only after every write); the re-run then reports those A rows as conflicts and needs -fa.
@@ -4717,7 +4814,8 @@ def apply_patch_tree(volume_roots, target_root, force=False, max_workers=1, verb
 		unsafe = [row for row in todo if row.op in ('A', 'M') and row.new.startswith('f:') and _payload_source(volume_roots, row) is None]
 		if unsafe:
 			raise RuntimeError(f'Incomplete patch: payload missing or unsafe for {len(unsafe)} file(s), e.g. {unsafe[0].path}; nothing applied')
-		_apply_rows(todo, volume_roots, target_root, max_workers, verbose, full_hash)
+		_apply_rows(todo, volume_roots, target_root, max_workers, verbose, full_hash,
+			forced_rows=[check.row for check in conflicts])
 		failed = _verify_rows(todo, target_root, compare_hash, full_hash, max_workers)
 	finally:
 		HASH_SIZE = saved_hash_size

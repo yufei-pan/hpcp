@@ -661,18 +661,135 @@ def _build_scenario(new, base):
 		_write(new / name, name)
 
 
-def test_apply_patch_tree_round_trip(trees, hpcp_mod, tmp_path):
-	"""Success criterion + Review Focus 3, 4, 5."""
+def _temp_leftovers(root):
+	return [os.path.join(d, n) for d, dirs, files in os.walk(str(root)) for n in dirs + files if n.startswith('.hpcp_tmp_')]
+
+
+@pytest.mark.parametrize('workers', [1, 2])
+def test_apply_patch_tree_round_trip(trees, hpcp_mod, tmp_path, workers):
+	"""Success criterion + Review Focus 3, 4, 5; workers=2 runs the copies on a process pool."""
 	new, base = trees
 	_build_scenario(new, base)
 	vol = tmp_path / 'vol'
 	_patch_from(hpcp_mod, new, base, [vol])
 	target = tmp_path / 'target'
 	_clone(base, target)
-	summary = hpcp_mod.apply_patch_tree([str(vol)], str(target), max_workers=1)
+	summary = hpcp_mod.apply_patch_tree([str(vol)], str(target), max_workers=workers)
 	assert summary['failed'] == 0 and summary['forced'] == 0
 	assert _changes(hpcp_mod, new, target) == []
 	assert hpcp_mod.ERRORS == []
+	assert _temp_leftovers(target) == []
+
+
+def test_apply_replaces_files_atomically(trees, hpcp_mod, tmp_path):
+	"""F1: a process holding the old file keeps the old inode and content; no temp file is left."""
+	new, base = trees
+	_write(new / 'lib.so', 'new library')
+	_write(base / 'lib.so', 'old library')
+	vol = tmp_path / 'vol'
+	_patch_from(hpcp_mod, new, base, [vol])
+	target = tmp_path / 'target'
+	_clone(base, target)
+	with open(str(target / 'lib.so'), 'rb') as held:
+		old_inode = os.fstat(held.fileno()).st_ino
+		summary = hpcp_mod.apply_patch_tree([str(vol)], str(target), max_workers=1)
+		held.seek(0)
+		assert held.read() == b'old library'
+	assert summary['failed'] == 0
+	assert os.stat(str(target / 'lib.so')).st_ino != old_inode
+	assert (target / 'lib.so').read_text() == 'new library'
+	assert _temp_leftovers(target) == []
+
+
+@pytest.mark.parametrize('failure', ['raises', 'short'])
+def test_failed_copy_keeps_destination_and_leaves_no_temp(trees, hpcp_mod, tmp_path, monkeypatch, failure):
+	"""F1: a cp that dies mid-write (or writes the wrong size) never touches the live file."""
+	new, base = trees
+	_write(new / 'mod.txt', 'new content')
+	_write(base / 'mod.txt', 'old')
+	vol = tmp_path / 'vol'
+	_patch_from(hpcp_mod, new, base, [vol])
+	target = tmp_path / 'target'
+	_clone(base, target)
+	real_run = hpcp_mod.run_command_in_multicmd_with_path_check
+
+	def broken_cp(command, *args, **kwargs):
+		if command and os.path.basename(str(command[0])) == 'cp':
+			with open(command[-1], 'wb') as f:
+				f.write(b'partial')
+			if failure == 'raises':
+				raise RuntimeError('simulated cp failure')
+			return []
+		return real_run(command, *args, **kwargs)
+
+	monkeypatch.setattr(hpcp_mod, 'run_command_in_multicmd_with_path_check', broken_cp)
+	summary = hpcp_mod.apply_patch_tree([str(vol)], str(target), max_workers=1)
+	assert summary['failed'] == 1
+	assert (target / 'mod.txt').read_text() == 'old'
+	assert _temp_leftovers(target) == []
+	assert any(error.startswith('Copy failed: mod.txt') for error in hpcp_mod.ERRORS)
+
+
+def test_apply_places_symlinks_through_a_temp_name(trees, hpcp_mod, tmp_path, monkeypatch):
+	"""F1: a symlink is created beside its target and renamed over it, never removed first."""
+	new, base = trees
+	os.symlink('new-target', new / 'ln')
+	os.symlink('old-target', base / 'ln')
+	vol = tmp_path / 'vol'
+	_patch_from(hpcp_mod, new, base, [vol])
+	target = tmp_path / 'target'
+	_clone(base, target)
+	real_symlink = os.symlink
+	created = []
+
+	def recording_symlink(src, dst, *args, **kwargs):
+		created.append(os.path.basename(str(dst)))
+		return real_symlink(src, dst, *args, **kwargs)
+
+	monkeypatch.setattr(os, 'symlink', recording_symlink)
+	summary = hpcp_mod.apply_patch_tree([str(vol)], str(target), max_workers=1)
+	monkeypatch.setattr(os, 'symlink', real_symlink)
+	assert summary['failed'] == 0
+	assert os.readlink(str(target / 'ln')) == 'new-target'
+	assert created and all(name.startswith('.hpcp_tmp_') for name in created)
+	assert _temp_leftovers(target) == []
+
+
+def test_unforced_directory_delete_keeps_late_entries(tmp_path, hpcp_mod, reset_hpcp_globals):
+	"""F3: an entry that appears after the check survives a non-forced D of its directory."""
+	_, dstate, _ = _states(hpcp_mod, tmp_path)
+	target = tmp_path / 'target'
+	_write(target / 'olddir' / 'late.txt', 'created after the check')
+	row = hpcp_mod.ChangeRow('D', 'olddir/', dstate, '-')
+	hpcp_mod._apply_rows([row], [str(tmp_path / 'vol')], str(target))
+	assert (target / 'olddir' / 'late.txt').read_text() == 'created after the check'
+	assert any(error.startswith('Remove directory failed') for error in hpcp_mod.ERRORS)
+	hpcp_mod.ERRORS.clear()
+	hpcp_mod._apply_rows([row], [str(tmp_path / 'vol')], str(target), forced_rows={row})
+	assert not (target / 'olddir').exists()
+	assert hpcp_mod.ERRORS == []
+
+
+def test_unlistable_directory_delete_is_a_conflict(trees, hpcp_mod, tmp_path, monkeypatch):
+	"""F3: a listdir failure is not 'no children'."""
+	new, base = trees
+	_write(base / 'olddir' / 'a.txt', 'a')
+	rows = _changes(hpcp_mod, new, base)
+	target = tmp_path / 'target'
+	_clone(base, target)
+	real_listdir = os.listdir
+	blocked = str(target / 'olddir')
+
+	def failing_listdir(path='.'):
+		if os.path.normpath(str(path)) == blocked:
+			raise PermissionError(13, 'Permission denied', blocked)
+		return real_listdir(path)
+
+	monkeypatch.setattr(os, 'listdir', failing_listdir)
+	checks = {(check.row.op, check.row.path): check for check in hpcp_mod.check_patch_target(rows, str(target))}
+	monkeypatch.setattr(os, 'listdir', real_listdir)
+	assert checks[('D', 'olddir/')].action == 'conflict'
+	assert checks[('D', 'olddir/')].reason == 'cannot list directory'
 
 
 def test_apply_patch_tree_is_idempotent(trees, hpcp_mod, tmp_path):
@@ -924,21 +1041,13 @@ def test_apply_rerun_after_interrupted_copy(trees, hpcp_mod, tmp_path, monkeypat
 	_patch_from(hpcp_mod, new, base, [vol])
 	target = tmp_path / 'target'
 	_clone(base, target)
-	real = hpcp_mod.copy_file_list_parallel
-	calls = []
-
-	def flaky(*args, **kwargs):
-		calls.append(1)
-		if len(calls) == 1:
-			raise RuntimeError('simulated copy failure')
-		return real(*args, **kwargs)
-
-	monkeypatch.setattr(hpcp_mod, 'copy_file_list_parallel', flaky)
+	restore = _break_copies(hpcp_mod, monkeypatch)
 	monkeypatch.setattr(sys, 'stdin', _FakeStdin(False))
 	first = hpcp_mod.apply_patch_tree([str(vol)], str(target), max_workers=1)
 	assert first['failed'] > 0
 	assert (target / 'mod.txt').read_text() == 'old'
-	monkeypatch.setattr(hpcp_mod, 'copy_file_list_parallel', real)
+	assert _temp_leftovers(target) == []
+	restore()
 	second = hpcp_mod.apply_patch_tree([str(vol)], str(target), max_workers=1)
 	assert second['failed'] == 0 and second['forced'] == 0
 	assert _changes(hpcp_mod, new, target) == []
@@ -1051,18 +1160,15 @@ def test_apply_breaks_hard_links_instead_of_writing_through(trees, hpcp_mod, tmp
 	assert ext.read_text() == 'old'
 
 
-def _fail_first_copy(hpcp_mod, monkeypatch):
-	real = hpcp_mod.copy_file_list_parallel
-	calls = []
+def _break_copies(hpcp_mod, monkeypatch):
+	"""Make every apply-side copy_file call raise (max_workers=1 copies in-process); returns restore()."""
+	real = hpcp_mod.copy_file
 
-	def flaky(*args, **kwargs):
-		calls.append(1)
-		if len(calls) == 1:
-			raise RuntimeError('simulated copy failure')
-		return real(*args, **kwargs)
+	def broken(*args, **kwargs):
+		raise RuntimeError('simulated copy failure')
 
-	monkeypatch.setattr(hpcp_mod, 'copy_file_list_parallel', flaky)
-	return real
+	monkeypatch.setattr(hpcp_mod, 'copy_file', broken)
+	return lambda: monkeypatch.setattr(hpcp_mod, 'copy_file', real)
 
 
 def test_interrupted_copy_keeps_old_xattrs(trees, hpcp_mod, tmp_path, monkeypatch):
@@ -1075,11 +1181,11 @@ def test_interrupted_copy_keeps_old_xattrs(trees, hpcp_mod, tmp_path, monkeypatc
 	_clone(base, target)
 	_set_xattr_or_skip(str(target / 'm.txt'), 'user.tag', b'1')
 	# the base side carries the xattr too, so the patch is a plain content change
-	real = _fail_first_copy(hpcp_mod, monkeypatch)
+	restore = _break_copies(hpcp_mod, monkeypatch)
 	first = hpcp_mod.apply_patch_tree([str(vol)], str(target), force=True, max_workers=1)
 	assert first['failed'] > 0
 	assert 'user.tag' in os.listxattr(str(target / 'm.txt'))
-	monkeypatch.setattr(hpcp_mod, 'copy_file_list_parallel', real)
+	restore()
 	second = hpcp_mod.apply_patch_tree([str(vol)], str(target), force=True, max_workers=1)
 	assert second['failed'] == 0
 	assert (target / 'm.txt').read_text() == 'new content'
@@ -1093,14 +1199,14 @@ def test_directory_metadata_applied_after_files(trees, hpcp_mod, tmp_path, monke
 	_patch_from(hpcp_mod, new, base, [vol])
 	target = tmp_path / 'target'
 	_clone(base, target)
-	real = hpcp_mod.copy_file_list_parallel
+	real = hpcp_mod.copy_file
 	modes = []
 
 	def recording(*args, **kwargs):
 		modes.append(stat.S_IMODE(os.stat(target / 'secret').st_mode))
 		return real(*args, **kwargs)
 
-	monkeypatch.setattr(hpcp_mod, 'copy_file_list_parallel', recording)
+	monkeypatch.setattr(hpcp_mod, 'copy_file', recording)
 	summary = hpcp_mod.apply_patch_tree([str(vol)], str(target), max_workers=1)
 	assert summary['failed'] == 0
 	assert modes and all(mode == 0o700 for mode in modes)
