@@ -11,7 +11,7 @@ Tested on a Lustre filesystem with 1.5 PB capacity running on 180 HDDs. Compared
 
 Basic functionality (parallel copy) should be stable.
 
-Imaging functionality (source/destination as `.img` files) will be extended with differential image support (differential backup). Imaging is only available on Linux—similar to `tar`, but uses disk images.
+Imaging functionality (source/destination as `.img` files) includes differential patch images (`-diff` / `-siff`, see below). Imaging is only available on Linux—similar to `tar`, but uses disk images.
 
 Block-image functionality is in **beta**. Only available on Linux. Possible use case: cloning a currently running OS without mounting `/` as read-only.
 
@@ -77,6 +77,30 @@ Size-dependent values are scaled rather than copied, so `-ddr` resizes stay vali
 parameter set, `hpcp` warns and retries with defaults rather than failing the copy. Use `-nfp` to
 turn mirroring off entirely.
 
+## Patch Images Feature Note
+
+Only available on Linux (loop devices and mounts, so usually root).
+
+`-diff [PATCH.img]` compares a new tree (a directory, or a single-filesystem image with `-si`) against a base (`-d DIR` or `-di IMG`) and writes a patch image. The patch is an ordinary xfs/ext4 image, split with `-dis` like `-di` output. It holds every added or modified file **whole** at its real path, plus `.hpcp_diff/manifest` and `.hpcp_diff/changes.tsv`, which list every added, modified and deleted path with its before and after state. A moved file appears as one delete plus one add. Any metadata change (mode, owner, mtime, ACL or xattr) counts as a modification. Without a value the patch is named `DIFF_<src>_TO_<base>_<time>.img`.
+
+A `-di` image store keeps files at their absolute source path. When the base is such a store, a directory is compared only with its own subtree inside the store, and the patch uses the same layout. So `hpcp -siff patch.img -di store.img` updates the store in place, and `hpcp -siff patch.img -d /` updates the live system.
+
+`-siff PATCH.img` applies a patch to `-d DIR`, `-di IMG` or a single path. Repeat it for every `-dis` volume. It first checks every path the patch touches. If the target differs from what the patch expects, it lists the conflicts and asks `Apply anyway? [y/N]`; the default, and any non-interactive run, aborts. `-fa --force_apply` applies anyway and prints each conflict as a warning. Re-running a patch is safe because already-updated paths are skipped, and every touched path is verified afterwards.
+
+An apply that is killed partway leaves directories it created private (mode 0700, owned by root) until the final metadata pass runs. Re-running the same patch then reports those directories as conflicts; re-run with `-fa` to finish.
+
+`changes.tsv` is also what `-dfl` writes:
+
+```
+#hpcp-changes	1
+#op	path	old	new
+D	gone.txt	f:<size>:<mtime_ns>:<mode>:<uid>:<gid>:<hash>:<xattr>	-
+A	newdir/	-	d:<mode>:<uid>:<gid>:<xattr>
+M	link	l:old-target	l:new-target
+```
+
+Paths escape `\`, tab, newline and carriage return as `\\`, `\t`, `\n`, `\r`.
+
 ## Remove Extra Feature Note
 
 `-rme --remove_extra`: Especially when combined with `-rf`, **PLEASE PAY CLOSE ATTENTION TO YOUR TARGET DIRECTORY!**  
@@ -98,9 +122,10 @@ usage: hpcp.py [-h] [-s] [-j MAX_WORKERS] [-b | -nb] [-v] [-do] [-nds] [-fh]
                [-nhfl] [-rm] [-rf] [-rme] [-rwloff] [-e EXCLUDE]
                [-x EXCLUDE_FILE] [-nlt] [-V] [-pfl] [-si SRC_IMAGE]
                [-siff LOAD_DIFF_IMAGE] [-d DEST_PATH] [-rds] [-di DEST_IMAGE]
-               [-dis DEST_IMAGE_SIZE] [-diff] [-dd] [-ddr DD_RESIZE] [-nfp]
-               [-L RATE_LIMIT] [-F FILE_RATE_LIMIT] [-tfs TARGET_FILE_SYSTEM]
-               [-ncd] [-co] [-ctl COMMAND_TIMEOUT_LIMIT] [-enes]
+               [-dis DEST_IMAGE_SIZE] [-diff [GET_DIFF_IMAGE]] [-fa] [-dd]
+               [-ddr DD_RESIZE] [-nfp] [-L RATE_LIMIT] [-F FILE_RATE_LIMIT]
+               [-tfs TARGET_FILE_SYSTEM] [-ncd] [-co]
+               [-ctl COMMAND_TIMEOUT_LIMIT] [-enes]
                [src_path ...]
 
 Copy files from source to destination
@@ -175,8 +200,10 @@ options:
                         Source Image, mount the image and copy the files from
                         it.
   -siff, --load_diff_image LOAD_DIFF_IMAGE
-                        Not implemented. Load diff images and apply the
-                        changes to the destination.
+                        Apply a patch image made by -diff to the target (-d /
+                        -di or a single path). Repeat for each -dis volume.
+                        Every path the patch touches is checked first;
+                        conflicts prompt before being overridden.
   -d, -C, --dest_path DEST_PATH
                         Destination Path
   -rds, --random_dest_selection
@@ -192,10 +219,16 @@ options:
                         Destination Image Size, specify the size of the
                         destination image to split into. Default is 0 (No
                         split). Example: {10TiB} or {1G}
-  -diff, --get_diff_image
-                        Not implemented. Compare the source and destination
-                        file list, create a diff image of that will update the
-                        destination to source.
+  -diff, --get_diff_image [GET_DIFF_IMAGE]
+                        Generate a patch image that updates the base (-d /
+                        -di) to the source (src_path / -si): added and
+                        modified files in full plus a change list under
+                        .hpcp_diff/. Optionally name the output; default
+                        DIFF_<src>_TO_<base>_<time>.img. Honors -dis, -fh, -hs
+                        and -e.
+  -fa, --force_apply    With -siff, apply even when the target differs from
+                        the state the patch expects. Conflicts are still
+                        printed as warnings.
   -dd, --disk_dump      Disk to Disk mirror, use this if you are backuping /
                         deploying an OS from / to a disk. Require 1 source,
                         can be 1 src_path or 1 -si src_image, require 1 -di
@@ -239,4 +272,23 @@ options:
                         instead of continuing (Note: Default is continue as in
                         compressed fs copy can be down even if source is
                         bigger than free space).
+
+Found bins: ['/usr/sbin/mkswap', '/usr/sbin/exfatlabel',
+'/usr/sbin/reiserfstune', '/usr/sbin/jfs_tune', '/usr/sbin/fsck.minix',
+'/usr/sbin/sgdisk', '/usr/sbin/debugreiserfs', '/usr/bin/ntfsinfo',
+'/usr/sbin/fsck.hfsplus', '/usr/sbin/mkfs.minix', '/usr/bin/udfinfo',
+'/usr/sbin/mkfs.ntfs', '/usr/bin/cp', '/usr/bin/truncate',
+'/usr/sbin/mkfs.xfs', '/usr/sbin/mkudffs', '/usr/sbin/mkfs.bfs',
+'/usr/sbin/fsck.jfs', '/usr/sbin/tune2fs', '/usr/sbin/mkfs.exfat',
+'/usr/sbin/dumpe2fs', '/usr/sbin/udflabel', '/usr/sbin/fsck.reiserfs',
+'/usr/sbin/mkfs.btrfs', '/usr/bin/dd', '/usr/sbin/swaplabel',
+'/usr/sbin/losetup', '/usr/sbin/e2fsck', '/usr/bin/ntfsfix',
+'/usr/bin/umount', '/usr/sbin/xfs_admin', '/usr/sbin/mkfs.reiserfs',
+'/usr/bin/mount', '/usr/sbin/dump.f2fs', '/usr/sbin/fsck.hfs',
+'/usr/sbin/xfs_repair', '/usr/sbin/mkfs.f2fs', '/usr/sbin/mkfs.vfat',
+'/usr/sbin/fsck.exfat', '/usr/sbin/fsck.fat', '/usr/bin/btrfs',
+'/usr/bin/lsblk', '/usr/sbin/blkid', '/usr/sbin/mkfs.hfsplus',
+'/usr/sbin/dump.exfat', '/usr/sbin/fsck.f2fs', '/usr/sbin/mkfs',
+'/usr/sbin/xfs_info', '/usr/sbin/mkfs.jfs'] Missing bins: {'newfs',
+'fsck.ufs', 'xcopy'}
 ```
