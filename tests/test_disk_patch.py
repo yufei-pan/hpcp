@@ -434,3 +434,16 @@ def test_partition_in_use_reasons(tmp_path, hpcp_mod):
 	assert check('/dev/sda4', (8, 4)) == 'active swap'
 	assert check('/dev/sda7', (8, 7)) == 'held by another device'
 	assert check('/dev/sda8', (8, 8)) == ''
+
+
+def test_malformed_mountinfo_line_is_skipped_not_fatal(tmp_path, hpcp_mod):
+	"""One bad line must not drop the mounts listed after it (the in-use check would fail open)."""
+	path = tmp_path / 'mountinfo'
+	path.write_text('\n'.join([
+		'36 25 8:3 / / rw,relatime shared:1 - ext4 /dev/sda3 rw',
+		'41 36 X:Y / /bad rw - ext4 /dev/sdz rw',
+		'39 36 8:5 / /mnt/with\\040space ro,relatime - ext4 /dev/sda5 ro',
+	]) + '\n')
+	entries = hpcp_mod._mountinfo_entries(str(path))
+	assert [entry['mount_point'] for entry in entries] == ['/', '/mnt/with space']
+	assert hpcp_mod._live_mount((8, 5), entries) == ('/mnt/with space', True)

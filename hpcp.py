@@ -5440,11 +5440,15 @@ def _mountinfo_entries(mountinfo_path='/proc/self/mountinfo'):
 	"""Parsed mountinfo lines (an empty list when the file cannot be read)."""
 	entries = []
 	try:
-		with open(mountinfo_path, encoding='utf-8', errors='surrogateescape') as f:
-			for line in f:
-				fields = line.split()
-				if '-' not in fields or len(fields) < 7:
-					continue
+		f = open(mountinfo_path, encoding='utf-8', errors='surrogateescape')
+	except OSError:
+		return entries
+	with f:
+		for line in f:
+			fields = line.split()
+			if '-' not in fields or len(fields) < 7:
+				continue
+			try:
 				separator = fields.index('-')
 				major, _, minor = fields[2].partition(':')
 				entries.append({
@@ -5453,8 +5457,8 @@ def _mountinfo_entries(mountinfo_path='/proc/self/mountinfo'):
 					'fstype': fields[separator + 1] if len(fields) > separator + 1 else '',
 					'source': _unescape_mount(fields[separator + 2]) if len(fields) > separator + 2 else '',
 				})
-	except (OSError, ValueError):
-		pass
+			except (ValueError, IndexError):
+				continue
 	return entries
 
 def _device_number(device):
