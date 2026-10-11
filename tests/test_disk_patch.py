@@ -857,6 +857,9 @@ def test_unmountable_filesystem_is_compared_as_raw_with_a_warning(hpcp_mod, monk
 	monkeypatch.setattr(hpcp_mod, '_mount_partition', lambda *a: None)
 	monkeypatch.setattr(hpcp_mod, '_hash_area', lambda *a: 'h')
 	monkeypatch.setattr(hpcp_mod, 'expand_paths', lambda paths: list(paths))
+	monkeypatch.setattr(hpcp_mod, '_swap_devices', lambda: set())
+	monkeypatch.setattr(hpcp_mod, '_device_number', lambda device: (7, 0))
+	monkeypatch.setattr(hpcp_mod, '_partition_in_use', lambda device, devnum, entries, swaps: '')
 	assert hpcp_mod.process_get_disk_diff_image(['/x/new'], ['/x/old'], '/x/out', [], [], max_workers=1) is None
 	assert 'partition 1 (ext4) could not be mounted on the new and old side; comparing it as a raw area' in capsys.readouterr().err
 
@@ -876,9 +879,42 @@ def _fake_generation(hpcp_mod, monkeypatch, new_parts, old_parts, in_use=None):
 	monkeypatch.setattr(hpcp_mod, '_partition_in_use', lambda device, devnum, entries, swaps: (in_use or {}).get(device, ''))
 	monkeypatch.setattr(hpcp_mod, '_mount_partition', lambda *a: None)
 	monkeypatch.setattr(hpcp_mod, 'expand_paths', lambda paths: list(paths))
+	def must_not_build(*args, **kwargs):
+		raise AssertionError('a stubbed generation must not create a patch image')
+	monkeypatch.setattr(hpcp_mod, '_claim_volume_names', must_not_build)
+	monkeypatch.setattr(hpcp_mod, 'create_image', must_not_build)
 	hashed = []
 	monkeypatch.setattr(hpcp_mod, '_hash_area', lambda path, offset=0, length=None: hashed.append(path) or path)
 	return hashed
+
+
+@pytest.mark.parametrize('busy, side', [('/dev/new2', '/x/new'), ('/dev/old2', '/x/old')])
+def test_in_use_raw_area_is_refused_before_anything_is_hashed(hpcp_mod, reset_hpcp_globals, monkeypatch, busy, side):
+	"""An LVM PV holding the live root would be hashed and copied in full, then fail as changed."""
+	new_parts = {2: _part(fs_type='', size=1 << 20, device='/dev/new2'), 4: _part(fs_type='swap', device='/dev/new4')}
+	old_parts = {2: _part(fs_type='', size=1 << 20, device='/dev/old2'), 4: _part(fs_type='swap', device='/dev/old4')}
+	hashed = _fake_generation(hpcp_mod, monkeypatch, new_parts, old_parts, in_use={busy: 'held by another device'})
+	with pytest.raises(RuntimeError, match=rf'^Disk in use: partition 2 of {side} is held by another device; a raw area cannot be copied while it is in use'):
+		hpcp_mod.process_get_disk_diff_image(['/x/new'], ['/x/old'], '/x/out', [], [], max_workers=1)
+	assert hashed == []
+
+
+def test_active_swap_and_unchanged_raw_areas_are_not_refused(hpcp_mod, reset_hpcp_globals, monkeypatch):
+	"""Swap is identity-only, so an active swap partition never blocks generation."""
+	new_parts = {4: _part(fs_type='swap', device='/dev/new4')}
+	old_parts = {4: _part(fs_type='swap', device='/dev/old4')}
+	_fake_generation(hpcp_mod, monkeypatch, new_parts, old_parts, in_use={'/dev/new4': 'active swap', '/dev/old4': 'active swap'})
+	monkeypatch.setattr(hpcp_mod, '_hash_area', lambda *a, **k: 'same')
+	assert hpcp_mod.process_get_disk_diff_image(['/x/new'], ['/x/old'], '/x/out', [], [], max_workers=1) is None
+
+
+def test_unmountable_in_use_filesystem_is_refused_as_a_raw_area(hpcp_mod, reset_hpcp_globals, monkeypatch):
+	new_parts = {1: _part(fs_type='ext4', device='/dev/new1')}
+	old_parts = {1: _part(fs_type='ext4', device='/dev/old1')}
+	hashed = _fake_generation(hpcp_mod, monkeypatch, new_parts, old_parts, in_use={'/dev/new1': 'held by another device'})
+	with pytest.raises(RuntimeError, match=r'^Disk in use: partition 1 of /x/new is held by another device'):
+		hpcp_mod.process_get_disk_diff_image(['/x/new'], ['/x/old'], '/x/out', [], [], max_workers=1)
+	assert hashed == []
 
 
 def test_raw_area_too_large_for_one_volume_suggests_a_dis_that_passes(hpcp_mod, reset_hpcp_globals, monkeypatch, capsys):

@@ -5894,6 +5894,16 @@ def _partition_changes(new_root, old_root, mount_points, live_mounts, exclude, f
 	_validate_patch_rows(rows)
 	return rows
 
+def _refuse_raw_in_use(number, disks, entries, swaps):
+	"""Raise 'Disk in use' when partition number, to be compared as a raw area, is in use on any
+	of disks ([(name, layout)]): a raw area that changes while it is hashed and copied fails late,
+	after a full copy. Swap partitions are identity-only and never come here."""
+	for name, layout in disks:
+		device = layout['parts'][number]['device']
+		reason = _partition_in_use(device, _device_number(device), entries, swaps)
+		if reason:
+			raise RuntimeError(f'Disk in use: partition {number} of {name} is {reason}; a raw area cannot be copied while it is in use; generate from an offline copy')
+
 def _is_identity_change(row, kinds):
 	"""A disk.tsv row whose value the patch would set on a target."""
 	if row.old == row.new:
@@ -5962,6 +5972,11 @@ def process_get_disk_diff_image(src_paths, dest_paths, output, mount_points, loo
 	if problems:
 		raise RuntimeError('Disk layout mismatch: ' + '; '.join(problems) + '; re-clone instead')
 	entries = _mountinfo_entries()
+	swaps = _swap_devices()
+	disks = ((sources[0], new_layout), (bases[0], old_layout))
+	for number in sorted(new_layout['parts']):
+		if _default_kind(new_layout['parts'][number]) == 'raw':
+			_refuse_raw_in_use(number, disks, entries, swaps)
 	kinds, sections, raws = {}, [], []
 	for number in sorted(new_layout['parts']):
 		new_part, old_part = new_layout['parts'][number], old_layout['parts'][number]
@@ -5984,6 +5999,7 @@ def process_get_disk_diff_image(src_paths, dest_paths, output, mount_points, loo
 						_release_mount(root, mount_points)
 				failed = ' and '.join(side for side, root in (('new', new_root), ('old', old_root)) if not root)
 				print(f"Warning: partition {number} ({new_part['fs_type']}) could not be mounted on the {failed} side; comparing it as a raw area", file=sys.stderr)
+				_refuse_raw_in_use(number, disks, entries, swaps)
 				kind = 'raw'
 		if kind == 'raw':
 			if new_part['size'] != old_part['size']:
