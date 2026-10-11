@@ -1286,26 +1286,91 @@ def test_spelled_on_disk_reads_the_targets_own_spelling(tmp_path, hpcp_mod):
 	assert hpcp_mod._spelled_on_disk(str(tmp_path), 'EFI/missing', listings) is None
 
 
+def _spelling_rows(hpcp_mod, target, vol):
+	state = hpcp_mod.get_entry_state
+	R = hpcp_mod.ChangeRow
+	return [R('D', 'EFI/BOOT/x.efi', state(str(target / 'EFI' / 'BOOT' / 'x.efi')), '-'),
+		R('A', 'EFI/Boot/x.efi', '-', state(str(vol / 'EFI' / 'Boot' / 'x.efi')))]
+
+
+def _spelling_actions(hpcp_mod, rows, target, case_insensitive):
+	checks = hpcp_mod.check_patch_target(rows, str(target), case_insensitive=case_insensitive)
+	return {check.row.path: (check.action, check.reason) for check in checks}
+
+
 def test_case_insensitive_planning_writes_where_a_differently_spelled_name_is_deleted(tmp_path, hpcp_mod, reset_hpcp_globals):
-	"""On FAT the add of EFI/Boot/x.efi finds the old file under the other spelling. Matched case-insensitively, the
-	delete of EFI/BOOT/x.efi removes that name first, so the add counts as absent: a write, not an 'already exists'
-	conflict. (A case-sensitive test directory holds both spellings to show the matching.)"""
+	"""On FAT the add of EFI/Boot/x.efi finds the old file under the other spelling. When the target agrees (the
+	A name is missing, or is the very entry the D row removes), the delete removes that name first, so the add
+	counts as absent: a write, not an 'already exists' conflict."""
+	hpcp_mod.HASH_SIZE = 65536
+	vol = tmp_path / 'vol'
+	_write(vol / 'EFI' / 'Boot' / 'x.efi', 'new content')
+	missing = tmp_path / 'missing'
+	_write(missing / 'EFI' / 'BOOT' / 'x.efi', 'old')
+	aliased = tmp_path / 'aliased'
+	_write(aliased / 'EFI' / 'BOOT' / 'x.efi', 'old')
+	os.makedirs(str(aliased / 'EFI' / 'Boot'))
+	os.link(str(aliased / 'EFI' / 'BOOT' / 'x.efi'), str(aliased / 'EFI' / 'Boot' / 'x.efi'))
+	for target in (missing, aliased):
+		rows = _spelling_rows(hpcp_mod, target, vol)
+		assert _spelling_actions(hpcp_mod, rows, target, True) == {'EFI/BOOT/x.efi': ('apply', ''), 'EFI/Boot/x.efi': ('apply', '')}
+	rows = _spelling_rows(hpcp_mod, missing, vol)
+	assert _spelling_actions(hpcp_mod, rows, aliased, False)['EFI/Boot/x.efi'] == ('conflict', 'already exists on target')
+
+
+def test_fold_equal_names_the_filesystem_keeps_apart_are_not_treated_as_removed(tmp_path, hpcp_mod, reset_hpcp_globals):
+	"""The fold may equate names the kernel keeps distinct (iocharset=utf8, exFAT upcase tables). A D row on one
+	must not make a locally modified, distinct entry on the other count as absent."""
 	hpcp_mod.HASH_SIZE = 65536
 	target, vol = tmp_path / 'target', tmp_path / 'vol'
 	_write(target / 'EFI' / 'BOOT' / 'x.efi', 'old')
-	_write(target / 'EFI' / 'Boot' / 'x.efi', 'old')
+	_write(target / 'EFI' / 'Boot' / 'x.efi', 'locally modified')
 	_write(vol / 'EFI' / 'Boot' / 'x.efi', 'new content')
-	state = hpcp_mod.get_entry_state
-	R = hpcp_mod.ChangeRow
-	rows = [R('D', 'EFI/BOOT/x.efi', state(str(target / 'EFI' / 'BOOT' / 'x.efi')), '-'),
-		R('A', 'EFI/Boot/x.efi', '-', state(str(vol / 'EFI' / 'Boot' / 'x.efi')))]
+	rows = _spelling_rows(hpcp_mod, target, vol)
+	assert _spelling_actions(hpcp_mod, rows, target, True) == {'EFI/BOOT/x.efi': ('apply', ''),
+		'EFI/Boot/x.efi': ('conflict', 'already exists on target')}
 
-	def actions(case_insensitive):
-		checks = hpcp_mod.check_patch_target(rows, str(target), case_insensitive=case_insensitive)
-		return {check.row.path: (check.action, check.reason) for check in checks}
 
-	assert actions(True) == {'EFI/BOOT/x.efi': ('apply', ''), 'EFI/Boot/x.efi': ('apply', '')}
-	assert actions(False)['EFI/Boot/x.efi'] == ('conflict', 'already exists on target')
+def test_spelled_on_disk_prefers_the_exact_component(tmp_path, hpcp_mod):
+	for name in ('BOOT', 'Boot', 'boot'):
+		_write(tmp_path / 'EFI' / name / 'x.efi', name)
+	for _ in range(5):
+		assert hpcp_mod._spelled_on_disk(str(tmp_path), 'EFI/Boot/x.efi', {}) == 'EFI/Boot/x.efi'
+		assert hpcp_mod._spelled_on_disk(str(tmp_path), 'EFI/BOOT', {}) == 'EFI/BOOT'
+
+
+@requires_root_and_disk_tools
+@pytest.mark.root
+@pytest.mark.loop
+@pytest.mark.parametrize('new_content', [True, False])
+def test_case_only_rename_under_a_parent_the_node_spells_differently_applies_once(tmp_path, hpcp_mod, reset_hpcp_globals, new_content):
+	"""A 9.67 node keeps EFI/BOOT while the golden spells EFI/Boot. D EFI/Boot/grubx64.efi + A EFI/Boot/GRUBX64.EFI
+	renames only the file: the run applies, and a re-run sees it done (both rows skipped) however the node spells the parent."""
+	hpcp_mod.HASH_SIZE = 65536
+	image, vol = tmp_path / 'esp.img', tmp_path / 'vol'
+	with open(str(image), 'wb') as f:
+		f.truncate(32 << 20)
+	_run('mkfs.vfat', str(image))
+	with _mounted(str(image)) as root:
+		_write(os.path.join(root, 'EFI', 'BOOT', 'grubx64.efi'), 'old-binary')
+		state = hpcp_mod.get_entry_state
+		old = state(os.path.join(root, 'EFI', 'BOOT', 'grubx64.efi'))
+		_write(vol / 'EFI' / 'Boot' / 'GRUBX64.EFI', 'new-binary' if new_content else 'old-binary')
+		R = hpcp_mod.ChangeRow
+		rows = [R('D', 'EFI/Boot/grubx64.efi', old, '-'), R('A', 'EFI/Boot/GRUBX64.EFI', '-', state(str(vol / 'EFI' / 'Boot' / 'GRUBX64.EFI')))]
+
+		def run():
+			plan = hpcp_mod._plan_section('part1', rows, [str(vol)], root, True, False, 1, metadata=False, case_insensitive=True)
+			actions = [check.action for check in plan.checks]
+			return actions, hpcp_mod._apply_section(plan, 1, False, False, True)
+
+		actions, summary = run()
+		assert actions == ['apply', 'apply'] and summary['failed'] == 0 and (summary['deleted'], summary['added']) == (1, 1)
+		with open(os.path.join(root, 'EFI', 'BOOT', 'GRUBX64.EFI'), 'rb') as f:
+			assert f.read() == (b'new-binary' if new_content else b'old-binary')
+		actions, summary = run()
+		assert actions == ['skip', 'skip'] and summary['failed'] == 0 and (summary['deleted'], summary['added'], summary['modified']) == (0, 0, 0)
+	assert hpcp_mod.ERRORS == []
 
 
 def test_hfsx_is_case_sensitive(tmp_path, hpcp_mod):

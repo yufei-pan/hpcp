@@ -4615,22 +4615,38 @@ def _fold_name(name):
 	gives exactly one character, otherwise kept, so 'ß' stays apart from 'SS' as FAT keeps them."""
 	return ''.join(char.upper() if len(char.upper()) == 1 else char for char in name)
 
-def _under_removed(key, removed_names):
-	"""True when key or one of its ancestors is a name some D row will remove."""
+def _under_removed(key, removed, target_root='', case_insensitive=False):
+	"""True when key or one of its ancestors is a name some D row will remove.
+
+	removed maps each removed name (folded when case_insensitive) to [(exact name, target path)]. A name that
+	matches only after folding counts when the filesystem agrees: the key's own prefix is missing on the
+	target, or is the very entry the D row removes (a fold may equate names the filesystem keeps apart).
+	"""
 	parts = key.rstrip('/').split('/')
-	return any('/'.join(parts[:index]) in removed_names for index in range(1, len(parts) + 1))
+	for index in range(1, len(parts) + 1):
+		prefix = '/'.join(parts[:index])
+		for name, path in removed.get(_fold_name(prefix) if case_insensitive else prefix, ()):
+			if name == prefix:
+				return True
+			own = _key_path(target_root, prefix)
+			if not os.path.lexists(own) or _same_entry(own, [path]):
+				return True
+	return False
 
 def _spelled_on_disk(target_root, name, listings):
-	"""name (a key without its trailing '/') as the target spells it, each component matched with _fold_name;
-	None when a component is missing. listings caches {directory: {folded name: name}}."""
+	"""name (a key without its trailing '/') as the target spells it; None when a component is missing. A component
+	the directory lists exactly is used as is; otherwise it is matched with _fold_name. listings caches
+	{directory: (set of names, {folded name: name})}."""
 	directory, spelled = os.path.normpath(target_root), []
 	for part in name.split('/'):
 		if directory not in listings:
 			try:
-				listings[directory] = {_fold_name(entry): entry for entry in os.listdir(directory)}
+				names = os.listdir(directory)
 			except OSError:
-				listings[directory] = {}
-		entry = listings[directory].get(_fold_name(part))
+				names = []
+			listings[directory] = (set(names), {_fold_name(entry): entry for entry in names})
+		names, folded = listings[directory]
+		entry = part if part in names else folded.get(_fold_name(part))
 		if entry is None:
 			return None
 		spelled.append(entry)
@@ -4679,7 +4695,7 @@ def check_patch_target(rows, target_root, compare_hash=True, full_hash=False, ma
 	deleted_keys = {fold(row.path) for row in rows if row.op == 'D'}
 	listings = {}
 	checks = {}
-	removed_names = set()
+	removed_names = {}
 	for row in rows:
 		if row.op != 'D':
 			continue
@@ -4687,8 +4703,12 @@ def check_patch_target(rows, target_root, compare_hash=True, full_hash=False, ma
 		found = states[paths[row.path]]
 		replacement = added_by_name.get(fold(name))
 		if replacement is not None and replacement.path.rstrip('/') != name:
-			# A case-only rename: only the target's own spelling shows whether it already happened.
-			if _spelled_on_disk(target_root, name, listings) != replacement.path.rstrip('/'):
+			# A case-only rename: the target's own spelling shows whether it already happened. Only the
+			# components the two rows spell differently count: the node may spell the others its own way.
+			spelled = _spelled_on_disk(target_root, name, listings)
+			added = replacement.path.rstrip('/')
+			if spelled is None or any(on_disk != new for on_disk, old, new in zip(spelled.split('/'), name.split('/'), added.split('/'))
+					if old != new):
 				replacement = None
 		if found == '-':
 			checks[row] = PatchCheck(row, 'skip', found, 'already absent')
@@ -4696,7 +4716,7 @@ def check_patch_target(rows, target_root, compare_hash=True, full_hash=False, ma
 		if replacement is not None and same(found, replacement.new):
 			checks[row] = PatchCheck(row, 'skip', found, 'already replaced')
 			continue
-		removed_names.add(fold(name))
+		removed_names.setdefault(fold(name), []).append((name, paths[row.path]))
 		if not same(found, row.old):
 			checks[row] = PatchCheck(row, 'conflict', found, 'changed on target')
 			continue
@@ -4710,7 +4730,7 @@ def check_patch_target(rows, target_root, compare_hash=True, full_hash=False, ma
 	for row in rows:
 		if row.op == 'D':
 			continue
-		found = '-' if _under_removed(fold(row.path), removed_names) else states[paths[row.path]]
+		found = '-' if _under_removed(row.path, removed_names, target_root, case_insensitive) else states[paths[row.path]]
 		if row.op == 'A':
 			if found == '-':
 				checks[row] = PatchCheck(row, 'apply', found, '')
@@ -5283,7 +5303,7 @@ def _verify_rows(rows, target_root, compare_hash=True, full_hash=False, max_work
 	return failed
 
 # metadata False: a content-only section (see states_equal). case_insensitive: the target looks names
-# up case-insensitively (FAT, exFAT, HFS+; see _has_case_insensitive_names).
+# up case-insensitively (FAT, exFAT, HFS+ but not HFSX; see _has_case_insensitive_names).
 SectionPlan = namedtuple('SectionPlan', 'name volume_roots target_root rows checks metadata case_insensitive')
 
 @contextlib.contextmanager
