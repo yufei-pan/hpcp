@@ -1080,3 +1080,125 @@ def test_apply_rows_symlink_pass_never_replaces_root(tmp_path, hpcp_mod, reset_h
 	rows = [hpcp_mod.ChangeRow('M', './', dstate, 'l:elsewhere')]
 	hpcp_mod._apply_rows(rows, [str(tmp_path / 'vol')], str(target))
 	assert target.is_dir() and not target.is_symlink() and (target / 'keep.txt').exists()
+
+
+_IMAGE_TOOLS = ('losetup', 'mkfs.ext4', 'mount', 'umount', 'lsblk')
+requires_root_and_image_tools = pytest.mark.skipif(
+	os.name == 'nt' or os.geteuid() != 0 or any(shutil.which(tool) is None for tool in _IMAGE_TOOLS),
+	reason='patch image tests need root and losetup/mkfs.ext4/mount/umount/lsblk')
+
+
+@contextlib.contextmanager
+def _mount_session(hpcp_mod):
+	mount_points, loop_devices = [], []
+	try:
+		yield mount_points, loop_devices
+	finally:
+		hpcp_mod.clean_up(mount_points, loop_devices)
+
+
+def _sha256(path):
+	digest = hashlib.sha256()
+	with open(path, 'rb') as f:
+		for chunk in iter(lambda: f.read(1 << 20), b''):
+			digest.update(chunk)
+	return digest.hexdigest()
+
+
+def test_process_get_diff_image_no_differences_creates_nothing(trees, hpcp_mod, tmp_path):
+	new, base = trees
+	_write(new / 'same.txt', 's')
+	_write(base / 'same.txt', 's')
+	out = tmp_path / 'patch.img'
+	assert hpcp_mod.process_get_diff_image([str(new)], None, [str(base)], None, str(out), [], [], max_workers=1) is None
+	assert not out.exists()
+
+
+def test_process_get_diff_image_refuses_existing_output(trees, hpcp_mod, tmp_path):
+	new, base = trees
+	_write(new / 'a.txt', 'a')
+	out = tmp_path / 'patch.img'
+	out.write_text('keep me')
+	with pytest.raises(RuntimeError, match='already exists'):
+		hpcp_mod.process_get_diff_image([str(new)], None, [str(base)], None, str(out), [], [], max_workers=1)
+	assert out.read_text() == 'keep me'
+
+
+def test_process_get_diff_image_refuses_reserved_name(trees, hpcp_mod, tmp_path):
+	new, base = trees
+	_write(new / '.hpcp_diff' / 'x', 'x')
+	with pytest.raises(RuntimeError, match='reserves'):
+		hpcp_mod.process_get_diff_image([str(new)], None, [str(base)], None, str(tmp_path / 'p.img'), [], [], max_workers=1)
+
+
+@requires_root_and_image_tools
+@pytest.mark.root
+@pytest.mark.loop
+def test_dir_patch_image_round_trip(trees, hpcp_mod, tmp_path):
+	new, base = trees
+	_build_scenario(new, base)
+	out = str(tmp_path / 'patch.img')
+	with _mount_session(hpcp_mod) as (mount_points, loop_devices):
+		assert hpcp_mod.process_get_diff_image([str(new)], None, [str(base)], None, out, mount_points, loop_devices, max_workers=2) == out
+	target = tmp_path / 'target'
+	_clone(base, target)
+	with _mount_session(hpcp_mod) as (mount_points, loop_devices):
+		summary = hpcp_mod.process_load_diff_image([out], [], [str(target)], None, mount_points, loop_devices, max_workers=2)
+	assert summary['failed'] == 0
+	assert _changes(hpcp_mod, new, target) == []
+
+
+@requires_root_and_image_tools
+@pytest.mark.root
+@pytest.mark.loop
+def test_store_image_patch_applies_in_place(tmp_path, hpcp_mod, reset_hpcp_globals):
+	hpcp_mod.HASH_SIZE = 65536
+	tree_a = tmp_path / 'live' / 'a'
+	tree_b = tmp_path / 'live' / 'b'
+	_write(tree_a / 'f.txt', 'v1')
+	_write(tree_a / 'gone.txt', 'bye')
+	_write(tree_b / 'g.txt', 'other')
+	store = str(tmp_path / 'store.img')
+	rc = hpcp_mod.hpcp([str(tree_a), str(tree_b)], dest_image=store, single_thread=True, max_workers=1,
+		batch=True, do_not_remove_files_while_listing=True)
+	assert rc in (None, 0)
+	_write(tree_a / 'f.txt', 'v2 changed')
+	os.unlink(tree_a / 'gone.txt')
+	_write(tree_a / 'new.txt', 'n')
+	before = _sha256(store)
+	out = str(tmp_path / 'patch.img')
+	with _mount_session(hpcp_mod) as (mount_points, loop_devices):
+		hpcp_mod.process_get_diff_image([str(tree_a)], None, [], store, out, mount_points, loop_devices, max_workers=2)
+	assert _sha256(store) == before
+	with _mount_session(hpcp_mod) as (mount_points, loop_devices):
+		summary = hpcp_mod.process_load_diff_image([out], [], [], store, mount_points, loop_devices, max_workers=2)
+	assert summary['failed'] == 0
+	with _mount_session(hpcp_mod) as (mount_points, loop_devices):
+		root = hpcp_mod._mount_single_fs_image(store, True, mount_points, loop_devices)
+		assert hpcp_mod.compute_changes(*hpcp_mod.build_store_maps(str(tree_a), root, max_workers=1), max_workers=1) == []
+		with open(os.path.join(root, os.path.relpath(str(tree_b), '/'), 'g.txt')) as f:
+			assert f.read() == 'other'
+
+
+@requires_root_and_image_tools
+@pytest.mark.root
+@pytest.mark.loop
+def test_split_patch_needs_every_volume(trees, hpcp_mod, tmp_path):
+	new, base = trees
+	for i in range(40):
+		_write(new / f'f{i:02d}.bin', os.urandom(2 * 1024 * 1024))
+	out = str(tmp_path / 'patch.img')
+	with _mount_session(hpcp_mod) as (mount_points, loop_devices):
+		hpcp_mod.process_get_diff_image([str(new)], None, [str(base)], None, out, mount_points, loop_devices,
+			dest_image_size=80 * 1024 * 1024, max_workers=2)
+	second = str(tmp_path / 'patch_1.img')
+	assert os.path.exists(second)
+	target = tmp_path / 'target'
+	_clone(base, target)
+	with _mount_session(hpcp_mod) as (mount_points, loop_devices):
+		with pytest.raises(RuntimeError, match=r'Incomplete patch: missing volume.*patch_1\.img'):
+			hpcp_mod.process_load_diff_image([out], [], [str(target)], None, mount_points, loop_devices, max_workers=2)
+	with _mount_session(hpcp_mod) as (mount_points, loop_devices):
+		summary = hpcp_mod.process_load_diff_image([out, second], [], [str(target)], None, mount_points, loop_devices, max_workers=2)
+	assert summary['failed'] == 0
+	assert _changes(hpcp_mod, new, target) == []

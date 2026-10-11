@@ -4712,6 +4712,105 @@ def apply_patch_tree(volume_roots, target_root, force=False, max_workers=1, verb
 	print('Patch summary: ' + ', '.join(f'{key} {value}' for key, value in summary.items()))
 	return summary
 
+def _mount_single_fs_image(image, read_only, mount_points, loop_devices):
+	"""Attach image, mount its largest partition (or the whole partitionless image), return the mount point + os.sep."""
+	image = os.path.abspath(os.path.expanduser(image))
+	if not os.path.isfile(image):
+		raise RuntimeError(f'Diff image error: image {image} does not exist')
+	if os.geteuid() != 0:
+		print(f"Warning: mounting {image} usually needs root privileges", file=sys.stderr)
+	loop_device = create_loop_device(image, read_only=read_only)
+	loop_devices.append(loop_device)
+	partitions = get_partitions(loop_device)
+	if len(partitions) > 1:
+		print(f"Warning: {image} has {len(partitions)} partitions; using the largest one. Use -dd for whole-disk images.", file=sys.stderr)
+	target = get_largest_partition(loop_device) if partitions else loop_device
+	mount_point = tempfile.mkdtemp()
+	mount_points.append(mount_point)
+	command = ['mount', '-o', 'ro', target, mount_point] if read_only else ['mount', target, mount_point]
+	run_command_in_multicmd_with_path_check(command, strict=False)
+	if not os.path.ismount(mount_point):
+		raise RuntimeError(f'Diff image error: cannot mount {target} from {image}')
+	return mount_point + os.sep
+
+def process_get_diff_image(src_paths, src_image, dest_paths, dest_image, output, mount_points, loop_devices,
+		exclude=None, full_hash=False, dest_image_size=0, max_workers=multiprocessing.cpu_count(),
+		parallel_file_listing=False, verbose=False):
+	"""Write a patch image that turns the base (-d DIR / -di IMG) into the new tree (src_path DIR / -si IMG).
+
+	Returns the patch path, or None when the trees do not differ (no image is created).
+	"""
+	if src_image:
+		images = expand_paths(src_image)
+		if len(images) != 1:
+			raise RuntimeError(f'Invalid arguments: -diff needs exactly one -si image, got {images}')
+		new_root = _mount_single_fs_image(images[0], True, mount_points, loop_devices)
+		new_name, new_is_dir = os.path.basename(images[0]), False
+	else:
+		paths = expand_paths(src_paths)
+		if len(paths) != 1 or not os.path.isdir(paths[0]):
+			raise RuntimeError(f'Invalid arguments: -diff needs exactly one existing source directory, got {src_paths}')
+		new_root = os.path.abspath(paths[0])
+		new_name, new_is_dir = os.path.basename(os.path.normpath(new_root)) or 'root', True
+	if dest_image:
+		base_root = _mount_single_fs_image(dest_image, True, mount_points, loop_devices)
+		base_name, base_is_image = os.path.basename(dest_image), True
+	else:
+		bases = expand_paths(dest_paths or [])
+		if len(bases) != 1 or not os.path.isdir(bases[0]):
+			raise RuntimeError(f'Invalid arguments: -diff needs exactly one existing base directory (-d), got {dest_paths}')
+		base_root = os.path.abspath(bases[0])
+		base_name, base_is_image = os.path.basename(os.path.normpath(base_root)) or 'root', False
+	if new_is_dir and base_is_image:
+		new_map, base_map = build_store_maps(new_root, base_root, exclude, max_workers, parallel_file_listing)
+		new_base, layout = os.sep, 'store'
+	else:
+		new_map, base_map = build_root_maps(new_root, base_root, exclude, max_workers, parallel_file_listing)
+		new_base, layout = new_root, 'root'
+	if any(_is_reserved_key(key) for key in new_map):
+		raise RuntimeError(f'Diff image error: {new_root} contains {DIFF_DIR_NAME}, which hpcp reserves for patch metadata')
+	if not output or output == 'auto':
+		output = f'DIFF_{new_name}_TO_{base_name}_{int(time.time())}.img'
+	output = os.path.abspath(os.path.expanduser(output))
+	if os.path.lexists(output):
+		raise RuntimeError(f'Diff image error: output {output} already exists')
+	rows = compute_changes(new_map, base_map, full_hash=full_hash, max_workers=max_workers)
+	meta = make_patch_meta(rows, new_name, base_name, layout, full_hash)
+	print(f"Changes: {meta['added']} added, {meta['modified']} modified, {meta['deleted']} deleted; payload {format_bytes(meta['payload_bytes'])}B")
+	if not rows:
+		print(f"No differences between {new_root} and {base_root}; no patch image created.")
+		return None
+	change_list_bytes = sum(len(row.path) + len(row.old) + len(row.new) + 8 for row in rows)
+	if os.geteuid() != 0:
+		print("Warning: creating a patch image usually needs root privileges (loop devices, mkfs, mount)", file=sys.stderr)
+	target_mount_point = tempfile.mkdtemp()
+	mount_points.append(target_mount_point)
+	volume_roots = create_image(output, target_mount_point, loop_devices, [], mount_points, max_workers=max_workers,
+		dest_image_size=dest_image_size, init_size=meta['payload_bytes'] + 2 * change_list_bytes)
+	build_patch_tree(rows, new_base, volume_roots, meta, max_workers=max_workers, verbose=verbose)
+	extra = f" (+{len(volume_roots) - 1} more volume(s))" if len(volume_roots) > 1 else ''
+	print(f"Patch image written to {output}{extra}")
+	return output
+
+def process_load_diff_image(load_diff_image, src_paths, dest_paths, dest_image, mount_points, loop_devices,
+		force=False, max_workers=multiprocessing.cpu_count(), verbose=False):
+	"""Mount every -siff volume and apply the patch to -di IMG, -d DIR, or a single positional path."""
+	images = expand_paths(load_diff_image)
+	if not images:
+		raise RuntimeError(f'Incomplete patch: no patch image found for {load_diff_image}')
+	volume_roots = [_mount_single_fs_image(image, True, mount_points, loop_devices) for image in images]
+	if dest_image:
+		target_root = _mount_single_fs_image(dest_image, False, mount_points, loop_devices)
+		store_note = False
+	else:
+		targets = expand_paths(dest_paths) if dest_paths else expand_paths(src_paths or [])
+		if len(targets) != 1 or not os.path.isdir(targets[0]):
+			raise RuntimeError(f'Invalid arguments: -siff needs exactly one existing target directory, got {dest_paths or src_paths}')
+		target_root = os.path.abspath(targets[0])
+		store_note = target_root != os.path.abspath(os.sep)
+	return apply_patch_tree(volume_roots, target_root, force=force, max_workers=max_workers, verbose=verbose,
+		volume_names=[os.path.abspath(image) for image in images], store_note=store_note)
+
 #%% ---- Remove Extra ----
 def remove_extra_dirs(src_paths, dests,exclude=None):
 	"""
@@ -5230,16 +5329,17 @@ def process_compare_file_list(src_paths: list, dests, max_workers = multiprocess
 	report_changes(rows, diff_file_list, tar_diff_file_list)
 
 def create_image(dest_image,target_mount_point,loop_devices: list,src_paths: list,mount_points, max_workers = multiprocessing.cpu_count(),
-				parallel_file_listing = False,exclude=None,dest_image_size=0):
+				parallel_file_listing = False,exclude=None,dest_image_size=0,init_size=None):
 	if target_mount_point and dest_image:
 		# This means we were supplied a dest_image that does not exist, we need to create it and initialize it
 		returnMountPoints = []
 		currentMountPoint = target_mount_point + os.path.sep
-		init_size = 0
-		for src in src_paths:
-			src = os.path.abspath(src + os.path.sep)
-			_,_,size,_ = get_file_list(src, max_workers=max_workers,exclude=exclude,parallel_file_listing=parallel_file_listing)
-			init_size += size
+		if init_size is None:
+			init_size = 0
+			for src in src_paths:
+				src = os.path.abspath(src + os.path.sep)
+				_,_,size,_ = get_file_list(src, max_workers=max_workers,exclude=exclude,parallel_file_listing=parallel_file_listing)
+				init_size += size
 		needed = _align_up(int(1.05 * init_size + _FS_IMAGE_SLAG))
 		number_of_images, image_file_size = _plan_dest_images(init_size, dest_image_size)
 		if dest_image_size <= 0:
