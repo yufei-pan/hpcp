@@ -5542,7 +5542,8 @@ def _probe_identity(device):
 	return values.get('TYPE', ''), values.get('UUID', ''), values.get('LABEL', '')
 
 def _partition_table_type(device):
-	"""Partition table type of device from a low-level `blkid -p` probe ('gpt', 'dos', ...; '' when it has none)."""
+	"""Partition table type of device from a low-level `blkid -p` probe ('gpt', 'dos', ...; '' when it finds
+	none, which includes an ambivalent probe: see _no_partition_table)."""
 	error_count = len(ERRORS)
 	try:
 		output = run_command_in_multicmd_with_path_check(['blkid', '-p', '-o', 'value', '-s', 'PTTYPE', device], quiet=True)
@@ -5551,8 +5552,14 @@ def _partition_table_type(device):
 		del ERRORS[error_count:]
 	return next((line.strip() for line in output if line.strip()), '')
 
-def read_disk_layout(device):
-	"""Fresh GPT + filesystem identity read of block device.
+def _no_partition_table(name):
+	"""Why a disk on which _partition_table_type found nothing is refused. blkid also finds nothing when
+	its probe is ambivalent: stale whole-disk RAID or filesystem signatures next to a GPT."""
+	return (f'blkid found no partition table on {name} (if it is a GPT disk, stale whole-disk signatures may hide it: '
+		f'check `wipefs -n {name}`)')
+
+def read_disk_layout(device, name=None):
+	"""Fresh GPT + filesystem identity read of block device (name: the disk as messages call it, default device).
 
 	Returns {'disk': {'guid', 'sector_size', 'size'}, 'parts': {number: {'type_guid',
 	'unique_guid', 'name', 'attrs', 'size', 'fs_type', 'fs_uuid', 'fs_label', 'fs_params',
@@ -5561,9 +5568,12 @@ def read_disk_layout(device):
 	Raises RuntimeError('Disk layout mismatch: ...') unless the disk has a GPT partition table:
 	sgdisk reads an MBR disk as if it were GPT, and an identity change would convert it.
 	"""
+	name = name or device
 	pttype = _partition_table_type(device)
+	if not pttype:
+		raise RuntimeError(f'Disk layout mismatch: {_no_partition_table(name)}; disk patches support GPT disks only')
 	if pttype != 'gpt':
-		raise RuntimeError(f'Disk layout mismatch: {device} has no GPT partition table (found {pttype or "none"}); disk patches support GPT disks only')
+		raise RuntimeError(f'Disk layout mismatch: {name} has no GPT partition table (found {pttype}); disk patches support GPT disks only')
 	get_partition_infos.cache_clear()
 	get_partition_details.cache_clear()
 	# A node udev is still re-adding would be probed with empty filesystem parameters.
@@ -6183,7 +6193,7 @@ def process_get_disk_diff_image(src_paths, dest_paths, output, mount_points, loo
 		raise RuntimeError(f'Diff image error: output {output} already exists')
 	new_disk = _attach_disk(sources[0], True, loop_devices)
 	old_disk = _attach_disk(bases[0], True, loop_devices)
-	new_layout, old_layout = read_disk_layout(new_disk), read_disk_layout(old_disk)
+	new_layout, old_layout = read_disk_layout(new_disk, name=sources[0]), read_disk_layout(old_disk, name=bases[0])
 	problems, _ = compare_disk_layouts(old_layout, new_layout)
 	if problems:
 		raise RuntimeError('Disk layout mismatch: ' + '; '.join(problems) + '; re-clone instead')
@@ -6363,8 +6373,8 @@ def apply_disk_patch(volume_roots, target, mount_points, loop_devices, force=Fal
 		_refuse_if_image_in_use(target)
 	disk = _attach_disk(target, False, loop_devices)
 	if not _partition_table_type(disk):
-		raise RuntimeError(f'Invalid arguments: {target} is not a partitioned disk; a disk patch needs a whole GPT disk (block device or disk image)')
-	layout = read_disk_layout(disk)
+		raise RuntimeError(f'Invalid arguments: {_no_partition_table(target)}; a disk patch needs a whole GPT disk (block device or disk image)')
+	layout = read_disk_layout(disk, name=target)
 	problems = match_target_layout(disk_rows, layout)
 	if problems:
 		raise RuntimeError('Disk layout mismatch: ' + '; '.join(problems) + '; nothing applied')

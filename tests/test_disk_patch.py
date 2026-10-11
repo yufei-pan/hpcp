@@ -234,16 +234,25 @@ def _fake_blkid_pttype(monkeypatch, hpcp_mod, pttype_lines, calls=None):
 	monkeypatch.setattr(hpcp_mod, 'run_command_in_multicmd_with_path_check', fake)
 
 
-@pytest.mark.parametrize('lines, found', [(['dos'], 'dos'), ([], 'none'), (['PMBR'], 'PMBR')])
+_NO_TABLE = ('blkid found no partition table on {0} (if it is a GPT disk, stale whole-disk signatures may hide it: '
+	'check `wipefs -n {0}`)')
+
+
+@pytest.mark.parametrize('lines, found', [(['dos'], 'dos'), ([], None), (['PMBR'], 'PMBR')])
 def test_read_disk_layout_refuses_a_disk_without_gpt(hpcp_mod, reset_hpcp_globals, monkeypatch, lines, found):
-	"""sgdisk reads an MBR disk as if it were GPT; a GPT identity change would then convert it."""
+	"""sgdisk reads an MBR disk as if it were GPT; a GPT identity change would then convert it.
+
+	blkid also finds no partition table when its probe is ambivalent (stale whole-disk RAID or
+	filesystem signatures next to a GPT): the message says what was found, not that there is no GPT."""
 	_fake_blkid_pttype(monkeypatch, hpcp_mod, lines)
 	def must_not_read(device):
 		raise AssertionError('the GPT was read before the partition table type was checked')
 	must_not_read.cache_clear = lambda: None
 	monkeypatch.setattr(hpcp_mod, 'get_partition_infos', must_not_read)
-	with pytest.raises(RuntimeError, match=rf'^Disk layout mismatch: /dev/x has no GPT partition table \(found {found}\); disk patches support GPT disks only$'):
-		hpcp_mod.read_disk_layout('/dev/x')
+	for kwargs, name in (({}, '/dev/x'), ({'name': '/images/new.img'}, '/images/new.img')):
+		reason = _NO_TABLE.format(name) if found is None else f'{name} has no GPT partition table (found {found})'
+		with pytest.raises(RuntimeError, match='^' + re.escape(f'Disk layout mismatch: {reason}; disk patches support GPT disks only') + '$'):
+			hpcp_mod.read_disk_layout('/dev/x', **kwargs)
 	assert hpcp_mod.ERRORS == []
 
 
@@ -301,10 +310,11 @@ def test_disk_apply_to_a_target_without_a_partition_table(tmp_path, hpcp_mod, re
 	target = tmp_path / 'fs.img'
 	target.write_bytes(b'')
 	_fake_blkid_pttype(monkeypatch, hpcp_mod, [])
-	with pytest.raises(RuntimeError, match=rf'^Invalid arguments: {target} is not a partitioned disk; a disk patch needs a whole GPT disk \(block device or disk image\)$'):
+	with pytest.raises(RuntimeError, match='^' + re.escape(f'Invalid arguments: {_NO_TABLE.format(target)}; '
+			'a disk patch needs a whole GPT disk (block device or disk image)') + '$'):
 		hpcp_mod.apply_disk_patch(['/vol'], str(target), [], [])
 	_fake_blkid_pttype(monkeypatch, hpcp_mod, ['dos'])
-	with pytest.raises(RuntimeError, match=r'^Disk layout mismatch: /dev/fake has no GPT partition table \(found dos\)'):
+	with pytest.raises(RuntimeError, match='^' + re.escape(f'Disk layout mismatch: {target} has no GPT partition table (found dos)')):
 		hpcp_mod.apply_disk_patch(['/vol'], str(target), [], [])
 
 
@@ -388,7 +398,7 @@ def test_in_use_raw_partition_is_refused_before_it_is_hashed(tmp_path, hpcp_mod,
 	monkeypatch.setattr(hpcp_mod, '_refuse_if_image_in_use', lambda image: None)
 	monkeypatch.setattr(hpcp_mod, '_attach_disk', lambda path, ro, loops: '/dev/fake')
 	monkeypatch.setattr(hpcp_mod, '_partition_table_type', lambda device: 'gpt')
-	monkeypatch.setattr(hpcp_mod, 'read_disk_layout', lambda disk: layout)
+	monkeypatch.setattr(hpcp_mod, 'read_disk_layout', lambda disk, name=None: layout)
 	monkeypatch.setattr(hpcp_mod, '_mountinfo_entries', lambda: [])
 	monkeypatch.setattr(hpcp_mod, '_swap_devices', lambda: set())
 	monkeypatch.setattr(hpcp_mod, '_device_number', lambda device: (7, 0))
@@ -415,7 +425,7 @@ def test_several_in_use_raw_partitions_and_other_refusals_share_one_message(tmp_
 	monkeypatch.setattr(hpcp_mod, '_refuse_if_image_in_use', lambda image: None)
 	monkeypatch.setattr(hpcp_mod, '_attach_disk', lambda path, ro, loops: '/dev/fake')
 	monkeypatch.setattr(hpcp_mod, '_partition_table_type', lambda device: 'gpt')
-	monkeypatch.setattr(hpcp_mod, 'read_disk_layout', lambda disk: layout)
+	monkeypatch.setattr(hpcp_mod, 'read_disk_layout', lambda disk, name=None: layout)
 	monkeypatch.setattr(hpcp_mod, '_mountinfo_entries', lambda: [])
 	monkeypatch.setattr(hpcp_mod, '_swap_devices', lambda: set())
 	monkeypatch.setattr(hpcp_mod, '_device_number', lambda device: (7, 0))
@@ -1189,7 +1199,7 @@ def test_unmountable_filesystem_is_compared_as_raw_with_a_warning(hpcp_mod, monk
 	parts = {1: _part(number=1, device=device, fs_type='ext4')}
 	layout = _layout(parts)
 	monkeypatch.setattr(hpcp_mod, '_attach_disk', lambda path, ro, loops: path)
-	monkeypatch.setattr(hpcp_mod, 'read_disk_layout', lambda disk: layout)
+	monkeypatch.setattr(hpcp_mod, 'read_disk_layout', lambda disk, name=None: layout)
 	monkeypatch.setattr(hpcp_mod, '_mountinfo_entries', lambda: [])
 	monkeypatch.setattr(hpcp_mod, '_mount_partition', lambda *a: None)
 	monkeypatch.setattr(hpcp_mod, '_hash_area', lambda *a: 'h')
@@ -1209,7 +1219,7 @@ def _fake_generation(hpcp_mod, monkeypatch, new_parts, old_parts, in_use=None):
 	"""
 	layouts = {'/x/new': _layout(new_parts), '/x/old': _layout(old_parts)}
 	monkeypatch.setattr(hpcp_mod, '_attach_disk', lambda path, ro, loops: path)
-	monkeypatch.setattr(hpcp_mod, 'read_disk_layout', lambda disk: layouts[disk])
+	monkeypatch.setattr(hpcp_mod, 'read_disk_layout', lambda disk, name=None: layouts[disk])
 	monkeypatch.setattr(hpcp_mod, '_mountinfo_entries', lambda: [])
 	monkeypatch.setattr(hpcp_mod, '_swap_devices', lambda: set())
 	monkeypatch.setattr(hpcp_mod, '_device_number', lambda device: (7, 0))
@@ -1357,7 +1367,7 @@ def test_disk_apply_plans_each_section_by_filesystem_class(tmp_path, hpcp_mod, r
 	monkeypatch.setattr(hpcp_mod, '_refuse_if_image_in_use', lambda image: None)
 	monkeypatch.setattr(hpcp_mod, '_attach_disk', lambda path, ro, loops: '/dev/fake')
 	monkeypatch.setattr(hpcp_mod, '_partition_table_type', lambda device: 'gpt')
-	monkeypatch.setattr(hpcp_mod, 'read_disk_layout', lambda disk: layout)
+	monkeypatch.setattr(hpcp_mod, 'read_disk_layout', lambda disk, name=None: layout)
 	monkeypatch.setattr(hpcp_mod, '_mountinfo_entries', lambda: [])
 	monkeypatch.setattr(hpcp_mod, '_swap_devices', lambda: set())
 	monkeypatch.setattr(hpcp_mod, '_device_number', lambda device: (7, 0))
@@ -1665,8 +1675,12 @@ def test_disk_apply_refuses_mbr_and_partitionless_targets(tmp_path, hpcp_mod, re
 	with open(str(fs_image), 'wb') as f:
 		f.truncate(16 << 20)
 	_run('mkfs.ext4', '-q', '-F', fs_image)
-	with pytest.raises(RuntimeError, match=r'Invalid arguments: .*fs\.img is not a partitioned disk'):
+	with pytest.raises(RuntimeError, match='^' + re.escape(f'Invalid arguments: {_NO_TABLE.format(fs_image)}; a disk patch needs a whole GPT disk')):
 		_apply(hpcp_mod, patch, fs_image)
+	# Generation names the disk image it was given, not the loop device it is read through.
+	with _session(hpcp_mod) as (mount_points, loop_devices):
+		with pytest.raises(RuntimeError, match='^' + re.escape(f'Disk layout mismatch: {_NO_TABLE.format(fs_image)}; disk patches support GPT disks only') + '$'):
+			hpcp_mod.process_get_disk_diff_image([str(new)], [str(fs_image)], str(tmp_path / 'x.img'), mount_points, loop_devices, max_workers=1)
 	# sgdisk would read this MBR disk as GPT, and the GPT name change would convert it.
 	mbr_image = tmp_path / 'mbr.img'
 	shutil.copyfile(str(old), str(mbr_image))
@@ -1676,7 +1690,7 @@ def test_disk_apply_refuses_mbr_and_partitionless_targets(tmp_path, hpcp_mod, re
 		_apply(hpcp_mod, patch, mbr_image)
 	assert _sha(mbr_image.read_bytes()) == before
 	with _session(hpcp_mod) as (mount_points, loop_devices):
-		with pytest.raises(RuntimeError, match=r'has no GPT partition table \(found dos\)'):
+		with pytest.raises(RuntimeError, match='^' + re.escape(f'Disk layout mismatch: {mbr_image} has no GPT partition table (found dos)')):
 			hpcp_mod.process_get_disk_diff_image([str(new)], [str(mbr_image)], str(tmp_path / 'x.img'), mount_points, loop_devices, max_workers=1)
 	assert not (tmp_path / 'x.img').exists()
 
