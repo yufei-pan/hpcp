@@ -1,4 +1,5 @@
 import contextlib
+import errno
 import os
 import re
 import shutil
@@ -1420,6 +1421,50 @@ def test_failed_section_stops_before_esp_raw_boot_code_and_identity(tmp_path, hp
 				assert f.read() == b'old-efi'
 	# Once the cause is fixed, a re-run completes the patch.
 	monkeypatch.setattr(hpcp_mod, '_apply_section', real_apply_section)
+	hpcp_mod.ERRORS.clear()
+	again = _apply(hpcp_mod, patch, target)
+	assert again['failed'] == 0 and again['raw_written'] == 2 and again['identity_changed'] == 2 and hpcp_mod.ERRORS == []
+	assert _no_differences(hpcp_mod, tmp_path, new, target)
+
+
+@requires_root_and_disk_tools
+@pytest.mark.root
+@pytest.mark.loop
+def test_failed_raw_write_stops_before_boot_code_and_identity(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch, capsys):
+	"""A raw partition area that cannot be written (the BIOS boot core image) must not be followed by MBR boot
+	code pointing at it, or by identity changes."""
+	old, new, patch = _make_patch(hpcp_mod, tmp_path)
+	target = tmp_path / 'node.img'
+	shutil.copyfile(str(old), str(target))
+	real_write_area = hpcp_mod._write_area
+	attempted = []
+	def failing(device, payload, offset, length):
+		attempted.append(device)
+		if device.endswith('p2'):
+			raise OSError(errno.EIO, 'simulated write failure')
+		return real_write_area(device, payload, offset, length)
+	monkeypatch.setattr(hpcp_mod, '_write_area', failing)
+	capsys.readouterr()
+	summary = _apply(hpcp_mod, patch, target)
+	assert len(attempted) == 1 and attempted[0].endswith('p2')
+	assert summary['failed'] == 1 and summary['raw_written'] == 0 and summary['identity_changed'] == 0
+	assert sorted(summary['sections']) == ['part1', 'part3'] and all(s['failed'] == 0 for s in summary['sections'].values())
+	captured = capsys.readouterr()
+	assert 'Section part3:' in captured.out and 'Disk patch summary:' in captured.out
+	assert [error for error in hpcp_mod.ERRORS if error.startswith('Raw area error: ')] == [
+		'Raw area error: part2: [Errno 5] simulated write failure',
+		'Raw area error: stopping: raw area part2 could not be written; later raw areas, the boot code and identity changes '
+		'were not applied; fix the cause and re-run']
+	assert len(hpcp_mod.ERRORS) == 2
+	with open(str(target), 'rb') as f:
+		assert f.read(14) == b'\xeb\x63OLD-BOOTCODE'
+	with _attached(target, read_only=True) as loop:
+		layout = hpcp_mod.read_disk_layout(loop)
+		assert layout['parts'][1]['name'] == 'ESP' and layout['parts'][3]['fs_label'] == 'root'
+		with open(loop + 'p2', 'rb') as f:
+			assert f.read(8) == b'GRUBCORE'
+	# Once the cause is fixed, a re-run completes the patch.
+	monkeypatch.setattr(hpcp_mod, '_write_area', real_write_area)
 	hpcp_mod.ERRORS.clear()
 	again = _apply(hpcp_mod, patch, target)
 	assert again['failed'] == 0 and again['raw_written'] == 2 and again['identity_changed'] == 2 and hpcp_mod.ERRORS == []
