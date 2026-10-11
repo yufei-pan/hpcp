@@ -4411,6 +4411,8 @@ def _validate_patch_rows(rows):
 	for row in rows:
 		old, new = row.old, row.new
 		where = f'{row.op} {row.path!r}'
+		if _is_reserved_key(row.path):
+			raise RuntimeError(f'Patch format error: row {where} uses the reserved name {DIFF_DIR_NAME}')
 		unset = ('-', '?')
 		if row.op == 'A':
 			ok = old == '-' and new not in unset
@@ -4526,12 +4528,13 @@ def _payload_source(volume_roots, row):
 	location = _payload_location(volume_roots, row)
 	return location[1] if location else None
 
-def _apply_rows(rows, volume_roots, target_root, max_workers=1, verbose=False):
+def _apply_rows(rows, volume_roots, target_root, max_workers=1, verbose=False, full_hash=False):
 	"""Carry out checked rows: deletions, then directories, files, symlinks, directory metadata.
 
 	Containment of every target path is re-checked immediately before each write, and the
 	target root itself is never removed. Existing regular files are overwritten in place by
-	the copy (so an interrupted apply leaves un-copied files in their old state).
+	the copy (so an interrupted apply leaves un-copied files in their old state); files with
+	several hard links are unlinked first so the content is never written through a link.
 	"""
 	root_norm = os.path.normpath(target_root)
 
@@ -4563,6 +4566,23 @@ def _apply_rows(rows, volume_roots, target_root, max_workers=1, verbose=False):
 			return os.path.isdir(path)
 		return row.new.startswith('f:') and os.path.isfile(path)
 
+	def sync_dir(row):
+		"""Copy volume 1's directory metadata onto the target directory, with containment checks."""
+		path = guarded(row)
+		if path is None:
+			return
+		if row.path != './' and (os.path.islink(path) or not os.path.isdir(path)):
+			eprint(f'Patch format error: {row.path} is not a real directory on the target; metadata skipped')
+			return
+		source = _key_path(volume_roots[0], row.path)
+		if row.path != './' and (os.path.islink(source) or not os.path.isdir(source) or not _inside_root(volume_roots[0], source)):
+			eprint(f'Patch format error: directory metadata source for {row.path} is not a real directory in volume 1; skipped')
+			return
+		try:
+			sync_directory_metadata(source, [path])
+		except OSError as e:
+			eprint(f'Copy failed: {row.path}: {e}')
+
 	deletes = [row for row in rows if row.op == 'D']
 	payload = [row for row in rows if row.op in ('A', 'M')]
 	# Non-directories first, then directories deepest first.
@@ -4577,9 +4597,15 @@ def _apply_rows(rows, volume_roots, target_root, max_workers=1, verbose=False):
 	dir_rows = []
 	for row in sorted((r for r in payload if r.new.startswith('d:')), key=lambda r: _key_depth(r.path)):
 		path = guarded(row)
-		if path is not None:
+		if path is None:
+			continue
+		try:
 			os.makedirs(path, exist_ok=True)
-			dir_rows.append(row)
+		except OSError as e:
+			eprint(f'Copy failed: {row.path}: {e}')
+			continue
+		dir_rows.append(row)
+		sync_dir(row)
 	by_volume = {}
 	for row in payload:
 		if not row.new.startswith('f:') or guarded(row) is None:
@@ -4590,18 +4616,27 @@ def _apply_rows(rows, volume_roots, target_root, max_workers=1, verbose=False):
 			continue
 		by_volume.setdefault(location[0], []).append((location[1], row))
 	for volume_root, entries in by_volume.items():
+		for _, row in entries:
+			path = _key_path(target_root, row.path)
+			try:
+				info = os.lstat(path)
+			except OSError:
+				continue
+			if stat.S_ISREG(info.st_mode) and info.st_nlink > 1:
+				remove(row)
 		try:
-			copy_file_list_parallel([source for source, _ in entries], [], volume_root, [target_root], max(1, max_workers), verbose=verbose)
+			copy_file_list_parallel([source for source, _ in entries], [], volume_root, [target_root], max(1, max_workers), full_hash=full_hash, verbose=verbose)
 		except RuntimeError as e:
 			eprint(f'Copy failed: {e}')
+			continue
 		for source, row in entries:
 			path = _key_path(target_root, row.path)
 			if os.path.isfile(path) and not os.path.islink(path):
 				_remove_stale_xattrs(source, path)
 	for row in payload:
-		if not row.new.startswith('l:'):
+		if not row.new.startswith('l:') or row.path == './':
 			continue
-		path = guarded(row)
+		path = guarded(row, removing=True)
 		if path is None:
 			continue
 		try:
@@ -4609,17 +4644,7 @@ def _apply_rows(rows, volume_roots, target_root, max_workers=1, verbose=False):
 		except OSError as e:
 			eprint(f'Failed to create symbolic link: {row.path}: {e}')
 	for row in sorted(dir_rows, key=lambda r: _key_depth(r.path), reverse=True):
-		path = guarded(row)
-		if path is None:
-			continue
-		if row.path != './' and (os.path.islink(path) or not os.path.isdir(path)):
-			eprint(f'Patch format error: {row.path} is not a real directory on the target; metadata skipped')
-			continue
-		source = _key_path(volume_roots[0], row.path)
-		if row.path != './' and (os.path.islink(source) or not os.path.isdir(source) or not _inside_root(volume_roots[0], source)):
-			eprint(f'Patch format error: directory metadata source for {row.path} is not a real directory in volume 1; skipped')
-			continue
-		sync_directory_metadata(source, [path])
+		sync_dir(row)
 
 def _verify_rows(rows, target_root, compare_hash=True, full_hash=False, max_workers=1):
 	"""Re-read every applied path and compare with its final expected state; returns the failure count."""
@@ -4671,7 +4696,7 @@ def apply_patch_tree(volume_roots, target_root, force=False, max_workers=1, verb
 		unsafe = [row for row in todo if row.op in ('A', 'M') and row.new.startswith('f:') and _payload_source(volume_roots, row) is None]
 		if unsafe:
 			raise RuntimeError(f'Incomplete patch: payload missing or unsafe for {len(unsafe)} file(s), e.g. {unsafe[0].path}; nothing applied')
-		_apply_rows(todo, volume_roots, target_root, max_workers, verbose)
+		_apply_rows(todo, volume_roots, target_root, max_workers, verbose, full_hash)
 		failed = _verify_rows(todo, target_root, compare_hash, full_hash, max_workers)
 	finally:
 		HASH_SIZE = saved_hash_size
