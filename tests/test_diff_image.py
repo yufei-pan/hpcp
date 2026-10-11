@@ -1649,6 +1649,23 @@ def test_image_roots_ignore_lost_and_found(trees, hpcp_mod, tmp_path, monkeypatc
 		'lost+foundling': '/m/lost+foundling'}) == {'./': '/m', 'lost+foundling': '/m/lost+foundling'}
 
 
+def test_image_side_drops_lost_and_found_on_both_sides(trees, hpcp_mod, tmp_path, monkeypatch):
+	"""G3: `-si golden.img -d /` must not delete (or touch) the live root's own lost+found/."""
+	new, base = trees
+	image_root = tmp_path / 'image_root'
+	_write(image_root / 'a.txt', 'a')
+	_write(image_root / 'added.txt', 'new file')
+	_write(image_root / 'lost+found' / 'x', 'image orphan')
+	_write(base / 'a.txt', 'a')
+	_write(base / 'lost+found' / 'y', 'live orphan')
+	image = tmp_path / 'golden.img'
+	image.write_bytes(b'')
+	_fake_image_mounts(hpcp_mod, monkeypatch, {str(image): image_root})
+	rows = _rows_before_mkfs(hpcp_mod, monkeypatch, [], [str(image)], [str(base)], None, str(tmp_path / 'p.img'), [], [], max_workers=1)
+	assert not [row for row in rows if 'lost+found' in row.path]
+	assert ('A', 'added.txt') in _ops(rows)
+
+
 def test_diff_ignores_its_own_image_mounted_inside_the_base(trees, hpcp_mod, tmp_path, monkeypatch):
 	"""F14: `-si new.img -d /` must not list new.img's own mount point as part of the base."""
 	new, base = trees

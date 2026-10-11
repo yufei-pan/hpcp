@@ -4953,8 +4953,8 @@ def process_get_diff_image(src_paths, src_image, dest_paths, dest_image, output,
 		parallel_file_listing=False, verbose=False):
 	"""Write a patch image that turns the base (-d DIR / -di IMG) into the new tree (src_path DIR / -si IMG).
 
-	This run's own mount points are left out of both listings, and so is lost+found/ at the
-	root of an image side compared root to root.
+	This run's own mount points are left out of both listings. When an image is compared root
+	to root, lost+found/ at the root (and everything under it) is left out of both listings.
 	Returns the patch path, or None when the trees do not differ (no image is created).
 	"""
 	if src_image:
@@ -4988,9 +4988,9 @@ def process_get_diff_image(src_paths, src_image, dest_paths, dest_image, output,
 	else:
 		new_map, base_map = build_root_maps(new_root, base_root, exclude, max_workers, parallel_file_listing)
 		new_base = new_root
-		if src_image:
+		if src_image or dest_image:
+			# On both sides: `-si golden.img -d /` must not delete or replace the live root's own lost+found/.
 			new_map = _drop_lost_found(new_map)
-		if dest_image:
 			base_map = _drop_lost_found(base_map)
 	if any(_is_reserved_key(key) for key in new_map):
 		raise RuntimeError(f'Diff image error: {new_root} contains {DIFF_DIR_NAME}, which hpcp reserves for patch metadata')
