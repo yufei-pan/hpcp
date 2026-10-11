@@ -4675,8 +4675,9 @@ def _apply_rows(rows, volume_roots, target_root, max_workers=1, verbose=False, f
 	appeared after the check survives (and verify reports the row); only a row in
 	forced_rows (a conflict the user forced) may remove a whole tree. Files and symlinks are
 	built at a temporary sibling and renamed over the target (see _replace_files), so an
-	existing file or symlink is never removed first; only a directory standing where a file
-	or symlink goes is.
+	existing file or symlink is never removed before its replacement exists. Only an entry
+	a rename cannot replace is removed first: a directory where a file or symlink goes, or
+	a file or symlink where a directory goes.
 	"""
 	root_norm = os.path.normpath(target_root)
 	forced_rows = set(forced_rows)
