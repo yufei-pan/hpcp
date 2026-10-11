@@ -786,13 +786,16 @@ def _no_differences(hpcp_mod, tmp_path, new, target):
 @requires_root_and_disk_tools
 @pytest.mark.root
 @pytest.mark.loop
-def test_disk_apply_round_trip_and_rerun(tmp_path, hpcp_mod, reset_hpcp_globals):
+def test_disk_apply_round_trip_and_rerun(tmp_path, hpcp_mod, reset_hpcp_globals, capsys):
 	"""Success criterion + Review Focus 5."""
 	old, new, patch = _make_patch(hpcp_mod, tmp_path)
 	target = tmp_path / 'node.img'
 	shutil.copyfile(str(old), str(target))
 	summary = _apply(hpcp_mod, patch, target)
 	assert summary['failed'] == 0 and summary['raw_written'] == 2 and summary['identity_changed'] == 2
+	assert hpcp_mod.ERRORS == []
+	out = capsys.readouterr().out
+	assert 'Section part3:' in out and 'Disk patch summary:' in out and ', added ' in out
 	assert _no_differences(hpcp_mod, tmp_path, new, target)
 	again = _apply(hpcp_mod, patch, target)
 	assert again['failed'] == 0 and again['raw_written'] == 0 and again['identity_changed'] == 0
@@ -873,3 +876,49 @@ def test_damaged_raw_payload_is_refused_up_front(tmp_path, hpcp_mod, reset_hpcp_
 	with pytest.raises(RuntimeError, match='Incomplete patch: raw payload'):
 		_apply(hpcp_mod, patch, target)
 	assert _sha(target.read_bytes()) == before
+
+
+@requires_root_and_disk_tools
+@pytest.mark.root
+@pytest.mark.loop
+def test_image_target_attached_but_unmounted_is_refused(tmp_path, hpcp_mod, reset_hpcp_globals):
+	old, new, patch = _make_patch(hpcp_mod, tmp_path)
+	target = tmp_path / 'node.img'
+	shutil.copyfile(str(old), str(target))
+	before = _sha(target.read_bytes())
+	with _attached(target) as loop:
+		with pytest.raises(RuntimeError, match='Disk in use: .* is attached as ' + loop):
+			_apply(hpcp_mod, patch, target)
+	assert _sha(target.read_bytes()) == before
+
+
+@requires_root_and_disk_tools
+@pytest.mark.root
+@pytest.mark.loop
+def test_symlinked_block_device_target_resolves_to_the_device(tmp_path, hpcp_mod, reset_hpcp_globals):
+	old, new, patch = _make_patch(hpcp_mod, tmp_path)
+	target = tmp_path / 'node.img'
+	shutil.copyfile(str(old), str(target))
+	with _attached(target) as loop:
+		link = tmp_path / 'by-id-link'
+		os.symlink(loop, str(link))
+		with _session(hpcp_mod) as (mount_points, loop_devices):
+			disk = hpcp_mod._attach_disk(str(link), False, loop_devices)
+			assert disk == os.path.realpath(loop)
+			assert sorted(hpcp_mod.read_disk_layout(disk)['parts']) == [1, 2, 3, 4]
+
+
+def test_read_write_mount_of_xfs_uses_nouuid(hpcp_mod, reset_hpcp_globals, monkeypatch):
+	calls = []
+	monkeypatch.setattr(hpcp_mod, '_probe_fs_type', lambda device: 'xfs')
+	monkeypatch.setattr(hpcp_mod, '_live_mount', lambda *a: (None, False))
+	monkeypatch.setattr(hpcp_mod, '_device_number', lambda device: (7, 1))
+	monkeypatch.setattr(hpcp_mod, '_is_mount_point', lambda path: True)
+	monkeypatch.setattr(hpcp_mod, 'run_command_in_multicmd_with_path_check', lambda argv, **kw: calls.append(list(argv)))
+	mount_points = []
+	try:
+		assert hpcp_mod._mount_partition('/dev/fake1', False, mount_points, []) is not None
+	finally:
+		for path in mount_points:
+			os.rmdir(path)
+	assert calls[0][:3] == ['mount', '-o', 'nouuid'] and calls[0][3] == '/dev/fake1'

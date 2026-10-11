@@ -5745,7 +5745,7 @@ def _attach_disk(path, read_only, loop_devices):
 	"""Block device for path: itself when it is one, else a loop device over the disk-image file."""
 	path = os.path.abspath(os.path.expanduser(path))
 	if pathlib.Path(path).resolve().is_block_device():
-		return path
+		return os.path.realpath(path)
 	if not os.path.isfile(path):
 		raise RuntimeError(f'Invalid arguments: {path} is not a block device or a disk image file')
 	loop_device = create_loop_device(path, read_only=read_only)
@@ -5787,6 +5787,9 @@ def _mount_partition(device, read_only, mount_points, entries):
 			run_command_in_multicmd_with_path_check(['mount', '-o', 'remount,bind,ro', mount_point], quiet=True)
 	elif read_only:
 		run_command_in_multicmd_with_path_check(['mount', '-o', _ro_mount_options(device), device, mount_point], quiet=True)
+	elif _probe_fs_type(device) == 'xfs':
+		# A clone of a mounted xfs carries the same UUID, which xfs refuses to mount twice.
+		run_command_in_multicmd_with_path_check(['mount', '-o', 'nouuid', device, mount_point], quiet=True)
 	else:
 		run_command_in_multicmd_with_path_check(['mount', device, mount_point], quiet=True)
 	del ERRORS[error_count:]
@@ -5959,7 +5962,11 @@ def process_get_disk_diff_image(src_paths, dest_paths, output, mount_points, loo
 	return output
 
 def _refuse_if_image_in_use(image, entries):
-	"""Refuse an image-file target that is attached to a loop device with something mounted from it."""
+	"""Refuse an image-file target that is already attached to any loop device.
+
+	A second read-write loop over the same file would leave the first one's page cache stale, and
+	swap or a dm/LVM/md holder on the first one would not be seen as in use. (entries is unused.)
+	"""
 	error_count = len(ERRORS)
 	try:
 		output = run_command_in_multicmd_with_path_check(['losetup', '-j', image], quiet=True)
@@ -5969,13 +5976,7 @@ def _refuse_if_image_in_use(image, entries):
 		loop = line.partition(':')[0].strip()
 		if not loop:
 			continue
-		for device in [loop] + get_partitions(loop):
-			try:
-				devnum = _device_number(device)
-			except OSError:
-				continue
-			if any(_entry_matches(entry, devnum, device) for entry in entries):
-				raise RuntimeError(f'Disk in use: {image} is attached as {loop} and {device} is mounted; unmount it first or apply to the device')
+		raise RuntimeError(f'Disk in use: {image} is attached as {loop}; detach it (losetup -d {loop}) or apply the patch to {loop}')
 
 def apply_disk_patch(volume_roots, target, mount_points, loop_devices, force=False, max_workers=1, verbose=False, volume_names=None):
 	"""Apply a disk patch (layout disk) to target: a GPT block device or disk-image file.
@@ -6092,6 +6093,10 @@ def apply_disk_patch(volume_roots, target, mount_points, loop_devices, force=Fal
 				failed += 1
 				where = 'disk' if change.number is None else f'partition {change.number}'
 				eprint(f'Identity change error: {where} {change.field} is {current!r}, expected {change.new!r}')
+	for name in sorted(summaries, key=lambda name: int(name[len('part'):])):
+		item = summaries[name]
+		print(f"Section {name}: deleted {item['deleted']}, added {item['added']}, modified {item['modified']}, "
+			f"skipped {item['skipped']}, forced {item['forced']}, failed {item['failed']}")
 	summary = {
 		'sections': summaries,
 		'raw_written': written,
@@ -6100,7 +6105,8 @@ def apply_disk_patch(volume_roots, target, mount_points, loop_devices, force=Fal
 		'forced': sum(summary['forced'] for summary in summaries.values()) + len(raw_conflicts),
 		'failed': failed,
 	}
-	print(f"Disk patch summary: {len(summaries)} section(s), raw written {written}, raw skipped {summary['raw_skipped']}, "
+	print(f"Disk patch summary: {len(summaries)} section(s), added {sum(item['added'] for item in summaries.values())}, "
+		f"modified {sum(item['modified'] for item in summaries.values())}, deleted {sum(item['deleted'] for item in summaries.values())}, raw written {written}, raw skipped {summary['raw_skipped']}, "
 		f"identity changed {changed}, forced {summary['forced']}, failed {failed}")
 	return summary
 
