@@ -89,6 +89,8 @@ A `-di` image store keeps files at their absolute source path. When the base is 
 
 Files and symlinks are replaced atomically: the new version is written next to the old one and renamed over it, so running processes keep the old file and an interrupted apply leaves each file either old or new. A directory the patch deletes is removed only if it is empty once the patch's own deletions are done; whole trees are removed only for conflicts forced with `-fa`. Paths are followed through symlinked directories that stay inside the target; if any path the patch deletes or writes resolves outside the target through a symlink, nothing is applied, even with `-fa`.
 
+A single-filesystem patch pairs names by exact case, so a case-only rename (`EFI/BOOT` to `EFI/Boot`) is a delete plus an add. Where those names land on FAT, exFAT or HFS/HFS+ (the target's filesystem, or one mounted below it), the add would find the old entry and the delete then remove it, so nothing is applied, even with `-fa`; regenerate with `-dd` from whole disks, or undo the rename. On such a target, paths skipped as already updated are verified too.
+
 An apply that is killed partway leaves directories it created private (mode 0700, owned by root) until the final metadata pass runs. Re-running the same patch then reports those directories as conflicts; re-run with `-fa` to finish.
 
 `changes.tsv` is also what `-dfl` writes:

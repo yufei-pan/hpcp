@@ -5194,6 +5194,21 @@ def _apply_section(plan, max_workers, verbose, full_hash, compare_hash):
 		'failed': failed,
 	}
 
+def _refuse_case_only_renames(rows, target_root, fs_type, below):
+	"""Refuse, even forced, rows that delete and write names differing only by case (see _case_collision)
+	on target_root's filesystem (fs_type) or on one mounted below it (below; see _path_mounts) that looks
+	names up case-insensitively: the writes would find the old entries and be skipped as done, then the
+	deletes remove them."""
+	for prefix, where, scope_type in [('', target_root, fs_type)] + list(below):
+		if not _has_case_insensitive_names(scope_type):
+			continue
+		scoped = rows if not prefix else [row for row in rows if row.path.rstrip('/') == prefix or row.path.startswith(prefix + '/')]
+		collision = _case_collision(scoped)
+		if collision:
+			raise RuntimeError(f'Patch conflict: {collision[0]!r} and {collision[1]!r} differ only by case and {where} is a '
+				f'case-insensitive {scope_type} filesystem; applying would delete what it writes; nothing applied '
+				'(regenerate with -dd from whole disks, or remove the case-only rename)')
+
 def apply_patch_tree(volume_roots, target_root, force=False, max_workers=1, verbose=False, volume_names=None, store_note=False):
 	"""Apply a patch whose volumes are mounted (or unpacked) at volume_roots onto directory target_root.
 
@@ -5210,13 +5225,20 @@ def apply_patch_tree(volume_roots, target_root, force=False, max_workers=1, verb
 	An interrupted apply leaves new directories 0700 and root-owned.
 	A hard kill mid-apply can leave new directories with default metadata (it is applied
 	only after every write); the re-run then reports those A rows as conflicts and needs -fa.
+	Rows that delete and write names differing only by case are refused, even forced, where they
+	land on a filesystem that looks names up case-insensitively (FAT, exFAT, HFS+): the target's
+	own (from mountinfo) or one mounted below it. A target on such a filesystem also verifies
+	the A / M rows skipped as already done (see _apply_section).
 	"""
 	meta, rows, volume_roots = load_patch_volumes(volume_roots, volume_names)
 	if store_note and meta.get('layout') == 'store':
 		example = rows[0].path if rows else ''
 		print(f"Note: this patch uses image-store layout; paths such as {example!r} are resolved under {target_root}")
+	fs_type, below = _path_mounts(target_root, _mountinfo_entries())
+	_refuse_case_only_renames(rows, target_root, fs_type, below)
 	with _patch_hash_settings(meta) as (compare_hash, full_hash):
-		plan = _plan_section('root', rows, volume_roots, target_root, compare_hash, full_hash, max_workers)
+		plan = _plan_section('root', rows, volume_roots, target_root, compare_hash, full_hash, max_workers,
+			case_insensitive=_has_case_insensitive_names(fs_type))
 		_resolve_section_conflicts([plan], force)
 		_preflight_section(plan)
 		summary = _apply_section(plan, max_workers, verbose, full_hash, compare_hash)
@@ -5790,6 +5812,25 @@ def _is_mount_point(path):
 		return True
 	real = os.path.realpath(path)
 	return any(entry['mount_point'] == real for entry in _mountinfo_entries())
+
+def _path_mounts(path, entries):
+	"""(fstype of the mount holding path, [(key prefix, mount point, fstype) of each mount below path]).
+
+	The mount holding path is the entry with the longest mount point that is path's real path or one
+	of its ancestors; of entries on one mount point, the later (on top). fstype '' when none holds it.
+	A key prefix is the mount point relative to path's real path.
+	"""
+	real = os.path.realpath(path)
+	inside = real.rstrip(os.sep) + os.sep
+	fs_type, depth, below = '', -1, []
+	for entry in entries:
+		mount_point = entry['mount_point']
+		if inside.startswith(mount_point.rstrip(os.sep) + os.sep):
+			if len(mount_point) >= depth:
+				fs_type, depth = entry['fstype'], len(mount_point)
+		elif mount_point.startswith(inside):
+			below.append((os.path.relpath(mount_point, real), mount_point, entry['fstype']))
+	return fs_type, below
 
 def _swap_devices(swaps_path='/proc/swaps'):
 	"""Real paths of the active swap areas."""

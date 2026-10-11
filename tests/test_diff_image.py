@@ -1,6 +1,7 @@
 import contextlib
 import hashlib
 import os
+import re
 import shutil
 import stat
 import struct
@@ -1281,6 +1282,130 @@ def test_apply_rejects_malformed_rows(case, tmp_path, hpcp_mod, reset_hpcp_globa
 	assert _snapshot(target) == before and (target / 'keep.txt').read_text() == 'keep'
 
 
+def _fake_mounts(hpcp_mod, monkeypatch, *mounts):
+	"""Make mountinfo list each (directory, fstype) of mounts as a mount point, and nothing else."""
+	entries = [{'devnum': (0, 100 + index), 'root': '/', 'mount_point': os.path.realpath(str(path)), 'options': ['rw'],
+		'fstype': fs_type, 'source': 'none'} for index, (path, fs_type) in enumerate(mounts)]
+	monkeypatch.setattr(hpcp_mod, '_mountinfo_entries', lambda *args, **kwargs: [dict(entry) for entry in entries])
+
+
+def _case_only_rename(new, base, prefix=''):
+	"""new renames base's EFI/BOOT (under prefix) to EFI/Boot, a change only in case."""
+	_write(new / prefix / 'EFI' / 'Boot' / 'BOOTX64.EFI', 'loader')
+	_write(base / prefix / 'EFI' / 'BOOT' / 'BOOTX64.EFI', 'loader')
+	_write(new / prefix / 'EFI' / 'grub.cfg', 'new cfg')
+	_write(base / prefix / 'EFI' / 'grub.cfg', 'old cfg')
+
+
+def _case_conflict(fs_type, a, b, where):
+	return (rf'^Patch conflict: {re.escape(repr(a))} and {re.escape(repr(b))} differ only by case and {re.escape(str(where))} '
+		rf'is a case-insensitive {fs_type} filesystem; applying would delete what it writes; nothing applied '
+		r'\(regenerate with -dd from whole disks, or remove the case-only rename\)$')
+
+
+@pytest.mark.parametrize('fs_type, refused', [('vfat', True), ('msdos', True), ('exfat', True), ('hfsplus', True),
+	('ext4', False), ('xfs', False), ('ntfs3', False), ('', False)])
+def test_single_fs_apply_refuses_case_only_rename_on_case_insensitive_target(trees, hpcp_mod, tmp_path, reset_hpcp_globals,
+		monkeypatch, fs_type, refused):
+	"""A case-only rename in a single-filesystem patch is a D + A pair. On a FAT, exFAT or HFS+ target the A rows
+	find the old entries and are skipped as done, then the D rows delete them: refused before anything changes,
+	even with -fa. Elsewhere (and when the type is unknown) the pair applies as before."""
+	new, base = trees
+	_case_only_rename(new, base)
+	vol = tmp_path / 'vol'
+	rows, _ = _patch_from(hpcp_mod, new, base, [vol])
+	assert {(row.op, row.path) for row in rows} == {('D', 'EFI/BOOT/'), ('D', 'EFI/BOOT/BOOTX64.EFI'),
+		('A', 'EFI/Boot/'), ('A', 'EFI/Boot/BOOTX64.EFI'), ('M', 'EFI/grub.cfg')}
+	target = tmp_path / 'target'
+	_clone(base, target)
+	_fake_mounts(hpcp_mod, monkeypatch, (target, fs_type))
+	if refused:
+		before = _snapshot(target)
+		with pytest.raises(RuntimeError, match=_case_conflict(fs_type, 'EFI/BOOT/', 'EFI/Boot/', target)):
+			hpcp_mod.apply_patch_tree([str(vol)], str(target), force=True, max_workers=1)
+		assert _snapshot(target) == before and (target / 'EFI' / 'grub.cfg').read_text() == 'old cfg'
+	else:
+		summary = hpcp_mod.apply_patch_tree([str(vol)], str(target), max_workers=1)
+		assert (summary['deleted'], summary['added'], summary['modified'], summary['failed']) == (2, 2, 1, 0)
+		assert _changes(hpcp_mod, new, target) == []
+
+
+def test_single_fs_apply_finds_the_target_mount_by_longest_prefix(trees, hpcp_mod, tmp_path, reset_hpcp_globals, monkeypatch):
+	"""The target's filesystem is the deepest mount holding its real path; of two on one mount point, the later
+	(which is on top) counts. A target reached through a symlink is looked up by its real path."""
+	new, base = trees
+	_case_only_rename(new, base)
+	vol = tmp_path / 'vol'
+	_patch_from(hpcp_mod, new, base, [vol])
+	target = tmp_path / 'mnt' / 'esp'
+	_clone(base, target)
+	link = tmp_path / 'link'
+	os.symlink(str(target), str(link))
+	_fake_mounts(hpcp_mod, monkeypatch, ('/', 'ext4'), (target, 'ext4'), (tmp_path / 'mnt', 'ext4'), (target, 'vfat'))
+	with pytest.raises(RuntimeError, match=_case_conflict('vfat', 'EFI/BOOT/', 'EFI/Boot/', str(link) + os.sep)):
+		hpcp_mod.apply_patch_tree([str(vol)], str(link) + os.sep, max_workers=1)
+	_fake_mounts(hpcp_mod, monkeypatch, ('/', 'ext4'), (target, 'vfat'), (tmp_path / 'mnt', 'vfat'), (target, 'ext4'))
+	assert hpcp_mod.apply_patch_tree([str(vol)], str(link) + os.sep, max_workers=1)['failed'] == 0
+	assert _changes(hpcp_mod, new, target) == []
+
+
+def test_single_fs_apply_refuses_case_only_rename_under_a_case_insensitive_mount_below_the_target(trees, hpcp_mod, tmp_path,
+		reset_hpcp_globals, monkeypatch):
+	"""`-siff store-patch.img -d /`: the target is ext4, but rows under boot/efi land on the vfat ESP mounted there.
+	A case-only rename elsewhere on the case-sensitive target still applies."""
+	new, base = trees
+	_case_only_rename(new, base, prefix='boot/efi')
+	vol = tmp_path / 'vol'
+	_patch_from(hpcp_mod, new, base, [vol])
+	target = tmp_path / 'target'
+	_clone(base, target)
+	_fake_mounts(hpcp_mod, monkeypatch, (target, 'ext4'), (target / 'boot' / 'efi', 'vfat'))
+	before = _snapshot(target)
+	with pytest.raises(RuntimeError, match=_case_conflict('vfat', 'boot/efi/EFI/BOOT/', 'boot/efi/EFI/Boot/',
+			os.path.realpath(str(target / 'boot' / 'efi')))):
+		hpcp_mod.apply_patch_tree([str(vol)], str(target), force=True, max_workers=1)
+	assert _snapshot(target) == before
+	# The same rename on the ext4 part of the target (boot/EFI is not under the vfat mount at boot/efi).
+	new2, base2, vol2, target2 = (tmp_path / name for name in ('new2', 'base2', 'vol2', 'target2'))
+	_case_only_rename(new2, base2, prefix='boot')
+	_patch_from(hpcp_mod, new2, base2, [vol2])
+	_clone(base2, target2)
+	(target2 / 'boot' / 'efi').mkdir()
+	(new2 / 'boot' / 'efi').mkdir()
+	_fake_mounts(hpcp_mod, monkeypatch, (target2, 'ext4'), (target2 / 'boot' / 'efi', 'vfat'))
+	assert hpcp_mod.apply_patch_tree([str(vol2)], str(target2), max_workers=1)['failed'] == 0
+	assert _changes(hpcp_mod, new2, target2) == []
+
+
+@pytest.mark.parametrize('fs_type, verified', [('vfat', True), ('ext4', False)])
+def test_single_fs_apply_on_case_insensitive_target_verifies_rows_skipped_as_done(trees, hpcp_mod, tmp_path, reset_hpcp_globals,
+		monkeypatch, fs_type, verified):
+	"""As in disk sections with case-insensitive names: an A / M row skipped as already done that the apply then
+	loses is a verify failure on a FAT, exFAT or HFS+ target."""
+	new, base = trees
+	_write(new / 'EFI' / 'keep.efi', 'keep')
+	_write(new / 'EFI' / 'mod.efi', 'new')
+	_write(base / 'EFI' / 'mod.efi', 'old')
+	vol = tmp_path / 'vol'
+	_patch_from(hpcp_mod, new, base, [vol])
+	target = tmp_path / 'target'
+	_clone(base, target)
+	_write(target / 'EFI' / 'keep.efi', 'keep')
+	_fake_mounts(hpcp_mod, monkeypatch, (target, fs_type))
+	real_apply_rows = hpcp_mod._apply_rows
+	def losing_apply_rows(*args, **kwargs):
+		real_apply_rows(*args, **kwargs)
+		os.unlink(str(target / 'EFI' / 'keep.efi'))
+	monkeypatch.setattr(hpcp_mod, '_apply_rows', losing_apply_rows)
+	summary = hpcp_mod.apply_patch_tree([str(vol)], str(target), max_workers=1)
+	assert (target / 'EFI' / 'mod.efi').read_text() == 'new' and summary['skipped'] == 1
+	if verified:
+		assert summary['failed'] == 1
+		assert len(hpcp_mod.ERRORS) == 1 and hpcp_mod.ERRORS[0].startswith('Patch verify error: A EFI/keep.efi: expected f:')
+	else:
+		assert summary['failed'] == 0 and hpcp_mod.ERRORS == []
+
+
 def test_apply_refuses_symlinked_parent_inside_patch_volume(tmp_path, hpcp_mod, reset_hpcp_globals):
 	outside = tmp_path / 'outside'
 	_write(outside / 'x.txt', 'secret')
@@ -1951,6 +2076,33 @@ def test_xfs_image_to_image_patch_applies_to_the_base_image(tmp_path, hpcp_mod, 
 		new_root = hpcp_mod._mount_single_fs_image(new_img, True, mount_points, loop_devices)
 		base_root = hpcp_mod._mount_single_fs_image(base_img, True, mount_points, loop_devices)
 		assert hpcp_mod.compute_changes(*hpcp_mod.build_root_maps(new_root, base_root, max_workers=1), max_workers=1) == []
+
+
+@requires_root_and_image_tools
+@pytest.mark.skipif(shutil.which('mkfs.vfat') is None, reason='needs mkfs.vfat')
+@pytest.mark.root
+@pytest.mark.loop
+def test_case_only_rename_patch_is_refused_on_a_vfat_image(tmp_path, hpcp_mod, reset_hpcp_globals):
+	"""-si golden_esp.img -di node_esp.img where golden renamed EFI/BOOT to EFI/Boot, then -siff onto node_esp.img:
+	applied, the A rows would be skipped as present and the D rows delete the boot loader."""
+	hpcp_mod.HASH_SIZE = 65536
+	golden, node, out = str(tmp_path / 'golden.img'), str(tmp_path / 'node.img'), str(tmp_path / 'patch.img')
+	for image, name in ((golden, 'Boot'), (node, 'BOOT')):
+		with open(image, 'wb') as f:
+			f.truncate(32 << 20)
+		subprocess.run(['mkfs.vfat', image], check=True, stdout=subprocess.DEVNULL)
+		_change_image(hpcp_mod, image, lambda root, name=name: _write(os.path.join(root, 'EFI', name, 'BOOTX64.EFI'), 'loader'))
+	with _mount_session(hpcp_mod) as (mount_points, loop_devices):
+		assert hpcp_mod.process_get_diff_image([], [golden], [], node, out, mount_points, loop_devices, max_workers=1) == out
+	with _mount_session(hpcp_mod) as (mount_points, loop_devices):
+		with pytest.raises(RuntimeError, match=r"^Patch conflict: 'EFI/BOOT/' and 'EFI/Boot/' differ only by case and /\S+ "
+				r'is a case-insensitive vfat filesystem; applying would delete what it writes; nothing applied'):
+			hpcp_mod.process_load_diff_image([out], [], [], node, mount_points, loop_devices, force=True, max_workers=1)
+	with _mount_session(hpcp_mod) as (mount_points, loop_devices):
+		root = hpcp_mod._mount_single_fs_image(node, True, mount_points, loop_devices)
+		assert os.listdir(os.path.join(root, 'EFI')) == ['BOOT']
+		with open(os.path.join(root, 'EFI', 'BOOT', 'BOOTX64.EFI')) as f:
+			assert f.read() == 'loader'
 
 
 def test_hpcp_rejects_bad_patch_arguments(tmp_path, hpcp_mod, reset_hpcp_globals, capsys):
