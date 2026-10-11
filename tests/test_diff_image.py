@@ -245,7 +245,7 @@ def test_read_manifest_rejects_foreign_or_newer(tmp_path, hpcp_mod):
 	path.write_text('format\tsomething-else\nformat_version\t1\n')
 	with pytest.raises(RuntimeError, match='Patch format error'):
 		hpcp_mod.read_manifest(str(path))
-	path.write_text('format\thpcp-diff\nformat_version\t2\n')
+	path.write_text('format\thpcp-diff\nformat_version\t3\n')
 	with pytest.raises(RuntimeError, match='newer'):
 		hpcp_mod.read_manifest(str(path))
 	path.write_text('format\thpcp-diff\nformat_version\t1\nunknown_key\tfine\n')

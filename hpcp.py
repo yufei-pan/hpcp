@@ -3722,7 +3722,9 @@ compare_file_list = _compare_file_lists
 
 #%% ---- Diff Image ----
 DIFF_DIR_NAME = '.hpcp_diff'
-DIFF_FORMAT_VERSION = 1
+DIFF_FORMAT_VERSION = 2
+# Single-filesystem patches keep the version hpcp 9.65 reads; disk patches (layout disk) are version 2.
+_SINGLE_FS_FORMAT_VERSION = 1
 CHANGES_HEADER = '#hpcp-changes'
 CHANGES_VERSION = 1
 ChangeRow = namedtuple('ChangeRow', 'op path old new')
@@ -3967,18 +3969,45 @@ def read_changes(source):
 			rows.append(ChangeRow(fields[0], path, fields[2], fields[3]))
 	return rows
 
+_SECTION_NAME_RE = re.compile(r'part[1-9][0-9]*')
+_SHA256_RE = re.compile(r'[0-9a-f]{64}')
+
 def write_manifest(target, meta):
-	"""Write meta (key -> value, plus 'sections': [(name, payload_dir, changes_file)]) as key/value TSV."""
+	"""Write meta as key/value TSV.
+
+	'sections' is a list of (name, payload_dir, changes_file) and 'raws' a list of
+	(name, file, old_sha256, new_sha256, size); both are written as repeatable lines.
+	"""
 	with open(target, 'w', encoding='utf-8', errors='surrogateescape', newline='\n') as f:
 		for key, value in meta.items():
-			if key != 'sections':
+			if key not in ('sections', 'raws'):
 				f.write(f'{key}\t{_escape_field(str(value))}\n')
 		for name, payload_dir, changes_file in meta.get('sections', []):
 			f.write(f'section\t{_escape_field(name)}\t{_escape_field(payload_dir)}\t{_escape_field(changes_file)}\n')
+		for raw in meta.get('raws', []):
+			f.write('raw\t' + '\t'.join(_escape_field(str(field)) for field in raw) + '\n')
+
+def _check_raw_entry(fields):
+	"""Validate one manifest raw line (name, file, old, new, size); returns it with size as int."""
+	name, raw_file, old_sha, new_sha, size = fields
+	bare = raw_file[len('raw/'):] if raw_file.startswith('raw/') else ''
+	if not (name == 'mbr' or _SECTION_NAME_RE.fullmatch(name)):
+		raise ValueError(f'bad raw area name {name!r}')
+	if not bare or '/' in bare or bare in ('.', '..'):
+		raise ValueError(f'bad raw payload file {raw_file!r}')
+	if not (_SHA256_RE.fullmatch(old_sha) and _SHA256_RE.fullmatch(new_sha)):
+		raise ValueError('bad raw area hash')
+	if not size.isdigit():
+		raise ValueError(f'bad raw area size {size!r}')
+	return (name, raw_file, old_sha, new_sha, int(size))
 
 def read_manifest(source):
-	"""Read a manifest. Values are strings; unknown keys are kept and ignored by callers."""
-	meta = {'sections': []}
+	"""Read a manifest. Values are strings; 'sections' and 'raws' are lists of tuples.
+
+	Unknown keys are kept and ignored by callers. Raw entries and the disk table are only
+	valid in a layout disk manifest (format_version 2).
+	"""
+	meta = {'sections': [], 'raws': []}
 	seen_keys = set()
 	with open(source, 'r', encoding='utf-8', errors='surrogateescape', newline='\n') as f:
 		for line in f:
@@ -4001,10 +4030,15 @@ def read_manifest(source):
 				except ValueError:
 					raise RuntimeError(f'Patch format error: {source} has an unsafe section line {line!r}')
 				meta['sections'].append(tuple(fields[1:]))
-			elif fields[0] != 'section' and len(fields) == 2:
+			elif fields[0] == 'raw' and len(fields) == 6:
+				try:
+					meta['raws'].append(_check_raw_entry(fields[1:]))
+				except ValueError as e:
+					raise RuntimeError(f'Patch format error: {source} has an unsafe raw line {line!r}: {e}')
+			elif fields[0] not in ('section', 'raw') and len(fields) == 2:
 				key, value = fields
-				if key == 'sections':
-					raise RuntimeError(f'Patch format error: {source} uses reserved key sections')
+				if key in ('sections', 'raws'):
+					raise RuntimeError(f'Patch format error: {source} uses reserved key {key}')
 				if key in seen_keys:
 					raise RuntimeError(f'Patch format error: {source} has a duplicate key {key!r}')
 				seen_keys.add(key)
@@ -4019,7 +4053,62 @@ def read_manifest(source):
 		raise RuntimeError(f'Patch format error: {source} has a bad format_version')
 	if format_version > DIFF_FORMAT_VERSION:
 		raise RuntimeError(f'Patch format error: {source} uses format version {format_version}, newer than supported {DIFF_FORMAT_VERSION}')
+	if meta.get('layout') == 'disk':
+		if format_version < 2:
+			raise RuntimeError(f'Patch format error: {source} has layout disk but format version {format_version}')
+		for name, payload_dir, changes_file in meta['sections']:
+			if not _SECTION_NAME_RE.fullmatch(name) or payload_dir != name or changes_file != name + '.changes.tsv':
+				raise RuntimeError(f'Patch format error: {source} has a bad disk section {name!r}')
+		for kind, names in (('section', [section[0] for section in meta['sections']]), ('raw area', [raw[0] for raw in meta['raws']])):
+			if len(set(names)) != len(names):
+				raise RuntimeError(f'Patch format error: {source} names a {kind} twice')
+		disk_file = meta.get('disk', '')
+		if not disk_file or '/' in disk_file or disk_file in ('.', '..'):
+			raise RuntimeError(f'Patch format error: {source} has no valid disk table entry')
+	elif meta['raws'] or 'disk' in meta:
+		raise RuntimeError(f'Patch format error: {source} has raw areas or a disk table outside layout disk')
 	return meta
+
+DISK_HEADER = '#hpcp-disk'
+DISK_VERSION = 1
+DiskRow = namedtuple('DiskRow', 'kind number field old new')
+_DISK_FIELDS = ('guid', 'sector_size')
+_PART_FIELDS = ('kind', 'type_guid', 'unique_guid', 'name', 'attrs', 'size', 'fs_type', 'fs_uuid', 'fs_label', 'fs_params')
+
+def write_disk_tsv(target, rows):
+	"""Write disk.tsv: escaped kind / number / field / old / new rows."""
+	with open(target, 'w', encoding='utf-8', errors='surrogateescape', newline='\n') as f:
+		f.write(f'{DISK_HEADER}\t{DISK_VERSION}\n')
+		f.write('#kind\tnumber\tfield\told\tnew\n')
+		for row in rows:
+			f.write('\t'.join(_escape_field(str(value)) for value in row) + '\n')
+
+def read_disk_tsv(source):
+	"""Read disk.tsv into DiskRows. Raises RuntimeError('Patch format error: ...')."""
+	rows = []
+	with open(source, 'r', encoding='utf-8', errors='surrogateescape', newline='\n') as f:
+		header = f.readline().rstrip('\n').split('\t')
+		if len(header) != 2 or header[0] != DISK_HEADER or not header[1].isdigit():
+			raise RuntimeError(f'Patch format error: {source} is not an hpcp disk table')
+		if int(header[1]) > DISK_VERSION:
+			raise RuntimeError(f'Patch format error: {source} has disk table version {header[1]}, newer than supported {DISK_VERSION}')
+		for line_number, line in enumerate(f, start=2):
+			line = line.rstrip('\n')
+			if not line or line.startswith('#'):
+				continue
+			try:
+				fields = [_unescape_field(field) for field in line.split('\t')]
+			except ValueError as e:
+				raise RuntimeError(f'Patch format error: {source} line {line_number}: {e}')
+			if len(fields) != 5:
+				raise RuntimeError(f'Patch format error: {source} line {line_number} is malformed')
+			kind, number, field = fields[:3]
+			ok = ((kind == 'disk' and number == '-' and field in _DISK_FIELDS) or
+				(kind == 'part' and number.isdigit() and int(number) > 0 and field in _PART_FIELDS))
+			if not ok:
+				raise RuntimeError(f'Patch format error: {source} line {line_number} has an unknown row {kind} {number} {field}')
+			rows.append(DiskRow(*fields))
+	return rows
 
 def _logically_excluded(rel, logical_root, exclude):
 	"""True when rel (relative to a listed root) or one of its ancestors matches exclude
@@ -4296,7 +4385,7 @@ def make_patch_meta(rows, new_name, base_name, layout, full_hash=False):
 	"""Manifest fields for a new patch; 'volume' is filled in per volume by write_patch_metadata()."""
 	return {
 		'format': 'hpcp-diff',
-		'format_version': DIFF_FORMAT_VERSION,
+		'format_version': _SINGLE_FS_FORMAT_VERSION,
 		'patch_id': uuid.uuid4().hex,
 		'volume': '1/1',
 		'created': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
