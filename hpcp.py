@@ -3869,7 +3869,7 @@ def states_equal(a, b, compare_hash=True, metadata=True):
 	digest of '-' on either side is not compared; '?' never equals anything.
 	With compare_hash False neither the content hash nor the xattr digest is compared
 	(both come from the same hasher). With metadata False mode, owner and xattrs are not
-	compared: on FAT, exFAT, NTFS and HFS they come from mount options, not the filesystem.
+	compared: on FAT, exFAT and NTFS they come from mount options, not the filesystem.
 	"""
 	if a == '?' or b == '?':
 		return False
@@ -4903,7 +4903,7 @@ def _finish_replace(job, target_root, wait, metadata=True):
 		_discard_temp(tmp)
 
 def _copy_content(src_path, dest_paths, full_hash=False, verbose=False):
-	"""copy_file for a target without POSIX metadata (FAT, exFAT, NTFS, HFS): the bytes and the
+	"""copy_file for a target without POSIX metadata (FAT, exFAT, NTFS): the bytes and the
 	times only; mode and owner come from the target's mount options. Raises on failure."""
 	st = os.stat(src_path)
 	for dest in dest_paths:
@@ -4972,7 +4972,7 @@ def _apply_rows(rows, volume_roots, target_root, max_workers=1, verbose=False, f
 	existing file or symlink is never removed before its replacement exists. Only an entry
 	a rename cannot replace is removed first: a directory where a file or symlink goes, or
 	a file or symlink where a directory goes.
-	With metadata False (a FAT / exFAT / NTFS / HFS target) only content and file times are
+	With metadata False (a FAT / exFAT / NTFS target) only content and file times are
 	written: no mode, owner, xattrs or directory metadata (new directories get the target's
 	default mode).
 	"""
@@ -5095,8 +5095,9 @@ def _verify_rows(rows, target_root, compare_hash=True, full_hash=False, max_work
 			eprint(f'Patch verify error: {row.op} {row.path}: expected {expected}, found {found}')
 	return failed
 
-# metadata False: a content-only section (see states_equal).
-SectionPlan = namedtuple('SectionPlan', 'name volume_roots target_root rows checks metadata')
+# metadata False: a content-only section (see states_equal). case_insensitive: the target looks names
+# up case-insensitively (FAT, exFAT, HFS+; see _has_case_insensitive_names).
+SectionPlan = namedtuple('SectionPlan', 'name volume_roots target_root rows checks metadata case_insensitive')
 
 @contextlib.contextmanager
 def _patch_hash_settings(meta):
@@ -5117,10 +5118,10 @@ def _patch_hash_settings(meta):
 	finally:
 		HASH_SIZE = saved_hash_size
 
-def _plan_section(name, rows, volume_roots, target_root, compare_hash, full_hash, max_workers, metadata=True):
+def _plan_section(name, rows, volume_roots, target_root, compare_hash, full_hash, max_workers, metadata=True, case_insensitive=False):
 	"""Check one section's rows against target_root; nothing changes."""
 	return SectionPlan(name, list(volume_roots), target_root, rows,
-		check_patch_target(rows, target_root, compare_hash, full_hash, max_workers, metadata), metadata)
+		check_patch_target(rows, target_root, compare_hash, full_hash, max_workers, metadata), metadata, case_insensitive)
 
 def _section_conflicts(plan):
 	return [check for check in plan.checks if check.action == 'conflict']
@@ -5157,8 +5158,8 @@ def _apply_section(plan, max_workers, verbose, full_hash, compare_hash):
 	_apply_rows(todo, plan.volume_roots, plan.target_root, max_workers, verbose, full_hash,
 		forced_rows=[check.row for check in conflicts], metadata=plan.metadata)
 	verify = todo
-	if not plan.metadata:
-		# A content-only target (FAT, exFAT, ...) looks names up case-insensitively: an A / M row skipped as
+	if plan.case_insensitive:
+		# A target that looks names up case-insensitively (FAT, exFAT, HFS+): an A / M row skipped as
 		# already done can still be lost to a D row on a name that differs only by case, so verify those too.
 		verify = todo + [check.row for check in plan.checks if check.action == 'skip' and check.row.op != 'D']
 	failed = _verify_rows(verify, plan.target_root, compare_hash, full_hash, max_workers, plan.metadata)
@@ -5788,11 +5789,18 @@ def _partition_in_use(device, devnum, entries, swaps, sys_block_path='/sys/class
 
 _FAT_TYPES = ('fat32', 'fat16', 'fat12', 'fat', 'vfat', 'msdos')
 # Filesystems whose file modes and owners come from mount options (umask=, uid=), not the disk.
-_NO_POSIX_METADATA_TYPES = frozenset(_FAT_TYPES + ('exfat', 'ntfs', 'ntfs3', 'hfs', 'hfsplus'))
+_NO_POSIX_METADATA_TYPES = frozenset(_FAT_TYPES + ('exfat', 'ntfs', 'ntfs3'))
+# Filesystems whose Linux drivers look names up case-insensitively (ntfs3 and ntfs-3g use the exact case;
+# hfsplus folds case but keeps owner, group and mode on disk).
+_CASE_INSENSITIVE_TYPES = frozenset(_FAT_TYPES + ('exfat', 'hfs', 'hfsplus'))
 
 def _has_posix_metadata(fs_type):
 	"""False for a filesystem whose sections are compared and applied by content only."""
 	return fs_type not in _NO_POSIX_METADATA_TYPES
+
+def _has_case_insensitive_names(fs_type):
+	"""True for a filesystem whose sections pair names case-insensitively (see _fold_case_keys, _case_collision)."""
+	return fs_type in _CASE_INSENSITIVE_TYPES
 
 _IDENTITY_FIELDS = ('unique_guid', 'name', 'attrs', 'fs_uuid', 'fs_label')
 IdentityChange = namedtuple('IdentityChange', 'number field current new')
@@ -5987,7 +5995,7 @@ def _case_folded_names(entry_map, label):
 	"""{casefolded name: key} of an entry map (a name is a key without its trailing '/').
 
 	Raises RuntimeError('Diff image error: ...') when two keys differ only by case: a
-	case-insensitive filesystem (FAT, exFAT) cannot hold both, so they cannot be paired.
+	case-insensitive filesystem (FAT, exFAT, HFS+) cannot hold both, so they cannot be paired.
 	"""
 	names = {}
 	for key in sorted(entry_map, key=lambda key: (_key_depth(key), key)):
@@ -6001,7 +6009,7 @@ def _case_folded_names(entry_map, label):
 def _fold_case_keys(new_map, base_map, labels=('new', 'old')):
 	"""base_map re-keyed to new_map's spelling wherever a name (or an ancestor) differs only by case.
 
-	For content-only sections (FAT, exFAT, NTFS, HFS), whose lookups are case-insensitive: a
+	For sections whose lookups are case-insensitive (FAT, exFAT, HFS+; see _has_case_insensitive_names): a
 	case-only rename then pairs the old and new entry (an M row in the new spelling, or no row),
 	instead of a D + A pair whose A rows the target would skip as present and whose D rows would
 	then delete those very entries. labels name the new and old side for the refusal of names
@@ -6054,10 +6062,10 @@ def _case_collision(rows):
 	return None
 
 def _partition_changes(new_root, old_root, mount_points, live_mounts, exclude, full_hash, max_workers, parallel_file_listing,
-		input_files=(), metadata=True, labels=('new', 'old')):
+		input_files=(), metadata=True, labels=('new', 'old'), case_insensitive=False):
 	"""Change rows of one filesystem partition (root to root; lost+found, this run's mounts and
-	its input disk-image files left out). metadata False: content-only rows (see states_equal),
-	with names paired case-insensitively (see _fold_case_keys; labels name the two sides)."""
+	its input disk-image files left out). metadata False: content-only rows (see states_equal).
+	case_insensitive: names paired case-insensitively (see _fold_case_keys; labels name the two sides)."""
 	matched = os.path.abspath(new_root)
 	patterns = _mount_point_excludes(mount_points, (new_root, old_root), matched)
 	for live_mount in live_mounts:
@@ -6074,7 +6082,7 @@ def _partition_changes(new_root, old_root, mount_points, live_mounts, exclude, f
 	new_map, base_map = _drop_lost_found(new_map), _drop_lost_found(base_map)
 	if any(_is_reserved_key(key) for key in new_map):
 		raise RuntimeError(f'Diff image error: {new_root} contains {DIFF_DIR_NAME}, which hpcp reserves for patch metadata')
-	if not metadata:
+	if case_insensitive:
 		new_map, base_map = _fold_case_keys(new_map, base_map, labels)
 	rows = compute_changes(new_map, base_map, full_hash=full_hash, max_workers=max_workers, metadata=metadata)
 	_validate_patch_rows(rows)
@@ -6175,7 +6183,9 @@ def process_get_disk_diff_image(src_paths, dest_paths, output, mount_points, loo
 			if new_root and old_root:
 				lives = [_live_mount(_device_number(part['device']), entries, part['device'])[0] for part in (new_part, old_part)]
 				rows = _partition_changes(new_root, old_root, mount_points, lives, exclude, full_hash, max_workers, parallel_file_listing,
-					input_files, _has_posix_metadata(new_part['fs_type']), (f'part{number} of {sources[0]}', f'part{number} of {bases[0]}'))
+					input_files, metadata=_has_posix_metadata(new_part['fs_type']),
+					labels=(f'part{number} of {sources[0]}', f'part{number} of {bases[0]}'),
+					case_insensitive=_has_case_insensitive_names(new_part['fs_type']))
 				_release_mount(old_root, mount_points)
 				if rows:
 					# Kept mounted: its payload is copied once the patch image exists.
@@ -6321,7 +6331,7 @@ def apply_disk_patch(volume_roots, target, mount_points, loop_devices, force=Fal
 	fs_types = {row.number: row.old for row in disk_rows if row.kind == 'part' and row.field == 'fs_type'}
 	for name, _, rows in sections:
 		# Patches from older hpcp turned a case-only rename into a D + A pair, which deletes the files on FAT.
-		collision = None if _has_posix_metadata(fs_types.get(name[len('part'):], '')) else _case_collision(rows)
+		collision = _case_collision(rows) if _has_case_insensitive_names(fs_types.get(name[len('part'):], '')) else None
 		if collision:
 			raise RuntimeError(f'Patch format error: section {name} deletes and writes {collision[0]} and {collision[1]} '
 				'differing only by case; regenerate the patch with this hpcp')
@@ -6379,8 +6389,9 @@ def apply_disk_patch(volume_roots, target, mount_points, loop_devices, force=Fal
 			root = _mount_partition(part['device'], False, mount_points, entries)
 			if root is None:
 				raise RuntimeError(f"Disk layout mismatch: partition {name[len('part'):]} ({part['fs_type']}) cannot be mounted read-write; nothing applied")
+			fs_type = fs_types.get(name[len('part'):], '')
 			plans.append(_plan_section(name, rows, _section_volume_roots(volume_roots, payload_dir), root, compare_hash, full_hash, max_workers,
-				_has_posix_metadata(fs_types.get(name[len('part'):], ''))))
+				_has_posix_metadata(fs_type), _has_case_insensitive_names(fs_type)))
 		raw_conflicts = [entry for entry in raw_plan if entry['action'] == 'conflict']
 		extra = [(f"raw {entry['name']}: content matches neither the patch base nor the new state (found {entry['found'][:12]})",
 			f"raw {entry['name']}: content differs") for entry in raw_conflicts]
