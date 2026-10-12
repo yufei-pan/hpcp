@@ -4251,25 +4251,25 @@ def test_exclude_matching_the_root_empties_both_sides(tmp_path, hpcp_mod, reset_
 	assert set(new_map) == {'./'} == set(base_map)
 
 
-def test_recheck_lookup_does_not_scan_every_mount_per_directory(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
-	"""Spec Part 3 item 2: with thousands of mounts the lookup walks up each directory's real path instead of scanning
-	every mount (5000 directories x 5000 mounts took seconds)."""
-	new = tmp_path / 'new'
-	rows, stats = [], {}
-	for index in range(5000):
-		path = _write(new / f'd{index:04}' / 'f.txt', 'x')
-		key = f'd{index:04}/f.txt'
-		rows.append(hpcp_mod.ChangeRow('A', key, '-', hpcp_mod.get_entry_state(path, False, False)))
-		stats[key] = hpcp_mod._scan_stat(os.lstat(path))
-	entries = [{'devnum': (0, 1), 'root': '/', 'mount_point': '/', 'options': ['rw'], 'fstype': 'ext4', 'source': '/dev/x',
-		'super_options': ['rw']}]
-	entries += [{'devnum': (0, 2 + index), 'root': '/', 'mount_point': f'/nx-mnt/m{index}', 'options': ['rw'], 'fstype': 'ext4',
-		'source': '/dev/y', 'super_options': ['rw']} for index in range(5000)]
-	monkeypatch.setattr(hpcp_mod, '_mountinfo_entries', lambda *args, **kwargs: entries)
-	monkeypatch.setattr(hpcp_mod, '_racy_window_ns', lambda: 0)
-	start = time.monotonic()
-	assert hpcp_mod._rows_to_recheck(rows, str(new), {'stats': stats, 'started_ns': int(time.time() * 1000000000)}) == []
-	assert time.monotonic() - start < 2.0
+class _CountingDict(dict):
+	def __init__(self, *args, **kwargs):
+		super().__init__(*args, **kwargs)
+		self.lookups = 0
+	def __contains__(self, key):
+		self.lookups += 1
+		return super().__contains__(key)
+
+
+def test_holding_mount_walks_up_the_path_not_the_mounts(hpcp_mod):
+	"""Spec Part 3 item 2: the deepest mount holding a directory is found with at most one lookup per path component
+	(plus '/'), however many mounts there are."""
+	points = _CountingDict({'': 'root', '/nx/a': 'a', '/nx/a/b': 'b'})
+	points.update({f'/nx-mnt/m{index}': index for index in range(5000)})
+	for directory, holder in (('/nx/a/b/c/d', 'b'), ('/nx/a/x', 'a'), ('/nx/other', 'root'), ('/', 'root'), ('/nx/a/b', 'b')):
+		points.lookups = 0
+		assert hpcp_mod._holding_mount(points, directory) == holder
+		assert points.lookups <= directory.count('/') + 1
+	assert hpcp_mod._holding_mount(_CountingDict({'/nx/a': 'a'}), '/nx/other') is None
 
 
 def test_compute_changes_collects_scan_stats_for_new_side_paths_only(trees, hpcp_mod, monkeypatch):

@@ -4681,6 +4681,18 @@ def _scan_stat(st):
 	"""The lstat values the payload re-check compares: device, inode, size, mtime and ctime (ns)."""
 	return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
 
+def _holding_mount(points, real_directory):
+	"""The deepest mount holding real_directory: its own entry in points ({mount point without a trailing separator
+	('' for '/'): mountinfo entry}) or the nearest parent's, looked up directory by directory up to '/', so the cost
+	grows with the depth of the path, not with the number of mounts. None when no mount holds it."""
+	key = real_directory.rstrip(os.sep)
+	while True:
+		if key in points:
+			return points[key]
+		if not key:
+			return None
+		key = key.rpartition(os.sep)[0]
+
 def _rows_to_recheck(rows, new_base, scan):
 	"""The rows (A / M file rows with a payload copy) whose copy _check_payload hashes again.
 
@@ -4703,16 +4715,7 @@ def _rows_to_recheck(rows, new_base, scan):
 		directory, name = os.path.split(source)
 		if directory not in holders:
 			real_directory = os.path.realpath(directory).rstrip(os.sep)
-			# The deepest visible mount holding it: its own real path or the nearest parent that is a mount point
-			# ('' stands for '/'), looked up in points, so the cost grows with the depth, not with the mounts.
-			key, found = real_directory, None
-			while True:
-				if key in points:
-					found = points[key]
-					break
-				if not key:
-					break
-				key = key.rpartition(os.sep)[0]
+			found = _holding_mount(points, real_directory)
 			holders[directory] = (found, real_directory)
 		found, real_directory = holders[directory]
 		return points.get(real_directory + os.sep + name, found)
