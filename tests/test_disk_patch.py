@@ -2731,3 +2731,29 @@ def test_disk_patch_writes_awkward_labels_names_and_exfat_serials_exactly(tmp_pa
 		assert hpcp_mod._probe_identity(loop + 'p2')[2] == _AWKWARD_LABEL
 		if _HAS_EXFAT:
 			assert hpcp_mod._probe_identity(loop + 'p3')[1] == 'ABCD-1234'
+
+
+@pytest.mark.parametrize('disk, lsblk, partitions, largest', [
+	('/dev/cciss/c0d0', ['cciss!c0d0 1000', 'cciss!c0d0p1 400', 'cciss!c0d0p2 600'],
+		['/dev/cciss/c0d0p1', '/dev/cciss/c0d0p2'], '/dev/cciss/c0d0p2'),
+	('/dev/disk/by-id/ata-DISK', ['sda 1000', 'sda1 400', 'sda2 600'], ['/dev/sda1', '/dev/sda2'], '/dev/sda2'),
+	('/dev/loop7', ['loop7 1000', 'loop7p1 900'], ['/dev/loop7p1'], '/dev/loop7p1'),
+])
+def test_partition_paths_come_from_kernel_names(hpcp_mod, reset_hpcp_globals, monkeypatch, disk, lsblk, partitions, largest):
+	"""A '!' in a kernel name is a '/' under /dev (cciss), and a disk given by a by-id link still has its
+	partitions under /dev, not next to the link."""
+	monkeypatch.setattr(hpcp_mod, 'run_command_in_multicmd_with_path_check', lambda argv, **kwargs: list(lsblk))
+	assert hpcp_mod.get_partitions(disk) == partitions
+	assert hpcp_mod.get_largest_partition(disk) == largest
+
+
+def test_target_partition_maps_cciss_names(hpcp_mod, reset_hpcp_globals, monkeypatch):
+	monkeypatch.setattr(hpcp_mod, 'create_loop_device', lambda image: '/dev/cciss/c0d0')
+	monkeypatch.setattr(hpcp_mod, 'run_command_in_multicmd_with_path_check',
+		lambda argv, **kwargs: ['cciss!c0d0', 'cciss!c0d0p1', 'cciss!c0d0p2'])
+	assert hpcp_mod.get_target_partition('/tmp/not-a-device.img', '2') == ('/dev/cciss/c0d0p2', '/dev/cciss/c0d0')
+
+
+def test_dev_path(hpcp_mod):
+	assert hpcp_mod._dev_path('cciss!c0d0p1') == '/dev/cciss/c0d0p1'
+	assert hpcp_mod._dev_path('nvme0n1p2') == '/dev/nvme0n1p2'

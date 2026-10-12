@@ -824,6 +824,11 @@ def format_exclude(exclude = None,exclude_file = None) -> frozenset:
 	return frozenset(exclude)
 
 #%% -- DD --
+def _dev_path(kernel_name):
+	"""/dev path of a block device from its kernel (lsblk, sysfs) name: a '!' spells a '/' (cciss!c0d0p1 is
+	/dev/cciss/c0d0p1). Never relative to the path the disk was given by (a /dev/disk/by-id link)."""
+	return '/dev/' + kernel_name.replace('!', '/')
+
 def get_largest_partition(disk):
 	"""
 	Get the largest partition on the disk.
@@ -839,7 +844,7 @@ def get_largest_partition(disk):
 	partitions = sorted(partitions, key=lambda x: int(x.split()[1]))
 	# Skip the first entry as it's the disk itself
 	largest_partition = partitions[-2].split()[0] if len(partitions) > 1 else partitions[-1].split()[0]
-	return os.path.join(os.path.dirname(disk), largest_partition)
+	return _dev_path(largest_partition)
 
 def get_partitions(disk):
 	"""Get all the partitions on the disk.
@@ -853,7 +858,7 @@ def get_partitions(disk):
 	"""
 	partitions = run_command_in_multicmd_with_path_check(["lsblk", '-nbl', '-o', 'NAME,SIZE',disk],strict=True)
 	# Skip the first entry as it's the disk itself
-	partitions = [os.path.join(os.path.dirname(disk), partition.split()[0]) for partition in partitions[1:]]
+	partitions = [_dev_path(partition.split()[0]) for partition in partitions[1:]]
 	return partitions
 
 def get_fs_type(path):
@@ -1672,7 +1677,7 @@ def get_target_partition(image, partition_name):
 	target_partition = ''
 	for part in partitions:
 		if part.endswith(partition_name):
-			target_partition = '/dev/' + part
+			target_partition = _dev_path(part.strip())
 			break
 	return target_partition, loop_device
 
@@ -6075,7 +6080,7 @@ def _partition_devices(disk, sys_block_path='/sys/class/block'):
 			continue
 		try:
 			with open(os.path.join(child_dir, 'partition')) as f:
-				result[int(f.read().strip())] = '/dev/' + child.replace('!', '/')
+				result[int(f.read().strip())] = _dev_path(child)
 		except (OSError, ValueError):
 			continue
 	return result
