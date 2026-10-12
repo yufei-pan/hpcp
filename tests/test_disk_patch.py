@@ -708,7 +708,7 @@ def test_fs_identity_commands_match_dd_mode_uuid_commands(hpcp_mod):
 	cmd = hpcp_mod._fs_identity_commands
 	assert cmd('ext4', dev, uuid=u) == [['e2fsck', '-f', '-y', dev], ['tune2fs', '-U', u, dev]]
 	assert cmd('xfs', dev, uuid=u) == [['xfs_admin', '-U', u, dev]]
-	assert cmd('exfat', dev, uuid=u) == [['exfatlabel', '-i', dev, u]]
+	assert cmd('exfat', dev, uuid=u) == [['exfatlabel', '-i', dev, '0x1234ABCD']]
 	assert cmd('udf', dev, uuid=u) == [['udflabel', '--uuid', u, dev]]
 	assert cmd('jfs', dev, uuid=u) == [['jfs_tune', '-U', u, dev]]
 	assert cmd('reiserfs', dev, uuid=u) == [['reiserfstune', '-u', u, dev]]
@@ -2423,9 +2423,7 @@ _IDENTITY_TOOL_CASES = [
 	('vfat', ['mkfs.vfat'], 'fatlabel', 'ABCD-1234', 'NEWLABEL'),
 	('btrfs', ['mkfs.btrfs', '-q', '-f'], 'btrfstune', _FULL_UUID, 'newlabel'),
 	('exfat', ['mkfs.exfat'], 'exfatlabel', None, 'newlabel'),
-	pytest.param('exfat', ['mkfs.exfat'], 'exfatlabel', 'ABCD-1234', None, marks=pytest.mark.xfail(
-		reason="pre-existing, not the hold (fails without it too): `exfatlabel -i DEVICE ABCD-1234` exits 234 with "
-		"'invalid serial number(ABCD-1234)'; exfatlabel takes the serial as hex (0xABCD1234)")),
+	('exfat', ['mkfs.exfat'], 'exfatlabel', 'ABCD-1234', None),
 	('swap', ['mkswap'], 'swaplabel', _FULL_UUID, 'newlabel'),
 	('udf', ['mkudffs'], 'udflabel', '0123456789abcdef', 'newlabel'),
 	('f2fs', ['mkfs.f2fs', '-f'], 'f2fslabel', None, 'newlabel'),
@@ -2613,3 +2611,123 @@ def test_single_filesystem_generation_marks_rows_under_a_fat_mount(tmp_path, hpc
 	by_path = {row.path: row for row in rows}
 	assert hpcp_mod._full_marked(by_path['boot/efi/EFI/x.efi'].new) and hpcp_mod._full_marked(by_path['boot/efi/EFI/x.efi'].old)
 	assert not hpcp_mod._full_marked(by_path['etc/conf'].new)
+
+
+def test_udev_decode_restores_the_exact_bytes(hpcp_mod):
+	"""Review Focus 1: blkid -o udev writes unsafe bytes as \\xNN (a space, a backslash, bytes that are not UTF-8);
+	multiCMD decodes undecodable output bytes to the same escape. Both decode to the original bytes."""
+	dec = hpcp_mod._udev_decode
+	assert dec('röot\\x20=x') == 'röot =x'
+	assert dec('a\\x5cb') == 'a\\b'
+	assert dec('x\\x5cx41') == 'x\\x41'
+	assert dec('a\\xffb') == 'a\udcffb'
+	assert dec('') == ''
+	assert dec('plain') == 'plain'
+
+
+def test_probe_identity_reads_the_encoded_udev_values(hpcp_mod, reset_hpcp_globals, monkeypatch):
+	output = ['ID_FS_UUID=9134403a-3b3f', 'ID_FS_UUID_ENC=9134403a-3b3f', 'ID_FS_UUID_SUB=sub',
+		'ID_FS_LABEL=röot_=x', 'ID_FS_LABEL_ENC=röot\\x20=x', 'ID_FS_LABEL_FATBOOT=BOOT', 'ID_FS_TYPE=ext4',
+		'ID_FS_USAGE=filesystem']
+	calls = []
+
+	def fake(argv, **kwargs):
+		calls.append(argv)
+		return output
+
+	monkeypatch.setattr(hpcp_mod, 'run_command_in_multicmd_with_path_check', fake)
+	assert hpcp_mod._probe_identity('/dev/x1') == ('ext4', '9134403a-3b3f', 'röot =x')
+	assert calls == [['blkid', '-p', '-o', 'udev', '/dev/x1']]
+	monkeypatch.setattr(hpcp_mod, 'run_command_in_multicmd_with_path_check', lambda argv, **kwargs: [])
+	assert hpcp_mod._probe_identity('/dev/x2') == ('', '', '')
+
+
+@pytest.mark.parametrize('line, name', [
+	("Partition name: 'it's a  name '", "it's a  name "),
+	("Partition name: ''", ''),
+	("Partition name: '   '", '   '),
+	("Partition name: 'a'b'c'", "a'b'c"),
+	("Partition name: 'Ünïcode ✓'", 'Ünïcode ✓'),
+])
+def test_get_partition_details_reads_gpt_names_exactly(hpcp_mod, reset_hpcp_globals, monkeypatch, line, name):
+	"""Review Focus 2: sgdisk prints the name raw between quotes (a quote inside it included)."""
+	sgdisk_output = ['Partition GUID code: 0FC63DAF-8483-4772-8E79-3D69D8477DE4 (Linux filesystem)',
+		'Partition unique GUID: 11111111-1111-1111-1111-111111111111', line,
+		'Attribute flags: 0000000000000000', 'Partition size: 2048 sectors (1.0 MiB)']
+
+	def fake(argv, **kwargs):
+		if argv[0] == 'sgdisk':
+			return sgdisk_output
+		if argv[0] == 'blkid':
+			return ['ID_FS_TYPE=ext4', 'ID_FS_LABEL_ENC=a\\x3db']
+		return ['']
+
+	monkeypatch.setattr(hpcp_mod, 'run_command_in_multicmd_with_path_check', fake)
+	monkeypatch.setattr(hpcp_mod, 'get_target_partition', lambda device, partition: ('/dev/x1', None))
+	monkeypatch.setattr(hpcp_mod, 'MIRROR_FS_PARAMS', False)
+	hpcp_mod.get_partition_details.cache_clear()
+	try:
+		details = hpcp_mod.get_partition_details('/dev/x', '1')
+	finally:
+		hpcp_mod.get_partition_details.cache_clear()
+	assert details['partition_name'] == name
+	assert (details['fs_type'], details['fs_label']) == ('ext4', 'a=b')
+
+
+def test_exfat_serial_is_passed_in_exfatlabel_form(hpcp_mod):
+	"""exfatlabel -i rejects blkid's XXXX-XXXX form ("invalid serial number") and takes 0xXXXXXXXX."""
+	assert hpcp_mod._fs_identity_commands('exfat', '/dev/x1', uuid='ABCD-1234') == [['exfatlabel', '-i', '/dev/x1', '0xABCD1234']]
+
+
+_AWKWARD_NAME_1 = "it's a  name "
+_AWKWARD_NAME_2 = 'Ünïcode ✓'
+_AWKWARD_LABEL = 'röot =x'
+_HAS_EXFAT = shutil.which('mkfs.exfat') is not None and shutil.which('exfatlabel') is not None
+
+
+def _make_identity_disk(path, names, label, exfat_serial=None):
+	"""64 MiB GPT disk: p1 vfat (name names[0]), p2 ext4 (name names[1], label label), p3 exFAT (when the tools
+	exist; serial exfat_serial, label 'dàta')."""
+	with open(str(path), 'wb') as f:
+		f.truncate(64 << 20)
+	argv = ['sgdisk', '-n1:2048:+16M', '-t1:EF00', f'-c1:{names[0]}', '-n2:0:+24M', '-t2:8300', f'-c2:{names[1]}']
+	if _HAS_EXFAT:
+		argv += ['-n3:0:+16M', '-t3:0700', '-c3:data']
+	_run(*(argv + [path]))
+	with _attached(path) as loop:
+		_run('mkfs.vfat', loop + 'p1')
+		_run('mkfs.ext4', '-q', '-F', '-L', label, loop + 'p2')
+		if _HAS_EXFAT:
+			_run('mkfs.exfat', '-L', 'dàta', loop + 'p3')
+			if exfat_serial:
+				_run('exfatlabel', '-i', loop + 'p3', exfat_serial)
+
+
+@requires_root_and_disk_tools
+@pytest.mark.root
+@pytest.mark.loop
+def test_disk_patch_writes_awkward_labels_names_and_exfat_serials_exactly(tmp_path, hpcp_mod, reset_hpcp_globals):
+	"""Spec Part 1: a golden whose GPT names hold an apostrophe, double and trailing spaces and non-ASCII
+	characters, whose ext4 label is non-ASCII with a space and '=', and whose exFAT serial differs: the node ends
+	with exactly those values."""
+	base, golden = tmp_path / 'base.img', tmp_path / 'golden.img'
+	_make_identity_disk(base, ('ESP', 'root'), 'ROOT', exfat_serial='0x11112222')
+	shutil.copyfile(str(base), str(golden))
+	_run('sgdisk', f'-c1:{_AWKWARD_NAME_1}', f'-c2:{_AWKWARD_NAME_2}', golden)
+	with _attached(golden) as loop:
+		_run('e2label', loop + 'p2', _AWKWARD_LABEL)
+		if _HAS_EXFAT:
+			_run('exfatlabel', '-i', loop + 'p3', '0xABCD1234')
+	patch = str(tmp_path / 'patch.img')
+	with _session(hpcp_mod) as (mount_points, loop_devices):
+		assert hpcp_mod.process_get_disk_diff_image([str(golden)], [str(base)], patch, mount_points, loop_devices, max_workers=1) == patch
+	target = tmp_path / 'node.img'
+	shutil.copyfile(str(base), str(target))
+	summary = _apply(hpcp_mod, patch, target)
+	assert summary['failed'] == 0
+	with _attached(target, read_only=True) as loop:
+		names = [subprocess.run(['sgdisk', '-i', str(number), loop], capture_output=True, text=True).stdout for number in (1, 2)]
+		assert f"Partition name: '{_AWKWARD_NAME_1}'" in names[0] and f"Partition name: '{_AWKWARD_NAME_2}'" in names[1]
+		assert hpcp_mod._probe_identity(loop + 'p2')[2] == _AWKWARD_LABEL
+		if _HAS_EXFAT:
+			assert hpcp_mod._probe_identity(loop + 'p3')[1] == 'ABCD-1234'

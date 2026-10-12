@@ -1716,7 +1716,10 @@ def get_partition_details(device, partition,sector_size=512):
 		elif "unique guid:" in line.lower():
 			rtnDic['unique_partition_guid'] = line.split(":")[1].strip()
 		elif "partition name:" in line.lower():
-			rtnDic['partition_name'] = line.split("'")[1].strip()
+			# sgdisk prints the name raw between quotes, a quote inside it included: everything between the first
+			# and the last quote, spaces kept.
+			first, last = line.find("'"), line.rfind("'")
+			rtnDic['partition_name'] = line[first + 1:last] if last > first else ''
 		elif "attribute flags:" in line.lower():
 			rtnDic['partition_attrs'] = line.split(":")[1].strip()
 		elif 'partition size:' in line.lower():
@@ -1729,17 +1732,10 @@ def get_partition_details(device, partition,sector_size=512):
 	# 		return rtnDic
 	# Get the fs type and uuid, use blkid
 	target_partition, loop_device = get_target_partition(device, partition)
-	# blkid exits 2 on a partition without a filesystem (BIOS boot, raw data): an answer, not an error.
-	error_count = len(ERRORS)
-	result = run_command_in_multicmd_with_path_check(["blkid", '-o', 'export', target_partition], quiet=True)
-	del ERRORS[error_count:]
-	for line in result:
-		if 'TYPE' in line.upper():
-			rtnDic['fs_type'] = line.split('=')[1].strip()
-		elif 'UUID' in line.upper() and 'PARTUUID' not in line.upper():
-			rtnDic['fs_uuid'] = line.split('=')[1].strip()
-		elif 'LABEL' in line.upper() and 'PARTLABEL' not in line.upper():
-			rtnDic['fs_label'] = line.split('=')[1].strip()
+	# The same exact, uncached probe disk patches use (_probe_identity): -o export mangled non-ASCII labels, and
+	# 'LABEL' in line also matched LABEL_FATBOOT and cut a label at its first '='.
+	if target_partition:
+		rtnDic['fs_type'], rtnDic['fs_uuid'], rtnDic['fs_label'] = _probe_identity(target_partition)
 	if rtnDic['fs_type'] and MIRROR_FS_PARAMS:
 		rtnDic['fs_params'] = probe_fs_params(target_partition, rtnDic['fs_type'])
 	if loop_device:
@@ -6126,25 +6122,38 @@ def _fs_params_text(params):
 	params = _stable_fs_params(params or {})
 	return ';'.join(f'{key}={params[key]}' for key in sorted(params))
 
-def _probe_identity(device):
-	"""(fs_type, fs_uuid, fs_label) of device from a low-level `blkid -p` probe ('' when nothing is found).
+_UDEV_HEX_ESCAPE_RE = re.compile(rb'\\x([0-9a-fA-F]{2})')
 
-	No blkid cache, so a label or UUID this run just changed reads back as it is on disk; exact
-	keys, so UUID_SUB (btrfs) and LABEL_FATBOOT (FAT) never stand in for UUID and LABEL.
+def _udev_decode(value):
+	"""A blkid `-o udev` *_ENC value as text, with the original bytes: blkid writes unsafe bytes (a space, a
+	backslash, bytes that are not UTF-8) as \\xNN and the rest as UTF-8, and multiCMD decodes undecodable output
+	bytes to the same escape. Bytes that are not UTF-8 are kept with surrogateescape."""
+	data = value.encode('utf-8', 'surrogateescape')
+	data = _UDEV_HEX_ESCAPE_RE.sub(lambda match: bytes([int(match.group(1), 16)]), data)
+	return data.decode('utf-8', 'surrogateescape')
+
+def _probe_identity(device):
+	"""(fs_type, fs_uuid, fs_label) of device from a low-level `blkid -p -o udev` probe, read exactly ('' when
+	nothing is found).
+
+	-o udev gives encoded forms (ID_FS_UUID_ENC, ID_FS_LABEL_ENC; see _udev_decode). -o export prints bytes above
+	127 in M- notation in every locale, so a label such as 'röot' would read back mangled. No blkid cache, so a
+	label or UUID this run just changed reads back as it is on disk; exact keys, so UUID_SUB (btrfs) and
+	LABEL_FATBOOT (FAT) never stand in for UUID and LABEL.
 	"""
 	error_count = len(ERRORS)
 	try:
-		output = run_command_in_multicmd_with_path_check(['blkid', '-p', '-o', 'export', device], quiet=True)
+		output = run_command_in_multicmd_with_path_check(['blkid', '-p', '-o', 'udev', device], quiet=True)
 	finally:
 		# blkid exits 2 when it finds nothing (BIOS boot and other raw partitions).
 		del ERRORS[error_count:]
 	values = {}
 	for line in output:
-		key, sep, value = line.strip().partition('=')
+		key, sep, value = line.rstrip('\r\n').partition('=')
 		if sep:
-			# -o export escapes shell-unsafe characters (a space in a label) with a backslash.
-			values[key] = re.sub(r'\\(.)', r'\1', value)
-	return values.get('TYPE', ''), values.get('UUID', ''), values.get('LABEL', '')
+			values[key] = value
+	uuid = values.get('ID_FS_UUID_ENC', values.get('ID_FS_UUID', ''))
+	return values.get('ID_FS_TYPE', ''), _udev_decode(uuid), _udev_decode(values.get('ID_FS_LABEL_ENC', ''))
 
 def _partition_table_type(device):
 	"""Partition table type of device from a low-level `blkid -p` probe ('gpt', 'dos', ...; '' when it finds
@@ -6693,7 +6702,8 @@ def _fs_identity_commands(fs_type, device, uuid=None, label=None):
 		elif fs_type in _FAT_TYPES:
 			commands.append(['fatlabel', '-i', device, uuid.replace('-', '').upper()])
 		elif fs_type == 'exfat':
-			commands.append(['exfatlabel', '-i', device, uuid])
+			# exfatlabel -i takes the serial as 0xXXXXXXXX; blkid shows it as XXXX-XXXX ("invalid serial number").
+			commands.append(['exfatlabel', '-i', device, '0x' + uuid.replace('-', '')])
 		elif fs_type == 'udf':
 			commands.append(['udflabel', '--uuid', uuid, device])
 		elif fs_type == 'jfs':

@@ -140,7 +140,7 @@ def test_get_partition_details_skips_probe_when_mirroring_disabled(monkeypatch):
 		'Attribute flags: 0000000000000000',
 		'Partition size: 2048 sectors (1.0 MiB)',
 	]
-	blkid_output = ['TYPE=vfat']
+	blkid_output = ['ID_FS_TYPE=vfat']
 
 	def fake_run_cmd(command, **kwargs):
 		if command[0] == 'sgdisk':
@@ -1371,6 +1371,38 @@ def test_dd_does_not_leak_the_source_loop_device(tmp_path):
 		# hpcp must detach its own read-only source loop before returning.
 		assert subprocess.run(['losetup', '-j', src], capture_output=True, text=True).stdout.strip() == ''
 		assert subprocess.run(['losetup', '-j', dest], capture_output=True, text=True).stdout.strip() == ''
+	finally:
+		_detach_loops_for_image(src)
+		_detach_loops_for_image(dest)
+
+
+@requires_root_and_tools
+def test_dd_copies_awkward_labels_and_gpt_names_exactly(tmp_path):
+	"""Spec Part 1 for -dd: a source whose GPT names hold an apostrophe, double and trailing spaces and non-ASCII
+	characters, and whose ext4 label is non-ASCII with a space and '=', is copied with exactly those values."""
+	name1, name2, label = "it's a  name ", 'Ünïcode ✓', 'röot =x'
+	src = str(tmp_path / 'src.img')
+	_run('truncate', '-s', '200M', src)
+	_run('sgdisk', '--clear', '--new=1:0:+64M', '--typecode=1:ef00', f'--change-name=1:{name1}',
+		'--new=2:0:0', '--typecode=2:8300', f'--change-name=2:{name2}', src)
+	loop = _run('losetup', '--partscan', '--find', '--show', src).strip()
+	try:
+		subprocess.run(['udevadm', 'settle'], check=False, capture_output=True)
+		_run('mkfs.vfat', '-F', '32', '-n', 'ESP', f'{loop}p1')
+		_run('mkfs.ext4', '-q', '-F', '-L', label, f'{loop}p2')
+	finally:
+		subprocess.run(['losetup', '-d', loop], check=False, capture_output=True)
+	dest = str(tmp_path / 'dest.img')
+	try:
+		_run_hpcp_dd([], src, dest)
+		loop = _run('losetup', '--partscan', '--find', '--show', '--read-only', dest).strip()
+		try:
+			subprocess.run(['udevadm', 'settle'], check=False, capture_output=True)
+			assert f"Partition name: '{name1}'" in _run('sgdisk', '-i', '1', loop)
+			assert f"Partition name: '{name2}'" in _run('sgdisk', '-i', '2', loop)
+			assert _run('e2label', f'{loop}p2').rstrip('\n') == label
+		finally:
+			subprocess.run(['losetup', '-d', loop], check=False, capture_output=True)
 	finally:
 		_detach_loops_for_image(src)
 		_detach_loops_for_image(dest)
