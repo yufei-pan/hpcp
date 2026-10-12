@@ -2510,6 +2510,64 @@ def test_writes_in_two_scopes_that_reach_one_entry_fail_at_verify(trees, hpcp_mo
 	assert (summaries[0]['added'], summaries[0]['failed']) == (2, 1)
 
 
+@pytest.mark.parametrize('op', ['A', 'M'])
+def test_directory_rows_in_two_scopes_that_reach_one_entry_fail_at_verify(trees, hpcp_mod, tmp_path, reset_hpcp_globals,
+		monkeypatch, op):
+	"""The golden's y/d/ and m/x/d/ differ in mode; on the node y -> m/x makes them one directory. A directory is
+	written in place (its inode stays), so the final pass verifies every directory row again, whatever its entry's
+	identity: the scope written first fails, as one of the two does on a single scope."""
+	new, base = trees
+	for tree in (new, base):
+		(tree / 'y').mkdir()
+		(tree / 'm' / 'x').mkdir(parents=True)
+	(new / 'y' / 'd').mkdir()
+	(new / 'm' / 'x' / 'd').mkdir()
+	os.chmod(str(new / 'y' / 'd'), 0o755 if op == 'A' else 0o750)
+	os.chmod(str(new / 'm' / 'x' / 'd'), 0o700)
+	if op == 'M':
+		for path in (base / 'y' / 'd', base / 'm' / 'x' / 'd'):
+			path.mkdir()
+			os.chmod(str(path), 0o755)
+	vol = tmp_path / 'vol'
+	rows, _ = _patch_from(hpcp_mod, new, base, [vol])
+	assert _ops(rows) == {(op, 'y/d/'), (op, 'm/x/d/')}
+	summaries = []
+	for name, mounts in (('target', ['m']), ('single', [])):
+		target = tmp_path / name
+		_clone(base, target)
+		shutil.rmtree(str(target / 'y'))
+		os.symlink(os.path.join('m', 'x'), str(target / 'y'))
+		summaries.append(_apply_on_scopes(hpcp_mod, monkeypatch, vol, target, mounts))
+		assert len(hpcp_mod.ERRORS) == 1 and hpcp_mod.ERRORS[0].startswith(f'Patch verify error: {op} ')
+	assert summaries[0] == summaries[1]
+	assert summaries[0]['failed'] == 1
+
+
+def test_a_row_failing_after_the_restore_across_scopes_is_counted_once(trees, hpcp_mod, tmp_path, reset_hpcp_globals,
+		monkeypatch):
+	"""The target's own scope writes y/F and verifies its skipped case sibling y/f (passes); scope m/ replaces m/x/f
+	(the same entry, through y -> m/x) with a directory. The restore across scopes finds y/f of another type and
+	fails its verify; the final pass must not count it again."""
+	new, base = trees
+	_write(new / 'y' / 'F', 'upper')
+	_write(new / 'y' / 'f', 'lower')
+	(new / 'm' / 'x' / 'f').mkdir(parents=True)
+	(base / 'y').mkdir()
+	_write(base / 'm' / 'x' / 'f', 'lower')
+	vol = tmp_path / 'vol'
+	rows, _ = _patch_from(hpcp_mod, new, base, [vol])
+	assert _ops(rows) == {('A', 'y/F'), ('A', 'y/f'), ('D', 'm/x/f'), ('A', 'm/x/f/')}
+	summaries = []
+	for name, mounts in (('target', ['m']), ('single', [])):
+		target = tmp_path / name
+		_clone(base, target)
+		(target / 'y').rmdir()
+		os.symlink(os.path.join('m', 'x'), str(target / 'y'))
+		summaries.append(_apply_on_scopes(hpcp_mod, monkeypatch, vol, target, mounts))
+		assert len([error for error in hpcp_mod.ERRORS if error.startswith('Patch verify error: A y/f:')]) == 1
+	assert summaries[0]['failed'] == summaries[1]['failed'] == 1
+
+
 def test_ordinary_multi_scope_apply_passes_the_final_verify(trees, hpcp_mod, tmp_path, reset_hpcp_globals, monkeypatch):
 	"""Deletes, adds and changes in the target's own scope and a vfat mount below it, without aliases: the final
 	pass finds nothing to report."""

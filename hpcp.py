@@ -5448,7 +5448,11 @@ def _restore_across_sections(ran, max_workers, verbose, full_hash, compare_hash)
 		passed = []
 		summary['failed'] += _verify_rows(rows, plan.target_root, compare_hash, full_hash, max_workers, plan.metadata, passed=passed)
 		outcome['verified'] = list(outcome.get('verified', ())) + rows
-		outcome.setdefault('identities', {}).update(_identities(plan.target_root, passed))
+		# A row that passed its section's verify and fails here must not be checked (and counted) again at the end.
+		identities = outcome.setdefault('identities', {})
+		for row in rows:
+			identities.pop(row, None)
+		identities.update(_identities(plan.target_root, passed))
 
 def _verify_across_sections(ran, max_workers, full_hash, compare_hash):
 	"""The final verify once more than one section ran, after _restore_across_sections.
@@ -5456,16 +5460,18 @@ def _verify_across_sections(ran, max_workers, full_hash, compare_hash):
 	A section is verified before the next one runs, so a later section (or a restore) that reaches one of its
 	entries through a symlinked directory would go unseen; on a single section the same contradictory patch fails at
 	verify. ran as for _restore_across_sections. Every D row that passed its verify is verified again (an lstat; the
-	case-only rename exception of _verify_rows still applies, with the section's verified A / M rows). Every A / M
-	row that passed is lstat'ed and verified again only when its entry (_entry_identity, recorded right after its
-	verify) changed or is gone. Failures are reported as verify errors and added to the section's summary.
+	case-only rename exception of _verify_rows still applies, with the section's verified A / M rows). Every
+	directory row that passed is verified again (no hashing): a directory is written in place, keeping its inode.
+	Every other A / M row that passed is lstat'ed and verified again only when its entry (_entry_identity, recorded
+	right after its verify) changed or is gone. Failures are reported as verify errors and added to the section's
+	summary.
 	"""
 	if len(ran) < 2:
 		return
 	for plan, summary, outcome in ran:
 		rows = list(outcome.get('deletes', ()))
 		rows += [row for row, identity in outcome.get('identities', {}).items()
-			if _entry_identity(_key_path(plan.target_root, row.path)) != identity]
+			if row.new.startswith('d:') or _entry_identity(_key_path(plan.target_root, row.path)) != identity]
 		if rows:
 			summary['failed'] += _verify_rows(rows, plan.target_root, compare_hash, full_hash, max_workers, plan.metadata,
 				written_rows=outcome.get('verified', ()))

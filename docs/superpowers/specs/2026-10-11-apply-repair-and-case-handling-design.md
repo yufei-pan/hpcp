@@ -72,8 +72,9 @@ pre-flight refusals run before the conflict prompt.
    lstat'ed again; missing ones are restored and verified with their own section's root, payload and
    metadata setting. An entry of another type in their place is never removed; it fails their verify.
    Then, when more than one section ran (`_verify_across_sections`), every D row that passed its
-   verify is verified again, and every A / M row that passed is verified again when its entry
-   (`st_dev`, `st_ino`, file type, recorded right after its verify) changed or is gone. A patch that is
+   verify is verified again, and every A / M row that passed is verified again when it is a directory
+   (written in place) or its entry (`st_dev`, `st_ino`, file type, recorded right after its verify)
+   changed or is gone. A patch that is
    contradictory on the node (a delete and a write, or two writes, reaching one entry through a
    symlinked directory across sections) thus fails as it does within one section.
 2. **Removed**: `_refuse_case_only_renames` and `_CASE_SENSITIVE_TYPES`; `_same_entry_pair` and
