@@ -1929,3 +1929,39 @@ def test_hpcp_cli_generates_and_applies_a_disk_patch(tmp_path, hpcp_mod, reset_h
 	assert hpcp_mod.hpcp([], dest_paths=[str(target)], load_diff_image=[out], max_workers=1) == 0
 	assert _no_differences(hpcp_mod, tmp_path, new, target)
 	assert hpcp_mod.hpcp([], dest_paths=[str(tmp_path)], load_diff_image=[out], max_workers=1) == 241
+
+
+def test_content_only_states_tolerate_timezone_shaped_mtime_offsets(hpcp_mod):
+	"""Review Focus 3: a FAT time read under two timezone settings differs by whole 15-minute steps (at most 24 h);
+	with the same size and hash that is the same file. Any other offset, another hash, POSIX sections and
+	comparisons without hashes still count the difference."""
+	eq = hpcp_mod.states_equal
+	t = 1717000000 * 10**9
+
+	def state(mtime_ns, digest='aaaa'):
+		return f'f:10:{mtime_ns}:100755:0:0:{digest}:-'
+
+	hour = 3600 * 10**9
+	assert eq(state(t), state(t + 2 * hour), metadata=False)
+	assert eq(state(t), state(t - 5 * hour - 30 * 60 * 10**9), metadata=False)
+	assert eq(state(t), state(t + 2 * hour + 10**9), metadata=False)
+	assert not eq(state(t), state(t + 7 * 60 * 10**9), metadata=False)
+	assert not eq(state(t), state(t + 25 * hour), metadata=False)
+	assert not eq(state(t), state(t + 2 * hour, 'bbbb'), metadata=False)
+	assert not eq(state(t), state(t + 2 * hour))
+	assert not eq(state(t), state(t + 2 * hour), compare_hash=False, metadata=False)
+	assert not eq(state(t, '-'), state(t + 2 * hour, '-'), metadata=False)
+
+
+def test_fat_attributes_are_none_off_fat(tmp_path, hpcp_mod):
+	path = tmp_path / 'f'
+	path.write_text('x')
+	assert hpcp_mod._fat_attributes(str(path)) is None
+	assert hpcp_mod._fat_attributes(str(tmp_path / 'missing')) is None
+
+
+@pytest.mark.skipif(not hasattr(os, 'mkfifo'), reason='needs os.mkfifo')
+def test_fat_attributes_do_not_open_a_fifo(tmp_path, hpcp_mod):
+	fifo = tmp_path / 'fifo'
+	os.mkfifo(str(fifo))
+	assert hpcp_mod._fat_attributes(str(fifo)) is None

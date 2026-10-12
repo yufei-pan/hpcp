@@ -3862,6 +3862,15 @@ def _mtime_ns_close(a_ns, b_ns):
 	precision = max(get_timestamp_precision(a_ns / 1e9), get_timestamp_precision(b_ns / 1e9))
 	return abs(a_ns - b_ns) <= precision * 2 * 1e9
 
+_TZ_STEP_NS = 15 * 60 * 10**9
+_TZ_MAX_NS = 24 * 3600 * 10**9
+
+def _tz_shift_close(a_ns, b_ns):
+	"""True when a_ns and b_ns are a whole number of 15-minute steps apart (at most 24 hours), within the usual
+	timestamp tolerance: one FAT timestamp read under two timezone settings (sys_tz, tz=, time_offset=)."""
+	shift = int(round((a_ns - b_ns) / _TZ_STEP_NS)) * _TZ_STEP_NS
+	return 0 < abs(shift) <= _TZ_MAX_NS and _mtime_ns_close(a_ns, b_ns + shift)
+
 def states_equal(a, b, compare_hash=True, metadata=True):
 	"""True when two entry states describe the same entry.
 
@@ -3870,6 +3879,7 @@ def states_equal(a, b, compare_hash=True, metadata=True):
 	With compare_hash False neither the content hash nor the xattr digest is compared
 	(both come from the same hasher). With metadata False mode, owner and xattrs are not
 	compared: on FAT, exFAT and NTFS they come from mount options, not the filesystem.
+	With metadata False a whole number of 15-minute steps (at most 24 hours) between file mtimes is tolerated when the hashes match: a FAT time read under another timezone setting.
 	"""
 	if a == '?' or b == '?':
 		return False
@@ -3890,7 +3900,12 @@ def states_equal(a, b, compare_hash=True, metadata=True):
 		return False
 	if compare_hash and info_a['hash'] != info_b['hash']:
 		return False
-	return _mtime_ns_close(info_a['mtime_ns'], info_b['mtime_ns'])
+	if _mtime_ns_close(info_a['mtime_ns'], info_b['mtime_ns']):
+		return True
+	# FAT stores local times: read under another timezone setting the same file shows a whole-step offset. Only
+	# content-only comparisons whose hashes confirmed the content accept it.
+	return (not metadata and compare_hash and info_a['hash'] not in ('', '-')
+		and _tz_shift_close(info_a['mtime_ns'], info_b['mtime_ns']))
 
 def _hash_algo_name():
 	return 'xxh64' if xxhash_available else 'blake2b'
@@ -4955,13 +4970,50 @@ def _discard_temp(path):
 	except OSError as e:
 		print(f"Warning: cannot remove temporary file {path}: {e}", file=sys.stderr)
 
+_FAT_IOCTL_GET_ATTRIBUTES = 0x80047210
+_FAT_IOCTL_SET_ATTRIBUTES = 0x40047211
+# Read-only, hidden, system and archive: the attribute bits a regular file carries.
+_FAT_FILE_ATTRIBUTES = 0x27
+
+def _fat_attributes(path):
+	"""The FAT attribute bits of an existing file on vfat / msdos, else None (missing file, not a regular
+	file, another filesystem, or a platform without fcntl)."""
+	try:
+		import fcntl
+		if not stat.S_ISREG(os.lstat(path).st_mode):
+			return None
+		fd = os.open(path, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NONBLOCK', 0))
+	except (ImportError, OSError):
+		return None
+	try:
+		return struct.unpack('I', fcntl.ioctl(fd, _FAT_IOCTL_GET_ATTRIBUTES, b'\0' * 4))[0] & _FAT_FILE_ATTRIBUTES
+	except OSError:
+		return None
+	finally:
+		os.close(fd)
+
+def _set_fat_attributes(path, attributes, key):
+	"""Set path's FAT attribute bits; a failure is a warning, never an error."""
+	try:
+		import fcntl
+		if not stat.S_ISREG(os.lstat(path).st_mode):
+			return
+		fd = os.open(path, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NONBLOCK', 0))
+		try:
+			fcntl.ioctl(fd, _FAT_IOCTL_SET_ATTRIBUTES, struct.pack('I', attributes))
+		finally:
+			os.close(fd)
+	except (ImportError, OSError) as e:
+		print(f'Warning: cannot keep the FAT attributes of {key}: {e}', file=sys.stderr)
+
 def _finish_replace(job, target_root, wait, metadata=True):
 	"""Wait for one temporary copy, check it, and rename it over its destination.
 
 	The temporary file is created in the live directory, so it inherits that directory's
 	default ACL as an access ACL, which cp -af keeps when the payload has none. Portable
 	xattrs the payload lacks are removed from it before the rename (cp -af already set the
-	payload's mode, and with it the ACL mask, so the group bits stay right). Any failure is reported as 'Copy failed' and leaves the destination untouched; the
+	payload's mode, and with it the ACL mask, so the group bits stay right). On a content-only target
+	(metadata False) an existing FAT file's attribute bits are kept. Any failure is reported as 'Copy failed' and leaves the destination untouched; the
 	temporary file never outlives this call.
 	"""
 	row, source, dest, tmp = job
@@ -4976,7 +5028,11 @@ def _finish_replace(job, target_root, wait, metadata=True):
 		reason = _unsafe_parent(target_root, dest)
 		if reason:
 			raise RuntimeError(reason)
+		# A FAT file keeps its read-only / hidden / system bits: the replacement would otherwise get the defaults.
+		attributes = None if metadata else _fat_attributes(dest)
 		os.replace(tmp, dest)
+		if attributes is not None and attributes != _fat_attributes(dest):
+			_set_fat_attributes(dest, attributes, row.path)
 	except Exception as e:
 		eprint(f'Copy failed: {row.path}: {e}')
 	finally:

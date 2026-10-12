@@ -2567,3 +2567,48 @@ def test_case_only_rename_is_restored_on_a_vfat_image_reported_as_nfs4(tmp_path,
 		if run == 1:
 			assert summary['restored'] == 2
 		assert _vfat_boot_listing(hpcp_mod, node) == (['Boot'], 'loader')
+
+
+def _fat_attrs(path, value=None):
+	"""Read (and first set, when value is given) the FAT attribute byte of a file on vfat."""
+	import fcntl
+	fd = os.open(str(path), os.O_RDONLY)
+	try:
+		if value is not None:
+			fcntl.ioctl(fd, 0x40047211, struct.pack('I', value))
+		return struct.unpack('I', fcntl.ioctl(fd, 0x80047210, b'\0' * 4))[0]
+	finally:
+		os.close(fd)
+
+
+@requires_root_and_image_tools
+@pytest.mark.skipif(shutil.which('mkfs.vfat') is None, reason='needs mkfs.vfat')
+@pytest.mark.root
+@pytest.mark.loop
+def test_replacing_a_file_on_vfat_keeps_its_fat_attributes(tmp_path, hpcp_mod, reset_hpcp_globals):
+	"""Review Focus 4: a read-only + hidden + system file on the node's FAT target is replaced (new content) and keeps
+	those attributes."""
+	hpcp_mod.HASH_SIZE = 65536
+	golden, node, out = str(tmp_path / 'golden.img'), str(tmp_path / 'node.img'), str(tmp_path / 'patch.img')
+	for image, data in ((golden, 'new loader'), (node, 'old loader')):
+		with open(image, 'wb') as f:
+			f.truncate(32 << 20)
+		subprocess.run(['mkfs.vfat', image], check=True, stdout=subprocess.DEVNULL)
+		_change_image(hpcp_mod, image, lambda root, data=data: _write(os.path.join(root, 'EFI', 'x.efi'), data))
+	# read-only (0x01) | hidden (0x02) | system (0x04) | archive (0x20)
+	_change_image(hpcp_mod, node, lambda root: _fat_attrs(os.path.join(root, 'EFI', 'x.efi'), 0x27))
+	with _mount_session(hpcp_mod) as (mount_points, loop_devices):
+		assert hpcp_mod.process_get_diff_image([], [golden], [], node, out, mount_points, loop_devices, max_workers=1) == out
+	with _mount_session(hpcp_mod) as (mount_points, loop_devices):
+		summary = hpcp_mod.process_load_diff_image([out], [], [], node, mount_points, loop_devices, max_workers=1)
+	assert summary['failed'] == 0 and summary['modified'] == 1
+	seen = {}
+
+	def read(root):
+		path = os.path.join(root, 'EFI', 'x.efi')
+		seen['attrs'] = _fat_attrs(path)
+		with open(path) as f:
+			seen['data'] = f.read()
+
+	_change_image(hpcp_mod, node, read)
+	assert seen['data'] == 'new loader' and seen['attrs'] & 0x07 == 0x07
