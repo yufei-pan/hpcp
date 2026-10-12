@@ -3871,7 +3871,7 @@ def _tz_shift_close(a_ns, b_ns):
 	shift = int(round((a_ns - b_ns) / _TZ_STEP_NS)) * _TZ_STEP_NS
 	return 0 < abs(shift) <= _TZ_MAX_NS and _mtime_ns_close(a_ns, b_ns + shift)
 
-def states_equal(a, b, compare_hash=True, metadata=True):
+def states_equal(a, b, compare_hash=True, metadata=True, full_hash=False):
 	"""True when two entry states describe the same entry.
 
 	Directories ignore mtime; files allow the timestamp-precision tolerance; an xattr
@@ -3879,7 +3879,10 @@ def states_equal(a, b, compare_hash=True, metadata=True):
 	With compare_hash False neither the content hash nor the xattr digest is compared
 	(both come from the same hasher). With metadata False mode, owner and xattrs are not
 	compared: on FAT, exFAT and NTFS they come from mount options, not the filesystem.
-	With metadata False a whole number of 15-minute steps (at most 24 hours) between file mtimes is tolerated when the hashes match: a FAT time read under another timezone setting.
+	With metadata False a whole number of 15-minute steps (at most 24 hours) between file mtimes is
+	tolerated when the hashes match and cover the whole file: a FAT time read under another timezone
+	setting. The hashes cover the whole file when its size is at most HASH_SIZE, or with full_hash (both
+	states hashed in full); past HASH_SIZE only the file's tail is hashed, and a head edit would pass.
 	"""
 	if a == '?' or b == '?':
 		return False
@@ -3903,8 +3906,8 @@ def states_equal(a, b, compare_hash=True, metadata=True):
 	if _mtime_ns_close(info_a['mtime_ns'], info_b['mtime_ns']):
 		return True
 	# FAT stores local times: read under another timezone setting the same file shows a whole-step offset. Only
-	# content-only comparisons whose hashes confirmed the content accept it.
-	return (not metadata and compare_hash and info_a['hash'] not in ('', '-')
+	# content-only comparisons whose hashes confirmed the whole content accept it.
+	return (not metadata and compare_hash and info_a['hash'] not in ('', '-') and (full_hash or info_a['size'] <= HASH_SIZE)
 		and _tz_shift_close(info_a['mtime_ns'], info_b['mtime_ns']))
 
 def _hash_algo_name():
@@ -4326,7 +4329,7 @@ def compute_changes(new_map, base_map, full_hash=False, max_workers=multiprocess
 		elif old_state[0] != new_state[0]:
 			rows.append(ChangeRow('D', key, old_state, '-'))
 			rows.append(ChangeRow('A', key, '-', new_state))
-		elif not states_equal(old_state, new_state, metadata=metadata):
+		elif not states_equal(old_state, new_state, metadata=metadata, full_hash=full_hash):
 			rows.append(ChangeRow('M', key, old_state, new_state))
 	return sort_change_rows(rows)
 
@@ -4551,7 +4554,7 @@ def _check_payload(rows, volume_roots, full_hash=False, max_workers=1, new_base=
 	states = _states_for_paths(set(copies.values()), full_hash=full_hash, read_xattrs=False, max_workers=max_workers)
 	for row, copy in copies.items():
 		# Hash and mtime, as an apply's verify compares them (mode and owner are not checked here).
-		if not states_equal(states[copy], row.new, compare_hash=decode_state(row.new)['hash'] != '-', metadata=False):
+		if not states_equal(states[copy], row.new, compare_hash=decode_state(row.new)['hash'] != '-', metadata=False, full_hash=full_hash):
 			changed.append(row)
 	problems = []
 	if incomplete:
@@ -4704,7 +4707,7 @@ def check_patch_target(rows, target_root, compare_hash=True, full_hash=False, ma
 	fold = _fold_name if case_insensitive else (lambda name: name)
 	paths = {row.path: _key_path(target_root, row.path) for row in rows}
 	states = _states_for_paths(set(paths.values()), full_hash=full_hash, read_xattrs=metadata, max_workers=max_workers)
-	same = functools.partial(states_equal, compare_hash=compare_hash, metadata=metadata)
+	same = functools.partial(states_equal, compare_hash=compare_hash, metadata=metadata, full_hash=full_hash)
 	added_by_name = {fold(row.path.rstrip('/')): row for row in rows if row.op == 'A'}
 	deleted_keys = {fold(row.path) for row in rows if row.op == 'D'}
 	listings = {}
@@ -5282,7 +5285,7 @@ def _verify_rows(rows, target_root, compare_hash=True, full_hash=False, max_work
 	for name, row in final.items():
 		expected = '-' if row.op == 'D' else row.new
 		found = states[paths[name]]
-		ok = found == '-' if expected == '-' else states_equal(found, expected, compare_hash, metadata)
+		ok = found == '-' if expected == '-' else states_equal(found, expected, compare_hash, metadata, full_hash)
 		if not ok and expected == '-' and _same_entry(paths[name], written.get(_fold_name(name), ())):
 			ok = True
 		if not ok:

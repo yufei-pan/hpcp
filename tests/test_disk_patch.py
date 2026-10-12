@@ -2014,6 +2014,42 @@ def test_content_only_states_tolerate_timezone_shaped_mtime_offsets(hpcp_mod):
 	assert not eq(state(t, '-'), state(t + 2 * hour, '-'), metadata=False)
 
 
+def test_timezone_tolerance_needs_a_hash_of_the_whole_file(hpcp_mod, reset_hpcp_globals):
+	"""Final review I2: past the hash window (HASH_SIZE) only a file's tail is hashed, so a head edit with a
+	timezone-shaped mtime offset would pass as the same file. The offset is tolerated only when the hash covers the
+	whole file: its size is at most HASH_SIZE, or it was hashed in full."""
+	eq = hpcp_mod.states_equal
+	hpcp_mod.HASH_SIZE = 16
+	t = 1717000000 * 10**9
+	hour = 3600 * 10**9
+
+	def state(size, mtime_ns):
+		return f'f:{size}:{mtime_ns}:100644:0:0:aaaa:-'
+
+	assert eq(state(16, t), state(16, t + hour), metadata=False)
+	assert not eq(state(17, t), state(17, t + hour), metadata=False)
+	assert eq(state(17, t), state(17, t + hour), metadata=False, full_hash=True)
+	assert eq(state(17, t), state(17, t + 10**9), metadata=False)
+
+
+@pytest.mark.parametrize('full_hash', [False, True])
+def test_head_edit_with_a_timezone_shaped_offset_is_a_conflict(tmp_path, hpcp_mod, reset_hpcp_globals, full_hash):
+	"""The reviewer's probe, scaled down: a file larger than the hash window that the node edited in its head (same
+	size) and whose mtime moved by an hour is a conflict for a D and an M row on a content-only target, not a
+	delete or an overwrite of the node's edit."""
+	hpcp_mod.HASH_SIZE = 4096
+	base, target = tmp_path / 'base', tmp_path / 'target'
+	body = b'h' * 4096 + b't' * 4096
+	for name in ('gone', 'changed'):
+		_write(base / name, body)
+		_write(target / name, b'EDIT' + body[4:], mtime=T0 + 3600)
+	state = lambda path: hpcp_mod.get_entry_state(str(path), full_hash=full_hash)
+	R = hpcp_mod.ChangeRow
+	rows = [R('D', 'gone', state(base / 'gone'), '-'),
+		R('M', 'changed', state(base / 'changed'), state(base / 'changed').replace(f':{T0}000000000:', f':{T0 + 7200}000000000:'))]
+	checks = hpcp_mod.check_patch_target(rows, str(target), full_hash=full_hash, metadata=False)
+	assert [(check.row.path, check.action) for check in checks] == [('gone', 'conflict'), ('changed', 'conflict')]
+
 def test_fat_attributes_are_none_off_fat(tmp_path, hpcp_mod):
 	path = tmp_path / 'f'
 	path.write_text('x')

@@ -113,7 +113,9 @@ pre-flight refusals run before the conflict prompt.
    directories classified through mountinfo.
 5. **FAT timestamps.** `states_equal(..., metadata=False)` also treats two file states as equal when
    size and hash match and the mtimes differ by a whole multiple of 15 minutes within ±24 hours
-   (a timezone-shaped offset). Any other mtime difference still counts.
+   (a timezone-shaped offset). Any other mtime difference still counts. The hash must cover the whole
+   file (its size at most the hash window `HASH_SIZE`, or full-file hashing): past the window only the
+   tail is hashed, and a head edit would pass.
 6. **FAT attributes.** When a file on a FAT-family target is replaced, its existing attribute byte is
    read (`FAT_IOCTL_GET_ATTRIBUTES`) before the rename and the hidden / system / read-only / archive
    bits are set on the replacement afterwards (`FAT_IOCTL_SET_ATTRIBUTES`). Best effort: a failure
