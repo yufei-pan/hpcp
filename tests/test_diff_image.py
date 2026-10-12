@@ -246,7 +246,7 @@ def test_read_manifest_rejects_foreign_or_newer(tmp_path, hpcp_mod):
 	path.write_text('format\tsomething-else\nformat_version\t1\n')
 	with pytest.raises(RuntimeError, match='Patch format error'):
 		hpcp_mod.read_manifest(str(path))
-	path.write_text('format\thpcp-diff\nformat_version\t3\n')
+	path.write_text('format\thpcp-diff\nformat_version\t4\n')
 	with pytest.raises(RuntimeError, match='newer'):
 		hpcp_mod.read_manifest(str(path))
 	path.write_text('format\thpcp-diff\nformat_version\t1\nunknown_key\tfine\n')
@@ -3211,3 +3211,54 @@ def test_timezone_tolerance_applies_on_fat_scopes_only(trees, hpcp_mod, tmp_path
 		summary = hpcp_mod.apply_patch_tree([str(vol)], str(target), max_workers=1)
 		assert summary['modified'] == 1 and summary['failed'] == 0
 		assert (target / 'boot.cfg').read_text() == 'new'
+
+
+def test_fat_paths_are_hashed_in_full_and_compared_like_fat(trees, hpcp_mod, reset_hpcp_globals):
+	"""Spec Part 3 item 1: a key whose path on either side is on FAT is hashed in full on both sides (marked), compared
+	by content only and with the timezone tolerance; other keys keep the tail hash and the plain comparison."""
+	hpcp_mod.HASH_SIZE = 16
+	new, base = trees
+	body = b'h' * 64
+	for tree in (new, base):
+		_write(tree / 'esp' / 'shifted', body)
+		_write(tree / 'root' / 'shifted', body)
+	os.utime(str(new / 'esp' / 'shifted'), (T0 + 3600, T0 + 3600))
+	os.utime(str(new / 'root' / 'shifted'), (T0 + 3600, T0 + 3600))
+	_write(new / 'esp' / 'edited', b'EDIT' + body[4:])
+	_write(base / 'esp' / 'edited', body)
+	new_map, base_map = hpcp_mod.build_root_maps(str(new), str(base), max_workers=1)
+	fat = {path for path in list(new_map.values()) + list(base_map.values()) if os.sep + 'esp' + os.sep in path}
+	rows = hpcp_mod.compute_changes(new_map, base_map, max_workers=1, fat_paths=fat)
+	by_path = {row.path: row for row in rows}
+	assert set(by_path) == {'esp/edited', 'root/shifted'}
+	assert hpcp_mod._full_marked(by_path['esp/edited'].old) and hpcp_mod._full_marked(by_path['esp/edited'].new)
+	assert not hpcp_mod._full_marked(by_path['root/shifted'].new)
+
+
+def test_paths_on_fat_follow_the_mount_below_the_root(tmp_path, hpcp_mod, monkeypatch):
+	root = tmp_path / 'tree'
+	paths = [str(root / 'etc' / 'x'), str(root / 'boot' / 'efi' / 'EFI' / 'x'), str(root / 'boot' / 'efix')]
+	entries = [_mount_entry(tmp_path, 'ext4'), _mount_entry(root / 'boot' / 'efi', 'vfat')]
+	for path in paths:
+		os.makedirs(os.path.dirname(path), exist_ok=True)
+	assert hpcp_mod._paths_on_fat(paths, str(root), entries) == {paths[1]}
+	assert hpcp_mod._paths_on_fat(paths, str(root), [_mount_entry(tmp_path, 'ext4')]) == set()
+
+
+def test_format_version_follows_the_full_hash_mark(hpcp_mod):
+	R = hpcp_mod.ChangeRow
+	plain = [R('A', 'a', '-', 'f:5:1:100644:0:0:aa:-')]
+	marked = [R('A', 'a', '-', 'f:5:1:100644:0:0:Faa:-')]
+	assert hpcp_mod.make_patch_meta(plain, 'n', 'b', 'root')['format_version'] == 1
+	assert hpcp_mod.make_patch_meta(marked, 'n', 'b', 'root')['format_version'] == 3
+	assert hpcp_mod.make_disk_patch_meta([(1, plain)], [], 'n', 'b')['format_version'] == 2
+	assert hpcp_mod.make_disk_patch_meta([(1, marked)], [], 'n', 'b')['format_version'] == 3
+
+
+def test_a_newer_reader_accepts_version_3_and_an_older_one_refuses_it(tmp_path, hpcp_mod, monkeypatch):
+	path = tmp_path / 'manifest'
+	path.write_text('format\thpcp-diff\nformat_version\t3\n')
+	assert hpcp_mod.read_manifest(str(path))['format_version'] == '3'
+	monkeypatch.setattr(hpcp_mod, 'DIFF_FORMAT_VERSION', 2)
+	with pytest.raises(RuntimeError, match='uses format version 3, newer than supported 2'):
+		hpcp_mod.read_manifest(str(path))

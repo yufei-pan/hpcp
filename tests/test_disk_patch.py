@@ -981,7 +981,8 @@ def test_disk_patch_generation_records_sections_raw_and_identity(tmp_path, hpcp_
 	with _session(hpcp_mod) as (mount_points, loop_devices):
 		root = hpcp_mod._mount_single_fs_image(out, True, mount_points, loop_devices)
 		meta = hpcp_mod.read_manifest(os.path.join(root, '.hpcp_diff', 'manifest'))
-		assert (meta['layout'], meta['format_version']) == ('disk', '2')
+		assert (meta['layout'], meta['format_version']) == ('disk', '3')
+		assert all(hpcp_mod._full_marked(row.new) for row in hpcp_mod.read_changes(os.path.join(root, '.hpcp_diff', 'part1.changes.tsv')) if row.new.startswith('f:'))
 		assert [section[0] for section in meta['sections']] == ['part1', 'part3']
 		assert sorted(raw[0] for raw in meta['raws']) == ['mbr', 'part2']
 		rows = hpcp_mod.read_disk_tsv(os.path.join(root, '.hpcp_diff', 'disk.tsv'))
@@ -2503,3 +2504,82 @@ def test_direct_read_falls_back_when_o_direct_is_refused(tmp_path, hpcp_mod, mon
 	monkeypatch.setattr(hpcp_mod, '_drop_cached_pages', lambda name: dropped.append(name))
 	assert hpcp_mod._hash_area(str(path), 10, 5, direct=True) == _sha(b'01234')
 	assert dropped == [str(path)]
+
+
+@requires_root_and_disk_tools
+@pytest.mark.root
+@pytest.mark.loop
+def test_fat_section_files_are_hashed_in_full_and_tolerate_a_timezone_shift(tmp_path, hpcp_mod, reset_hpcp_globals):
+	"""Spec Part 3: the golden changes a 256 KiB ESP file. Its rows carry the full-hash mark and the patch is format 3;
+	the root section's rows are unmarked. A node whose copy of the old file is identical but an hour later (another
+	timezone) applies; a node whose copy differs in its head (same size, same tail) is a conflict."""
+	hpcp_mod.HASH_SIZE = 65536  # the CLI's -hs default: the 256 KiB file is past the tail window
+	old, new = tmp_path / 'old.img', tmp_path / 'new.img'
+	_make_golden(old)
+	big = bytes(range(256)) * 1024
+	with _attached(old) as loop, _mounted(loop + 'p1') as esp:
+		_write(os.path.join(esp, 'EFI', 'BOOT', 'shim.efi'), big)
+	shutil.copyfile(str(old), str(new))
+	with _attached(new) as loop:
+		with _mounted(loop + 'p1') as esp:
+			_write(os.path.join(esp, 'EFI', 'BOOT', 'shim.efi'), big[:-4] + b'NEW!')
+		with _mounted(loop + 'p3') as root:
+			_write(os.path.join(root, 'etc', 'os-release'), b'v2')
+	patch = str(tmp_path / 'patch.img')
+	with _session(hpcp_mod) as (mount_points, loop_devices):
+		assert hpcp_mod.process_get_disk_diff_image([str(new)], [str(old)], patch, mount_points, loop_devices, max_workers=1) == patch
+	# A session of its own: the generating session's devices still hold the patch image and show its state before the write.
+	with _session(hpcp_mod) as (mount_points, loop_devices):
+		volume = hpcp_mod._mount_single_fs_image(patch, True, mount_points, loop_devices)
+		meta = hpcp_mod.read_manifest(os.path.join(volume, hpcp_mod.DIFF_DIR_NAME, 'manifest'))
+		esp_rows = hpcp_mod.read_changes(os.path.join(volume, hpcp_mod.DIFF_DIR_NAME, 'part1.changes.tsv'))
+		root_rows = hpcp_mod.read_changes(os.path.join(volume, hpcp_mod.DIFF_DIR_NAME, 'part3.changes.tsv'))
+	assert meta['format_version'] == '3'
+	assert all(hpcp_mod._full_marked(row.new) for row in esp_rows if row.new.startswith('f:'))
+	assert not any(hpcp_mod._full_marked(row.new) for row in root_rows)
+	for name, head, expect_conflict in (('shifted.img', b'', False), ('edited.img', b'EDIT', True)):
+		target = tmp_path / name
+		shutil.copyfile(str(old), str(target))
+		with _attached(target) as loop, _mounted(loop + 'p1') as esp:
+			shim = os.path.join(esp, 'EFI', 'BOOT', 'shim.efi')
+			if head:
+				with open(shim, 'r+b') as f:
+					f.write(head)
+			stat_result = os.stat(shim)
+			os.utime(shim, (stat_result.st_atime + 3600, stat_result.st_mtime + 3600))
+		if expect_conflict:
+			with pytest.raises(RuntimeError, match='^Patch conflict'):
+				_apply(hpcp_mod, patch, target)
+		else:
+			summary = _apply(hpcp_mod, patch, target)
+			assert summary['failed'] == 0 and summary['sections']['part1']['modified'] >= 1
+
+
+@requires_root_and_disk_tools
+@pytest.mark.root
+@pytest.mark.loop
+def test_single_filesystem_generation_marks_rows_under_a_fat_mount(tmp_path, hpcp_mod, reset_hpcp_globals):
+	"""Spec Part 3 item 1: diffing a tree with a vfat filesystem mounted below its root marks only the rows under it."""
+	hpcp_mod.HASH_SIZE = 16
+	esp_image = tmp_path / 'esp.img'
+	with open(str(esp_image), 'wb') as f:
+		f.truncate(32 << 20)
+	_run('mkfs.vfat', esp_image)
+	new, base = tmp_path / 'new', tmp_path / 'base'
+	_write(os.path.join(str(new), 'etc', 'conf'), b'new-conf-' * 8)
+	_write(os.path.join(str(base), 'etc', 'conf'), b'old-conf-' * 8)
+	os.makedirs(os.path.join(str(new), 'boot', 'efi'))
+	_write(os.path.join(str(base), 'boot', 'efi', 'EFI', 'x.efi'), b'old-efi-' * 8)
+	with _plain_loop(esp_image) as loop, _mounted(loop, 'vfat') as esp_mount:
+		subprocess.run(['mount', '--bind', esp_mount, os.path.join(str(new), 'boot', 'efi')], check=True)
+		try:
+			_write(os.path.join(str(new), 'boot', 'efi', 'EFI', 'x.efi'), b'new-efi-' * 8)
+			entries = hpcp_mod._mountinfo_entries()
+			new_map, base_map = hpcp_mod.build_root_maps(str(new), str(base), max_workers=1)
+			fat = hpcp_mod._paths_on_fat(new_map.values(), str(new), entries) | hpcp_mod._paths_on_fat(base_map.values(), str(base), entries)
+			rows = hpcp_mod.compute_changes(new_map, base_map, max_workers=1, fat_paths=fat)
+		finally:
+			subprocess.run(['umount', os.path.join(str(new), 'boot', 'efi')], check=False)
+	by_path = {row.path: row for row in rows}
+	assert hpcp_mod._full_marked(by_path['boot/efi/EFI/x.efi'].new) and hpcp_mod._full_marked(by_path['boot/efi/EFI/x.efi'].old)
+	assert not hpcp_mod._full_marked(by_path['etc/conf'].new)

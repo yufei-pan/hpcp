@@ -3785,9 +3785,12 @@ compare_file_list = _compare_file_lists
 
 #%% ---- Diff Image ----
 DIFF_DIR_NAME = '.hpcp_diff'
-DIFF_FORMAT_VERSION = 2
-# Single-filesystem patches keep the version hpcp 9.65 reads; disk patches (layout disk) are version 2.
+DIFF_FORMAT_VERSION = 3
+# Single-filesystem patches keep the version hpcp 9.65 reads; disk patches (layout disk) are version 2; a patch whose
+# states carry the full-hash mark (_FULL_HASH_MARK, FAT files, hpcp 9.69) is version 3, which 9.68 and older refuse.
 _SINGLE_FS_FORMAT_VERSION = 1
+_DISK_FORMAT_VERSION = 2
+_FULL_HASH_FORMAT_VERSION = 3
 
 # A hash over the whole file in a patch hashed by its tail (manifest full_hash 0): 'F' + the hex digest. Files on FAT
 # carry it (see compute_changes); digests are lowercase hex, so the mark cannot be one.
@@ -4327,15 +4330,22 @@ def _states_for_paths(paths, full_hash=False, read_xattrs=True, max_workers=1, m
 			ERRORS.extend(chunk_errors)
 	return states
 
-def compute_changes(new_map, base_map, full_hash=False, max_workers=multiprocessing.cpu_count(), read_xattrs=True, metadata=True):
+def compute_changes(new_map, base_map, full_hash=False, max_workers=multiprocessing.cpu_count(), read_xattrs=True, metadata=True,
+		fat_paths=frozenset()):
 	"""Rows that turn base_map's tree into new_map's tree, sorted D / A / M.
 
 	With metadata False (see states_equal) a mode, owner or xattr difference alone is no change.
+	fat_paths: paths (values of either map) on FAT. A key whose path on either side is one is compared like a FAT
+	section: by content only and with the timezone tolerance, its files on both sides hashed in full and marked
+	(_FULL_HASH_MARK; unless full_hash already hashes every file in full), so the tolerance holds past HASH_SIZE.
 	"""
+	keys = set(new_map) | set(base_map)
+	fat_keys = {key for key in keys if new_map.get(key) in fat_paths or base_map.get(key) in fat_paths} if fat_paths else set()
+	marked = set() if full_hash else {tree[key] for tree in (new_map, base_map) for key in fat_keys if key in tree}
 	states = _states_for_paths(set(new_map.values()) | set(base_map.values()), full_hash=full_hash,
-		read_xattrs=read_xattrs and metadata, max_workers=max_workers)
+		read_xattrs=read_xattrs and metadata, max_workers=max_workers, marked=marked)
 	rows = []
-	for key in set(new_map) | set(base_map):
+	for key in keys:
 		new_state = states[new_map[key]] if key in new_map else '-'
 		old_state = states[base_map[key]] if key in base_map else '-'
 		# A read failure (already recorded) or a special file: a guessed row could delete or add real files.
@@ -4350,7 +4360,8 @@ def compute_changes(new_map, base_map, full_hash=False, max_workers=multiprocess
 		elif old_state[0] != new_state[0]:
 			rows.append(ChangeRow('D', key, old_state, '-'))
 			rows.append(ChangeRow('A', key, '-', new_state))
-		elif not states_equal(old_state, new_state, metadata=metadata, full_hash=full_hash):
+		elif not states_equal(old_state, new_state, metadata=metadata and key not in fat_keys, full_hash=full_hash,
+				tz_tolerant=key in fat_keys):
 			rows.append(ChangeRow('M', key, old_state, new_state))
 	return sort_change_rows(rows)
 
@@ -4493,7 +4504,8 @@ def make_patch_meta(rows, new_name, base_name, layout, full_hash=False):
 	"""Manifest fields for a new patch; 'volume' is filled in per volume by write_patch_metadata()."""
 	return {
 		'format': 'hpcp-diff',
-		'format_version': _SINGLE_FS_FORMAT_VERSION,
+		'format_version': (_FULL_HASH_FORMAT_VERSION if any(_full_marked(row.old) or _full_marked(row.new) for row in rows)
+			else _SINGLE_FS_FORMAT_VERSION),
 		'patch_id': uuid.uuid4().hex,
 		'volume': '1/1',
 		'created': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
@@ -5888,8 +5900,11 @@ def process_get_diff_image(src_paths, src_image, dest_paths, dest_image, output,
 	if os.path.lexists(output):
 		raise RuntimeError(f'Diff image error: output {output} already exists')
 	# Modes and owners on FAT, exFAT and NTFS come from mount options: compare content only when either side is one.
-	metadata = _compare_metadata((new_root, base_root), _mountinfo_entries())
-	rows = compute_changes(new_map, base_map, full_hash=full_hash, max_workers=max_workers, metadata=metadata)
+	entries = _mountinfo_entries()
+	metadata = _compare_metadata((new_root, base_root), entries)
+	# Files on FAT on either side (the root itself, or a mount below it such as /boot/efi) are hashed in full.
+	fat_paths = _paths_on_fat(new_map.values(), new_root, entries) | _paths_on_fat(base_map.values(), base_root, entries)
+	rows = compute_changes(new_map, base_map, full_hash=full_hash, max_workers=max_workers, metadata=metadata, fat_paths=fat_paths)
 	# Fail here, before any image exists, on rows every apply would reject.
 	_validate_patch_rows(rows)
 	meta = make_patch_meta(rows, new_name, base_name, layout, full_hash)
@@ -6541,6 +6556,24 @@ def _rows_by_scope(rows, scopes):
 		grouped.setdefault(name, []).append(row)
 	return grouped
 
+def _paths_on_fat(paths, root, entries):
+	"""The paths (absolute, under root) on a FAT filesystem: root's own mount, or one mounted below it (_mount_scopes;
+	hidden mounts left out). Each path looks up its own parent names, deepest first, as _rows_by_scope does."""
+	fat = {prefix: _is_fat(fs_type) for prefix, fs_type, _ in _mount_scopes(root, entries)}
+	if not any(fat.values()):
+		return set()
+	root = os.path.abspath(root)
+	result = set()
+	for path in paths:
+		name = os.path.relpath(path, root).replace(os.sep, '/')
+		if name == '.' or name.startswith('../'):
+			name = ''
+		while name and name not in fat:
+			name = name.rpartition('/')[0]
+		if fat.get(name, False):
+			result.add(path)
+	return result
+
 def _compare_metadata(roots, entries):
 	"""False when any of roots sits on a filesystem whose modes and owners come from mount options (FAT, exFAT,
 	NTFS): a single-filesystem patch between such trees compares content only (see states_equal)."""
@@ -6796,9 +6829,10 @@ def _mount_partition(device, read_only, mount_points, entries):
 	return mount_point + os.sep
 
 def _partition_changes(new_root, old_root, mount_points, live_mounts, exclude, full_hash, max_workers, parallel_file_listing,
-		input_files=(), metadata=True):
+		input_files=(), metadata=True, fat=False):
 	"""Change rows of one filesystem partition (root to root; lost+found, this run's mounts and
 	its input disk-image files left out). metadata False: content-only rows (see states_equal).
+	fat: a FAT section, its files hashed in full (see compute_changes).
 	Names are compared by exact case in every section: a case-only rename is a delete plus an add."""
 	matched = os.path.abspath(new_root)
 	patterns = _mount_point_excludes(mount_points, (new_root, old_root), matched)
@@ -6816,7 +6850,8 @@ def _partition_changes(new_root, old_root, mount_points, live_mounts, exclude, f
 	new_map, base_map = _drop_lost_found(new_map), _drop_lost_found(base_map)
 	if any(_is_reserved_key(key) for key in new_map):
 		raise RuntimeError(f'Diff image error: {new_root} contains {DIFF_DIR_NAME}, which hpcp reserves for patch metadata')
-	rows = compute_changes(new_map, base_map, full_hash=full_hash, max_workers=max_workers, metadata=metadata)
+	fat_paths = frozenset(new_map.values()) | frozenset(base_map.values()) if fat else frozenset()
+	rows = compute_changes(new_map, base_map, full_hash=full_hash, max_workers=max_workers, metadata=metadata, fat_paths=fat_paths)
 	_validate_patch_rows(rows)
 	return rows
 
@@ -6843,7 +6878,9 @@ def _is_identity_change(row, kinds):
 def make_disk_patch_meta(sections, raws, new_name, base_name, full_hash=False):
 	"""Manifest fields for a disk patch; sections = [(number, rows)], raws = [(name, file, old, new, size)]."""
 	meta = make_patch_meta([row for _, rows in sections for row in rows], new_name, base_name, 'disk', full_hash)
-	meta['format_version'] = DIFF_FORMAT_VERSION
+	# Version 3 when a section's rows carry the full-hash mark (see make_patch_meta), else the disk version 2.
+	if meta['format_version'] != _FULL_HASH_FORMAT_VERSION:
+		meta['format_version'] = _DISK_FORMAT_VERSION
 	meta['sections'] = [(f'part{number}', f'part{number}', f'part{number}.changes.tsv') for number, _ in sections]
 	meta['raws'] = list(raws)
 	meta['disk'] = 'disk.tsv'
@@ -6915,7 +6952,8 @@ def process_get_disk_diff_image(src_paths, dest_paths, output, mount_points, loo
 			if new_root and old_root:
 				lives = [_live_mount(_device_number(part['device']), entries, part['device'])[0] for part in (new_part, old_part)]
 				rows = _partition_changes(new_root, old_root, mount_points, lives, exclude, full_hash, max_workers, parallel_file_listing,
-					input_files, metadata=_has_posix_metadata(new_part['fs_type']))
+					input_files, metadata=_has_posix_metadata(new_part['fs_type']),
+					fat=_is_fat(new_part['fs_type']) or _is_fat(old_part['fs_type']))
 				_release_mount(old_root, mount_points)
 				if rows:
 					# Kept mounted: its payload is copied once the patch image exists.
