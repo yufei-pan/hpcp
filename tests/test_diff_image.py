@@ -2987,6 +2987,33 @@ def test_remove_tree_around_mounts_collects_errors_and_keeps_going(tmp_path, hpc
 	assert sorted(os.listdir(str(top))) == ['a'] and os.listdir(str(top / 'a')) == ['stuck']
 
 
+@pytest.mark.parametrize('fd_walk', [True, False])
+def test_remove_tree_around_mounts_refuses_a_symlink_as_the_top(tmp_path, hpcp_mod, monkeypatch, fd_walk):
+	"""Security: the path itself is a symlink to a directory outside; nothing is removed and an error comes back."""
+	monkeypatch.setattr(hpcp_mod, '_DIR_FD_WALK', fd_walk)
+	_write(tmp_path / 'scratch' / 'precious', 'keep me')
+	os.symlink(str(tmp_path / 'scratch'), str(tmp_path / 'app'))
+	for path in (str(tmp_path / 'app'), str(tmp_path / 'app') + os.sep):
+		kept, errors = hpcp_mod._remove_tree_around_mounts(path, set())
+		assert kept == [] and errors
+	assert (tmp_path / 'scratch' / 'precious').read_text() == 'keep me' and os.path.islink(str(tmp_path / 'app'))
+
+
+def test_remove_tree_around_mounts_path_fallback_matches_the_fd_walk(tmp_path, hpcp_mod, monkeypatch):
+	monkeypatch.setattr(hpcp_mod, '_DIR_FD_WALK', False)
+	top = tmp_path / 'app'
+	_write(top / 'a' / 'f', 'x')
+	_write(top / 'b' / 'data' / 'keep', 'mounted')
+	_write(tmp_path / 'outside' / 'target', 'outside')
+	os.symlink(str(tmp_path / 'outside'), str(top / 'link'))
+	kept, errors = hpcp_mod._remove_tree_around_mounts(str(top), {os.path.realpath(str(top / 'b' / 'data'))})
+	assert kept == ['b/data'] and errors == []
+	assert (top / 'b' / 'data' / 'keep').read_text() == 'mounted'
+	assert not (top / 'a').exists() and not os.path.lexists(str(top / 'link'))
+	assert (tmp_path / 'outside' / 'target').read_text() == 'outside'
+	assert sorted(os.listdir(str(top))) == ['b'] and os.listdir(str(top / 'b')) == ['data']
+
+
 def test_mounts_below(tmp_path, hpcp_mod):
 	top = os.path.realpath(str(tmp_path / 'app'))
 	points = {top + '/data', top + '/x/y', top + 'z', '/elsewhere', top}

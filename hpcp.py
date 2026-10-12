@@ -5145,7 +5145,7 @@ def _mounts_below(path, mount_points):
 
 # Whether the platform has the descriptor-relative calls the delete walk needs (as shutil.rmtree checks).
 _DIR_FD_WALK = (os.open in os.supports_dir_fd and os.listdir in os.supports_fd and os.stat in os.supports_dir_fd
-	and os.unlink in os.supports_dir_fd and os.rmdir in os.supports_dir_fd and hasattr(os, 'O_NOFOLLOW'))
+	and os.stat in os.supports_follow_symlinks and os.unlink in os.supports_dir_fd and os.rmdir in os.supports_dir_fd and hasattr(os, 'O_NOFOLLOW'))
 
 def _remove_tree_by_path(top, top_dev, mount_points):
 	"""The path-based walk of _remove_tree_around_mounts, for platforms without directory descriptors (open to a
@@ -5199,22 +5199,30 @@ def _remove_tree_around_mounts(path, mount_points=None):
 	An entry that is a mount point in mountinfo (any entry: bind mounts and hidden mounts too), or a directory whose
 	st_dev differs from path's (a mount made after mountinfo was read), is left in place with everything below it,
 	and so are the directories above it; path itself too when it is a mount point. Symlinks are unlinked, never
-	followed. The walk is iterative and keeps going after an error. Returns (the entries left in place as mount
+	followed, and that holds for path itself: only its parent is resolved, so a path that is a symlink (or not a
+	directory) removes nothing and returns an error. The walk is iterative and keeps going after an error. Returns (the entries left in place as mount
 	points, relative to path; the errors met, as text).
 
 	The walk goes by directory descriptors, as shutil.rmtree does: every directory is opened with O_NOFOLLOW
-	relative to its parent and checked against the lstat taken before descending, and entries are read and removed
+	relative to its parent (path itself included) and checked against the lstat taken before descending, and entries are read and removed
 	relative to the descriptor, so a directory swapped for a symlink during the walk is refused, never followed
 	(this runs as root on trees other users may write to). Where the platform lacks the descriptor functions it
 	falls back to a walk by path, which does not close that race.
 	"""
 	if mount_points is None:
 		mount_points = {entry['mount_point'] for entry in _mountinfo_entries()}
-	top = os.path.realpath(path)
+	# The parent is resolved, the last component never: a symlink there must not be followed to its target.
+	stripped = path.rstrip(os.sep) or os.sep
+	top = os.path.join(os.path.realpath(os.path.dirname(stripped)), os.path.basename(stripped))
 	try:
-		top_dev = os.lstat(top).st_dev
+		top_info = os.lstat(top)
 	except FileNotFoundError:
 		return [], []
+	except OSError as e:
+		return [], [f'.: {e.strerror}']
+	if not stat.S_ISDIR(top_info.st_mode):
+		return [], ['.: not a directory (a symlink?)']
+	top_dev = top_info.st_dev
 	if top in mount_points:
 		return ['.'], []
 	if not _DIR_FD_WALK:
@@ -5278,7 +5286,7 @@ def _remove_tree_around_mounts(path, mount_points=None):
 					errors.append(f'{rel}: {e.strerror}')
 
 	try:
-		enter(top, None, top, os.lstat(top))
+		enter(top, None, top, top_info)
 		while stack:
 			frame = stack[-1]
 			if frame[3]:
