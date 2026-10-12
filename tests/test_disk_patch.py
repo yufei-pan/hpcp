@@ -2395,3 +2395,74 @@ def test_identity_tools_work_while_the_partition_is_held(tmp_path, hpcp_mod, res
 	assert label is None or f'LABEL={label}' in found
 	# Every command succeeded, not only the ones whose result blkid shows: ext4's filesystem check runs first.
 	assert hpcp_mod.ERRORS == []
+
+
+requires_root_loop = pytest.mark.skipif(os.name == 'nt' or os.geteuid() != 0 or shutil.which('losetup') is None,
+	reason='needs root and losetup')
+
+
+@contextlib.contextmanager
+def _plain_loop(image, sector_size=None):
+	argv = ['losetup', '--find', '--show'] + (['--sector-size', str(sector_size)] if sector_size else []) + [str(image)]
+	loop = subprocess.run(argv, check=True, capture_output=True, text=True).stdout.strip()
+	try:
+		yield loop
+	finally:
+		subprocess.run(['losetup', '-d', loop], capture_output=True)
+
+
+@requires_root_loop
+@pytest.mark.root
+@pytest.mark.loop
+def test_direct_read_back_sees_the_device_not_the_cache(tmp_path, hpcp_mod):
+	"""Spec Part 2 item 3: after a write through the loop device, the backing file is changed underneath; the direct
+	read hashes what the device now holds (a buffered read may still return the cached page)."""
+	image = tmp_path / 'disk.img'
+	with open(str(image), 'wb') as f:
+		f.truncate(8 << 20)
+	payload = tmp_path / 'payload'
+	payload.write_bytes(b'A' * 8192)
+	with _plain_loop(image) as loop:
+		hpcp_mod._write_area(loop, str(payload), 4096, 8192)
+		assert hpcp_mod._hash_area(loop, 4096, 8192, direct=True) == _sha(b'A' * 8192)
+		with open(str(image), 'r+b') as f:
+			f.seek(4096)
+			f.write(b'B' * 8192)
+			f.flush()
+			os.fsync(f.fileno())
+		assert hpcp_mod._hash_area(loop, 4096, 8192, direct=True) == _sha(b'B' * 8192)
+
+
+@requires_root_loop
+@pytest.mark.root
+@pytest.mark.loop
+@pytest.mark.parametrize('sector_size', [512, 4096])
+def test_direct_read_of_the_boot_code_on_any_sector_size(tmp_path, hpcp_mod, sector_size):
+	"""Review Focus 5: the 440-byte boot code is read as its enclosing logical block and cut back to 440 bytes; an
+	area ending short of a whole read chunk is hashed exactly."""
+	image = tmp_path / 'disk.img'
+	data = bytes(range(256)) * (5 << 12)
+	image.write_bytes(data)
+	with _plain_loop(image, sector_size) as loop:
+		assert hpcp_mod._hash_area(loop, 0, 440, direct=True) == _sha(data[:440])
+		assert hpcp_mod._hash_area(loop, 1000, 777, direct=True) == _sha(data[1000:1777])
+		length = (5 << 20) - 3 * 4096
+		assert hpcp_mod._hash_area(loop, 4096, length, direct=True) == _sha(data[4096:4096 + length])
+
+
+def test_direct_read_falls_back_when_o_direct_is_refused(tmp_path, hpcp_mod, monkeypatch):
+	"""Where O_DIRECT is refused (EINVAL), the cached pages are dropped and the area is read normally."""
+	path = tmp_path / 'file'
+	path.write_bytes(b'0123456789' * 1000)
+	dropped = []
+	real_open = os.open
+
+	def refusing_open(name, flags, *args):
+		if flags & getattr(os, 'O_DIRECT', 0):
+			raise OSError(errno.EINVAL, 'Invalid argument')
+		return real_open(name, flags, *args)
+
+	monkeypatch.setattr(os, 'open', refusing_open)
+	monkeypatch.setattr(hpcp_mod, '_drop_cached_pages', lambda name: dropped.append(name))
+	assert hpcp_mod._hash_area(str(path), 10, 5, direct=True) == _sha(b'01234')
+	assert dropped == [str(path)]

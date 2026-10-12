@@ -6187,11 +6187,99 @@ def match_target_layout(disk_rows, target):
 _MBR_BOOTCODE_SIZE = 440
 _AREA_CHUNK = 4 << 20
 
-def _hash_area(path, offset=0, length=None):
+_BLKSSZGET = 0x1268
+_BLKFLSBUF = 0x1261
+
+def _logical_block_size(fd):
+	"""fd's logical block size (BLKSSZGET); 4096 when it is not a block device or unknown, which suits every size."""
+	try:
+		import fcntl
+		size = struct.unpack('i', fcntl.ioctl(fd, _BLKSSZGET, b'\0' * 4))[0]
+	except (ImportError, OSError):
+		return 4096
+	return size if size > 0 else 4096
+
+def _hash_area_direct(path, offset, length):
+	"""sha256 of length bytes of path from offset, read past the page cache (O_DIRECT); None when O_DIRECT is refused.
+
+	O_DIRECT needs the buffer, the file offset and the read size aligned to the logical block size: the reads cover
+	the enclosing blocks into a page-aligned buffer (mmap), and only the requested bytes are hashed. Raises OSError
+	when path ends before offset + length.
+	"""
+	flag = getattr(os, 'O_DIRECT', 0)
+	if not flag:
+		return None
+	import mmap
+	try:
+		fd = os.open(path, os.O_RDONLY | flag | getattr(os, 'O_CLOEXEC', 0))
+	except OSError as e:
+		if e.errno == errno.EINVAL:
+			return None
+		raise
+	buffer = None
+	try:
+		block = _logical_block_size(fd)
+		chunk = max(block, _AREA_CHUNK - _AREA_CHUNK % block)
+		buffer = mmap.mmap(-1, chunk)
+		end = offset + length
+		position = offset - offset % block
+		digest = hashlib.sha256()
+		while position < end:
+			os.lseek(fd, position, os.SEEK_SET)
+			try:
+				count = os.readv(fd, [buffer])
+			except OSError as e:
+				if e.errno == errno.EINVAL and position == offset - offset % block:
+					return None
+				raise
+			if count <= 0:
+				break
+			first, last = max(offset - position, 0), min(count, end - position)
+			if last > first:
+				with memoryview(buffer) as view:
+					digest.update(view[first:last])
+			position += count
+		if position < end:
+			raise OSError(errno.EIO, f'{path} ends before byte {end}')
+		return digest.hexdigest()
+	finally:
+		if buffer is not None:
+			buffer.close()
+		os.close(fd)
+
+def _drop_cached_pages(path):
+	"""Ask the kernel to forget path's cached pages: BLKFLSBUF for a block device, then posix_fadvise DONTNEED."""
+	try:
+		fd = os.open(path, os.O_RDONLY | getattr(os, 'O_CLOEXEC', 0))
+	except OSError:
+		return
+	try:
+		try:
+			import fcntl
+			if stat.S_ISBLK(os.fstat(fd).st_mode):
+				fcntl.ioctl(fd, _BLKFLSBUF, 0)
+		except (ImportError, OSError):
+			pass
+		if hasattr(os, 'posix_fadvise'):
+			try:
+				os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+			except OSError:
+				pass
+	finally:
+		os.close(fd)
+
+def _hash_area(path, offset=0, length=None, direct=False):
 	"""sha256 hex digest of length bytes of path from offset (to the end when length is None).
 
+	direct (with a length): read past the page cache (_hash_area_direct), so a read-back sees what the device holds;
+	where O_DIRECT is refused, the cached pages are dropped first (_drop_cached_pages) and the area read normally.
 	Raises OSError when path ends before offset + length.
 	"""
+	if direct and length is not None:
+		found = _hash_area_direct(path, offset, length)
+		if found is not None:
+			return found
+		_drop_cached_pages(path)
 	digest = hashlib.sha256()
 	remaining = length
 	with open(path, 'rb') as f:
@@ -7172,12 +7260,12 @@ def apply_disk_patch(volume_roots, target, mount_points, loop_devices, force=Fal
 			with _disk_write_hold(disk, sorted(write_devices.values())) as holds:
 				# Partition areas first, the MBR boot code last. A write that fails stops the rest and the identity
 				# changes: boot code pointing at a core image that is not there would leave the node unbootable.
-				# So does one that raised no error but does not hold the new content when read back.
+				# So does one that raised no error but does not hold the new content when read back past the page cache.
 				for entry in sorted(pending, key=lambda entry: entry['name'] == 'mbr'):
 					attempted.append(entry)
 					try:
 						_write_area(entry['device'], entry['payload'], 0, entry['size'])
-						if _hash_area(entry['device'], 0, entry['size']) != entry['new']:
+						if _hash_area(entry['device'], 0, entry['size'], direct=True) != entry['new']:
 							entry['error'] = 'does not hold the new content after writing'
 					except OSError as e:
 						entry['error'] = str(e)
@@ -7201,7 +7289,7 @@ def apply_disk_patch(volume_roots, target, mount_points, loop_devices, force=Fal
 		reason = entry.get('error')
 		if not reason:
 			try:
-				if _hash_area(entry['device'], 0, entry['size']) == entry['new']:
+				if _hash_area(entry['device'], 0, entry['size'], direct=True) == entry['new']:
 					written += 1
 					continue
 				reason = 'does not hold the new content after writing'
