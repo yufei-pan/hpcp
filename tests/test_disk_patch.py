@@ -2718,6 +2718,55 @@ def test_probe_identity_reads_the_encoded_udev_values(hpcp_mod, reset_hpcp_globa
 	assert hpcp_mod._probe_identity('/dev/x2') == ('', '', '')
 
 
+@pytest.mark.parametrize('enc, raw, label', [
+	# blkid keeps an *_ENC value in a 265-byte buffer: a long one is cut, at times mid-escape.
+	('a' * 258 + '\\x2', 'a' * 258 + ' and the rest', 'a' * 258 + ' and the rest'),
+	# A value ending in a partial escape was cut, however short it reads.
+	('a\\x20b\\', 'a b c', 'a b c'),
+	('a\\x20b\\x', 'a b c', 'a b c'),
+	('a\\x20b\\x4', 'a b c', 'a b c'),
+	# 261 bytes or more, in fewer characters (UTF-8 is kept as it is), may have been cut too.
+	('ü' * 131, 'ü' * 140, 'ü' * 140),
+	# The raw line holds the label's own backslashes as they are; multiCMD escapes only bytes that are not UTF-8.
+	('a' * 258 + '\\x5', 'a' * 258 + ' \\x41\\xff', 'a' * 258 + ' \\x41\udcff'),
+], ids=['long-mid-escape', 'ends-in-backslash', 'ends-in-x', 'ends-in-x-digit', 'long-in-bytes', 'raw-backslashes'])
+def test_probe_identity_reads_a_cut_label_raw(hpcp_mod, reset_hpcp_globals, monkeypatch, enc, raw, label):
+	calls = []
+
+	def fake(argv, **kwargs):
+		calls.append(argv)
+		if '-o' in argv and argv[argv.index('-o') + 1] == 'value':
+			return [raw]
+		return ['ID_FS_UUID_ENC=u1', 'ID_FS_LABEL_ENC=' + enc, 'ID_FS_TYPE=btrfs']
+
+	monkeypatch.setattr(hpcp_mod, 'run_command_in_multicmd_with_path_check', fake)
+	assert hpcp_mod._probe_identity('/dev/x1') == ('btrfs', 'u1', label)
+	assert calls == [['blkid', '-p', '-o', 'udev', '/dev/x1'], ['blkid', '-p', '-o', 'value', '-s', 'LABEL', '/dev/x1']]
+
+
+def test_probe_identity_reads_a_whole_label_from_udev_alone(hpcp_mod, reset_hpcp_globals, monkeypatch):
+	"""A 260-character ENC value that ends in a whole escape was not cut: no second probe."""
+	calls = []
+	enc = 'a' * 250 + 'b\\x5cx\\x20'
+	assert len(enc) == 260
+	monkeypatch.setattr(hpcp_mod, 'run_command_in_multicmd_with_path_check',
+		lambda argv, **kwargs: calls.append(argv) or ['ID_FS_LABEL_ENC=' + enc, 'ID_FS_TYPE=btrfs'])
+	assert hpcp_mod._probe_identity('/dev/x1') == ('btrfs', '', 'a' * 250 + 'b\\x ')
+	assert len(calls) == 1
+
+
+@pytest.mark.skipif(shutil.which('mkfs.btrfs') is None or shutil.which('blkid') is None, reason='needs mkfs.btrfs and blkid')
+def test_probe_identity_reads_a_long_btrfs_label_exactly(tmp_path, hpcp_mod, reset_hpcp_globals):
+	"""A 249-byte btrfs label of spaces and backslashes needs more than blkid's 265-byte ENC buffer (libblkid trims
+	a label's trailing whitespace on every path, so it ends in a letter)."""
+	label = ('a b\\x41 ' * 40)[:249]
+	image = tmp_path / 'btrfs.img'
+	with open(str(image), 'wb') as f:
+		f.truncate(128 << 20)
+	_run('mkfs.btrfs', '-q', '-f', '-L', label, image)
+	assert hpcp_mod._probe_identity(str(image))[2] == label
+
+
 @pytest.mark.parametrize('line, name', [
 	("Partition name: 'it's a  name '", "it's a  name "),
 	("Partition name: ''", ''),

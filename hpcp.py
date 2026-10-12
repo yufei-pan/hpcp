@@ -6144,6 +6144,11 @@ def _fs_params_text(params):
 	return ';'.join(f'{key}={params[key]}' for key in sorted(params))
 
 _UDEV_HEX_ESCAPE_RE = re.compile(rb'\\x([0-9a-fA-F]{2})')
+# multiCMD's backslashreplace escape of an output byte that is not UTF-8: always 0x80 or above, in lowercase.
+_BACKSLASHREPLACE_RE = re.compile(rb'\\x([89a-f][0-9a-f])')
+# blkid -o udev keeps an *_ENC value in a 265-byte buffer: a longer one comes out cut, at times mid-escape (a\x2).
+_UDEV_ENC_CUT_BYTES = 261
+_UDEV_PARTIAL_ESCAPE_RE = re.compile(r'\\(x[0-9a-fA-F]?)?$')
 
 def _udev_decode(value):
 	"""A blkid `-o udev` *_ENC value as text, with the original bytes: blkid writes unsafe bytes (a space, a
@@ -6161,6 +6166,9 @@ def _probe_identity(device):
 	127 in M- notation in every locale, so a label such as 'röot' would read back mangled. No blkid cache, so a
 	label or UUID this run just changed reads back as it is on disk; exact keys, so UUID_SUB (btrfs) and
 	LABEL_FATBOOT (FAT) never stand in for UUID and LABEL.
+	An ID_FS_LABEL_ENC value of 261 bytes or more, or one ending in a partial escape, may have been cut (blkid keeps
+	it in a 265-byte buffer; a long btrfs, NTFS, f2fs or udf label full of spaces needs more): the label is then
+	read raw (_probe_raw_label).
 	"""
 	error_count = len(ERRORS)
 	try:
@@ -6174,7 +6182,31 @@ def _probe_identity(device):
 		if sep:
 			values[key] = value
 	uuid = values.get('ID_FS_UUID_ENC', values.get('ID_FS_UUID', ''))
-	return values.get('ID_FS_TYPE', ''), _udev_decode(uuid), _udev_decode(values.get('ID_FS_LABEL_ENC', ''))
+	label = values.get('ID_FS_LABEL_ENC', '')
+	if len(label.encode('utf-8', 'surrogateescape')) >= _UDEV_ENC_CUT_BYTES or _UDEV_PARTIAL_ESCAPE_RE.search(label):
+		raw_label = _probe_raw_label(device)
+		label = _udev_decode(label) if raw_label is None else raw_label
+	else:
+		label = _udev_decode(label)
+	return values.get('ID_FS_TYPE', ''), _udev_decode(uuid), label
+
+def _probe_raw_label(device):
+	"""device's label from `blkid -p -o value -s LABEL`, which prints it raw (None when it prints nothing).
+
+	multiCMD writes each output byte that is not UTF-8 as \\xNN (0x80 and above); those become the bytes again, kept
+	with surrogateescape. A backslash in the label itself is printed as it is and stays: _udev_decode would read a
+	label's own '\\x41' as 'A'.
+	"""
+	error_count = len(ERRORS)
+	try:
+		output = run_command_in_multicmd_with_path_check(['blkid', '-p', '-o', 'value', '-s', 'LABEL', device], quiet=True)
+	finally:
+		del ERRORS[error_count:]
+	if not output:
+		return None
+	data = output[0].rstrip('\r\n').encode('utf-8', 'surrogateescape')
+	data = _BACKSLASHREPLACE_RE.sub(lambda match: bytes([int(match.group(1), 16)]), data)
+	return data.decode('utf-8', 'surrogateescape')
 
 def _partition_table_type(device):
 	"""Partition table type of device from a low-level `blkid -p` probe ('gpt', 'dos', ...; '' when it finds
