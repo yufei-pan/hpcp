@@ -6436,7 +6436,7 @@ def _raw_payload_candidates(volume_roots, raw_file, size):
 def _raw_payload_present(volume_roots, raw_file, size):
 	"""True when some volume holds raw_file with the recorded size (checked before anything is hashed; its content
 	is checked by _raw_payload)."""
-	return any(True for _ in _raw_payload_candidates(volume_roots, raw_file, size))
+	return next(_raw_payload_candidates(volume_roots, raw_file, size), None) is not None
 
 def _raw_payload(volume_roots, raw_file, new_sha, size):
 	"""Path of raw_file on a volume when it is a regular file inside that volume with the recorded
@@ -7270,9 +7270,13 @@ def _run_identity_commands(commands, holds):
 def apply_disk_patch(volume_roots, target, mount_points, loop_devices, force=False, max_workers=1, verbose=False, volume_names=None):
 	"""Apply a disk patch (layout disk) to target: a GPT block device or disk-image file.
 
-	Everything is checked before anything changes: the layout, which partitions are in use,
-	every section's paths, the raw areas and the identity values. Every refusal that needs no content hash (in use, read-only live mounts, identity changes that cannot be made, the exclusive check, missing raw payloads, sections that cannot be mounted) comes before the first raw area is read: a raw area can be gigabytes. A partition the patch writes raw or sets a UUID /
-	label on must open exclusively (O_EXCL) during planning, or nothing is applied (Disk in use): that also catches
+	Everything is checked before anything is written (the filesystem sections are mounted read-write before the raw
+	areas are hashed, as before planning): the layout, which partitions are in use, every section's paths, the raw
+	areas and the identity values. Every refusal that needs no content hash (in use, read-only live mounts, identity
+	changes that cannot be made, the exclusive check, missing raw payloads, sections that cannot be mounted) comes
+	before the first raw area is read: a raw area can be gigabytes. Every raw partition with an entry in the patch
+	(including one whose area turns out to be already done) and every partition the patch sets a UUID / label on
+	must open exclusively (O_EXCL) during planning, or nothing is applied (Disk in use): that also catches
 	mounts in another mount namespace. During the raw writes and identity commands the whole disk is flock'ed and
 	those partitions held exclusively; a hold that cannot be taken then (or again, after a tool that needs the
 	partition to itself) stops the raw areas, boot code and identity changes not yet done, like a failed section.
@@ -7342,7 +7346,7 @@ def apply_disk_patch(volume_roots, target, mount_points, loop_devices, force=Fal
 	exclusive = _exclusive_refusals(write_devices)
 	if exclusive:
 		raise RuntimeError('Disk in use: ' + '; '.join(exclusive) + '; nothing applied')
-	for name, raw_file, _, _, size in meta['raws']:
+	for _, raw_file, _, _, size in meta['raws']:
 		if not _raw_payload_present(volume_roots, raw_file, size):
 			raise RuntimeError(f'Incomplete patch: raw payload {raw_file} is missing or damaged; nothing applied')
 	with _patch_hash_settings(meta) as (compare_hash, full_hash):
