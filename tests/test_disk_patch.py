@@ -1483,7 +1483,7 @@ def test_skipped_write_a_delete_in_another_section_took_away_is_restored(tmp_pat
 	assert (root1 / 'x' / 'f').read_text() == 'moved'
 
 
-def test_failed_restore_across_sections_stops_raw_areas_and_identity(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch, capsys):
+def test_failed_restore_across_sections_stops_raw_areas_and_identity(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
 	"""Every section applied, but a restore after them fails (its payload is missing): like a failed section, it stops
 	the raw areas, boot code and identity changes."""
 	volume, root1 = _cross_section_disk_patch(hpcp_mod, tmp_path, monkeypatch, 'part3', payload=False)
