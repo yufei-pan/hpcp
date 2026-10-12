@@ -3167,7 +3167,19 @@ def test_remove_tree_around_mounts_keeps_a_top_on_another_device_than_its_parent
 			return os.stat_result(values)
 		return info
 
+	parent_id = (real_lstat(parent).st_dev, real_lstat(parent).st_ino)
+	real_fstat = os.fstat
+
+	def fake_fstat(fd):
+		info = real_fstat(fd)
+		if (info.st_dev, info.st_ino) == parent_id:
+			values = list(info)
+			values[stat.ST_DEV] = info.st_dev + 1
+			return os.stat_result(values)
+		return info
+
 	monkeypatch.setattr(os, 'lstat', fake_lstat)
+	monkeypatch.setattr(os, 'fstat', fake_fstat)
 	kept, errors = hpcp_mod._remove_tree_around_mounts(str(top), set())
 	monkeypatch.undo()
 	assert (kept, errors) == (['.'], [])
@@ -3272,6 +3284,68 @@ def test_remove_tree_around_mounts_path_fallback_matches_the_fd_walk(tmp_path, h
 	assert not (top / 'a').exists() and not os.path.lexists(str(top / 'link'))
 	assert (tmp_path / 'outside' / 'target').read_text() == 'outside'
 	assert sorted(os.listdir(str(top))) == ['b'] and os.listdir(str(top / 'b')) == ['data']
+
+
+def _victim_tree(tmp_path):
+	"""target/a/b/victim/ with a file, and outside/a/b/victim/ with a file the removal must never touch."""
+	for top in ('target', 'outside'):
+		_write(tmp_path / top / 'a' / 'b' / 'victim' / 'f.txt', top)
+	return tmp_path / 'target', tmp_path / 'outside'
+
+
+def test_forced_removal_refuses_a_parent_resolving_outside_the_target(tmp_path, hpcp_mod):
+	"""Spec Part 2: a directory above the top swapped for a symlink to outside before the removal resolves its parent:
+	the parent's real path lies outside the target, so nothing is removed."""
+	target, outside = _victim_tree(tmp_path)
+	shutil.rmtree(str(target / 'a'))
+	os.symlink(str(outside / 'a'), str(target / 'a'))
+	kept, errors = hpcp_mod._remove_tree_around_mounts(str(target / 'a' / 'b' / 'victim'), set(), target_root=str(target))
+	assert kept == [] and errors and 'outside' in errors[0]
+	assert (outside / 'a' / 'b' / 'victim' / 'f.txt').exists()
+
+
+def test_forced_removal_refuses_a_parent_swapped_after_it_was_resolved(tmp_path, hpcp_mod, monkeypatch):
+	"""Spec Part 2: the swap comes right after the removal resolved its parent; the descriptor walk (O_NOFOLLOW at every
+	component) meets the symlink and refuses, so nothing outside the target is removed."""
+	target, outside = _victim_tree(tmp_path)
+	parent = os.path.realpath(str(target / 'a' / 'b'))
+	real_realpath = os.path.realpath
+	def realpath(path, *args, **kwargs):
+		result = real_realpath(path, *args, **kwargs)
+		if path == str(target / 'a' / 'b') and not os.path.islink(str(target / 'a')):
+			os.rename(str(target / 'a'), str(target / 'a-old'))
+			os.symlink(str(outside / 'a'), str(target / 'a'))
+		return result
+	monkeypatch.setattr(hpcp_mod.os.path, 'realpath', realpath)
+	kept, errors = hpcp_mod._remove_tree_around_mounts(str(target / 'a' / 'b' / 'victim'), set(), target_root=str(target))
+	monkeypatch.setattr(hpcp_mod.os.path, 'realpath', real_realpath)
+	assert parent.startswith(real_realpath(str(target)))
+	assert kept == [] and errors
+	assert (outside / 'a' / 'b' / 'victim' / 'f.txt').exists()
+	assert (target / 'a-old' / 'b' / 'victim' / 'f.txt').exists()
+
+
+def test_forced_removal_follows_a_symlinked_directory_inside_the_target(tmp_path, hpcp_mod):
+	target = tmp_path / 'target'
+	_write(target / 'real' / 'sub' / 'victim' / 'f.txt', 'x')
+	os.symlink('real', str(target / 'link'))
+	kept, errors = hpcp_mod._remove_tree_around_mounts(str(target / 'link' / 'sub' / 'victim'), set(), target_root=str(target))
+	assert (kept, errors) == ([], [])
+	assert not (target / 'real' / 'sub' / 'victim').exists() and (target / 'real' / 'sub').is_dir()
+
+
+@pytest.mark.skipif(not os.path.isdir('/proc/self/fd'), reason='needs /proc/self/fd')
+def test_forced_removal_refusal_leaks_no_descriptors(tmp_path, hpcp_mod):
+	"""Review Focus 4: every descriptor the walk opened is closed, on refusals too."""
+	target, outside = _victim_tree(tmp_path)
+	before = len(os.listdir('/proc/self/fd'))
+	(target / 'a' / 'b' / 'victim2').mkdir()
+	hpcp_mod._remove_tree_around_mounts(str(target / 'a' / 'b' / 'victim2'), set(), target_root=str(target))
+	shutil.rmtree(str(target / 'a'))
+	os.symlink(str(outside / 'a'), str(target / 'a'))
+	hpcp_mod._remove_tree_around_mounts(str(target / 'a' / 'b' / 'victim'), set(), target_root=str(target))
+	hpcp_mod._remove_tree_around_mounts(str(target / 'missing' / 'x'), set(), target_root=str(target))
+	assert len(os.listdir('/proc/self/fd')) == before
 
 
 def test_mounts_below(tmp_path, hpcp_mod):
