@@ -3414,6 +3414,49 @@ def test_paths_on_fat_follow_the_mount_below_the_root(tmp_path, hpcp_mod, monkey
 	assert hpcp_mod._paths_on_fat(paths, str(root), [_mount_entry(tmp_path, 'ext4')]) == set()
 
 
+def test_paths_on_fat_follow_a_symlinked_root(tmp_path, hpcp_mod, reset_hpcp_globals):
+	"""Final review M5: build_entry_map lists a symlinked source root from its real path; the FAT mount below the real
+	tree still classifies the paths under it (and only those)."""
+	real = tmp_path / 'real'
+	_write(real / 'etc' / 'x', 'x')
+	_write(real / 'boot' / 'efi' / 'EFI' / 'x', 'x')
+	_write(real / 'boot' / 'efix', 'x')
+	link = tmp_path / 'link'
+	os.symlink('real', str(link))
+	paths = list(hpcp_mod.build_entry_map(str(link), max_workers=1).values())
+	efi = os.path.realpath(str(real / 'boot' / 'efi'))
+	expected = {path for path in paths if path == efi or path.startswith(efi + os.sep)}
+	assert os.path.join(efi, 'EFI', 'x') in expected and len(expected) == 3
+	entries = [_mount_entry(tmp_path, 'ext4'), _mount_entry(real / 'boot' / 'efi', 'vfat')]
+	assert hpcp_mod._paths_on_fat(paths, str(link), entries) == expected
+
+
+@pytest.mark.parametrize('compare_hash', [True, False])
+def test_marked_rows_are_hashed_in_full_only_when_hashes_are_compared(trees, hpcp_mod, tmp_path, monkeypatch, compare_hash):
+	"""Final review M6: with the patch hashed by another algorithm than the node's (compare_hash False) no hash is
+	compared, so checking and verifying do not hash marked rows' files in full."""
+	new, base = trees
+	_write(new / 'f', 'new')
+	_write(base / 'f', 'old')
+	new_map, base_map = hpcp_mod.build_root_maps(str(new), str(base), max_workers=1)
+	rows = hpcp_mod.compute_changes(new_map, base_map, max_workers=1, fat_paths=set(new_map.values()) | set(base_map.values()))
+	assert _ops(rows) == {('M', 'f')} and hpcp_mod._full_marked(rows[0].new)
+	target = tmp_path / 'target'
+	_clone(base, target)
+	seen = []
+	real_states_for_paths = hpcp_mod._states_for_paths
+
+	def states_for_paths(paths, *args, **kwargs):
+		seen.append(set(kwargs.get('marked', ())))
+		return real_states_for_paths(paths, *args, **kwargs)
+
+	monkeypatch.setattr(hpcp_mod, '_states_for_paths', states_for_paths)
+	hpcp_mod.check_patch_target(rows, str(target), compare_hash=compare_hash, metadata=False, tz_tolerant=True)
+	hpcp_mod._verify_rows(rows, str(target), compare_hash=compare_hash, metadata=False, tz_tolerant=True)
+	marked = {str(target / 'f')} if compare_hash else set()
+	assert seen == [marked, marked]
+
+
 def test_format_version_follows_the_full_hash_mark(hpcp_mod):
 	R = hpcp_mod.ChangeRow
 	plain = [R('A', 'a', '-', 'f:5:1:100644:0:0:aa:-')]

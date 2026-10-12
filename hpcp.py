@@ -4737,12 +4737,14 @@ def check_patch_target(rows, target_root, compare_hash=True, full_hash=False, ma
 	entries, the name a D row removes, and the A row that replaces a D row. A case-only rename (D on one
 	spelling, A on another) is then a delete and a write; once applied (the target already spells the A
 	row's name) both rows are skipped.
-	Rows whose states carry the full-hash mark (_FULL_HASH_MARK) are compared with the target's file hashed in full and marked.
+	Rows whose states carry the full-hash mark (_FULL_HASH_MARK) are compared with the target's file hashed in full and marked
+	(only with compare_hash: no hash is compared otherwise).
 	tz_tolerant: a FAT section (see states_equal).
 	"""
 	fold = _fold_name if case_insensitive else (lambda name: name)
 	paths = {row.path: _key_path(target_root, row.path) for row in rows}
-	marked = {paths[row.path] for row in rows if _full_marked(row.old) or _full_marked(row.new)}
+	# Without hashes to compare (another algorithm) nothing is hashed in full.
+	marked = {paths[row.path] for row in rows if _full_marked(row.old) or _full_marked(row.new)} if compare_hash else set()
 	states = _states_for_paths(set(paths.values()), full_hash=full_hash, read_xattrs=metadata, max_workers=max_workers, marked=marked)
 	same = functools.partial(states_equal, compare_hash=compare_hash, metadata=metadata, full_hash=full_hash, tz_tolerant=tz_tolerant)
 	added_by_name = {fold(row.path.rstrip('/')): row for row in rows if row.op == 'A'}
@@ -5518,14 +5520,14 @@ def _verify_rows(rows, target_root, compare_hash=True, full_hash=False, max_work
 	(_fold_name) and both paths are one entry (same st_dev / st_ino): a case-only rename on a
 	case-insensitive target, whether or not hpcp recognised the filesystem as one. written_rows: more
 	A / M rows that count for this, not verified themselves. passed: a list that receives the rows that pass.
-	Marked rows are read hashed in full (see check_patch_target); tz_tolerant: a FAT section.
+	Marked rows are read hashed in full with compare_hash (see check_patch_target); tz_tolerant: a FAT section.
 	"""
 	final = {}
 	for row in sort_change_rows(rows):
 		# D sorts before A, so for a D + A pair on one name the A row decides the final state.
 		final[row.path.rstrip('/')] = row
 	paths = {name: _key_path(target_root, row.path) for name, row in final.items()}
-	marked = {paths[name] for name, row in final.items() if _full_marked(row.old) or _full_marked(row.new)}
+	marked = {paths[name] for name, row in final.items() if _full_marked(row.old) or _full_marked(row.new)} if compare_hash else set()
 	states = _states_for_paths(set(paths.values()), full_hash=full_hash, read_xattrs=metadata, max_workers=max_workers, marked=marked)
 	written = {}
 	for name, row in final.items():
@@ -6584,16 +6586,20 @@ def _rows_by_scope(rows, scopes):
 
 def _paths_on_fat(paths, root, entries):
 	"""The paths (absolute, under root) on a FAT filesystem: root's own mount, or one mounted below it (_mount_scopes;
-	hidden mounts left out). Each path looks up its own parent names, deepest first, as _rows_by_scope does."""
+	hidden mounts left out). Each path looks up its own parent names, deepest first, as _rows_by_scope does. Paths may
+	lie under root as given or under its real path (build_entry_map lists a symlinked root from its target)."""
 	fat = {prefix: _is_fat(fs_type) for prefix, fs_type, _ in _mount_scopes(root, entries)}
 	if not any(fat.values()):
 		return set()
-	root = os.path.abspath(root)
+	roots = {os.path.abspath(root), os.path.realpath(root)}
+	insides = [(top, top.rstrip(os.sep) + os.sep) for top in roots]
 	result = set()
 	for path in paths:
-		name = os.path.relpath(path, root).replace(os.sep, '/')
-		if name == '.' or name.startswith('../'):
-			name = ''
+		name = ''
+		for top, inside in insides:
+			if path != top and path.startswith(inside):
+				name = path[len(inside):].replace(os.sep, '/')
+				break
 		while name and name not in fat:
 			name = name.rpartition('/')[0]
 		if fat.get(name, False):
