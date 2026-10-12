@@ -1373,26 +1373,38 @@ def test_case_only_rename_under_a_parent_the_node_spells_differently_applies_onc
 	assert hpcp_mod.ERRORS == []
 
 
-def test_hfsx_is_case_sensitive(tmp_path, hpcp_mod):
+def test_hfsx_is_case_sensitive(tmp_path, hpcp_mod, monkeypatch):
 	device = tmp_path / 'hfs.img'
 	device.write_bytes(b'\0' * 1024 + b'HX' + b'\0' * 510)
-	assert hpcp_mod._has_case_insensitive_names('hfsplus', str(device)) is False
+	assert hpcp_mod._is_hfsx(str(device)) is True
 	device.write_bytes(b'\0' * 1024 + b'H+' + b'\0' * 510)
-	assert hpcp_mod._has_case_insensitive_names('hfsplus', str(device)) is True
-	assert hpcp_mod._has_case_insensitive_names('hfsplus', str(tmp_path / 'missing')) is True
+	assert hpcp_mod._is_hfsx(str(device)) is False
+	assert hpcp_mod._is_hfsx(str(tmp_path / 'missing')) is False
+	monkeypatch.setattr(hpcp_mod, '_is_hfsx', lambda device: device == '/dev/hfsx')
+	assert hpcp_mod._has_case_insensitive_names('hfsplus', '/dev/hfsx') is False
+	assert hpcp_mod._has_case_insensitive_names('hfsplus', '/dev/hfsplus') is True
 	assert hpcp_mod._has_case_insensitive_names('hfsplus') is True
-	assert hpcp_mod._has_case_insensitive_names('vfat', str(device)) is True
-	assert hpcp_mod._has_case_insensitive_names('ext4', str(device)) is False
+	assert hpcp_mod._has_case_insensitive_names('vfat', '/dev/hfsx') is True
+	assert hpcp_mod._has_case_insensitive_names('ext4', '/dev/hfsx') is False
+
+
+def test_hfsx_header_is_read_only_from_a_device_node(tmp_path, hpcp_mod, monkeypatch):
+	"""Final review M4: a mount source such as 'none' is not a path; opening it would read a file of that name in the
+	working directory."""
+	monkeypatch.chdir(str(tmp_path))
+	(tmp_path / 'none').write_bytes(b'\0' * 1024 + b'HX' + b'\0' * 510)
+	assert hpcp_mod._has_case_insensitive_names('hfsplus', 'none') is True
+	assert hpcp_mod._has_case_insensitive_names('hfsplus', str(tmp_path / 'none')) is True
 
 
 @pytest.mark.skipif(shutil.which('mkfs.hfsplus') is None, reason='needs mkfs.hfsplus')
 def test_hfsx_made_by_mkfs_is_case_sensitive(tmp_path, hpcp_mod):
-	for flags, insensitive in (([], True), (['-s'], False)):
+	for flags, hfsx in (([], False), (['-s'], True)):
 		image = tmp_path / f'hfs{len(flags)}.img'
 		with open(str(image), 'wb') as f:
 			f.truncate(32 << 20)
 		subprocess.run(['mkfs.hfsplus'] + flags + [str(image)], check=True, stdout=subprocess.DEVNULL)
-		assert hpcp_mod._has_case_insensitive_names('hfsplus', str(image)) is insensitive
+		assert hpcp_mod._is_hfsx(str(image)) is hfsx
 
 
 @pytest.mark.parametrize('fs_type, metadata, case_insensitive', [('vfat', False, True), ('exfat', False, True), ('ntfs', False, False),

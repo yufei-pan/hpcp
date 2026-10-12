@@ -6091,14 +6091,20 @@ def _hidden_mounts(entries):
 		return False
 	memo = {}
 	def reached(entry):
-		chain, seen, current = [], set(), entry
+		chain, position, current = [], {}, entry
 		while current['mount_id'] not in memo:
+			position[current['mount_id']] = len(chain)
 			chain.append(current)
-			seen.add(current['mount_id'])
 			parent = by_id.get(current['parent_id'])
-			if parent is None or parent['mount_id'] in seen:
+			if parent is None:
 				memo[current['mount_id']] = True
 				chain.pop()
+				break
+			if parent['mount_id'] in position:
+				# A cycle (a self-parent included): every member from the parent on is reached.
+				for node in chain[position[parent['mount_id']]:]:
+					memo[node['mount_id']] = True
+				del chain[position[parent['mount_id']]:]
 				break
 			current = parent
 		for node in reversed(chain):
@@ -6142,13 +6148,15 @@ def _scope_fs_type(fs_type, source):
 	return fs_type
 
 def _rows_by_scope(rows, scopes):
-	"""{key prefix: rows}: each row under the deepest scope prefix it lies in ('' for the target's own)."""
-	prefixes = sorted((prefix for prefix, _, _ in scopes if prefix), key=len, reverse=True)
+	"""{key prefix: rows}: each row under the deepest scope prefix it lies in ('' for the target's own). Each row
+	looks up its own name and parent names, deepest first, so the cost does not grow with the number of mounts."""
+	prefixes = {prefix for prefix, _, _ in scopes if prefix}
 	grouped = {}
 	for row in rows:
 		name = row.path.rstrip('/')
-		scope = next((prefix for prefix in prefixes if name == prefix or name.startswith(prefix + '/')), '')
-		grouped.setdefault(scope, []).append(row)
+		while name and name not in prefixes:
+			name = name.rpartition('/')[0]
+		grouped.setdefault(name, []).append(row)
 	return grouped
 
 def _compare_metadata(roots, entries):
@@ -6194,20 +6202,23 @@ def _has_posix_metadata(fs_type):
 	"""False for a filesystem whose sections are compared and applied by content only."""
 	return fs_type not in _NO_POSIX_METADATA_TYPES
 
+def _is_hfsx(device):
+	"""True when device holds case-sensitive HFSX: its HFS+ volume header signature (2 bytes at offset 1024) is 'HX'.
+	False for 'H+' or an unreadable header."""
+	try:
+		with open(device, 'rb') as f:
+			f.seek(1024)
+			return f.read(2) == b'HX'
+	except OSError:
+		return False
+
 def _has_case_insensitive_names(fs_type, device=''):
 	"""True for a filesystem whose Linux driver looks names up case-insensitively: the FAT family, exFAT, HFS and
-	HFS+, except case-sensitive HFSX (an hfsplus volume whose header signature, 2 bytes at offset 1024 of device,
-	is 'HX'). An unreadable header counts as case-insensitive."""
+	HFS+, except case-sensitive HFSX (see _is_hfsx). Only a /dev/ path is read (a mount source such as 'none' would
+	be opened relative to the working directory); an unreadable header counts as case-insensitive."""
 	if fs_type not in _CASE_INSENSITIVE_TYPES:
 		return False
-	if fs_type == 'hfsplus' and device:
-		try:
-			with open(device, 'rb') as f:
-				f.seek(1024)
-				return f.read(2) != b'HX'
-		except OSError:
-			pass
-	return True
+	return not (fs_type == 'hfsplus' and device.startswith('/dev/') and _is_hfsx(device))
 
 _IDENTITY_FIELDS = ('unique_guid', 'name', 'attrs', 'fs_uuid', 'fs_label')
 IdentityChange = namedtuple('IdentityChange', 'number field current new')

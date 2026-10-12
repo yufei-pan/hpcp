@@ -2304,8 +2304,21 @@ def test_mount_scopes_follow_what_path_lookup_reaches(tmp_path, hpcp_mod):
 		_mount_entry(mnt2 / 'data' / 'sub', 'new', ids=(12, 11))]
 	assert scopes(str(mnt2 / 'data' / 'sub'), entries)[0][1] == 'new'
 	assert scopes(str(mnt2 / 'data'), entries)[0][1] == 'over'
-	# A cycle of parent ids ends (the mounts count as not reached).
+	# A cycle of parent ids ends: both count as reached, but each is stacked on the other, so neither is visible.
 	assert scopes(str(mnt2), [_mount_entry(mnt2, 'a', ids=(1, 2)), _mount_entry(mnt2, 'b', ids=(2, 1))])[0][1] == ''
+
+
+def test_every_member_of_a_parent_cycle_counts_as_reached(tmp_path, hpcp_mod):
+	"""A parent-id cycle (impossible on a real system) counts as reached for every member, in whatever order the
+	entries come: B at x and A at x/a are each other's parent, and C, another child of B on A's mount point, would
+	hide A were A reached only through B."""
+	import itertools
+	x = tmp_path / 'x'
+	cycle = [_mount_entry(x, 'b', ids=(2, 1)), _mount_entry(x / 'a', 'a', ids=(1, 2))]
+	sibling = _mount_entry(x / 'a', 'c', ids=(3, 2))
+	for entries in itertools.permutations(cycle + [sibling]):
+		hidden = hpcp_mod._hidden_mounts(list(entries))
+		assert [entry['fstype'] for index, entry in enumerate(entries) if index in hidden] == ['c']
 
 
 def test_self_parented_root_mount_hides_nothing(tmp_path, hpcp_mod):
@@ -2495,6 +2508,21 @@ def test_rows_by_scope_uses_the_deepest_mount(hpcp_mod):
 	grouped = hpcp_mod._rows_by_scope(rows, scopes)
 	assert {scope: [row.path for row in scoped] for scope, scoped in grouped.items()} == {
 		'': ['./', 'etc/x', 'boot/efix'], 'boot/efi': ['boot/efi/', 'boot/efi/EFI/a']}
+
+
+def test_rows_by_scope_scales_with_many_mounts(hpcp_mod):
+	"""Final review M1: each row looks up its own ancestors, not every mount (20000 kubelet-style mounts)."""
+	import time
+	R = hpcp_mod.ChangeRow
+	scopes = [('', 'ext4', '')] + [(f'var/lib/kubelet/pods/p{i}/volumes/v', 'tmpfs', '') for i in range(20000)]
+	rows = [R('A', f'var/lib/kubelet/pods/p{i}/volumes/v/f', '-', 'f:1:1:100644:0:0:-:-') for i in range(20000)]
+	rows.append(R('A', 'var/lib/kubelet/pods/p1/volumes/vx', '-', 'f:1:1:100644:0:0:-:-'))
+	start = time.time()
+	grouped = hpcp_mod._rows_by_scope(rows, scopes)
+	assert time.time() - start < 2
+	assert len(grouped) == 20001 and [row.path for row in grouped['var/lib/kubelet/pods/p7/volumes/v']] == [
+		'var/lib/kubelet/pods/p7/volumes/v/f']
+	assert [row.path for row in grouped['']] == ['var/lib/kubelet/pods/p1/volumes/vx']
 
 
 def test_rows_under_a_content_only_mount_below_the_target_are_content_only(trees, hpcp_mod, tmp_path, reset_hpcp_globals, monkeypatch):
