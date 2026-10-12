@@ -363,6 +363,51 @@ def test_write_partition_info_does_not_fsck_ext_when_uuid_is_empty(monkeypatch):
 	assert not any(cmd and cmd[0] == 'e2fsck' for cmd in delayed)
 
 
+_BTRFS_UUID = '3df5b1c5-933f-45e2-8b15-b4c94ef5aa14'
+
+
+def _write_btrfs_partition_info(monkeypatch, temp_fsid):
+	"""write_partition_info for a btrfs partition with a UUID and label; returns (mkfs argv, delayed commands)."""
+	seen = []
+	monkeypatch.setattr(hpcp, '_btrfs_temp_fsid_supported', lambda: temp_fsid)
+	monkeypatch.setattr(hpcp, 'get_target_partition', lambda image, name: ('/dev/loop0p2', None))
+	monkeypatch.setattr(hpcp, 'run_command_in_multicmd_with_path_check', lambda command, **kwargs: [''])
+	monkeypatch.setattr(hpcp, '_run_mkfs_with_fallback', lambda base, params, target, fs_type: seen.append(list(base)) or True)
+	infos = _partition_info_stub('btrfs', _BTRFS_UUID)
+	infos['2']['fs_label'] = 'DATA'
+	delayed = hpcp.write_partition_info('/dev/fakeimg', infos, '2')
+	return seen[0], delayed
+
+
+def test_write_partition_info_mirrors_the_btrfs_uuid_at_mkfs_with_temp_fsid(monkeypatch, capsys):
+	command, delayed = _write_btrfs_partition_info(monkeypatch, True)
+	assert command == ['mkfs.btrfs', '-L', 'DATA', '-U', _BTRFS_UUID]
+	assert delayed == []
+	assert 'temp_fsid' not in capsys.readouterr().err
+
+
+def test_write_partition_info_gives_btrfs_a_new_uuid_without_temp_fsid(monkeypatch, capsys):
+	"""Without temp_fsid the kernel cannot mount the copy next to the mounted source with one UUID, and btrfstune -U
+	refuses a UUID an attached device carries: the copy gets a new UUID and a warning says how to set the source's."""
+	monkeypatch.setattr(hpcp, 'ERRORS', [])
+	command, delayed = _write_btrfs_partition_info(monkeypatch, False)
+	assert command == ['mkfs.btrfs', '-L', 'DATA']
+	assert delayed == []
+	err = capsys.readouterr().err
+	assert 'Warning: this kernel cannot mount two btrfs filesystems with one UUID (no temp_fsid support)' in err
+	assert '/dev/loop0p2' in err and f'set {_BTRFS_UUID} with btrfstune -U once the source is detached' in err
+	# A degrade, not a failure: printed, never recorded as an error (eprint would make the run exit non-zero).
+	assert hpcp.ERRORS == []
+
+
+def test_btrfs_temp_fsid_supported_checks_the_sysfs_feature(monkeypatch):
+	"""The static feature file exists when the kernel has temp-fsid (it reads 0, like rmdir_subvol)."""
+	monkeypatch.setattr(hpcp.os.path, 'exists', lambda path: path == '/sys/fs/btrfs/features/temp_fsid')
+	assert hpcp._btrfs_temp_fsid_supported() is True
+	monkeypatch.setattr(hpcp.os.path, 'exists', lambda path: False)
+	assert hpcp._btrfs_temp_fsid_supported() is False
+
+
 def test_e2fsck_exit_1_is_not_a_task_error(monkeypatch):
 	# e2fsck uses a bitmask: 1 = errors corrected, 2 = reboot recommended.
 	# A live-system clone almost always needs journal replay, so treating 1 as
@@ -1401,6 +1446,60 @@ def test_dd_copies_awkward_labels_and_gpt_names_exactly(tmp_path):
 			assert f"Partition name: '{name1}'" in _run('sgdisk', '-i', '1', loop)
 			assert f"Partition name: '{name2}'" in _run('sgdisk', '-i', '2', loop)
 			assert _run('e2label', f'{loop}p2').rstrip('\n') == label
+		finally:
+			subprocess.run(['losetup', '-d', loop], check=False, capture_output=True)
+	finally:
+		_detach_loops_for_image(src)
+		_detach_loops_for_image(dest)
+
+
+@requires_root_and_tools
+@pytest.mark.skipif(shutil.which('mkfs.btrfs') is None or shutil.which('btrfstune') is None,
+	reason='btrfs dd round trip needs mkfs.btrfs and btrfstune')
+def test_dd_copies_a_btrfs_partition_with_the_source_uuid_and_label(tmp_path):
+	"""A btrfs partition is copied file by file with the source's label. With temp_fsid the copy is made with the
+	source's UUID (mkfs.btrfs -U) and still mounts next to the mounted source; without it the copy gets a new UUID and a
+	warning (btrfstune -U refuses a UUID the attached source carries)."""
+	src = str(tmp_path / 'src.img')
+	_run('truncate', '-s', '400M', src)
+	_run('sgdisk', '--clear', '--new=1:0:0', '--typecode=1:8300', '--change-name=1:data', src)
+	loop = _run('losetup', '--partscan', '--find', '--show', src).strip()
+	try:
+		subprocess.run(['udevadm', 'settle'], check=False, capture_output=True)
+		_run('mkfs.btrfs', '-q', '-f', '-L', 'BTRLABEL', f'{loop}p1')
+		mount_point = str(tmp_path / 'mnt1')
+		os.makedirs(mount_point, exist_ok=True)
+		_run('mount', f'{loop}p1', mount_point)
+		try:
+			with open(os.path.join(mount_point, 'file1.txt'), 'w') as f:
+				f.write('hello-btrfs\n')
+		finally:
+			_run('umount', mount_point)
+		src_uuid = _run('blkid', '-p', '-s', 'UUID', '-o', 'value', f'{loop}p1').strip()
+		src_label = _run('blkid', '-p', '-s', 'LABEL', '-o', 'value', f'{loop}p1').strip()
+	finally:
+		subprocess.run(['losetup', '-d', loop], check=False, capture_output=True)
+	assert src_uuid and src_label == 'BTRLABEL'
+	temp_fsid = hpcp._btrfs_temp_fsid_supported()
+	dest = str(tmp_path / 'dest.img')
+	try:
+		result = _run_hpcp_dd([], src, dest)
+		assert 'usig dd for copying' not in result.stderr + result.stdout
+		assert ('no temp_fsid support' in result.stderr) is not temp_fsid
+		loop = _run('losetup', '--partscan', '--find', '--show', '--read-only', dest).strip()
+		try:
+			subprocess.run(['udevadm', 'settle'], check=False, capture_output=True)
+			dest_uuid = _run('blkid', '-p', '-s', 'UUID', '-o', 'value', f'{loop}p1').strip()
+			assert (dest_uuid == src_uuid) is temp_fsid and dest_uuid
+			assert _run('blkid', '-p', '-s', 'LABEL', '-o', 'value', f'{loop}p1').strip() == src_label
+			mount_point = str(tmp_path / 'dest-mnt')
+			os.makedirs(mount_point, exist_ok=True)
+			_run('mount', '-o', 'ro', f'{loop}p1', mount_point)
+			try:
+				with open(os.path.join(mount_point, 'file1.txt')) as f:
+					assert f.read() == 'hello-btrfs\n'
+			finally:
+				_run('umount', mount_point)
 		finally:
 			subprocess.run(['losetup', '-d', loop], check=False, capture_output=True)
 	finally:

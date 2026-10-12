@@ -1821,6 +1821,11 @@ def get_partition_infos(device, identity=True):
 		partition_info[part[0]] = get_partition_details(device, part[0], sector_size, identity)
 	return partition_info
 
+def _btrfs_temp_fsid_supported():
+	"""True when the kernel's btrfs has temp-fsid: it can mount a second single-device btrfs whose fsid is already
+	mounted (the static feature file exists; like rmdir_subvol it reads 0)."""
+	return os.path.exists('/sys/fs/btrfs/features/temp_fsid')
+
 def write_partition_info(image, partition_infos, partition_name):
 	"""
 	Writes partition information to a specified partition within a disk image.
@@ -1895,9 +1900,12 @@ def write_partition_info(image, partition_infos, partition_name):
 				command = ['mkfs.btrfs']
 				if fs_label:
 					command.extend(['-L', fs_label])
-				if fs_uuid:
-					#cannot delay, must set during creation
+				# Not delayed: btrfstune -U refuses a UUID the attached source carries; -U at mkfs needs temp_fsid to mount next to it.
+				if fs_uuid and _btrfs_temp_fsid_supported():
 					command.extend(['-U', fs_uuid])
+				elif fs_uuid:
+					print(f"Warning: this kernel cannot mount two btrfs filesystems with one UUID (no temp_fsid support); "
+						f"{target_partition} gets a new btrfs UUID; set {fs_uuid} with btrfstune -U once the source is detached", file=sys.stderr)
 				_run_mkfs_with_fallback(command, param_args, target_partition, fs_type)
 			elif fs_type == 'xfs':
 				command = ['mkfs.xfs']
@@ -6149,9 +6157,11 @@ def _fs_params_text(params):
 	return ';'.join(f'{key}={params[key]}' for key in sorted(params))
 
 _UDEV_HEX_ESCAPE_RE = re.compile(rb'\\x([0-9a-fA-F]{2})')
-# multiCMD's backslashreplace escape of an output byte that is not UTF-8: always 0x80 or above, in lowercase.
+# multiCMD's backslashreplace escape of an output byte that is not UTF-8: always 0x80 or above, in lowercase. Only
+# these \x80-\xff escapes are decoded on a raw `-o value` line: a label's own literal '\x41' text stays.
 _BACKSLASHREPLACE_RE = re.compile(rb'\\x([89a-f][0-9a-f])')
 # blkid -o udev keeps an *_ENC value in a 265-byte buffer: a longer one comes out cut, at times mid-escape (a\x2).
+# Counted in UTF-8 bytes, as the buffer is: blkid keeps UTF-8 as it is, so a multibyte label is cut in fewer characters.
 _UDEV_ENC_CUT_BYTES = 261
 _UDEV_PARTIAL_ESCAPE_RE = re.compile(r'\\(x[0-9a-fA-F]?)?$')
 
