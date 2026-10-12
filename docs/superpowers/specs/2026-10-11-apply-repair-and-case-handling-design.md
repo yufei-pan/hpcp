@@ -60,9 +60,17 @@ pre-flight refusals run before the conflict prompt.
    files come from the payload, symlinks are recreated. Repaired rows are verified like every written
    row (`_verify_rows`). The section summary gains `restored N` (N = repaired rows; 0 when none).
 
-   Verify (`_verify_rows`): a D row whose path still exists passes when an A / M row's name differs from it only
-   by case (`_fold_name`) and both paths are one entry (same `st_dev` / `st_ino`), so a correct case-only rename
-   on a case-insensitive filesystem hpcp does not recognise is not reported as a failure.
+   Verify (`_verify_rows`): a D row whose path still exists passes when an A / M row's name differs
+   from it only by case (`_fold_name`) and both paths are one entry (same `st_dev` / `st_ino`), so a
+   correct case-only rename on a case-insensitive filesystem hpcp does not recognise is not reported
+   as a failure. Verify also covers a skipped A / M row whose name differs only by case from a written
+   one (a golden from a case-sensitive filesystem holding both names): on a case-insensitive target
+   the write lands on the skipped row's entry, and verify reports it.
+
+   Across sections (`_restore_across_sections`): once every mount scope or disk section ran (also
+   after a failed one), when any of them removed something, every section's skipped A / M rows are
+   lstat'ed again; missing ones are restored and verified with their own section's root, payload and
+   metadata setting. An entry of another type in their place is never removed; it fails their verify.
 2. **Removed**: `_refuse_case_only_renames` and `_CASE_SENSITIVE_TYPES`; `_same_entry_pair` and
    `_caseless` (only `_same_entry_pair` uses it; `_names_removed_first` stays, the outside-symlink
    check uses it too); the old-patch `_case_collision` refusal in `apply_disk_patch`; the extra
@@ -84,33 +92,35 @@ pre-flight refusals run before the conflict prompt.
    `check_patch_target` compares names with `_fold_name(name)` — each character upper-cased only when
    `c.upper()` is a single character, otherwise kept (so `ß` never becomes `SS`). The fold applies to
    (a) the D-directory child check (`_unlisted_children`, as today), (b) the "already replaced" lookup
-   for D rows (`added_by_name`), (c) `removed_names` for A / M rows (`_under_removed`).
-   A name the target spells exactly is preferred over a fold match (`_spelled_on_disk`), and an A / M row counts as
-   under a removed name that differs only by case only when the filesystem agrees (the row's prefix is missing, or is
-   the same entry as the deleted one), so names the kernel keeps apart are never merged. A case rename,
-   with or without a content change, is therefore planned as delete + write (no `-fa`), and a re-run
-   after a successful apply skips both rows. On a case-insensitive target hpcp does not recognise, the
-   repair step keeps the files; a case rename with a content change there is a conflict (needs `-fa`).
+   for D rows (`added_by_name`), (c) `removed_names` for A / M rows (`_under_removed`). A name the
+   target spells exactly is preferred over a fold match (`_spelled_on_disk`), and an A / M row counts
+   as under a removed name that differs only by case only when the filesystem agrees (the row's prefix
+   is missing, or is the same entry as the deleted one), so names the kernel keeps apart are never
+   merged. A case rename, with or without a content change, is therefore planned as delete + write
+   (no `-fa`), and a re-run after a successful apply skips both rows. On a case-insensitive target hpcp
+   does not recognise, the repair step keeps the files; a case rename with a content change there is a
+   conflict (needs `-fa`).
 3. **Which rows are case-insensitive / content-only.**
    - Disk sections: from the partition's `fs_type` in `disk.tsv` (as today).
-   - Single-filesystem apply: from `/proc/self/mountinfo`.
-     `_mount_scopes` (replacing `_path_mounts`) reads each entry's mount ID and parent ID and keeps the mounts that
-     path lookup reaches. A mount is reached when it has no listed parent, when its parent is itself or it lies on a
-     parent-ID cycle (a namespace root; the safe direction), or when its parent is reached and — for a mount on
-     another mount point than its parent's — nothing else is stacked on the parent at the parent's mount point and no
-     other child of the same parent sits at the mount's own mount point or a parent path of it. A reached mount is
-     visible when nothing is stacked on it at its own mount point. Each path belongs to the deepest visible mount
-     holding it, so a mount hidden by a later mount on a parent is not chosen. FUSE block mounts (`fuseblk`) are
-     classified by probing their source device, only for scopes that hold rows.
-     Rows under a mount below the target (e.g.
+   - Single-filesystem apply: from `/proc/self/mountinfo`. `_mount_scopes` (replacing
+     `_path_mounts`) reads each entry's mount ID and parent ID and keeps the mounts that path lookup
+     reaches. A mount is reached when it has no listed parent, when its parent is itself or it lies on
+     a parent-ID cycle (a namespace root; the safe direction), or when its parent is reached and — for
+     a mount on another mount point than its parent's — nothing else is stacked on the parent at the
+     parent's mount point and no other child of the same parent sits at the mount's own mount point or
+     a parent path of it. A reached mount is visible when nothing is stacked on it at its own mount
+     point. Each path belongs to the deepest visible mount holding it, so a mount hidden by a later
+     mount on a parent is not chosen. FUSE block mounts (`fuseblk`) are classified by probing their
+     source device, only for scopes that hold rows. Rows under a mount below the target (e.g.
      `boot/efi/` when applying to `/`) get that mount's classification: the patch is split into one
      sub-plan per mount scope (the target's own scope plus each mount below it that holds rows), each
      with its own `metadata` / case flags, applied through the existing multi-section machinery with a
-     single shared conflict prompt and a single summary.
-     Scopes apply in turn, the target's own first; after a scope fails, the later ones are not applied.
+     single shared conflict prompt and a single summary. Scopes apply in turn, the target's own first;
+     after a scope fails, the later ones are not applied.
 4. **Single-filesystem generation** (`process_get_diff_image`) compares content only when either side
-   sits on a content-only filesystem (FAT family, exFAT, NTFS): images probed with `_probe_fs_type`,
-   directories classified through mountinfo.
+   sits on a content-only filesystem (FAT family, exFAT, NTFS), classified through mountinfo:
+   directories as they are, images once hpcp has mounted them (a `fuseblk` source is probed with
+   `_probe_fs_type`).
 5. **FAT timestamps.** `states_equal(..., metadata=False)` also treats two file states as equal when
    size and hash match and the mtimes differ by a whole multiple of 15 minutes within ±24 hours
    (a timezone-shaped offset). Any other mtime difference still counts. The hash must cover the whole
@@ -119,9 +129,9 @@ pre-flight refusals run before the conflict prompt.
 6. **FAT attributes.** When a file on a FAT-family target is replaced, its existing attribute byte is
    read (`FAT_IOCTL_GET_ATTRIBUTES`) before the rename and the hidden / system / read-only / archive
    bits are set on the replacement afterwards (`FAT_IOCTL_SET_ATTRIBUTES`). Best effort: a failure
-   prints a warning, never fails the row. Only a regular file is opened (never a FIFO or
-   device node). New files get the filesystem's defaults. (Linux exposes no
-   such ioctl for exFAT; exFAT is unchanged.)
+   prints a warning, never fails the row. Only a regular file is opened (never a FIFO or device
+   node). New files get the filesystem's defaults. (Linux exposes no such ioctl for exFAT; exFAT is
+   unchanged.)
 7. **HFSX.** An `hfsplus` filesystem is case-sensitive when its volume header signature (2 bytes at
    offset 1024 of the device) is `HX`; `H+` or an unreadable header keeps it case-insensitive. Disk
    sections read the partition device; single-filesystem apply reads the mount's source device.
@@ -147,13 +157,13 @@ Real-filesystem tests (root + loop where needed; scratch only under /tmp; probes
   monkeypatched to report `nfs4` — files are restored, summary shows `restored N`.
 - Symlink alias inside the target (`y -> x`): skipped row lost to a delete is restored; contradictory
   `D x/f` + `A y/f` fails at verify, non-zero exit.
-- Forced type change (`-fa`) over an aliased skipped row: the loss is reported (copy error and verify failure);
-  it cannot be restored once the alias points at a file.
+- Forced type change (`-fa`) over an aliased skipped row: the loss is reported (copy error and
+  verify failure); it cannot be restored once the alias points at a file.
 - ESP mounted below the target (`-d /`-style test tree with a vfat mount under it, umask differing
   from the generator): content-only, no mode conflicts.
-- `_mount_scopes` with a hidden mount (a tmpfs on `/x` mounted after a vfat on `/x/esp`, with mount and parent
-  IDs): `/x/esp` belongs to the tmpfs; a self-parented namespace root hides nothing; a 5000-deep parent chain and
-  20000 siblings resolve without recursion and in linear time.
+- `_mount_scopes` with a hidden mount (a tmpfs on `/x` mounted after a vfat on `/x/esp`, with mount
+  and parent IDs): `/x/esp` belongs to the tmpfs; a self-parented namespace root hides nothing; a
+  5000-deep parent chain and 20000 siblings resolve without recursion and in linear time.
 - Timezone tolerance: a 2 h offset with equal size + hash is equal; a 7 min offset is not.
 - FAT attributes: a hidden + system file keeps both bits after replacement.
 - HFSX (`mkfs.hfsplus -s`) is case-sensitive; plain HFS+ is case-insensitive.
