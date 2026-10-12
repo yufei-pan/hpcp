@@ -96,14 +96,19 @@ first, in which case B2 becomes part of it.
    already done.
 
    Then raw areas are hashed (node area and payload), then the sections are planned, then the prompt.
-2. **Disk patch generation.** Before any hashing:
-   - "raw area and its size changed" is checked for every raw partition (kind `raw` on the new layout, including
-     partitions that fall back to raw because they cannot be mounted on one side — those are only known once
-     mounting is tried, so they keep the check where it is);
-   - the `-dis` "a raw area must fit in one patch volume" refusal runs as soon as the layout shows a raw area larger
-     than one volume's usable space for the given `-dis`. A patch with such an area always needs more than one volume,
-     so it is refused without hashing anything. The existing check after hashing stays for the cases only the full
-     size reveals.
+2. **Disk patch generation.**
+   - "raw area and its size changed" is checked for every partition of kind `raw` on the new layout before anything
+     is hashed. Partitions that fall back to raw because they cannot be mounted on one side are only known once
+     mounting is tried, so they keep the check where it is.
+   - The partitions of kind `raw` are hashed first, before any filesystem section is diffed (today they are hashed in
+     partition order, between the sections' file diffs).
+   - The `-dis` "a raw area must fit in one patch volume" refusal then runs right after those raw hashes. It runs
+     whenever the changed raw areas alone force more than one volume and the largest of them does not fit one
+     volume's usable space. Whether a raw area is in the patch at all is only known once its old and new contents
+     are hashed, so this refusal cannot come earlier without refusing unchanged areas.
+   - The existing check after all hashing stays, for splits that the sections' payload causes.
+   - (Corrected after the design was approved: the approved text said this refusal could run from the layout alone,
+     before any hashing. That would refuse a raw area that turns out to be unchanged.)
 3. **One probe per layout read.**
    - `read_disk_layout(device, name=None, pttype=None, fs_params=True)`: `apply_disk_patch` passes the
      partition-table type it already probed, instead of probing twice.
