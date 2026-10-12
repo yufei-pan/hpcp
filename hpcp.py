@@ -1821,10 +1821,12 @@ def get_partition_infos(device, identity=True):
 		partition_info[part[0]] = get_partition_details(device, part[0], sector_size, identity)
 	return partition_info
 
+_BTRFS_TEMP_FSID_FEATURE = '/sys/fs/btrfs/features/temp_fsid'
+
 def _btrfs_temp_fsid_supported():
 	"""True when the kernel's btrfs has temp-fsid: it can mount a second single-device btrfs whose fsid is already
 	mounted (the static feature file exists; like rmdir_subvol it reads 0)."""
-	return os.path.exists('/sys/fs/btrfs/features/temp_fsid')
+	return os.path.exists(_BTRFS_TEMP_FSID_FEATURE)
 
 def write_partition_info(image, partition_infos, partition_name):
 	"""

@@ -400,12 +400,14 @@ def test_write_partition_info_gives_btrfs_a_new_uuid_without_temp_fsid(monkeypat
 	assert hpcp.ERRORS == []
 
 
-def test_btrfs_temp_fsid_supported_checks_the_sysfs_feature(monkeypatch):
+def test_btrfs_temp_fsid_supported_checks_the_sysfs_feature(monkeypatch, tmp_path):
 	"""The static feature file exists when the kernel has temp-fsid (it reads 0, like rmdir_subvol)."""
-	monkeypatch.setattr(hpcp.os.path, 'exists', lambda path: path == '/sys/fs/btrfs/features/temp_fsid')
-	assert hpcp._btrfs_temp_fsid_supported() is True
-	monkeypatch.setattr(hpcp.os.path, 'exists', lambda path: False)
+	assert hpcp._BTRFS_TEMP_FSID_FEATURE == '/sys/fs/btrfs/features/temp_fsid'
+	feature = tmp_path / 'temp_fsid'
+	monkeypatch.setattr(hpcp, '_BTRFS_TEMP_FSID_FEATURE', str(feature))
 	assert hpcp._btrfs_temp_fsid_supported() is False
+	feature.write_text('0\n')
+	assert hpcp._btrfs_temp_fsid_supported() is True
 
 
 def test_e2fsck_exit_1_is_not_a_task_error(monkeypatch):
