@@ -5943,49 +5943,53 @@ def _is_mount_point(path):
 def _hidden_mounts(entries):
 	"""Indexes (into entries) of the mounts path lookup does not reach, so the files at their mount point are not theirs.
 
-	With mountinfo's ids: M is reached when its parent is not in the table, else when its parent is reached and, if M
-	is on another mount point than its parent, nothing else is stacked on the parent at the parent's mount point and no
-	other child of the parent sits on M's mount point or a parent path of it below the parent's (a mount made over M's
-	place). M is visible when it is reached and nothing is stacked on it at its own mount point. A cycle in the parent
-	ids counts as not reached (the safe side: the mount is left out). An entry without ids (a test double) is never
-	hidden and hides nothing."""
+	With mountinfo's ids: M is reached when its parent is not in the table, or is M itself (the kernel lists a
+	namespace's root mount that way), or M is on a parent cycle (impossible on a real system; counted as reached, the
+	side that never hides what may be visible). Else M is reached when its parent is reached and, if M is on another
+	mount point than its parent, nothing else is stacked on the parent at the parent's mount point and no other child
+	of the parent sits on M's mount point or a parent path of it below the parent's (a mount made over M's place).
+	M is visible when it is reached and nothing is stacked on it at its own mount point. Resolved without recursion
+	and with the children of each parent indexed by mount point (linear in the entries). An entry without ids (a
+	test double) is never hidden and hides nothing."""
 	def point(entry):
 		return entry['mount_point'].rstrip(os.sep) or os.sep
 	by_id = {entry['mount_id']: entry for entry in entries if 'mount_id' in entry}
-	children = {}
+	at = {}
 	for entry in by_id.values():
-		children.setdefault(entry['parent_id'], []).append(entry)
-	memo, pending = {}, set()
+		at.setdefault(entry['parent_id'], {}).setdefault(point(entry), []).append(entry)
+	def covered(entry, parent):
+		"""True when a mount made over entry's place sits on parent."""
+		mounts = at.get(parent['mount_id'], {})
+		parent_point = point(parent)
+		if any(other is not entry and other is not parent for other in mounts.get(parent_point, ())):
+			return True
+		current = point(entry)
+		while len(current) > len(parent_point) and current != os.path.dirname(current):
+			if any(other is not entry for other in mounts.get(current, ())):
+				return True
+			current = os.path.dirname(current)
+		return False
+	memo = {}
 	def reached(entry):
-		ident = entry['mount_id']
-		if ident in memo:
-			return memo[ident]
-		if ident in pending:
-			return False
-		pending.add(ident)
-		parent = by_id.get(entry['parent_id'])
-		if parent is None:
-			result = True
-		elif not reached(parent):
-			result = False
-		elif point(entry) == point(parent):
-			result = True
-		else:
-			names = set()
-			current = point(entry)
-			while len(current) > len(point(parent)) and current != os.path.dirname(current):
-				names.add(current)
-				current = os.path.dirname(current)
-			result = not any(other is not entry and (point(other) == point(parent) or point(other) in names)
-				for other in children.get(parent['mount_id'], ()))
-		pending.discard(ident)
-		memo[ident] = result
-		return result
+		chain, seen, current = [], set(), entry
+		while current['mount_id'] not in memo:
+			chain.append(current)
+			seen.add(current['mount_id'])
+			parent = by_id.get(current['parent_id'])
+			if parent is None or parent['mount_id'] in seen:
+				memo[current['mount_id']] = True
+				chain.pop()
+				break
+			current = parent
+		for node in reversed(chain):
+			parent = by_id[node['parent_id']]
+			memo[node['mount_id']] = memo[parent['mount_id']] and (point(node) == point(parent) or not covered(node, parent))
+		return memo[entry['mount_id']]
 	hidden = set()
 	for index, entry in enumerate(entries):
 		if 'mount_id' not in entry:
 			continue
-		if not reached(entry) or any(other is not entry and point(other) == point(entry) for other in children.get(entry['mount_id'], ())):
+		if not reached(entry) or any(other is not entry for other in at.get(entry['mount_id'], {}).get(point(entry), ())):
 			hidden.add(index)
 	return hidden
 

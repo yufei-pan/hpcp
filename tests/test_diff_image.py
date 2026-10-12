@@ -2224,9 +2224,9 @@ def _mount_entry(point, fs_type, source='none', ids=None):
 
 
 def test_mount_scopes_follow_mountinfo_order(tmp_path, hpcp_mod):
-	"""The deepest visible mount holding the real path is the target's. A mount is hidden only by one made on its
-	place (its mount point or a parent path) that it does not sit on in the parent chain. Mounts below the target
-	come after, deepest last. Entries without ids are never hidden."""
+	"""The deepest visible mount holding the real path is the target's. A mount is hidden when path lookup does not
+	reach it: a mount made over its place (its mount point or a parent path) that it does not sit on in the parent
+	chain. Mounts below the target come after, deepest last. Entries without ids are never hidden."""
 	scopes = hpcp_mod._mount_scopes
 	esp = tmp_path / 'mnt' / 'esp'
 	esp.mkdir(parents=True)
@@ -2291,6 +2291,34 @@ def test_mount_scopes_follow_what_path_lookup_reaches(tmp_path, hpcp_mod):
 	assert scopes(str(mnt2 / 'data'), entries)[0][1] == 'over'
 	# A cycle of parent ids ends (the mounts count as not reached).
 	assert scopes(str(mnt2), [_mount_entry(mnt2, 'a', ids=(1, 2)), _mount_entry(mnt2, 'b', ids=(2, 1))])[0][1] == ''
+
+
+def test_self_parented_root_mount_hides_nothing(tmp_path, hpcp_mod):
+	"""The kernel lists a namespace's root mount with its own id as parent."""
+	esp = tmp_path / 'boot' / 'efi'
+	esp.mkdir(parents=True)
+	entries = [_mount_entry('/', 'ext4', ids=(35, 35)), _mount_entry(tmp_path / 'boot', 'xfs', ids=(36, 35)),
+		_mount_entry(esp, 'vfat', ids=(37, 36))]
+	assert hpcp_mod._mount_scopes(str(esp), entries)[0][1] == 'vfat'
+	assert hpcp_mod._mount_scopes(str(tmp_path / 'boot'), entries)[0][1] == 'xfs'
+	assert hpcp_mod._mount_scopes('/', entries)[0][1] == 'ext4'
+	assert hpcp_mod._compare_metadata((str(esp),), entries) is False
+
+
+def test_mount_visibility_scales_with_deep_chains_and_many_siblings(tmp_path, hpcp_mod):
+	import time
+	# A 5000-deep chain listed children-first: every mount on the same point of its parent, only the last is visible.
+	point = tmp_path / 'deep'
+	entries = [_mount_entry(point, f'fs{i}', ids=(i + 100, i + 99)) for i in range(5000, 0, -1)]
+	hidden = hpcp_mod._hidden_mounts(entries)
+	assert [entries[i]['fstype'] for i in range(len(entries)) if i not in hidden] == ['fs5000']
+	assert hpcp_mod._mount_scopes(str(point), entries)[0][1] == 'fs5000'
+	# 20000 siblings under one parent resolve quickly.
+	root = _mount_entry('/', 'ext4', ids=(1, 0))
+	siblings = [_mount_entry(tmp_path / 'sib' / f'm{i}', 'tmpfs', ids=(i + 10, 1)) for i in range(20000)]
+	start = time.time()
+	assert hpcp_mod._hidden_mounts([root] + siblings) == set()
+	assert time.time() - start < 2
 
 
 def test_fuseblk_scopes_are_probed_only_where_used(tmp_path, hpcp_mod, monkeypatch):
