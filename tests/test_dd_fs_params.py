@@ -395,7 +395,7 @@ def test_write_partition_info_gives_btrfs_a_new_uuid_without_temp_fsid(monkeypat
 	assert delayed == []
 	err = capsys.readouterr().err
 	assert 'Warning: this kernel cannot mount two btrfs filesystems with one UUID (no temp_fsid support)' in err
-	assert '/dev/loop0p2' in err and f'set {_BTRFS_UUID} with btrfstune -U once the source is detached' in err
+	assert '/dev/loop0p2' in err and f'set {_BTRFS_UUID} with btrfstune -U once no attached device carries {_BTRFS_UUID}' in err
 	# A degrade, not a failure: printed, never recorded as an error (eprint would make the run exit non-zero).
 	assert hpcp.ERRORS == []
 

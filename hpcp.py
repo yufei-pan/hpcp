@@ -838,6 +838,8 @@ def _lsblk_disk_rows(disk, columns):
 	part are partitions. A -l NAME has no spaces and TYPE is the last column.
 	"""
 	rows = [line.split() for line in run_command_in_multicmd_with_path_check(["lsblk", '-p', '-nbl', '-o', columns + ',TYPE', disk],strict=True) if line.strip()]
+	if not rows:
+		raise RuntimeError(f'Disk error: lsblk printed nothing for {disk}')
 	return rows[0], [row for row in rows[1:] if row[-1] == 'part']
 
 def get_largest_partition(disk):
@@ -1907,7 +1909,7 @@ def write_partition_info(image, partition_infos, partition_name):
 					command.extend(['-U', fs_uuid])
 				elif fs_uuid:
 					print(f"Warning: this kernel cannot mount two btrfs filesystems with one UUID (no temp_fsid support); "
-						f"{target_partition} gets a new btrfs UUID; set {fs_uuid} with btrfstune -U once the source is detached", file=sys.stderr)
+						f"{target_partition} gets a new btrfs UUID; set {fs_uuid} with btrfstune -U once no attached device carries {fs_uuid}", file=sys.stderr)
 				_run_mkfs_with_fallback(command, param_args, target_partition, fs_type)
 			elif fs_type == 'xfs':
 				command = ['mkfs.xfs']
@@ -7115,13 +7117,9 @@ def process_get_disk_diff_image(src_paths, dest_paths, output, mount_points, loo
 
 	numbers = sorted(new_layout['parts'])
 	raw_numbers = [number for number in numbers if _default_kind(new_layout['parts'][number]) == 'raw']
-	# Raw areas first, before any filesystem section is diffed: their sizes are checked before anything is
-	# hashed, and an area too large for -dis is refused before the sections' file diffs when the raw areas alone
-	# force more than one volume (otherwise below, once the sections' payload is known).
-	for number in raw_numbers:
-		new_size, old_size = new_layout['parts'][number]['size'], old_layout['parts'][number]['size']
-		if new_size != old_size:
-			raise RuntimeError(f"Disk layout mismatch: partition {number} is a raw area and its size changed ({old_size} vs {new_size}); re-clone instead")
+	# Raw areas first, before any filesystem section is diffed (compare_disk_layouts already refused one whose size
+	# changed, before anything was hashed): an area too large for -dis is refused before the sections' file diffs when
+	# the raw areas alone force more than one volume (otherwise below, once the sections' payload is known).
 	for number in raw_numbers:
 		add_raw(number)
 		kinds[number] = 'raw'

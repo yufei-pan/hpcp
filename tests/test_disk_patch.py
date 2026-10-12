@@ -1197,7 +1197,8 @@ def test_disk_patch_exclude_patterns_are_rooted_in_each_partition(tmp_path, hpcp
 	assert any(path.endswith('grubx64.efi') for path in paths1)
 
 
-def test_unmountable_filesystem_is_compared_as_raw_with_a_warning(hpcp_mod, monkeypatch, capsys):
+def test_unmountable_filesystem_is_compared_as_raw_with_a_warning(tmp_path, hpcp_mod, monkeypatch, capsys):
+	new, old, out = _fake_disk_paths(tmp_path)
 	device = '/dev/none'
 	parts = {1: _part(number=1, device=device, fs_type='ext4')}
 	layout = _layout(parts)
@@ -1210,17 +1211,24 @@ def test_unmountable_filesystem_is_compared_as_raw_with_a_warning(hpcp_mod, monk
 	monkeypatch.setattr(hpcp_mod, '_swap_devices', lambda: set())
 	monkeypatch.setattr(hpcp_mod, '_device_number', lambda device: (7, 0))
 	monkeypatch.setattr(hpcp_mod, '_partition_in_use', lambda device, devnum, entries, swaps: '')
-	assert hpcp_mod.process_get_disk_diff_image(['/x/new'], ['/x/old'], '/x/out', [], [], max_workers=1) is None
+	assert hpcp_mod.process_get_disk_diff_image([new], [old], out, [], [], max_workers=1) is None
 	assert 'partition 1 (ext4) could not be mounted on the new and old side; comparing it as a raw area' in capsys.readouterr().err
 
 
-def _fake_generation(hpcp_mod, monkeypatch, new_parts, old_parts, in_use=None):
-	"""Stub the disk side of process_get_disk_diff_image for disks /x/new and /x/old.
+def _fake_disk_paths(tmp_path):
+	"""(new disk, old disk, patch output) under tmp_path for stubbed generations: a stub that regresses can create or
+	mount something only there, never under a real directory such as /x."""
+	return str(tmp_path / 'new.img'), str(tmp_path / 'old.img'), str(tmp_path / 'out.img')
+
+
+def _fake_generation(hpcp_mod, monkeypatch, tmp_path, new_parts, old_parts, in_use=None):
+	"""Stub the disk side of process_get_disk_diff_image for the disks of _fake_disk_paths(tmp_path).
 
 	Raw areas hash to their device path (so old and new always differ); returns the list of
 	hashed devices. in_use maps a partition device to _partition_in_use's answer.
 	"""
-	layouts = {'/x/new': _layout(new_parts), '/x/old': _layout(old_parts)}
+	new, old, _ = _fake_disk_paths(tmp_path)
+	layouts = {new: _layout(new_parts), old: _layout(old_parts)}
 	monkeypatch.setattr(hpcp_mod, '_attach_disk', lambda path, ro, loops: path)
 	monkeypatch.setattr(hpcp_mod, 'read_disk_layout', lambda disk, name=None, **kwargs: layouts[disk])
 	monkeypatch.setattr(hpcp_mod, '_mountinfo_entries', lambda: [])
@@ -1238,42 +1246,47 @@ def _fake_generation(hpcp_mod, monkeypatch, new_parts, old_parts, in_use=None):
 	return hashed
 
 
-@pytest.mark.parametrize('busy, side', [('/dev/new2', '/x/new'), ('/dev/old2', '/x/old')])
-def test_in_use_raw_area_is_refused_before_anything_is_hashed(hpcp_mod, reset_hpcp_globals, monkeypatch, busy, side):
+@pytest.mark.parametrize('busy, side', [('/dev/new2', 'new'), ('/dev/old2', 'old')])
+def test_in_use_raw_area_is_refused_before_anything_is_hashed(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch, busy, side):
 	"""An LVM PV holding the live root would be hashed and copied in full, then fail as changed."""
 	new_parts = {2: _part(fs_type='', size=1 << 20, device='/dev/new2'), 4: _part(fs_type='swap', device='/dev/new4')}
 	old_parts = {2: _part(fs_type='', size=1 << 20, device='/dev/old2'), 4: _part(fs_type='swap', device='/dev/old4')}
-	hashed = _fake_generation(hpcp_mod, monkeypatch, new_parts, old_parts, in_use={busy: 'held by another device'})
-	with pytest.raises(RuntimeError, match=rf'^Disk in use: partition 2 of {side} is held by another device; a raw area cannot be copied while it is in use'):
-		hpcp_mod.process_get_disk_diff_image(['/x/new'], ['/x/old'], '/x/out', [], [], max_workers=1)
+	new, old, out = _fake_disk_paths(tmp_path)
+	disk = {'new': new, 'old': old}[side]
+	hashed = _fake_generation(hpcp_mod, monkeypatch, tmp_path, new_parts, old_parts, in_use={busy: 'held by another device'})
+	with pytest.raises(RuntimeError, match=rf'^Disk in use: partition 2 of {re.escape(disk)} is held by another device; a raw area cannot be copied while it is in use'):
+		hpcp_mod.process_get_disk_diff_image([new], [old], out, [], [], max_workers=1)
 	assert hashed == []
 
 
-def test_active_swap_and_unchanged_raw_areas_are_not_refused(hpcp_mod, reset_hpcp_globals, monkeypatch):
+def test_active_swap_and_unchanged_raw_areas_are_not_refused(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
 	"""Swap is identity-only, so an active swap partition never blocks generation."""
 	new_parts = {4: _part(fs_type='swap', device='/dev/new4')}
 	old_parts = {4: _part(fs_type='swap', device='/dev/old4')}
-	_fake_generation(hpcp_mod, monkeypatch, new_parts, old_parts, in_use={'/dev/new4': 'active swap', '/dev/old4': 'active swap'})
+	new, old, out = _fake_disk_paths(tmp_path)
+	_fake_generation(hpcp_mod, monkeypatch, tmp_path, new_parts, old_parts, in_use={'/dev/new4': 'active swap', '/dev/old4': 'active swap'})
 	monkeypatch.setattr(hpcp_mod, '_hash_area', lambda *a, **k: 'same')
-	assert hpcp_mod.process_get_disk_diff_image(['/x/new'], ['/x/old'], '/x/out', [], [], max_workers=1) is None
+	assert hpcp_mod.process_get_disk_diff_image([new], [old], out, [], [], max_workers=1) is None
 
 
-def test_unmountable_in_use_filesystem_is_refused_as_a_raw_area(hpcp_mod, reset_hpcp_globals, monkeypatch):
+def test_unmountable_in_use_filesystem_is_refused_as_a_raw_area(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
 	new_parts = {1: _part(fs_type='ext4', device='/dev/new1')}
 	old_parts = {1: _part(fs_type='ext4', device='/dev/old1')}
-	hashed = _fake_generation(hpcp_mod, monkeypatch, new_parts, old_parts, in_use={'/dev/new1': 'held by another device'})
-	with pytest.raises(RuntimeError, match=r'^Disk in use: partition 1 of /x/new is held by another device'):
-		hpcp_mod.process_get_disk_diff_image(['/x/new'], ['/x/old'], '/x/out', [], [], max_workers=1)
+	new, old, out = _fake_disk_paths(tmp_path)
+	hashed = _fake_generation(hpcp_mod, monkeypatch, tmp_path, new_parts, old_parts, in_use={'/dev/new1': 'held by another device'})
+	with pytest.raises(RuntimeError, match=rf'^Disk in use: partition 1 of {re.escape(new)} is held by another device'):
+		hpcp_mod.process_get_disk_diff_image([new], [old], out, [], [], max_workers=1)
 	assert hashed == []
 
 
-def test_raw_area_too_large_for_one_volume_suggests_a_dis_that_passes(hpcp_mod, reset_hpcp_globals, monkeypatch, capsys):
+def test_raw_area_too_large_for_one_volume_suggests_a_dis_that_passes(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch, capsys):
 	"""The suggested -dis is a whole number of MiB the -dis parser reads back, and it is large enough."""
 	size = (1 << 30) + 12345 * 512
-	hashed = _fake_generation(hpcp_mod, monkeypatch, {2: _part(fs_type='', size=size, device='/dev/new2')},
+	new, old, out = _fake_disk_paths(tmp_path)
+	hashed = _fake_generation(hpcp_mod, monkeypatch, tmp_path, {2: _part(fs_type='', size=size, device='/dev/new2')},
 		{2: _part(fs_type='', size=size, device='/dev/old2')})
 	with pytest.raises(RuntimeError, match=r'must fit in one patch volume') as error:
-		hpcp_mod.process_get_disk_diff_image(['/x/new'], ['/x/old'], '/x/out', [], [], max_workers=1, dest_image_size=256 << 20)
+		hpcp_mod.process_get_disk_diff_image([new], [old], out, [], [], max_workers=1, dest_image_size=256 << 20)
 	match = re.search(r'use -dis (\d+)MiB or larger$', str(error.value))
 	assert match, str(error.value)
 	suggested = hpcp_mod.format_bytes(f'{match.group(1)}MiB', to_int=True)
@@ -1291,7 +1304,8 @@ def test_raw_areas_are_stored_before_section_payloads_largest_first(tmp_path, hp
 	"""Section payloads fill the first volume first; a large raw area stored after them could fail to fit late."""
 	parts = lambda side: {1: _part(fs_type='vfat', device=f'/dev/{side}1'), 2: _part(fs_type='', size=1 << 20, device=f'/dev/{side}2'),
 		5: _part(fs_type='', size=4 << 20, device=f'/dev/{side}5')}
-	_fake_generation(hpcp_mod, monkeypatch, parts('new'), parts('old'))
+	new, old, _ = _fake_disk_paths(tmp_path)
+	_fake_generation(hpcp_mod, monkeypatch, tmp_path, parts('new'), parts('old'))
 	calls = []
 	monkeypatch.setattr(hpcp_mod, '_mount_partition', lambda device, read_only, mount_points, entries: str(tmp_path / device[5:]) + os.sep)
 	monkeypatch.setattr(hpcp_mod, '_release_mount', lambda mount_point, mount_points: None)
@@ -1304,7 +1318,7 @@ def test_raw_areas_are_stored_before_section_payloads_largest_first(tmp_path, hp
 	monkeypatch.setattr(hpcp_mod, 'write_disk_patch_metadata', lambda *args: calls.append(('metadata',)))
 	monkeypatch.setattr(tempfile, 'tempdir', str(tmp_path))
 	out = str(tmp_path / 'patch.img')
-	assert hpcp_mod.process_get_disk_diff_image(['/x/new'], ['/x/old'], out, [], [], max_workers=1) == out
+	assert hpcp_mod.process_get_disk_diff_image([new], [old], out, [], [], max_workers=1) == out
 	assert calls == [('raw', 'raw/part5.img'), ('raw', 'raw/part2.img'), ('raw', 'raw/mbr-bootcode.bin'),
 		('payload', str(tmp_path / 'new1') + os.sep), ('metadata',)]
 
@@ -1328,7 +1342,8 @@ def test_generation_classifies_sections_by_filesystem_type(tmp_path, hpcp_mod, r
 	for tree, mode in ((old, 0o644), (new, 0o755)):
 		os.chmod(_write(tree / 'tool.sh', 'run'), mode)
 	parts = lambda side: {1: _part(fs_type=fs_type, device=f'/dev/{side}1')}
-	_fake_generation(hpcp_mod, monkeypatch, parts('new'), parts('old'))
+	new, old, _ = _fake_disk_paths(tmp_path)
+	_fake_generation(hpcp_mod, monkeypatch, tmp_path, parts('new'), parts('old'))
 	monkeypatch.setattr(hpcp_mod, '_mount_partition', lambda device, read_only, mount_points, entries: str(tmp_path / device[5:]) + os.sep)
 	monkeypatch.setattr(hpcp_mod, '_release_mount', lambda mount_point, mount_points: None)
 	monkeypatch.setattr(hpcp_mod, '_live_mount', lambda *args: (None, False))
@@ -1340,7 +1355,7 @@ def test_generation_classifies_sections_by_filesystem_type(tmp_path, hpcp_mod, r
 	monkeypatch.setattr(hpcp_mod, 'write_disk_patch_metadata', lambda *args: None)
 	monkeypatch.setattr(tempfile, 'tempdir', str(tmp_path))
 	out = str(tmp_path / 'patch.img')
-	assert hpcp_mod.process_get_disk_diff_image(['/x/new'], ['/x/old'], out, [], [], max_workers=1) == out
+	assert hpcp_mod.process_get_disk_diff_image([new], [old], out, [], [], max_workers=1) == out
 	assert sections == [expected]
 
 
@@ -2727,6 +2742,26 @@ def test_udev_decode_restores_the_exact_bytes(hpcp_mod):
 	assert dec('a\\xffb') == 'a\udcffb'
 	assert dec('') == ''
 	assert dec('plain') == 'plain'
+
+
+def test_stubbed_generation_tests_use_no_real_directory():
+	"""The /x/out hazard: a stub that regressed once let a test create and mount /x/out on the real filesystem."""
+	with open(__file__, encoding='utf-8') as f:
+		assert ("'" + '/x' + '/') not in f.read()
+
+
+def test_probe_identity_falls_back_to_the_plain_uuid(hpcp_mod, reset_hpcp_globals, monkeypatch):
+	"""A blkid that prints ID_FS_UUID without ID_FS_UUID_ENC still gives the UUID (get_partition_details reads identity
+	only through _probe_identity)."""
+	monkeypatch.setattr(hpcp_mod, 'run_command_in_multicmd_with_path_check',
+		lambda argv, **kwargs: ['ID_FS_UUID=ABCD-1234', 'ID_FS_TYPE=vfat'])
+	assert hpcp_mod._probe_identity('/dev/x1') == ('vfat', 'ABCD-1234', '')
+
+
+def test_lsblk_disk_rows_refuses_empty_output(hpcp_mod, reset_hpcp_globals, monkeypatch):
+	monkeypatch.setattr(hpcp_mod, 'run_command_in_multicmd_with_path_check', lambda argv, **kwargs: ['', '  '])
+	with pytest.raises(RuntimeError, match=r'^Disk error: lsblk printed nothing for /dev/sdz$'):
+		hpcp_mod._lsblk_disk_rows('/dev/sdz', 'NAME,SIZE')
 
 
 def test_probe_identity_reads_the_encoded_udev_values(hpcp_mod, reset_hpcp_globals, monkeypatch):
