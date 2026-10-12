@@ -1,4 +1,5 @@
 import contextlib
+import errno
 import hashlib
 import os
 import shutil
@@ -2925,21 +2926,65 @@ def test_remove_tree_around_mounts_stops_at_another_device(tmp_path, hpcp_mod, m
 	top = tmp_path / 'app'
 	_write(top / 'late' / 'keep', 'k')
 	_write(top / 'f', 'x')
-	late = os.path.realpath(str(top / 'late'))
-	real_lstat = os.lstat
+	real_stat = os.stat
 
-	def lstat(path, *args, **kwargs):
-		info = real_lstat(path, *args, **kwargs)
-		if os.fspath(path) == late:
+	def fake_stat(path, *args, **kwargs):
+		info = real_stat(path, *args, **kwargs)
+		if os.fspath(path) == 'late' and kwargs.get('dir_fd') is not None:
 			values = list(info)
 			values[stat.ST_DEV] = info.st_dev + 1
 			return os.stat_result(values)
 		return info
 
-	monkeypatch.setattr(os, 'lstat', lstat)
+	monkeypatch.setattr(os, 'stat', fake_stat)
 	kept, errors = hpcp_mod._remove_tree_around_mounts(str(top), set())
 	monkeypatch.undo()
 	assert kept == ['late'] and errors == [] and (top / 'late' / 'keep').exists() and not (top / 'f').exists()
+
+
+def test_remove_tree_around_mounts_refuses_a_directory_swapped_for_a_symlink(tmp_path, hpcp_mod, monkeypatch):
+	"""Security: sub is a real directory when the walk looks at it, a symlink to a directory outside by the time it
+	descends. The walk must not follow it; the outside file survives and an error is reported."""
+	top = tmp_path / 'app'
+	_write(top / 'sub' / 'f', 'x')
+	_write(top / 'other', 'y')
+	_write(tmp_path / 'outside' / 'precious', 'keep me')
+	real_stat = os.stat
+	swapped = []
+
+	def racing_stat(path, *args, **kwargs):
+		info = real_stat(path, *args, **kwargs)
+		if os.fspath(path) == 'sub' and not swapped:
+			swapped.append(True)
+			os.rename(str(top / 'sub'), str(tmp_path / 'moved'))
+			os.symlink(str(tmp_path / 'outside'), str(top / 'sub'))
+		return info
+
+	monkeypatch.setattr(os, 'stat', racing_stat)
+	kept, errors = hpcp_mod._remove_tree_around_mounts(str(top), set())
+	monkeypatch.undo()
+	assert swapped and kept == [] and len(errors) == 1 and errors[0].startswith('sub:')
+	assert (tmp_path / 'outside' / 'precious').read_text() == 'keep me'
+	assert not (top / 'other').exists()
+
+
+def test_remove_tree_around_mounts_collects_errors_and_keeps_going(tmp_path, hpcp_mod, monkeypatch):
+	top = tmp_path / 'app'
+	_write(top / 'a' / 'stuck', 'x')
+	_write(top / 'a' / 'free', 'x')
+	_write(top / 'b', 'y')
+	real_unlink = os.unlink
+
+	def unlink(path, *args, **kwargs):
+		if os.fspath(path) == 'stuck':
+			raise PermissionError(errno.EPERM, 'Operation not permitted')
+		return real_unlink(path, *args, **kwargs)
+
+	monkeypatch.setattr(os, 'unlink', unlink)
+	kept, errors = hpcp_mod._remove_tree_around_mounts(str(top), set())
+	monkeypatch.undo()
+	assert kept == [] and errors == ['a/stuck: Operation not permitted']
+	assert sorted(os.listdir(str(top))) == ['a'] and os.listdir(str(top / 'a')) == ['stuck']
 
 
 def test_mounts_below(tmp_path, hpcp_mod):
@@ -3010,7 +3055,7 @@ def test_forced_removal_stops_at_a_mount(trees, hpcp_mod, tmp_path, capsys, kind
 
 @requires_root
 @pytest.mark.root
-def test_forced_type_change_stops_at_a_mount(trees, hpcp_mod, tmp_path):
+def test_forced_type_change_stops_at_a_mount(trees, hpcp_mod, tmp_path, capsys):
 	"""A forced directory-to-file replacement over a directory holding a mount leaves the mount and fails."""
 	new, base = trees
 	_write(base / 'app' / 'one', '1')
@@ -3024,4 +3069,5 @@ def test_forced_type_change_stops_at_a_mount(trees, hpcp_mod, tmp_path):
 		hpcp_mod.ERRORS.clear()
 		summary = hpcp_mod.apply_patch_tree([str(vol)], str(target), force=True, max_workers=1)
 		assert (target / 'app' / 'data' / 'precious').read_text() == 'keep me'
+	assert 'Note: forced removal of app/ stops at the mount at app/data; that row will fail verify' in capsys.readouterr().out
 	assert summary['failed'] >= 1 and os.path.isdir(str(target / 'app'))
