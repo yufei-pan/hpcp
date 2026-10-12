@@ -9,6 +9,7 @@ import subprocess
 import sys
 import time
 import pytest
+import re
 
 
 def test_escape_field_round_trips_special_characters(hpcp_mod):
@@ -4080,11 +4081,11 @@ def _automount_entries(target, triggered, net=False):
 		{'mount_id': 20, 'parent_id': 1, 'devnum': (8, 2), 'root': '/', 'mount_point': '/', 'options': ['rw'],
 			'fstype': 'ext4', 'source': '/dev/sda2', 'super_options': ['rw']},
 		{'mount_id': 30, 'parent_id': 20, 'devnum': (0, 50), 'root': '/', 'mount_point': esp, 'options': ['rw'],
-			'fstype': 'autofs', 'source': 'systemd-1', 'super_options': ['rw']},
+			'fstype': 'autofs', 'source': 'systemd-1', 'super_options': ['rw', 'fd=40', 'direct']},
 	]
 	if net:
 		entries.append({'mount_id': 40, 'parent_id': 20, 'devnum': (0, 51), 'root': '/', 'mount_point': os.path.join(real, 'net'),
-			'options': ['rw'], 'fstype': 'autofs', 'source': 'auto.net', 'super_options': ['rw']})
+			'options': ['rw'], 'fstype': 'autofs', 'source': 'auto.net', 'super_options': ['rw', 'direct']})
 	if triggered:
 		entries.append({'mount_id': 31, 'parent_id': 30, 'devnum': (8, 1), 'root': '/', 'mount_point': esp, 'options': ['rw'],
 			'fstype': 'vfat', 'source': '/dev/sda1', 'super_options': ['rw']})
@@ -4240,15 +4241,45 @@ def test_compare_mode_keeps_real_path_matching_for_directory_sources(trees, hpcp
 	assert any(row.path.endswith('var/log/a.log') for row in rows)
 
 
-def test_exclude_matching_the_root_empties_both_sides(tmp_path, hpcp_mod, reset_hpcp_globals):
-	"""Spec Part 3 item 3: '-e /' (a pattern matching the filesystem root itself) lists nothing on either side."""
-	new, base = tmp_path / 'mnt_new', tmp_path / 'mnt_base'
-	for root in (new, base):
-		_write(root / 'a.txt', 'a')
-	new_map, base_map = hpcp_mod.build_rooted_maps(str(new), str(base), frozenset([os.sep]), max_workers=1)
-	assert set(new_map) == {'./'} == set(base_map)
-	new_map, base_map = hpcp_mod.build_rooted_maps(str(new), str(base), frozenset(['/a.txt']), max_workers=1)
-	assert set(new_map) == {'./'} == set(base_map)
+def test_format_exclude_skips_blank_values(tmp_path, hpcp_mod):
+	"""Spec Part 3 item 3: a blank -e value or -x line is ignored (it would become '*/', matching every root)."""
+	xfile = tmp_path / 'x.txt'
+	xfile.write_text('/b\n\n  \n')
+	assert hpcp_mod.format_exclude(['', '  ', '/a'], str(xfile)) == frozenset(['/a', '/b'])
+
+
+@pytest.mark.parametrize('pattern', ['/', '*/'])
+def test_mounted_source_refuses_a_root_matching_exclude(trees, hpcp_mod, tmp_path, monkeypatch, pattern):
+	new, base = trees
+	_write(new / 'a.txt', 'a')
+	img = tmp_path / 'new.img'
+	img.write_bytes(b'')
+	_fake_image_mounts(hpcp_mod, monkeypatch, {str(img): new})
+	def listed(*args, **kwargs):
+		raise AssertionError('nothing may be listed before the refusal')
+	monkeypatch.setattr(hpcp_mod, 'build_rooted_maps', listed)
+	with pytest.raises(RuntimeError, match=r"^Invalid arguments: exclude pattern %s matches the root" % re.escape(repr(pattern))):
+		hpcp_mod.process_get_diff_image([], [str(img)], [str(base)], None, str(tmp_path / 'p.img'), [], [],
+			exclude=frozenset([pattern]), max_workers=1)
+
+
+def test_directory_source_refuses_an_exclude_matching_its_root(trees, hpcp_mod, tmp_path):
+	new, base = trees
+	_write(new / 'a.txt', 'a')
+	with pytest.raises(RuntimeError, match=r'^Invalid arguments: exclude pattern .* matches the root of '):
+		hpcp_mod.process_get_diff_image([str(new)], None, [str(base)], None, str(tmp_path / 'p.img'), [], [],
+			exclude=frozenset([str(new)]), max_workers=1)
+
+
+def test_refuse_root_exclude_helper(hpcp_mod):
+	for pattern in ('/', '*/'):
+		with pytest.raises(RuntimeError, match='matches the root of /:'):
+			hpcp_mod._refuse_root_exclude(frozenset([pattern]), root='/')
+		with pytest.raises(RuntimeError, match='matches the root of the filesystem:'):
+			hpcp_mod._refuse_root_exclude(frozenset([pattern]))
+	hpcp_mod._refuse_root_exclude(frozenset(['/var/log/*', '*/cache']), root='/')
+	hpcp_mod._refuse_root_exclude(frozenset(['/var/log/*', '*/cache']))
+	hpcp_mod._refuse_root_exclude(None)
 
 
 class _CountingDict(dict):
@@ -4258,6 +4289,9 @@ class _CountingDict(dict):
 	def __contains__(self, key):
 		self.lookups += 1
 		return super().__contains__(key)
+	def _scan(self, *args, **kwargs):
+		raise AssertionError('the holding mount must be found by walking up the path, not by scanning the mounts')
+	__iter__ = keys = values = items = _scan
 
 
 def test_holding_mount_walks_up_the_path_not_the_mounts(hpcp_mod):
@@ -4335,3 +4369,63 @@ def test_full_hash_patches_catch_a_copy_damaged_after_the_copy(trees, hpcp_mod, 
 		hpcp_mod.build_patch_tree(rows, str(new), [str(vol)], hpcp_mod.make_patch_meta(rows, 'n', 'b', 'root', full_hash=True),
 			max_workers=1, scan=scan)
 	assert not (vol / '.hpcp_diff' / 'manifest').exists()
+
+
+def test_apply_refuses_an_indirect_automount_map_without_triggering_it(trees, hpcp_mod, tmp_path, monkeypatch):
+	"""An indirect map mounts only through its keys: a patch writing under it is refused with the leave-it-out message."""
+	new, base = trees
+	_write(new / 'home' / 'u' / 'f.txt', 'f')
+	(base / 'home').mkdir()
+	vol = tmp_path / 'vol'
+	_patch_from(hpcp_mod, new, base, [vol])
+	target = tmp_path / 'target'
+	_clone(base, target)
+	real = os.path.realpath(str(target))
+	entries = [
+		{'mount_id': 20, 'parent_id': 1, 'devnum': (8, 2), 'root': '/', 'mount_point': '/', 'options': ['rw'],
+			'fstype': 'ext4', 'source': '/dev/sda2', 'super_options': ['rw']},
+		{'mount_id': 30, 'parent_id': 20, 'devnum': (0, 50), 'root': '/', 'mount_point': os.path.join(real, 'home'),
+			'options': ['rw'], 'fstype': 'autofs', 'source': 'auto.home', 'super_options': ['rw', 'indirect']},
+	]
+	monkeypatch.setattr(hpcp_mod, '_mountinfo_entries', lambda *args, **kwargs: [dict(entry) for entry in entries])
+	def trigger(mount_point):
+		raise AssertionError('an indirect map must not be triggered')
+	monkeypatch.setattr(hpcp_mod, '_trigger_automount', trigger)
+	with pytest.raises(RuntimeError, match=r"^Patch error: .*home is an indirect automount map \(autofs\); hpcp does not write into one: "
+			r"leave it out of the patch \(-e '/home/\*' when generating\) or mount what it needs and re-run$"):
+		hpcp_mod.apply_patch_tree([str(vol)], str(target), max_workers=1)
+	assert not (target / 'home' / 'u').exists()
+
+
+def test_full_marked_copies_are_hashed_again_without_fh(trees, hpcp_mod, tmp_path, monkeypatch):
+	"""A FAT file (full-hash mark) is hashed again whatever its source; a plain file on a read-only source is not."""
+	new, base = trees
+	_write(new / 'fat.txt', 'fat')
+	_write(new / 'plain.txt', 'plain')
+	_one_mount(hpcp_mod, monkeypatch, options=('ro',), super_options=('ro',))
+	new_map, base_map = hpcp_mod.build_root_maps(str(new), str(base), max_workers=1)
+	scan = {}
+	rows = hpcp_mod.compute_changes(new_map, base_map, max_workers=1, scan=scan, fat_paths={new_map['fat.txt']})
+	assert hpcp_mod._full_marked(next(row for row in rows if row.path == 'fat.txt').new)
+	assert not hpcp_mod._full_marked(next(row for row in rows if row.path == 'plain.txt').new)
+	vol = tmp_path / 'vol'
+	vol.mkdir()
+	hashed = []
+	real = hpcp_mod._states_for_paths
+	def spy(paths, *args, **kwargs):
+		paths = list(paths)
+		hashed.extend(paths)
+		return real(paths, *args, **kwargs)
+	monkeypatch.setattr(hpcp_mod, '_states_for_paths', spy)
+	hpcp_mod.build_patch_tree(rows, str(new), [str(vol)], hpcp_mod.make_patch_meta(rows, 'n', 'b', 'root'), max_workers=1, scan=scan)
+	assert sorted(os.path.relpath(path, str(vol)).replace(os.sep, '/') for path in hashed) == ['fat.txt']
+
+
+@pytest.mark.parametrize('last', ['..', '.'])
+def test_remove_tree_around_mounts_refuses_dot_components(tmp_path, hpcp_mod, last):
+	target = tmp_path / 'target'
+	_write(target / 'f', 'x')
+	_write(tmp_path / 'sibling' / 'keep', 'k')
+	kept, errors = hpcp_mod._remove_tree_around_mounts(str(target) + '/' + last, set(), target_root=str(target))
+	assert errors and 'refusing to remove . or ..' in errors[0]
+	assert (target / 'f').read_text() == 'x' and (tmp_path / 'sibling' / 'keep').read_text() == 'k'

@@ -3320,3 +3320,26 @@ def test_generation_does_not_refuse_an_unchanged_large_raw_area(tmp_path, hpcp_m
 	assert hpcp_mod.process_get_disk_diff_image([str(tmp_path / 'new.img')], [str(tmp_path / 'old.img')], str(tmp_path / 'p.img'), [], [],
 		dest_image_size=100 << 20, max_workers=1) is None
 	assert 'section' in calls
+
+
+@pytest.mark.parametrize('pattern', ['/', '*/'])
+def test_disk_generation_refuses_a_root_matching_exclude_before_attaching(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch, pattern):
+	new, old, out = _fake_disk_paths(tmp_path)
+	_fake_generation(hpcp_mod, monkeypatch, tmp_path, {}, {})
+	def attach(*args, **kwargs):
+		raise AssertionError('no disk may be attached before the refusal')
+	monkeypatch.setattr(hpcp_mod, '_attach_disk', attach)
+	with pytest.raises(RuntimeError, match=r'^Invalid arguments: exclude pattern .* matches the root of the filesystem'):
+		hpcp_mod.process_get_disk_diff_image([new], [old], out, [], [], exclude=frozenset([pattern]), max_workers=1)
+
+
+def test_a_blank_x_line_does_not_empty_a_partition_comparison(tmp_path, hpcp_mod, reset_hpcp_globals):
+	hpcp_mod.HASH_SIZE = 65536
+	new, base = tmp_path / 'new', tmp_path / 'base'
+	_write(base / 'etc' / 'os-release', 'old')
+	_write(new / 'etc' / 'os-release', 'newer')
+	xfile = tmp_path / 'x.txt'
+	xfile.write_text('/var/log/*\n\n')
+	exclude = hpcp_mod.format_exclude(None, str(xfile))
+	rows = hpcp_mod._partition_changes(str(new), str(base), [], [], exclude, False, 1, False)
+	assert ('M', 'etc/os-release') in {(row.op, row.path) for row in rows}

@@ -820,7 +820,8 @@ def format_exclude(exclude = None,exclude_file = None) -> frozenset:
 		else:
 			eprint(f"Exclude file not exist: Exclude file {exclude_file} does not exist, skipping")
 
-	exclude = set([re.sub(r'/+','/','*/'+ path if not path.startswith('*/') else path) if not path.startswith('/') else path for path in exclude ])
+	# A blank value (an empty -e, a blank line in an -x file) would become '*/', which matches every root: skip it.
+	exclude = set([re.sub(r'/+','/','*/'+ path if not path.startswith('*/') else path) if not path.startswith('/') else path for path in exclude if path.strip()])
 	# freeze frozenset
 	return frozenset(exclude)
 
@@ -4351,14 +4352,8 @@ def build_rooted_maps(new_root, base_root, exclude=None, max_workers=multiproces
 	exclude matched against '/' + the path inside each filesystem (_rooted_excludes). Each side is listed with its own
 	rooted patterns, so an excluded directory is skipped, not walked, on both sides."""
 	exclude = frozenset(exclude or ())
-	# A pattern matching the filesystem root itself ('-e /'): each side's own root is excluded too, so nothing is
-	# listed on either side (a '/' base already was, by its walker's check of the root).
-	whole = any(fnmatch.fnmatch(os.sep, pattern) for pattern in exclude)
-	def rooted(root):
-		patterns = _rooted_excludes(exclude, root)
-		return patterns | {glob.escape(os.path.abspath(root).rstrip(os.sep)) or os.sep} if whole else patterns
-	new_map = build_entry_map(new_root, '', None, rooted(new_root), None, max_workers, parallel_file_listing)
-	base_map = build_entry_map(base_root, '', None, rooted(base_root), None, max_workers, parallel_file_listing)
+	new_map = build_entry_map(new_root, '', None, _rooted_excludes(exclude, new_root), None, max_workers, parallel_file_listing)
+	base_map = build_entry_map(base_root, '', None, _rooted_excludes(exclude, base_root), None, max_workers, parallel_file_listing)
 	return new_map, base_map
 
 def _states_chunk(paths, full_hash, read_xattrs, hash_size, marked=frozenset(), stat_paths=None):
@@ -4767,7 +4762,9 @@ def _check_payload(rows, volume_roots, full_hash=False, max_workers=1, new_base=
 			incomplete.append(row.path)
 	# With -fh every copy is hashed again, whatever its source (as up to 9.70): a copy that came out wrong with the
 	# right size is caught here, before the patch exists, not by every apply's verify after it was written.
-	recheck = set(copies) if full_hash or new_base is None else set(_rows_to_recheck(list(copies), new_base, scan))
+	# Copies of files on FAT (the full-hash mark) are always hashed again: they were hashed in full, and are the ones a changed source hurts most.
+	recheck = set(copies) if full_hash or new_base is None else (
+		{row for row in copies if _full_marked(row.new)} | set(_rows_to_recheck([row for row in copies if not _full_marked(row.new)], new_base, scan)))
 	copies = {row: copy for row, copy in copies.items() if row in recheck}
 	marked = {copy for row, copy in copies.items() if _full_marked(row.new)}
 	states = _states_for_paths(set(copies.values()), full_hash=full_hash, read_xattrs=False, max_workers=max_workers, marked=marked) if copies else {}
@@ -5473,8 +5470,8 @@ def _remove_tree_around_mounts(path, mount_points=None, target_root=None):
 	# The parent is resolved once, the last component never: a symlink there must not be followed to its target.
 	stripped = path.rstrip(os.sep) or os.sep
 	name = os.path.basename(stripped)
-	if not name:
-		return [], ['.: refusing to remove a filesystem root']
+	if name in ('', os.curdir, os.pardir):
+		return [], ['.: refusing to remove . or .. or a filesystem root']
 	root_real = os.path.realpath(target_root or os.sep)
 	parent_real = os.path.realpath(os.path.dirname(stripped))
 	top = os.path.join(parent_real, name)
@@ -6001,15 +5998,29 @@ def _trigger_automount(mount_point):
 	except OSError:
 		pass
 
+def _autofs_is_direct(entries, real, prefix):
+	"""True when the autofs mount standing at real/prefix (the target's own, the deepest one holding real, when prefix is
+	'') is a direct map: mountinfo's super options carry 'direct'. An indirect map ('indirect') or an offset ('offset') is
+	mounted only through its keys, never by a lookup of the mount point."""
+	point = os.path.join(real, prefix) if prefix else real
+	found = None
+	for entry in entries:
+		inside = entry['mount_point'].rstrip(os.sep) + os.sep
+		if entry['fstype'] == 'autofs' and (entry['mount_point'] == point if prefix else (point.rstrip(os.sep) + os.sep).startswith(inside)):
+			if found is None or len(entry['mount_point']) >= len(found['mount_point']):
+				found = entry
+	return found is not None and 'direct' in found.get('super_options', ())
+
 def _trigger_automounts(target_root, rows, entries):
-	"""mountinfo entries after triggering each visible automount (autofs) at or below target_root that rows write into
-	(rows _rows_by_scope groups under it, the target's own scope included); entries as given when there is none.
-	Other automounts (/net, NFS home directories) are left alone."""
+	"""mountinfo entries after triggering each visible direct automount (autofs, super option 'direct') at or below
+	target_root that rows write into (rows _rows_by_scope groups under it, the target's own scope included); entries as
+	given when there is none. Other automounts (/net, NFS home directories) are left alone, and so are indirect maps
+	(a lookup of their mount point mounts nothing; apply_patch_tree refuses a patch writing into one)."""
 	scopes = _mount_scopes(target_root, entries)
 	grouped = _rows_by_scope(rows, scopes)
 	real = os.path.realpath(target_root)
 	points = [os.path.join(real, prefix) if prefix else real
-		for prefix, fs_type, _ in scopes if fs_type == 'autofs' and prefix in grouped]
+		for prefix, fs_type, _ in scopes if fs_type == 'autofs' and prefix in grouped and _autofs_is_direct(entries, real, prefix)]
 	for point in points:
 		_trigger_automount(point)
 	return _mountinfo_entries() if points else entries
@@ -6038,7 +6049,7 @@ def apply_patch_tree(volume_roots, target_root, force=False, max_workers=1, verb
 	and _restore_across_sections). With more than one mount patched, what one mount's rows or a
 	restore changed in another is verified again at the end (see _verify_across_sections), so a
 	contradictory patch fails as it would on a single filesystem.
-	An automount (autofs) the patch writes into is triggered before the scopes are planned (see _trigger_automounts); one that cannot be mounted is refused before anything changes.
+	A direct automount (autofs) the patch writes into is triggered before the scopes are planned (see _trigger_automounts); one that cannot be mounted, and an indirect map, are refused before anything changes.
 	"""
 	meta, rows, volume_roots = load_patch_volumes(volume_roots, volume_names)
 	if store_note and meta.get('layout') == 'store':
@@ -6046,13 +6057,17 @@ def apply_patch_tree(volume_roots, target_root, force=False, max_workers=1, verb
 		print(f"Note: this patch uses image-store layout; paths such as {example!r} are resolved under {target_root}")
 	# An automounted filesystem the patch writes into (an ESP systemd mounts on demand) is mounted first, so it is
 	# planned as what it holds; one that stays an automount is refused before anything changes.
-	scopes = _mount_scopes(target_root, _trigger_automounts(target_root, rows, _mountinfo_entries()))
+	entries = _trigger_automounts(target_root, rows, _mountinfo_entries())
+	scopes = _mount_scopes(target_root, entries)
 	grouped = _rows_by_scope(rows, scopes)
 	real = os.path.realpath(target_root)
 	for prefix, fs_type, _ in scopes:
 		if fs_type == 'autofs' and prefix in grouped:
 			point = os.path.join(real, prefix) if prefix else real
-			raise RuntimeError(f'Patch error: {point} is an automount (autofs) that could not be mounted; mount it and re-run')
+			if _autofs_is_direct(entries, real, prefix):
+				raise RuntimeError(f'Patch error: {point} is an automount (autofs) that could not be mounted; mount it and re-run')
+			raise RuntimeError(f"Patch error: {point} is an indirect automount map (autofs); hpcp does not write into one: leave it out of the patch "
+				f"(-e '{'/' + prefix if prefix else ''}/*' when generating) or mount what it needs and re-run")
 	with _patch_hash_settings(meta) as (compare_hash, full_hash):
 		plans = []
 		for prefix, fs_type, source in scopes:
@@ -6149,6 +6164,20 @@ def _rooted_excludes(patterns, root):
 	prefix = glob.escape(os.path.abspath(root).rstrip(os.sep))
 	return frozenset(prefix + pattern for pattern in patterns)
 
+def _refuse_root_exclude(exclude, root=None):
+	"""Refuse a user exclude pattern that leaves the compared tree's root out: the whole tree would drop out of one
+	listing (a directory source's walker tests its root) and not the other, so the patch could delete everything.
+
+	root None: a mounted filesystem (-si image, -dd -diff section), whose patterns are matched against '/' + the path
+	inside it; else a directory source, whose patterns are matched against its real paths."""
+	for pattern in sorted(exclude or ()):
+		if root is None:
+			hit, what = fnmatch.fnmatch(os.sep, pattern), 'the filesystem'
+		else:
+			hit, what = is_excluded(os.path.abspath(root), [pattern]), os.path.abspath(root)
+		if hit:
+			raise RuntimeError(f"Invalid arguments: exclude pattern {pattern!r} matches the root of {what}: it would leave the whole tree out of the comparison; remove it")
+
 def process_get_diff_image(src_paths, src_image, dest_paths, dest_image, output, mount_points, loop_devices,
 		exclude=None, full_hash=False, dest_image_size=0, max_workers=multiprocessing.cpu_count(),
 		parallel_file_listing=False, verbose=False):
@@ -6162,6 +6191,7 @@ def process_get_diff_image(src_paths, src_image, dest_paths, dest_image, output,
 		images = expand_paths(src_image)
 		if len(images) != 1:
 			raise RuntimeError(f'Invalid arguments: -diff needs exactly one -si image, got {images}')
+		_refuse_root_exclude(exclude)
 		new_root = _mount_single_fs_image(images[0], True, mount_points, loop_devices)
 		new_name, new_is_dir = os.path.basename(images[0]), False
 	else:
@@ -6169,6 +6199,7 @@ def process_get_diff_image(src_paths, src_image, dest_paths, dest_image, output,
 		if len(paths) != 1 or not os.path.isdir(paths[0]):
 			raise RuntimeError(f'Invalid arguments: -diff needs exactly one existing source directory, got {src_paths}')
 		new_root = os.path.abspath(paths[0])
+		_refuse_root_exclude(exclude, new_root)
 		new_name, new_is_dir = os.path.basename(os.path.normpath(new_root)) or 'root', True
 	if dest_image:
 		base_root = _mount_single_fs_image(dest_image, True, mount_points, loop_devices)
@@ -7350,6 +7381,7 @@ def process_get_disk_diff_image(src_paths, dest_paths, output, mount_points, loo
 	Both disks are GPT block devices or disk-image files and are only read. Returns the
 	patch path, or None when the disks do not differ (no image is created).
 	"""
+	_refuse_root_exclude(exclude)
 	sources, bases = expand_paths(src_paths or []), expand_paths(dest_paths or [])
 	if len(sources) != 1 or len(bases) != 1:
 		raise RuntimeError(f'Invalid arguments: -dd -diff needs exactly one new disk and one old disk (-d), got {src_paths} and {dest_paths}')

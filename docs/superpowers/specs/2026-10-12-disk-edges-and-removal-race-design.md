@@ -138,8 +138,14 @@ This ships as hpcp 9.72. 9.68–9.72 are not on PyPI; publishing needs the user'
    - For each source it checks the file's own real path, then walks up the parents of its directory's real path.
    - The cost grows with path depth, not with the number of mounts. The result is the same as today: the deepest
      visible mount, with a mount on the file itself first.
-3. **`-e /`.** When an exclude pattern matches `/` (the filesystem root itself), `build_rooted_maps` lists nothing on
-   either side, so the same input means the same thing for a `/` base and a temp-mounted image.
+3. **`-e /`.** A user exclude pattern that excludes the compared tree's root (`-e /`, `-e '*/'`) is refused in
+   generation (`_refuse_root_exclude`, before anything is mounted or listed) with "Invalid arguments: exclude pattern
+   ... matches the root of ...". For a mounted source (`-si` image, `-dd -diff` section) a pattern matches the root when
+   `fnmatch('/', pattern)`; for a directory source when the walker's own test excludes its real path. Blank `-e` values
+   and blank or whitespace-only lines in an `-x` file are ignored (`format_exclude`), since they used to become `*/`.
+   (Corrected after review: a '/' base was not excluded whole, because the base side is post-filtered, so a
+   root-matching pattern half-excluded the tree and could write a patch deleting everything; a blank `-x` line produced
+   such a pattern. The earlier rule that `-e /` empties both sides is dropped.)
 4. **Scan-stat pin.** A test shows that `compute_changes(scan=…)` asks `_states_for_paths` for stats of new-side paths
    only. The C1 final review found this unpinned.
 5. **Full re-check with `-fh`.**
@@ -175,7 +181,9 @@ This ships as hpcp 9.72. 9.68–9.72 are not on PyPI; publishing needs the user'
 - Patch formats are unchanged.
 - `-dd` results are unchanged for disks without stacked partitions.
 - Patches made by 9.65–9.71 apply as before.
-- An autofs scope that 9.71 refused, or mis-planned, as POSIX is now planned as what is mounted on it.
+- An autofs scope that 9.71 refused, or mis-planned, as POSIX is now planned as what is mounted on it (a direct map is
+  triggered; an indirect map is refused with a message saying so).
+- A root-matching exclude pattern is now refused in generation; blank `-x` lines are ignored.
 
 ## Testing
 
@@ -221,7 +229,8 @@ and stopped or removed in a trap.
   - Compare mode with a `-si` source and `-e '/var/log/*'` (fake image mounts).
   - A lookup test with many fake mounts, showing the per-directory work no longer scales with them, and that results
     are unchanged (file mount first, then the deepest).
-  - `-e /` empties both sides.
+  - A root-matching exclude pattern (`/`, `*/`) is refused for `-si`, directory sources and `-dd -diff` before anything
+    is listed or attached; blank `-x` lines are ignored.
   - The scan-stat pin.
   - With `-fh`, every copy is hashed again even from a read-only source, and a copy damaged after the copy (same size)
     stops generation before any manifest is written.
