@@ -7119,7 +7119,8 @@ def _live_excludes(root, device, paths, entries):
 
 	A live mount M of the device may show the whole filesystem, a btrfs subvolume (Fedora mounts / from subvolume
 	root) or a bound directory: its mountinfo root R says which. A path P below M is R + P's path below M in the
-	filesystem's own terms; it is excluded as its path below the root R0 hpcp's own mount shows (mountinfo root of
+	filesystem's own terms, mapped through the visible mount that holds it (the deepest mount point above it, of any
+	device; hpcp's own mount is not recursive, so a path another mount holds is not on this device); it is excluded as its path below the root R0 hpcp's own mount shows (mountinfo root of
 	root's mount), when it lies there. Entries of other devices, hpcp's own mount and this run's other mounts (the
 	paths themselves) are not live mounts. Empty when root is not a mount point in entries."""
 	root_real = os.path.realpath(root)
@@ -7130,19 +7131,23 @@ def _live_excludes(root, device, paths, entries):
 	devnum = _device_number(device)
 	reals = [os.path.realpath(path) for path in paths]
 	skip = set(reals) | {root_real}
+	hidden = _hidden_mounts(entries)
+	visible = [entry for index, entry in enumerate(entries) if index not in hidden]
 	patterns = set()
-	for entry in entries:
-		point = entry['mount_point']
-		if point in skip or not _entry_matches(entry, devnum, device):
+	for real in reals:
+		# The visible mount that holds the path (the deepest; any device): hpcp's own mount is not recursive, so a path
+		# held by another mount is not on this device, and one held by a bind over a directory is that bind's.
+		holder, depth = None, -1
+		for entry in visible:
+			inside = entry['mount_point'].rstrip(os.sep) + os.sep
+			if real.startswith(inside) and len(inside) >= depth:
+				holder, depth = entry, len(inside)
+		if holder is None or holder['mount_point'] in skip or not _entry_matches(holder, devnum, device):
 			continue
-		point_inside = point.rstrip(os.sep) + os.sep
-		for real in reals:
-			if not real.startswith(point_inside):
-				continue
-			inside = os.path.normpath(os.path.join(entry['root'], os.path.relpath(real, point)))
-			if own_root != os.sep and not inside.startswith(own_root.rstrip(os.sep) + os.sep):
-				continue
-			patterns.add(glob.escape(os.sep + os.path.relpath(inside, own_root)))
+		inside = os.path.normpath(os.path.join(holder['root'], os.path.relpath(real, holder['mount_point'])))
+		if own_root != os.sep and not inside.startswith(own_root.rstrip(os.sep) + os.sep):
+			continue
+		patterns.add(glob.escape(os.sep + os.path.relpath(inside, own_root)))
 	return patterns
 
 def _partition_changes(new_root, old_root, mount_points, devices, exclude, full_hash, max_workers, parallel_file_listing,

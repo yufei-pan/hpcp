@@ -1200,6 +1200,23 @@ def test_live_excludes_map_paths_through_mount_roots(hpcp_mod, monkeypatch, own_
 	assert hpcp_mod._live_excludes(own, '/dev/sda3', paths, entries) == {_glob.escape(path) for path in expected}
 
 
+def test_live_excludes_maps_a_path_through_the_bind_that_holds_it(hpcp_mod, monkeypatch):
+	"""D live whole at /nx-d and D:/a bound at /nx-d/b: the image under the bind is D:/a/golden.img only; D:/b/golden.img
+	(a shadowed, real file) is not it."""
+	import glob as _glob
+	entries = [_mount_entry('/nx-own'), _mount_entry('/nx-d'), _mount_entry('/nx-d/b', '/a')]
+	monkeypatch.setattr(hpcp_mod, '_device_number', lambda device: (8, 3))
+	assert hpcp_mod._live_excludes('/nx-own', '/dev/sda3', ['/nx-d/b/golden.img'], entries) == {_glob.escape('/a/golden.img')}
+
+
+def test_live_excludes_ignores_a_path_held_by_another_devices_mount(hpcp_mod, monkeypatch):
+	"""D live at /nx-root with another device mounted at /nx-root/srv/images: an image there is not on D."""
+	entries = [_mount_entry('/nx-own'), _mount_entry('/nx-root'),
+		_mount_entry('/nx-root/srv/images', devnum=(7, 1), source='/dev/loop1')]
+	monkeypatch.setattr(hpcp_mod, '_device_number', lambda device: (8, 3))
+	assert hpcp_mod._live_excludes('/nx-own', '/dev/sda3', ['/nx-root/srv/images/golden.img'], entries) == set()
+
+
 def test_live_excludes_without_an_own_mount_entry_is_empty(hpcp_mod, monkeypatch):
 	monkeypatch.setattr(hpcp_mod, '_device_number', lambda device: (8, 3))
 	assert hpcp_mod._live_excludes('/nx-not-mounted', '/dev/sda3', ['/nx/a.img'], [_mount_entry('/', '/root')]) == set()
