@@ -2440,11 +2440,11 @@ def _cross_scope_move(hpcp_mod, tmp_path, new, base, into_mount):
 	return vol, kept, make_target
 
 
-def _apply_on_scopes(hpcp_mod, monkeypatch, vol, target, mounts):
+def _apply_on_scopes(hpcp_mod, monkeypatch, vol, target, mounts, force=False):
 	"""Apply vol to target with mountinfo listing the target and each of mounts (keys below it) as ext4 mounts."""
 	_fake_mounts(hpcp_mod, monkeypatch, (target, 'ext4'), *[(target / mount, 'ext4') for mount in mounts])
 	hpcp_mod.ERRORS.clear()
-	return hpcp_mod.apply_patch_tree([str(vol)], str(target), max_workers=1)
+	return hpcp_mod.apply_patch_tree([str(vol)], str(target), force=force, max_workers=1)
 
 
 @pytest.mark.parametrize('into_mount', [True, False])
@@ -2932,6 +2932,121 @@ def test_skipped_directory_changed_through_an_alias_fails_at_verify(trees, hpcp_
 	summary = _apply_on_scopes(hpcp_mod, monkeypatch, vol, target, [])
 	assert summary['failed'] == 1
 	assert [error for error in hpcp_mod.ERRORS if error.startswith('Patch verify error: A y/d/:')]
+
+
+def _later_scope_writes(new, base):
+	"""Scope m/ also writes m/other and scope n/ writes n/late: a scope that fails stops n/ from being applied."""
+	_write(new / 'm' / 'other', 'other')
+	_write(new / 'n' / 'late', 'late')
+	(base / 'n').mkdir()
+
+
+def _mkdir(path, mode):
+	os.makedirs(str(path), exist_ok=True)
+	os.chmod(str(path), mode)
+
+
+def _alias_node(tmp_path, base, prepare):
+	"""make_target(name): a clone of base where y -> m/x makes y/... and m/x/... one entry, then prepare(target)."""
+	def make_target(name):
+		target = tmp_path / name
+		_clone(base, target)
+		shutil.rmtree(str(target / 'y'))
+		os.symlink(os.path.join('m', 'x'), str(target / 'y'))
+		prepare(target)
+		return target
+	return make_target
+
+
+def _apply_on_one_and_three_scopes(hpcp_mod, monkeypatch, vol, make_target, force=False):
+	"""Group A's invariant: the patch ends alike on one scope and on scopes m/ and n/ below the target (equal summaries
+	and errors), and every scope is applied. Returns (summary, errors)."""
+	results = []
+	for name, mounts in (('single', []), ('scoped', ['m', 'n'])):
+		target = make_target(name)
+		summary = _apply_on_scopes(hpcp_mod, monkeypatch, vol, target, mounts, force=force)
+		assert (target / 'm' / 'other').read_text() == 'other' and (target / 'n' / 'late').read_text() == 'late'
+		results.append((summary, list(hpcp_mod.ERRORS)))
+	assert results[0] == results[1]
+	return results[0]
+
+
+@pytest.mark.parametrize('kind', ['file', 'directory'])
+def test_a_delete_through_an_alias_in_an_earlier_scope_fails_once_and_later_scopes_apply(trees, hpcp_mod, tmp_path,
+		reset_hpcp_globals, monkeypatch, kind):
+	"""Final review I1, probe 1 (and its directory form): the root's D y/f removes m/x/f through y -> m/x, which scope
+	m/ skipped as already present. m/ writes too, but its own verify sees only what its own writes did: the missing
+	entry is restored once every scope ran, the delete fails at the final pass, and n/ is applied, as on one scope."""
+	new, base = trees
+	(new / 'y').mkdir()
+	(base / 'm' / 'x').mkdir(parents=True)
+	if kind == 'file':
+		gone, added = 'y/f', 'm/x/f'
+		_write(new / 'm' / 'x' / 'f', 'moved')
+		_write(base / 'y' / 'f', 'moved')
+		prepare = lambda target: _write(target / 'm' / 'x' / 'f', 'moved')
+	else:
+		gone, added = 'y/d/', 'm/x/d/'
+		_mkdir(new / 'm' / 'x' / 'd', 0o755)
+		_mkdir(base / 'y' / 'd', 0o755)
+		prepare = lambda target: _mkdir(target / 'm' / 'x' / 'd', 0o755)
+	_later_scope_writes(new, base)
+	vol = tmp_path / 'vol'
+	rows, _ = _patch_from(hpcp_mod, new, base, [vol])
+	assert _ops(rows) == {('D', gone), ('A', added), ('A', 'm/other'), ('A', 'n/late')}
+	summary, errors = _apply_on_one_and_three_scopes(hpcp_mod, monkeypatch, vol, _alias_node(tmp_path, base, prepare))
+	assert (summary['deleted'], summary['added'], summary['restored'], summary['skipped'], summary['failed']) == (1, 2, 1, 0, 1)
+	assert len(errors) == 1 and errors[0].startswith(f'Patch verify error: D {gone}: expected -')
+
+
+@pytest.mark.parametrize('kind', ['file', 'directory'])
+def test_a_change_through_an_alias_in_an_earlier_scope_fails_once_and_later_scopes_apply(trees, hpcp_mod, tmp_path,
+		reset_hpcp_globals, monkeypatch, kind):
+	"""Final review I1, probe 2 (and its directory form): the root's M y/f rewrites m/x/f (M y/d/ changes m/x/d's
+	mode) through y -> m/x, which scope m/ skipped as already done. m/ writes too; the skipped row is not failed by m/'s
+	own verify (its own writes did not change it) but by the final pass, and n/ is applied, as on one scope."""
+	new, base = trees
+	(base / 'm' / 'x').mkdir(parents=True)
+	if kind == 'file':
+		changed, skipped = 'y/f', 'm/x/f'
+		_write(new / 'y' / 'f', 'new')
+		_write(new / 'm' / 'x' / 'f', 'old')
+		_write(base / 'y' / 'f', 'old')
+		prepare = lambda target: _write(target / 'm' / 'x' / 'f', 'old')
+	else:
+		changed, skipped = 'y/d/', 'm/x/d/'
+		_mkdir(new / 'y' / 'd', 0o700)
+		_mkdir(new / 'm' / 'x' / 'd', 0o755)
+		_mkdir(base / 'y' / 'd', 0o755)
+		prepare = lambda target: _mkdir(target / 'm' / 'x' / 'd', 0o755)
+	_later_scope_writes(new, base)
+	vol = tmp_path / 'vol'
+	rows, _ = _patch_from(hpcp_mod, new, base, [vol])
+	assert _ops(rows) == {('M', changed), ('A', skipped), ('A', 'm/other'), ('A', 'n/late')}
+	summary, errors = _apply_on_one_and_three_scopes(hpcp_mod, monkeypatch, vol, _alias_node(tmp_path, base, prepare))
+	assert (summary['modified'], summary['added'], summary['skipped'], summary['failed']) == (1, 2, 1, 1)
+	assert len(errors) == 1 and errors[0].startswith(f'Patch verify error: A {skipped}: expected ')
+
+
+def test_a_skipped_row_a_forced_write_replaced_is_counted_once(trees, hpcp_mod, tmp_path, reset_hpcp_globals, monkeypatch):
+	"""A forced A y/f (a symlink) replaces the skipped m/x/f through y -> m/x, and D z removes something. The skipped
+	row fails once: the repair step across scopes does not verify (and count) again a row that failed its section's
+	verify. One scope and scopes m/ and n/ end alike."""
+	new, base = trees
+	(new / 'y').mkdir()
+	os.symlink('elsewhere', str(new / 'y' / 'f'))
+	_write(new / 'm' / 'x' / 'f', 'data')
+	(base / 'y').mkdir()
+	(base / 'm' / 'x').mkdir(parents=True)
+	_write(base / 'z', 'z')
+	_later_scope_writes(new, base)
+	vol = tmp_path / 'vol'
+	rows, _ = _patch_from(hpcp_mod, new, base, [vol])
+	assert _ops(rows) == {('A', 'y/f'), ('A', 'm/x/f'), ('D', 'z'), ('A', 'm/other'), ('A', 'n/late')}
+	summary, errors = _apply_on_one_and_three_scopes(hpcp_mod, monkeypatch, vol,
+		_alias_node(tmp_path, base, lambda target: _write(target / 'm' / 'x' / 'f', 'data')), force=True)
+	assert (summary['forced'], summary['skipped'], summary['failed']) == (1, 1, 1)
+	assert len(errors) == 1 and errors[0].startswith('Patch verify error: A m/x/f: expected ') and errors[0].endswith('found l:elsewhere')
 
 
 def test_unchanged_skipped_files_are_not_verified_again(trees, hpcp_mod, tmp_path, monkeypatch):

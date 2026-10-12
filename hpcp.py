@@ -5157,6 +5157,14 @@ def _identities(target_root, rows):
 	"""{row: _entry_identity of its path} for the A / M rows among rows."""
 	return {row: _entry_identity(_key_path(target_root, row.path)) for row in rows if row.op != 'D'}
 
+def _entry_snapshots(target_root, rows, metadata=True, max_workers=1):
+	"""{row: (_entry_identity of its path, its state for a directory row, else None)} for the A / M rows among rows.
+	A directory is written in place, keeping its inode, so only its state (read without hashing; xattrs when
+	metadata) shows a change."""
+	directories = {row: _key_path(target_root, row.path) for row in rows if row.op != 'D' and row.new.startswith('d:')}
+	states = _states_for_paths(set(directories.values()), read_xattrs=metadata, max_workers=max_workers) if directories else {}
+	return {row: (identity, states.get(directories.get(row))) for row, identity in _identities(target_root, rows).items()}
+
 def _same_entry(path, others):
 	"""True when path and one of others are one entry: same st_dev and st_ino (last components not followed)."""
 	try:
@@ -5616,35 +5624,42 @@ def _preflight_section(plan):
 def _apply_section(plan, max_workers, verbose, full_hash, compare_hash, outcome=None):
 	"""Apply a checked section and verify it (with the rows the repair step restored); returns its summary.
 
-	Once anything was written, removed or restored, verify also covers each skipped A / M row whose entry is no longer
-	the one planning found (plan.skipped_identities: another row's write reached it through a symlinked directory, or
-	through a name differing only by case on a case-insensitive filesystem, recognised or not) and every skipped
-	directory row (a directory changed in place keeps its inode). Such a contradictory patch then fails loudly.
+	When the section writes anything, verify also covers each skipped A / M row its own writes changed: the row's
+	_entry_snapshots (its entry, and a directory's state, since a directory changed in place keeps its inode) differ
+	from a snapshot taken right before the writes (another row's write reached it through a symlinked directory, or
+	through a name differing only by case on a case-insensitive filesystem, recognised or not). Such a contradictory
+	patch then fails loudly. What an earlier section did to a skipped row (all sections are planned before any runs) is
+	not this section's failure: the row keeps planning's entry (plan.skipped_identities), and _restore_across_sections
+	and _verify_across_sections deal with it once every section ran, as on a single section.
 	outcome: a dict that receives, for _restore_across_sections and _verify_across_sections: 'removed' (True when a
 	removal took anything away), 'restored' (the rows the repair step wrote again), 'verified' (the rows verified),
-	'deletes' (the D rows that passed) and 'identities' (each A / M row that passed: its entry's _entry_identity
-	right after the verify).
+	'failures' (the A / M rows that failed the verify), 'deletes' (the D rows that passed) and 'identities' (each A / M
+	row that passed: its entry's _entry_identity right after the verify; each skipped row not verified: planning's).
 	"""
 	conflicts = _section_conflicts(plan)
 	todo = _section_todo(plan)
 	skipped = [check.row for check in plan.checks if check.action == 'skip' and check.row.op != 'D']
+	# Taken right before the writes: a section's verify sees only what its own writes did.
+	before = _entry_snapshots(plan.target_root, skipped, plan.metadata, max_workers) if todo else {}
 	restored, removed = _apply_rows(todo, plan.volume_roots, plan.target_root, max_workers, verbose, full_hash,
 		forced_rows=[check.row for check in conflicts], metadata=plan.metadata, skipped=skipped)
 	restored_rows = set(restored)
 	changed = []
-	if todo or restored:
-		changed = [row for row in skipped if row not in restored_rows and (row.new.startswith('d:')
-			or _entry_identity(_key_path(plan.target_root, row.path)) != plan.skipped_identities.get(row))]
+	if todo:
+		unrestored = [row for row in skipped if row not in restored_rows]
+		after = _entry_snapshots(plan.target_root, unrestored, plan.metadata, max_workers)
+		changed = [row for row in unrestored if after[row] != before[row]]
 	verified, passed = todo + restored + changed, []
 	failed = _verify_rows(verified, plan.target_root, compare_hash, full_hash, max_workers, plan.metadata, passed=passed,
 		tz_tolerant=plan.tz_tolerant)
 	if outcome is not None:
-		# Skipped rows not verified here keep planning's entry, so the final pass across sections sees a later change.
-		verified_rows = set(verified)
+		# Skipped rows not verified here keep planning's entry, so the final pass across sections sees an earlier
+		# section's change as well as a later one's.
+		verified_rows, passed_rows = set(verified), set(passed)
 		identities = {row: plan.skipped_identities.get(row) for row in skipped if row not in verified_rows}
 		identities.update(_identities(plan.target_root, passed))
 		outcome.update(removed=bool(removed), restored=restored, verified=verified, deletes=[row for row in passed if row.op == 'D'],
-			identities=identities)
+			identities=identities, failures={row for row in verified if row.op != 'D' and row not in passed_rows})
 	return {
 		'deleted': sum(1 for row in todo if row.op == 'D'),
 		'added': sum(1 for row in todo if row.op == 'A'),
@@ -5665,14 +5680,15 @@ def _restore_across_sections(ran, max_workers, verbose, full_hash, compare_hash)
 	missing one is written again with its own section's root, payload and metadata setting, through the guarded
 	writes _apply_rows uses (the directories of every section first), and verified. Nothing is removed: an entry of
 	another type in a skipped row's place was put there by another row, so it is left and fails that row's verify. A
-	failed section's own restores (already verified and counted) are not tried twice. The summaries are updated
-	('restored', 'skipped', 'failed'), and the outcomes ('verified', 'identities') for _verify_across_sections.
+	row that failed its section's verify (outcome 'failures': already counted, a restore of its own among them) is not
+	tried again. The summaries are updated ('restored', 'skipped', 'failed'), and the outcomes ('verified',
+	'identities') for _verify_across_sections.
 	"""
 	if not any(outcome.get('removed') for _, _, outcome in ran):
 		return
 	lost = []
 	for plan, summary, outcome in ran:
-		tried = set(outcome.get('restored', ())) if summary['failed'] else set()
+		tried = outcome.get('failures', set())
 		rows = [check.row for check in plan.checks if check.action == 'skip' and check.row.op != 'D' and check.row.path != './'
 			and check.row not in tried and not _holds_type(_key_path(plan.target_root, check.row.path), check.row.new)]
 		if rows:
@@ -5708,13 +5724,15 @@ def _verify_across_sections(ran, max_workers, full_hash, compare_hash):
 	"""The final verify once more than one section ran, after _restore_across_sections.
 
 	A section is verified before the next one runs, so a later section (or a restore) that reaches one of its
-	entries through a symlinked directory would go unseen; on a single section the same contradictory patch fails at
-	verify. ran as for _restore_across_sections. Every D row that passed its verify is verified again (an lstat; the
+	entries through a symlinked directory would go unseen; nor does a section's verify cover what an earlier section
+	did to a row it skipped (see _apply_section). On a single section the same contradictory patch fails at verify.
+	ran as for _restore_across_sections. Every D row that passed its verify is verified again (an lstat; the
 	case-only rename exception of _verify_rows still applies, with the section's verified A / M rows). Every
-	directory row that passed is verified again (no hashing): a directory is written in place, keeping its inode.
-	Every other A / M row that passed, or that its section skipped without verifying, is lstat'ed and verified again only
-	when its entry (_entry_identity, recorded right after its verify, or while planning) changed or is gone. Failures are reported as verify errors and added to the section's
-	summary.
+	directory row that passed, or that its section skipped without verifying, is verified again (no hashing): a
+	directory is written in place, keeping its inode. Every other A / M row that passed, or that its section skipped
+	without verifying, is lstat'ed and verified again only when its entry (_entry_identity, recorded right after its
+	verify, or while planning) changed or is gone. A row that failed its section's verify is not verified again.
+	Failures are reported as verify errors and added to the section's summary.
 	"""
 	if len(ran) < 2:
 		return
@@ -5747,8 +5765,8 @@ def apply_patch_tree(volume_roots, target_root, force=False, max_workers=1, verb
 	names matched case-insensitively (see check_patch_target). A write skipped as already done that a
 	delete then takes away (a case-insensitive filesystem hpcp does not recognise, a symlinked directory
 	alias, also from one mount into another) is written again and counted as restored (see _apply_rows
-	and _restore_across_sections). With more than one mount patched, what a later mount's rows or a
-	restore changed in an earlier one is verified again at the end (see _verify_across_sections), so a
+	and _restore_across_sections). With more than one mount patched, what one mount's rows or a
+	restore changed in another is verified again at the end (see _verify_across_sections), so a
 	contradictory patch fails as it would on a single filesystem.
 	"""
 	meta, rows, volume_roots = load_patch_volumes(volume_roots, volume_names)
@@ -7215,8 +7233,8 @@ def apply_disk_patch(volume_roots, target, mount_points, loop_devices, force=Fal
 	So does a raw area that cannot be written, or that does not hold the new content when read back
 	right after its write: later raw areas, the boot code and identity changes.
 	After the sections, a write one section skipped as already done that a delete in another took away
-	(through a symlinked directory) is restored (see _restore_across_sections), and what a later section
-	or a restore changed in an earlier section is verified again (see _verify_across_sections); a failure
+	(through a symlinked directory) is restored (see _restore_across_sections), and what one section
+	or a restore changed in another section is verified again (see _verify_across_sections); a failure
 	there stops the raw areas, boot code and identity changes like a failed section.
 	Returns {'sections', 'raw_written', 'raw_skipped', 'identity_changed', 'forced', 'failed'}.
 	"""
