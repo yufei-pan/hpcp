@@ -4326,6 +4326,15 @@ def build_root_maps(new_root, base_root, exclude=None, max_workers=multiprocessi
 	base_map = build_entry_map(base_root, '', None, exclude, os.path.abspath(new_root), max_workers, parallel_file_listing)
 	return new_map, base_map
 
+def build_rooted_maps(new_root, base_root, exclude=None, max_workers=multiprocessing.cpu_count(), parallel_file_listing=False):
+	"""Entry maps for two mounted filesystems compared root to root ('root' layout: -si images, -dd -diff sections),
+	exclude matched against '/' + the path inside each filesystem (_rooted_excludes). Each side is listed with its own
+	rooted patterns, so an excluded directory is skipped, not walked, on both sides."""
+	exclude = frozenset(exclude or ())
+	new_map = build_entry_map(new_root, '', None, _rooted_excludes(exclude, new_root), None, max_workers, parallel_file_listing)
+	base_map = build_entry_map(base_root, '', None, _rooted_excludes(exclude, base_root), None, max_workers, parallel_file_listing)
+	return new_map, base_map
+
 def _states_chunk(paths, full_hash, read_xattrs, hash_size, marked=frozenset()):
 	"""Worker body for _states_for_paths: states plus the errors recorded while computing them.
 
@@ -5889,22 +5898,27 @@ def _drop_lost_found(entry_map):
 	"""entry_map without lost+found/ and everything under it (mkfs.ext4 puts one on every image root)."""
 	return {key: path for key, path in entry_map.items() if not key.startswith('lost+found/')}
 
-def _mount_point_excludes(mount_points, listed_roots, matched_root):
-	"""Exclude patterns that keep this run's mount points out of the listings of listed_roots.
-
-	Both listings match exclude patterns against matched_root + relative path (the new
-	side's path; see build_entry_map's logical_root), so a mount point strictly inside a
-	listed root is excluded at matched_root + its path relative to that root. A listed root
-	itself is never excluded.
-	"""
+def _inside_excludes(paths, roots):
+	"""Rooted exclude patterns (matched against '/' + a path inside a listed tree; see _rooted_excludes), one for each
+	of paths that lies strictly inside one of roots: its path relative to that root, compared by real path. Used for
+	this run's mount points and inputs, so both listings leave them out. A root itself is never excluded."""
 	patterns = set()
-	for mount_point in mount_points:
-		mount_real = os.path.realpath(mount_point)
-		for root in listed_roots:
+	for path in paths:
+		path_real = os.path.realpath(path)
+		for root in roots:
 			root_real = os.path.realpath(root)
-			if mount_real.startswith(root_real.rstrip(os.sep) + os.sep):
-				patterns.add(glob.escape(os.path.join(matched_root, os.path.relpath(mount_real, root_real))))
+			if path_real.startswith(root_real.rstrip(os.sep) + os.sep):
+				patterns.add(glob.escape(os.sep + os.path.relpath(path_real, root_real)))
 	return patterns
+
+def _rooted_excludes(patterns, root):
+	"""patterns written for '/' + a path inside the tree at root, as patterns for the real paths under root.
+
+	root's own path, glob-escaped, goes in front of each, so a real path matches exactly when its '/'-rooted path does:
+	'/var/log/*' under /tmp/tmpab12 becomes '/tmp/tmpab12/var/log/*', and '*/tmp/*' matches a tmp/ inside the tree,
+	never the tree's own (temporary) mount path. Nothing changes for root '/'."""
+	prefix = glob.escape(os.path.abspath(root).rstrip(os.sep))
+	return frozenset(prefix + pattern for pattern in patterns)
 
 def process_get_diff_image(src_paths, src_image, dest_paths, dest_image, output, mount_points, loop_devices,
 		exclude=None, full_hash=False, dest_image_size=0, max_workers=multiprocessing.cpu_count(),
@@ -5939,17 +5953,23 @@ def process_get_diff_image(src_paths, src_image, dest_paths, dest_image, output,
 	layout = 'store' if new_is_dir and base_is_image else 'root'
 	# Store layout lists only the new tree's own subtree inside the store (see build_store_maps).
 	base_listed = os.path.join(base_root, os.path.relpath(os.path.abspath(new_root), os.sep)) if layout == 'store' else base_root
-	exclude = frozenset(exclude or ()) | _mount_point_excludes(mount_points, (new_root, base_listed), os.path.abspath(new_root))
-	if layout == 'store':
-		new_map, base_map = build_store_maps(new_root, base_root, exclude, max_workers, parallel_file_listing)
-		new_base = os.sep
+	# This run's mount points inside a listed tree stay out of both listings.
+	internal = _inside_excludes(mount_points, (new_root, base_listed))
+	if src_image:
+		# A mounted source: patterns are matched against '/' + the path inside each filesystem.
+		new_map, base_map = build_rooted_maps(new_root, base_root, frozenset(exclude or ()) | internal, max_workers, parallel_file_listing)
 	else:
-		new_map, base_map = build_root_maps(new_root, base_root, exclude, max_workers, parallel_file_listing)
-		new_base = new_root
-		if src_image or dest_image:
-			# On both sides: `-si golden.img -d /` must not delete or replace the live root's own lost+found/.
-			new_map = _drop_lost_found(new_map)
-			base_map = _drop_lost_found(base_map)
+		# A directory source: patterns are matched against its real paths, as in copy mode.
+		exclude = frozenset(exclude or ()) | _rooted_excludes(internal, new_root)
+		if layout == 'store':
+			new_map, base_map = build_store_maps(new_root, base_root, exclude, max_workers, parallel_file_listing)
+		else:
+			new_map, base_map = build_root_maps(new_root, base_root, exclude, max_workers, parallel_file_listing)
+	new_base = os.sep if layout == 'store' else new_root
+	if layout == 'root' and (src_image or dest_image):
+		# On both sides: `-si golden.img -d /` must not delete or replace the live root's own lost+found/.
+		new_map = _drop_lost_found(new_map)
+		base_map = _drop_lost_found(base_map)
 	if any(_is_reserved_key(key) for key in new_map):
 		raise RuntimeError(f'Diff image error: {new_root} contains {DIFF_DIR_NAME}, which hpcp reserves for patch metadata')
 	if not output or output == 'auto':
@@ -6958,22 +6978,17 @@ def _mount_partition(device, read_only, mount_points, entries):
 def _partition_changes(new_root, old_root, mount_points, live_mounts, exclude, full_hash, max_workers, parallel_file_listing,
 		input_files=(), metadata=True, fat=False):
 	"""Change rows of one filesystem partition (root to root; lost+found, this run's mounts and
-	its input disk-image files left out). metadata False: content-only rows (see states_equal).
+	its input disk-image files left out). exclude is matched against '/' + the path inside the partition's filesystem
+	(build_rooted_maps). metadata False: content-only rows (see states_equal).
 	fat: a FAT section, its files hashed in full (see compute_changes).
 	Names are compared by exact case in every section: a case-only rename is a delete plus an add."""
-	matched = os.path.abspath(new_root)
-	patterns = _mount_point_excludes(mount_points, (new_root, old_root), matched)
+	internal = _inside_excludes(mount_points, (new_root, old_root))
 	for live_mount in live_mounts:
-		if not live_mount:
-			continue
-		# A live filesystem holds the (empty) directories of this run's other temp mount points,
-		# and may hold the disk images this run compares (the old golden image on the new golden).
-		live_real = os.path.realpath(live_mount)
-		for path in list(mount_points) + list(input_files):
-			path_real = os.path.realpath(path)
-			if path_real.startswith(live_real.rstrip(os.sep) + os.sep):
-				patterns.add(glob.escape(os.path.join(matched, os.path.relpath(path_real, live_real))))
-	new_map, base_map = build_root_maps(new_root, old_root, frozenset(exclude or ()) | patterns, max_workers, parallel_file_listing)
+		if live_mount:
+			# A live filesystem holds the (empty) directories of this run's other temp mount points,
+			# and may hold the disk images this run compares (the old golden image on the new golden).
+			internal |= _inside_excludes(list(mount_points) + list(input_files), (live_mount,))
+	new_map, base_map = build_rooted_maps(new_root, old_root, frozenset(exclude or ()) | internal, max_workers, parallel_file_listing)
 	new_map, base_map = _drop_lost_found(new_map), _drop_lost_found(base_map)
 	if any(_is_reserved_key(key) for key in new_map):
 		raise RuntimeError(f'Diff image error: {new_root} contains {DIFF_DIR_NAME}, which hpcp reserves for patch metadata')

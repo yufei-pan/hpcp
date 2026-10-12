@@ -3474,3 +3474,94 @@ def test_a_newer_reader_accepts_version_3_and_an_older_one_refuses_it(tmp_path, 
 	monkeypatch.setattr(hpcp_mod, 'DIFF_FORMAT_VERSION', 2)
 	with pytest.raises(RuntimeError, match='uses format version 3, newer than supported 2'):
 		hpcp_mod.read_manifest(str(path))
+
+
+def test_rooted_excludes_match_like_the_rooted_path(hpcp_mod):
+	"""Spec Part 1 / Review Focus 4: a pattern rooted at a mount matches a real path exactly when it matches '/' + the
+	path inside; the mount's own path never matches a pattern's '*' part, and is escaped."""
+	import fnmatch
+	for root in ('/tmp/tmpab12', '/m/[x]*?', '/m/[x]*?/'):
+		rooted = hpcp_mod._rooted_excludes(['/var/log/*', '*/tmp/*', '*/cache'], root)
+		real = os.path.abspath(root).rstrip(os.sep)
+		for inside, excluded in (('/var/log/a', True), ('/var/logs', False), ('/tmp/b', True), ('/a/cache', True),
+				('/a', False), ('/var/log', False)):
+			assert any(fnmatch.fnmatch(real + inside, pattern) for pattern in rooted) is excluded, (root, inside)
+	assert hpcp_mod._rooted_excludes(['/var/log/*', '*/tmp/*'], '/') == frozenset(['/var/log/*', '*/tmp/*'])
+
+
+def test_inside_excludes_key_paths_by_their_place_in_a_root(tmp_path, hpcp_mod):
+	root, other = tmp_path / 'root', tmp_path / 'other'
+	(root / 'a' / '[b]').mkdir(parents=True)
+	other.mkdir()
+	paths = [str(root / 'a' / '[b]'), str(other), str(root)]
+	assert hpcp_mod._inside_excludes(paths, [str(root)]) == {'/a/[[]b]'}
+
+
+def test_image_source_excludes_are_rooted_in_the_image(trees, hpcp_mod, tmp_path, monkeypatch):
+	"""Spec Part 1: for -si, '/var/log/*' means var/log inside the image, on both sides; '*/var/log/*' still works; and
+	'*/tmp/*' or '/tmp/*' no longer match the (temporary) path the image is mounted at, which excluded the whole image."""
+	new, base = trees
+	image_root = tmp_path / 'image_root'
+	_write(image_root / 'keep.txt', 'k')
+	_write(image_root / 'var' / 'log' / 'a.log', 'log')
+	_write(image_root / 'tmp' / 'b', 'b')
+	_write(base / 'var' / 'log' / 'old.log', 'old')
+	_write(base / 'tmp' / 'c', 'c')
+	image = tmp_path / 'new.img'
+	image.write_bytes(b'')
+	_fake_image_mounts(hpcp_mod, monkeypatch, {str(image): image_root})
+	for patterns in (['/var/log/*', '*/tmp/*'], ['*/var/log/*', '/tmp/*']):
+		rows = _rows_before_mkfs(hpcp_mod, monkeypatch, [], [str(image)], [str(base)], None, str(tmp_path / 'p.img'), [], [],
+			exclude=frozenset(patterns), max_workers=1)
+		ops = _ops(rows)
+		assert ('A', 'keep.txt') in ops, patterns
+		assert not [path for _, path in ops if path.startswith(('var/log/', 'tmp/')) and path not in ('var/log/', 'tmp/')], patterns
+
+
+def test_exclude_file_patterns_are_rooted_like_e(trees, hpcp_mod, tmp_path, monkeypatch):
+	"""-x patterns go through format_exclude with -e ones and are rooted the same way."""
+	new, base = trees
+	image_root = tmp_path / 'image_root'
+	_write(image_root / 'keep.txt', 'k')
+	_write(image_root / 'var' / 'log' / 'a.log', 'log')
+	image = tmp_path / 'new.img'
+	image.write_bytes(b'')
+	listing = tmp_path / 'exclude.txt'
+	listing.write_text('/var/log/*\n')
+	_fake_image_mounts(hpcp_mod, monkeypatch, {str(image): image_root})
+	rows = _rows_before_mkfs(hpcp_mod, monkeypatch, [], [str(image)], [str(base)], None, str(tmp_path / 'p.img'), [], [],
+		exclude=hpcp_mod.format_exclude(None, str(listing)), max_workers=1)
+	assert ('A', 'keep.txt') in _ops(rows) and ('A', 'var/log/a.log') not in _ops(rows)
+
+
+def test_directory_source_excludes_still_match_real_paths(trees, hpcp_mod, tmp_path, monkeypatch):
+	"""Spec Part 1 item 4: a directory source keeps copy mode's matching: real paths, not '/' + the path inside."""
+	new, base = trees
+	_write(new / 'keep.txt', 'k')
+	_write(new / 'var' / 'log' / 'a.log', 'log')
+	real = _rows_before_mkfs(hpcp_mod, monkeypatch, [str(new)], None, [str(base)], None, str(tmp_path / 'p.img'), [], [],
+		exclude=frozenset([str(new / 'var' / 'log') + '/*']), max_workers=1)
+	assert ('A', 'keep.txt') in _ops(real) and ('A', 'var/log/a.log') not in _ops(real)
+	rooted = _rows_before_mkfs(hpcp_mod, monkeypatch, [str(new)], None, [str(base)], None, str(tmp_path / 'p2.img'), [], [],
+		exclude=frozenset(['/var/log/*']), max_workers=1)
+	assert ('A', 'var/log/a.log') in _ops(rooted)
+
+
+def test_rooted_maps_skip_excluded_directories_on_both_sides(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	"""Spec Part 1 item 6: an excluded directory is skipped, not walked, on the new and the base side."""
+	new, base = tmp_path / 'mnt_new', tmp_path / 'mnt_base'
+	for root in (new, base):
+		_write(root / 'var' / 'log' / 'deep' / 'a.log', 'log')
+		_write(root / 'keep.txt', 'k')
+	walked = []
+	real = hpcp_mod.get_file_list_serial
+	def spy(root, *args, **kwargs):
+		walked.append(root)
+		return real(root, *args, **kwargs)
+	monkeypatch.setattr(hpcp_mod, 'get_file_list_serial', spy)
+	new_map, base_map = hpcp_mod.build_rooted_maps(str(new), str(base), frozenset(['/var/log']), max_workers=1, parallel_file_listing=False)
+	for entry_map in (new_map, base_map):
+		assert 'var/' in entry_map and 'keep.txt' in entry_map
+		assert not [key for key in entry_map if key.startswith('var/log')]
+	log_dir = os.path.join('var', 'log')
+	assert not [root for root in walked if root.endswith(log_dir) or log_dir + os.sep in root]

@@ -1169,6 +1169,34 @@ def test_input_disk_image_on_a_live_partition_stays_out_of_the_patch(tmp_path, h
 	assert 'root/' in paths and ('M', 'etc/os-release') in {(row.op, row.path) for row in part3}
 
 
+@requires_root_and_disk_tools
+@pytest.mark.root
+@pytest.mark.loop
+def test_disk_patch_exclude_patterns_are_rooted_in_each_partition(tmp_path, hpcp_mod, reset_hpcp_globals):
+	"""Spec Part 1: '/var/log/*' applies to the root partition, '/EFI/x/*' to the ESP, and '*/tmp/*' to tmp/ inside a
+	partition only (it used to match the temporary mount path and exclude every partition)."""
+	old, new, out = tmp_path / 'old.img', tmp_path / 'new.img', str(tmp_path / 'patch.img')
+	_make_golden(old)
+	_make_newer(old, new, label=None, raw=False, mbr=False, gpt_name=None)
+	with _attached(new) as loop:
+		with _mounted(loop + 'p3') as root:
+			_write(os.path.join(root, 'var', 'log', 'syslog'), b'noise')
+			_write(os.path.join(root, 'tmp', 'scratch'), b'scratch')
+		with _mounted(loop + 'p1') as esp:
+			_write(os.path.join(esp, 'EFI', 'x', 'skip.efi'), b'skip')
+	with _session(hpcp_mod) as (mount_points, loop_devices):
+		assert hpcp_mod.process_get_disk_diff_image([str(new)], [str(old)], out, mount_points, loop_devices,
+			exclude=frozenset(['/var/log/*', '/EFI/x/*', '*/tmp/*']), max_workers=1) == out
+	_, part3 = _read_part3_patch(hpcp_mod, out)
+	_, part1 = _read_part3_patch(hpcp_mod, out, section='part1')
+	paths3, paths1 = {row.path for row in part3}, {row.path for row in part1}
+	assert 'var/log/' in paths3 and 'var/log/syslog' not in paths3
+	assert 'tmp/' in paths3 and 'tmp/scratch' not in paths3
+	assert ('M', 'etc/os-release') in {(row.op, row.path) for row in part3}
+	assert 'EFI/x/' in paths1 and 'EFI/x/skip.efi' not in paths1
+	assert any(path.endswith('grubx64.efi') for path in paths1)
+
+
 def test_unmountable_filesystem_is_compared_as_raw_with_a_warning(hpcp_mod, monkeypatch, capsys):
 	device = '/dev/none'
 	parts = {1: _part(number=1, device=device, fs_type='ext4')}
