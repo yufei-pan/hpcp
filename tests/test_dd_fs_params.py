@@ -1236,9 +1236,9 @@ def test_dd_roundtrip_uses_defaults_with_no_fs_param_mirror(tmp_path):
 
 
 def test_version_bumped():
-	assert hpcp.version == '9.69'
+	assert hpcp.version == '9.70'
 	assert hpcp.__version__ == hpcp.version
-	assert hpcp.COMMIT_DATE == '2026-10-11'
+	assert hpcp.COMMIT_DATE == '2026-10-12'
 
 
 #%% -- Pre-existing -dd defects found while building the mirroring feature --
