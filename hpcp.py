@@ -5242,8 +5242,9 @@ def _remove_tree_around_mounts(path, mount_points=None):
 	"""Remove the directory tree at path as shutil.rmtree would, without entering a mount.
 
 	An entry that is a mount point in mountinfo (any entry: bind mounts and hidden mounts too), or a directory whose
-	st_dev differs from path's (a mount made after mountinfo was read), is left in place with everything below it,
-	and so are the directories above it; path itself too when it is a mount point. Symlinks are unlinked, never
+	st_dev differs from path's (a mount made after mountinfo was read, or a btrfs subvolume), is left in place with
+	everything below it, and so are the directories above it; path itself too when it is a mount point in mountinfo or
+	its st_dev differs from its parent's. Symlinks are unlinked, never
 	followed, and that holds for path itself: only its parent is resolved, so a path that is a symlink (or not a
 	directory) removes nothing and returns an error. The walk is iterative and keeps going after an error. Returns (the entries left in place as mount
 	points, relative to path; the errors met, as text).
@@ -5269,6 +5270,13 @@ def _remove_tree_around_mounts(path, mount_points=None):
 		return [], ['.: not a directory (a symlink?)']
 	top_dev = top_info.st_dev
 	if top in mount_points:
+		return ['.'], []
+	# A mount made on path itself after mountinfo was read (or a btrfs subvolume) is on another device than its parent.
+	try:
+		parent_dev = os.lstat(os.path.dirname(top)).st_dev
+	except OSError as e:
+		return [], [f'..: {e.strerror}']
+	if parent_dev != top_dev:
 		return ['.'], []
 	if not _DIR_FD_WALK:
 		return _remove_tree_by_path(top, top_dev, mount_points)
@@ -5411,7 +5419,7 @@ def _apply_rows(rows, volume_roots, target_root, max_workers=1, verbose=False, f
 					eprint(f'Remove directory failed: {row.path}: {error}')
 				if kept:
 					eprint(f"Remove directory failed: {row.path}: {', '.join(kept[:3])}{' ...' if len(kept) > 3 else ''} "
-						'is a mount point; left in place with the directories above it')
+						'is a mount point or another filesystem (a btrfs subvolume, say); left in place with the directories above it')
 				return
 			elif directory:
 				os.rmdir(path)
@@ -7163,7 +7171,8 @@ def _disk_write_hold(disk, devices, timeout=10):
 	holds its shared lock; then an O_EXCL open of every device, kept to the end, so nothing can mount or claim them
 	meanwhile. Raises DiskHoldError when disk cannot be opened or the lock or a hold cannot be taken (what was taken
 	is released). On exit the holds are closed first (the kernel cannot re-read a table whose partitions are open
-	exclusively), then the partition table is re-read, then the lock released (even when the re-read raises).
+	exclusively), then the partition table is re-read, only when the lock was taken (another tool's lock means the
+	table must be left alone), then the lock released (even when the re-read raises).
 	"""
 	import fcntl
 	try:
@@ -7171,11 +7180,13 @@ def _disk_write_hold(disk, devices, timeout=10):
 	except OSError as e:
 		raise DiskHoldError(e.errno, f'cannot open {disk} ({e.strerror})')
 	holds = {}
+	locked = False
 	try:
 		deadline = time.time() + timeout
 		while True:
 			try:
 				fcntl.flock(disk_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+				locked = True
 				break
 			except OSError as e:
 				if e.errno not in (errno.EWOULDBLOCK, errno.EAGAIN) or time.time() >= deadline:
@@ -7192,7 +7203,8 @@ def _disk_write_hold(disk, devices, timeout=10):
 			for fd in holds.values():
 				if fd is not None:
 					os.close(fd)
-			_reread_partition_table(disk_fd, disk)
+			if locked:
+				_reread_partition_table(disk_fd, disk)
 		finally:
 			# Closing the descriptor releases the lock.
 			os.close(disk_fd)

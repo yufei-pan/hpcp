@@ -2356,6 +2356,36 @@ def test_disk_write_hold_unlocks_when_the_reread_raises(tmp_path, hpcp_mod, monk
 		fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
 
 
+@pytest.mark.skipif(os.name == 'nt' or shutil.which('flock') is None, reason='needs flock(1)')
+def test_disk_write_hold_does_not_reread_a_disk_it_could_not_lock(tmp_path, hpcp_mod, monkeypatch):
+	"""Final review M1: while another process holds `flock -x` on the disk, the hold fails and the partition table is
+	not re-read on the way out (BLKRRPART / partx on a disk another tool locked is what the lock forbids)."""
+	disk = tmp_path / 'disk'
+	disk.write_bytes(b'')
+	rereads = []
+	monkeypatch.setattr(hpcp_mod, '_reread_partition_table', lambda disk_fd, path: rereads.append(path))
+	# The holder keeps the lock until its stdin closes.
+	holder = subprocess.Popen(['flock', '-x', str(disk), '-c', 'echo locked; exec cat'], stdin=subprocess.PIPE,
+		stdout=subprocess.PIPE)
+	try:
+		assert holder.stdout.readline() == b'locked\n'
+		with pytest.raises(hpcp_mod.DiskHoldError, match='cannot lock'):
+			with hpcp_mod._disk_write_hold(str(disk), [], timeout=0.3):
+				pass
+	finally:
+		holder.stdin.close()
+		try:
+			holder.wait(timeout=10)
+		except subprocess.TimeoutExpired:
+			holder.kill()
+			holder.wait()
+		holder.stdout.close()
+	assert rereads == []
+	with hpcp_mod._disk_write_hold(str(disk), [], timeout=0.3):
+		pass
+	assert rereads == [str(disk)]
+
+
 @pytest.mark.skipif(os.name == 'nt', reason='flock is POSIX')
 def test_disk_write_hold_reports_a_disk_it_cannot_open(tmp_path, hpcp_mod):
 	"""Fix round 1: a disk that cannot be opened is a DiskHoldError, which stops the write phase like a lost hold."""

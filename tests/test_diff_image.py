@@ -3147,6 +3147,60 @@ def test_remove_tree_around_mounts_stops_at_another_device(tmp_path, hpcp_mod, m
 	assert kept == ['late'] and errors == [] and (top / 'late' / 'keep').exists() and not (top / 'f').exists()
 
 
+@pytest.mark.parametrize('fd_walk', [True, False])
+def test_remove_tree_around_mounts_keeps_a_top_on_another_device_than_its_parent(tmp_path, hpcp_mod, monkeypatch, fd_walk):
+	"""Final review M2: a mount made on the path itself after mountinfo was read (or a btrfs subvolume as the path)
+	has another st_dev than its parent: it is kept like a path listed in mountinfo, and nothing is removed."""
+	monkeypatch.setattr(hpcp_mod, '_DIR_FD_WALK', fd_walk)
+	top = tmp_path / 'app'
+	_write(top / 'sub' / 'f', 'x')
+	_write(top / 'g', 'y')
+	parent = os.path.realpath(str(tmp_path))
+	real_lstat = os.lstat
+
+	def fake_lstat(path, *args, **kwargs):
+		info = real_lstat(path, *args, **kwargs)
+		if os.fspath(path) == parent:
+			values = list(info)
+			values[stat.ST_DEV] = info.st_dev + 1
+			return os.stat_result(values)
+		return info
+
+	monkeypatch.setattr(os, 'lstat', fake_lstat)
+	kept, errors = hpcp_mod._remove_tree_around_mounts(str(top), set())
+	monkeypatch.undo()
+	assert (kept, errors) == (['.'], [])
+	assert (top / 'sub' / 'f').read_text() == 'x' and (top / 'g').read_text() == 'y'
+
+
+def test_forced_removal_names_another_filesystem_it_kept(trees, hpcp_mod, tmp_path, monkeypatch):
+	"""Final review M3: a nested btrfs subvolume is not in mountinfo, but its st_dev differs, so the forced removal of
+	app/ keeps app/data; the error says it is a mount point or another filesystem."""
+	new, base = trees
+	vol = _app_dropped(hpcp_mod, tmp_path, new, base)
+	target = tmp_path / 'target'
+	_clone(base, target)
+	_write(target / 'app' / 'data' / 'precious', 'keep me')
+	monkeypatch.setattr(hpcp_mod, '_mountinfo_entries', lambda *args, **kwargs: [])
+	real_stat = os.stat
+
+	def fake_stat(path, *args, **kwargs):
+		info = real_stat(path, *args, **kwargs)
+		if os.fspath(path) == 'data' and kwargs.get('dir_fd') is not None:
+			values = list(info)
+			values[stat.ST_DEV] = info.st_dev + 1
+			return os.stat_result(values)
+		return info
+
+	monkeypatch.setattr(os, 'stat', fake_stat)
+	hpcp_mod.ERRORS.clear()
+	summary = hpcp_mod.apply_patch_tree([str(vol)], str(target), force=True, max_workers=1)
+	monkeypatch.undo()
+	assert (target / 'app' / 'data' / 'precious').read_text() == 'keep me' and summary['failed'] >= 1
+	assert ('Remove directory failed: app/: data is a mount point or another filesystem (a btrfs subvolume, say); left in '
+		'place with the directories above it') in hpcp_mod.ERRORS
+
+
 def test_remove_tree_around_mounts_refuses_a_directory_swapped_for_a_symlink(tmp_path, hpcp_mod, monkeypatch):
 	"""Security: sub is a real directory when the walk looks at it, a symlink to a directory outside by the time it
 	descends. The walk must not follow it; the outside file survives and an error is reported."""
