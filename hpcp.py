@@ -833,21 +833,26 @@ def get_largest_partition(disk):
 	"""
 	Get the largest partition on the disk.
 
+	lsblk is asked for full paths (-p): it names each node itself (cciss, by-id and device-mapper
+	nodes alike), so no path is built here from the kernel names.
+
 	Args:
 		disk (str): The disk name or path.
 
 	Returns:
 		str: The path of the largest partition on the disk.
 	"""
-	partitions = run_command_in_multicmd_with_path_check(["lsblk", '-nbl', '-o', 'NAME,SIZE',disk],strict=True)
+	partitions = run_command_in_multicmd_with_path_check(["lsblk", '-p', '-nbl', '-o', 'NAME,SIZE',disk],strict=True)
 	# sort by size
 	partitions = sorted(partitions, key=lambda x: int(x.split()[1]))
 	# Skip the first entry as it's the disk itself
 	largest_partition = partitions[-2].split()[0] if len(partitions) > 1 else partitions[-1].split()[0]
-	return _dev_path(largest_partition)
+	return largest_partition
 
 def get_partitions(disk):
 	"""Get all the partitions on the disk.
+
+	lsblk is asked for full paths (-p), so each partition's node is used as lsblk names it.
 
 	Args:
 		disk (str): The disk name or path.
@@ -856,9 +861,9 @@ def get_partitions(disk):
 		list: A list of partition paths.
 
 	"""
-	partitions = run_command_in_multicmd_with_path_check(["lsblk", '-nbl', '-o', 'NAME,SIZE',disk],strict=True)
+	partitions = run_command_in_multicmd_with_path_check(["lsblk", '-p', '-nbl', '-o', 'NAME,SIZE',disk],strict=True)
 	# Skip the first entry as it's the disk itself
-	partitions = [_dev_path(partition.split()[0]) for partition in partitions[1:]]
+	partitions = [partition.split()[0] for partition in partitions[1:]]
 	return partitions
 
 def get_fs_type(path):
@@ -1653,6 +1658,7 @@ def get_target_partition(image, partition_name):
 	This function handles both regular image files and block devices. If the input is an
 	image file, it creates a loop device first. It then identifies all partitions and
 	returns the path to the partition that matches the given partition name.
+	lsblk is asked for full paths (-p), so cciss, by-id and device-mapper nodes come back as they are named.
 	
 	Args:
 		image (str): Path to the disk image file or block device
@@ -1672,12 +1678,12 @@ def get_target_partition(image, partition_name):
 		loop_device = create_loop_device(image)
 		image = loop_device
 	# Need to get a partition path for mkfs
-	partitions = run_command_in_multicmd_with_path_check(["lsblk", '-nbl', '-o', 'NAME', image],strict=True)
+	partitions = run_command_in_multicmd_with_path_check(["lsblk", '-p', '-nbl', '-o', 'NAME', image],strict=True)
 	partitions.pop(0) # remove the disk itself
 	target_partition = ''
 	for part in partitions:
 		if part.endswith(partition_name):
-			target_partition = _dev_path(part.strip())
+			target_partition = part.strip()
 			break
 	return target_partition, loop_device
 

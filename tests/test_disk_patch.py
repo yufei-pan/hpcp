@@ -2734,26 +2734,53 @@ def test_disk_patch_writes_awkward_labels_names_and_exfat_serials_exactly(tmp_pa
 
 
 @pytest.mark.parametrize('disk, lsblk, partitions, largest', [
-	('/dev/cciss/c0d0', ['cciss!c0d0 1000', 'cciss!c0d0p1 400', 'cciss!c0d0p2 600'],
+	('/dev/cciss/c0d0', ['/dev/cciss/c0d0 1000', '/dev/cciss/c0d0p1 400', '/dev/cciss/c0d0p2 600'],
 		['/dev/cciss/c0d0p1', '/dev/cciss/c0d0p2'], '/dev/cciss/c0d0p2'),
-	('/dev/disk/by-id/ata-DISK', ['sda 1000', 'sda1 400', 'sda2 600'], ['/dev/sda1', '/dev/sda2'], '/dev/sda2'),
-	('/dev/loop7', ['loop7 1000', 'loop7p1 900'], ['/dev/loop7p1'], '/dev/loop7p1'),
+	('/dev/disk/by-id/ata-DISK', ['/dev/sda 1000', '/dev/sda1 400', '/dev/sda2 600'],
+		['/dev/sda1', '/dev/sda2'], '/dev/sda2'),
+	('/dev/loop7', ['/dev/loop7 1000', '/dev/loop7p1 900'], ['/dev/loop7p1'], '/dev/loop7p1'),
+	('/dev/mapper/mpatha', ['/dev/mapper/mpatha 1000', '/dev/mapper/mpatha1 400', '/dev/mapper/mpatha2 600'],
+		['/dev/mapper/mpatha1', '/dev/mapper/mpatha2'], '/dev/mapper/mpatha2'),
 ])
-def test_partition_paths_come_from_kernel_names(hpcp_mod, reset_hpcp_globals, monkeypatch, disk, lsblk, partitions, largest):
-	"""A '!' in a kernel name is a '/' under /dev (cciss), and a disk given by a by-id link still has its
-	partitions under /dev, not next to the link."""
-	monkeypatch.setattr(hpcp_mod, 'run_command_in_multicmd_with_path_check', lambda argv, **kwargs: list(lsblk))
+def test_partition_paths_come_from_lsblk_full_names(hpcp_mod, reset_hpcp_globals, monkeypatch, disk, lsblk, partitions, largest):
+	"""lsblk -p prints each node's full path (cciss, by-id and device-mapper alike), so those are used as they are."""
+	argvs = []
+	def fake_lsblk(argv, **kwargs):
+		argvs.append(argv)
+		return list(lsblk)
+	monkeypatch.setattr(hpcp_mod, 'run_command_in_multicmd_with_path_check', fake_lsblk)
 	assert hpcp_mod.get_partitions(disk) == partitions
 	assert hpcp_mod.get_largest_partition(disk) == largest
+	assert all('-p' in argv for argv in argvs)
 
 
-def test_target_partition_maps_cciss_names(hpcp_mod, reset_hpcp_globals, monkeypatch):
+def test_target_partition_uses_lsblk_full_names(hpcp_mod, reset_hpcp_globals, monkeypatch):
+	argvs = []
+	def fake_lsblk(argv, **kwargs):
+		argvs.append(argv)
+		return ['/dev/cciss/c0d0', '/dev/cciss/c0d0p1', '/dev/cciss/c0d0p2']
 	monkeypatch.setattr(hpcp_mod, 'create_loop_device', lambda image: '/dev/cciss/c0d0')
-	monkeypatch.setattr(hpcp_mod, 'run_command_in_multicmd_with_path_check',
-		lambda argv, **kwargs: ['cciss!c0d0', 'cciss!c0d0p1', 'cciss!c0d0p2'])
+	monkeypatch.setattr(hpcp_mod, 'run_command_in_multicmd_with_path_check', fake_lsblk)
 	assert hpcp_mod.get_target_partition('/tmp/not-a-device.img', '2') == ('/dev/cciss/c0d0p2', '/dev/cciss/c0d0')
+	assert '-p' in argvs[0]
 
 
 def test_dev_path(hpcp_mod):
 	assert hpcp_mod._dev_path('cciss!c0d0p1') == '/dev/cciss/c0d0p1'
 	assert hpcp_mod._dev_path('nvme0n1p2') == '/dev/nvme0n1p2'
+
+
+@requires_root_and_disk_tools
+@pytest.mark.root
+@pytest.mark.loop
+def test_lsblk_partition_paths_exist_on_a_real_loop_disk(tmp_path, hpcp_mod, reset_hpcp_globals):
+	"""On a real attached GPT disk, get_partitions and get_largest_partition return nodes that exist."""
+	image = tmp_path / 'disk.img'
+	with open(str(image), 'wb') as f:
+		f.truncate(64 << 20)
+	_run('sgdisk', '-n1:2048:+16M', '-n2:0:+24M', image)
+	with _attached(image, read_only=True) as loop:
+		paths = hpcp_mod.get_partitions(loop)
+		assert paths == [loop + 'p1', loop + 'p2']
+		assert all(os.path.exists(path) for path in paths)
+		assert hpcp_mod.get_largest_partition(loop) == loop + 'p2'
