@@ -80,8 +80,8 @@ This ships as hpcp 9.71. 9.68–9.71 are not on PyPI; publishing needs the user'
    physical-to-logical path mapping, so the base side, which today walks excluded directories and filters them
    afterwards, skips them too.
 7. **Compatibility.** `*/…` patterns still match inside a mounted filesystem. Two kinds of pattern change, both
-   written against hpcp's temporary mount path (`-diff` first shipped in 9.67, so only 9.67–9.70 are affected):
-   - patterns that named the path under it, such as `/tmp/*/var/log/*` or `/tmp/tmp*/…`, matched in 9.67–9.70 and now
+   written against hpcp's temporary mount path (`-diff` first shipped in 9.65, so only 9.65–9.70 are affected):
+   - patterns that named the path under it, such as `/tmp/*/var/log/*` or `/tmp/tmp*/…`, matched in 9.65–9.70 and now
      match nothing: write them as `/…` paths inside the filesystem (`/var/log/*`);
    - a pattern that matched the temporary path itself (`*/tmp/*`, `/tmp/*`) and so excluded the whole filesystem now
      matches only inside it.
@@ -184,11 +184,11 @@ runs only for the rows below.
 
 ## Compatibility
 
-- Patch formats are unchanged. Patches made by 9.67–9.70 apply as before.
+- Patch formats are unchanged. Patches made by 9.65–9.70 apply as before.
 - `-e` on mounted sources:
   - `*/…` patterns behave as before;
   - `/`-anchored patterns that used to match nothing now match inside the filesystem;
-  - patterns written against the temporary mount path (`/tmp/*/var/log/*`, `/tmp/tmp*/…`) matched in 9.67–9.70 and
+  - patterns written against the temporary mount path (`/tmp/*/var/log/*`, `/tmp/tmp*/…`) matched in 9.65–9.70 and
     now match nothing;
   - a pattern that matched hpcp's temporary mount path itself (`*/tmp/*`, `/tmp/*`), and so excluded the whole
     filesystem, now matches only inside it.
