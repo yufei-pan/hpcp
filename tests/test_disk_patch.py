@@ -1473,14 +1473,19 @@ def _cross_section_disk_patch(hpcp_mod, tmp_path, monkeypatch, delete_in, payloa
 def test_skipped_write_a_delete_in_another_section_took_away_is_restored(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch,
 		delete_in):
 	"""Final review C1, disk sections: a delete in one section removes the file the other skipped as already present;
-	after every section ran, the skipped write is restored from its own section's payload, under its own root."""
+	after every section ran, the skipped write is restored from its own section's payload, under its own root, and
+	the delete, verified again, fails (a contradictory patch stays loud), stopping raw areas and identity changes."""
 	volume, root1 = _cross_section_disk_patch(hpcp_mod, tmp_path, monkeypatch, delete_in)
 	summary = hpcp_mod.apply_disk_patch([volume], str(tmp_path / 'node.img'), [], [])
 	added_in = 'part1' if delete_in == 'part3' else 'part3'
-	assert summary['failed'] == 0 and hpcp_mod.ERRORS == []
+	deleted = 'y/f' if delete_in == 'part3' else 'x/f'
 	assert (summary['sections'][delete_in]['deleted'], summary['sections'][added_in]['restored']) == (1, 1)
 	assert summary['sections'][added_in]['skipped'] == 0
+	assert summary['sections'][delete_in]['failed'] == 1 and summary['failed'] == 1
 	assert (root1 / 'x' / 'f').read_text() == 'moved'
+	assert hpcp_mod.ERRORS[0].startswith(f'Patch verify error: D {deleted}: expected -')
+	assert hpcp_mod.ERRORS[1] == (f'Patch verify error: stopping: section {delete_in} failed; raw areas, boot code and '
+		'identity changes were not applied; fix the cause and re-run') and len(hpcp_mod.ERRORS) == 2
 
 
 def test_failed_restore_across_sections_stops_raw_areas_and_identity(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):

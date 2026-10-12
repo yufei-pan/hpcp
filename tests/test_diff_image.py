@@ -2145,7 +2145,7 @@ def test_restore_across_sections_does_not_retry_a_failed_sections_own_restore(tm
 	plan = hpcp_mod._plan_section('root', rows, [str(vol)], str(target), True, False, 1)
 	outcome = {}
 	summary = hpcp_mod._apply_section(plan, 1, False, False, True, outcome)
-	assert outcome == {'removed': True, 'restored': [rows[1]]}
+	assert (outcome['removed'], outcome['restored']) == (True, [rows[1]])
 	hpcp_mod._restore_across_sections([(plan, summary, outcome)], 1, False, False, True)
 	assert (summary['restored'], summary['failed']) == (1, 1)
 	assert len([error for error in hpcp_mod.ERRORS if error.startswith('Incomplete patch')]) == 1
@@ -2412,9 +2412,10 @@ def test_apply_stops_after_a_scope_that_failed(trees, hpcp_mod, tmp_path, reset_
 	assert any(error.startswith('Patch verify error: stopping: scope root failed') for error in hpcp_mod.ERRORS)
 
 
-def _cross_scope_move(hpcp_mod, monkeypatch, tmp_path, new, base, into_mount):
-	"""The golden moves y/f to m/x/f (into_mount) or back; the node has y -> m/x, so both names are one file, and m is
-	a mount below the target. The delete applies in one scope, the add is skipped as already present in the other."""
+def _cross_scope_move(hpcp_mod, tmp_path, new, base, into_mount):
+	"""The golden moves y/f to m/x/f (into_mount) or back. Returns (volume, the deleted key, make_target):
+	make_target(name) clones the node, where y -> m/x makes both names one file. With m mounted below the target,
+	the delete applies in one scope and the add is skipped as already present in the other."""
 	moved, kept = ('m/x/f', 'y/f') if into_mount else ('y/f', 'm/x/f')
 	(new / 'y').mkdir()
 	(new / 'm' / 'x').mkdir(parents=True)
@@ -2425,36 +2426,50 @@ def _cross_scope_move(hpcp_mod, monkeypatch, tmp_path, new, base, into_mount):
 	vol = tmp_path / 'vol'
 	rows, _ = _patch_from(hpcp_mod, new, base, [vol])
 	assert _ops(rows) == {('D', kept), ('A', moved)}
-	target = tmp_path / 'target'
-	_clone(base, target)
-	(target / kept).unlink()
-	(target / 'y').rmdir()
-	_write(target / 'm' / 'x' / 'f', 'moved')
-	os.symlink(os.path.join('m', 'x'), str(target / 'y'))
-	_fake_mounts(hpcp_mod, monkeypatch, (target, 'ext4'), (target / 'm', 'ext4'))
-	return vol, target
+
+	def make_target(name):
+		target = tmp_path / name
+		_clone(base, target)
+		(target / kept).unlink()
+		(target / 'y').rmdir()
+		_write(target / 'm' / 'x' / 'f', 'moved')
+		os.symlink(os.path.join('m', 'x'), str(target / 'y'))
+		return target
+
+	return vol, kept, make_target
+
+
+def _apply_on_scopes(hpcp_mod, monkeypatch, vol, target, mounts):
+	"""Apply vol to target with mountinfo listing the target and each of mounts (keys below it) as ext4 mounts."""
+	_fake_mounts(hpcp_mod, monkeypatch, (target, 'ext4'), *[(target / mount, 'ext4') for mount in mounts])
+	hpcp_mod.ERRORS.clear()
+	return hpcp_mod.apply_patch_tree([str(vol)], str(target), max_workers=1)
 
 
 @pytest.mark.parametrize('into_mount', [True, False])
 def test_skipped_write_a_delete_in_another_scope_took_away_is_restored(trees, hpcp_mod, tmp_path, reset_hpcp_globals,
 		monkeypatch, into_mount):
 	"""Final review C1: D y/f in the target's own scope removes m/x/f, which scope m/ skipped as already present (or
-	the reverse). The repair step of one scope never sees the other's removals; after every scope ran, the skipped
-	write is restored with its own scope's settings."""
+	the reverse). The skipped write is restored with its own scope's settings once every scope ran, and the delete,
+	verified again after that, fails: the patch is contradictory on this node and stays loud, exactly as when the
+	same patch is applied to a single scope."""
 	new, base = trees
-	vol, target = _cross_scope_move(hpcp_mod, monkeypatch, tmp_path, new, base, into_mount)
-	summary = hpcp_mod.apply_patch_tree([str(vol)], str(target), max_workers=1)
-	assert (summary['deleted'], summary['restored'], summary['skipped'], summary['failed']) == (1, 1, 0, 0)
-	assert hpcp_mod.ERRORS == []
-	assert (target / 'm' / 'x' / 'f').read_text() == 'moved'
-	assert os.path.islink(str(target / 'y'))
+	vol, kept, make_target = _cross_scope_move(hpcp_mod, tmp_path, new, base, into_mount)
+	summaries = []
+	for name, mounts in (('target', ['m']), ('single', [])):
+		target = make_target(name)
+		summaries.append(_apply_on_scopes(hpcp_mod, monkeypatch, vol, target, mounts))
+		assert (target / 'm' / 'x' / 'f').read_text() == 'moved' and os.path.islink(str(target / 'y'))
+		assert len(hpcp_mod.ERRORS) == 1 and hpcp_mod.ERRORS[0].startswith(f'Patch verify error: D {kept}: expected -')
+	assert summaries[0] == summaries[1]
+	assert (summaries[0]['deleted'], summaries[0]['restored'], summaries[0]['skipped'], summaries[0]['failed']) == (1, 1, 0, 1)
 
 
 def test_cross_scope_restore_runs_after_a_scope_that_failed(trees, hpcp_mod, tmp_path, reset_hpcp_globals, monkeypatch):
 	"""Scope m/ deletes m/x/f, which the target's own scope skipped as y/f, and then fails: the loop stops, but the
-	skipped write is still restored."""
+	skipped write is still restored and the delete verified again."""
 	new, base = trees
-	vol, target = _cross_scope_move(hpcp_mod, monkeypatch, tmp_path, new, base, into_mount=False)
+	vol, _, make_target = _cross_scope_move(hpcp_mod, tmp_path, new, base, into_mount=False)
 	real_apply_section = hpcp_mod._apply_section
 	def apply_section(plan, *args):
 		summary = real_apply_section(plan, *args)
@@ -2463,10 +2478,58 @@ def test_cross_scope_restore_runs_after_a_scope_that_failed(trees, hpcp_mod, tmp
 			summary['failed'] = 1
 		return summary
 	monkeypatch.setattr(hpcp_mod, '_apply_section', apply_section)
-	summary = hpcp_mod.apply_patch_tree([str(vol)], str(target), max_workers=1)
-	assert (summary['restored'], summary['failed']) == (1, 1)
+	target = make_target('target')
+	summary = _apply_on_scopes(hpcp_mod, monkeypatch, vol, target, ['m'])
+	assert (summary['restored'], summary['failed']) == (1, 2)
 	assert (target / 'm' / 'x' / 'f').read_text() == 'moved'
-	assert hpcp_mod.ERRORS == ['Patch verify error: simulated failure']
+	assert hpcp_mod.ERRORS[0] == 'Patch verify error: simulated failure'
+	assert hpcp_mod.ERRORS[1].startswith('Patch verify error: D m/x/f: expected -') and len(hpcp_mod.ERRORS) == 2
+
+
+def test_writes_in_two_scopes_that_reach_one_entry_fail_at_verify(trees, hpcp_mod, tmp_path, reset_hpcp_globals, monkeypatch):
+	"""The golden holds y/f and m/x/f with different content; on the node y -> m/x makes them one file. The scope
+	written first was verified before the other replaced its file; the final pass sees that the entry changed,
+	verifies it again and fails, as on a single scope."""
+	new, base = trees
+	_write(new / 'y' / 'f', 'from the root scope')
+	_write(new / 'm' / 'x' / 'f', 'from the mount scope')
+	(base / 'y').mkdir()
+	(base / 'm' / 'x').mkdir(parents=True)
+	vol = tmp_path / 'vol'
+	rows, _ = _patch_from(hpcp_mod, new, base, [vol])
+	assert _ops(rows) == {('A', 'y/f'), ('A', 'm/x/f')}
+	summaries = []
+	for name, mounts in (('target', ['m']), ('single', [])):
+		target = tmp_path / name
+		_clone(base, target)
+		(target / 'y').rmdir()
+		os.symlink(os.path.join('m', 'x'), str(target / 'y'))
+		summaries.append(_apply_on_scopes(hpcp_mod, monkeypatch, vol, target, mounts))
+		assert len(hpcp_mod.ERRORS) == 1 and hpcp_mod.ERRORS[0].startswith('Patch verify error: A ')
+	assert summaries[0] == summaries[1]
+	assert (summaries[0]['added'], summaries[0]['failed']) == (2, 1)
+
+
+def test_ordinary_multi_scope_apply_passes_the_final_verify(trees, hpcp_mod, tmp_path, reset_hpcp_globals, monkeypatch):
+	"""Deletes, adds and changes in the target's own scope and a vfat mount below it, without aliases: the final
+	pass finds nothing to report."""
+	new, base = trees
+	for prefix in ('', 'boot/efi/'):
+		_write(new / prefix / 'changed', 'new')
+		_write(base / prefix / 'changed', 'old')
+		_write(base / prefix / 'gone' / 'f', 'bye')
+		_write(new / prefix / 'added' / 'f', 'hello')
+	vol = tmp_path / 'vol'
+	rows, _ = _patch_from(hpcp_mod, new, base, [vol])
+	target = tmp_path / 'target'
+	_clone(base, target)
+	_fake_mounts(hpcp_mod, monkeypatch, (target, 'ext4'), (target / 'boot' / 'efi', 'vfat'))
+	summary = hpcp_mod.apply_patch_tree([str(vol)], str(target), max_workers=1)
+	assert (summary['deleted'], summary['added'], summary['modified'], summary['failed']) == (4, 4, 2, 0)
+	assert hpcp_mod.ERRORS == []
+	for prefix in ('', 'boot/efi/'):
+		assert (target / prefix / 'changed').read_text() == 'new' and (target / prefix / 'added' / 'f').read_text() == 'hello'
+		assert not (target / prefix / 'gone').exists()
 
 
 @pytest.mark.parametrize('new_type, base_type, rows', [('vfat', 'ext4', 0), ('ext4', 'exfat', 0), ('ext4', 'ext4', 1)])
