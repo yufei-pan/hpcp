@@ -3863,7 +3863,7 @@ def test_recheck_without_a_window_hashes_every_live_row(trees, hpcp_mod, tmp_pat
 	assert _scan_and_build(hpcp_mod, new, base, tmp_path, monkeypatch) == ['a.txt']
 
 
-def _store_layout_recheck(hpcp_mod, monkeypatch, tmp_path, entries):
+def _store_layout_recheck(hpcp_mod, monkeypatch, tmp_path, entries, fresh=False):
 	"""A row of a store-layout scan ('/' as new_base) whose source is spelled through a symlinked directory, with a stale scan stat.
 	Returns the rows _rows_to_recheck picks."""
 	real = tmp_path / 'real' / 'u'
@@ -3873,7 +3873,7 @@ def _store_layout_recheck(hpcp_mod, monkeypatch, tmp_path, entries):
 	os.symlink(str(tmp_path / 'real'), str(link))
 	key = os.path.relpath(str(link / 'u' / 'f'), '/')
 	st = os.lstat(str(real / 'f'))
-	stale = (st.st_dev, st.st_ino, st.st_size + 1, st.st_mtime_ns, st.st_ctime_ns)
+	stale = (st.st_dev, st.st_ino, st.st_size + (0 if fresh else 1), st.st_mtime_ns, st.st_ctime_ns)
 	monkeypatch.setattr(hpcp_mod, '_mountinfo_entries', lambda *args, **kwargs: [dict(entry) for entry in entries])
 	monkeypatch.setattr(hpcp_mod, '_racy_window_ns', lambda: 0)
 	row = hpcp_mod.ChangeRow('A', key, '-', hpcp_mod.get_entry_state(str(real / 'f')))
@@ -3895,5 +3895,25 @@ def test_recheck_judges_a_store_layout_row_by_the_filesystem_holding_its_file_no
 
 def test_recheck_hashes_a_store_layout_row_whose_symlink_target_is_on_fat(tmp_path, hpcp_mod, monkeypatch):
 	entries = [_entry('/', 'ext4', ['rw']), _entry(os.path.realpath(str(tmp_path / 'real')), 'vfat', ['rw'])]
-	picked, row = _store_layout_recheck(hpcp_mod, monkeypatch, tmp_path, entries)
+	picked, row = _store_layout_recheck(hpcp_mod, monkeypatch, tmp_path, entries, fresh=True)
 	assert picked == [row]
+
+
+@pytest.mark.parametrize('root, file_mount, fresh', [
+	(_entry('/', 'erofs', ['ro']), ('ext4', ['rw']), False),
+	(_entry('/', 'ext4', ['rw']), ('tmpfs', ['rw']), True),
+])
+def test_recheck_judges_a_row_by_a_mount_on_the_file_itself(tmp_path, hpcp_mod, monkeypatch, root, file_mount, fresh):
+	"""A bind mount of one file (/etc/machine-id from a tmpfs, /etc/hosts of a container) holds that file."""
+	(tmp_path / 'etc').mkdir()
+	(tmp_path / 'etc' / 'machine-id').write_text('x')
+	source = os.path.join(os.path.realpath(str(tmp_path / 'etc')), 'machine-id')
+	st = os.lstat(source)
+	key = os.path.relpath(source, '/')
+	entries = [dict(root), _entry(source, *file_mount)]
+	monkeypatch.setattr(hpcp_mod, '_mountinfo_entries', lambda *args, **kwargs: [dict(entry) for entry in entries])
+	monkeypatch.setattr(hpcp_mod, '_racy_window_ns', lambda: 0)
+	row = hpcp_mod.ChangeRow('A', key, '-', hpcp_mod.get_entry_state(source))
+	scan = {'started_ns': st.st_ctime_ns + 10 ** 9,
+		'stats': {key: (st.st_dev, st.st_ino, st.st_size + (0 if fresh else 1), st.st_mtime_ns, st.st_ctime_ns)}}
+	assert hpcp_mod._rows_to_recheck([row], '/', scan) == [row]

@@ -4659,27 +4659,34 @@ def _rows_to_recheck(rows, new_base, scan):
 	a row whose source may have changed since the scan read it: its filesystem is not in _TRUSTED_CTIME_FS, the scan
 	(compute_changes' scan dict) has no stat for it, its scan-time ctime lies within _racy_window_ns of the scan's
 	start or later (any ctime when the window is None), or its lstat now differs from the scan's. A row's filesystem
-	is the visible mount holding the real path of its source's parent directory, not the one holding the spelled
-	path: a key can be spelled through a symlink (store layout)."""
+	is the visible mount whose mount point is its source file itself (a bind of one file), else the deepest visible
+	mount holding the real path of its source's parent directory; not the one holding the spelled path: a key can
+	be spelled through a symlink (store layout)."""
 	entries = _mountinfo_entries()
 	hidden = _hidden_mounts(entries)
 	visible = [(entry['mount_point'].rstrip(os.sep) + os.sep, entry) for index, entry in enumerate(entries) if index not in hidden]
 	scan = scan or {}
 	stats, started = scan.get('stats', {}), scan.get('started_ns')
 	window = _racy_window_ns()
+	points = {}
+	for point, entry in visible:
+		points[point.rstrip(os.sep)] = entry
 	holders = {}
-	def holder(directory):
+	def holder(source):
+		# A mount on the file itself (a bind of one file) holds it; else the deepest mount holding its directory.
+		directory, name = os.path.split(source)
 		if directory not in holders:
 			inside, found, depth = os.path.realpath(directory).rstrip(os.sep) + os.sep, None, -1
 			for point, entry in visible:
 				if inside.startswith(point) and len(point) >= depth:
 					found, depth = entry, len(point)
-			holders[directory] = found
-		return holders[directory]
+			holders[directory] = (found, os.path.realpath(directory).rstrip(os.sep))
+		found, real_directory = holders[directory]
+		return points.get(real_directory + os.sep + name, found)
 	recheck = []
 	for row in rows:
 		source = _key_path(new_base, row.path)
-		entry = holder(os.path.dirname(source))
+		entry = holder(source)
 		if entry is not None and 'ro' in entry.get('super_options', ()):
 			continue
 		before = stats.get(row.path)
