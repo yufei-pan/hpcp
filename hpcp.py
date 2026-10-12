@@ -7113,20 +7113,54 @@ def _mount_partition(device, read_only, mount_points, entries):
 		return None
 	return mount_point + os.sep
 
-def _partition_changes(new_root, old_root, mount_points, live_mounts, exclude, full_hash, max_workers, parallel_file_listing,
+def _live_excludes(root, device, paths, entries):
+	"""Rooted exclude patterns (see _rooted_excludes) for the paths (this run's mount points and input disk images)
+	that a live mount of device shows, as they lie in what hpcp's own mount of device at root shows.
+
+	A live mount M of the device may show the whole filesystem, a btrfs subvolume (Fedora mounts / from subvolume
+	root) or a bound directory: its mountinfo root R says which. A path P below M is R + P's path below M in the
+	filesystem's own terms; it is excluded as its path below the root R0 hpcp's own mount shows (mountinfo root of
+	root's mount), when it lies there. Entries of other devices, hpcp's own mount and this run's other mounts (the
+	paths themselves) are not live mounts. Empty when root is not a mount point in entries."""
+	root_real = os.path.realpath(root)
+	own = next((entry for entry in entries if entry['mount_point'] == root_real), None)
+	if own is None or not device:
+		return set()
+	own_root = own['root']
+	devnum = _device_number(device)
+	reals = [os.path.realpath(path) for path in paths]
+	skip = set(reals) | {root_real}
+	patterns = set()
+	for entry in entries:
+		point = entry['mount_point']
+		if point in skip or not _entry_matches(entry, devnum, device):
+			continue
+		point_inside = point.rstrip(os.sep) + os.sep
+		for real in reals:
+			if not real.startswith(point_inside):
+				continue
+			inside = os.path.normpath(os.path.join(entry['root'], os.path.relpath(real, point)))
+			if own_root != os.sep and not inside.startswith(own_root.rstrip(os.sep) + os.sep):
+				continue
+			patterns.add(glob.escape(os.sep + os.path.relpath(inside, own_root)))
+	return patterns
+
+def _partition_changes(new_root, old_root, mount_points, devices, exclude, full_hash, max_workers, parallel_file_listing,
 		input_files=(), metadata=True, fat=False, scan=None):
 	"""Change rows of one filesystem partition (root to root; lost+found, this run's mounts and
 	its input disk-image files left out). exclude is matched against '/' + the path inside the partition's filesystem
 	(build_rooted_maps). metadata False: content-only rows (see states_equal).
 	fat: a FAT section, its files hashed in full (see compute_changes).
+	devices: (new device, old device) of the partition, whose live mounts may show this run's paths (see _live_excludes); () when there are none.
 	scan: compute_changes' scan dict (see _rows_to_recheck).
 	Names are compared by exact case in every section: a case-only rename is a delete plus an add."""
 	internal = _inside_excludes(mount_points, (new_root, old_root))
-	for live_mount in live_mounts:
-		if live_mount:
-			# A live filesystem holds the (empty) directories of this run's other temp mount points,
-			# and may hold the disk images this run compares (the old golden image on the new golden).
-			internal |= _inside_excludes(list(mount_points) + list(input_files), (live_mount,))
+	# A live mount of the partition (the whole filesystem, a btrfs subvolume or a bound directory) holds the (empty)
+	# directories of this run's other temp mount points, and may hold the disk images this run compares (the old
+	# golden image on the new golden). mountinfo is read now: hpcp's own mounts of both sides exist.
+	entries = _mountinfo_entries() if devices else []
+	for root, device in zip((new_root, old_root), devices):
+		internal |= _live_excludes(root, device, list(mount_points) + list(input_files), entries)
 	new_map, base_map = build_rooted_maps(new_root, old_root, frozenset(exclude or ()) | internal, max_workers, parallel_file_listing)
 	new_map, base_map = _drop_lost_found(new_map), _drop_lost_found(base_map)
 	if any(_is_reserved_key(key) for key in new_map):
@@ -7266,9 +7300,8 @@ def process_get_disk_diff_image(src_paths, dest_paths, output, mount_points, loo
 			new_root = _mount_partition(new_part['device'], True, mount_points, entries)
 			old_root = _mount_partition(old_part['device'], True, mount_points, entries)
 			if new_root and old_root:
-				lives = [_live_mount(_device_number(part['device']), entries, part['device'])[0] for part in (new_part, old_part)]
 				scan = {}
-				rows = _partition_changes(new_root, old_root, mount_points, lives, exclude, full_hash, max_workers, parallel_file_listing,
+				rows = _partition_changes(new_root, old_root, mount_points, (new_part['device'], old_part['device']), exclude, full_hash, max_workers, parallel_file_listing,
 					input_files, metadata=_has_posix_metadata(new_part['fs_type']),
 					fat=_is_fat(new_part['fs_type']) or _is_fat(old_part['fs_type']), scan=scan)
 				_release_mount(old_root, mount_points)

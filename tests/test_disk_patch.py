@@ -1169,6 +1169,80 @@ def test_input_disk_image_on_a_live_partition_stays_out_of_the_patch(tmp_path, h
 	assert 'root/' in paths and ('M', 'etc/os-release') in {(row.op, row.path) for row in part3}
 
 
+def _mount_entry(mount_point, root='/', devnum=(8, 3), source='/dev/sda3'):
+	return {'mount_point': mount_point, 'root': root, 'devnum': devnum, 'source': source, 'fstype': 'btrfs',
+		'options': ['rw'], 'super_options': ['rw']}
+
+
+@pytest.mark.parametrize('own_root, live, paths, expected', [
+	# Fedora: subvolume /root mounted at /, hpcp's own mount shows the top level.
+	('/', [('/', '/root')], ['/nx/golden-v1.img', '/nx/tmp/tmpab'], {'/root/nx/golden-v1.img', '/root/nx/tmp/tmpab'}),
+	# hpcp's own mount shows subvolume /root itself (a default subvolume set to it).
+	('/root', [('/', '/root')], ['/nx/golden-v1.img'], {'/nx/golden-v1.img'}),
+	# A bind of a subdirectory; a path outside every live mount of the device maps to nothing.
+	('/', [('/nx-srv', '/data')], ['/nx-srv/x.img', '/nx-elsewhere/y.img'], {'/data/x.img'}),
+	# The whole filesystem live (the case before 9.72).
+	('/', [('/nx-live', '/')], ['/nx-live/a.img'], {'/a.img'}),
+	# A live path outside what hpcp's own mount shows.
+	('/home', [('/', '/root')], ['/nx/x.img'], set()),
+	# Review Focus 3: this run's own temp mount of the same device is no live mount to map through.
+	('/', [('/nx-run/tmpzz', '/')], ['/nx-run/tmpzz', '/nx-run/tmpzz/a.img'], set()),
+])
+def test_live_excludes_map_paths_through_mount_roots(hpcp_mod, monkeypatch, own_root, live, paths, expected):
+	"""Spec Part 1 item 2: a path below a live mount M showing root R is R + its path below M in the filesystem's own
+	terms; it is excluded relative to the root hpcp's own mount shows. Paths are under /nx* (nonexistent), so
+	realpath leaves them as they are."""
+	import glob as _glob
+	own = '/nx-own'
+	entries = ([_mount_entry(own, own_root)] + [_mount_entry(point, root) for point, root in live]
+		+ [_mount_entry('/nx-other', '/', devnum=(7, 1), source='/dev/loop1')])
+	monkeypatch.setattr(hpcp_mod, '_device_number', lambda device: (8, 3))
+	assert hpcp_mod._live_excludes(own, '/dev/sda3', paths, entries) == {_glob.escape(path) for path in expected}
+
+
+def test_live_excludes_without_an_own_mount_entry_is_empty(hpcp_mod, monkeypatch):
+	monkeypatch.setattr(hpcp_mod, '_device_number', lambda device: (8, 3))
+	assert hpcp_mod._live_excludes('/nx-not-mounted', '/dev/sda3', ['/nx/a.img'], [_mount_entry('/', '/root')]) == set()
+
+
+@requires_root_and_disk_tools
+@pytest.mark.root
+@pytest.mark.loop
+@pytest.mark.skipif(shutil.which('mkfs.btrfs') is None or shutil.which('btrfs') is None, reason='needs btrfs-progs')
+def test_input_disk_image_under_a_live_btrfs_subvolume_stays_out_of_the_patch(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	"""Spec Part 1 item 2: a Fedora-style root (btrfs subvolume 'root' mounted live) holding the old golden image and
+	this run's temp directories: none of them lands in the patch."""
+	if not hpcp_mod._btrfs_temp_fsid_supported():
+		pytest.skip('mounting the old copy next to the live one (same fsid) needs btrfs temp_fsid (kernel 6.7+)')
+	old, new, out = tmp_path / 'old.img', tmp_path / 'new.img', str(tmp_path / 'patch.img')
+	with open(str(old), 'wb') as f:
+		f.truncate(320 << 20)
+	_run('sgdisk', '-n1:2048:+300M', '-t1:8300', '-c1:root', old)
+	with _attached(old) as loop:
+		_run('mkfs.btrfs', '-q', '-f', loop + 'p1')
+		with _mounted(loop + 'p1') as top:
+			_run('btrfs', 'subvolume', 'create', os.path.join(top, 'root'))
+			_write(os.path.join(top, 'root', 'etc', 'os-release'), b'v1')
+	shutil.copyfile(str(old), str(new))
+	with _attached(new) as loop:
+		with _mounted(loop + 'p1', options='subvol=root') as live_root:
+			_write(os.path.join(live_root, 'etc', 'os-release'), b'v2')
+			inside = os.path.join(live_root, 'root', 'golden-v1.img')
+			os.makedirs(os.path.dirname(inside))
+			_run('cp', '--sparse=always', old, inside)
+			temp_dir = os.path.join(live_root, 'tmp')
+			os.makedirs(temp_dir)
+			monkeypatch.setattr(tempfile, 'tempdir', temp_dir)
+			with _session(hpcp_mod) as (mount_points, loop_devices):
+				assert hpcp_mod.process_get_disk_diff_image([loop], [inside], out, mount_points, loop_devices, max_workers=1) == out
+			monkeypatch.setattr(tempfile, 'tempdir', None)
+	_, part1 = _read_part3_patch(hpcp_mod, out, section='part1')
+	paths = {row.path for row in part1}
+	assert ('M', 'root/etc/os-release') in {(row.op, row.path) for row in part1}
+	assert 'root/root/golden-v1.img' not in paths
+	assert [path for path in paths if path.startswith('root/tmp/') and path != 'root/tmp/'] == []
+
+
 @requires_root_and_disk_tools
 @pytest.mark.root
 @pytest.mark.loop
