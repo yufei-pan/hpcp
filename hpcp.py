@@ -5349,6 +5349,9 @@ def _preflight_section(plan):
 def _apply_section(plan, max_workers, verbose, full_hash, compare_hash, outcome=None):
 	"""Apply a checked section and verify it (with the rows the repair step restored); returns its summary.
 
+	Verify also covers each skipped A / M row whose name differs only by case (_fold_name) from a written or restored
+	A / M row: on a case-insensitive filesystem, recognised or not, that write lands on the entry the skipped row
+	found already done (a golden from a case-sensitive filesystem holding both names), which then fails loudly.
 	outcome: a dict that receives 'removed' (True when a removal took anything away) and 'restored' (the rows the
 	repair step wrote again), for _restore_across_sections.
 	"""
@@ -5357,7 +5360,14 @@ def _apply_section(plan, max_workers, verbose, full_hash, compare_hash, outcome=
 	skipped = [check.row for check in plan.checks if check.action == 'skip' and check.row.op != 'D']
 	restored, removed = _apply_rows(todo, plan.volume_roots, plan.target_root, max_workers, verbose, full_hash,
 		forced_rows=[check.row for check in conflicts], metadata=plan.metadata, skipped=skipped)
-	failed = _verify_rows(todo + restored, plan.target_root, compare_hash, full_hash, max_workers, plan.metadata)
+	written = {}
+	for row in todo + restored:
+		if row.op != 'D':
+			written.setdefault(_fold_name(row.path.rstrip('/')), set()).add(row.path.rstrip('/'))
+	restored_rows = set(restored)
+	siblings = [row for row in skipped if row not in restored_rows
+		and written.get(_fold_name(row.path.rstrip('/')), set()) - {row.path.rstrip('/')}]
+	failed = _verify_rows(todo + restored + siblings, plan.target_root, compare_hash, full_hash, max_workers, plan.metadata)
 	if outcome is not None:
 		outcome.update(removed=bool(removed), restored=restored)
 	return {

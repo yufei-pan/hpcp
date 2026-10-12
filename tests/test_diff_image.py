@@ -2684,3 +2684,60 @@ def test_replacing_a_file_on_vfat_keeps_its_fat_attributes(tmp_path, hpcp_mod, r
 
 	_change_image(hpcp_mod, node, read)
 	assert seen['data'] == 'new loader' and seen['attrs'] & 0x07 == 0x07
+
+
+def _case_siblings(hpcp_mod, tmp_path, new, base):
+	"""The golden (a case-sensitive tree) holds EFI/X = NEW and EFI/x = old; the base EFI/X = old: rows M EFI/X and
+	A EFI/x. Returns the patch volume."""
+	_write(new / 'EFI' / 'X', 'NEW loader')
+	_write(new / 'EFI' / 'x', 'old loader')
+	_write(base / 'EFI' / 'X', 'old loader')
+	vol = tmp_path / 'vol'
+	rows, _ = _patch_from(hpcp_mod, new, base, [vol])
+	assert {(op, path) for op, path in _ops(rows) if path.startswith('EFI/')} == {('M', 'EFI/X'), ('A', 'EFI/x')}
+	return vol
+
+
+def test_skipped_rows_whose_names_differ_only_by_case_from_a_write_are_verified(trees, hpcp_mod, tmp_path, monkeypatch):
+	"""Final review I1: a skipped A / M row whose name folds (_fold_name) to a written row's is verified too; other
+	skipped rows are not. On a case-sensitive target both names are separate files, and verify passes."""
+	new, base = trees
+	_write(new / 'other', 'same')
+	vol = _case_siblings(hpcp_mod, tmp_path, new, base)
+	target = tmp_path / 'target'
+	_clone(base, target)
+	_write(target / 'EFI' / 'x', 'old loader')
+	shutil.copy2(str(new / 'other'), str(target / 'other'))
+	verified = []
+	real_verify_rows = hpcp_mod._verify_rows
+	def verify_rows(rows, *args, **kwargs):
+		verified.extend(row.path for row in rows)
+		return real_verify_rows(rows, *args, **kwargs)
+	monkeypatch.setattr(hpcp_mod, '_verify_rows', verify_rows)
+	summary = hpcp_mod.apply_patch_tree([str(vol)], str(target), max_workers=1)
+	assert (summary['modified'], summary['skipped'], summary['failed']) == (1, 2, 0)
+	assert sorted(verified) == ['EFI/X', 'EFI/x']
+	assert (target / 'EFI' / 'X').read_text() == 'NEW loader' and (target / 'EFI' / 'x').read_text() == 'old loader'
+
+
+@requires_root_and_image_tools
+@pytest.mark.skipif(shutil.which('mkfs.vfat') is None, reason='needs mkfs.vfat')
+@pytest.mark.root
+@pytest.mark.loop
+def test_write_over_a_skipped_case_sibling_on_vfat_fails_at_verify(trees, hpcp_mod, tmp_path):
+	"""Final review I1: on vfat, A EFI/x is skipped (the lookup finds EFI/X, still old), then M EFI/X writes NEW into
+	that one entry. The golden's two files cannot both exist on FAT: verify reports EFI/x instead of a silent success."""
+	new, base = trees
+	vol = _case_siblings(hpcp_mod, tmp_path, new, base)
+	node = str(tmp_path / 'node.img')
+	with open(node, 'wb') as f:
+		f.truncate(32 << 20)
+	subprocess.run(['mkfs.vfat', node], check=True, stdout=subprocess.DEVNULL)
+	_change_image(hpcp_mod, node, lambda root: _write(os.path.join(root, 'EFI', 'X'), 'old loader'))
+	with _mount_session(hpcp_mod) as (mount_points, loop_devices):
+		root = hpcp_mod._mount_single_fs_image(node, False, mount_points, loop_devices)
+		summary = hpcp_mod.apply_patch_tree([str(vol)], root, max_workers=1)
+		names = os.listdir(os.path.join(root, 'EFI'))
+	assert summary['modified'] == 1 and summary['failed'] >= 1
+	assert any(error.startswith('Patch verify error: A EFI/x:') for error in hpcp_mod.ERRORS)
+	assert names == ['X']
