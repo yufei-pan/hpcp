@@ -11,8 +11,8 @@ Patch generation (`-diff` and `-dd -diff`) has four problems left over from 9.67
   - So `-e '/var/log/*'` silently excludes nothing, and only `*/var/log/*` works. The README says so for
     `-dd -diff` only.
   - Worse, `-e '*/tmp/*'` matches the temporary mount path itself and excludes the whole filesystem.
-  - A live partition in `-dd -diff` is matched at its live mount point instead (`/boot/efi/...`), so the same
-    command behaves differently depending on whether the golden disk is live.
+  - A live partition in `-dd -diff` is bind-mounted at a temporary path too (`_mount_partition`), so it has the same
+    problem.
 - **Inputs inside a listed tree.**
   - `-dd -diff` already leaves its input disk-image files out of the listings (9.67). Single-filesystem `-diff`
     does not.
@@ -79,9 +79,13 @@ This ships as hpcp 9.71. 9.68–9.71 are not on PyPI; publishing needs the user'
    does today with physical paths, so listing time does not regress. Both listings match through the same
    physical-to-logical path mapping, so the base side, which today walks excluded directories and filters them
    afterwards, skips them too.
-7. **Compatibility.** With a live partition in `-dd -diff`, a pattern written with its live mount point
-   (`/boot/efi/EFI/...`) no longer matches; it is now `/EFI/...`. The README says so. Patches are unchanged: `-e`
-   affects only which rows exist.
+7. **Compatibility.** No pattern that excluded part of a mounted filesystem before stops doing so. The temporary
+   path was not known in advance, so only `*/…` patterns could match there, and they still do. The exception is a
+   pattern that matched the temporary path itself (`*/tmp/*`, `/tmp/*`) and so excluded the whole filesystem: it now
+   matches only inside it. Patches are unchanged: `-e` affects only which rows exist.
+   (Corrected after the design was approved. The approved text said a live `-dd -diff` partition was matched at its
+   live mount point, so `/boot/efi/...` patterns would stop matching. `_mount_partition` bind-mounts a live partition
+   at a temporary path, so it never was.)
 
 ### Part 2 — inputs kept out of the listings
 
@@ -170,7 +174,8 @@ runs only for the rows below.
 - `-e` on mounted sources:
   - `*/…` patterns behave as before;
   - `/`-anchored patterns that used to match nothing now match inside the filesystem;
-  - patterns written with a live partition's mount point must drop that prefix.
+  - a pattern that matched hpcp's temporary mount path itself (`*/tmp/*`, `/tmp/*`), and so excluded the whole
+    filesystem, now matches only inside it.
 - Generation from read-only sources no longer reads the payload twice. From live sources it reads again only the
   files listed in Part 3.
 
