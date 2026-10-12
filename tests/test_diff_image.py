@@ -3694,7 +3694,7 @@ def test_payload_recheck_catches_a_rewrite_that_keeps_size_and_mtime(trees, hpcp
 	new, base = trees
 	_write(new / 'live.log', 'version 1')
 	_one_mount(hpcp_mod, monkeypatch, options=options)
-	monkeypatch.setattr(hpcp_mod, '_RACY_WINDOW_NS', 0)
+	monkeypatch.setattr(hpcp_mod, '_racy_window_ns', lambda: 0)
 	with pytest.raises(RuntimeError, match=_CHANGED_WHILE_BUILT):
 		_scan_and_build(hpcp_mod, new, base, tmp_path, monkeypatch, lambda: _write(new / 'live.log', 'version 2'))
 
@@ -3704,7 +3704,7 @@ def test_payload_recheck_trusts_an_unchanged_file_outside_the_racy_window(trees,
 	_write(new / 'a.txt', 'a')
 	_write(new / 'sub' / 'b.txt', 'b')
 	_one_mount(hpcp_mod, monkeypatch)
-	monkeypatch.setattr(hpcp_mod, '_RACY_WINDOW_NS', 0)
+	monkeypatch.setattr(hpcp_mod, '_racy_window_ns', lambda: 0)
 	assert _scan_and_build(hpcp_mod, new, base, tmp_path, monkeypatch) == []
 
 
@@ -3716,12 +3716,12 @@ def test_payload_recheck_hashes_a_file_changed_within_the_racy_window(trees, hpc
 	assert _scan_and_build(hpcp_mod, new, base, tmp_path, monkeypatch) == ['a.txt']
 
 
-@pytest.mark.parametrize('fs_type', ['vfat', 'exfat', 'ntfs3', 'fuseblk', 'nfs4', 'cifs', 'zfs'])
+@pytest.mark.parametrize('fs_type', ['vfat', 'exfat', 'ntfs3', 'fuseblk', 'nfs4', 'cifs', 'zfs', 'tmpfs'])
 def test_payload_recheck_hashes_files_on_an_untrusted_filesystem(trees, hpcp_mod, tmp_path, monkeypatch, fs_type):
 	new, base = trees
 	_write(new / 'a.txt', 'a')
 	_one_mount(hpcp_mod, monkeypatch, fs_type=fs_type)
-	monkeypatch.setattr(hpcp_mod, '_RACY_WINDOW_NS', 0)
+	monkeypatch.setattr(hpcp_mod, '_racy_window_ns', lambda: 0)
 	assert _scan_and_build(hpcp_mod, new, base, tmp_path, monkeypatch) == ['a.txt']
 
 
@@ -3729,7 +3729,7 @@ def test_payload_recheck_without_scan_stats_hashes_every_copy(trees, hpcp_mod, t
 	new, base = trees
 	_write(new / 'a.txt', 'a')
 	_one_mount(hpcp_mod, monkeypatch)
-	monkeypatch.setattr(hpcp_mod, '_RACY_WINDOW_NS', 0)
+	monkeypatch.setattr(hpcp_mod, '_racy_window_ns', lambda: 0)
 	assert _scan_and_build(hpcp_mod, new, base, tmp_path, monkeypatch, scan=False) == ['a.txt']
 
 
@@ -3738,7 +3738,7 @@ def test_payload_recheck_hashes_a_metadata_change_and_keeps_the_copy(trees, hpcp
 	new, base = trees
 	_write(new / 'a.txt', 'a')
 	_one_mount(hpcp_mod, monkeypatch)
-	monkeypatch.setattr(hpcp_mod, '_RACY_WINDOW_NS', 0)
+	monkeypatch.setattr(hpcp_mod, '_racy_window_ns', lambda: 0)
 	assert _scan_and_build(hpcp_mod, new, base, tmp_path, monkeypatch, lambda: os.chmod(str(new / 'a.txt'), 0o600)) == ['a.txt']
 	assert (tmp_path / 'vol' / '.hpcp_diff' / 'manifest').exists()
 
@@ -3753,7 +3753,7 @@ def test_payload_recheck_hashes_files_on_an_untrusted_mount_below_the_source(tre
 		{'devnum': (0, 2), 'root': '/', 'mount_point': os.path.realpath(str(new / 'esp')), 'options': ['rw'], 'fstype': 'vfat',
 			'source': '/dev/b', 'super_options': ['rw']}]
 	monkeypatch.setattr(hpcp_mod, '_mountinfo_entries', lambda *args, **kwargs: [dict(entry) for entry in entries])
-	monkeypatch.setattr(hpcp_mod, '_RACY_WINDOW_NS', 0)
+	monkeypatch.setattr(hpcp_mod, '_racy_window_ns', lambda: 0)
 	assert _scan_and_build(hpcp_mod, new, base, tmp_path, monkeypatch) == ['esp/boot.efi']
 
 
@@ -3763,7 +3763,7 @@ def test_payload_recheck_uses_scan_stats_from_worker_processes(trees, hpcp_mod, 
 	for index in range(300):
 		_write(new / 'many' / f'f{index:03}.txt', f'file {index:03}')
 	_one_mount(hpcp_mod, monkeypatch)
-	monkeypatch.setattr(hpcp_mod, '_RACY_WINDOW_NS', 0)
+	monkeypatch.setattr(hpcp_mod, '_racy_window_ns', lambda: 0)
 	assert _scan_and_build(hpcp_mod, new, base, tmp_path, monkeypatch, max_workers=2) == []
 	with pytest.raises(RuntimeError, match=r'^Diff image error: 1 file\(s\) changed while the patch was built \(e\.g\. many/f007\.txt\)'):
 		_scan_and_build(hpcp_mod, new, base, tmp_path, monkeypatch, lambda: _write(new / 'many' / 'f007.txt', 'FILE 007'),
@@ -3777,7 +3777,7 @@ def test_payload_recheck_through_a_symlinked_new_root(trees, hpcp_mod, tmp_path,
 	link = tmp_path / 'link'
 	os.symlink(str(new), str(link))
 	_one_mount(hpcp_mod, monkeypatch)
-	monkeypatch.setattr(hpcp_mod, '_RACY_WINDOW_NS', 0)
+	monkeypatch.setattr(hpcp_mod, '_racy_window_ns', lambda: 0)
 	assert _scan_and_build(hpcp_mod, link, base, tmp_path, monkeypatch) == []
 	with pytest.raises(RuntimeError, match=_CHANGED_WHILE_BUILT):
 		_scan_and_build(hpcp_mod, link, base, tmp_path, monkeypatch, lambda: _write(new / 'live.log', 'version 2'), volume='vol2')
@@ -3793,7 +3793,7 @@ def test_directory_source_generation_passes_the_scan_to_the_payload_check(trees,
 	monkeypatch.setattr(hpcp_mod, '_claim_volume_names', lambda output, count: [output])
 	monkeypatch.setattr(hpcp_mod, 'create_image', lambda *args, **kwargs: [str(vol)])
 	_one_mount(hpcp_mod, monkeypatch)
-	monkeypatch.setattr(hpcp_mod, '_RACY_WINDOW_NS', 0)
+	monkeypatch.setattr(hpcp_mod, '_racy_window_ns', lambda: 0)
 	rechecked = []
 	real = hpcp_mod._states_for_paths
 	def spy(paths, *args, **kwargs):
@@ -3830,3 +3830,70 @@ def test_image_source_payload_is_not_read_again(trees, hpcp_mod, tmp_path, monke
 	with _mount_session(hpcp_mod) as (mount_points, loop_devices):
 		assert hpcp_mod.process_get_diff_image([], [image], [str(base)], None, out, mount_points, loop_devices, max_workers=1) == out
 	assert rechecked == []
+
+
+def _vm_files(hpcp_mod, monkeypatch, tmp_path, expire, writeback):
+	"""Point _read_vm_centisecs at fake /proc/sys/vm files (None: file missing)."""
+	for name, value in (('dirty_expire_centisecs', expire), ('dirty_writeback_centisecs', writeback)):
+		if value is not None:
+			(tmp_path / name).write_text(f'{value}\n')
+	real = open
+	monkeypatch.setattr('builtins.open', lambda path, *args, **kwargs: real(str(tmp_path / os.path.basename(path)), *args, **kwargs)
+		if str(path).startswith('/proc/sys/vm/') else real(path, *args, **kwargs))
+
+
+@pytest.mark.parametrize('expire, writeback, expected', [
+	(3000, 500, 2 * 3500 * 10000000),
+	(10, 10, 2000000000),
+	(3000, 0, None),
+	(None, 500, 120000000000),
+	(3000, None, 120000000000),
+	('x', 500, 120000000000),
+])
+def test_racy_window_follows_the_writeback_horizon(hpcp_mod, tmp_path, monkeypatch, expire, writeback, expected):
+	_vm_files(hpcp_mod, monkeypatch, tmp_path, expire, writeback)
+	assert hpcp_mod._racy_window_ns() == expected
+
+
+def test_recheck_without_a_window_hashes_every_live_row(trees, hpcp_mod, tmp_path, monkeypatch):
+	new, base = trees
+	_write(new / 'a.txt', 'a')
+	_one_mount(hpcp_mod, monkeypatch)
+	monkeypatch.setattr(hpcp_mod, '_racy_window_ns', lambda: None)
+	assert _scan_and_build(hpcp_mod, new, base, tmp_path, monkeypatch) == ['a.txt']
+
+
+def _store_layout_recheck(hpcp_mod, monkeypatch, tmp_path, entries):
+	"""A row of a store-layout scan ('/' as new_base) whose source is spelled through a symlinked directory, with a stale scan stat.
+	Returns the rows _rows_to_recheck picks."""
+	real = tmp_path / 'real' / 'u'
+	real.mkdir(parents=True)
+	(real / 'f').write_text('x')
+	link = tmp_path / 'home'
+	os.symlink(str(tmp_path / 'real'), str(link))
+	key = os.path.relpath(str(link / 'u' / 'f'), '/')
+	st = os.lstat(str(real / 'f'))
+	stale = (st.st_dev, st.st_ino, st.st_size + 1, st.st_mtime_ns, st.st_ctime_ns)
+	monkeypatch.setattr(hpcp_mod, '_mountinfo_entries', lambda *args, **kwargs: [dict(entry) for entry in entries])
+	monkeypatch.setattr(hpcp_mod, '_racy_window_ns', lambda: 0)
+	row = hpcp_mod.ChangeRow('A', key, '-', hpcp_mod.get_entry_state(str(real / 'f')))
+	scan = {'started_ns': st.st_ctime_ns + 10 ** 9, 'stats': {key: stale}}
+	return hpcp_mod._rows_to_recheck([row], '/', scan), row
+
+
+def _entry(mount_point, fstype, super_options):
+	return {'devnum': (0, 1), 'root': '/', 'mount_point': mount_point, 'options': ['rw'], 'fstype': fstype, 'source': '/dev/x',
+		'super_options': super_options}
+
+
+def test_recheck_judges_a_store_layout_row_by_the_filesystem_holding_its_file_not_its_link(tmp_path, hpcp_mod, monkeypatch):
+	"""A read-only root with a writable ext4 mounted where the symlink points: the row is not skipped as read-only."""
+	entries = [_entry('/', 'erofs', ['ro']), _entry(os.path.realpath(str(tmp_path / 'real')), 'ext4', ['rw'])]
+	picked, row = _store_layout_recheck(hpcp_mod, monkeypatch, tmp_path, entries)
+	assert picked == [row]
+
+
+def test_recheck_hashes_a_store_layout_row_whose_symlink_target_is_on_fat(tmp_path, hpcp_mod, monkeypatch):
+	entries = [_entry('/', 'ext4', ['rw']), _entry(os.path.realpath(str(tmp_path / 'real')), 'vfat', ['rw'])]
+	picked, row = _store_layout_recheck(hpcp_mod, monkeypatch, tmp_path, entries)
+	assert picked == [row]

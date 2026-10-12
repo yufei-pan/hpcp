@@ -4617,13 +4617,32 @@ def _source_resized(new_base, row):
 		return True
 	return not stat.S_ISREG(info.st_mode) or info.st_size != decode_state(row.new)['size']
 
-# Filesystems where every write to a file moves its ctime, which nothing can set back: an unchanged ctime then proves
-# the content did not change (outside _RACY_WINDOW_NS). Everything else (FAT, exFAT, NTFS, FUSE, network filesystems)
-# is hashed again.
-_TRUSTED_CTIME_FS = frozenset(('ext2', 'ext3', 'ext4', 'xfs', 'btrfs', 'f2fs', 'tmpfs'))
-# A file written again within the timestamp tick of its last write keeps its ctime ("racily clean"): a file whose
-# scan-time ctime is this close to the scan's start, or later, is hashed again.
-_RACY_WINDOW_NS = 2 * 1000000000
+# Filesystems where a write to a file moves its ctime, which nothing can set back: an unchanged ctime then shows the
+# content did not change, outside the racy window (_racy_window_ns). The one exception is a store through a shared
+# writable mapping to a page that is already dirty: it leaves ctime unchanged until writeback cleans the page. The
+# window therefore covers twice the writeback horizon, and tmpfs (never written back) is not trusted. Everything else
+# (FAT, exFAT, NTFS, FUSE, network filesystems) is hashed again.
+_TRUSTED_CTIME_FS = frozenset(('ext2', 'ext3', 'ext4', 'xfs', 'btrfs', 'f2fs'))
+
+def _read_vm_centisecs(name):
+	"""int of /proc/sys/vm/<name>, None when it cannot be read or parsed."""
+	try:
+		with open('/proc/sys/vm/' + name) as f:
+			return int(f.read().strip())
+	except (OSError, ValueError):
+		return None
+
+def _racy_window_ns():
+	"""How close to the scan's start (or after it) a scan-time ctime must be for its copy to be hashed again, in ns:
+	twice the writeback horizon (vm.dirty_expire_centisecs + vm.dirty_writeback_centisecs), at least 2 s; 120 s when
+	either cannot be read (no /proc); None when periodic writeback is off (dirty_writeback_centisecs 0): no ctime is
+	trusted then."""
+	expire, writeback = _read_vm_centisecs('dirty_expire_centisecs'), _read_vm_centisecs('dirty_writeback_centisecs')
+	if expire is None or writeback is None or expire < 0 or writeback < 0:
+		return 120 * 1000000000
+	if writeback == 0:
+		return None
+	return max(2 * 1000000000, 2 * (expire + writeback) * 10000000)
 
 def _wall_clock_ns():
 	"""Wall-clock time in ns (time.time_ns needs Python 3.7)."""
@@ -4638,30 +4657,42 @@ def _rows_to_recheck(rows, new_base, scan):
 
 	Nothing on a filesystem whose superblock is read-only (mountinfo super options; it cannot change). On any other,
 	a row whose source may have changed since the scan read it: its filesystem is not in _TRUSTED_CTIME_FS, the scan
-	(compute_changes' scan dict) has no stat for it, its scan-time ctime lies within _RACY_WINDOW_NS of the scan's
-	start or later, or its lstat now differs from the scan's. Filesystems are found per row as _rows_by_scope groups
-	rows (mounts below new_base included)."""
-	scopes = _mount_scope_entries(new_base, _mountinfo_entries())
-	entries = dict(scopes)
+	(compute_changes' scan dict) has no stat for it, its scan-time ctime lies within _racy_window_ns of the scan's
+	start or later (any ctime when the window is None), or its lstat now differs from the scan's. A row's filesystem
+	is the visible mount holding the real path of its source's parent directory, not the one holding the spelled
+	path: a key can be spelled through a symlink (store layout)."""
+	entries = _mountinfo_entries()
+	hidden = _hidden_mounts(entries)
+	visible = [(entry['mount_point'].rstrip(os.sep) + os.sep, entry) for index, entry in enumerate(entries) if index not in hidden]
 	scan = scan or {}
 	stats, started = scan.get('stats', {}), scan.get('started_ns')
+	window = _racy_window_ns()
+	holders = {}
+	def holder(directory):
+		if directory not in holders:
+			inside, found, depth = os.path.realpath(directory).rstrip(os.sep) + os.sep, None, -1
+			for point, entry in visible:
+				if inside.startswith(point) and len(point) >= depth:
+					found, depth = entry, len(point)
+			holders[directory] = found
+		return holders[directory]
 	recheck = []
-	for prefix, scope_rows in _rows_by_scope(rows, [(prefix, '', '') for prefix, _ in scopes]).items():
-		entry = entries.get(prefix)
+	for row in rows:
+		source = _key_path(new_base, row.path)
+		entry = holder(os.path.dirname(source))
 		if entry is not None and 'ro' in entry.get('super_options', ()):
 			continue
-		trusted = entry is not None and entry['fstype'] in _TRUSTED_CTIME_FS
-		for row in scope_rows:
-			before = stats.get(row.path)
-			if not trusted or before is None or started is None or before[4] >= started - _RACY_WINDOW_NS:
-				recheck.append(row)
-				continue
-			try:
-				now = _scan_stat(os.lstat(_key_path(new_base, row.path)))
-			except OSError:
-				now = None
-			if now != before:
-				recheck.append(row)
+		before = stats.get(row.path)
+		if (entry is None or entry['fstype'] not in _TRUSTED_CTIME_FS or before is None or started is None or window is None
+				or before[4] >= started - window):
+			recheck.append(row)
+			continue
+		try:
+			now = _scan_stat(os.lstat(source))
+		except OSError:
+			now = None
+		if now != before:
+			recheck.append(row)
 	return recheck
 
 def _check_payload(rows, volume_roots, full_hash=False, max_workers=1, new_base=None, scan=None):

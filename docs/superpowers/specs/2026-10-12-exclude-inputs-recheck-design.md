@@ -127,12 +127,18 @@ runs only for the rows below.
    - After the payload copy, each source is `lstat`ed again.
    - The copy is hashed and compared as today when any one of these holds:
      - any of the five values differ;
-     - the scan-time `ctime_ns` is no earlier than 2 seconds before the scan began, which includes a ctime in the
-       future. This is the "racily clean" case: a second write within the same timestamp tick leaves ctime
-       unchanged.
+     - the scan-time `ctime_ns` is no earlier than the racy window before the scan began, which includes a ctime in
+       the future. The window is twice the writeback horizon, `2 * (vm.dirty_expire_centisecs +
+       vm.dirty_writeback_centisecs)` read from `/proc/sys/vm` when the check runs: at least 2 seconds, 120 seconds
+       when either file cannot be read, and no ctime is trusted at all (every live copy is re-hashed) when
+       `dirty_writeback_centisecs` is 0.
      - the source's filesystem is not one whose ctime hpcp trusts. The trusted types are `ext2`, `ext3`, `ext4`,
-       `xfs`, `btrfs`, `f2fs` and `tmpfs`. FAT, exFAT, NTFS, FUSE, NFS, CIFS and all others are compared as
-       today.
+       `xfs`, `btrfs` and `f2fs`. FAT, exFAT, NTFS, FUSE, NFS, CIFS, tmpfs and all others are compared as today.
+       The filesystem is the visible mount holding the real path of the source's parent directory, not the one
+       holding the spelled path (a store-layout key can be spelled through a symlink).
+       (Corrected during implementation: a store through a shared writable mmap to a page that is already dirty does
+       not move ctime until writeback cleans the page, and tmpfs never updates it for mmap stores. A fixed 2 second
+       window and tmpfs in the trusted list would have trusted a changed copy.)
      - the scan stat is missing for the row.
    - Otherwise the copy is trusted without being read.
    - "The scan began" is a wall-clock time taken before the new side's states are computed.
@@ -206,7 +212,7 @@ at the top of a shell command is ignored in this harness. Every path variable ge
   - the new directory inside the base directory.
 - **Re-check.** Spies on the hash function used by `_check_payload` show:
   - a read-only loop-mounted `-si` source: zero re-hashes;
-  - an unchanged live file whose ctime is older than the window: zero;
+  - an unchanged live file whose ctime is older than the window (tmpfs and the other untrusted types are re-hashed): zero;
   - a live file rewritten after the scan with the same size, and its mtime put back with `os.utime`: caught as
     changed;
   - a file within the racy window: re-hashed;
