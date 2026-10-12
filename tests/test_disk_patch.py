@@ -296,19 +296,47 @@ def test_fs_params_text_ignores_ext_runtime_features(hpcp_mod):
 	assert hpcp_mod._fs_params_text({}) == hpcp_mod._fs_params_text(None) == ''
 
 
-def test_read_disk_layout_settles_udev_before_reading(hpcp_mod, monkeypatch):
-	"""A node udev is still re-adding would otherwise probe its filesystem parameters as empty."""
+def test_read_disk_layout_settles_once_and_probes_each_partition_once(hpcp_mod, monkeypatch):
+	"""A node udev is still re-adding would be probed as empty: settle once, then wait for the nodes without settling
+	again; the GPT read runs no blkid of its own, and each partition gets one probe on its settled device."""
 	calls = []
-	monkeypatch.setattr(hpcp_mod, '_partition_table_type', lambda device: 'gpt')
+	monkeypatch.setattr(hpcp_mod, '_partition_table_type', lambda device: calls.append('pttype') or 'gpt')
 	monkeypatch.setattr(hpcp_mod, '_udev_settle', lambda: calls.append('settle'))
-	def infos(device):
-		calls.append('infos')
-		return {'x': {'disk_identifier': 'G', 'sector_size': 512, 'size': 1 << 20}}
+
+	def infos(device, identity=True):
+		calls.append(('infos', identity))
+		return {'x': {'disk_identifier': 'G', 'sector_size': 512, 'size': 1 << 20},
+			'1': {'partition_guid_code': 'T', 'unique_partition_guid': 'U', 'partition_name': 'n', 'partition_attrs': '0', 'size': 1 << 20}}
+
 	infos.cache_clear = lambda: None
 	monkeypatch.setattr(hpcp_mod, 'get_partition_infos', infos)
-	monkeypatch.setattr(hpcp_mod, '_settle_partitions', lambda disk, numbers: calls.append('partitions') or {})
-	assert hpcp_mod.read_disk_layout('/dev/x') == {'disk': {'guid': 'G', 'sector_size': 512, 'size': 1 << 20}, 'parts': {}}
-	assert calls == ['settle', 'infos', 'partitions']
+	monkeypatch.setattr(hpcp_mod, '_settle_partitions', lambda disk, numbers, timeout=10, settle=True: calls.append(('nodes', settle)) or {1: '/dev/x1'})
+	monkeypatch.setattr(hpcp_mod, '_probe_identity', lambda device: calls.append(('probe', device)) or ('ext4', 'u', 'l'))
+	monkeypatch.setattr(hpcp_mod, 'probe_fs_params', lambda device, fs_type: calls.append(('params', device)) or {})
+	monkeypatch.setattr(hpcp_mod, 'MIRROR_FS_PARAMS', True)
+	layout = hpcp_mod.read_disk_layout('/dev/x')
+	assert calls == ['pttype', 'settle', ('infos', False), ('nodes', False), ('probe', '/dev/x1'), ('params', '/dev/x1')]
+	assert layout['parts'][1]['fs_label'] == 'l' and layout['parts'][1]['device'] == '/dev/x1'
+	del calls[:]
+	hpcp_mod.read_disk_layout('/dev/x', pttype='gpt', fs_params=False)
+	assert calls == ['settle', ('infos', False), ('nodes', False), ('probe', '/dev/x1')]
+
+
+def test_get_partition_details_without_identity_runs_only_sgdisk(hpcp_mod, reset_hpcp_globals, monkeypatch):
+	commands = []
+
+	def fake(argv, **kwargs):
+		commands.append(argv[0])
+		return ["Partition name: 'n'"] if argv[0] == 'sgdisk' else []
+
+	monkeypatch.setattr(hpcp_mod, 'run_command_in_multicmd_with_path_check', fake)
+	monkeypatch.setattr(hpcp_mod, 'get_target_partition', lambda device, partition: (_ for _ in ()).throw(AssertionError('not called')))
+	hpcp_mod.get_partition_details.cache_clear()
+	try:
+		details = hpcp_mod.get_partition_details('/dev/x', '1', 512, identity=False)
+	finally:
+		hpcp_mod.get_partition_details.cache_clear()
+	assert commands == ['sgdisk'] and details['partition_name'] == 'n' and details['fs_type'] == ''
 
 
 def test_partition_table_type_is_quiet(hpcp_mod, reset_hpcp_globals, monkeypatch):
@@ -417,7 +445,7 @@ def test_in_use_raw_partition_is_refused_before_it_is_hashed(tmp_path, hpcp_mod,
 	monkeypatch.setattr(hpcp_mod, '_refuse_if_image_in_use', lambda image: None)
 	monkeypatch.setattr(hpcp_mod, '_attach_disk', lambda path, ro, loops: '/dev/fake')
 	monkeypatch.setattr(hpcp_mod, '_partition_table_type', lambda device: 'gpt')
-	monkeypatch.setattr(hpcp_mod, 'read_disk_layout', lambda disk, name=None: layout)
+	monkeypatch.setattr(hpcp_mod, 'read_disk_layout', lambda disk, name=None, **kwargs: layout)
 	monkeypatch.setattr(hpcp_mod, '_mountinfo_entries', lambda: [])
 	monkeypatch.setattr(hpcp_mod, '_swap_devices', lambda: set())
 	monkeypatch.setattr(hpcp_mod, '_device_number', lambda device: (7, 0))
@@ -444,7 +472,7 @@ def test_several_in_use_raw_partitions_and_other_refusals_share_one_message(tmp_
 	monkeypatch.setattr(hpcp_mod, '_refuse_if_image_in_use', lambda image: None)
 	monkeypatch.setattr(hpcp_mod, '_attach_disk', lambda path, ro, loops: '/dev/fake')
 	monkeypatch.setattr(hpcp_mod, '_partition_table_type', lambda device: 'gpt')
-	monkeypatch.setattr(hpcp_mod, 'read_disk_layout', lambda disk, name=None: layout)
+	monkeypatch.setattr(hpcp_mod, 'read_disk_layout', lambda disk, name=None, **kwargs: layout)
 	monkeypatch.setattr(hpcp_mod, '_mountinfo_entries', lambda: [])
 	monkeypatch.setattr(hpcp_mod, '_swap_devices', lambda: set())
 	monkeypatch.setattr(hpcp_mod, '_device_number', lambda device: (7, 0))
@@ -563,6 +591,37 @@ def _session(hpcp_mod):
 
 
 @requires_root_and_disk_tools
+@requires_root_and_disk_tools
+@pytest.mark.root
+@pytest.mark.loop
+def test_a_fresh_loop_disk_reads_the_same_ten_times(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	"""Review Focus 5: one settle per read must not bring back the udev re-read race 9.67 fixed: attach, read at once,
+	repeatedly; the counts show one PTTYPE probe, one settle and one blkid per partition per read."""
+	image = tmp_path / 'golden.img'
+	_make_golden(image)
+	commands = []
+	real = hpcp_mod.run_command_in_multicmd_with_path_check
+
+	def counting(argv, **kwargs):
+		commands.append(list(argv))
+		return real(argv, **kwargs)
+
+	monkeypatch.setattr(hpcp_mod, 'run_command_in_multicmd_with_path_check', counting)
+	first = None
+	for _ in range(10):
+		with _session(hpcp_mod) as (mount_points, loop_devices):
+			disk = hpcp_mod._attach_disk(str(image), True, loop_devices)
+			del commands[:]
+			layout = hpcp_mod.read_disk_layout(disk)
+			stripped = {number: {key: value for key, value in part.items() if key != 'device'} for number, part in layout['parts'].items()}
+			first = first or stripped
+			assert stripped == first
+			assert sum(1 for argv in commands if 'PTTYPE' in argv) == 1
+			assert sum(1 for argv in commands if argv[:2] == ['udevadm', 'settle']) == 1
+			assert sum(1 for argv in commands if argv[:4] == ['blkid', '-p', '-o', 'udev']) == len(layout['parts'])
+	assert first[3]['fs_label'] == 'root' and first[1]['fs_type'] == 'vfat'
+
+
 @pytest.mark.root
 @pytest.mark.loop
 def test_read_disk_layout_of_a_gpt_image(tmp_path, hpcp_mod, reset_hpcp_globals):
@@ -1115,7 +1174,7 @@ def test_unmountable_filesystem_is_compared_as_raw_with_a_warning(hpcp_mod, monk
 	parts = {1: _part(number=1, device=device, fs_type='ext4')}
 	layout = _layout(parts)
 	monkeypatch.setattr(hpcp_mod, '_attach_disk', lambda path, ro, loops: path)
-	monkeypatch.setattr(hpcp_mod, 'read_disk_layout', lambda disk, name=None: layout)
+	monkeypatch.setattr(hpcp_mod, 'read_disk_layout', lambda disk, name=None, **kwargs: layout)
 	monkeypatch.setattr(hpcp_mod, '_mountinfo_entries', lambda: [])
 	monkeypatch.setattr(hpcp_mod, '_mount_partition', lambda *a: None)
 	monkeypatch.setattr(hpcp_mod, '_hash_area', lambda *a: 'h')
@@ -1135,7 +1194,7 @@ def _fake_generation(hpcp_mod, monkeypatch, new_parts, old_parts, in_use=None):
 	"""
 	layouts = {'/x/new': _layout(new_parts), '/x/old': _layout(old_parts)}
 	monkeypatch.setattr(hpcp_mod, '_attach_disk', lambda path, ro, loops: path)
-	monkeypatch.setattr(hpcp_mod, 'read_disk_layout', lambda disk, name=None: layouts[disk])
+	monkeypatch.setattr(hpcp_mod, 'read_disk_layout', lambda disk, name=None, **kwargs: layouts[disk])
 	monkeypatch.setattr(hpcp_mod, '_mountinfo_entries', lambda: [])
 	monkeypatch.setattr(hpcp_mod, '_swap_devices', lambda: set())
 	monkeypatch.setattr(hpcp_mod, '_device_number', lambda device: (7, 0))
@@ -1417,7 +1476,7 @@ def test_disk_apply_plans_each_section_by_filesystem_class(tmp_path, hpcp_mod, r
 	monkeypatch.setattr(hpcp_mod, '_refuse_if_image_in_use', lambda image: None)
 	monkeypatch.setattr(hpcp_mod, '_attach_disk', lambda path, ro, loops: '/dev/fake')
 	monkeypatch.setattr(hpcp_mod, '_partition_table_type', lambda device: 'gpt')
-	monkeypatch.setattr(hpcp_mod, 'read_disk_layout', lambda disk, name=None: layout)
+	monkeypatch.setattr(hpcp_mod, 'read_disk_layout', lambda disk, name=None, **kwargs: layout)
 	monkeypatch.setattr(hpcp_mod, '_mountinfo_entries', lambda: [])
 	monkeypatch.setattr(hpcp_mod, '_swap_devices', lambda: set())
 	monkeypatch.setattr(hpcp_mod, '_device_number', lambda device: (7, 0))
@@ -1459,7 +1518,7 @@ def _cross_section_disk_patch(hpcp_mod, tmp_path, monkeypatch, delete_in, payloa
 	monkeypatch.setattr(hpcp_mod, '_refuse_if_image_in_use', lambda image: None)
 	monkeypatch.setattr(hpcp_mod, '_attach_disk', lambda path, ro, loops: '/dev/fake')
 	monkeypatch.setattr(hpcp_mod, '_partition_table_type', lambda device: 'gpt')
-	monkeypatch.setattr(hpcp_mod, 'read_disk_layout', lambda disk, name=None: layout)
+	monkeypatch.setattr(hpcp_mod, 'read_disk_layout', lambda disk, name=None, **kwargs: layout)
 	monkeypatch.setattr(hpcp_mod, '_mountinfo_entries', lambda: [])
 	monkeypatch.setattr(hpcp_mod, '_swap_devices', lambda: set())
 	monkeypatch.setattr(hpcp_mod, '_device_number', lambda device: (7, 0))

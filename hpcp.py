@@ -1688,7 +1688,7 @@ def get_target_partition(image, partition_name):
 	return target_partition, loop_device
 
 @functools.lru_cache(maxsize=None)
-def get_partition_details(device, partition,sector_size=512):
+def get_partition_details(device, partition,sector_size=512, identity=True):
 	"""
 	Retrieves detailed information about a specific partition on a device.
 
@@ -1699,6 +1699,8 @@ def get_partition_details(device, partition,sector_size=512):
 		device (str): Path to the device containing the partition (e.g., '/dev/sda').
 		partition (str): The partition number or identifier (e.g., '1' for first partition).
 		sector_size (int, optional): Sector size in bytes. Defaults to 512.
+		identity (bool, optional): False reads the GPT entry only (one sgdisk call): no partition lookup, blkid or
+			fs-params probe; read_disk_layout probes the settled device itself.
 
 	Returns:
 		dict: A dictionary containing partition details with the following keys:
@@ -1741,6 +1743,8 @@ def get_partition_details(device, partition,sector_size=512):
 	# 	if line.startswith(partition):
 	# 		rtnDic['fs_type'] = line.split(':')[4].strip()
 	# 		return rtnDic
+	if not identity:
+		return rtnDic
 	# Get the fs type and uuid, use blkid
 	target_partition, loop_device = get_target_partition(device, partition)
 	# The same exact, uncached probe disk patches use (_probe_identity): -o export mangled non-ASCII labels, and
@@ -1754,7 +1758,7 @@ def get_partition_details(device, partition,sector_size=512):
 	return rtnDic
 
 @functools.lru_cache(maxsize=None)
-def get_partition_infos(device):
+def get_partition_infos(device, identity=True):
 	"""
 	Extracts detailed partition information from a specified block device.
 	
@@ -1805,7 +1809,7 @@ def get_partition_infos(device):
 		if not part or not part.strip() or len(part.split()) < 4 or part.lower().startswith('error'):
 			continue
 		part = part.split()
-		partition_info[part[0]] = get_partition_details(device, part[0],sector_size)
+		partition_info[part[0]] = get_partition_details(device, part[0], sector_size, identity)
 	return partition_info
 
 def write_partition_info(image, partition_infos, partition_name):
@@ -6100,14 +6104,16 @@ def _udev_settle():
 		finally:
 			del ERRORS[error_count:]
 
-def _settle_partitions(disk, numbers, timeout=10):
+def _settle_partitions(disk, numbers, timeout=10, settle=True):
 	"""{number: device} once udev is idle and every partition in numbers has its device node.
 
 	udev re-reads a whole disk's partition table after the disk is closed from writing (a new
 	loop device, an MBR or GPT write), removing and re-adding the partition nodes meanwhile.
+	settle False skips the udev settle (the caller has just settled).
 	Raises RuntimeError('Disk layout mismatch: ...') when a node is still missing after timeout seconds.
 	"""
-	_udev_settle()
+	if settle:
+		_udev_settle()
 	deadline = time.time() + timeout
 	while True:
 		devices = _partition_devices(disk)
@@ -6183,28 +6189,32 @@ def _no_partition_table(name):
 	return (f'blkid found no partition table on {name} (if it is a GPT disk, stale whole-disk signatures may hide it: '
 		f'check `wipefs -n {name}`)')
 
-def read_disk_layout(device, name=None):
+def read_disk_layout(device, name=None, pttype=None, fs_params=True):
 	"""Fresh GPT + filesystem identity read of block device (name: the disk as messages call it, default device).
 
 	Returns {'disk': {'guid', 'sector_size', 'size'}, 'parts': {number: {'type_guid',
 	'unique_guid', 'name', 'attrs', 'size', 'fs_type', 'fs_uuid', 'fs_label', 'fs_params',
 	'device'}}}. The partition caches are cleared first: loop device names are reused.
-	Filesystem type, UUID and label come from _probe_identity, not the cached blkid read.
+	pttype: the partition-table type the caller already probed (_partition_table_type), so it is not probed twice.
+	udev is settled once, the GPT is read with sgdisk alone, then each partition is probed once on its settled
+	device (_probe_identity); fs_params False skips the mkfs-parameter probes ('fs_params' is then '': a verify read
+	compares identity values only).
 	Raises RuntimeError('Disk layout mismatch: ...') unless the disk has a GPT partition table:
 	sgdisk reads an MBR disk as if it were GPT, and an identity change would convert it.
 	"""
 	name = name or device
-	pttype = _partition_table_type(device)
+	if pttype is None:
+		pttype = _partition_table_type(device)
 	if not pttype:
 		raise RuntimeError(f'Disk layout mismatch: {_no_partition_table(name)}; disk patches support GPT disks only')
 	if pttype != 'gpt':
 		raise RuntimeError(f'Disk layout mismatch: {name} has no GPT partition table (found {pttype}); disk patches support GPT disks only')
 	get_partition_infos.cache_clear()
 	get_partition_details.cache_clear()
-	# A node udev is still re-adding would be probed with empty filesystem parameters.
+	# A node udev is still re-adding would be probed as empty: settle once, then wait for every node.
 	_udev_settle()
-	infos = get_partition_infos(device)
-	devices = _settle_partitions(device, [int(key) for key, info in infos.items() if 'disk_identifier' not in info])
+	infos = get_partition_infos(device, identity=False)
+	devices = _settle_partitions(device, [int(key) for key, info in infos.items() if 'disk_identifier' not in info], settle=False)
 	disk, parts = {}, {}
 	for key, info in infos.items():
 		if 'disk_identifier' in info:
@@ -6212,11 +6222,12 @@ def read_disk_layout(device, name=None):
 			continue
 		number = int(key)
 		fs_type, fs_uuid, fs_label = _probe_identity(devices[number])
+		params = probe_fs_params(devices[number], fs_type) if fs_params and fs_type and MIRROR_FS_PARAMS else {}
 		parts[number] = {
 			'type_guid': info['partition_guid_code'], 'unique_guid': info['unique_partition_guid'],
 			'name': info['partition_name'], 'attrs': info['partition_attrs'], 'size': info['size'],
 			'fs_type': fs_type, 'fs_uuid': fs_uuid, 'fs_label': fs_label,
-			'fs_params': _fs_params_text(info.get('fs_params')), 'device': devices[number],
+			'fs_params': _fs_params_text(params), 'device': devices[number],
 		}
 	return {'disk': disk, 'parts': parts}
 
@@ -7333,9 +7344,10 @@ def apply_disk_patch(volume_roots, target, mount_points, loop_devices, force=Fal
 	if not pathlib.Path(target).resolve().is_block_device():
 		_refuse_if_image_in_use(target)
 	disk = _attach_disk(target, False, loop_devices)
-	if not _partition_table_type(disk):
+	pttype = _partition_table_type(disk)
+	if not pttype:
 		raise RuntimeError(f'Invalid arguments: {_no_partition_table(target)}; a disk patch needs a whole GPT disk (block device or disk image)')
-	layout = read_disk_layout(disk, name=target)
+	layout = read_disk_layout(disk, name=target, pttype=pttype)
 	problems = match_target_layout(disk_rows, layout)
 	if problems:
 		raise RuntimeError('Disk layout mismatch: ' + '; '.join(problems) + '; nothing applied')
@@ -7488,7 +7500,7 @@ def apply_disk_patch(volume_roots, target, mount_points, loop_devices, force=Fal
 	applied = ([change for change in changes if (change.number, change.field) not in skipped_identity]
 		if stopped is None and raw_stopped is None and hold_error is None else [])
 	if applied:
-		after = read_disk_layout(disk)
+		after = read_disk_layout(disk, pttype=pttype, fs_params=False)
 		for change in applied:
 			current = str(after['disk'].get('guid', '')) if change.number is None else str(after['parts'][change.number][change.field])
 			if current == change.new:
