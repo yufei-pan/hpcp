@@ -4104,3 +4104,19 @@ def test_generation_reads_mountinfo_after_its_listing_entered_any_automount(tree
 	monkeypatch.setattr(hpcp_mod, '_mountinfo_entries', lambda *args, **kwargs: order.append('mountinfo') or real_entries(*args, **kwargs))
 	_rows_before_mkfs(hpcp_mod, monkeypatch, [str(new)], None, [str(base)], None, str(tmp_path / 'p.img'), [], [], max_workers=1)
 	assert 'mountinfo' in order and order.index('listing') < order.index('mountinfo')
+
+
+@pytest.mark.parametrize('machine, numbers', [
+	('x86_64', (0x80047210, 0x40047211)), ('i686', (0x80047210, 0x40047211)), ('aarch64', (0x80047210, 0x40047211)),
+	('armv7l', (0x80047210, 0x40047211)), ('riscv64', (0x80047210, 0x40047211)), ('s390x', (0x80047210, 0x40047211)),
+	('loongarch64', (0x80047210, 0x40047211)),
+	('ppc64le', (0x40047210, 0x80047211)), ('ppc64', (0x40047210, 0x80047211)), ('ppc', (0x40047210, 0x80047211)),
+	('mips', (0x40047210, 0x80047211)), ('mips64', (0x40047210, 0x80047211)), ('mipsel', (0x40047210, 0x80047211)),
+	('sparc64', (0x40047210, 0x80047211)), ('alpha', (0x40047210, 0x80047211)), ('parisc64', (0x40047210, 0x80047211)),
+])
+def test_fat_ioctl_numbers_follow_the_architecture(hpcp_mod, machine, numbers):
+	"""Spec Part 1 item 4: _IOR('r', 0x10, __u32) / _IOW('r', 0x11, __u32). alpha, mips, powerpc and sparc put
+	_IOC_READ (2) and _IOC_WRITE (4) at bit 29, and parisc swaps the generic read and write bits: either way the two
+	numbers come out the other way round."""
+	assert hpcp_mod._fat_ioctl_numbers(machine) == numbers
+	assert (hpcp_mod._FAT_IOCTL_GET_ATTRIBUTES, hpcp_mod._FAT_IOCTL_SET_ATTRIBUTES) == hpcp_mod._fat_ioctl_numbers()

@@ -17,6 +17,7 @@ import hashlib
 import multiprocessing
 import os
 import pathlib
+import platform
 import random
 import re
 import shutil
@@ -5183,8 +5184,17 @@ def _discard_temp(path):
 	except OSError as e:
 		print(f"Warning: cannot remove temporary file {path}: {e}", file=sys.stderr)
 
-_FAT_IOCTL_GET_ATTRIBUTES = 0x80047210
-_FAT_IOCTL_SET_ATTRIBUTES = 0x40047211
+def _fat_ioctl_numbers(machine=None):
+	"""(FAT_IOCTL_GET_ATTRIBUTES, FAT_IOCTL_SET_ATTRIBUTES) for machine (platform.machine() by default):
+	_IOR('r', 0x10, __u32) and _IOW('r', 0x11, __u32). alpha, mips, powerpc and sparc put _IOC_READ (2) and
+	_IOC_WRITE (4) at bit 29, and parisc swaps the generic read and write bits: on all of them the two numbers come
+	out the other way round."""
+	machine = (platform.machine() if machine is None else machine).lower()
+	if machine.startswith(('alpha', 'mips', 'ppc', 'powerpc', 'sparc', 'parisc')):
+		return 0x40047210, 0x80047211
+	return 0x80047210, 0x40047211
+
+_FAT_IOCTL_GET_ATTRIBUTES, _FAT_IOCTL_SET_ATTRIBUTES = _fat_ioctl_numbers()
 # Read-only, hidden, system and archive: the attribute bits a regular file carries.
 _FAT_FILE_ATTRIBUTES = 0x27
 
