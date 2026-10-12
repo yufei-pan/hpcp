@@ -2191,12 +2191,28 @@ def test_write_phase_holds_partitions_and_locks_the_disk(tmp_path, hpcp_mod, res
 	assert seen['flock'] != 0 and seen['excl'] == errno.EBUSY
 
 
+_WRITE_PHASE_STOPPED = ('; the write phase stopped there: the raw areas, boot code and identity changes not yet done were '
+	'not applied; fix the cause and re-run')
+
+
+def _identity_on_disk(hpcp_mod, loop):
+	"""(p2's first 1024 bytes, the MBR boot code's first 14 bytes, p3's UUID and label, p1's GPT name) of loop."""
+	with open(loop + 'p2', 'rb') as f:
+		raw = f.read(1024)
+	with open(loop, 'rb') as f:
+		boot = f.read(14)
+	layout = hpcp_mod.read_disk_layout(loop)
+	return raw, boot, layout['parts'][3]['fs_uuid'], layout['parts'][3]['fs_label'], layout['parts'][1]['name']
+
+
 @requires_root_and_disk_tools
 @pytest.mark.root
 @pytest.mark.loop
-def test_a_hold_lost_before_the_write_phase_stops_raw_areas_and_identity(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
-	"""Something took partition 2 after the up-front check (simulated): raw areas, boot code and identity changes are
-	not applied, the apply fails loudly (Disk in use), and a re-run can finish."""
+@pytest.mark.parametrize('failing', ['p2', 'p3'])
+def test_a_hold_lost_before_the_write_phase_stops_raw_areas_and_identity(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch, failing):
+	"""Something took a written partition after the up-front check (simulated): raw areas, boot code and identity
+	changes are not applied, the apply fails loudly (Disk in use), and a re-run can finish. p3: partition 2 was
+	already held when partition 3 failed; its hold and the disk lock are released too."""
 	old, new, patch = _make_patch(hpcp_mod, tmp_path)
 	target = tmp_path / 'node.img'
 	shutil.copyfile(str(old), str(target))
@@ -2205,20 +2221,111 @@ def test_a_hold_lost_before_the_write_phase_stops_raw_areas_and_identity(tmp_pat
 
 	def exclusive_open(device):
 		calls.append(device)
-		if len(calls) > 2 and device.endswith('p2'):
+		# The up-front check opens p2 and p3 first; the hold opens them again, p2 first.
+		if len(calls) > 2 and device.endswith(failing):
 			raise OSError(errno.EBUSY, 'Device or resource busy')
 		return real_exclusive_open(device)
 
 	monkeypatch.setattr(hpcp_mod, '_exclusive_open', exclusive_open)
 	with _attached(target) as loop:
-		with open(loop + 'p2', 'rb') as f:
-			raw_before = f.read(1024)
+		before = _identity_on_disk(hpcp_mod, loop)
 		summary = _apply(hpcp_mod, patch, loop)
-		with open(loop + 'p2', 'rb') as f:
-			assert f.read(1024) == raw_before
 		assert subprocess.run(['flock', '-n', loop, 'true']).returncode == 0
-	assert summary['failed'] >= 1 and summary['raw_written'] == 0 and summary['identity_changed'] == 0
-	assert any(error.startswith('Disk in use: ') and 'not applied' in error for error in hpcp_mod.ERRORS)
+		for device in (loop + 'p2', loop + 'p3'):
+			os.close(os.open(device, os.O_RDONLY | os.O_EXCL))
+		assert _identity_on_disk(hpcp_mod, loop) == before
+		assert summary['failed'] >= 1 and summary['raw_written'] == 0 and summary['identity_changed'] == 0
+		assert f'Disk in use: {loop}{failing} could not be held (Device or resource busy)' + _WRITE_PHASE_STOPPED in hpcp_mod.ERRORS
+		monkeypatch.undo()
+		error_count = len(hpcp_mod.ERRORS)
+		rerun = _apply(hpcp_mod, patch, loop)
+		assert hpcp_mod.ERRORS[error_count:] == []
+		assert rerun['failed'] == 0 and rerun['raw_written'] == 2 and rerun['identity_changed'] == 2
+		assert _identity_on_disk(hpcp_mod, loop) == (b'GRUBCOR2' * 128, b'\xeb\x63NEW-BOOTCODE', before[2], 'root2', 'ESP-v2')
+
+
+@requires_root_and_disk_tools
+@pytest.mark.root
+@pytest.mark.loop
+def test_a_hold_not_taken_again_after_a_dropped_command_stops_the_write_phase(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	"""Fix round 1: e2fsck (in _TOOLS_NEEDING_EXCLUSIVE) runs with partition 3's hold dropped. When the hold cannot be
+	taken again, the identity commands after it do not run, the apply fails (Disk in use) without counting the identity
+	changes, and a re-run finishes them."""
+	old, new, patch = tmp_path / 'old.img', tmp_path / 'new.img', str(tmp_path / 'patch.img')
+	_make_golden(old)
+	_make_newer(old, new)
+	with _attached(new) as loop:
+		# tune2fs -U on a metadata_csum filesystem wants a freshly checked one.
+		_run('e2fsck', '-f', '-y', loop + 'p3')
+		_run('tune2fs', '-U', _FULL_UUID, loop + 'p3')
+	with _session(hpcp_mod) as (mount_points, loop_devices):
+		assert hpcp_mod.process_get_disk_diff_image([str(new)], [str(old)], patch, mount_points, loop_devices, max_workers=1) == patch
+	target = tmp_path / 'node.img'
+	shutil.copyfile(str(old), str(target))
+	opened, ran = [], []
+	real_exclusive_open = hpcp_mod._exclusive_open
+	real_run = hpcp_mod.run_command_in_multicmd_with_path_check
+
+	def exclusive_open(device):
+		opened.append(device)
+		# p3 is opened by the up-front check, then by the hold; the third open is the re-take after e2fsck.
+		if device.endswith('p3') and opened.count(device) == 3:
+			raise OSError(errno.EBUSY, 'Device or resource busy')
+		return real_exclusive_open(device)
+
+	def run(command, *args, **kwargs):
+		ran.append(list(command) if isinstance(command, list) else command)
+		return real_run(command, *args, **kwargs)
+
+	monkeypatch.setattr(hpcp_mod, '_exclusive_open', exclusive_open)
+	monkeypatch.setattr(hpcp_mod, 'run_command_in_multicmd_with_path_check', run)
+	with _attached(target) as loop:
+		before = _identity_on_disk(hpcp_mod, loop)
+		summary = _apply(hpcp_mod, patch, loop)
+		assert ['e2fsck', '-f', '-y', loop + 'p3'] in ran
+		assert not [command for command in ran if isinstance(command, list) and (command[:2] == ['tune2fs', '-U']
+			or command[0] == 'e2label' or command[0] == 'sgdisk' and any(arg.startswith('--change-name') for arg in command))]
+		assert subprocess.run(['flock', '-n', loop, 'true']).returncode == 0
+		os.close(os.open(loop + 'p3', os.O_RDONLY | os.O_EXCL))
+		# The raw areas and the boot code were written before the identity commands; the identity is unchanged.
+		assert _identity_on_disk(hpcp_mod, loop)[2:] == before[2:]
+		assert summary['failed'] >= 1 and summary['raw_written'] == 2 and summary['identity_changed'] == 0
+		assert (f'Disk in use: {loop}p3 could not be held again after e2fsck (Device or resource busy)' + _WRITE_PHASE_STOPPED
+			in hpcp_mod.ERRORS)
+		monkeypatch.undo()
+		error_count = len(hpcp_mod.ERRORS)
+		rerun = _apply(hpcp_mod, patch, loop)
+		assert hpcp_mod.ERRORS[error_count:] == []
+		assert rerun['failed'] == 0 and rerun['raw_written'] == 0 and rerun['raw_skipped'] == 2 and rerun['identity_changed'] == 3
+		assert _identity_on_disk(hpcp_mod, loop) == (b'GRUBCOR2' * 128, b'\xeb\x63NEW-BOOTCODE', _FULL_UUID, 'root2', 'ESP-v2')
+
+
+@pytest.mark.skipif(os.name == 'nt', reason='flock is POSIX')
+def test_disk_write_hold_unlocks_when_the_reread_raises(tmp_path, hpcp_mod, monkeypatch):
+	"""Fix round 1: the disk descriptor, and so its lock, is closed even when re-reading the partition table raises."""
+	import fcntl
+	disk = tmp_path / 'disk'
+	disk.write_bytes(b'')
+
+	def reread(disk_fd, path):
+		raise RuntimeError('partx went away')
+
+	monkeypatch.setattr(hpcp_mod, '_reread_partition_table', reread)
+	with pytest.raises(RuntimeError, match='partx went away'):
+		with hpcp_mod._disk_write_hold(str(disk), []):
+			pass
+	with open(str(disk), 'rb') as f:
+		fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+@pytest.mark.skipif(os.name == 'nt', reason='flock is POSIX')
+def test_disk_write_hold_reports_a_disk_it_cannot_open(tmp_path, hpcp_mod):
+	"""Fix round 1: a disk that cannot be opened is a DiskHoldError, which stops the write phase like a lost hold."""
+	missing = str(tmp_path / 'missing')
+	with pytest.raises(hpcp_mod.DiskHoldError) as caught:
+		with hpcp_mod._disk_write_hold(missing, []):
+			pass
+	assert caught.value.errno == errno.ENOENT and caught.value.strerror == f'cannot open {missing} (No such file or directory)'
 
 
 @requires_root_and_disk_tools
@@ -2240,16 +2347,23 @@ def test_disk_write_hold_releases_on_an_error_inside(tmp_path, hpcp_mod, reset_h
 
 
 _FULL_UUID = '11111111-2222-3333-4444-555555555555'
-# (fs_type, mkfs argv, identity tool, UUID as blkid shows it, label)
+# (fs_type, mkfs argv, identity tool, UUID as blkid shows it, label); None is left alone (hpcp sets only the label of
+# f2fs and ntfs).
 _IDENTITY_TOOL_CASES = [
 	('ext4', ['mkfs.ext4', '-q', '-F'], 'tune2fs', _FULL_UUID, 'newlabel'),
 	('xfs', ['mkfs.xfs', '-q', '-f'], 'xfs_admin', _FULL_UUID, 'newlabel'),
 	('vfat', ['mkfs.vfat'], 'fatlabel', 'ABCD-1234', 'NEWLABEL'),
 	('btrfs', ['mkfs.btrfs', '-q', '-f'], 'btrfstune', _FULL_UUID, 'newlabel'),
-	pytest.param('exfat', ['mkfs.exfat'], 'exfatlabel', 'ABCD-1234', 'newlabel', marks=pytest.mark.xfail(
+	('exfat', ['mkfs.exfat'], 'exfatlabel', None, 'newlabel'),
+	pytest.param('exfat', ['mkfs.exfat'], 'exfatlabel', 'ABCD-1234', None, marks=pytest.mark.xfail(
 		reason="pre-existing, not the hold (fails without it too): `exfatlabel -i DEVICE ABCD-1234` exits 234 with "
 		"'invalid serial number(ABCD-1234)'; exfatlabel takes the serial as hex (0xABCD1234)")),
 	('swap', ['mkswap'], 'swaplabel', _FULL_UUID, 'newlabel'),
+	('udf', ['mkudffs'], 'udflabel', '0123456789abcdef', 'newlabel'),
+	('f2fs', ['mkfs.f2fs', '-f'], 'f2fslabel', None, 'newlabel'),
+	('jfs', ['mkfs.jfs', '-q'], 'jfs_tune', _FULL_UUID, 'newlabel'),
+	('reiserfs', ['mkfs.reiserfs', '-q', '-f'], 'reiserfstune', _FULL_UUID, 'newlabel'),
+	('ntfs', ['mkfs.ntfs', '-Q', '-F'], 'ntfslabel', None, 'newlabel'),
 ]
 
 
@@ -2277,6 +2391,7 @@ def test_identity_tools_work_while_the_partition_is_held(tmp_path, hpcp_mod, res
 			hpcp_mod._run_identity_commands(commands, holds)
 		hpcp_mod._settle_partitions(loop, [1])
 		found = subprocess.run(['blkid', '-p', '-o', 'export', part], capture_output=True, text=True).stdout
-	assert f'UUID={uuid}' in found and f'LABEL={label}' in found
+	assert uuid is None or f'UUID={uuid}' in found
+	assert label is None or f'LABEL={label}' in found
 	# Every command succeeded, not only the ones whose result blkid shows: ext4's filesystem check runs first.
 	assert hpcp_mod.ERRORS == []

@@ -6921,7 +6921,7 @@ def _refuse_if_image_in_use(image):
 _BLKRRPART = 0x125f
 # Identity tools that fail while hpcp holds their partition O_EXCL (found by
 # test_identity_tools_work_while_the_partition_is_held); they run with that partition's hold dropped.
-_TOOLS_NEEDING_EXCLUSIVE = frozenset(('e2fsck', 'btrfstune', 'btrfs', 'exfatlabel'))
+_TOOLS_NEEDING_EXCLUSIVE = frozenset(('e2fsck', 'btrfstune', 'btrfs', 'exfatlabel', 'udflabel', 'f2fslabel'))
 
 class DiskHoldError(OSError):
 	"""The write phase could not lock the disk or hold a partition (see _disk_write_hold)."""
@@ -6981,12 +6981,15 @@ def _disk_write_hold(disk, devices, timeout=10):
 	flock(LOCK_EX) on the whole disk (systemd's block-device locking convention: udev postpones its events for a disk
 	locked so, and so does not re-read the partition table mid-phase), retried for up to timeout seconds while udev
 	holds its shared lock; then an O_EXCL open of every device, kept to the end, so nothing can mount or claim them
-	meanwhile. Raises DiskHoldError when the lock or a hold cannot be taken (what was taken is released). On exit the
-	holds are closed first (the kernel cannot re-read a table whose partitions are open exclusively), then the
-	partition table is re-read, then the lock released.
+	meanwhile. Raises DiskHoldError when disk cannot be opened or the lock or a hold cannot be taken (what was taken
+	is released). On exit the holds are closed first (the kernel cannot re-read a table whose partitions are open
+	exclusively), then the partition table is re-read, then the lock released (even when the re-read raises).
 	"""
 	import fcntl
-	disk_fd = os.open(disk, os.O_RDONLY | getattr(os, 'O_CLOEXEC', 0))
+	try:
+		disk_fd = os.open(disk, os.O_RDONLY | getattr(os, 'O_CLOEXEC', 0))
+	except OSError as e:
+		raise DiskHoldError(e.errno, f'cannot open {disk} ({e.strerror})')
 	holds = {}
 	try:
 		deadline = time.time() + timeout
@@ -7002,20 +7005,23 @@ def _disk_write_hold(disk, devices, timeout=10):
 			try:
 				holds[device] = _exclusive_open(device)
 			except OSError as e:
-				raise DiskHoldError(e.errno, f'{device} was taken after the check ({e.strerror})')
+				raise DiskHoldError(e.errno, f'{device} could not be held ({e.strerror})')
 		yield holds
 	finally:
-		for fd in holds.values():
-			if fd is not None:
-				os.close(fd)
-		_reread_partition_table(disk_fd, disk)
-		# Closing the descriptor releases the lock.
-		os.close(disk_fd)
+		try:
+			for fd in holds.values():
+				if fd is not None:
+					os.close(fd)
+			_reread_partition_table(disk_fd, disk)
+		finally:
+			# Closing the descriptor releases the lock.
+			os.close(disk_fd)
 
 def _run_identity_commands(commands, holds):
 	"""Run the identity commands while the write phase holds their partitions. A tool in _TOOLS_NEEDING_EXCLUSIVE
 	opens its device exclusively itself: the hold of every held device its command names is dropped for that one
-	command and taken again after it (a warning when that fails; the remaining commands still run)."""
+	command and taken again after it. Raises DiskHoldError when a hold cannot be taken again: the remaining commands
+	do not run."""
 	for command in commands:
 		dropped = []
 		if command[0] in _TOOLS_NEEDING_EXCLUSIVE:
@@ -7029,7 +7035,7 @@ def _run_identity_commands(commands, holds):
 			try:
 				holds[device] = _exclusive_open(device)
 			except OSError as e:
-				print(f'Warning: cannot hold {device} again after {command[0]} ({e.strerror})', file=sys.stderr)
+				raise DiskHoldError(e.errno, f'{device} could not be held again after {command[0]} ({e.strerror})')
 
 def apply_disk_patch(volume_roots, target, mount_points, loop_devices, force=False, max_workers=1, verbose=False, volume_names=None):
 	"""Apply a disk patch (layout disk) to target: a GPT block device or disk-image file.
@@ -7038,8 +7044,9 @@ def apply_disk_patch(volume_roots, target, mount_points, loop_devices, force=Fal
 	every section's paths, the raw areas and the identity values. A partition the patch writes raw or sets a UUID /
 	label on must open exclusively (O_EXCL) during planning, or nothing is applied (Disk in use): that also catches
 	mounts in another mount namespace. During the raw writes and identity commands the whole disk is flock'ed and
-	those partitions held exclusively; a hold that cannot be taken then stops the raw areas, boot code and identity
-	changes like a failed section. Filesystem sections are
+	those partitions held exclusively; a hold that cannot be taken then (or again, after a tool that needs the
+	partition to itself) stops the raw areas, boot code and identity changes not yet done, like a failed section.
+	Filesystem sections are
 	applied first (partition order, ESP last), then raw partition areas, the MBR boot code
 	and identity changes; then everything is verified. A section that fails stops the apply
 	there: later sections, raw areas, boot code and identity changes are left for a re-run.
@@ -7182,7 +7189,9 @@ def apply_disk_patch(volume_roots, target, mount_points, loop_devices, force=Fal
 		except DiskHoldError as e:
 			hold_error = e.strerror
 			failed += 1
-			eprint(f'Disk in use: {hold_error}; raw areas, the boot code and identity changes were not applied; fix the cause and re-run')
+			# Raw areas and earlier identity commands may be done already; a re-run skips them.
+			eprint(f'Disk in use: {hold_error}; the write phase stopped there: the raw areas, boot code and identity changes '
+				'not yet done were not applied; fix the cause and re-run')
 	if stopped is None:
 		# The holds are released and the partition table re-read: wait until udev shows every partition again.
 		_settle_partitions(disk, sorted(layout['parts']))
