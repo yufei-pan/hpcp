@@ -591,7 +591,6 @@ def _session(hpcp_mod):
 
 
 @requires_root_and_disk_tools
-@requires_root_and_disk_tools
 @pytest.mark.root
 @pytest.mark.loop
 def test_a_fresh_loop_disk_reads_the_same_ten_times(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
@@ -622,6 +621,7 @@ def test_a_fresh_loop_disk_reads_the_same_ten_times(tmp_path, hpcp_mod, reset_hp
 	assert first[3]['fs_label'] == 'root' and first[1]['fs_type'] == 'vfat'
 
 
+@requires_root_and_disk_tools
 @pytest.mark.root
 @pytest.mark.loop
 def test_read_disk_layout_of_a_gpt_image(tmp_path, hpcp_mod, reset_hpcp_globals):

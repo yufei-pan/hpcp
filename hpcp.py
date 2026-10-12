@@ -6212,6 +6212,8 @@ def read_disk_layout(device, name=None, pttype=None, fs_params=True):
 	get_partition_infos.cache_clear()
 	get_partition_details.cache_clear()
 	# A node udev is still re-adding would be probed as empty: settle once, then wait for every node.
+	# sgdisk --print only reads the disk, so it triggers no udev re-read: this one settle before it, plus the node wait
+	# after it, is enough.
 	_udev_settle()
 	infos = get_partition_infos(device, identity=False)
 	devices = _settle_partitions(device, [int(key) for key, info in infos.items() if 'disk_identifier' not in info], settle=False)
