@@ -5137,6 +5137,73 @@ def _same_entry(path, others):
 			return True
 	return False
 
+def _mounts_below(path, mount_points):
+	"""The mount points at or below path's real path, relative to it ('.' for path itself), sorted."""
+	real = os.path.realpath(path)
+	inside = real.rstrip(os.sep) + os.sep
+	return sorted(os.path.relpath(point, real) for point in mount_points if point == real or point.startswith(inside))
+
+def _remove_tree_around_mounts(path, mount_points=None):
+	"""Remove the directory tree at path as shutil.rmtree would, without entering a mount.
+
+	An entry that is a mount point in mountinfo (any entry: bind mounts and hidden mounts too), or a directory whose
+	st_dev differs from path's (a mount made after mountinfo was read), is left in place with everything below it,
+	and so are the directories above it; path itself too when it is a mount point. Symlinks are unlinked, never
+	followed. The walk is iterative and keeps going after an error. Returns (the entries left in place as mount
+	points, relative to path; the errors met, as text).
+	"""
+	if mount_points is None:
+		mount_points = {entry['mount_point'] for entry in _mountinfo_entries()}
+	top = os.path.realpath(path)
+	kept, errors = [], []
+	try:
+		top_dev = os.lstat(top).st_dev
+	except FileNotFoundError:
+		return kept, errors
+	if top in mount_points:
+		return ['.'], errors
+	# (directory, its entries already handled): a directory is pushed again after its children, then removed.
+	stack = [(top, False)]
+	while stack:
+		directory, done = stack.pop()
+		if done:
+			try:
+				os.rmdir(directory)
+			except FileNotFoundError:
+				pass
+			except OSError as e:
+				# Not empty: a kept mount below it, or an entry whose removal already failed (recorded).
+				if e.errno not in (errno.ENOTEMPTY, errno.EEXIST):
+					errors.append(f'{os.path.relpath(directory, top)}: {e.strerror}')
+			continue
+		stack.append((directory, True))
+		try:
+			names = os.listdir(directory)
+		except OSError as e:
+			errors.append(f'{os.path.relpath(directory, top)}: {e.strerror}')
+			continue
+		for name in names:
+			child = os.path.join(directory, name)
+			try:
+				info = os.lstat(child)
+			except FileNotFoundError:
+				continue
+			except OSError as e:
+				errors.append(f'{os.path.relpath(child, top)}: {e.strerror}')
+				continue
+			if child in mount_points or (stat.S_ISDIR(info.st_mode) and info.st_dev != top_dev):
+				kept.append(os.path.relpath(child, top))
+			elif stat.S_ISDIR(info.st_mode):
+				stack.append((child, False))
+			else:
+				try:
+					os.unlink(child)
+				except FileNotFoundError:
+					pass
+				except OSError as e:
+					errors.append(f'{os.path.relpath(child, top)}: {e.strerror}')
+	return sorted(kept), errors
+
 def _apply_rows(rows, volume_roots, target_root, max_workers=1, verbose=False, full_hash=False, forced_rows=(), metadata=True,
 		skipped=()):
 	"""Carry out checked rows: deletions, then directories, files, symlinks, directory metadata.
@@ -5144,7 +5211,8 @@ def _apply_rows(rows, volume_roots, target_root, max_workers=1, verbose=False, f
 	Containment of every target path is re-checked immediately before each write, and the
 	target root itself is never removed. A directory is removed with rmdir, so an entry that
 	appeared after the check survives (and verify reports the row); only a row in
-	forced_rows (a conflict the user forced) may remove a whole tree. Files and symlinks are
+	forced_rows (a conflict the user forced) may remove a whole tree, and that removal never enters a mount (see
+	_remove_tree_around_mounts): a tree holding a mount point is left in place and fails verify. Files and symlinks are
 	built at a temporary sibling and renamed over the target (see _replace_files), so an
 	existing file or symlink is never removed before its replacement exists. Only an entry
 	a rename cannot replace is removed first: a directory where a file or symlink goes, or
@@ -5176,17 +5244,23 @@ def _apply_rows(rows, volume_roots, target_root, max_workers=1, verbose=False, f
 		return os.path.isdir(path) and not os.path.islink(path)
 
 	def remove(row):
-		"""Unlink row's target, rmdir it, or (forced rows only) remove its whole tree."""
+		"""Unlink row's target, rmdir it, or (forced rows only) remove its whole tree, never entering a mount."""
 		path = guarded(row, removing=True)
 		if path is None:
 			return
 		directory = is_real_dir(path)
 		try:
 			if directory and row in forced_rows:
-				# Recorded before the call: an rmtree that fails partway may already have removed entries,
-				# so the repair step must still check the skipped rows.
+				# Recorded before the walk: one that stops partway may already have removed entries, so the
+				# repair step must still check the skipped rows.
 				removed.append(row.path)
-				shutil.rmtree(path)
+				kept, errors = _remove_tree_around_mounts(path)
+				for error in errors:
+					eprint(f'Remove directory failed: {row.path}: {error}')
+				if kept:
+					eprint(f"Remove directory failed: {row.path}: {', '.join(kept[:3])}{' ...' if len(kept) > 3 else ''} "
+						'is a mount point; left in place with the directories above it')
+				return
 			elif directory:
 				os.rmdir(path)
 			else:
@@ -5347,10 +5421,28 @@ def _section_todo(plan):
 	return [check.row for check in plan.checks if check.action != 'skip']
 
 def _resolve_section_conflicts(plans, force, extra_lines=()):
-	"""One conflict list and one prompt for every section (and extra lines such as raw areas)."""
+	"""One conflict list and one prompt for every section (and extra lines such as raw areas).
+
+	Before them, a note for each conflicting row whose forced removal of a directory would stop at a mount below it
+	(see _remove_tree_around_mounts), so the user sees it before confirming.
+	"""
 	lines = []
+	mount_points = None
 	for plan in plans:
-		lines += _conflict_lines(_section_conflicts(plan), '' if plan.name == 'root' else f'[{plan.name}] ')
+		conflicts = _section_conflicts(plan)
+		where = '' if plan.name == 'root' else f'[{plan.name}] '
+		lines += _conflict_lines(conflicts, where)
+		for check in conflicts:
+			row = check.row
+			if not check.found.startswith('d:') or (row.op != 'D' and row.new.startswith('d:')):
+				continue
+			if mount_points is None:
+				mount_points = {entry['mount_point'] for entry in _mountinfo_entries()}
+			below = _mounts_below(_key_path(plan.target_root, row.path), mount_points)
+			if below:
+				first = os.path.normpath(os.path.join(row.path.rstrip('/'), below[0]))
+				more = f' (and {len(below) - 1} more)' if len(below) > 1 else ''
+				print(f'Note: forced removal of {where}{row.path} stops at the mount at {first}{more}; that row will fail verify')
 	lines += list(extra_lines)
 	if lines:
 		_resolve_conflict_lines(lines, force)

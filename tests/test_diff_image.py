@@ -2204,10 +2204,10 @@ def test_failed_forced_rmtree_still_runs_the_repair_step(tmp_path, hpcp_mod, res
 	R = hpcp_mod.ChangeRow
 	row = R('D', 'd/', state(str(target / 'd')), '-')
 	skipped = R('A', 'keep.txt', '-', state(str(vol / 'keep.txt')))
-	def partial_rmtree(path, *args, **kwargs):
+	def partial_walk(path, *args, **kwargs):
 		os.unlink(str(target / 'keep.txt'))
-		raise OSError('boom')
-	monkeypatch.setattr(hpcp_mod.shutil, 'rmtree', partial_rmtree)
+		return [], ['a: boom']
+	monkeypatch.setattr(hpcp_mod, '_remove_tree_around_mounts', partial_walk)
 	restored, _ = hpcp_mod._apply_rows([row], [str(vol)], str(target), forced_rows=[row], skipped=[skipped])
 	assert restored == [skipped] and (target / 'keep.txt').read_text() == 'k'
 
@@ -2890,3 +2890,138 @@ def test_write_over_a_skipped_case_sibling_on_vfat_fails_at_verify(trees, hpcp_m
 	assert summary['modified'] == 1 and summary['failed'] >= 1
 	assert any(error.startswith('Patch verify error: A EFI/x:') for error in hpcp_mod.ERRORS)
 	assert names == ['X']
+
+
+requires_root = pytest.mark.skipif(os.name == 'nt' or os.geteuid() != 0 or shutil.which('mount') is None,
+	reason='needs root and mount')
+
+
+def test_remove_tree_around_mounts_keeps_mount_points(tmp_path, hpcp_mod):
+	"""The walk removes everything on the tree's own filesystem and never enters a directory listed as a mount
+	point; the directories above a kept mount stay. Symlinks are unlinked, never followed."""
+	top = tmp_path / 'app'
+	_write(top / 'a' / 'f', 'x')
+	_write(top / 'b' / 'data' / 'keep', 'mounted')
+	_write(tmp_path / 'outside' / 'target', 'outside')
+	os.symlink(str(tmp_path / 'outside'), str(top / 'link'))
+	mount = os.path.realpath(str(top / 'b' / 'data'))
+	kept, errors = hpcp_mod._remove_tree_around_mounts(str(top), {mount})
+	assert kept == ['b/data'] and errors == []
+	assert (top / 'b' / 'data' / 'keep').read_text() == 'mounted'
+	assert not (top / 'a').exists() and not os.path.lexists(str(top / 'link'))
+	assert (tmp_path / 'outside' / 'target').read_text() == 'outside'
+	assert sorted(os.listdir(str(top))) == ['b'] and os.listdir(str(top / 'b')) == ['data']
+
+
+def test_remove_tree_around_mounts_leaves_a_mount_point_root_alone(tmp_path, hpcp_mod):
+	top = tmp_path / 'esp'
+	_write(top / 'EFI' / 'x', 'x')
+	kept, errors = hpcp_mod._remove_tree_around_mounts(str(top), {os.path.realpath(str(top))})
+	assert (kept, errors) == (['.'], []) and (top / 'EFI' / 'x').read_text() == 'x'
+
+
+def test_remove_tree_around_mounts_stops_at_another_device(tmp_path, hpcp_mod, monkeypatch):
+	"""Review Focus 2: a mount made after mountinfo was read is still not entered: its directory's st_dev differs."""
+	top = tmp_path / 'app'
+	_write(top / 'late' / 'keep', 'k')
+	_write(top / 'f', 'x')
+	late = os.path.realpath(str(top / 'late'))
+	real_lstat = os.lstat
+
+	def lstat(path, *args, **kwargs):
+		info = real_lstat(path, *args, **kwargs)
+		if os.fspath(path) == late:
+			values = list(info)
+			values[stat.ST_DEV] = info.st_dev + 1
+			return os.stat_result(values)
+		return info
+
+	monkeypatch.setattr(os, 'lstat', lstat)
+	kept, errors = hpcp_mod._remove_tree_around_mounts(str(top), set())
+	monkeypatch.undo()
+	assert kept == ['late'] and errors == [] and (top / 'late' / 'keep').exists() and not (top / 'f').exists()
+
+
+def test_mounts_below(tmp_path, hpcp_mod):
+	top = os.path.realpath(str(tmp_path / 'app'))
+	points = {top + '/data', top + '/x/y', top + 'z', '/elsewhere', top}
+	assert hpcp_mod._mounts_below(str(tmp_path / 'app'), points) == ['.', 'data', 'x/y']
+
+
+@contextlib.contextmanager
+def _tmpfs_at(path):
+	os.makedirs(str(path), exist_ok=True)
+	subprocess.run(['mount', '-t', 'tmpfs', '-o', 'size=4m', 'tmpfs', str(path)], check=True)
+	try:
+		yield path
+	finally:
+		subprocess.run(['umount', str(path)], check=False)
+
+
+@contextlib.contextmanager
+def _bind_at(source, path):
+	os.makedirs(str(path), exist_ok=True)
+	subprocess.run(['mount', '--bind', str(source), str(path)], check=True)
+	try:
+		yield path
+	finally:
+		subprocess.run(['umount', str(path)], check=False)
+
+
+def _app_dropped(hpcp_mod, tmp_path, new, base):
+	"""The golden drops app/ (two files) and adds other.txt. Returns the patch volume."""
+	_write(base / 'app' / 'one', '1')
+	_write(base / 'app' / 'two', '2')
+	_write(new / 'other.txt', 'added')
+	vol = tmp_path / 'vol'
+	rows, _ = _patch_from(hpcp_mod, new, base, [vol])
+	assert ('D', 'app/') in _ops(rows)
+	return vol
+
+
+@requires_root
+@pytest.mark.root
+@pytest.mark.parametrize('kind', ['tmpfs', 'bind'])
+def test_forced_removal_stops_at_a_mount(trees, hpcp_mod, tmp_path, capsys, kind):
+	"""Spec Part 1 item 1: -fa removes app/ around the filesystem mounted at app/data (a tmpfs, or a bind of a
+	directory of the same filesystem): the mounted files survive, the D row fails at verify, the rest applies, and
+	a note names the mount before anything changes."""
+	new, base = trees
+	vol = _app_dropped(hpcp_mod, tmp_path, new, base)
+	target = tmp_path / 'target'
+	_clone(base, target)
+	outside = tmp_path / 'outside'
+	_write(outside / 'precious', 'keep me')
+	mount = _tmpfs_at(target / 'app' / 'data') if kind == 'tmpfs' else _bind_at(outside, target / 'app' / 'data')
+	with mount:
+		if kind == 'tmpfs':
+			_write(target / 'app' / 'data' / 'precious', 'keep me')
+		hpcp_mod.ERRORS.clear()
+		summary = hpcp_mod.apply_patch_tree([str(vol)], str(target), force=True, max_workers=1)
+		assert (target / 'app' / 'data' / 'precious').read_text() == 'keep me'
+		assert os.path.ismount(str(target / 'app' / 'data')) or kind == 'bind'
+	out = capsys.readouterr().out
+	assert 'Note: forced removal of app/ stops at the mount at app/data; that row will fail verify' in out
+	assert summary['failed'] >= 1 and (target / 'other.txt').read_text() == 'added'
+	assert not (target / 'app' / 'one').exists() and not (target / 'app' / 'two').exists()
+	assert any(error.startswith('Patch verify error: D app/') for error in hpcp_mod.ERRORS)
+	assert (outside / 'precious').read_text() == 'keep me'
+
+
+@requires_root
+@pytest.mark.root
+def test_forced_type_change_stops_at_a_mount(trees, hpcp_mod, tmp_path):
+	"""A forced directory-to-file replacement over a directory holding a mount leaves the mount and fails."""
+	new, base = trees
+	_write(base / 'app' / 'one', '1')
+	_write(new / 'app', 'now a file')
+	vol = tmp_path / 'vol'
+	_patch_from(hpcp_mod, new, base, [vol])
+	target = tmp_path / 'target'
+	_clone(base, target)
+	with _tmpfs_at(target / 'app' / 'data'):
+		_write(target / 'app' / 'data' / 'precious', 'keep me')
+		hpcp_mod.ERRORS.clear()
+		summary = hpcp_mod.apply_patch_tree([str(vol)], str(target), force=True, max_workers=1)
+		assert (target / 'app' / 'data' / 'precious').read_text() == 'keep me'
+	assert summary['failed'] >= 1 and os.path.isdir(str(target / 'app'))
