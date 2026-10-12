@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** `-dd` sees only a disk's own partitions, `-dd -diff` keeps this run's paths out on btrfs subvolume roots and binds, applies plan automounted ESPs as FAT, FAT attributes survive on every architecture, a forced removal can never act outside the target, and the C1 leftovers are closed (hpcp 9.72).
+**Goal:** `-dd` sees only a disk's own partitions, `-dd -diff` keeps this run's paths out on btrfs subvolume roots and binds, applies plan automounted ESPs as FAT, FAT attributes survive on every architecture, a forced removal can never act outside the target, the C1 leftovers are closed, and `-fh` generation hashes every payload copy again (hpcp 9.72).
 
 **Architecture:** Each fix is local to one helper:
 - `_lsblk_disk_rows` parses `lsblk -P` pairs and filters partitions by `PKNAME`.
@@ -874,13 +874,14 @@ git commit -m "fix(siff): a forced removal reaches its top by a descriptor walk 
 
 ---
 
-### Task 6: polish — rooted `-e` in compare mode, holder lookup by dict, `-e /`, scan-stat pin
+### Task 6: polish — rooted `-e` in compare mode, holder lookup by dict, `-e /`, scan-stat pin, full re-check with `-fh`
 
 **Files:**
 - Modify: `hpcp.py`:
   - `process_compare_file_list` (~8220-8245);
   - the `holder()` closure in `_rows_to_recheck` (~4663);
-  - `build_rooted_maps` (~4330).
+  - `build_rooted_maps` (~4330);
+  - `_check_payload`: its `recheck` line (~4741) and its docstring.
 - Test: `tests/test_diff_image.py`
 
 **Interfaces:**
@@ -979,17 +980,68 @@ def test_compute_changes_collects_scan_stats_for_new_side_paths_only(trees, hpcp
 	monkeypatch.setattr(hpcp_mod, '_states_for_paths', spy)
 	hpcp_mod.compute_changes(new_map, base_map, max_workers=1, scan={})
 	assert asked == [set(new_map.values())]
+
+
+def test_full_hash_patches_hash_every_payload_copy_again(trees, hpcp_mod, tmp_path, monkeypatch):
+	"""Spec Part 3 item 5: with -fh every copy is hashed again (as up to 9.70), even from a read-only source."""
+	new, base = trees
+	_write(new / 'a.txt', 'a')
+	_write(new / 'sub' / 'b.txt', 'b')
+	_one_mount(hpcp_mod, monkeypatch, options=('ro',), super_options=('ro',))
+	new_map, base_map = hpcp_mod.build_root_maps(str(new), str(base), max_workers=1)
+	scan = {}
+	rows = hpcp_mod.compute_changes(new_map, base_map, full_hash=True, max_workers=1, scan=scan)
+	vol = tmp_path / 'vol'
+	vol.mkdir()
+	hashed = []
+	real = hpcp_mod._states_for_paths
+	def spy(paths, *args, **kwargs):
+		paths = list(paths)
+		hashed.extend(paths)
+		return real(paths, *args, **kwargs)
+	monkeypatch.setattr(hpcp_mod, '_states_for_paths', spy)
+	hpcp_mod.build_patch_tree(rows, str(new), [str(vol)], hpcp_mod.make_patch_meta(rows, 'n', 'b', 'root', full_hash=True),
+		max_workers=1, scan=scan)
+	assert sorted(os.path.relpath(path, str(vol)).replace(os.sep, '/') for path in hashed) == ['a.txt', 'sub/b.txt']
+
+
+def test_full_hash_patches_catch_a_copy_damaged_after_the_copy(trees, hpcp_mod, tmp_path, monkeypatch):
+	"""Spec Part 3 item 5: a copy that came out wrong with the right size (and the source's mtime) stops a -fh
+	generation before any manifest is written, even from a read-only source."""
+	new, base = trees
+	source = _write(new / 'a.txt', 'aaaa')
+	_one_mount(hpcp_mod, monkeypatch, options=('ro',), super_options=('ro',))
+	new_map, base_map = hpcp_mod.build_root_maps(str(new), str(base), max_workers=1)
+	scan = {}
+	rows = hpcp_mod.compute_changes(new_map, base_map, full_hash=True, max_workers=1, scan=scan)
+	vol = tmp_path / 'vol'
+	vol.mkdir()
+	real_copy = hpcp_mod.copy_file_list_parallel
+	def damaging_copy(*args, **kwargs):
+		result = real_copy(*args, **kwargs)
+		with open(str(vol / 'a.txt'), 'r+b') as f:
+			f.write(b'X')
+		st = os.stat(source)
+		os.utime(str(vol / 'a.txt'), ns=(st.st_atime_ns, st.st_mtime_ns))
+		return result
+	monkeypatch.setattr(hpcp_mod, 'copy_file_list_parallel', damaging_copy)
+	with pytest.raises(RuntimeError, match=r'^Diff image error: 1 file\(s\) changed while the patch was built \(e\.g\. a\.txt\)'):
+		hpcp_mod.build_patch_tree(rows, str(new), [str(vol)], hpcp_mod.make_patch_meta(rows, 'n', 'b', 'root', full_hash=True),
+			max_workers=1, scan=scan)
+	assert not (vol / '.hpcp_diff' / 'manifest').exists()
 ```
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `python -m pytest tests/test_diff_image.py -q -k "compare_mode or matching_the_root or recheck_lookup or new_side_paths_only"`
+Run: `python -m pytest tests/test_diff_image.py -q -k "compare_mode or matching_the_root or recheck_lookup or new_side_paths_only or full_hash_patches"`
 Expected:
 - The two rooted compare-mode tests fail: `*/tmp/*` excludes everything (no `M changed.txt` row), or `/var/log/*` is
   not rooted (`var/log` files show up).
 - `test_exclude_matching_the_root_empties_both_sides` fails, because the temp-mounted side still lists `a.txt`.
 - The lookup test fails on the time bound, since the old holder scans every mount.
 - The directory-source test and the scan-stat pin pass: they pin existing behaviour.
+- The two `-fh` tests fail: a read-only source's copies are not hashed again (no paths hashed; the damaged copy
+  ships).
 
 - [ ] **Step 3: Implement**
 
@@ -1063,9 +1115,27 @@ If `visible` has no other user left in `_rows_to_recheck`, keep building `points
 
 The scan-stat pin needs no code change.
 
+**Full re-check with `-fh`.** In `_check_payload`, replace
+
+```python
+	recheck = set(_rows_to_recheck(list(copies), new_base, scan)) if new_base is not None else set(copies)
+```
+
+with
+
+```python
+	# With -fh every copy is hashed again, whatever its source (as up to 9.70): a copy that came out wrong with the
+	# right size is caught here, before the patch exists, not by every apply's verify after it was written.
+	recheck = set(copies) if full_hash or new_base is None else set(_rows_to_recheck(list(copies), new_base, scan))
+```
+
+and in its docstring change `A copy is hashed again only when its source may have changed since the scan read it
+(_rows_to_recheck; every copy when new_base is None).` to `With full_hash (-fh) every copy is hashed again; otherwise
+only when its source may have changed since the scan read it (_rows_to_recheck; every copy when new_base is None).`
+
 - [ ] **Step 4: Run the tests to verify they pass**
 
-Run: `python -m pytest tests/test_diff_image.py -q -k "compare or rooted or recheck or payload or matching_the_root or new_side_paths_only or file_list"`
+Run: `python -m pytest tests/test_diff_image.py -q -k "compare or rooted or recheck or payload or matching_the_root or new_side_paths_only or file_list or full_hash"`
 Expected: PASS. The C1 re-check tests (file mount, mount below the source, store layout) give the same answers.
 
 - [ ] **Step 5: Run the affected files in full**
@@ -1077,7 +1147,7 @@ Expected: all pass.
 
 ```bash
 git add hpcp.py tests/test_diff_image.py
-git commit -m "fix: rooted -e for image sources in compare mode; recheck lookup by mount-point dict; -e / empties both sides; pin scan stats to the new side"
+git commit -m "fix: rooted -e for image sources in compare mode; recheck lookup by mount-point dict; -e / empties both sides; pin scan stats to the new side; -fh re-checks every payload copy"
 ```
 
 ---
@@ -1100,7 +1170,7 @@ In `docs/superpowers/specs/2026-10-12-exclude-inputs-recheck-design.md`:
 
 - [ ] **Step 2: README**
 
-1. In line ~84, replace `never on a read-only filesystem (a \`-si\` image, or a golden mounted read-only)` with `on a read-only filesystem (a \`-si\` image, or a golden mounted read-only) only when the file's stat moved`.
+1. In line ~84, replace `never on a read-only filesystem (a \`-si\` image, or a golden mounted read-only)` with `on a read-only filesystem (a \`-si\` image, or a golden mounted read-only) only when the file's stat moved`. At the end of that sentence (after `...anything but ext2/3/4, xfs, btrfs and f2fs).`), append ` With \`-fh\` every copy is read again, whatever its source, so a copy that came out wrong is caught before the patch exists.`
 2. In line ~92, after the sentence `Rows are planned per filesystem: the target's own and each one mounted below it (for example the ESP at \`/boot/efi\` when applying to \`/\`).`, insert:
    ` An automounted filesystem the patch writes into (an ESP that systemd mounts on demand, shown as autofs until something enters it) is mounted first, so it is planned as what it holds; one that cannot be mounted stops the apply before anything changes. A file written by one filesystem's rows and then removed, through a symlinked directory, by a later filesystem's delete is reported by verify (failed), not written again; and an entry replaced twice by contradictory rows of one patch can in principle reuse an inode number, which verify then cannot tell apart (both need patches that contradict themselves).`
 3. In line ~118 (the `-dd -diff` paragraph), after the `-e` sentence, insert:

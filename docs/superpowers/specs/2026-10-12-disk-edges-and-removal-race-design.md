@@ -61,6 +61,10 @@ This ships as hpcp 9.72. 9.68–9.72 are not on PyPI; publishing needs the user'
 2. **Race fix scope.** Forced removals only. Ordinary writes keep the documented race. The other options were every
    write, rename and delete, or documentation only.
 3. **Design sections 1–3** were presented and approved as written here.
+4. **Full re-check with `-fh`** (added after the spec was approved). A side review pointed out that since 9.71 a payload
+   copy that came out damaged, with the right size, ships when its source is read-only or unchanged. Watching mtime
+   cannot catch it, because the copy's mtime is stamped from the source after the data is written. The user chose to
+   hash every copy again when `-fh` is set, rather than hashing during the copy or adding an `O_DIRECT` read-back.
 
 ## Design
 
@@ -138,6 +142,12 @@ This ships as hpcp 9.72. 9.68–9.72 are not on PyPI; publishing needs the user'
    either side, so the same input means the same thing for a `/` base and a temp-mounted image.
 4. **Scan-stat pin.** A test shows that `compute_changes(scan=…)` asks `_states_for_paths` for stats of new-side paths
    only. The C1 final review found this unpinned.
+5. **Full re-check with `-fh`.**
+   - When the patch's rows are hashed in full (`-fh`, the manifest's `full_hash` 1), `_check_payload` hashes every A/M
+     file copy again and compares it with its row, whatever its source, as up to 9.70.
+   - Without `-fh`, C1's rules stand (`_rows_to_recheck`). The cost of `-fh` generation is again one more read of the
+     payload, mostly from the page cache right after the copy.
+   - The README says so next to the re-check sentence.
 
 ### Part 4 — docs
 
@@ -213,6 +223,8 @@ and stopped or removed in a trap.
     are unchanged (file mount first, then the deepest).
   - `-e /` empties both sides.
   - The scan-stat pin.
+  - With `-fh`, every copy is hashed again even from a read-only source, and a copy damaged after the copy (same size)
+    stops generation before any manifest is written.
 - **Compatibility:** the full suite stays green.
 
 ## Review focus
