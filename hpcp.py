@@ -3788,6 +3788,17 @@ DIFF_DIR_NAME = '.hpcp_diff'
 DIFF_FORMAT_VERSION = 2
 # Single-filesystem patches keep the version hpcp 9.65 reads; disk patches (layout disk) are version 2.
 _SINGLE_FS_FORMAT_VERSION = 1
+
+# A hash over the whole file in a patch hashed by its tail (manifest full_hash 0): 'F' + the hex digest. Files on FAT
+# carry it (see compute_changes); digests are lowercase hex, so the mark cannot be one.
+_FULL_HASH_MARK = 'F'
+
+def _full_marked(state):
+	"""True when state is a file state whose hash carries the full-hash mark (_FULL_HASH_MARK)."""
+	if not state.startswith('f:'):
+		return False
+	fields = state.split(':')
+	return len(fields) == 8 and fields[6].startswith(_FULL_HASH_MARK)
 CHANGES_HEADER = '#hpcp-changes'
 CHANGES_VERSION = 1
 ChangeRow = namedtuple('ChangeRow', 'op path old new')
@@ -3871,7 +3882,7 @@ def _tz_shift_close(a_ns, b_ns):
 	shift = int(round((a_ns - b_ns) / _TZ_STEP_NS)) * _TZ_STEP_NS
 	return 0 < abs(shift) <= _TZ_MAX_NS and _mtime_ns_close(a_ns, b_ns + shift)
 
-def states_equal(a, b, compare_hash=True, metadata=True, full_hash=False):
+def states_equal(a, b, compare_hash=True, metadata=True, full_hash=False, tz_tolerant=False):
 	"""True when two entry states describe the same entry.
 
 	Directories ignore mtime; files allow the timestamp-precision tolerance; an xattr
@@ -3879,10 +3890,11 @@ def states_equal(a, b, compare_hash=True, metadata=True, full_hash=False):
 	With compare_hash False neither the content hash nor the xattr digest is compared
 	(both come from the same hasher). With metadata False mode, owner and xattrs are not
 	compared: on FAT, exFAT and NTFS they come from mount options, not the filesystem.
-	With metadata False a whole number of 15-minute steps (at most 24 hours) between file mtimes is
-	tolerated when the hashes match and cover the whole file: a FAT time read under another timezone
-	setting. The hashes cover the whole file when its size is at most HASH_SIZE, or with full_hash (both
-	states hashed in full); past HASH_SIZE only the file's tail is hashed, and a head edit would pass.
+	With tz_tolerant (a FAT section or scope: FAT stores local times) a whole number of 15-minute steps (at most 24
+	hours) between file mtimes is tolerated when the hashes match and cover the whole file: a FAT time read under
+	another timezone setting. The hashes cover the whole file when its size is at most HASH_SIZE, when they carry the
+	full-hash mark (_FULL_HASH_MARK), or with full_hash; past HASH_SIZE only the file's tail is hashed, and a head
+	edit would pass. NTFS stores UTC times and exFAT records the offset: no tolerance there.
 	"""
 	if a == '?' or b == '?':
 		return False
@@ -3906,8 +3918,9 @@ def states_equal(a, b, compare_hash=True, metadata=True, full_hash=False):
 	if _mtime_ns_close(info_a['mtime_ns'], info_b['mtime_ns']):
 		return True
 	# FAT stores local times: read under another timezone setting the same file shows a whole-step offset. Only
-	# content-only comparisons whose hashes confirmed the whole content accept it.
-	return (not metadata and compare_hash and info_a['hash'] not in ('', '-') and (full_hash or info_a['size'] <= HASH_SIZE)
+	# FAT comparisons whose hashes confirmed the whole content accept it.
+	return (tz_tolerant and compare_hash and info_a['hash'] not in ('', '-')
+		and (full_hash or info_a['hash'].startswith(_FULL_HASH_MARK) or info_a['size'] <= HASH_SIZE)
 		and _tz_shift_close(info_a['mtime_ns'], info_b['mtime_ns']))
 
 def _hash_algo_name():
@@ -3950,11 +3963,13 @@ def _xattr_digest(path):
 		hasher.update(os.fsencode(name) + b'\0' + struct.pack('>Q', len(value)) + value)
 	return hasher.hexdigest()
 
-def get_entry_state(path, full_hash=False, read_xattrs=True):
+def get_entry_state(path, full_hash=False, read_xattrs=True, mark_full=False):
 	"""State string of one path (see decode_state). Missing paths, including ones below a
 	regular file, are '-'; any other read failure is recorded with eprint and returns '?' (unknown).
 	An existing entry that is not a regular file, directory or symlink (FIFO, socket, device)
-	is '?' too, without an error: hpcp ignores special files, but they are not absent."""
+	is '?' too, without an error: hpcp ignores special files, but they are not absent.
+	mark_full: hash a regular file in full and mark the hash (_FULL_HASH_MARK), unless full_hash already hashes every file in full.
+	"""
 	path = path.rstrip(os.sep) or os.sep
 	try:
 		st = os.lstat(path)
@@ -3965,7 +3980,9 @@ def get_entry_state(path, full_hash=False, read_xattrs=True):
 			return encode_state({'type': 'd', 'mode': st.st_mode, 'uid': st.st_uid, 'gid': st.st_gid, 'xattr': xattr})
 		if stat.S_ISREG(st.st_mode):
 			# hash_file is lru_cached and would return a stale hash for a same-size rewrite.
-			file_hash = hash_file.__wrapped__(path, st.st_size, full_hash) or '-'
+			file_hash = hash_file.__wrapped__(path, st.st_size, full_hash or mark_full) or '-'
+			if mark_full and not full_hash and file_hash != '-':
+				file_hash = _FULL_HASH_MARK + file_hash
 			return encode_state({'type': 'f', 'size': st.st_size, 'mtime_ns': st.st_mtime_ns, 'mode': st.st_mode,
 				'uid': st.st_uid, 'gid': st.st_gid, 'hash': file_hash, 'xattr': xattr})
 	except (FileNotFoundError, NotADirectoryError):
@@ -4276,7 +4293,7 @@ def build_root_maps(new_root, base_root, exclude=None, max_workers=multiprocessi
 	base_map = build_entry_map(base_root, '', None, exclude, os.path.abspath(new_root), max_workers, parallel_file_listing)
 	return new_map, base_map
 
-def _states_chunk(paths, full_hash, read_xattrs, hash_size):
+def _states_chunk(paths, full_hash, read_xattrs, hash_size, marked=frozenset()):
 	"""Worker body for _states_for_paths: states plus the errors recorded while computing them.
 
 	hash_size is the caller's HASH_SIZE; a worker that did not fork from the caller
@@ -4285,21 +4302,25 @@ def _states_chunk(paths, full_hash, read_xattrs, hash_size):
 	global HASH_SIZE
 	HASH_SIZE = hash_size
 	error_start = len(ERRORS)
-	states = {path: get_entry_state(path, full_hash, read_xattrs) for path in paths}
+	states = {path: get_entry_state(path, full_hash, read_xattrs, path in marked) for path in paths}
 	errors = ERRORS[error_start:]
 	del ERRORS[error_start:]
 	return states, errors
 
-def _states_for_paths(paths, full_hash=False, read_xattrs=True, max_workers=1):
-	"""{path: state} for every path; parallel chunks on a ProcessPoolExecutor for large sets."""
+def _states_for_paths(paths, full_hash=False, read_xattrs=True, max_workers=1, marked=frozenset()):
+	"""{path: state} for every path; parallel chunks on a ProcessPoolExecutor for large sets. Paths in marked are
+	hashed in full with the mark (see get_entry_state)."""
 	paths = list(paths)
 	if max_workers <= 1 or len(paths) < 256:
-		return {path: get_entry_state(path, full_hash, read_xattrs) for path in paths}
+		return {path: get_entry_state(path, full_hash, read_xattrs, path in marked) for path in paths}
 	chunk_size = max(64, len(paths) // (max_workers * 4) + 1)
 	states = {}
 	with ProcessPoolExecutor(max_workers=max_workers) as executor:
-		futures = [executor.submit(_states_chunk, paths[index:index + chunk_size], full_hash, read_xattrs, HASH_SIZE)
-			for index in range(0, len(paths), chunk_size)]
+		futures = []
+		for index in range(0, len(paths), chunk_size):
+			chunk = paths[index:index + chunk_size]
+			futures.append(executor.submit(_states_chunk, chunk, full_hash, read_xattrs, HASH_SIZE,
+				frozenset(path for path in chunk if path in marked)))
 		for future in concurrent.futures.as_completed(futures):
 			chunk_states, chunk_errors = future.result()
 			states.update(chunk_states)
@@ -4551,7 +4572,8 @@ def _check_payload(rows, volume_roots, full_hash=False, max_workers=1, new_base=
 			changed.append(row)
 		else:
 			incomplete.append(row.path)
-	states = _states_for_paths(set(copies.values()), full_hash=full_hash, read_xattrs=False, max_workers=max_workers)
+	marked = {copy for row, copy in copies.items() if _full_marked(row.new)}
+	states = _states_for_paths(set(copies.values()), full_hash=full_hash, read_xattrs=False, max_workers=max_workers, marked=marked)
 	for row, copy in copies.items():
 		# Hash and mtime, as an apply's verify compares them (mode and owner are not checked here).
 		if not states_equal(states[copy], row.new, compare_hash=decode_state(row.new)['hash'] != '-', metadata=False, full_hash=full_hash):
@@ -4689,7 +4711,7 @@ def _unlisted_children(key, path, deleted_keys, case_insensitive=False):
 			unlisted.append(child_key)
 	return unlisted
 
-def check_patch_target(rows, target_root, compare_hash=True, full_hash=False, max_workers=1, metadata=True, case_insensitive=False):
+def check_patch_target(rows, target_root, compare_hash=True, full_hash=False, max_workers=1, metadata=True, case_insensitive=False, tz_tolerant=False):
 	"""Classify every row against target_root as 'apply', 'skip' or 'conflict'.
 
 	D: target == old -> apply; absent, or already the replacing A row's state -> skip.
@@ -4703,11 +4725,14 @@ def check_patch_target(rows, target_root, compare_hash=True, full_hash=False, ma
 	entries, the name a D row removes, and the A row that replaces a D row. A case-only rename (D on one
 	spelling, A on another) is then a delete and a write; once applied (the target already spells the A
 	row's name) both rows are skipped.
+	Rows whose states carry the full-hash mark (_FULL_HASH_MARK) are compared with the target's file hashed in full and marked.
+	tz_tolerant: a FAT section (see states_equal).
 	"""
 	fold = _fold_name if case_insensitive else (lambda name: name)
 	paths = {row.path: _key_path(target_root, row.path) for row in rows}
-	states = _states_for_paths(set(paths.values()), full_hash=full_hash, read_xattrs=metadata, max_workers=max_workers)
-	same = functools.partial(states_equal, compare_hash=compare_hash, metadata=metadata, full_hash=full_hash)
+	marked = {paths[row.path] for row in rows if _full_marked(row.old) or _full_marked(row.new)}
+	states = _states_for_paths(set(paths.values()), full_hash=full_hash, read_xattrs=metadata, max_workers=max_workers, marked=marked)
+	same = functools.partial(states_equal, compare_hash=compare_hash, metadata=metadata, full_hash=full_hash, tz_tolerant=tz_tolerant)
 	added_by_name = {fold(row.path.rstrip('/')): row for row in rows if row.op == 'A'}
 	deleted_keys = {fold(row.path) for row in rows if row.op == 'D'}
 	listings = {}
@@ -5457,7 +5482,7 @@ def _apply_rows(rows, volume_roots, target_root, max_workers=1, verbose=False, f
 	return restored, removed
 
 def _verify_rows(rows, target_root, compare_hash=True, full_hash=False, max_workers=1, metadata=True, written_rows=(),
-		passed=None):
+		passed=None, tz_tolerant=False):
 	"""Re-read every applied path and compare with its final expected state (content only with
 	metadata False); returns the failure count.
 
@@ -5465,13 +5490,15 @@ def _verify_rows(rows, target_root, compare_hash=True, full_hash=False, max_work
 	(_fold_name) and both paths are one entry (same st_dev / st_ino): a case-only rename on a
 	case-insensitive target, whether or not hpcp recognised the filesystem as one. written_rows: more
 	A / M rows that count for this, not verified themselves. passed: a list that receives the rows that pass.
+	Marked rows are read hashed in full (see check_patch_target); tz_tolerant: a FAT section.
 	"""
 	final = {}
 	for row in sort_change_rows(rows):
 		# D sorts before A, so for a D + A pair on one name the A row decides the final state.
 		final[row.path.rstrip('/')] = row
 	paths = {name: _key_path(target_root, row.path) for name, row in final.items()}
-	states = _states_for_paths(set(paths.values()), full_hash=full_hash, read_xattrs=metadata, max_workers=max_workers)
+	marked = {paths[name] for name, row in final.items() if _full_marked(row.old) or _full_marked(row.new)}
+	states = _states_for_paths(set(paths.values()), full_hash=full_hash, read_xattrs=metadata, max_workers=max_workers, marked=marked)
 	written = {}
 	for name, row in final.items():
 		if row.op != 'D':
@@ -5483,7 +5510,7 @@ def _verify_rows(rows, target_root, compare_hash=True, full_hash=False, max_work
 	for name, row in final.items():
 		expected = '-' if row.op == 'D' else row.new
 		found = states[paths[name]]
-		ok = found == '-' if expected == '-' else states_equal(found, expected, compare_hash, metadata, full_hash)
+		ok = found == '-' if expected == '-' else states_equal(found, expected, compare_hash, metadata, full_hash, tz_tolerant)
 		if not ok and expected == '-' and _same_entry(paths[name], written.get(_fold_name(name), ())):
 			ok = True
 		if not ok:
@@ -5496,7 +5523,8 @@ def _verify_rows(rows, target_root, compare_hash=True, full_hash=False, max_work
 # metadata False: a content-only section (see states_equal). case_insensitive: the target looks names
 # up case-insensitively (FAT, exFAT, HFS+ but not HFSX; see _has_case_insensitive_names). skipped_identities:
 # {row: _entry_identity} of the A / M rows planned as skipped, recorded while planning (see _apply_section).
-SectionPlan = namedtuple('SectionPlan', 'name volume_roots target_root rows checks metadata case_insensitive skipped_identities')
+# tz_tolerant: a FAT section (see states_equal).
+SectionPlan = namedtuple('SectionPlan', 'name volume_roots target_root rows checks metadata case_insensitive skipped_identities tz_tolerant')
 
 @contextlib.contextmanager
 def _patch_hash_settings(meta):
@@ -5517,14 +5545,15 @@ def _patch_hash_settings(meta):
 	finally:
 		HASH_SIZE = saved_hash_size
 
-def _plan_section(name, rows, volume_roots, target_root, compare_hash, full_hash, max_workers, metadata=True, case_insensitive=False):
+def _plan_section(name, rows, volume_roots, target_root, compare_hash, full_hash, max_workers, metadata=True, case_insensitive=False, tz_tolerant=False):
 	"""Check one section's rows against target_root; nothing changes. The entries of the rows found already done are
 	recorded, so a later write that reaches one of them (through a symlinked directory, or a name differing only by
 	case) is seen."""
-	checks = check_patch_target(rows, target_root, compare_hash, full_hash, max_workers, metadata, case_insensitive)
+	checks = check_patch_target(rows, target_root, compare_hash, full_hash, max_workers, metadata, case_insensitive,
+		tz_tolerant=tz_tolerant)
 	skipped = [check.row for check in checks if check.action == 'skip' and check.row.op != 'D']
 	return SectionPlan(name, list(volume_roots), target_root, rows, checks, metadata, case_insensitive,
-		_identities(target_root, skipped))
+		_identities(target_root, skipped), tz_tolerant)
 
 def _section_conflicts(plan):
 	return [check for check in plan.checks if check.action == 'conflict']
@@ -5595,7 +5624,8 @@ def _apply_section(plan, max_workers, verbose, full_hash, compare_hash, outcome=
 		changed = [row for row in skipped if row not in restored_rows and (row.new.startswith('d:')
 			or _entry_identity(_key_path(plan.target_root, row.path)) != plan.skipped_identities.get(row))]
 	verified, passed = todo + restored + changed, []
-	failed = _verify_rows(verified, plan.target_root, compare_hash, full_hash, max_workers, plan.metadata, passed=passed)
+	failed = _verify_rows(verified, plan.target_root, compare_hash, full_hash, max_workers, plan.metadata, passed=passed,
+		tz_tolerant=plan.tz_tolerant)
 	if outcome is not None:
 		# Skipped rows not verified here keep planning's entry, so the final pass across sections sees a later change.
 		verified_rows = set(verified)
@@ -5653,7 +5683,8 @@ def _restore_across_sections(ran, max_workers, verbose, full_hash, compare_hash)
 		summary['restored'] = summary.get('restored', 0) + len(written)
 		summary['skipped'] -= len(written)
 		passed = []
-		summary['failed'] += _verify_rows(rows, plan.target_root, compare_hash, full_hash, max_workers, plan.metadata, passed=passed)
+		summary['failed'] += _verify_rows(rows, plan.target_root, compare_hash, full_hash, max_workers, plan.metadata, passed=passed,
+		tz_tolerant=plan.tz_tolerant)
 		outcome['verified'] = list(outcome.get('verified', ())) + rows
 		# A row that passed its section's verify and fails here must not be checked (and counted) again at the end.
 		identities = outcome.setdefault('identities', {})
@@ -5681,7 +5712,7 @@ def _verify_across_sections(ran, max_workers, full_hash, compare_hash):
 			if row.new.startswith('d:') or _entry_identity(_key_path(plan.target_root, row.path)) != identity]
 		if rows:
 			summary['failed'] += _verify_rows(rows, plan.target_root, compare_hash, full_hash, max_workers, plan.metadata,
-				written_rows=outcome.get('verified', ()))
+				written_rows=outcome.get('verified', ()), tz_tolerant=plan.tz_tolerant)
 
 def apply_patch_tree(volume_roots, target_root, force=False, max_workers=1, verbose=False, volume_names=None, store_note=False):
 	"""Apply a patch whose volumes are mounted (or unpacked) at volume_roots onto directory target_root.
@@ -5700,7 +5731,7 @@ def apply_patch_tree(volume_roots, target_root, force=False, max_workers=1, verb
 	A hard kill mid-apply can leave new directories with default metadata (it is applied
 	only after every write); the re-run then reports those A rows as conflicts and needs -fa.
 	Rows are planned per mount (the target's own, and each filesystem mounted below it, from
-	/proc/self/mountinfo): on FAT, exFAT or NTFS by content only, on FAT, exFAT or HFS+ (not HFSX) with
+	/proc/self/mountinfo): on FAT, exFAT or NTFS by content only (on FAT with the timezone tolerance, see states_equal), on FAT, exFAT or HFS+ (not HFSX) with
 	names matched case-insensitively (see check_patch_target). A write skipped as already done that a
 	delete then takes away (a case-insensitive filesystem hpcp does not recognise, a symlinked directory
 	alias, also from one mount into another) is written again and counted as restored (see _apply_rows
@@ -5721,7 +5752,8 @@ def apply_patch_tree(volume_roots, target_root, force=False, max_workers=1, verb
 				continue
 			fs_type = _scope_fs_type(fs_type, source)
 			plans.append(_plan_section(prefix + '/' if prefix else 'root', grouped.get(prefix, []), volume_roots, target_root,
-				compare_hash, full_hash, max_workers, _has_posix_metadata(fs_type), _has_case_insensitive_names(fs_type, source)))
+				compare_hash, full_hash, max_workers, _has_posix_metadata(fs_type), _has_case_insensitive_names(fs_type, source),
+				tz_tolerant=_is_fat(fs_type)))
 		for plan in plans:
 			_preflight_section(plan)
 		_resolve_section_conflicts(plans, force)
@@ -6543,6 +6575,10 @@ def _partition_in_use(device, devnum, entries, swaps, sys_block_path='/sys/class
 
 
 _FAT_TYPES = ('fat32', 'fat16', 'fat12', 'fat', 'vfat', 'msdos')
+
+def _is_fat(fs_type):
+	"""True for the FAT family: local-time timestamps (the timezone tolerance) and full hashes (_FULL_HASH_MARK)."""
+	return fs_type in _FAT_TYPES
 # Filesystems whose file modes and owners come from mount options (umask=, uid=), not the disk.
 _NO_POSIX_METADATA_TYPES = frozenset(_FAT_TYPES + ('exfat', 'ntfs', 'ntfs3'))
 # Filesystems whose Linux drivers look names up case-insensitively (ntfs3 and ntfs-3g use the exact case;
@@ -7219,7 +7255,7 @@ def apply_disk_patch(volume_roots, target, mount_points, loop_devices, force=Fal
 				raise RuntimeError(f"Disk layout mismatch: partition {name[len('part'):]} ({part['fs_type']}) cannot be mounted read-write; nothing applied")
 			fs_type = fs_types.get(name[len('part'):], '')
 			plans.append(_plan_section(name, rows, _section_volume_roots(volume_roots, payload_dir), root, compare_hash, full_hash, max_workers,
-				_has_posix_metadata(fs_type), _has_case_insensitive_names(fs_type, part['device'])))
+				_has_posix_metadata(fs_type), _has_case_insensitive_names(fs_type, part['device']), tz_tolerant=_is_fat(fs_type)))
 		raw_conflicts = [entry for entry in raw_plan if entry['action'] == 'conflict']
 		extra = [(f"raw {entry['name']}: content matches neither the patch base nor the new state (found {entry['found'][:12]})",
 			f"raw {entry['name']}: content differs") for entry in raw_conflicts]

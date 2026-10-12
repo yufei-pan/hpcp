@@ -3188,3 +3188,26 @@ def test_forced_type_change_stops_at_a_mount(trees, hpcp_mod, tmp_path, capsys):
 		assert (target / 'app' / 'data' / 'precious').read_text() == 'keep me'
 	assert 'Note: forced removal of app/ stops at the mount at app/data; that row will fail verify' in capsys.readouterr().out
 	assert summary['failed'] >= 1 and os.path.isdir(str(target / 'app'))
+
+
+@pytest.mark.parametrize('fs_type, conflict', [('vfat', False), ('exfat', True)])
+def test_timezone_tolerance_applies_on_fat_scopes_only(trees, hpcp_mod, tmp_path, reset_hpcp_globals, monkeypatch, fs_type, conflict):
+	"""B1 decision 1: the node's copy of a changed file is the base's content with its mtime an hour later (a FAT time
+	read under another timezone). On a vfat scope the M row applies; on exFAT (which records UTC offsets) the shift is
+	a real difference: a conflict."""
+	new, base = trees
+	_write(new / 'boot.cfg', 'new')
+	_write(base / 'boot.cfg', 'old')
+	vol = tmp_path / 'vol'
+	_patch_from(hpcp_mod, new, base, [vol])
+	target = tmp_path / 'target'
+	_clone(base, target)
+	os.utime(str(target / 'boot.cfg'), (T0 + 3600, T0 + 3600))
+	_fake_mounts(hpcp_mod, monkeypatch, (target, fs_type))
+	if conflict:
+		with pytest.raises(RuntimeError, match='^Patch conflict'):
+			hpcp_mod.apply_patch_tree([str(vol)], str(target), max_workers=1)
+	else:
+		summary = hpcp_mod.apply_patch_tree([str(vol)], str(target), max_workers=1)
+		assert summary['modified'] == 1 and summary['failed'] == 0
+		assert (target / 'boot.cfg').read_text() == 'new'

@@ -2009,10 +2009,10 @@ def test_hpcp_cli_generates_and_applies_a_disk_patch(tmp_path, hpcp_mod, reset_h
 	assert hpcp_mod.hpcp([], dest_paths=[str(tmp_path)], load_diff_image=[out], max_workers=1) == 241
 
 
-def test_content_only_states_tolerate_timezone_shaped_mtime_offsets(hpcp_mod):
-	"""Review Focus 3: a FAT time read under two timezone settings differs by whole 15-minute steps (at most 24 h);
-	with the same size and hash that is the same file. Any other offset, another hash, POSIX sections and
-	comparisons without hashes still count the difference."""
+def test_fat_states_tolerate_timezone_shaped_mtime_offsets(hpcp_mod):
+	"""Review Focus 3 (group A), FAT only (B1 decision 1): a FAT time read under two timezone settings differs by whole
+	15-minute steps (at most 24 h); with the same size and hash that is the same file. Any other offset, another hash,
+	exFAT / NTFS (content-only but no tolerance) and comparisons without hashes still count the difference."""
 	eq = hpcp_mod.states_equal
 	t = 1717000000 * 10**9
 
@@ -2020,33 +2020,37 @@ def test_content_only_states_tolerate_timezone_shaped_mtime_offsets(hpcp_mod):
 		return f'f:10:{mtime_ns}:100755:0:0:{digest}:-'
 
 	hour = 3600 * 10**9
-	assert eq(state(t), state(t + 2 * hour), metadata=False)
-	assert eq(state(t), state(t - 5 * hour - 30 * 60 * 10**9), metadata=False)
-	assert eq(state(t), state(t + 2 * hour + 10**9), metadata=False)
-	assert not eq(state(t), state(t + 7 * 60 * 10**9), metadata=False)
-	assert not eq(state(t), state(t + 25 * hour), metadata=False)
-	assert not eq(state(t), state(t + 2 * hour, 'bbbb'), metadata=False)
+	fat = dict(metadata=False, tz_tolerant=True)
+	assert eq(state(t), state(t + 2 * hour), **fat)
+	assert eq(state(t), state(t - 5 * hour - 30 * 60 * 10**9), **fat)
+	assert eq(state(t), state(t + 2 * hour + 10**9), **fat)
+	assert not eq(state(t), state(t + 7 * 60 * 10**9), **fat)
+	assert not eq(state(t), state(t + 25 * hour), **fat)
+	assert not eq(state(t), state(t + 2 * hour, 'bbbb'), **fat)
+	assert not eq(state(t), state(t + 2 * hour), metadata=False)
 	assert not eq(state(t), state(t + 2 * hour))
-	assert not eq(state(t), state(t + 2 * hour), compare_hash=False, metadata=False)
-	assert not eq(state(t, '-'), state(t + 2 * hour, '-'), metadata=False)
+	assert not eq(state(t), state(t + 2 * hour), compare_hash=False, **fat)
+	assert not eq(state(t, '-'), state(t + 2 * hour, '-'), **fat)
 
 
 def test_timezone_tolerance_needs_a_hash_of_the_whole_file(hpcp_mod, reset_hpcp_globals):
-	"""Final review I2: past the hash window (HASH_SIZE) only a file's tail is hashed, so a head edit with a
-	timezone-shaped mtime offset would pass as the same file. The offset is tolerated only when the hash covers the
-	whole file: its size is at most HASH_SIZE, or it was hashed in full."""
+	"""Final review I2 (group A): past HASH_SIZE only a file's tail is hashed, so a head edit with a timezone-shaped
+	offset would pass. The offset is tolerated only when the hash covers the whole file: size at most HASH_SIZE,
+	a full-hash mark ('F'), or full_hash."""
 	eq = hpcp_mod.states_equal
 	hpcp_mod.HASH_SIZE = 16
 	t = 1717000000 * 10**9
 	hour = 3600 * 10**9
 
-	def state(size, mtime_ns):
-		return f'f:{size}:{mtime_ns}:100644:0:0:aaaa:-'
+	def state(size, mtime_ns, digest='aaaa'):
+		return f'f:{size}:{mtime_ns}:100644:0:0:{digest}:-'
 
-	assert eq(state(16, t), state(16, t + hour), metadata=False)
-	assert not eq(state(17, t), state(17, t + hour), metadata=False)
-	assert eq(state(17, t), state(17, t + hour), metadata=False, full_hash=True)
-	assert eq(state(17, t), state(17, t + 10**9), metadata=False)
+	fat = dict(metadata=False, tz_tolerant=True)
+	assert eq(state(16, t), state(16, t + hour), **fat)
+	assert not eq(state(17, t), state(17, t + hour), **fat)
+	assert eq(state(17, t), state(17, t + hour), full_hash=True, **fat)
+	assert eq(state(17, t, 'Faaaa'), state(17, t + hour, 'Faaaa'), **fat)
+	assert eq(state(17, t), state(17, t + 10**9), **fat)
 
 
 @pytest.mark.parametrize('full_hash', [False, True])
@@ -2064,8 +2068,41 @@ def test_head_edit_with_a_timezone_shaped_offset_is_a_conflict(tmp_path, hpcp_mo
 	R = hpcp_mod.ChangeRow
 	rows = [R('D', 'gone', state(base / 'gone'), '-'),
 		R('M', 'changed', state(base / 'changed'), state(base / 'changed').replace(f':{T0}000000000:', f':{T0 + 7200}000000000:'))]
-	checks = hpcp_mod.check_patch_target(rows, str(target), full_hash=full_hash, metadata=False)
+	checks = hpcp_mod.check_patch_target(rows, str(target), full_hash=full_hash, metadata=False, tz_tolerant=True)
 	assert [(check.row.path, check.action) for check in checks] == [('gone', 'conflict'), ('changed', 'conflict')]
+
+def test_marked_states_hash_the_whole_file(tmp_path, hpcp_mod, reset_hpcp_globals):
+	"""get_entry_state(mark_full=True) hashes the whole file and marks it 'F' (unless full_hash already hashes every file
+	in full); _full_marked recognises it."""
+	hpcp_mod.HASH_SIZE = 16
+	path = tmp_path / 'f'
+	path.write_bytes(b'head' + b'x' * 60)
+	marked = hpcp_mod.get_entry_state(str(path), mark_full=True)
+	digest = marked.split(':')[6]
+	assert digest == 'F' + hpcp_mod.hash_file.__wrapped__(str(path), 64, True)
+	assert hpcp_mod._full_marked(marked) and not hpcp_mod._full_marked(hpcp_mod.get_entry_state(str(path)))
+	assert hpcp_mod.get_entry_state(str(path), full_hash=True, mark_full=True).split(':')[6] == digest[1:]
+	assert not hpcp_mod._full_marked('d:40755:0:0:-') and not hpcp_mod._full_marked('-')
+
+
+def test_marked_rows_compare_the_node_file_hashed_in_full(tmp_path, hpcp_mod, reset_hpcp_globals):
+	"""Spec Part 3 item 3: rows whose states carry the mark compare the node's file hashed in full: on a FAT section a
+	timezone-shifted identical copy is already done, a head edit (same size, tail unchanged) is a conflict, and verify
+	of an identical copy passes."""
+	hpcp_mod.HASH_SIZE = 4096
+	base, target = tmp_path / 'base', tmp_path / 'target'
+	body = b'h' * 4096 + b't' * 4096
+	_write(base / 'same', body)
+	_write(base / 'edited', body)
+	_write(target / 'same', body, mtime=T0 + 3600)
+	_write(target / 'edited', b'EDIT' + body[4:], mtime=T0 + 3600)
+	state = lambda path: hpcp_mod.get_entry_state(str(path), mark_full=True)
+	R = hpcp_mod.ChangeRow
+	rows = [R('A', 'same', '-', state(base / 'same')), R('D', 'edited', state(base / 'edited'), '-')]
+	checks = hpcp_mod.check_patch_target(rows, str(target), metadata=False, tz_tolerant=True)
+	assert [(check.row.path, check.action) for check in checks] == [('same', 'skip'), ('edited', 'conflict')]
+	assert hpcp_mod._verify_rows([rows[0]], str(target), metadata=False, tz_tolerant=True) == 0
+
 
 def test_fat_attributes_are_none_off_fat(tmp_path, hpcp_mod):
 	path = tmp_path / 'f'
