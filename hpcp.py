@@ -829,30 +829,36 @@ def _dev_path(kernel_name):
 	/dev/cciss/c0d0p1). Never relative to the path the disk was given by (a /dev/disk/by-id link)."""
 	return '/dev/' + kernel_name.replace('!', '/')
 
+def _lsblk_disk_rows(disk, columns):
+	"""(disk row, partition rows) of `lsblk -p -nbl -o <columns>,TYPE disk`, each row split into its columns.
+
+	lsblk is asked for full paths (-p): it names each node itself (cciss, by-id and kpartx nodes alike), so no path
+	is built here from the kernel names. The first row is the disk itself. lsblk -l also lists every holder of the
+	disk's partitions (LVM, LUKS and dm-linear devices, md arrays), whose -p path is just as real: only rows of TYPE
+	part are partitions. A -l NAME has no spaces and TYPE is the last column.
+	"""
+	rows = [line.split() for line in run_command_in_multicmd_with_path_check(["lsblk", '-p', '-nbl', '-o', columns + ',TYPE', disk],strict=True) if line.strip()]
+	return rows[0], [row for row in rows[1:] if row[-1] == 'part']
+
 def get_largest_partition(disk):
 	"""
-	Get the largest partition on the disk.
-
-	lsblk is asked for full paths (-p): it names each node itself (cciss, by-id and device-mapper
-	nodes alike), so no path is built here from the kernel names.
+	Get the largest partition on the disk (see _lsblk_disk_rows: holders of its partitions are not partitions).
 
 	Args:
 		disk (str): The disk name or path.
 
 	Returns:
-		str: The path of the largest partition on the disk.
+		str: The path of the largest partition on the disk, or the disk itself when it has no partitions.
 	"""
-	partitions = run_command_in_multicmd_with_path_check(["lsblk", '-p', '-nbl', '-o', 'NAME,SIZE',disk],strict=True)
+	disk_row, partitions = _lsblk_disk_rows(disk, 'NAME,SIZE')
+	if not partitions:
+		return disk_row[0]
 	# sort by size
-	partitions = sorted(partitions, key=lambda x: int(x.split()[1]))
-	# Skip the first entry as it's the disk itself
-	largest_partition = partitions[-2].split()[0] if len(partitions) > 1 else partitions[-1].split()[0]
-	return largest_partition
+	return sorted(partitions, key=lambda row: int(row[1]))[-1][0]
 
 def get_partitions(disk):
-	"""Get all the partitions on the disk.
-
-	lsblk is asked for full paths (-p), so each partition's node is used as lsblk names it.
+	"""Get all the partitions on the disk, as lsblk names their nodes (see _lsblk_disk_rows: holders of its
+	partitions are not partitions).
 
 	Args:
 		disk (str): The disk name or path.
@@ -861,10 +867,8 @@ def get_partitions(disk):
 		list: A list of partition paths.
 
 	"""
-	partitions = run_command_in_multicmd_with_path_check(["lsblk", '-p', '-nbl', '-o', 'NAME,SIZE',disk],strict=True)
-	# Skip the first entry as it's the disk itself
-	partitions = [partition.split()[0] for partition in partitions[1:]]
-	return partitions
+	_, partitions = _lsblk_disk_rows(disk, 'NAME,SIZE')
+	return [row[0] for row in partitions]
 
 def get_fs_type(path):
 	"""
@@ -1658,7 +1662,8 @@ def get_target_partition(image, partition_name):
 	This function handles both regular image files and block devices. If the input is an
 	image file, it creates a loop device first. It then identifies all partitions and
 	returns the path to the partition that matches the given partition name.
-	lsblk is asked for full paths (-p), so cciss, by-id and device-mapper nodes come back as they are named.
+	The partitions are lsblk's TYPE part rows, with full paths (see _lsblk_disk_rows): a holder lsblk also lists,
+	such as a dm-linear device on partition 1 named hpcp-holder-2, is never matched as partition 2.
 	
 	Args:
 		image (str): Path to the disk image file or block device
@@ -1678,12 +1683,11 @@ def get_target_partition(image, partition_name):
 		loop_device = create_loop_device(image)
 		image = loop_device
 	# Need to get a partition path for mkfs
-	partitions = run_command_in_multicmd_with_path_check(["lsblk", '-p', '-nbl', '-o', 'NAME', image],strict=True)
-	partitions.pop(0) # remove the disk itself
+	_, partitions = _lsblk_disk_rows(image, 'NAME')
 	target_partition = ''
-	for part in partitions:
-		if part.endswith(partition_name):
-			target_partition = part.strip()
+	for row in partitions:
+		if row[0].endswith(partition_name):
+			target_partition = row[0]
 			break
 	return target_partition, loop_device
 

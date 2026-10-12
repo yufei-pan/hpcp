@@ -2810,16 +2810,21 @@ def test_disk_patch_writes_awkward_labels_names_and_exfat_serials_exactly(tmp_pa
 
 
 @pytest.mark.parametrize('disk, lsblk, partitions, largest', [
-	('/dev/cciss/c0d0', ['/dev/cciss/c0d0 1000', '/dev/cciss/c0d0p1 400', '/dev/cciss/c0d0p2 600'],
-		['/dev/cciss/c0d0p1', '/dev/cciss/c0d0p2'], '/dev/cciss/c0d0p2'),
-	('/dev/disk/by-id/ata-DISK', ['/dev/sda 1000', '/dev/sda1 400', '/dev/sda2 600'],
-		['/dev/sda1', '/dev/sda2'], '/dev/sda2'),
-	('/dev/loop7', ['/dev/loop7 1000', '/dev/loop7p1 900'], ['/dev/loop7p1'], '/dev/loop7p1'),
-	('/dev/mapper/mpatha', ['/dev/mapper/mpatha 1000', '/dev/mapper/mpatha1 400', '/dev/mapper/mpatha2 600'],
+	# An LVM LV spanning both partitions: larger than either and its name ends in '2'.
+	('/dev/cciss/c0d0', ['/dev/cciss/c0d0 1000 disk', '/dev/mapper/vg-data2 990 lvm', '/dev/cciss/c0d0p1 400 part',
+		'/dev/cciss/c0d0p2 600 part'], ['/dev/cciss/c0d0p1', '/dev/cciss/c0d0p2'], '/dev/cciss/c0d0p2'),
+	('/dev/disk/by-id/ata-DISK', ['/dev/sda 1000 disk', '/dev/sda1 400 part', '/dev/sda2 600 part',
+		'/dev/mapper/luks-2 584 crypt'], ['/dev/sda1', '/dev/sda2'], '/dev/sda2'),
+	('/dev/loop7', ['/dev/loop7 1000 loop', '/dev/mapper/hpcp-holder-1 900 dm', '/dev/loop7p1 900 part'],
+		['/dev/loop7p1'], '/dev/loop7p1'),
+	('/dev/mapper/mpatha', ['/dev/mapper/mpatha 1000 mpath', '/dev/mapper/mpatha1 400 part', '/dev/mapper/mpatha2 600 part'],
 		['/dev/mapper/mpatha1', '/dev/mapper/mpatha2'], '/dev/mapper/mpatha2'),
+	# A whole-disk filesystem image: no partitions, so the disk itself is the largest.
+	('/dev/loop8', ['/dev/loop8 1000 loop'], [], '/dev/loop8'),
 ])
 def test_partition_paths_come_from_lsblk_full_names(hpcp_mod, reset_hpcp_globals, monkeypatch, disk, lsblk, partitions, largest):
-	"""lsblk -p prints each node's full path (cciss, by-id and device-mapper alike), so those are used as they are."""
+	"""lsblk -p prints each node's full path (cciss, by-id and kpartx alike), so those are used as they are. lsblk -l
+	also lists every holder (LVM, LUKS, dm-linear), whose -p path is just as real: only TYPE part rows are partitions."""
 	argvs = []
 	def fake_lsblk(argv, **kwargs):
 		argvs.append(argv)
@@ -2827,18 +2832,19 @@ def test_partition_paths_come_from_lsblk_full_names(hpcp_mod, reset_hpcp_globals
 	monkeypatch.setattr(hpcp_mod, 'run_command_in_multicmd_with_path_check', fake_lsblk)
 	assert hpcp_mod.get_partitions(disk) == partitions
 	assert hpcp_mod.get_largest_partition(disk) == largest
-	assert all('-p' in argv for argv in argvs)
+	assert all('-p' in argv and argv[argv.index('-o') + 1] == 'NAME,SIZE,TYPE' for argv in argvs)
 
 
 def test_target_partition_uses_lsblk_full_names(hpcp_mod, reset_hpcp_globals, monkeypatch):
 	argvs = []
 	def fake_lsblk(argv, **kwargs):
 		argvs.append(argv)
-		return ['/dev/cciss/c0d0', '/dev/cciss/c0d0p1', '/dev/cciss/c0d0p2']
+		# A dm holder of partition 1 whose name ends in '2' comes before the partitions, as lsblk -l lists it.
+		return ['/dev/cciss/c0d0 disk', '/dev/mapper/hpcp-holder-2 dm', '/dev/cciss/c0d0p1 part', '/dev/cciss/c0d0p2 part']
 	monkeypatch.setattr(hpcp_mod, 'create_loop_device', lambda image: '/dev/cciss/c0d0')
 	monkeypatch.setattr(hpcp_mod, 'run_command_in_multicmd_with_path_check', fake_lsblk)
 	assert hpcp_mod.get_target_partition('/tmp/not-a-device.img', '2') == ('/dev/cciss/c0d0p2', '/dev/cciss/c0d0')
-	assert '-p' in argvs[0]
+	assert '-p' in argvs[0] and argvs[0][argvs[0].index('-o') + 1] == 'NAME,TYPE'
 
 
 def test_dev_path(hpcp_mod):
@@ -2860,6 +2866,39 @@ def test_lsblk_partition_paths_exist_on_a_real_loop_disk(tmp_path, hpcp_mod, res
 		assert paths == [loop + 'p1', loop + 'p2']
 		assert all(os.path.exists(path) for path in paths)
 		assert hpcp_mod.get_largest_partition(loop) == loop + 'p2'
+
+
+@requires_root_and_disk_tools
+@pytest.mark.root
+@pytest.mark.loop
+@pytest.mark.skipif(shutil.which('dmsetup') is None, reason='needs dmsetup')
+def test_a_device_mapper_holder_is_never_taken_for_a_partition(tmp_path, hpcp_mod, reset_hpcp_globals):
+	"""lsblk -l lists a dm-linear device on partition 1 ahead of the partitions, and with -p its path is real: whose
+	name ends in '2', it must be neither returned as a partition nor matched as partition 2, whose identity -dd copies."""
+	image = tmp_path / 'disk.img'
+	with open(str(image), 'wb') as f:
+		f.truncate(64 << 20)
+	_run('sgdisk', '-n1:2048:+16M', '-n2:0:+24M', image)
+	holder = f'hpcp-holder-{os.getpid()}-2'
+	with _attached(image) as loop:
+		_run('mkfs.ext4', '-q', '-F', '-L', 'DMLABEL', loop + 'p1')
+		_run('mkfs.ext4', '-q', '-F', '-L', 'P2LABEL', loop + 'p2')
+		with open(f'/sys/class/block/{os.path.basename(loop)}p1/size') as f:
+			sectors = int(f.read())
+		_run('dmsetup', 'create', holder, '--table', f'0 {sectors} linear {loop}p1 0')
+		try:
+			if shutil.which('udevadm'):
+				subprocess.run(['udevadm', 'settle'], capture_output=True)
+			listing = subprocess.run(['lsblk', '-p', '-nbl', '-o', 'NAME', loop], capture_output=True, text=True).stdout.split()
+			assert '/dev/mapper/' + holder in listing, listing
+			hpcp_mod.get_partition_details.cache_clear()
+			assert hpcp_mod.get_partitions(loop) == [loop + 'p1', loop + 'p2']
+			assert hpcp_mod.get_largest_partition(loop) == loop + 'p2'
+			assert hpcp_mod.get_target_partition(loop, '2') == (loop + 'p2', None)
+			assert hpcp_mod.get_partition_details(loop, '2')['fs_label'] == 'P2LABEL'
+		finally:
+			hpcp_mod.get_partition_details.cache_clear()
+			subprocess.run(['dmsetup', 'remove', '--retry', holder], capture_output=True)
 
 
 def _refusal_target(hpcp_mod, tmp_path, monkeypatch, sections=(), kinds=None, payload=True, raw_size=1 << 20):
