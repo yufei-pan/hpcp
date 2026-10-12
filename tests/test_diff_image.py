@@ -3680,6 +3680,84 @@ def test_compute_changes_keeps_the_scan_stats_of_new_files(trees, hpcp_mod):
 	assert before <= scan['started_ns'] <= int(time.time() * 1000000000)
 
 
+def test_compute_changes_keeps_scan_stats_only_for_added_and_modified_files(trees, hpcp_mod):
+	new, base = trees
+	_write(new / 'a.txt', 'a')
+	_write(new / 'same.txt', 'same')
+	_write(base / 'same.txt', 'same')
+	os.utime(str(base / 'same.txt'), ns=(os.lstat(str(new / 'same.txt')).st_atime_ns, os.lstat(str(new / 'same.txt')).st_mtime_ns))
+	_write(new / 'm.txt', 'new content')
+	_write(base / 'm.txt', 'old')
+	_write(base / 'gone.txt', 'gone')
+	scan = {}
+	rows = hpcp_mod.compute_changes(*hpcp_mod.build_root_maps(str(new), str(base), max_workers=1), max_workers=1, scan=scan)
+	assert {(row.op, row.path) for row in rows} == {('A', 'a.txt'), ('M', 'm.txt'), ('D', 'gone.txt')}
+	assert sorted(scan['stats']) == ['a.txt', 'm.txt']
+
+
+def test_compute_changes_parallel_scan_stats_cover_only_changed_new_files(trees, hpcp_mod):
+	new, base = trees
+	for index in range(300):
+		_write(new / 'many' / f'f{index:03}.txt', f'file {index:03}')
+		_write(base / 'many' / f'f{index:03}.txt', f'file {index:03}')
+		_write(base / 'only' / f'g{index:03}.txt', f'base {index:03}')
+	_write(new / 'many' / 'f007.txt', 'FILE 007')
+	_write(new / 'added.txt', 'added')
+	scan = {}
+	hpcp_mod.compute_changes(*hpcp_mod.build_root_maps(str(new), str(base), max_workers=1), max_workers=2, scan=scan)
+	assert 'added.txt' in scan['stats'] and 'many/f007.txt' in scan['stats']
+	assert not [key for key in scan['stats'] if key.startswith('only/')]
+	assert len(scan['stats']) < 10
+
+
+@pytest.mark.parametrize('workers', [1, 2])
+def test_states_for_paths_collects_stats_only_for_the_wanted_paths(tmp_path, hpcp_mod, reset_hpcp_globals, workers):
+	paths = []
+	for index in range(300):
+		path = tmp_path / f'f{index:03}.txt'
+		_write(path, f'file {index:03}')
+		paths.append(str(path))
+	wanted = {paths[3], paths[290]}
+	stats = {}
+	hpcp_mod._states_for_paths(paths, max_workers=workers, stats=stats, stat_paths=wanted)
+	assert set(stats) == wanted
+	assert stats[paths[3]] == hpcp_mod._scan_stat(os.lstat(paths[3]))
+
+
+def _ro_recheck(hpcp_mod, monkeypatch, tmp_path, entries, stat_delta, with_stat=True):
+	(tmp_path / 'f').write_text('x')
+	source = os.path.realpath(str(tmp_path / 'f'))
+	st = os.lstat(source)
+	key = os.path.relpath(source, '/')
+	monkeypatch.setattr(hpcp_mod, '_mountinfo_entries', lambda *args, **kwargs: [dict(entry) for entry in entries])
+	monkeypatch.setattr(hpcp_mod, '_racy_window_ns', lambda: 0)
+	row = hpcp_mod.ChangeRow('A', key, '-', hpcp_mod.get_entry_state(source))
+	scan = {'started_ns': st.st_ctime_ns + 10 ** 9,
+		'stats': {key: (st.st_dev, st.st_ino, st.st_size + stat_delta, st.st_mtime_ns, st.st_ctime_ns)} if with_stat else {}}
+	return hpcp_mod._rows_to_recheck([row], '/', scan), row
+
+
+def test_recheck_of_a_read_only_row_still_compares_the_scan_stat(tmp_path, hpcp_mod, monkeypatch):
+	"""A ro mount replaced at the same path, or a remount-ro after a write: the stat moved, so the copy is read again."""
+	picked, row = _ro_recheck(hpcp_mod, monkeypatch, tmp_path, [_entry('/', 'ext4', ['ro'])], 1)
+	assert picked == [row]
+
+
+def test_recheck_of_a_read_only_row_with_a_matching_stat_is_skipped(tmp_path, hpcp_mod, monkeypatch):
+	picked, row = _ro_recheck(hpcp_mod, monkeypatch, tmp_path, [_entry('/', 'ext4', ['ro'])], 0)
+	assert picked == []
+
+
+def test_recheck_of_a_read_only_row_without_a_scan_stat_is_skipped(tmp_path, hpcp_mod, monkeypatch):
+	picked, row = _ro_recheck(hpcp_mod, monkeypatch, tmp_path, [_entry('/', 'ext4', ['ro'])], 0, with_stat=False)
+	assert picked == []
+
+
+def test_recheck_without_a_mountinfo_entry_rechecks_every_live_row(tmp_path, hpcp_mod, monkeypatch):
+	picked, row = _ro_recheck(hpcp_mod, monkeypatch, tmp_path, [], 0)
+	assert picked == [row]
+
+
 def test_payload_recheck_skips_a_read_only_filesystem(trees, hpcp_mod, tmp_path, monkeypatch):
 	"""Spec Part 3 item 1: a source on a read-only superblock cannot change; its copies are not read again."""
 	new, base = trees

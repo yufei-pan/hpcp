@@ -79,10 +79,14 @@ This ships as hpcp 9.71. 9.68–9.71 are not on PyPI; publishing needs the user'
    does today with physical paths, so listing time does not regress. Both listings match through the same
    physical-to-logical path mapping, so the base side, which today walks excluded directories and filters them
    afterwards, skips them too.
-7. **Compatibility.** No pattern that excluded part of a mounted filesystem before stops doing so. The temporary
-   path was not known in advance, so only `*/…` patterns could match there, and they still do. The exception is a
-   pattern that matched the temporary path itself (`*/tmp/*`, `/tmp/*`) and so excluded the whole filesystem: it now
-   matches only inside it. Patches are unchanged: `-e` affects only which rows exist.
+7. **Compatibility.** `*/…` patterns still match inside a mounted filesystem. Two kinds of pattern change, both
+   written against hpcp's temporary mount path (`-diff` first shipped in 9.67, so only 9.67–9.70 are affected):
+   - patterns that named the path under it, such as `/tmp/*/var/log/*` or `/tmp/tmp*/…`, matched in 9.67–9.70 and now
+     match nothing: write them as `/…` paths inside the filesystem (`/var/log/*`);
+   - a pattern that matched the temporary path itself (`*/tmp/*`, `/tmp/*`) and so excluded the whole filesystem now
+     matches only inside it.
+
+   Patches are unchanged: `-e` affects only which rows exist.
    (Corrected after the design was approved. The approved text said a live `-dd -diff` partition was matched at its
    live mount point, so `/boot/efi/...` patterns would stop matching. `_mount_partition` bind-mounts a live partition
    at a temporary path, so it never was.)
@@ -114,13 +118,17 @@ volume, or the source must have resized. The hash comparison of the copy with th
 runs only for the rows below.
 
 1. **Read-only sources: never.** The source file lies on a filesystem whose superblock is read-only (`ro` in
-   mountinfo's super options, the field after the source). That filesystem is found through `_mount_scopes`, as
-   `_paths_on_fat` finds FAT. This covers:
+   mountinfo's super options, the field after the source). The filesystem is found from real paths, not through
+   `_mount_scopes`: it is the visible mount at the file's own real path (a bind mount of one file), else the deepest
+   visible mount holding the real path of its directory. This covers:
    - `-si` images;
    - partitions `-dd -diff` mounts itself;
    - a golden the user mounted read-only.
 
    A read-only bind mount of a writable filesystem does not count. `_mountinfo_entries` gains the super options.
+   A read-only row skips the window and filesystem-type tests but still compares the scan stat with a fresh `lstat`
+   (hashing only when it moved), which catches a read-only mount replaced at the same path, a directory swapped for a
+   symlink into one, and a remount read-only after a write. A read-only row with no scan stat is not hashed again.
 2. **Live sources: only suspects.**
    - The scan's `lstat` of each new-side file already comes before the file is read for its hash
      (`get_entry_state`). The scan keeps that stat's device, inode, size, `mtime_ns` and `ctime_ns`.
@@ -180,6 +188,8 @@ runs only for the rows below.
 - `-e` on mounted sources:
   - `*/…` patterns behave as before;
   - `/`-anchored patterns that used to match nothing now match inside the filesystem;
+  - patterns written against the temporary mount path (`/tmp/*/var/log/*`, `/tmp/tmp*/…`) matched in 9.67–9.70 and
+    now match nothing;
   - a pattern that matched hpcp's temporary mount path itself (`*/tmp/*`, `/tmp/*`), and so excluded the whole
     filesystem, now matches only inside it.
 - Generation from read-only sources no longer reads the payload twice. From live sources it reads again only the

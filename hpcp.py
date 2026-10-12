@@ -4340,9 +4340,9 @@ def build_rooted_maps(new_root, base_root, exclude=None, max_workers=multiproces
 	base_map = build_entry_map(base_root, '', None, _rooted_excludes(exclude, base_root), None, max_workers, parallel_file_listing)
 	return new_map, base_map
 
-def _states_chunk(paths, full_hash, read_xattrs, hash_size, marked=frozenset(), want_stats=False):
-	"""Worker body for _states_for_paths: states, the errors recorded while computing them, and (want_stats) the
-	regular files' _scan_stat values ({} otherwise).
+def _states_chunk(paths, full_hash, read_xattrs, hash_size, marked=frozenset(), stat_paths=None):
+	"""Worker body for _states_for_paths: states, the errors recorded while computing them, and the _scan_stat values
+	of the regular files among stat_paths (None: no stats; {} comes back).
 
 	hash_size is the caller's HASH_SIZE; a worker that did not fork from the caller
 	(spawn / forkserver) would otherwise hash with the module default.
@@ -4350,18 +4350,21 @@ def _states_chunk(paths, full_hash, read_xattrs, hash_size, marked=frozenset(), 
 	global HASH_SIZE
 	HASH_SIZE = hash_size
 	error_start = len(ERRORS)
-	stats = {} if want_stats else None
-	states = {path: get_entry_state(path, full_hash, read_xattrs, path in marked, stats) for path in paths}
+	stats = {} if stat_paths is not None else None
+	states = {path: get_entry_state(path, full_hash, read_xattrs, path in marked, stats if stats is not None and path in stat_paths else None)
+		for path in paths}
 	errors = ERRORS[error_start:]
 	del ERRORS[error_start:]
 	return states, errors, stats or {}
 
-def _states_for_paths(paths, full_hash=False, read_xattrs=True, max_workers=1, marked=frozenset(), stats=None):
+def _states_for_paths(paths, full_hash=False, read_xattrs=True, max_workers=1, marked=frozenset(), stats=None, stat_paths=()):
 	"""{path: state} for every path; parallel chunks on a ProcessPoolExecutor for large sets. Paths in marked are
-	hashed in full with the mark (see get_entry_state). stats: a dict filled with each regular file's _scan_stat values."""
+	hashed in full with the mark (see get_entry_state). stats: a dict filled with the _scan_stat values of the regular
+	files among stat_paths (only those: the dict grows with them, not with the number of paths)."""
 	paths = list(paths)
 	if max_workers <= 1 or len(paths) < 256:
-		return {path: get_entry_state(path, full_hash, read_xattrs, path in marked, stats) for path in paths}
+		return {path: get_entry_state(path, full_hash, read_xattrs, path in marked, stats if path in stat_paths else None)
+			for path in paths}
 	chunk_size = max(64, len(paths) // (max_workers * 4) + 1)
 	states = {}
 	with ProcessPoolExecutor(max_workers=max_workers) as executor:
@@ -4369,7 +4372,8 @@ def _states_for_paths(paths, full_hash=False, read_xattrs=True, max_workers=1, m
 		for index in range(0, len(paths), chunk_size):
 			chunk = paths[index:index + chunk_size]
 			futures.append(executor.submit(_states_chunk, chunk, full_hash, read_xattrs, HASH_SIZE,
-				frozenset(path for path in chunk if path in marked), stats is not None))
+				frozenset(path for path in chunk if path in marked),
+				frozenset(path for path in chunk if path in stat_paths) if stats is not None else None))
 		for future in concurrent.futures.as_completed(futures):
 			chunk_states, chunk_errors, chunk_stats = future.result()
 			states.update(chunk_states)
@@ -4387,7 +4391,7 @@ def compute_changes(new_map, base_map, full_hash=False, max_workers=multiprocess
 	section: by content only and with the timezone tolerance, its files on both sides hashed in full and marked
 	(_FULL_HASH_MARK; unless full_hash already hashes every file in full), so the tolerance holds past HASH_SIZE.
 	scan: a dict, filled for the payload re-check (_rows_to_recheck): 'started_ns', the wall clock before any state is read, and
-	'stats', {key: _scan_stat values} of new_map's regular files, from the lstat taken before each was read.
+	'stats', {key: _scan_stat values} of the A / M file rows' new-side files, from the lstat taken before each was read.
 	"""
 	keys = set(new_map) | set(base_map)
 	fat_keys = {key for key in keys if new_map.get(key) in fat_paths or base_map.get(key) in fat_paths} if fat_paths else set()
@@ -4397,9 +4401,8 @@ def compute_changes(new_map, base_map, full_hash=False, max_workers=multiprocess
 		scan['started_ns'] = _wall_clock_ns()
 		stats = {}
 	states = _states_for_paths(set(new_map.values()) | set(base_map.values()), full_hash=full_hash,
-		read_xattrs=read_xattrs and metadata, max_workers=max_workers, marked=marked, stats=stats)
-	if scan is not None:
-		scan['stats'] = {key: stats[path] for key, path in new_map.items() if path in stats}
+		read_xattrs=read_xattrs and metadata, max_workers=max_workers, marked=marked, stats=stats,
+		stat_paths=set(new_map.values()) if scan is not None else ())
 	rows = []
 	for key in keys:
 		new_state = states[new_map[key]] if key in new_map else '-'
@@ -4419,6 +4422,10 @@ def compute_changes(new_map, base_map, full_hash=False, max_workers=multiprocess
 		elif not states_equal(old_state, new_state, metadata=metadata and key not in fat_keys, full_hash=full_hash,
 				tz_tolerant=key in fat_keys):
 			rows.append(ChangeRow('M', key, old_state, new_state))
+	if scan is not None:
+		# Only the rows the payload check can look at: the dict does not grow with the unchanged files.
+		scan['stats'] = {row.path: stats[new_map[row.path]] for row in rows
+			if row.op in ('A', 'M') and row.new.startswith('f:') and new_map[row.path] in stats}
 	return sort_change_rows(rows)
 
 def _printable_path(path):
@@ -4621,7 +4628,8 @@ def _source_resized(new_base, row):
 # content did not change, outside the racy window (_racy_window_ns). The one exception is a store through a shared
 # writable mapping to a page that is already dirty: it leaves ctime unchanged until writeback cleans the page. The
 # window therefore covers twice the writeback horizon, and tmpfs (never written back) is not trusted. Everything else
-# (FAT, exFAT, NTFS, FUSE, network filesystems) is hashed again.
+# (FAT, exFAT, NTFS, FUSE, network filesystems) is hashed again. The window is a heuristic: under writeback backlog a
+# page can stay dirty longer than twice the horizon, and a store into it then goes unseen.
 _TRUSTED_CTIME_FS = frozenset(('ext2', 'ext3', 'ext4', 'xfs', 'btrfs', 'f2fs'))
 
 def _read_vm_centisecs(name):
@@ -4655,11 +4663,11 @@ def _scan_stat(st):
 def _rows_to_recheck(rows, new_base, scan):
 	"""The rows (A / M file rows with a payload copy) whose copy _check_payload hashes again.
 
-	Nothing on a filesystem whose superblock is read-only (mountinfo super options; it cannot change). On any other,
-	a row whose source may have changed since the scan read it: its filesystem is not in _TRUSTED_CTIME_FS, the scan
-	(compute_changes' scan dict) has no stat for it, its scan-time ctime lies within _racy_window_ns of the scan's
-	start or later (any ctime when the window is None), or its lstat now differs from the scan's. A row's filesystem
-	is the visible mount whose mount point is its source file itself (a bind of one file), else the deepest visible
+	On a filesystem whose superblock is read-only (mountinfo super options; it cannot change) only a row whose lstat now
+	differs from the scan's (a row with no scan stat is left). On any other, a row whose source may have changed since
+	the scan read it: its filesystem is not in _TRUSTED_CTIME_FS, the scan (compute_changes' scan dict) has no stat for
+	it, its scan-time ctime lies within _racy_window_ns of the scan's start or later (any ctime when the window is
+	None), or its lstat now differs from the scan's. A row's filesystem is the visible mount whose mount point is its source file itself (a bind of one file), else the deepest visible
 	mount holding the real path of its source's parent directory; not the one holding the spelled path: a key can
 	be spelled through a symlink (store layout)."""
 	entries = _mountinfo_entries()
@@ -4676,21 +4684,25 @@ def _rows_to_recheck(rows, new_base, scan):
 		# A mount on the file itself (a bind of one file) holds it; else the deepest mount holding its directory.
 		directory, name = os.path.split(source)
 		if directory not in holders:
-			inside, found, depth = os.path.realpath(directory).rstrip(os.sep) + os.sep, None, -1
+			real_directory = os.path.realpath(directory).rstrip(os.sep)
+			inside, found, depth = real_directory + os.sep, None, -1
 			for point, entry in visible:
 				if inside.startswith(point) and len(point) >= depth:
 					found, depth = entry, len(point)
-			holders[directory] = (found, os.path.realpath(directory).rstrip(os.sep))
+			holders[directory] = (found, real_directory)
 		found, real_directory = holders[directory]
 		return points.get(real_directory + os.sep + name, found)
 	recheck = []
 	for row in rows:
 		source = _key_path(new_base, row.path)
 		entry = holder(source)
-		if entry is not None and 'ro' in entry.get('super_options', ()):
-			continue
 		before = stats.get(row.path)
-		if (entry is None or entry['fstype'] not in _TRUSTED_CTIME_FS or before is None or started is None or window is None
+		if entry is not None and 'ro' in entry.get('super_options', ()):
+			# The window and the filesystem type do not matter on a read-only superblock; a moved stat still does (a mount
+			# replaced at the same path, a directory swapped for a symlink into it, a remount read-only after a write).
+			if before is None:
+				continue
+		elif (entry is None or entry['fstype'] not in _TRUSTED_CTIME_FS or before is None or started is None or window is None
 				or before[4] >= started - window):
 			recheck.append(row)
 			continue
@@ -6770,10 +6782,11 @@ def _hidden_mounts(entries):
 			hidden.add(index)
 	return hidden
 
-def _mount_scope_entries(path, entries):
-	"""[(key prefix, mountinfo entry or None)] for path: first ('', ...) for the visible mount holding path's real path
-	(the deepest; None when no mount holds it), then one per visible mount below it, deepest last. A mount path lookup
-	does not reach, or that another is stacked on, is left out (see _hidden_mounts), as on the system."""
+def _mount_scopes(path, entries):
+	"""[(key prefix, fstype, source)] for path: first ('', ...) for the visible mount holding path's real path (the
+	deepest), then one per visible mount below it, deepest last. A mount path lookup does not reach, or that another is
+	stacked on, is left out (see _hidden_mounts), as on the system. fstype and source '' when no mount holds path.
+	fstype is mountinfo's; see _scope_fs_type."""
 	hidden = _hidden_mounts(entries)
 	visible = [entry for index, entry in enumerate(entries) if index not in hidden]
 	real = os.path.realpath(path)
@@ -6785,15 +6798,10 @@ def _mount_scope_entries(path, entries):
 			if len(inside) >= depth:
 				holder, depth = entry, len(inside)
 		elif inside.startswith(real_inside):
-			below.append((os.path.relpath(entry['mount_point'], real), entry))
+			below.append((os.path.relpath(entry['mount_point'], real), entry['fstype'], entry.get('source', '')))
 	below.sort(key=lambda scope: (scope[0].count('/'), scope[0]))
-	return [('', holder)] + below
-
-def _mount_scopes(path, entries):
-	"""[(key prefix, fstype, source)] for path (see _mount_scope_entries); fstype and source '' when no mount holds
-	path. fstype is mountinfo's; see _scope_fs_type."""
-	return [(prefix, entry['fstype'], entry.get('source', '')) if entry else (prefix, '', '')
-		for prefix, entry in _mount_scope_entries(path, entries)]
+	own = ('', holder['fstype'], holder.get('source', '')) if holder else ('', '', '')
+	return [own] + below
 
 def _scope_fs_type(fs_type, source):
 	"""fs_type, a fuseblk one (ntfs-3g, exFAT through FUSE) replaced by what its device holds (_probe_fs_type) when
