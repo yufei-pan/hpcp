@@ -5494,8 +5494,9 @@ def _verify_rows(rows, target_root, compare_hash=True, full_hash=False, max_work
 	return failed
 
 # metadata False: a content-only section (see states_equal). case_insensitive: the target looks names
-# up case-insensitively (FAT, exFAT, HFS+ but not HFSX; see _has_case_insensitive_names).
-SectionPlan = namedtuple('SectionPlan', 'name volume_roots target_root rows checks metadata case_insensitive')
+# up case-insensitively (FAT, exFAT, HFS+ but not HFSX; see _has_case_insensitive_names). skipped_identities:
+# {row: _entry_identity} of the A / M rows planned as skipped, recorded while planning (see _apply_section).
+SectionPlan = namedtuple('SectionPlan', 'name volume_roots target_root rows checks metadata case_insensitive skipped_identities')
 
 @contextlib.contextmanager
 def _patch_hash_settings(meta):
@@ -5517,9 +5518,13 @@ def _patch_hash_settings(meta):
 		HASH_SIZE = saved_hash_size
 
 def _plan_section(name, rows, volume_roots, target_root, compare_hash, full_hash, max_workers, metadata=True, case_insensitive=False):
-	"""Check one section's rows against target_root; nothing changes."""
-	return SectionPlan(name, list(volume_roots), target_root, rows,
-		check_patch_target(rows, target_root, compare_hash, full_hash, max_workers, metadata, case_insensitive), metadata, case_insensitive)
+	"""Check one section's rows against target_root; nothing changes. The entries of the rows found already done are
+	recorded, so a later write that reaches one of them (through a symlinked directory, or a name differing only by
+	case) is seen."""
+	checks = check_patch_target(rows, target_root, compare_hash, full_hash, max_workers, metadata, case_insensitive)
+	skipped = [check.row for check in checks if check.action == 'skip' and check.row.op != 'D']
+	return SectionPlan(name, list(volume_roots), target_root, rows, checks, metadata, case_insensitive,
+		_identities(target_root, skipped))
 
 def _section_conflicts(plan):
 	return [check for check in plan.checks if check.action == 'conflict']
@@ -5570,9 +5575,10 @@ def _preflight_section(plan):
 def _apply_section(plan, max_workers, verbose, full_hash, compare_hash, outcome=None):
 	"""Apply a checked section and verify it (with the rows the repair step restored); returns its summary.
 
-	Verify also covers each skipped A / M row whose name differs only by case (_fold_name) from a written or restored
-	A / M row: on a case-insensitive filesystem, recognised or not, that write lands on the entry the skipped row
-	found already done (a golden from a case-sensitive filesystem holding both names), which then fails loudly.
+	Once anything was written, removed or restored, verify also covers each skipped A / M row whose entry is no longer
+	the one planning found (plan.skipped_identities: another row's write reached it through a symlinked directory, or
+	through a name differing only by case on a case-insensitive filesystem, recognised or not) and every skipped
+	directory row (a directory changed in place keeps its inode). Such a contradictory patch then fails loudly.
 	outcome: a dict that receives, for _restore_across_sections and _verify_across_sections: 'removed' (True when a
 	removal took anything away), 'restored' (the rows the repair step wrote again), 'verified' (the rows verified),
 	'deletes' (the D rows that passed) and 'identities' (each A / M row that passed: its entry's _entry_identity
@@ -5583,18 +5589,20 @@ def _apply_section(plan, max_workers, verbose, full_hash, compare_hash, outcome=
 	skipped = [check.row for check in plan.checks if check.action == 'skip' and check.row.op != 'D']
 	restored, removed = _apply_rows(todo, plan.volume_roots, plan.target_root, max_workers, verbose, full_hash,
 		forced_rows=[check.row for check in conflicts], metadata=plan.metadata, skipped=skipped)
-	written = {}
-	for row in todo + restored:
-		if row.op != 'D':
-			written.setdefault(_fold_name(row.path.rstrip('/')), set()).add(row.path.rstrip('/'))
 	restored_rows = set(restored)
-	siblings = [row for row in skipped if row not in restored_rows
-		and written.get(_fold_name(row.path.rstrip('/')), set()) - {row.path.rstrip('/')}]
-	verified, passed = todo + restored + siblings, []
+	changed = []
+	if todo or restored:
+		changed = [row for row in skipped if row not in restored_rows and (row.new.startswith('d:')
+			or _entry_identity(_key_path(plan.target_root, row.path)) != plan.skipped_identities.get(row))]
+	verified, passed = todo + restored + changed, []
 	failed = _verify_rows(verified, plan.target_root, compare_hash, full_hash, max_workers, plan.metadata, passed=passed)
 	if outcome is not None:
+		# Skipped rows not verified here keep planning's entry, so the final pass across sections sees a later change.
+		verified_rows = set(verified)
+		identities = {row: plan.skipped_identities.get(row) for row in skipped if row not in verified_rows}
+		identities.update(_identities(plan.target_root, passed))
 		outcome.update(removed=bool(removed), restored=restored, verified=verified, deletes=[row for row in passed if row.op == 'D'],
-			identities=_identities(plan.target_root, passed))
+			identities=identities)
 	return {
 		'deleted': sum(1 for row in todo if row.op == 'D'),
 		'added': sum(1 for row in todo if row.op == 'A'),
@@ -5661,8 +5669,8 @@ def _verify_across_sections(ran, max_workers, full_hash, compare_hash):
 	verify. ran as for _restore_across_sections. Every D row that passed its verify is verified again (an lstat; the
 	case-only rename exception of _verify_rows still applies, with the section's verified A / M rows). Every
 	directory row that passed is verified again (no hashing): a directory is written in place, keeping its inode.
-	Every other A / M row that passed is lstat'ed and verified again only when its entry (_entry_identity, recorded
-	right after its verify) changed or is gone. Failures are reported as verify errors and added to the section's
+	Every other A / M row that passed, or that its section skipped without verifying, is lstat'ed and verified again only
+	when its entry (_entry_identity, recorded right after its verify, or while planning) changed or is gone. Failures are reported as verify errors and added to the section's
 	summary.
 	"""
 	if len(ran) < 2:

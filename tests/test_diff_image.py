@@ -2848,9 +2848,10 @@ def _case_siblings(hpcp_mod, tmp_path, new, base):
 	return vol
 
 
-def test_skipped_rows_whose_names_differ_only_by_case_from_a_write_are_verified(trees, hpcp_mod, tmp_path, monkeypatch):
-	"""Final review I1: a skipped A / M row whose name folds (_fold_name) to a written row's is verified too; other
-	skipped rows are not. On a case-sensitive target both names are separate files, and verify passes."""
+def test_skipped_case_siblings_on_a_case_sensitive_target_are_not_verified(trees, hpcp_mod, tmp_path, monkeypatch):
+	"""On a case-sensitive target EFI/X and EFI/x are separate files: writing EFI/X leaves EFI/x's entry unchanged, so
+	the skipped EFI/x is not verified again, and verify passes. (On vfat the write lands on EFI/x's entry, which then
+	fails loudly: test_write_over_a_skipped_case_sibling_on_vfat_fails_at_verify.)"""
 	new, base = trees
 	_write(new / 'other', 'same')
 	vol = _case_siblings(hpcp_mod, tmp_path, new, base)
@@ -2860,14 +2861,103 @@ def test_skipped_rows_whose_names_differ_only_by_case_from_a_write_are_verified(
 	shutil.copy2(str(new / 'other'), str(target / 'other'))
 	verified = []
 	real_verify_rows = hpcp_mod._verify_rows
+
 	def verify_rows(rows, *args, **kwargs):
 		verified.extend(row.path for row in rows)
 		return real_verify_rows(rows, *args, **kwargs)
+
 	monkeypatch.setattr(hpcp_mod, '_verify_rows', verify_rows)
 	summary = hpcp_mod.apply_patch_tree([str(vol)], str(target), max_workers=1)
 	assert (summary['modified'], summary['skipped'], summary['failed']) == (1, 2, 0)
-	assert sorted(verified) == ['EFI/X', 'EFI/x']
+	assert verified == ['EFI/X']
 	assert (target / 'EFI' / 'X').read_text() == 'NEW loader' and (target / 'EFI' / 'x').read_text() == 'old loader'
+
+
+def _alias_overwrite(hpcp_mod, tmp_path, new, base):
+	"""The golden adds y/f with the content base's m/x/f has, and changes m/x/f. On a node where y -> m/x, A y/f is
+	skipped (already there) and M m/x/f then rewrites that same file. Returns (volume, make_target)."""
+	(new / 'm' / 'x').mkdir(parents=True)
+	(base / 'm' / 'x').mkdir(parents=True)
+	(base / 'y').mkdir()
+	(new / 'y').mkdir()
+	_write(base / 'm' / 'x' / 'f', 'old')
+	_write(new / 'y' / 'f', 'old')
+	_write(new / 'm' / 'x' / 'f', 'new')
+	vol = tmp_path / 'vol'
+	rows, _ = _patch_from(hpcp_mod, new, base, [vol])
+	assert _ops(rows) == {('A', 'y/f'), ('M', 'm/x/f')}
+
+	def make_target(name):
+		target = tmp_path / name
+		_clone(base, target)
+		(target / 'y').rmdir()
+		os.symlink(os.path.join('m', 'x'), str(target / 'y'))
+		return target
+
+	return vol, make_target
+
+
+def test_skipped_row_overwritten_through_an_alias_fails_at_verify(trees, hpcp_mod, tmp_path, reset_hpcp_globals, monkeypatch):
+	"""Spec Part 1 item 2 / Review Focus 1: A y/f is skipped, M m/x/f rewrites the same entry through y -> m/x. The
+	skipped row's entry changed, so it is verified and fails, on one scope and across two (m mounted below)."""
+	new, base = trees
+	vol, make_target = _alias_overwrite(hpcp_mod, tmp_path, new, base)
+	summaries = []
+	for name, mounts in (('single', []), ('scoped', ['m'])):
+		target = make_target(name)
+		summaries.append(_apply_on_scopes(hpcp_mod, monkeypatch, vol, target, mounts))
+		assert (target / 'm' / 'x' / 'f').read_text() == 'new'
+		assert [error for error in hpcp_mod.ERRORS if error.startswith('Patch verify error: A y/f:')]
+	assert summaries[0] == summaries[1] and summaries[0]['failed'] == 1
+
+
+def test_skipped_directory_changed_through_an_alias_fails_at_verify(trees, hpcp_mod, tmp_path, reset_hpcp_globals, monkeypatch):
+	"""A skipped directory row keeps its inode when another row changes its mode through an alias: skipped
+	directories are always verified once something was written."""
+	new, base = trees
+	for tree in (new, base):
+		(tree / 'm' / 'x' / 'd').mkdir(parents=True)
+		(tree / 'y').mkdir()
+	(new / 'y' / 'd').mkdir()
+	os.chmod(str(new / 'y' / 'd'), 0o755)
+	os.chmod(str(base / 'm' / 'x' / 'd'), 0o755)
+	os.chmod(str(new / 'm' / 'x' / 'd'), 0o700)
+	vol = tmp_path / 'vol'
+	rows, _ = _patch_from(hpcp_mod, new, base, [vol])
+	assert {('A', 'y/d/'), ('M', 'm/x/d/')} <= _ops(rows)
+	target = tmp_path / 'target'
+	_clone(base, target)
+	(target / 'y').rmdir()
+	os.symlink(os.path.join('m', 'x'), str(target / 'y'))
+	summary = _apply_on_scopes(hpcp_mod, monkeypatch, vol, target, [])
+	assert summary['failed'] == 1
+	assert [error for error in hpcp_mod.ERRORS if error.startswith('Patch verify error: A y/d/:')]
+
+
+def test_unchanged_skipped_files_are_not_verified_again(trees, hpcp_mod, tmp_path, monkeypatch):
+	"""An ordinary apply: skipped files whose entry did not change are not verified again (no extra hashing); the
+	written rows are, and the apply ends failed 0."""
+	new, base = trees
+	for index in range(20):
+		_write(new / f'same{index}', 's')
+	_write(new / 'changed', 'new')
+	_write(base / 'changed', 'old')
+	vol = tmp_path / 'vol'
+	_patch_from(hpcp_mod, new, base, [vol])
+	target = tmp_path / 'target'
+	_clone(new, target)
+	_write(target / 'changed', 'old')
+	verified = []
+	real_verify_rows = hpcp_mod._verify_rows
+
+	def verify_rows(rows, *args, **kwargs):
+		verified.extend(row.path for row in rows)
+		return real_verify_rows(rows, *args, **kwargs)
+
+	monkeypatch.setattr(hpcp_mod, '_verify_rows', verify_rows)
+	summary = hpcp_mod.apply_patch_tree([str(vol)], str(target), max_workers=1)
+	assert summary['failed'] == 0 and summary['skipped'] == 20
+	assert verified == ['changed']
 
 
 @requires_root_and_image_tools
