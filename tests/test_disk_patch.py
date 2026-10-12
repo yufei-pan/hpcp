@@ -1313,7 +1313,7 @@ def test_raw_areas_are_stored_before_section_payloads_largest_first(tmp_path, hp
 	monkeypatch.setattr(hpcp_mod, '_partition_changes', lambda *args, **kwargs: _one_row(hpcp_mod))
 	monkeypatch.setattr(hpcp_mod, '_claim_volume_names', lambda output, count: [output])
 	monkeypatch.setattr(hpcp_mod, 'create_image', lambda *args, **kwargs: [str(tmp_path / 'vol')])
-	monkeypatch.setattr(hpcp_mod, '_build_payload', lambda rows, new_root, roots, *args: calls.append(('payload', new_root)))
+	monkeypatch.setattr(hpcp_mod, '_build_payload', lambda rows, new_root, roots, *args, **kwargs: calls.append(('payload', new_root)))
 	monkeypatch.setattr(hpcp_mod, '_store_raw', lambda roots, raw_file, device, size, new_sha: calls.append(('raw', raw_file)))
 	monkeypatch.setattr(hpcp_mod, 'write_disk_patch_metadata', lambda *args: calls.append(('metadata',)))
 	monkeypatch.setattr(tempfile, 'tempdir', str(tmp_path))
@@ -1321,6 +1321,29 @@ def test_raw_areas_are_stored_before_section_payloads_largest_first(tmp_path, hp
 	assert hpcp_mod.process_get_disk_diff_image([new], [old], out, [], [], max_workers=1) == out
 	assert calls == [('raw', 'raw/part5.img'), ('raw', 'raw/part2.img'), ('raw', 'raw/mbr-bootcode.bin'),
 		('payload', str(tmp_path / 'new1') + os.sep), ('metadata',)]
+
+
+def test_disk_generation_passes_each_sections_scan_to_its_payload(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	"""Each section's compute_changes scan reaches that section's _build_payload (Spec Part 3 item 4)."""
+	parts = lambda side: {1: _part(fs_type='vfat', device=f'/dev/{side}1'), 3: _part(fs_type='ext4', device=f'/dev/{side}3')}
+	_fake_generation(hpcp_mod, monkeypatch, tmp_path, parts('new'), parts('old'))
+	monkeypatch.setattr(hpcp_mod, '_mount_partition', lambda device, read_only, mount_points, entries: str(tmp_path / device[5:]) + os.sep)
+	monkeypatch.setattr(hpcp_mod, '_release_mount', lambda mount_point, mount_points: None)
+	monkeypatch.setattr(hpcp_mod, '_live_mount', lambda *args: (None, False))
+	def changes(new_root, *args, scan=None, **kwargs):
+		scan['marker'] = new_root
+		return _one_row(hpcp_mod)
+	monkeypatch.setattr(hpcp_mod, '_partition_changes', changes)
+	monkeypatch.setattr(hpcp_mod, '_claim_volume_names', lambda output, count: [output])
+	monkeypatch.setattr(hpcp_mod, 'create_image', lambda *args, **kwargs: [str(tmp_path / 'vol')])
+	seen = []
+	monkeypatch.setattr(hpcp_mod, '_build_payload', lambda rows, new_root, roots, *args, **kwargs: seen.append((new_root, kwargs['scan']['marker'])))
+	monkeypatch.setattr(hpcp_mod, '_store_raw', lambda *args: None)
+	monkeypatch.setattr(hpcp_mod, 'write_disk_patch_metadata', lambda *args: None)
+	monkeypatch.setattr(tempfile, 'tempdir', str(tmp_path))
+	new, old, out = _fake_disk_paths(tmp_path)
+	assert hpcp_mod.process_get_disk_diff_image([new], [old], out, [], [], max_workers=1) == out
+	assert seen == [(root, root) for root in (str(tmp_path / 'new1') + os.sep, str(tmp_path / 'new3') + os.sep)]
 
 
 @pytest.mark.parametrize('fs_type, expected', [
@@ -1350,7 +1373,7 @@ def test_generation_classifies_sections_by_filesystem_type(tmp_path, hpcp_mod, r
 	monkeypatch.setattr(hpcp_mod, '_claim_volume_names', lambda output, count: [output])
 	monkeypatch.setattr(hpcp_mod, 'create_image', lambda *args, **kwargs: [str(tmp_path / 'vol')])
 	sections = []
-	monkeypatch.setattr(hpcp_mod, '_build_payload', lambda rows, new_root, roots, *args: sections.append({(row.op, row.path) for row in rows}))
+	monkeypatch.setattr(hpcp_mod, '_build_payload', lambda rows, new_root, roots, *args, **kwargs: sections.append({(row.op, row.path) for row in rows}))
 	monkeypatch.setattr(hpcp_mod, '_store_raw', lambda *args: None)
 	monkeypatch.setattr(hpcp_mod, 'write_disk_patch_metadata', lambda *args: None)
 	monkeypatch.setattr(tempfile, 'tempdir', str(tmp_path))

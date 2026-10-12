@@ -3998,12 +3998,13 @@ def _xattr_digest(path):
 		hasher.update(os.fsencode(name) + b'\0' + struct.pack('>Q', len(value)) + value)
 	return hasher.hexdigest()
 
-def get_entry_state(path, full_hash=False, read_xattrs=True, mark_full=False):
+def get_entry_state(path, full_hash=False, read_xattrs=True, mark_full=False, stats=None):
 	"""State string of one path (see decode_state). Missing paths, including ones below a
 	regular file, are '-'; any other read failure is recorded with eprint and returns '?' (unknown).
 	An existing entry that is not a regular file, directory or symlink (FIFO, socket, device)
 	is '?' too, without an error: hpcp ignores special files, but they are not absent.
 	mark_full: hash a regular file in full and mark the hash (_FULL_HASH_MARK), unless full_hash already hashes every file in full.
+	stats: a dict; a regular file's _scan_stat values, from the lstat taken before the file is read, are stored under path.
 	"""
 	path = path.rstrip(os.sep) or os.sep
 	try:
@@ -4014,6 +4015,8 @@ def get_entry_state(path, full_hash=False, read_xattrs=True, mark_full=False):
 		if stat.S_ISDIR(st.st_mode):
 			return encode_state({'type': 'd', 'mode': st.st_mode, 'uid': st.st_uid, 'gid': st.st_gid, 'xattr': xattr})
 		if stat.S_ISREG(st.st_mode):
+			if stats is not None:
+				stats[path] = _scan_stat(st)
 			# hash_file is lru_cached and would return a stale hash for a same-size rewrite.
 			file_hash = hash_file.__wrapped__(path, st.st_size, full_hash or mark_full) or '-'
 			if mark_full and not full_hash and file_hash != '-':
@@ -4337,8 +4340,9 @@ def build_rooted_maps(new_root, base_root, exclude=None, max_workers=multiproces
 	base_map = build_entry_map(base_root, '', None, _rooted_excludes(exclude, base_root), None, max_workers, parallel_file_listing)
 	return new_map, base_map
 
-def _states_chunk(paths, full_hash, read_xattrs, hash_size, marked=frozenset()):
-	"""Worker body for _states_for_paths: states plus the errors recorded while computing them.
+def _states_chunk(paths, full_hash, read_xattrs, hash_size, marked=frozenset(), want_stats=False):
+	"""Worker body for _states_for_paths: states, the errors recorded while computing them, and (want_stats) the
+	regular files' _scan_stat values ({} otherwise).
 
 	hash_size is the caller's HASH_SIZE; a worker that did not fork from the caller
 	(spawn / forkserver) would otherwise hash with the module default.
@@ -4346,17 +4350,18 @@ def _states_chunk(paths, full_hash, read_xattrs, hash_size, marked=frozenset()):
 	global HASH_SIZE
 	HASH_SIZE = hash_size
 	error_start = len(ERRORS)
-	states = {path: get_entry_state(path, full_hash, read_xattrs, path in marked) for path in paths}
+	stats = {} if want_stats else None
+	states = {path: get_entry_state(path, full_hash, read_xattrs, path in marked, stats) for path in paths}
 	errors = ERRORS[error_start:]
 	del ERRORS[error_start:]
-	return states, errors
+	return states, errors, stats or {}
 
-def _states_for_paths(paths, full_hash=False, read_xattrs=True, max_workers=1, marked=frozenset()):
+def _states_for_paths(paths, full_hash=False, read_xattrs=True, max_workers=1, marked=frozenset(), stats=None):
 	"""{path: state} for every path; parallel chunks on a ProcessPoolExecutor for large sets. Paths in marked are
-	hashed in full with the mark (see get_entry_state)."""
+	hashed in full with the mark (see get_entry_state). stats: a dict filled with each regular file's _scan_stat values."""
 	paths = list(paths)
 	if max_workers <= 1 or len(paths) < 256:
-		return {path: get_entry_state(path, full_hash, read_xattrs, path in marked) for path in paths}
+		return {path: get_entry_state(path, full_hash, read_xattrs, path in marked, stats) for path in paths}
 	chunk_size = max(64, len(paths) // (max_workers * 4) + 1)
 	states = {}
 	with ProcessPoolExecutor(max_workers=max_workers) as executor:
@@ -4364,27 +4369,37 @@ def _states_for_paths(paths, full_hash=False, read_xattrs=True, max_workers=1, m
 		for index in range(0, len(paths), chunk_size):
 			chunk = paths[index:index + chunk_size]
 			futures.append(executor.submit(_states_chunk, chunk, full_hash, read_xattrs, HASH_SIZE,
-				frozenset(path for path in chunk if path in marked)))
+				frozenset(path for path in chunk if path in marked), stats is not None))
 		for future in concurrent.futures.as_completed(futures):
-			chunk_states, chunk_errors = future.result()
+			chunk_states, chunk_errors, chunk_stats = future.result()
 			states.update(chunk_states)
 			ERRORS.extend(chunk_errors)
+			if stats is not None:
+				stats.update(chunk_stats)
 	return states
 
 def compute_changes(new_map, base_map, full_hash=False, max_workers=multiprocessing.cpu_count(), read_xattrs=True, metadata=True,
-		fat_paths=frozenset()):
+		fat_paths=frozenset(), scan=None):
 	"""Rows that turn base_map's tree into new_map's tree, sorted D / A / M.
 
 	With metadata False (see states_equal) a mode, owner or xattr difference alone is no change.
 	fat_paths: paths (values of either map) on FAT. A key whose path on either side is one is compared like a FAT
 	section: by content only and with the timezone tolerance, its files on both sides hashed in full and marked
 	(_FULL_HASH_MARK; unless full_hash already hashes every file in full), so the tolerance holds past HASH_SIZE.
+	scan: a dict, filled for the payload re-check (_rows_to_recheck): 'started_ns', the wall clock before any state is read, and
+	'stats', {key: _scan_stat values} of new_map's regular files, from the lstat taken before each was read.
 	"""
 	keys = set(new_map) | set(base_map)
 	fat_keys = {key for key in keys if new_map.get(key) in fat_paths or base_map.get(key) in fat_paths} if fat_paths else set()
 	marked = set() if full_hash else {tree[key] for tree in (new_map, base_map) for key in fat_keys if key in tree}
+	stats = None
+	if scan is not None:
+		scan['started_ns'] = _wall_clock_ns()
+		stats = {}
 	states = _states_for_paths(set(new_map.values()) | set(base_map.values()), full_hash=full_hash,
-		read_xattrs=read_xattrs and metadata, max_workers=max_workers, marked=marked)
+		read_xattrs=read_xattrs and metadata, max_workers=max_workers, marked=marked, stats=stats)
+	if scan is not None:
+		scan['stats'] = {key: stats[path] for key, path in new_map.items() if path in stats}
 	rows = []
 	for key in keys:
 		new_state = states[new_map[key]] if key in new_map else '-'
@@ -4602,7 +4617,54 @@ def _source_resized(new_base, row):
 		return True
 	return not stat.S_ISREG(info.st_mode) or info.st_size != decode_state(row.new)['size']
 
-def _check_payload(rows, volume_roots, full_hash=False, max_workers=1, new_base=None):
+# Filesystems where every write to a file moves its ctime, which nothing can set back: an unchanged ctime then proves
+# the content did not change (outside _RACY_WINDOW_NS). Everything else (FAT, exFAT, NTFS, FUSE, network filesystems)
+# is hashed again.
+_TRUSTED_CTIME_FS = frozenset(('ext2', 'ext3', 'ext4', 'xfs', 'btrfs', 'f2fs', 'tmpfs'))
+# A file written again within the timestamp tick of its last write keeps its ctime ("racily clean"): a file whose
+# scan-time ctime is this close to the scan's start, or later, is hashed again.
+_RACY_WINDOW_NS = 2 * 1000000000
+
+def _wall_clock_ns():
+	"""Wall-clock time in ns (time.time_ns needs Python 3.7)."""
+	return int(time.time() * 1000000000)
+
+def _scan_stat(st):
+	"""The lstat values the payload re-check compares: device, inode, size, mtime and ctime (ns)."""
+	return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+
+def _rows_to_recheck(rows, new_base, scan):
+	"""The rows (A / M file rows with a payload copy) whose copy _check_payload hashes again.
+
+	Nothing on a filesystem whose superblock is read-only (mountinfo super options; it cannot change). On any other,
+	a row whose source may have changed since the scan read it: its filesystem is not in _TRUSTED_CTIME_FS, the scan
+	(compute_changes' scan dict) has no stat for it, its scan-time ctime lies within _RACY_WINDOW_NS of the scan's
+	start or later, or its lstat now differs from the scan's. Filesystems are found per row as _rows_by_scope groups
+	rows (mounts below new_base included)."""
+	scopes = _mount_scope_entries(new_base, _mountinfo_entries())
+	entries = dict(scopes)
+	scan = scan or {}
+	stats, started = scan.get('stats', {}), scan.get('started_ns')
+	recheck = []
+	for prefix, scope_rows in _rows_by_scope(rows, [(prefix, '', '') for prefix, _ in scopes]).items():
+		entry = entries.get(prefix)
+		if entry is not None and 'ro' in entry.get('super_options', ()):
+			continue
+		trusted = entry is not None and entry['fstype'] in _TRUSTED_CTIME_FS
+		for row in scope_rows:
+			before = stats.get(row.path)
+			if not trusted or before is None or started is None or before[4] >= started - _RACY_WINDOW_NS:
+				recheck.append(row)
+				continue
+			try:
+				now = _scan_stat(os.lstat(_key_path(new_base, row.path)))
+			except OSError:
+				now = None
+			if now != before:
+				recheck.append(row)
+	return recheck
+
+def _check_payload(rows, volume_roots, full_hash=False, max_workers=1, new_base=None, scan=None):
 	"""Raise RuntimeError('Diff image error: ...') unless every A / M file row's payload is on a volume
 	and still matches its row; every failing row is checked and reported in one error.
 
@@ -4611,7 +4673,8 @@ def _check_payload(rows, volume_roots, full_hash=False, max_workers=1, new_base=
 	under new_base no longer has that size either (a live file that grew or went away). A live
 	source can also change between the change scan and the copy at the same size; that copy
 	would fail every apply's verify, so its hash (computed as the row's was, with HASH_SIZE and
-	full_hash) and mtime are compared with the row.
+	full_hash) and mtime are compared with the row. A copy is hashed again only when its source may have changed since
+	the scan read it (_rows_to_recheck; every copy when new_base is None).
 	"""
 	incomplete, changed, copies = [], [], {}
 	for row in rows:
@@ -4625,8 +4688,10 @@ def _check_payload(rows, volume_roots, full_hash=False, max_workers=1, new_base=
 			changed.append(row)
 		else:
 			incomplete.append(row.path)
+	recheck = set(_rows_to_recheck(list(copies), new_base, scan)) if new_base is not None else set(copies)
+	copies = {row: copy for row, copy in copies.items() if row in recheck}
 	marked = {copy for row, copy in copies.items() if _full_marked(row.new)}
-	states = _states_for_paths(set(copies.values()), full_hash=full_hash, read_xattrs=False, max_workers=max_workers, marked=marked)
+	states = _states_for_paths(set(copies.values()), full_hash=full_hash, read_xattrs=False, max_workers=max_workers, marked=marked) if copies else {}
 	for row, copy in copies.items():
 		# Hash and mtime, as an apply's verify compares them (mode and owner are not checked here).
 		if not states_equal(states[copy], row.new, compare_hash=decode_state(row.new)['hash'] != '-', metadata=False, full_hash=full_hash):
@@ -4659,12 +4724,12 @@ def write_patch_metadata(volume_roots, rows, meta):
 		volume_meta['volume'] = f'{index}/{total}'
 		write_manifest(os.path.join(diff_dir, 'manifest'), volume_meta)
 
-def _build_payload(rows, new_base, volume_roots, max_workers=1, verbose=False, estimated_size=0, full_hash=False):
+def _build_payload(rows, new_base, volume_roots, max_workers=1, verbose=False, estimated_size=0, full_hash=False, scan=None):
 	"""Copy the A / M payload of rows from new_base onto the volume roots and check it landed
 	unchanged (_check_payload; full_hash as the rows were hashed).
 
 	Every map key is relpath(path, new_base), so new_base is '/' for store layout and the
-	new tree's root for root layout.
+	new tree's root for root layout. scan: compute_changes' scan dict for these rows (see _rows_to_recheck).
 	"""
 	for row in rows:
 		if _is_reserved_key(row.path):
@@ -4692,12 +4757,13 @@ def _build_payload(rows, new_base, volume_roots, max_workers=1, verbose=False, e
 			# A symlinked root is listed from its target (build_entry_map); take its metadata there too.
 			source = os.path.realpath(source)
 		sync_directory_metadata(source, [_key_path(volume_root, key) for volume_root in volume_roots])
-	_check_payload(payload, volume_roots, full_hash, max_workers, new_base)
+	_check_payload(payload, volume_roots, full_hash, max_workers, new_base, scan)
 
-def build_patch_tree(rows, new_base, volume_roots, meta, max_workers=1, verbose=False):
-	"""Copy the A / M payload of rows from new_base onto the volume roots, then write .hpcp_diff/."""
+def build_patch_tree(rows, new_base, volume_roots, meta, max_workers=1, verbose=False, scan=None):
+	"""Copy the A / M payload of rows from new_base onto the volume roots, then write .hpcp_diff/.
+	scan: compute_changes' scan dict for rows (see _rows_to_recheck)."""
 	_build_payload(rows, new_base, volume_roots, max_workers, verbose, meta.get('payload_bytes', 0),
-		str(meta.get('full_hash', 0)) == '1')
+		str(meta.get('full_hash', 0)) == '1', scan=scan)
 	write_patch_metadata(volume_roots, rows, meta)
 
 PatchCheck = namedtuple('PatchCheck', 'row action found reason')
@@ -5988,7 +6054,8 @@ def process_get_diff_image(src_paths, src_image, dest_paths, dest_image, output,
 	metadata = _compare_metadata((new_root, base_root), entries)
 	# Files on FAT on either side (the root itself, or a mount below it such as /boot/efi) are hashed in full.
 	fat_paths = _paths_on_fat(new_map.values(), new_root, entries) | _paths_on_fat(base_map.values(), base_root, entries)
-	rows = compute_changes(new_map, base_map, full_hash=full_hash, max_workers=max_workers, metadata=metadata, fat_paths=fat_paths)
+	scan = {}
+	rows = compute_changes(new_map, base_map, full_hash=full_hash, max_workers=max_workers, metadata=metadata, fat_paths=fat_paths, scan=scan)
 	# Fail here, before any image exists, on rows every apply would reject.
 	_validate_patch_rows(rows)
 	meta = make_patch_meta(rows, new_name, base_name, layout, full_hash)
@@ -6005,7 +6072,7 @@ def process_get_diff_image(src_paths, src_image, dest_paths, dest_image, output,
 	_claim_volume_names(output, count)
 	volume_roots = create_image(output, target_mount_point, loop_devices, [], mount_points, max_workers=max_workers,
 		dest_image_size=dest_image_size, init_size=init_size)
-	build_patch_tree(rows, new_base, volume_roots, meta, max_workers=max_workers, verbose=verbose)
+	build_patch_tree(rows, new_base, volume_roots, meta, max_workers=max_workers, verbose=verbose, scan=scan)
 	extra = f" (+{len(volume_roots) - 1} more volume(s))" if len(volume_roots) > 1 else ''
 	print(f"Patch image written to {output}{extra}")
 	return output
@@ -6569,6 +6636,7 @@ def _mountinfo_entries(mountinfo_path='/proc/self/mountinfo'):
 					'mount_point': _unescape_mount(fields[4]), 'options': fields[5].split(','),
 					'fstype': fields[separator + 1] if len(fields) > separator + 1 else '',
 					'source': _unescape_mount(fields[separator + 2]) if len(fields) > separator + 2 else '',
+					'super_options': fields[separator + 3].split(',') if len(fields) > separator + 3 else [],
 				})
 			except (ValueError, IndexError):
 				continue
@@ -6664,11 +6732,10 @@ def _hidden_mounts(entries):
 			hidden.add(index)
 	return hidden
 
-def _mount_scopes(path, entries):
-	"""[(key prefix, fstype, source)] for path: first ('', ...) for the visible mount holding path's real path (the
-	deepest), then one per visible mount below it, deepest last. A mount path lookup does not reach, or that another is
-	stacked on, is left out (see _hidden_mounts), as on the system. fstype and source '' when no mount holds path.
-	fstype is mountinfo's; see _scope_fs_type."""
+def _mount_scope_entries(path, entries):
+	"""[(key prefix, mountinfo entry or None)] for path: first ('', ...) for the visible mount holding path's real path
+	(the deepest; None when no mount holds it), then one per visible mount below it, deepest last. A mount path lookup
+	does not reach, or that another is stacked on, is left out (see _hidden_mounts), as on the system."""
 	hidden = _hidden_mounts(entries)
 	visible = [entry for index, entry in enumerate(entries) if index not in hidden]
 	real = os.path.realpath(path)
@@ -6680,10 +6747,15 @@ def _mount_scopes(path, entries):
 			if len(inside) >= depth:
 				holder, depth = entry, len(inside)
 		elif inside.startswith(real_inside):
-			below.append((os.path.relpath(entry['mount_point'], real), entry['fstype'], entry.get('source', '')))
+			below.append((os.path.relpath(entry['mount_point'], real), entry))
 	below.sort(key=lambda scope: (scope[0].count('/'), scope[0]))
-	own = ('', holder['fstype'], holder.get('source', '')) if holder else ('', '', '')
-	return [own] + below
+	return [('', holder)] + below
+
+def _mount_scopes(path, entries):
+	"""[(key prefix, fstype, source)] for path (see _mount_scope_entries); fstype and source '' when no mount holds
+	path. fstype is mountinfo's; see _scope_fs_type."""
+	return [(prefix, entry['fstype'], entry.get('source', '')) if entry else (prefix, '', '')
+		for prefix, entry in _mount_scope_entries(path, entries)]
 
 def _scope_fs_type(fs_type, source):
 	"""fs_type, a fuseblk one (ntfs-3g, exFAT through FUSE) replaced by what its device holds (_probe_fs_type) when
@@ -6982,11 +7054,12 @@ def _mount_partition(device, read_only, mount_points, entries):
 	return mount_point + os.sep
 
 def _partition_changes(new_root, old_root, mount_points, live_mounts, exclude, full_hash, max_workers, parallel_file_listing,
-		input_files=(), metadata=True, fat=False):
+		input_files=(), metadata=True, fat=False, scan=None):
 	"""Change rows of one filesystem partition (root to root; lost+found, this run's mounts and
 	its input disk-image files left out). exclude is matched against '/' + the path inside the partition's filesystem
 	(build_rooted_maps). metadata False: content-only rows (see states_equal).
 	fat: a FAT section, its files hashed in full (see compute_changes).
+	scan: compute_changes' scan dict (see _rows_to_recheck).
 	Names are compared by exact case in every section: a case-only rename is a delete plus an add."""
 	internal = _inside_excludes(mount_points, (new_root, old_root))
 	for live_mount in live_mounts:
@@ -6999,7 +7072,7 @@ def _partition_changes(new_root, old_root, mount_points, live_mounts, exclude, f
 	if any(_is_reserved_key(key) for key in new_map):
 		raise RuntimeError(f'Diff image error: {new_root} contains {DIFF_DIR_NAME}, which hpcp reserves for patch metadata')
 	fat_paths = frozenset(new_map.values()) | frozenset(base_map.values()) if fat else frozenset()
-	rows = compute_changes(new_map, base_map, full_hash=full_hash, max_workers=max_workers, metadata=metadata, fat_paths=fat_paths)
+	rows = compute_changes(new_map, base_map, full_hash=full_hash, max_workers=max_workers, metadata=metadata, fat_paths=fat_paths, scan=scan)
 	_validate_patch_rows(rows)
 	return rows
 
@@ -7134,13 +7207,14 @@ def process_get_disk_diff_image(src_paths, dest_paths, output, mount_points, loo
 			old_root = _mount_partition(old_part['device'], True, mount_points, entries)
 			if new_root and old_root:
 				lives = [_live_mount(_device_number(part['device']), entries, part['device'])[0] for part in (new_part, old_part)]
+				scan = {}
 				rows = _partition_changes(new_root, old_root, mount_points, lives, exclude, full_hash, max_workers, parallel_file_listing,
 					input_files, metadata=_has_posix_metadata(new_part['fs_type']),
-					fat=_is_fat(new_part['fs_type']) or _is_fat(old_part['fs_type']))
+					fat=_is_fat(new_part['fs_type']) or _is_fat(old_part['fs_type']), scan=scan)
 				_release_mount(old_root, mount_points)
 				if rows:
 					# Kept mounted: its payload is copied once the patch image exists.
-					sections.append((number, new_root, rows))
+					sections.append((number, new_root, rows, scan))
 				else:
 					_release_mount(new_root, mount_points)
 			else:
@@ -7165,7 +7239,7 @@ def process_get_disk_diff_image(src_paths, dest_paths, output, mount_points, loo
 	identity = [row for row in disk_rows if _is_identity_change(row, kinds)]
 	raw_entries = [(name, 'raw/mbr-bootcode.bin' if name == 'mbr' else f'raw/{name}.img', old_sha, new_sha, size)
 		for name, _, size, old_sha, new_sha in raws]
-	section_rows = [(number, rows) for number, _, rows in sections]
+	section_rows = [(number, rows) for number, _, rows, _ in sections]
 	meta = make_disk_patch_meta(section_rows, raw_entries, new_name, base_name, full_hash)
 	print(f"Disk changes: {len(sections)} filesystem section(s), {len(raws)} raw area(s), {len(identity)} identity value(s); "
 		f"{meta['added']} added, {meta['modified']} modified, {meta['deleted']} deleted; "
@@ -7189,11 +7263,11 @@ def process_get_disk_diff_image(src_paths, dest_paths, output, mount_points, loo
 	# copied before them would fill the first volume.
 	for (name, device, size, old_sha, new_sha), entry in sorted(zip(raws, raw_entries), key=lambda pair: (-pair[0][2], pair[0][0])):
 		_store_raw(volume_roots, entry[1], device, size, new_sha)
-	for number, new_root, rows in sections:
+	for number, new_root, rows, scan in sections:
 		section_roots = [os.path.join(volume_root, f'part{number}') for volume_root in volume_roots]
 		for root in section_roots:
 			os.makedirs(root, exist_ok=True)
-		_build_payload(rows, new_root, section_roots, max_workers, verbose, _payload_bytes(rows), full_hash)
+		_build_payload(rows, new_root, section_roots, max_workers, verbose, _payload_bytes(rows), full_hash, scan=scan)
 	write_disk_patch_metadata(volume_roots, section_rows, disk_rows, meta)
 	extra = f" (+{len(volume_roots) - 1} more volume(s))" if len(volume_roots) > 1 else ''
 	print(f"Disk patch image written to {output}{extra}")

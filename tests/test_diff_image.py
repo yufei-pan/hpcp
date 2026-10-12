@@ -7,6 +7,7 @@ import stat
 import struct
 import subprocess
 import sys
+import time
 import pytest
 
 
@@ -3627,3 +3628,205 @@ def test_base_directory_given_through_a_symlink_inside_the_new_directory_stays_o
 	rows = _rows_before_mkfs(hpcp_mod, monkeypatch, [str(new)], None, [str(link)], None, str(tmp_path / 'p.img'), [], [], max_workers=1)
 	assert ('A', 'a.txt') in _ops(rows)
 	assert not [row for row in rows if row.path.startswith('mnt/oldroot')]
+
+
+def _one_mount(hpcp_mod, monkeypatch, fs_type='ext4', options=('rw',), super_options=('rw',)):
+	"""mountinfo holding every path on one mount at / (no ids: a test double is never hidden)."""
+	entry = {'devnum': (0, 99), 'root': '/', 'mount_point': '/', 'options': list(options), 'fstype': fs_type,
+		'source': '/dev/x', 'super_options': list(super_options)}
+	monkeypatch.setattr(hpcp_mod, '_mountinfo_entries', lambda *args, **kwargs: [dict(entry)])
+
+
+def _scan_and_build(hpcp_mod, new, base, tmp_path, monkeypatch, change=lambda: None, max_workers=1, scan=True, volume='vol'):
+	"""Scan new vs base (keeping the scan stats unless scan is False), change() the sources, then build the patch.
+	Returns the payload copies _check_payload hashed again, relative to the volume."""
+	new_map, base_map = hpcp_mod.build_root_maps(str(new), str(base), max_workers=1)
+	kept = {} if scan else None
+	rows = hpcp_mod.compute_changes(new_map, base_map, max_workers=max_workers, scan=kept)
+	change()
+	hashed = []
+	real = hpcp_mod._states_for_paths
+	def spy(paths, *args, **kwargs):
+		paths = list(paths)
+		hashed.extend(paths)
+		return real(paths, *args, **kwargs)
+	monkeypatch.setattr(hpcp_mod, '_states_for_paths', spy)
+	vol = tmp_path / volume
+	vol.mkdir()
+	hpcp_mod.build_patch_tree(rows, str(new), [str(vol)], hpcp_mod.make_patch_meta(rows, 'n', 'b', 'root'),
+		max_workers=max_workers, scan=kept)
+	monkeypatch.setattr(hpcp_mod, '_states_for_paths', real)
+	return sorted(os.path.relpath(path, str(vol)).replace(os.sep, '/') for path in hashed)
+
+
+def test_mountinfo_entries_keep_super_options(tmp_path, hpcp_mod):
+	path = tmp_path / 'mountinfo'
+	path.write_text('36 35 98:0 / /mnt/a rw,noatime master:1 - ext4 /dev/sda1 ro,errors=continue\n'
+		'37 35 98:1 / /mnt/b ro - vfat /dev/sda2\n')
+	entries = hpcp_mod._mountinfo_entries(str(path))
+	assert entries[0]['options'] == ['rw', 'noatime'] and entries[0]['super_options'] == ['ro', 'errors=continue']
+	assert entries[1]['super_options'] == []
+
+
+def test_compute_changes_keeps_the_scan_stats_of_new_files(trees, hpcp_mod):
+	new, base = trees
+	_write(new / 'a.txt', 'a')
+	_write(base / 'b.txt', 'b')
+	before = int(time.time() * 1000000000)
+	scan = {}
+	hpcp_mod.compute_changes(*hpcp_mod.build_root_maps(str(new), str(base), max_workers=1), max_workers=1, scan=scan)
+	st = os.lstat(str(new / 'a.txt'))
+	assert scan['stats'] == {'a.txt': (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)}
+	assert before <= scan['started_ns'] <= int(time.time() * 1000000000)
+
+
+def test_payload_recheck_skips_a_read_only_filesystem(trees, hpcp_mod, tmp_path, monkeypatch):
+	"""Spec Part 3 item 1: a source on a read-only superblock cannot change; its copies are not read again."""
+	new, base = trees
+	_write(new / 'a.txt', 'a')
+	_one_mount(hpcp_mod, monkeypatch, options=('ro',), super_options=('ro',))
+	assert _scan_and_build(hpcp_mod, new, base, tmp_path, monkeypatch) == []
+
+
+@pytest.mark.parametrize('options', [('rw',), ('ro',)])
+def test_payload_recheck_catches_a_rewrite_that_keeps_size_and_mtime(trees, hpcp_mod, tmp_path, monkeypatch, options):
+	"""Only ctime shows this rewrite; a read-only bind of a writable filesystem (mount ro, superblock rw) is live."""
+	new, base = trees
+	_write(new / 'live.log', 'version 1')
+	_one_mount(hpcp_mod, monkeypatch, options=options)
+	monkeypatch.setattr(hpcp_mod, '_RACY_WINDOW_NS', 0)
+	with pytest.raises(RuntimeError, match=_CHANGED_WHILE_BUILT):
+		_scan_and_build(hpcp_mod, new, base, tmp_path, monkeypatch, lambda: _write(new / 'live.log', 'version 2'))
+
+
+def test_payload_recheck_trusts_an_unchanged_file_outside_the_racy_window(trees, hpcp_mod, tmp_path, monkeypatch):
+	new, base = trees
+	_write(new / 'a.txt', 'a')
+	_write(new / 'sub' / 'b.txt', 'b')
+	_one_mount(hpcp_mod, monkeypatch)
+	monkeypatch.setattr(hpcp_mod, '_RACY_WINDOW_NS', 0)
+	assert _scan_and_build(hpcp_mod, new, base, tmp_path, monkeypatch) == []
+
+
+def test_payload_recheck_hashes_a_file_changed_within_the_racy_window(trees, hpcp_mod, tmp_path, monkeypatch):
+	"""Written a moment before the scan: a second write in the same timestamp tick would keep its ctime."""
+	new, base = trees
+	_write(new / 'a.txt', 'a')
+	_one_mount(hpcp_mod, monkeypatch)
+	assert _scan_and_build(hpcp_mod, new, base, tmp_path, monkeypatch) == ['a.txt']
+
+
+@pytest.mark.parametrize('fs_type', ['vfat', 'exfat', 'ntfs3', 'fuseblk', 'nfs4', 'cifs', 'zfs'])
+def test_payload_recheck_hashes_files_on_an_untrusted_filesystem(trees, hpcp_mod, tmp_path, monkeypatch, fs_type):
+	new, base = trees
+	_write(new / 'a.txt', 'a')
+	_one_mount(hpcp_mod, monkeypatch, fs_type=fs_type)
+	monkeypatch.setattr(hpcp_mod, '_RACY_WINDOW_NS', 0)
+	assert _scan_and_build(hpcp_mod, new, base, tmp_path, monkeypatch) == ['a.txt']
+
+
+def test_payload_recheck_without_scan_stats_hashes_every_copy(trees, hpcp_mod, tmp_path, monkeypatch):
+	new, base = trees
+	_write(new / 'a.txt', 'a')
+	_one_mount(hpcp_mod, monkeypatch)
+	monkeypatch.setattr(hpcp_mod, '_RACY_WINDOW_NS', 0)
+	assert _scan_and_build(hpcp_mod, new, base, tmp_path, monkeypatch, scan=False) == ['a.txt']
+
+
+def test_payload_recheck_hashes_a_metadata_change_and_keeps_the_copy(trees, hpcp_mod, tmp_path, monkeypatch):
+	"""A chmod moves ctime: the copy is hashed again, matches its row, and the patch is written."""
+	new, base = trees
+	_write(new / 'a.txt', 'a')
+	_one_mount(hpcp_mod, monkeypatch)
+	monkeypatch.setattr(hpcp_mod, '_RACY_WINDOW_NS', 0)
+	assert _scan_and_build(hpcp_mod, new, base, tmp_path, monkeypatch, lambda: os.chmod(str(new / 'a.txt'), 0o600)) == ['a.txt']
+	assert (tmp_path / 'vol' / '.hpcp_diff' / 'manifest').exists()
+
+
+def test_payload_recheck_hashes_files_on_an_untrusted_mount_below_the_source(trees, hpcp_mod, tmp_path, monkeypatch):
+	"""Review Focus 3: `-diff /` with a FAT ESP at /boot/efi: only the ESP's files are read again."""
+	new, base = trees
+	_write(new / 'root.txt', 'r')
+	_write(new / 'esp' / 'boot.efi', 'e')
+	entries = [{'devnum': (0, 1), 'root': '/', 'mount_point': '/', 'options': ['rw'], 'fstype': 'ext4', 'source': '/dev/a',
+			'super_options': ['rw']},
+		{'devnum': (0, 2), 'root': '/', 'mount_point': os.path.realpath(str(new / 'esp')), 'options': ['rw'], 'fstype': 'vfat',
+			'source': '/dev/b', 'super_options': ['rw']}]
+	monkeypatch.setattr(hpcp_mod, '_mountinfo_entries', lambda *args, **kwargs: [dict(entry) for entry in entries])
+	monkeypatch.setattr(hpcp_mod, '_RACY_WINDOW_NS', 0)
+	assert _scan_and_build(hpcp_mod, new, base, tmp_path, monkeypatch) == ['esp/boot.efi']
+
+
+def test_payload_recheck_uses_scan_stats_from_worker_processes(trees, hpcp_mod, tmp_path, monkeypatch):
+	"""Review Focus 1: with >= 256 paths the scan runs in a process pool; its stats must come back from the workers."""
+	new, base = trees
+	for index in range(300):
+		_write(new / 'many' / f'f{index:03}.txt', f'file {index:03}')
+	_one_mount(hpcp_mod, monkeypatch)
+	monkeypatch.setattr(hpcp_mod, '_RACY_WINDOW_NS', 0)
+	assert _scan_and_build(hpcp_mod, new, base, tmp_path, monkeypatch, max_workers=2) == []
+	with pytest.raises(RuntimeError, match=r'^Diff image error: 1 file\(s\) changed while the patch was built \(e\.g\. many/f007\.txt\)'):
+		_scan_and_build(hpcp_mod, new, base, tmp_path, monkeypatch, lambda: _write(new / 'many' / 'f007.txt', 'FILE 007'),
+			max_workers=2, volume='vol2')
+
+
+def test_payload_recheck_through_a_symlinked_new_root(trees, hpcp_mod, tmp_path, monkeypatch):
+	"""Review Focus 2: the scan lists the link's target, the copy goes through the link; stats are keyed by row."""
+	new, base = trees
+	_write(new / 'live.log', 'version 1')
+	link = tmp_path / 'link'
+	os.symlink(str(new), str(link))
+	_one_mount(hpcp_mod, monkeypatch)
+	monkeypatch.setattr(hpcp_mod, '_RACY_WINDOW_NS', 0)
+	assert _scan_and_build(hpcp_mod, link, base, tmp_path, monkeypatch) == []
+	with pytest.raises(RuntimeError, match=_CHANGED_WHILE_BUILT):
+		_scan_and_build(hpcp_mod, link, base, tmp_path, monkeypatch, lambda: _write(new / 'live.log', 'version 2'), volume='vol2')
+
+
+def test_directory_source_generation_passes_the_scan_to_the_payload_check(trees, hpcp_mod, tmp_path, monkeypatch):
+	"""process_get_diff_image hands compute_changes' scan to build_patch_tree (without it every copy is read again)."""
+	new, base = trees
+	_write(new / 'a.txt', 'a')
+	vol = tmp_path / 'vol'
+	vol.mkdir()
+	monkeypatch.setattr('tempfile.tempdir', str(tmp_path))
+	monkeypatch.setattr(hpcp_mod, '_claim_volume_names', lambda output, count: [output])
+	monkeypatch.setattr(hpcp_mod, 'create_image', lambda *args, **kwargs: [str(vol)])
+	_one_mount(hpcp_mod, monkeypatch)
+	monkeypatch.setattr(hpcp_mod, '_RACY_WINDOW_NS', 0)
+	rechecked = []
+	real = hpcp_mod._states_for_paths
+	def spy(paths, *args, **kwargs):
+		paths = list(paths)
+		if kwargs.get('read_xattrs', True) is False:
+			rechecked.extend(paths)
+		return real(paths, *args, **kwargs)
+	monkeypatch.setattr(hpcp_mod, '_states_for_paths', spy)
+	out = str(tmp_path / 'p.img')
+	assert hpcp_mod.process_get_diff_image([str(new)], None, [str(base)], None, out, [], [], max_workers=1) == out
+	assert rechecked == [] and (vol / '.hpcp_diff' / 'manifest').exists()
+
+
+@requires_root_and_image_tools
+@pytest.mark.root
+@pytest.mark.loop
+def test_image_source_payload_is_not_read_again(trees, hpcp_mod, tmp_path, monkeypatch):
+	"""Spec Part 3 item 1 on a real read-only loop mount: a -si image's payload copies are not hashed a second time."""
+	new, base = trees
+	_write(new / 'a.txt', 'a' * 1000)
+	_write(new / 'sub' / 'b.txt', 'b')
+	image = str(tmp_path / 'new.img')
+	rc = hpcp_mod.hpcp([str(new)], dest_image=image, single_thread=True, max_workers=1, batch=True, do_not_remove_files_while_listing=True)
+	assert rc in (None, 0)
+	rechecked = []
+	real = hpcp_mod._states_for_paths
+	def spy(paths, *args, **kwargs):
+		paths = list(paths)
+		if kwargs.get('read_xattrs', True) is False:
+			rechecked.extend(paths)
+		return real(paths, *args, **kwargs)
+	monkeypatch.setattr(hpcp_mod, '_states_for_paths', spy)
+	out = str(tmp_path / 'patch.img')
+	with _mount_session(hpcp_mod) as (mount_points, loop_devices):
+		assert hpcp_mod.process_get_diff_image([], [image], [str(base)], None, out, mount_points, loop_devices, max_workers=1) == out
+	assert rechecked == []
