@@ -1728,18 +1728,20 @@ def get_partition_details(device, partition,sector_size=512, identity=True):
 	result = run_command_in_multicmd_with_path_check(["sgdisk", '--info='+partition, device],strict=True)
 	rtnDic = {'partition_guid_code': '', 'unique_partition_guid': '', 'partition_name': '', 'partition_attrs': '', 'fs_type': '', 'fs_uuid': '', 'fs_label': '', 'size': 0, 'fs_params': {}}
 	for line in result:
-		if "guid code:" in line.lower():
+		# Each field is matched at the start of its line: a GPT name may hold another field's label ('guid code: x').
+		field = line.strip().lower()
+		if field.startswith("partition guid code:"):
 			rtnDic['partition_guid_code'] = line.split(":")[1].split()[0].strip()
-		elif "unique guid:" in line.lower():
+		elif field.startswith("partition unique guid:"):
 			rtnDic['unique_partition_guid'] = line.split(":")[1].strip()
-		elif "partition name:" in line.lower():
+		elif field.startswith("partition name:"):
 			# sgdisk prints the name raw between quotes, a quote inside it included: everything between the first
 			# and the last quote, spaces kept.
 			first, last = line.find("'"), line.rfind("'")
 			rtnDic['partition_name'] = line[first + 1:last] if last > first else ''
-		elif "attribute flags:" in line.lower():
+		elif field.startswith("attribute flags:"):
 			rtnDic['partition_attrs'] = line.split(":")[1].strip()
-		elif 'partition size:' in line.lower():
+		elif field.startswith('partition size:'):
 			rtnDic['size'] = int(line.split(':')[1].split()[0].strip()) * int(sector_size)
 	# Also get the fs type, use parted
 	# result = run_command_in_multicmd_with_path_check(f"parted --machine --script {device} print")
@@ -1772,6 +1774,9 @@ def get_partition_infos(device, identity=True):
 	
 	Args:
 		device (str): Path to the block device (e.g., '/dev/sda').
+		identity (bool, optional): Passed on to get_partition_details. True (the -dd copy) also probes each
+			partition's filesystem type, UUID, label and mkfs parameters; False reads the GPT entries alone, one
+			sgdisk call per partition (read_disk_layout probes the settled partitions itself).
 		
 	Returns:
 		dict: A dictionary containing disk and partition information with the following structure:
@@ -7080,7 +7085,8 @@ def process_get_disk_diff_image(src_paths, dest_paths, output, mount_points, loo
 	numbers = sorted(new_layout['parts'])
 	raw_numbers = [number for number in numbers if _default_kind(new_layout['parts'][number]) == 'raw']
 	# Raw areas first, before any filesystem section is diffed: their sizes are checked before anything is
-	# hashed, and an area too large for -dis is refused before the sections' file diffs.
+	# hashed, and an area too large for -dis is refused before the sections' file diffs when the raw areas alone
+	# force more than one volume (otherwise below, once the sections' payload is known).
 	for number in raw_numbers:
 		new_size, old_size = new_layout['parts'][number]['size'], old_layout['parts'][number]['size']
 		if new_size != old_size:

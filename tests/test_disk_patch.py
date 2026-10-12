@@ -2799,6 +2799,27 @@ def test_get_partition_details_reads_gpt_names_exactly(hpcp_mod, reset_hpcp_glob
 	assert (details['fs_type'], details['fs_label']) == ('ext4', 'a=b')
 
 
+@pytest.mark.parametrize('name', ['guid code: x', 'Partition unique GUID: y', 'attribute flags: 1', 'partition size: 5 sectors'])
+def test_get_partition_details_anchors_each_sgdisk_field(hpcp_mod, reset_hpcp_globals, monkeypatch, name):
+	"""Each sgdisk --info field is matched at the start of its line: a GPT name holding another field's label is the
+	name, and the GUID, attribute and size fields stay as sgdisk printed them."""
+	sgdisk_output = ['Partition GUID code: 0FC63DAF-8483-4772-8E79-3D69D8477DE4 (Linux filesystem)',
+		'Partition unique GUID: 11111111-1111-1111-1111-111111111111', 'First sector: 2048 (at 1024.0 KiB)',
+		'Last sector: 4095 (at 2.0 MiB)', 'Partition size: 2048 sectors (1.0 MiB)', 'Attribute flags: 0000000000000004',
+		f"Partition name: '{name}'"]
+	monkeypatch.setattr(hpcp_mod, 'run_command_in_multicmd_with_path_check', lambda argv, **kwargs: sgdisk_output)
+	hpcp_mod.get_partition_details.cache_clear()
+	try:
+		details = hpcp_mod.get_partition_details('/dev/x', '1', identity=False)
+	finally:
+		hpcp_mod.get_partition_details.cache_clear()
+	assert details['partition_name'] == name
+	assert details['partition_guid_code'] == '0FC63DAF-8483-4772-8E79-3D69D8477DE4'
+	assert details['unique_partition_guid'] == '11111111-1111-1111-1111-111111111111'
+	assert details['partition_attrs'] == '0000000000000004'
+	assert details['size'] == 2048 * 512
+
+
 def test_exfat_serial_is_passed_in_exfatlabel_form(hpcp_mod):
 	"""exfatlabel -i rejects blkid's XXXX-XXXX form ("invalid serial number") and takes 0xXXXXXXXX."""
 	assert hpcp_mod._fs_identity_commands('exfat', '/dev/x1', uuid='ABCD-1234') == [['exfatlabel', '-i', '/dev/x1', '0xABCD1234']]
