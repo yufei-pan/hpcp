@@ -1195,9 +1195,8 @@ def test_raw_area_too_large_for_one_volume_suggests_a_dis_that_passes(hpcp_mod, 
 	assert count == 1 or size <= int(volume_size * 0.90) - (16 << 20)
 	# One MiB less would not always do: the suggestion is rounded up, never down.
 	assert int(hpcp_mod._align_up(suggested - (1 << 20)) * 0.90) - (16 << 20) < size
-	# The planned sizes are printed before any volume is created.
-	assert re.search(r'Disk changes: 0 filesystem section\(s\), 2 raw area\(s\), 0 identity value\(s\); 0 added, 0 modified, 0 deleted; '
-		r'payload 0\.00 B, raw 1\.\d\d GiB', capsys.readouterr().out)
+	# The refusal comes right after the raw hashes, before the change summary is printed or any volume is created.
+	assert 'Disk changes:' not in capsys.readouterr().out
 	assert '/dev/new2' in hashed
 
 
@@ -2882,3 +2881,64 @@ def test_wrong_size_raw_payload_is_refused_before_any_hash_or_mount(tmp_path, hp
 	with pytest.raises(RuntimeError, match='^' + re.escape('Incomplete patch: raw payload raw/part2.img is missing or damaged; nothing applied') + '$'):
 		hpcp_mod.apply_disk_patch([volume], str(tmp_path / 'node.img'), [], [])
 	assert hashed == [] and mounted == []
+
+
+def _generation_fakes(hpcp_mod, monkeypatch, tmp_path, new_raw_size=1 << 20, old_raw_size=1 << 20, raw_changes=True):
+	"""Fake disks for process_get_disk_diff_image: p1 vfat (a section), p2 raw. Returns calls: the order of
+	_hash_area / _partition_changes calls."""
+	new = _layout({1: _part(fs_type='vfat', device='/dev/new1'), 2: _part(fs_type='', size=new_raw_size, device='/dev/new2')})
+	old = _layout({1: _part(fs_type='vfat', device='/dev/old1'), 2: _part(fs_type='', size=old_raw_size, device='/dev/old2')})
+	layouts = {'/dev/newdisk': new, '/dev/olddisk': old}
+	monkeypatch.setattr(hpcp_mod, '_attach_disk', lambda path, ro, loops: '/dev/newdisk' if path.endswith('new.img') else '/dev/olddisk')
+	monkeypatch.setattr(hpcp_mod, 'read_disk_layout', lambda disk, name=None, **kwargs: layouts[disk])
+	monkeypatch.setattr(hpcp_mod, '_mountinfo_entries', lambda: [])
+	monkeypatch.setattr(hpcp_mod, '_swap_devices', lambda: set())
+	monkeypatch.setattr(hpcp_mod, '_refuse_raw_in_use', lambda number, disks, entries, swaps: None)
+	monkeypatch.setattr(hpcp_mod, '_mount_partition', lambda device, read_only, mount_points, entries: str(tmp_path))
+	monkeypatch.setattr(hpcp_mod, '_release_mount', lambda root, mount_points: None)
+	monkeypatch.setattr(hpcp_mod, '_live_mount', lambda devnum, entries, device='': (None, False))
+	monkeypatch.setattr(hpcp_mod, '_device_number', lambda device: (7, 0))
+	calls = []
+
+	def changes(*args, **kwargs):
+		calls.append('section')
+		return []
+
+	def hash_area(path, offset=0, length=None, direct=False):
+		calls.append(path)
+		return 'new' if raw_changes and path.startswith('/dev/new') else 'old'
+
+	monkeypatch.setattr(hpcp_mod, '_partition_changes', changes)
+	monkeypatch.setattr(hpcp_mod, '_hash_area', hash_area)
+	for name in ('new.img', 'old.img'):
+		(tmp_path / name).write_bytes(b'')
+	return calls
+
+
+def test_generation_refuses_a_raw_size_change_before_hashing(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	calls = _generation_fakes(hpcp_mod, monkeypatch, tmp_path, new_raw_size=2 << 20)
+	with pytest.raises(RuntimeError, match=r'^Disk layout mismatch: partition 2 is a raw area and its size changed'):
+		hpcp_mod.process_get_disk_diff_image([str(tmp_path / 'new.img')], [str(tmp_path / 'old.img')], str(tmp_path / 'p.img'), [], [], max_workers=1)
+	assert calls == []
+
+
+def test_generation_hashes_raw_areas_before_any_section(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	calls = _generation_fakes(hpcp_mod, monkeypatch, tmp_path, raw_changes=False)
+	assert hpcp_mod.process_get_disk_diff_image([str(tmp_path / 'new.img')], [str(tmp_path / 'old.img')], str(tmp_path / 'p.img'), [], [], max_workers=1) is None
+	assert calls.index('section') > max(calls.index('/dev/old2'), calls.index('/dev/new2'))
+
+
+def test_generation_refuses_a_raw_area_too_large_for_dis_before_any_section(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	"""Spec Part 2 item 2: the changed raw areas alone force a split and the largest one does not fit a volume."""
+	calls = _generation_fakes(hpcp_mod, monkeypatch, tmp_path, new_raw_size=300 << 20, old_raw_size=300 << 20)
+	with pytest.raises(RuntimeError, match=r'^Diff image error: a raw area of .* must fit in one patch volume; use -dis \d+MiB or larger$'):
+		hpcp_mod.process_get_disk_diff_image([str(tmp_path / 'new.img')], [str(tmp_path / 'old.img')], str(tmp_path / 'p.img'), [], [],
+			dest_image_size=100 << 20, max_workers=1)
+	assert 'section' not in calls
+
+
+def test_generation_does_not_refuse_an_unchanged_large_raw_area(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	calls = _generation_fakes(hpcp_mod, monkeypatch, tmp_path, new_raw_size=300 << 20, old_raw_size=300 << 20, raw_changes=False)
+	assert hpcp_mod.process_get_disk_diff_image([str(tmp_path / 'new.img')], [str(tmp_path / 'old.img')], str(tmp_path / 'p.img'), [], [],
+		dest_image_size=100 << 20, max_workers=1) is None
+	assert 'section' in calls

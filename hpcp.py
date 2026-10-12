@@ -6973,6 +6973,20 @@ def _store_raw(volume_roots, raw_file, device, size, new_sha):
 			return dest
 	raise RuntimeError(f'Diff image error: no patch volume has room for {raw_file} ({format_bytes(size)}B); use a larger -dis')
 
+def _check_raw_fits_a_volume(raw_sizes, init_size, dest_image_size):
+	"""Raise 'Diff image error: ...' when the patch needs more than one volume (_plan_dest_images for init_size)
+	and its largest raw area, which must fit whole in one volume, is larger than one volume's usable space."""
+	if not raw_sizes:
+		return
+	count, volume_size = _plan_dest_images(init_size, dest_image_size)
+	largest_raw = max(raw_sizes)
+	# Same usable-space estimate as _plan_dest_images uses for split volumes.
+	if count > 1 and largest_raw > int(volume_size * 0.90) - (16 << 20):
+		needed = _align_up(int((largest_raw + (16 << 20)) / 0.90) + 1)
+		# Whole MiB, rounded up, in a form the -dis parser reads exactly ('M' alone is 10^6 bytes).
+		needed_mib = (needed + (1 << 20) - 1) >> 20
+		raise RuntimeError(f'Diff image error: a raw area of {format_bytes(largest_raw)}B must fit in one patch volume; use -dis {needed_mib}MiB or larger')
+
 def process_get_disk_diff_image(src_paths, dest_paths, output, mount_points, loop_devices, exclude=None,
 		full_hash=False, dest_image_size=0, max_workers=multiprocessing.cpu_count(), parallel_file_listing=False, verbose=False):
 	"""Write a disk patch image that turns a disk laid out like the old disk (-d) into the new disk.
@@ -7004,7 +7018,31 @@ def process_get_disk_diff_image(src_paths, dest_paths, output, mount_points, loo
 		if _default_kind(new_layout['parts'][number]) == 'raw':
 			_refuse_raw_in_use(number, disks, entries, swaps)
 	kinds, sections, raws = {}, [], []
-	for number in sorted(new_layout['parts']):
+
+	def add_raw(number):
+		"""Hash partition number's area on both disks; a changed one becomes a raw entry."""
+		new_part, old_part = new_layout['parts'][number], old_layout['parts'][number]
+		if new_part['size'] != old_part['size']:
+			raise RuntimeError(f"Disk layout mismatch: partition {number} is a raw area and its size changed ({old_part['size']} vs {new_part['size']}); re-clone instead")
+		old_sha, new_sha = _hash_area(old_part['device'], 0, old_part['size']), _hash_area(new_part['device'], 0, new_part['size'])
+		if old_sha != new_sha:
+			raws.append((f'part{number}', new_part['device'], new_part['size'], old_sha, new_sha))
+
+	numbers = sorted(new_layout['parts'])
+	raw_numbers = [number for number in numbers if _default_kind(new_layout['parts'][number]) == 'raw']
+	# Raw areas first, before any filesystem section is diffed: their sizes are checked before anything is
+	# hashed, and an area too large for -dis is refused before the sections' file diffs.
+	for number in raw_numbers:
+		new_size, old_size = new_layout['parts'][number]['size'], old_layout['parts'][number]['size']
+		if new_size != old_size:
+			raise RuntimeError(f"Disk layout mismatch: partition {number} is a raw area and its size changed ({old_size} vs {new_size}); re-clone instead")
+	for number in raw_numbers:
+		add_raw(number)
+		kinds[number] = 'raw'
+	_check_raw_fits_a_volume([raw[2] for raw in raws], sum(_align_up(raw[2]) for raw in raws) + 64 * 1024, dest_image_size)
+	for number in numbers:
+		if number in kinds:
+			continue
 		new_part, old_part = new_layout['parts'][number], old_layout['parts'][number]
 		kind = _default_kind(new_part)
 		if kind == 'fs':
@@ -7029,13 +7067,10 @@ def process_get_disk_diff_image(src_paths, dest_paths, output, mount_points, loo
 				print(f"Warning: partition {number} ({new_part['fs_type']}) could not be mounted on the {failed} side; comparing it as a raw area", file=sys.stderr)
 				_refuse_raw_in_use(number, disks, entries, swaps)
 				kind = 'raw'
-		if kind == 'raw':
-			if new_part['size'] != old_part['size']:
-				raise RuntimeError(f"Disk layout mismatch: partition {number} is a raw area and its size changed ({old_part['size']} vs {new_part['size']}); re-clone instead")
-			old_sha, new_sha = _hash_area(old_part['device'], 0, old_part['size']), _hash_area(new_part['device'], 0, new_part['size'])
-			if old_sha != new_sha:
-				raws.append((f'part{number}', new_part['device'], new_part['size'], old_sha, new_sha))
+				add_raw(number)
 		kinds[number] = kind
+	# Fallback raw areas were added after the up-front ones; keep the raws in partition order.
+	raws.sort(key=lambda raw: int(raw[0][4:]))
 	old_mbr, new_mbr = _hash_area(old_disk, 0, _MBR_BOOTCODE_SIZE), _hash_area(new_disk, 0, _MBR_BOOTCODE_SIZE)
 	if old_mbr != new_mbr:
 		raws.append(('mbr', new_disk, _MBR_BOOTCODE_SIZE, old_mbr, new_mbr))
@@ -7057,13 +7092,8 @@ def process_get_disk_diff_image(src_paths, dest_paths, output, mount_points, loo
 	init_size = (sum(_payload_allocation(rows) for _, rows in section_rows) + sum(_align_up(raw[2]) for raw in raws)
 		+ 64 * 1024 * (len(sections) + 1))
 	count, volume_size = _plan_dest_images(init_size, dest_image_size)
-	largest_raw = max((raw[2] for raw in raws), default=0)
-	# Same usable-space estimate as _plan_dest_images uses for split volumes.
-	if count > 1 and largest_raw > int(volume_size * 0.90) - (16 << 20):
-		needed = _align_up(int((largest_raw + (16 << 20)) / 0.90) + 1)
-		# Whole MiB, rounded up, in a form the -dis parser reads exactly ('M' alone is 10^6 bytes).
-		needed_mib = (needed + (1 << 20) - 1) >> 20
-		raise RuntimeError(f'Diff image error: a raw area of {format_bytes(largest_raw)}B must fit in one patch volume; use -dis {needed_mib}MiB or larger')
+	# Again with every section's payload: sections can force the split the raw areas alone did not.
+	_check_raw_fits_a_volume([raw[2] for raw in raws], init_size, dest_image_size)
 	if os.geteuid() != 0:
 		print("Warning: creating a patch image usually needs root privileges (loop devices, mkfs, mount)", file=sys.stderr)
 	target_mount_point = tempfile.mkdtemp()
