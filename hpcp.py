@@ -6664,11 +6664,11 @@ def apply_disk_patch(volume_roots, target, mount_points, loop_devices, force=Fal
 	applied first (partition order, ESP last), then raw partition areas, the MBR boot code
 	and identity changes; then everything is verified. A section that fails stops the apply
 	there: later sections, raw areas, boot code and identity changes are left for a re-run.
-	After the sections, a write one section skipped as already done that a delete in another took away
-	(through a symlinked directory) is restored (see _restore_across_sections); a restore that fails stops
-	the raw areas, boot code and identity changes the same way.
 	So does a raw area that cannot be written, or that does not hold the new content when read back
 	right after its write: later raw areas, the boot code and identity changes.
+	After the sections, a write one section skipped as already done that a delete in another took away
+	(through a symlinked directory) is restored (see _restore_across_sections); a restore that fails stops
+	the raw areas, boot code and identity changes like a failed section.
 	Returns {'sections', 'raw_written', 'raw_skipped', 'identity_changed', 'forced', 'failed'}.
 	"""
 	meta, sections, volume_roots = _load_patch(volume_roots, volume_names)
