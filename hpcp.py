@@ -5953,8 +5953,12 @@ def process_get_diff_image(src_paths, src_image, dest_paths, dest_image, output,
 	layout = 'store' if new_is_dir and base_is_image else 'root'
 	# Store layout lists only the new tree's own subtree inside the store (see build_store_maps).
 	base_listed = os.path.join(base_root, os.path.relpath(os.path.abspath(new_root), os.sep)) if layout == 'store' else base_root
-	# This run's mount points inside a listed tree stay out of both listings.
+	# This run's mount points, and its inputs inside a directory being compared (the -si / -di image files, the base
+	# and new directories), stay out of both listings: `-diff / -di /root/golden-v1.img` must not ship the image.
 	internal = _inside_excludes(mount_points, (new_root, base_listed))
+	directories = [root for root, is_dir in ((new_root, new_is_dir), (base_root, not base_is_image)) if is_dir]
+	images_in = [os.path.expanduser(path) for path in (images[0] if src_image else None, dest_image) if path]
+	internal |= _inside_excludes(images_in + directories, directories)
 	if src_image:
 		# A mounted source: patterns are matched against '/' + the path inside each filesystem.
 		new_map, base_map = build_rooted_maps(new_root, base_root, frozenset(exclude or ()) | internal, max_workers, parallel_file_listing)

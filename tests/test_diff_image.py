@@ -3565,3 +3565,65 @@ def test_rooted_maps_skip_excluded_directories_on_both_sides(tmp_path, hpcp_mod,
 		assert not [key for key in entry_map if key.startswith('var/log')]
 	log_dir = os.path.join('var', 'log')
 	assert not [root for root in walked if root.endswith(log_dir) or log_dir + os.sep in root]
+
+
+def test_di_image_inside_the_new_directory_stays_out(trees, hpcp_mod, tmp_path, monkeypatch):
+	"""Spec Part 2: `-diff / -di /root/golden-v1.img` must not install the base image on every node."""
+	new, base = trees
+	_write(new / 'a.txt', 'a')
+	image = new / 'golden-v1.img'
+	image.write_bytes(b'image bytes')
+	store_root = tmp_path / 'store_root'
+	store_root.mkdir()
+	_fake_image_mounts(hpcp_mod, monkeypatch, {str(image): store_root})
+	rows = _rows_before_mkfs(hpcp_mod, monkeypatch, [str(new)], None, [], str(image), str(tmp_path / 'p.img'), [], [], max_workers=1)
+	assert any(row.path.endswith('/a.txt') for row in rows)
+	assert not [row for row in rows if 'golden-v1.img' in row.path]
+
+
+def test_si_image_inside_the_base_directory_stays_out(trees, hpcp_mod, tmp_path, monkeypatch):
+	"""`-diff -si /new.img -d /`: the image file on the base side is no D row."""
+	new, base = trees
+	image_root = tmp_path / 'image_root'
+	_write(image_root / 'a.txt', 'a')
+	image = base / 'new.img'
+	image.write_bytes(b'image bytes')
+	_fake_image_mounts(hpcp_mod, monkeypatch, {str(image): image_root})
+	rows = _rows_before_mkfs(hpcp_mod, monkeypatch, [], [str(image)], [str(base)], None, str(tmp_path / 'p.img'), [], [], max_workers=1)
+	assert ('A', 'a.txt') in _ops(rows)
+	assert not [row for row in rows if 'new.img' in row.path]
+
+
+def test_base_directory_inside_the_new_directory_stays_out(trees, hpcp_mod, tmp_path, monkeypatch):
+	"""`-diff / -d /mnt/oldroot` must not add the whole old tree under mnt/oldroot/."""
+	new, base = trees
+	_write(new / 'a.txt', 'a')
+	oldroot = new / 'mnt' / 'oldroot'
+	_write(oldroot / 'old.txt', 'old')
+	rows = _rows_before_mkfs(hpcp_mod, monkeypatch, [str(new)], None, [str(oldroot)], None, str(tmp_path / 'p.img'), [], [], max_workers=1)
+	assert ('A', 'a.txt') in _ops(rows) and ('A', 'mnt/') in _ops(rows)
+	assert not [row for row in rows if row.path.startswith('mnt/oldroot')]
+
+
+def test_new_directory_inside_the_base_directory_stays_out(trees, hpcp_mod, tmp_path, monkeypatch):
+	"""The base listing must not see the new tree inside it and delete it on every node."""
+	new, base = trees
+	inner = base / 'srv' / 'golden'
+	_write(inner / 'a.txt', 'a')
+	_write(base / 'keep.txt', 'k')
+	rows = _rows_before_mkfs(hpcp_mod, monkeypatch, [str(inner)], None, [str(base)], None, str(tmp_path / 'p.img'), [], [], max_workers=1)
+	assert ('A', 'a.txt') in _ops(rows) and ('D', 'keep.txt') in _ops(rows)
+	assert not [row for row in rows if row.path.startswith('srv/golden')]
+
+
+def test_base_directory_given_through_a_symlink_inside_the_new_directory_stays_out(trees, hpcp_mod, tmp_path, monkeypatch):
+	"""Review Focus 5: inputs are compared by real path, so a symlinked spelling of the base is still found."""
+	new, base = trees
+	_write(new / 'a.txt', 'a')
+	oldroot = new / 'mnt' / 'oldroot'
+	_write(oldroot / 'old.txt', 'old')
+	link = tmp_path / 'oldroot-link'
+	os.symlink(str(oldroot), str(link))
+	rows = _rows_before_mkfs(hpcp_mod, monkeypatch, [str(new)], None, [str(link)], None, str(tmp_path / 'p.img'), [], [], max_workers=1)
+	assert ('A', 'a.txt') in _ops(rows)
+	assert not [row for row in rows if row.path.startswith('mnt/oldroot')]
