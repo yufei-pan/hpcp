@@ -2965,22 +2965,47 @@ def test_disk_patch_writes_awkward_labels_names_and_exfat_serials_exactly(tmp_pa
 			assert hpcp_mod._probe_identity(loop + 'p3')[1] == 'ABCD-1234'
 
 
+def _lsblk_p(name, size, kname, pkname, kind):
+	"""One `lsblk -p -nb -P` line."""
+	return f'NAME="{name}" SIZE="{size}" KNAME="{kname}" PKNAME="{pkname}" TYPE="{kind}"'
+
+
 @pytest.mark.parametrize('disk, lsblk, partitions, largest', [
-	# An LVM LV spanning both partitions: larger than either and its name ends in '2'.
-	('/dev/cciss/c0d0', ['/dev/cciss/c0d0 1000 disk', '/dev/mapper/vg-data2 990 lvm', '/dev/cciss/c0d0p1 400 part',
-		'/dev/cciss/c0d0p2 600 part'], ['/dev/cciss/c0d0p1', '/dev/cciss/c0d0p2'], '/dev/cciss/c0d0p2'),
-	('/dev/disk/by-id/ata-DISK', ['/dev/sda 1000 disk', '/dev/sda1 400 part', '/dev/sda2 600 part',
-		'/dev/mapper/luks-2 584 crypt'], ['/dev/sda1', '/dev/sda2'], '/dev/sda2'),
-	('/dev/loop7', ['/dev/loop7 1000 loop', '/dev/mapper/hpcp-holder-1 900 dm', '/dev/loop7p1 900 part'],
-		['/dev/loop7p1'], '/dev/loop7p1'),
-	('/dev/mapper/mpatha', ['/dev/mapper/mpatha 1000 mpath', '/dev/mapper/mpatha1 400 part', '/dev/mapper/mpatha2 600 part'],
+	# An LVM LV spanning both partitions: larger than either, its name ends in '2', and it is not a partition.
+	('/dev/cciss/c0d0', [_lsblk_p('/dev/cciss/c0d0', 1000, '/dev/cciss!c0d0', '', 'disk'),
+		_lsblk_p('/dev/mapper/vg-data2', 990, '/dev/dm-3', '/dev/cciss!c0d0p1', 'lvm'),
+		_lsblk_p('/dev/cciss/c0d0p1', 400, '/dev/cciss!c0d0p1', '/dev/cciss!c0d0', 'part'),
+		_lsblk_p('/dev/cciss/c0d0p2', 600, '/dev/cciss!c0d0p2', '/dev/cciss!c0d0', 'part')],
+		['/dev/cciss/c0d0p1', '/dev/cciss/c0d0p2'], '/dev/cciss/c0d0p2'),
+	('/dev/disk/by-id/ata-DISK', [_lsblk_p('/dev/sda', 1000, '/dev/sda', '', 'disk'),
+		_lsblk_p('/dev/sda1', 400, '/dev/sda1', '/dev/sda', 'part'), _lsblk_p('/dev/sda2', 600, '/dev/sda2', '/dev/sda', 'part'),
+		_lsblk_p('/dev/mapper/luks-2', 584, '/dev/dm-0', '/dev/sda2', 'crypt')], ['/dev/sda1', '/dev/sda2'], '/dev/sda2'),
+	('/dev/loop7', [_lsblk_p('/dev/loop7', 1000, '/dev/loop7', '', 'loop'),
+		_lsblk_p('/dev/mapper/hpcp-holder-1', 900, '/dev/dm-1', '/dev/loop7p1', 'dm'),
+		_lsblk_p('/dev/loop7p1', 900, '/dev/loop7p1', '/dev/loop7', 'part')], ['/dev/loop7p1'], '/dev/loop7p1'),
+	# dm multipath: NAME (/dev/mapper/...) differs from KNAME (/dev/dm-N); parents are kernel names.
+	('/dev/mapper/mpatha', [_lsblk_p('/dev/mapper/mpatha', 1000, '/dev/dm-0', '', 'mpath'),
+		_lsblk_p('/dev/mapper/mpatha1', 400, '/dev/dm-1', '/dev/dm-0', 'part'),
+		_lsblk_p('/dev/mapper/mpatha2', 600, '/dev/dm-2', '/dev/dm-0', 'part')],
 		['/dev/mapper/mpatha1', '/dev/mapper/mpatha2'], '/dev/mapper/mpatha2'),
 	# A whole-disk filesystem image: no partitions, so the disk itself is the largest.
-	('/dev/loop8', ['/dev/loop8 1000 loop'], [], '/dev/loop8'),
+	('/dev/loop8', [_lsblk_p('/dev/loop8', 1000, '/dev/loop8', '', 'loop')], [], '/dev/loop8'),
+	# A disk that is a member of a partitioned md array: the array's partitions are TYPE part, but not the disk's.
+	('/dev/loop9', [_lsblk_p('/dev/loop9', 1000, '/dev/loop9', '', 'loop'),
+		_lsblk_p('/dev/md127', 990, '/dev/md127', '/dev/loop9', 'raid1'),
+		_lsblk_p('/dev/md127p1', 400, '/dev/md127p1', '/dev/md127', 'part'),
+		_lsblk_p('/dev/md127p2', 500, '/dev/md127p2', '/dev/md127', 'part')], [], '/dev/loop9'),
+	# An md array on partition 1, partitioned itself: only the disk's own partitions count.
+	('/dev/sdb', [_lsblk_p('/dev/sdb', 1000, '/dev/sdb', '', 'disk'),
+		_lsblk_p('/dev/sdb1', 600, '/dev/sdb1', '/dev/sdb', 'part'),
+		_lsblk_p('/dev/md126', 590, '/dev/md126', '/dev/sdb1', 'raid1'),
+		_lsblk_p('/dev/md126p1', 580, '/dev/md126p1', '/dev/md126', 'part'),
+		_lsblk_p('/dev/sdb2', 400, '/dev/sdb2', '/dev/sdb', 'part')], ['/dev/sdb1', '/dev/sdb2'], '/dev/sdb1'),
 ])
 def test_partition_paths_come_from_lsblk_full_names(hpcp_mod, reset_hpcp_globals, monkeypatch, disk, lsblk, partitions, largest):
-	"""lsblk -p prints each node's full path (cciss, by-id and kpartx alike), so those are used as they are. lsblk -l
-	also lists every holder (LVM, LUKS, dm-linear), whose -p path is just as real: only TYPE part rows are partitions."""
+	"""lsblk -p prints each node's full path (cciss, by-id and kpartx alike), so those are used as they are. lsblk
+	also lists every device stacked on the disk's partitions and those devices' own partitions (md127p1): only TYPE
+	part rows whose parent (PKNAME) is the disk itself (its KNAME) are partitions."""
 	argvs = []
 	def fake_lsblk(argv, **kwargs):
 		argvs.append(argv)
@@ -2988,19 +3013,27 @@ def test_partition_paths_come_from_lsblk_full_names(hpcp_mod, reset_hpcp_globals
 	monkeypatch.setattr(hpcp_mod, 'run_command_in_multicmd_with_path_check', fake_lsblk)
 	assert hpcp_mod.get_partitions(disk) == partitions
 	assert hpcp_mod.get_largest_partition(disk) == largest
-	assert all('-p' in argv and argv[argv.index('-o') + 1] == 'NAME,SIZE,TYPE' for argv in argvs)
+	assert all('-p' in argv and '-P' in argv and argv[argv.index('-o') + 1] == 'NAME,SIZE,KNAME,PKNAME,TYPE' for argv in argvs)
 
 
 def test_target_partition_uses_lsblk_full_names(hpcp_mod, reset_hpcp_globals, monkeypatch):
 	argvs = []
 	def fake_lsblk(argv, **kwargs):
 		argvs.append(argv)
-		# A dm holder of partition 1 whose name ends in '2' comes before the partitions, as lsblk -l lists it.
-		return ['/dev/cciss/c0d0 disk', '/dev/mapper/hpcp-holder-2 dm', '/dev/cciss/c0d0p1 part', '/dev/cciss/c0d0p2 part']
+		# A dm holder of partition 1 whose name ends in '2' comes before the partitions, as lsblk lists it.
+		return ['NAME="/dev/cciss/c0d0" KNAME="/dev/cciss!c0d0" PKNAME="" TYPE="disk"',
+			'NAME="/dev/mapper/hpcp-holder-2" KNAME="/dev/dm-0" PKNAME="/dev/cciss!c0d0p1" TYPE="dm"',
+			'NAME="/dev/cciss/c0d0p1" KNAME="/dev/cciss!c0d0p1" PKNAME="/dev/cciss!c0d0" TYPE="part"',
+			'NAME="/dev/cciss/c0d0p2" KNAME="/dev/cciss!c0d0p2" PKNAME="/dev/cciss!c0d0" TYPE="part"']
 	monkeypatch.setattr(hpcp_mod, 'create_loop_device', lambda image: '/dev/cciss/c0d0')
 	monkeypatch.setattr(hpcp_mod, 'run_command_in_multicmd_with_path_check', fake_lsblk)
 	assert hpcp_mod.get_target_partition('/tmp/not-a-device.img', '2') == ('/dev/cciss/c0d0p2', '/dev/cciss/c0d0')
-	assert '-p' in argvs[0] and argvs[0][argvs[0].index('-o') + 1] == 'NAME,TYPE'
+	assert '-P' in argvs[0] and argvs[0][argvs[0].index('-o') + 1] == 'NAME,KNAME,PKNAME,TYPE'
+
+
+def test_lsblk_pairs_decode_escapes(hpcp_mod):
+	"""Review Focus 2: lsblk -P writes special characters as \\xNN escapes."""
+	assert hpcp_mod._lsblk_pairs('NAME="/dev/mapper/a\\x20b" SIZE="7" PKNAME=""') == {'NAME': '/dev/mapper/a b', 'SIZE': '7', 'PKNAME': ''}
 
 
 def test_dev_path(hpcp_mod):

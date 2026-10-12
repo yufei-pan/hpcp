@@ -829,22 +829,35 @@ def _dev_path(kernel_name):
 	/dev/cciss/c0d0p1). Never relative to the path the disk was given by (a /dev/disk/by-id link)."""
 	return '/dev/' + kernel_name.replace('!', '/')
 
+_LSBLK_PAIR_RE = re.compile(r'([A-Z][A-Z0-9:_-]*)="((?:[^"\\]|\\.)*)"')
+
+def _lsblk_pairs(line):
+	"""{column: value} of one `lsblk -P` line (KEY="value" pairs; lsblk writes special characters as \\xNN)."""
+	return {key: _udev_decode(value) for key, value in _LSBLK_PAIR_RE.findall(line)}
+
 def _lsblk_disk_rows(disk, columns):
-	"""(disk row, partition rows) of `lsblk -p -nbl -o <columns>,TYPE disk`, each row split into its columns.
+	"""(disk row, partition rows) of `lsblk -p -nb -P -o <columns>,KNAME,PKNAME,TYPE disk`, each row the list of the
+	asked columns' values.
 
 	lsblk is asked for full paths (-p): it names each node itself (cciss, by-id and kpartx nodes alike), so no path
-	is built here from the kernel names. The first row is the disk itself. lsblk -l also lists every holder of the
-	disk's partitions (LVM, LUKS and dm-linear devices, md arrays), whose -p path is just as real: only rows of TYPE
-	part are partitions. A -l NAME has no spaces and TYPE is the last column.
+	is built here from the kernel names. The first row is the disk itself. lsblk also lists every device stacked on
+	the disk's partitions (LVM, LUKS and dm-linear devices, md arrays) and those devices' own partitions (md127p1 of a
+	partitioned md array built on the disk): a row is a partition of the disk only when its TYPE is part and its
+	parent (PKNAME) is the disk itself (its KNAME). -P prints KEY="value" pairs, so the disk's empty PKNAME cannot
+	shift the columns.
 	"""
-	rows = [line.split() for line in run_command_in_multicmd_with_path_check(["lsblk", '-p', '-nbl', '-o', columns + ',TYPE', disk],strict=True) if line.strip()]
+	names = columns.split(',')
+	lines = run_command_in_multicmd_with_path_check(['lsblk', '-p', '-nb', '-P', '-o', columns + ',KNAME,PKNAME,TYPE', disk], strict=True)
+	rows = [_lsblk_pairs(line) for line in lines if line.strip()]
 	if not rows:
 		raise RuntimeError(f'Disk error: lsblk printed nothing for {disk}')
-	return rows[0], [row for row in rows[1:] if row[-1] == 'part']
+	disk_row = rows[0]
+	partitions = [row for row in rows[1:] if row.get('TYPE') == 'part' and row.get('PKNAME') == disk_row.get('KNAME')]
+	return [disk_row.get(name, '') for name in names], [[row.get(name, '') for name in names] for row in partitions]
 
 def get_largest_partition(disk):
 	"""
-	Get the largest partition on the disk (see _lsblk_disk_rows: holders of its partitions are not partitions).
+	Get the largest partition on the disk (see _lsblk_disk_rows: devices stacked on its partitions, and their own partitions, are not partitions).
 
 	Args:
 		disk (str): The disk name or path.
@@ -859,8 +872,8 @@ def get_largest_partition(disk):
 	return sorted(partitions, key=lambda row: int(row[1]))[-1][0]
 
 def get_partitions(disk):
-	"""Get all the partitions on the disk, as lsblk names their nodes (see _lsblk_disk_rows: holders of its
-	partitions are not partitions).
+	"""Get all the partitions on the disk, as lsblk names their nodes (see _lsblk_disk_rows: devices stacked on its
+	partitions, and their own partitions, are not partitions).
 
 	Args:
 		disk (str): The disk name or path.
@@ -1664,8 +1677,9 @@ def get_target_partition(image, partition_name):
 	This function handles both regular image files and block devices. If the input is an
 	image file, it creates a loop device first. It then identifies all partitions and
 	returns the path to the partition that matches the given partition name.
-	The partitions are lsblk's TYPE part rows, with full paths (see _lsblk_disk_rows): a holder lsblk also lists,
-	such as a dm-linear device on partition 1 named hpcp-holder-2, is never matched as partition 2.
+	The partitions are lsblk's TYPE part rows whose parent is the disk, with full paths (see _lsblk_disk_rows): a
+	device stacked on a partition, or that device's own partitions, such as a dm-linear device on partition 1 named
+	hpcp-holder-2, is never matched as partition 2.
 	
 	Args:
 		image (str): Path to the disk image file or block device
