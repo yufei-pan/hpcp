@@ -4194,3 +4194,144 @@ def test_fat_ioctl_numbers_follow_the_architecture(hpcp_mod, machine, numbers):
 	numbers come out the other way round."""
 	assert hpcp_mod._fat_ioctl_numbers(machine) == numbers
 	assert (hpcp_mod._FAT_IOCTL_GET_ATTRIBUTES, hpcp_mod._FAT_IOCTL_SET_ATTRIBUTES) == hpcp_mod._fat_ioctl_numbers()
+
+
+def _compare_rows(hpcp_mod, monkeypatch, *args, **kwargs):
+	captured = {}
+	monkeypatch.setattr(hpcp_mod, 'report_changes', lambda rows, *rest, **options: captured.setdefault('rows', rows))
+	hpcp_mod.process_compare_file_list(*args, **kwargs)
+	return captured['rows']
+
+
+def test_compare_mode_roots_exclude_patterns_for_image_sources(trees, hpcp_mod, tmp_path, monkeypatch):
+	"""Spec Part 3 item 1: -si image sources (and a -di image base) are listed with rooted matching in compare mode,
+	as in -diff -si; '*/tmp/*' no longer matches the temporary mount path."""
+	image_root, store_root = tmp_path / 'image_root', tmp_path / 'store_root'
+	_write(image_root / 'changed.txt', 'new content')
+	_write(store_root / 'changed.txt', 'old')
+	_write(image_root / 'var' / 'log' / 'a.log', 'new log')
+	_write(store_root / 'var' / 'log' / 'old.log', 'old log')
+	rows = _compare_rows(hpcp_mod, monkeypatch, [str(image_root)], [str(store_root)], max_workers=1,
+		exclude=frozenset(['/var/log/*', '*/tmp/*']), dest_image='store.img', src_image_roots=[str(image_root)])
+	# Something is compared at all (before 9.72, '*/tmp/*' matched both temp mount paths and excluded everything) ...
+	assert ('M', 'changed.txt') in _ops(rows)
+	# ... and '/var/log/*' left out what is under var/log on both sides.
+	assert not [row for row in rows if row.path.startswith('var/log/') and row.path != 'var/log/']
+
+
+def test_compare_mode_roots_exclude_patterns_against_directory_bases(trees, hpcp_mod, tmp_path, monkeypatch):
+	"""Without -di, an image source's patterns are rooted on both sides, as -diff -si -d DIR does (C1 Part 1 item 3)."""
+	image_root, base = tmp_path / 'image_root', tmp_path / 'base_dir'
+	_write(image_root / 'var' / 'log' / 'a.log', 'new log')
+	_write(base / 'var' / 'log' / 'old.log', 'old log')
+	_write(image_root / 'changed.txt', 'new content')
+	_write(base / 'changed.txt', 'old')
+	rows = _compare_rows(hpcp_mod, monkeypatch, [str(image_root) + os.sep], [str(base) + os.sep], max_workers=1,
+		exclude=frozenset(['/var/log/*']), src_image_roots=[str(image_root) + os.sep])
+	assert any(row.op == 'M' and row.path.endswith('changed.txt') for row in rows)
+	assert not [row for row in rows if 'var/log/' in row.path and not row.path.endswith('var/log/')]
+
+
+def test_compare_mode_keeps_real_path_matching_for_directory_sources(trees, hpcp_mod, tmp_path, monkeypatch):
+	new, base = trees
+	_write(new / 'var' / 'log' / 'a.log', 'log')
+	rows = _compare_rows(hpcp_mod, monkeypatch, [str(new) + os.sep], [str(base) + os.sep], max_workers=1,
+		exclude=frozenset(['/var/log/*']))
+	assert any(row.path.endswith('var/log/a.log') for row in rows)
+
+
+def test_exclude_matching_the_root_empties_both_sides(tmp_path, hpcp_mod, reset_hpcp_globals):
+	"""Spec Part 3 item 3: '-e /' (a pattern matching the filesystem root itself) lists nothing on either side."""
+	new, base = tmp_path / 'mnt_new', tmp_path / 'mnt_base'
+	for root in (new, base):
+		_write(root / 'a.txt', 'a')
+	new_map, base_map = hpcp_mod.build_rooted_maps(str(new), str(base), frozenset([os.sep]), max_workers=1)
+	assert set(new_map) == {'./'} == set(base_map)
+	new_map, base_map = hpcp_mod.build_rooted_maps(str(new), str(base), frozenset(['/a.txt']), max_workers=1)
+	assert set(new_map) == {'./'} == set(base_map)
+
+
+def test_recheck_lookup_does_not_scan_every_mount_per_directory(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	"""Spec Part 3 item 2: with thousands of mounts the lookup walks up each directory's real path instead of scanning
+	every mount (5000 directories x 5000 mounts took seconds)."""
+	new = tmp_path / 'new'
+	rows, stats = [], {}
+	for index in range(5000):
+		path = _write(new / f'd{index:04}' / 'f.txt', 'x')
+		key = f'd{index:04}/f.txt'
+		rows.append(hpcp_mod.ChangeRow('A', key, '-', hpcp_mod.get_entry_state(path, False, False)))
+		stats[key] = hpcp_mod._scan_stat(os.lstat(path))
+	entries = [{'devnum': (0, 1), 'root': '/', 'mount_point': '/', 'options': ['rw'], 'fstype': 'ext4', 'source': '/dev/x',
+		'super_options': ['rw']}]
+	entries += [{'devnum': (0, 2 + index), 'root': '/', 'mount_point': f'/nx-mnt/m{index}', 'options': ['rw'], 'fstype': 'ext4',
+		'source': '/dev/y', 'super_options': ['rw']} for index in range(5000)]
+	monkeypatch.setattr(hpcp_mod, '_mountinfo_entries', lambda *args, **kwargs: entries)
+	monkeypatch.setattr(hpcp_mod, '_racy_window_ns', lambda: 0)
+	start = time.monotonic()
+	assert hpcp_mod._rows_to_recheck(rows, str(new), {'stats': stats, 'started_ns': int(time.time() * 1000000000)}) == []
+	assert time.monotonic() - start < 2.0
+
+
+def test_compute_changes_collects_scan_stats_for_new_side_paths_only(trees, hpcp_mod, monkeypatch):
+	"""C1 parked gap: base-side paths are never stat-collected (memory grows with the changes, not the tree)."""
+	new, base = trees
+	_write(new / 'a.txt', 'a')
+	_write(base / 'b.txt', 'b')
+	new_map, base_map = hpcp_mod.build_root_maps(str(new), str(base), max_workers=1)
+	asked = []
+	real = hpcp_mod._states_for_paths
+	def spy(paths, *args, **kwargs):
+		asked.append(set(kwargs.get('stat_paths') or ()))
+		return real(paths, *args, **kwargs)
+	monkeypatch.setattr(hpcp_mod, '_states_for_paths', spy)
+	hpcp_mod.compute_changes(new_map, base_map, max_workers=1, scan={})
+	assert asked == [set(new_map.values())]
+
+
+def test_full_hash_patches_hash_every_payload_copy_again(trees, hpcp_mod, tmp_path, monkeypatch):
+	"""Spec Part 3 item 5: with -fh every copy is hashed again (as up to 9.70), even from a read-only source."""
+	new, base = trees
+	_write(new / 'a.txt', 'a')
+	_write(new / 'sub' / 'b.txt', 'b')
+	_one_mount(hpcp_mod, monkeypatch, options=('ro',), super_options=('ro',))
+	new_map, base_map = hpcp_mod.build_root_maps(str(new), str(base), max_workers=1)
+	scan = {}
+	rows = hpcp_mod.compute_changes(new_map, base_map, full_hash=True, max_workers=1, scan=scan)
+	vol = tmp_path / 'vol'
+	vol.mkdir()
+	hashed = []
+	real = hpcp_mod._states_for_paths
+	def spy(paths, *args, **kwargs):
+		paths = list(paths)
+		hashed.extend(paths)
+		return real(paths, *args, **kwargs)
+	monkeypatch.setattr(hpcp_mod, '_states_for_paths', spy)
+	hpcp_mod.build_patch_tree(rows, str(new), [str(vol)], hpcp_mod.make_patch_meta(rows, 'n', 'b', 'root', full_hash=True),
+		max_workers=1, scan=scan)
+	assert sorted(os.path.relpath(path, str(vol)).replace(os.sep, '/') for path in hashed) == ['a.txt', 'sub/b.txt']
+
+
+def test_full_hash_patches_catch_a_copy_damaged_after_the_copy(trees, hpcp_mod, tmp_path, monkeypatch):
+	"""Spec Part 3 item 5: a copy that came out wrong with the right size (and the source's mtime) stops a -fh
+	generation before any manifest is written, even from a read-only source."""
+	new, base = trees
+	source = _write(new / 'a.txt', 'aaaa')
+	_one_mount(hpcp_mod, monkeypatch, options=('ro',), super_options=('ro',))
+	new_map, base_map = hpcp_mod.build_root_maps(str(new), str(base), max_workers=1)
+	scan = {}
+	rows = hpcp_mod.compute_changes(new_map, base_map, full_hash=True, max_workers=1, scan=scan)
+	vol = tmp_path / 'vol'
+	vol.mkdir()
+	real_copy = hpcp_mod.copy_file_list_parallel
+	def damaging_copy(*args, **kwargs):
+		result = real_copy(*args, **kwargs)
+		with open(str(vol / 'a.txt'), 'r+b') as f:
+			f.write(b'X')
+		st = os.stat(source)
+		os.utime(str(vol / 'a.txt'), ns=(st.st_atime_ns, st.st_mtime_ns))
+		return result
+	monkeypatch.setattr(hpcp_mod, 'copy_file_list_parallel', damaging_copy)
+	with pytest.raises(RuntimeError, match=r'^Diff image error: 1 file\(s\) changed while the patch was built \(e\.g\. a\.txt\)'):
+		hpcp_mod.build_patch_tree(rows, str(new), [str(vol)], hpcp_mod.make_patch_meta(rows, 'n', 'b', 'root', full_hash=True),
+			max_workers=1, scan=scan)
+	assert not (vol / '.hpcp_diff' / 'manifest').exists()

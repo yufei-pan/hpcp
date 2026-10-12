@@ -4351,8 +4351,14 @@ def build_rooted_maps(new_root, base_root, exclude=None, max_workers=multiproces
 	exclude matched against '/' + the path inside each filesystem (_rooted_excludes). Each side is listed with its own
 	rooted patterns, so an excluded directory is skipped, not walked, on both sides."""
 	exclude = frozenset(exclude or ())
-	new_map = build_entry_map(new_root, '', None, _rooted_excludes(exclude, new_root), None, max_workers, parallel_file_listing)
-	base_map = build_entry_map(base_root, '', None, _rooted_excludes(exclude, base_root), None, max_workers, parallel_file_listing)
+	# A pattern matching the filesystem root itself ('-e /'): each side's own root is excluded too, so nothing is
+	# listed on either side (a '/' base already was, by its walker's check of the root).
+	whole = any(fnmatch.fnmatch(os.sep, pattern) for pattern in exclude)
+	def rooted(root):
+		patterns = _rooted_excludes(exclude, root)
+		return patterns | {glob.escape(os.path.abspath(root).rstrip(os.sep)) or os.sep} if whole else patterns
+	new_map = build_entry_map(new_root, '', None, rooted(new_root), None, max_workers, parallel_file_listing)
+	base_map = build_entry_map(base_root, '', None, rooted(base_root), None, max_workers, parallel_file_listing)
 	return new_map, base_map
 
 def _states_chunk(paths, full_hash, read_xattrs, hash_size, marked=frozenset(), stat_paths=None):
@@ -4687,23 +4693,26 @@ def _rows_to_recheck(rows, new_base, scan):
 	be spelled through a symlink (store layout)."""
 	entries = _mountinfo_entries()
 	hidden = _hidden_mounts(entries)
-	visible = [(entry['mount_point'].rstrip(os.sep) + os.sep, entry) for index, entry in enumerate(entries) if index not in hidden]
 	scan = scan or {}
 	stats, started = scan.get('stats', {}), scan.get('started_ns')
 	window = _racy_window_ns()
-	points = {}
-	for point, entry in visible:
-		points[point.rstrip(os.sep)] = entry
+	points = {entry['mount_point'].rstrip(os.sep): entry for index, entry in enumerate(entries) if index not in hidden}
 	holders = {}
 	def holder(source):
 		# A mount on the file itself (a bind of one file) holds it; else the deepest mount holding its directory.
 		directory, name = os.path.split(source)
 		if directory not in holders:
 			real_directory = os.path.realpath(directory).rstrip(os.sep)
-			inside, found, depth = real_directory + os.sep, None, -1
-			for point, entry in visible:
-				if inside.startswith(point) and len(point) >= depth:
-					found, depth = entry, len(point)
+			# The deepest visible mount holding it: its own real path or the nearest parent that is a mount point
+			# ('' stands for '/'), looked up in points, so the cost grows with the depth, not with the mounts.
+			key, found = real_directory, None
+			while True:
+				if key in points:
+					found = points[key]
+					break
+				if not key:
+					break
+				key = key.rpartition(os.sep)[0]
 			holders[directory] = (found, real_directory)
 		found, real_directory = holders[directory]
 		return points.get(real_directory + os.sep + name, found)
@@ -4738,8 +4747,8 @@ def _check_payload(rows, volume_roots, full_hash=False, max_workers=1, new_base=
 	under new_base no longer has that size either (a live file that grew or went away). A live
 	source can also change between the change scan and the copy at the same size; that copy
 	would fail every apply's verify, so its hash (computed as the row's was, with HASH_SIZE and
-	full_hash) and mtime are compared with the row. A copy is hashed again only when its source may have changed since
-	the scan read it (_rows_to_recheck; every copy when new_base is None).
+	full_hash) and mtime are compared with the row. With full_hash (-fh) every copy is hashed again; otherwise
+	only when its source may have changed since the scan read it (_rows_to_recheck; every copy when new_base is None).
 	"""
 	incomplete, changed, copies = [], [], {}
 	for row in rows:
@@ -4753,7 +4762,9 @@ def _check_payload(rows, volume_roots, full_hash=False, max_workers=1, new_base=
 			changed.append(row)
 		else:
 			incomplete.append(row.path)
-	recheck = set(_rows_to_recheck(list(copies), new_base, scan)) if new_base is not None else set(copies)
+	# With -fh every copy is hashed again, whatever its source (as up to 9.70): a copy that came out wrong with the
+	# right size is caught here, before the patch exists, not by every apply's verify after it was written.
+	recheck = set(copies) if full_hash or new_base is None else set(_rows_to_recheck(list(copies), new_base, scan))
 	copies = {row: copy for row, copy in copies.items() if row in recheck}
 	marked = {copy for row, copy in copies.items() if _full_marked(row.new)}
 	states = _states_for_paths(set(copies.values()), full_hash=full_hash, read_xattrs=False, max_workers=max_workers, marked=marked) if copies else {}
@@ -8364,17 +8375,21 @@ def process_compare_file_list(src_paths: list, dests, max_workers = multiprocess
 	if dest_image:
 		for src in src_paths:
 			if src in src_image_roots:
-				new_map.update(build_entry_map(src, '', exclude=exclude, max_workers=max_workers, parallel_file_listing=parallel_file_listing))
-				base_map.update(build_entry_map(dests[0], '', exclude=exclude, logical_root=os.path.abspath(src), max_workers=max_workers, parallel_file_listing=parallel_file_listing))
+				# An image source and the -di image store, both mounted: patterns match '/' + the path inside each.
+				src_new, src_base = build_rooted_maps(src, dests[0], exclude, max_workers, parallel_file_listing)
 			else:
 				src_new, src_base = build_store_maps(src, dests[0], exclude=exclude, max_workers=max_workers, parallel_file_listing=parallel_file_listing)
-				new_map.update(src_new)
-				base_map.update(src_base)
+			new_map.update(src_new)
+			base_map.update(src_base)
 	else:
+		# With image sources, patterns match '/' + the path inside each tree on both sides (as -diff -si -d DIR does).
+		rooted = bool(src_image_roots)
 		for src in src_paths:
-			new_map.update(build_entry_map(src, _trim_prefix(src), exclude=exclude, max_workers=max_workers, parallel_file_listing=parallel_file_listing))
+			src_exclude = _rooted_excludes(exclude or (), src) if src in src_image_roots else exclude
+			new_map.update(build_entry_map(src, _trim_prefix(src), exclude=src_exclude, max_workers=max_workers, parallel_file_listing=parallel_file_listing))
 		for dest in dests:
-			base_map.update(build_entry_map(dest, _trim_prefix(dest), exclude=exclude, max_workers=max_workers, parallel_file_listing=parallel_file_listing))
+			dest_exclude = _rooted_excludes(exclude or (), dest) if rooted else exclude
+			base_map.update(build_entry_map(dest, _trim_prefix(dest), exclude=dest_exclude, max_workers=max_workers, parallel_file_listing=parallel_file_listing))
 	print('-'*80)
 	rows = compute_changes(new_map, base_map, full_hash=full_hash, max_workers=max_workers)
 	report_changes(rows, diff_file_list, tar_diff_file_list)
