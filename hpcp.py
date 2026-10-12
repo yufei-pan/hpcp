@@ -6425,15 +6425,23 @@ def _write_area(target, payload, offset, length):
 		out.flush()
 		os.fsync(out.fileno())
 
-def _raw_payload(volume_roots, raw_file, new_sha, size):
-	"""Path of raw_file on a volume when it is a regular file inside that volume with the recorded
-	size and sha256; None when no volume holds an intact copy."""
+def _raw_payload_candidates(volume_roots, raw_file, size):
+	"""Paths of raw_file on the volumes that are regular files inside their volume with the recorded size."""
 	for volume_root in volume_roots:
 		path = os.path.join(volume_root, raw_file)
 		if (_inside_root(volume_root, path) and os.path.isfile(path) and not os.path.islink(path)
-				and os.path.getsize(path) == size and _hash_area(path) == new_sha):
-			return path
-	return None
+				and os.path.getsize(path) == size):
+			yield path
+
+def _raw_payload_present(volume_roots, raw_file, size):
+	"""True when some volume holds raw_file with the recorded size (checked before anything is hashed; its content
+	is checked by _raw_payload)."""
+	return any(True for _ in _raw_payload_candidates(volume_roots, raw_file, size))
+
+def _raw_payload(volume_roots, raw_file, new_sha, size):
+	"""Path of raw_file on a volume when it is a regular file inside that volume with the recorded
+	size and sha256; None when no volume holds an intact copy."""
+	return next((path for path in _raw_payload_candidates(volume_roots, raw_file, size) if _hash_area(path) == new_sha), None)
 
 def _plan_raw(old_sha, new_sha, found_sha):
 	"""'skip' when the area already holds the new content, 'apply' when it holds the old, else 'conflict'."""
@@ -7160,13 +7168,16 @@ def _exclusive_refusals(devices):
 				refusals.append(f'partition {number} cannot be opened exclusively ({e.strerror})')
 	return refusals
 
-def _write_phase_devices(raw_plan, changes, layout, skipped_identity):
-	"""{number: device} of the partitions the write phase writes: a raw area to write, or a filesystem UUID or label
-	to set. GPT fields and the MBR boot code are written through the whole disk, which the write phase locks."""
+def _write_phase_devices(raws, changes, layout, skipped_identity):
+	"""{number: device} of the partitions the write phase may write: every raw partition with an entry in the patch
+	(raws: the manifest's raw entries; whether an area is already done is known only after hashing, and the
+	exclusive check runs before any hash), and every partition whose filesystem UUID or label the patch sets. GPT
+	fields and the MBR boot code are written through the whole disk, which the write phase locks."""
 	devices = {}
-	for entry in raw_plan:
-		if entry['action'] != 'skip' and entry['name'] != 'mbr':
-			devices[int(entry['name'][len('part'):])] = entry['device']
+	for name, _, _, _, _ in raws:
+		if name != 'mbr':
+			number = int(name[len('part'):])
+			devices[number] = layout['parts'][number]['device']
 	for change in changes:
 		if change.number is not None and change.field in ('fs_uuid', 'fs_label') and (change.number, change.field) not in skipped_identity:
 			devices[change.number] = layout['parts'][change.number]['device']
@@ -7260,7 +7271,7 @@ def apply_disk_patch(volume_roots, target, mount_points, loop_devices, force=Fal
 	"""Apply a disk patch (layout disk) to target: a GPT block device or disk-image file.
 
 	Everything is checked before anything changes: the layout, which partitions are in use,
-	every section's paths, the raw areas and the identity values. A partition the patch writes raw or sets a UUID /
+	every section's paths, the raw areas and the identity values. Every refusal that needs no content hash (in use, read-only live mounts, identity changes that cannot be made, the exclusive check, missing raw payloads, sections that cannot be mounted) comes before the first raw area is read: a raw area can be gigabytes. A partition the patch writes raw or sets a UUID /
 	label on must open exclusively (O_EXCL) during planning, or nothing is applied (Disk in use): that also catches
 	mounts in another mount namespace. During the raw writes and identity commands the whole disk is flock'ed and
 	those partitions held exclusively; a hold that cannot be taken then (or again, after a tool that needs the
@@ -7298,25 +7309,15 @@ def apply_disk_patch(volume_roots, target, mount_points, loop_devices, force=Fal
 	in_use = {number: _partition_in_use(part['device'], _device_number(part['device']), entries, swaps)
 		for number, part in layout['parts'].items()}
 	changes, refusals, warnings = _plan_identity(disk_rows, layout, in_use)
-	raw_plan, raw_refusals = [], []
-	for name, raw_file, old_sha, new_sha, size in meta['raws']:
+	# Every refusal that needs no content hash comes before the first one: a raw area can be gigabytes.
+	raw_refusals = []
+	for name, _, _, _, _ in meta['raws']:
 		number = None if name == 'mbr' else int(name[len('part'):])
 		if number is not None and in_use.get(number):
 			# Refused without reading it: a live area (an LVM PV, say) can be hundreds of GB. So whether it
 			# already holds the new content (a live re-run) is not known either.
 			raw_refusals.append(f'partition {number} is {in_use[number]}; this patch carries its raw area, '
 				'which cannot be checked or written while it is in use')
-			continue
-		device = disk if number is None else layout['parts'][number]['device']
-		found = _hash_area(device, 0, size)
-		action = _plan_raw(old_sha, new_sha, found)
-		payload = None
-		if action != 'skip':
-			payload = _raw_payload(volume_roots, raw_file, new_sha, size)
-			if payload is None:
-				raise RuntimeError(f'Incomplete patch: raw payload {raw_file} is missing or damaged; nothing applied')
-		raw_plan.append({'name': name, 'device': device, 'size': size, 'payload': payload, 'action': action,
-			'found': found, 'new': new_sha})
 	for name, _, _ in sections:
 		part = layout['parts'][int(name[len('part'):])]
 		live, live_read_only = _live_mount(_device_number(part['device']), entries, part['device'])
@@ -7337,19 +7338,40 @@ def apply_disk_patch(volume_roots, target, mount_points, loop_devices, force=Fal
 		print(f'Warning: {text}', file=sys.stderr)
 	skipped_identity = {(number, field) for number, fields, _ in unsupported for field in fields}
 	# The kernel answers for every mount namespace and for hidden mounts, which _partition_in_use cannot see.
-	write_devices = _write_phase_devices(raw_plan, changes, layout, skipped_identity)
+	write_devices = _write_phase_devices(meta['raws'], changes, layout, skipped_identity)
 	exclusive = _exclusive_refusals(write_devices)
 	if exclusive:
 		raise RuntimeError('Disk in use: ' + '; '.join(exclusive) + '; nothing applied')
+	for name, raw_file, _, _, size in meta['raws']:
+		if not _raw_payload_present(volume_roots, raw_file, size):
+			raise RuntimeError(f'Incomplete patch: raw payload {raw_file} is missing or damaged; nothing applied')
 	with _patch_hash_settings(meta) as (compare_hash, full_hash):
-		plans = []
-		for name, payload_dir, rows in sections:
+		roots = {}
+		for name, _, _ in sections:
 			part = layout['parts'][int(name[len('part'):])]
 			root = _mount_partition(part['device'], False, mount_points, entries)
 			if root is None:
 				raise RuntimeError(f"Disk layout mismatch: partition {name[len('part'):]} ({part['fs_type']}) cannot be mounted read-write; nothing applied")
+			roots[name] = root
+		# Only now the raw areas are read: every refusal that needs no hash has run.
+		raw_plan = []
+		for name, raw_file, old_sha, new_sha, size in meta['raws']:
+			number = None if name == 'mbr' else int(name[len('part'):])
+			device = disk if number is None else layout['parts'][number]['device']
+			found = _hash_area(device, 0, size)
+			action = _plan_raw(old_sha, new_sha, found)
+			payload = None
+			if action != 'skip':
+				payload = _raw_payload(volume_roots, raw_file, new_sha, size)
+				if payload is None:
+					raise RuntimeError(f'Incomplete patch: raw payload {raw_file} is missing or damaged; nothing applied')
+			raw_plan.append({'name': name, 'device': device, 'size': size, 'payload': payload, 'action': action,
+				'found': found, 'new': new_sha})
+		plans = []
+		for name, payload_dir, rows in sections:
+			part = layout['parts'][int(name[len('part'):])]
 			fs_type = fs_types.get(name[len('part'):], '')
-			plans.append(_plan_section(name, rows, _section_volume_roots(volume_roots, payload_dir), root, compare_hash, full_hash, max_workers,
+			plans.append(_plan_section(name, rows, _section_volume_roots(volume_roots, payload_dir), roots[name], compare_hash, full_hash, max_workers,
 				_has_posix_metadata(fs_type), _has_case_insensitive_names(fs_type, part['device']), tz_tolerant=_is_fat(fs_type)))
 		raw_conflicts = [entry for entry in raw_plan if entry['action'] == 'conflict']
 		extra = [(f"raw {entry['name']}: content matches neither the patch base nor the new state (found {entry['found'][:12]})",

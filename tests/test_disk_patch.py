@@ -425,12 +425,12 @@ def test_in_use_raw_partition_is_refused_before_it_is_hashed(tmp_path, hpcp_mod,
 	hashed = []
 	# The disk's boot code is already new (skip); the area on the partition still holds the old bytes.
 	answers = {'/dev/fake': _D, '/dev/fake2': _A, payload: _B}
-	monkeypatch.setattr(hpcp_mod, '_hash_area', lambda path, offset=0, length=None: hashed.append(path) or answers[path])
+	monkeypatch.setattr(hpcp_mod, '_hash_area', lambda path, offset=0, length=None, direct=False: hashed.append(path) or answers[path])
 	# Not "its raw area changes": unread, the area may already hold the new content (a live re-run).
 	with pytest.raises(RuntimeError, match='^' + re.escape('Disk in use: partition 2 is held by another device; this patch carries its raw area, '
 			'which cannot be checked or written while it is in use; apply the patch offline (an offline apply skips it if it is already done)') + '$'):
 		hpcp_mod.apply_disk_patch([volume], str(tmp_path / 'node.img'), [], [])
-	assert '/dev/fake2' not in hashed and hashed == ['/dev/fake']
+	assert hashed == []
 
 
 def test_several_in_use_raw_partitions_and_other_refusals_share_one_message(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
@@ -451,7 +451,7 @@ def test_several_in_use_raw_partitions_and_other_refusals_share_one_message(tmp_
 	busy = {'/dev/fake1': 'mounted at /boot/efi', '/dev/fake2': 'held by another device', '/dev/fake5': 'active swap'}
 	monkeypatch.setattr(hpcp_mod, '_partition_in_use', lambda device, devnum, entries, swaps: busy.get(device, ''))
 	hashed = []
-	monkeypatch.setattr(hpcp_mod, '_hash_area', lambda path, offset=0, length=None: hashed.append(path) or _A)
+	monkeypatch.setattr(hpcp_mod, '_hash_area', lambda path, offset=0, length=None, direct=False: hashed.append(path) or _A)
 	with pytest.raises(RuntimeError, match='^' + re.escape('Disk in use: partition 1 is mounted at /boot/efi and its name changes; '
 			'partition 2 is held by another device; this patch carries its raw area, which cannot be checked or written while it is in use; '
 			'partition 5 is active swap; this patch carries its raw area, which cannot be checked or written while it is in use; '
@@ -1919,10 +1919,15 @@ def test_damaged_raw_payload_is_refused_up_front(tmp_path, hpcp_mod, reset_hpcp_
 				f.write(b'BITROT!!')
 	target = tmp_path / 'node.img'
 	shutil.copyfile(str(old), str(target))
-	before = _sha(target.read_bytes())
+	# The refusal comes after the sections are mounted (a mount may touch a filesystem's own superblock): what must
+	# stay untouched is the partition table, the raw areas and the boot code.
+	def untouched():
+		data = target.read_bytes()
+		return _sha(data[:2048 * 512]), _sha(data[67584 * 512:67584 * 512 + (1 << 20)])
+	before = untouched()
 	with pytest.raises(RuntimeError, match='Incomplete patch: raw payload'):
 		_apply(hpcp_mod, patch, target)
-	assert _sha(target.read_bytes()) == before
+	assert untouched() == before
 
 
 @requires_root_and_disk_tools
@@ -2137,14 +2142,14 @@ def test_exclusive_refusals_name_busy_partitions(hpcp_mod, monkeypatch):
 
 
 def test_write_phase_devices(hpcp_mod):
+	"""Every raw partition with an entry is written or checked; whether its area is already done is only known after
+	hashing, and the exclusive check runs before any hash."""
 	IC = hpcp_mod.IdentityChange
 	layout = {'parts': {1: {'device': '/dev/p1'}, 2: {'device': '/dev/p2'}, 3: {'device': '/dev/p3'}, 4: {'device': '/dev/p4'}}}
-	raw_plan = [{'name': 'part2', 'device': '/dev/p2', 'action': 'apply'}, {'name': 'part4', 'device': '/dev/p4', 'action': 'skip'},
-		{'name': 'mbr', 'device': '/dev/disk', 'action': 'apply'}]
-	changes = [IC(3, 'fs_label', 'a', 'b'), IC(1, 'name', 'x', 'y'), IC(4, 'fs_uuid', 'u', 'v'), IC(None, 'guid', 'g', 'h')]
-	devices = hpcp_mod._write_phase_devices(raw_plan, changes, layout, {(4, 'fs_uuid')})
-	assert devices == {2: '/dev/p2', 3: '/dev/p3'}
-
+	raws = [('part2', 'raw/part2.img', 'a', 'b', 1), ('part4', 'raw/part4.img', 'a', 'b', 1), ('mbr', 'raw/mbr-bootcode.bin', 'c', 'd', 440)]
+	changes = [IC(3, 'fs_label', 'a', 'b'), IC(1, 'name', 'x', 'y'), IC(None, 'guid', 'g', 'h')]
+	assert hpcp_mod._write_phase_devices(raws, changes, layout, set()) == {2: '/dev/p2', 3: '/dev/p3', 4: '/dev/p4'}
+	assert hpcp_mod._write_phase_devices([], [IC(3, 'fs_label', 'a', 'b')], layout, {(3, 'fs_label')}) == {}
 
 @requires_root_and_disk_tools
 @pytest.mark.root
@@ -2784,3 +2789,72 @@ def test_lsblk_partition_paths_exist_on_a_real_loop_disk(tmp_path, hpcp_mod, res
 		assert paths == [loop + 'p1', loop + 'p2']
 		assert all(os.path.exists(path) for path in paths)
 		assert hpcp_mod.get_largest_partition(loop) == loop + 'p2'
+
+
+def _refusal_target(hpcp_mod, tmp_path, monkeypatch, sections=(), kinds=None, payload=True, raw_size=1 << 20):
+	"""A hand-made disk patch with a changed raw area on partition 2 and a target whose raw areas would be hashed;
+	returns (volume, layout, hashed): hashed lists every _hash_area call."""
+	raws = [('part2', 'raw/part2.img', _A, _B, raw_size)]
+	volume, layout = _hand_made_disk_patch(hpcp_mod, tmp_path, monkeypatch, sections=sections, raws=raws, kinds=kinds, open_target=True)
+	if payload:
+		path = os.path.join(volume, 'raw', 'part2.img')
+		os.makedirs(os.path.dirname(path))
+		with open(path, 'wb') as f:
+			f.truncate(raw_size)
+	monkeypatch.setattr(hpcp_mod, '_refuse_if_image_in_use', lambda image: None)
+	monkeypatch.setattr(hpcp_mod, '_attach_disk', lambda path, ro, loops: '/dev/fake')
+	monkeypatch.setattr(hpcp_mod, '_partition_table_type', lambda device: 'gpt')
+	monkeypatch.setattr(hpcp_mod, 'read_disk_layout', lambda disk, name=None, **kwargs: layout)
+	monkeypatch.setattr(hpcp_mod, '_mountinfo_entries', lambda: [])
+	monkeypatch.setattr(hpcp_mod, '_swap_devices', lambda: set())
+	monkeypatch.setattr(hpcp_mod, '_device_number', lambda device: (7, 0))
+	monkeypatch.setattr(hpcp_mod, '_partition_in_use', lambda device, devnum, entries, swaps: '')
+	monkeypatch.setattr(hpcp_mod, '_exclusive_refusals', lambda devices: [])
+	hashed = []
+	monkeypatch.setattr(hpcp_mod, '_hash_area', lambda path, offset=0, length=None, direct=False: hashed.append(path) or _A)
+	return volume, layout, hashed
+
+
+def test_read_only_live_section_is_refused_before_any_raw_hash(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	volume, _, hashed = _refusal_target(hpcp_mod, tmp_path, monkeypatch, sections=[('part1', _one_row(hpcp_mod))])
+	monkeypatch.setattr(hpcp_mod, '_live_mount', lambda devnum, entries, device='': ('/boot/efi', True) if device == '/dev/fake1' else (None, False))
+	with pytest.raises(RuntimeError, match='^' + re.escape('Disk in use: partition 1 is mounted read-only at /boot/efi; apply this patch offline') + '$'):
+		hpcp_mod.apply_disk_patch([volume], str(tmp_path / 'node.img'), [], [])
+	assert hashed == []
+
+
+def test_unsupported_identity_change_is_refused_before_any_raw_hash(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	kinds = dict(_GOLDEN_KINDS)
+	kinds[3] = ('fs', 'ntfs', 40 << 20)
+	volume, _, hashed = _refusal_target(hpcp_mod, tmp_path, monkeypatch, kinds=kinds)
+	path = os.path.join(volume, '.hpcp_diff', 'disk.tsv')
+	rows = [row._replace(new='NEW-UUID') if (row.number, row.field) == ('3', 'fs_uuid') else row for row in hpcp_mod.read_disk_tsv(path)]
+	hpcp_mod.write_disk_tsv(path, rows)
+	with pytest.raises(RuntimeError, match=r'^Identity change error: .*nothing applied \(use -fa to apply the rest\)$'):
+		hpcp_mod.apply_disk_patch([volume], str(tmp_path / 'node.img'), [], [])
+	assert hashed == []
+
+
+def test_exclusive_refusal_comes_before_any_raw_hash(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	volume, _, hashed = _refusal_target(hpcp_mod, tmp_path, monkeypatch)
+	seen = []
+	monkeypatch.setattr(hpcp_mod, '_exclusive_refusals', lambda devices: seen.append(dict(devices)) or ['partition 2 is held'])
+	with pytest.raises(RuntimeError, match='^' + re.escape('Disk in use: partition 2 is held; nothing applied') + '$'):
+		hpcp_mod.apply_disk_patch([volume], str(tmp_path / 'node.img'), [], [])
+	assert hashed == [] and seen == [{2: '/dev/fake2'}]
+
+
+def test_missing_raw_payload_is_refused_before_any_raw_hash(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	volume, _, hashed = _refusal_target(hpcp_mod, tmp_path, monkeypatch, payload=False)
+	with pytest.raises(RuntimeError, match='^' + re.escape('Incomplete patch: raw payload raw/part2.img is missing or damaged; nothing applied') + '$'):
+		hpcp_mod.apply_disk_patch([volume], str(tmp_path / 'node.img'), [], [])
+	assert hashed == []
+
+
+def test_unmountable_section_is_refused_before_any_raw_hash(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	volume, _, hashed = _refusal_target(hpcp_mod, tmp_path, monkeypatch, sections=[('part1', _one_row(hpcp_mod))])
+	monkeypatch.setattr(hpcp_mod, '_live_mount', lambda devnum, entries, device='': (None, False))
+	monkeypatch.setattr(hpcp_mod, '_mount_partition', lambda device, read_only, mount_points, entries: None)
+	with pytest.raises(RuntimeError, match='^' + re.escape('Disk layout mismatch: partition 1 (vfat) cannot be mounted read-write; nothing applied') + '$'):
+		hpcp_mod.apply_disk_patch([volume], str(tmp_path / 'node.img'), [], [])
+	assert hashed == []
