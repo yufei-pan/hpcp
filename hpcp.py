@@ -6918,11 +6918,128 @@ def _refuse_if_image_in_use(image):
 			continue
 		raise RuntimeError(f'Disk in use: {image} is attached as {loop}; detach it (losetup -d {loop}) or apply the patch to {loop}')
 
+_BLKRRPART = 0x125f
+# Identity tools that fail while hpcp holds their partition O_EXCL (found by
+# test_identity_tools_work_while_the_partition_is_held); they run with that partition's hold dropped.
+_TOOLS_NEEDING_EXCLUSIVE = frozenset(('e2fsck', 'btrfstune', 'btrfs', 'exfatlabel'))
+
+class DiskHoldError(OSError):
+	"""The write phase could not lock the disk or hold a partition (see _disk_write_hold)."""
+
+def _exclusive_open(device):
+	"""A read-only O_EXCL descriptor of block device device. Raises OSError (EBUSY) when it is mounted, active swap or
+	held (LVM, md, dm, another exclusive opener) in any mount namespace: the kernel answers for all of them."""
+	return os.open(device, os.O_RDONLY | os.O_EXCL | getattr(os, 'O_CLOEXEC', 0))
+
+def _exclusive_refusals(devices):
+	"""'partition N is ...' for each {number: device} that cannot be opened exclusively right now (opened, then
+	closed at once)."""
+	refusals = []
+	for number, device in sorted(devices.items()):
+		try:
+			os.close(_exclusive_open(device))
+		except OSError as e:
+			if e.errno == errno.EBUSY:
+				refusals.append(f'partition {number} is mounted, active swap or held (LVM, md, dm), in this or another mount namespace')
+			else:
+				refusals.append(f'partition {number} cannot be opened exclusively ({e.strerror})')
+	return refusals
+
+def _write_phase_devices(raw_plan, changes, layout, skipped_identity):
+	"""{number: device} of the partitions the write phase writes: a raw area to write, or a filesystem UUID or label
+	to set. GPT fields and the MBR boot code are written through the whole disk, which the write phase locks."""
+	devices = {}
+	for entry in raw_plan:
+		if entry['action'] != 'skip' and entry['name'] != 'mbr':
+			devices[int(entry['name'][len('part'):])] = entry['device']
+	for change in changes:
+		if change.number is not None and change.field in ('fs_uuid', 'fs_label') and (change.number, change.field) not in skipped_identity:
+			devices[change.number] = layout['parts'][change.number]['device']
+	return devices
+
+def _reread_partition_table(disk_fd, disk):
+	"""Ask the kernel to re-read disk's partition table (BLKRRPART on disk_fd; `partx -u` when the kernel refuses, a
+	partition being in use). Quiet: udev settling afterwards shows the outcome."""
+	try:
+		import fcntl
+		fcntl.ioctl(disk_fd, _BLKRRPART)
+		return
+	except (ImportError, OSError):
+		pass
+	if check_path('partx'):
+		error_count = len(ERRORS)
+		try:
+			run_command_in_multicmd_with_path_check(['partx', '-u', disk], quiet=True, strict=False)
+		finally:
+			del ERRORS[error_count:]
+
+@contextlib.contextmanager
+def _disk_write_hold(disk, devices, timeout=10):
+	"""Hold disk for the write phase; yields {device: descriptor} for devices (None once dropped, see
+	_run_identity_commands).
+
+	flock(LOCK_EX) on the whole disk (systemd's block-device locking convention: udev postpones its events for a disk
+	locked so, and so does not re-read the partition table mid-phase), retried for up to timeout seconds while udev
+	holds its shared lock; then an O_EXCL open of every device, kept to the end, so nothing can mount or claim them
+	meanwhile. Raises DiskHoldError when the lock or a hold cannot be taken (what was taken is released). On exit the
+	holds are closed first (the kernel cannot re-read a table whose partitions are open exclusively), then the
+	partition table is re-read, then the lock released.
+	"""
+	import fcntl
+	disk_fd = os.open(disk, os.O_RDONLY | getattr(os, 'O_CLOEXEC', 0))
+	holds = {}
+	try:
+		deadline = time.time() + timeout
+		while True:
+			try:
+				fcntl.flock(disk_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+				break
+			except OSError as e:
+				if e.errno not in (errno.EWOULDBLOCK, errno.EAGAIN) or time.time() >= deadline:
+					raise DiskHoldError(e.errno, f'cannot lock {disk} ({e.strerror})')
+				time.sleep(0.1)
+		for device in devices:
+			try:
+				holds[device] = _exclusive_open(device)
+			except OSError as e:
+				raise DiskHoldError(e.errno, f'{device} was taken after the check ({e.strerror})')
+		yield holds
+	finally:
+		for fd in holds.values():
+			if fd is not None:
+				os.close(fd)
+		_reread_partition_table(disk_fd, disk)
+		# Closing the descriptor releases the lock.
+		os.close(disk_fd)
+
+def _run_identity_commands(commands, holds):
+	"""Run the identity commands while the write phase holds their partitions. A tool in _TOOLS_NEEDING_EXCLUSIVE
+	opens its device exclusively itself: the hold of every held device its command names is dropped for that one
+	command and taken again after it (a warning when that fails; the remaining commands still run)."""
+	for command in commands:
+		dropped = []
+		if command[0] in _TOOLS_NEEDING_EXCLUSIVE:
+			for device, fd in list(holds.items()):
+				if fd is not None and device in command:
+					os.close(fd)
+					holds[device] = None
+					dropped.append(device)
+		run_command_in_multicmd_with_path_check(command, strict=False)
+		for device in dropped:
+			try:
+				holds[device] = _exclusive_open(device)
+			except OSError as e:
+				print(f'Warning: cannot hold {device} again after {command[0]} ({e.strerror})', file=sys.stderr)
+
 def apply_disk_patch(volume_roots, target, mount_points, loop_devices, force=False, max_workers=1, verbose=False, volume_names=None):
 	"""Apply a disk patch (layout disk) to target: a GPT block device or disk-image file.
 
 	Everything is checked before anything changes: the layout, which partitions are in use,
-	every section's paths, the raw areas and the identity values. Filesystem sections are
+	every section's paths, the raw areas and the identity values. A partition the patch writes raw or sets a UUID /
+	label on must open exclusively (O_EXCL) during planning, or nothing is applied (Disk in use): that also catches
+	mounts in another mount namespace. During the raw writes and identity commands the whole disk is flock'ed and
+	those partitions held exclusively; a hold that cannot be taken then stops the raw areas, boot code and identity
+	changes like a failed section. Filesystem sections are
 	applied first (partition order, ESP last), then raw partition areas, the MBR boot code
 	and identity changes; then everything is verified. A section that fails stops the apply
 	there: later sections, raw areas, boot code and identity changes are left for a re-run.
@@ -6993,6 +7110,11 @@ def apply_disk_patch(volume_roots, target, mount_points, loop_devices, force=Fal
 	for text in warnings:
 		print(f'Warning: {text}', file=sys.stderr)
 	skipped_identity = {(number, field) for number, fields, _ in unsupported for field in fields}
+	# The kernel answers for every mount namespace and for hidden mounts, which _partition_in_use cannot see.
+	write_devices = _write_phase_devices(raw_plan, changes, layout, skipped_identity)
+	exclusive = _exclusive_refusals(write_devices)
+	if exclusive:
+		raise RuntimeError('Disk in use: ' + '; '.join(exclusive) + '; nothing applied')
 	with _patch_hash_settings(meta) as (compare_hash, full_hash):
 		plans = []
 		for name, payload_dir, rows in sections:
@@ -7035,27 +7157,35 @@ def apply_disk_patch(volume_roots, target, mount_points, loop_devices, force=Fal
 	pending = [entry for entry in raw_plan if entry['action'] != 'skip'] if stopped is None else []
 	attempted = []
 	raw_stopped = None
-	# Partition areas first, the MBR boot code last. A write that fails stops the rest and the identity
-	# changes: boot code pointing at a core image that is not there would leave the node unbootable.
-	# So does one that raised no error but does not hold the new content when read back.
-	for entry in sorted(pending, key=lambda entry: entry['name'] == 'mbr'):
-		attempted.append(entry)
+	hold_error = None
+	if stopped is None and (pending or commands):
 		try:
-			_write_area(entry['device'], entry['payload'], 0, entry['size'])
-			if _hash_area(entry['device'], 0, entry['size']) != entry['new']:
-				entry['error'] = 'does not hold the new content after writing'
-		except OSError as e:
-			entry['error'] = str(e)
-		if entry.get('error'):
-			raw_stopped = entry['name']
-			break
+			# The disk is locked (udev leaves it alone) and every partition written here is held exclusively
+			# (nothing can mount it) from the first raw write to the last identity command.
+			with _disk_write_hold(disk, sorted(write_devices.values())) as holds:
+				# Partition areas first, the MBR boot code last. A write that fails stops the rest and the identity
+				# changes: boot code pointing at a core image that is not there would leave the node unbootable.
+				# So does one that raised no error but does not hold the new content when read back.
+				for entry in sorted(pending, key=lambda entry: entry['name'] == 'mbr'):
+					attempted.append(entry)
+					try:
+						_write_area(entry['device'], entry['payload'], 0, entry['size'])
+						if _hash_area(entry['device'], 0, entry['size']) != entry['new']:
+							entry['error'] = 'does not hold the new content after writing'
+					except OSError as e:
+						entry['error'] = str(e)
+					if entry.get('error'):
+						raw_stopped = entry['name']
+						break
+				if raw_stopped is None:
+					_run_identity_commands(commands, holds)
+		except DiskHoldError as e:
+			hold_error = e.strerror
+			failed += 1
+			eprint(f'Disk in use: {hold_error}; raw areas, the boot code and identity changes were not applied; fix the cause and re-run')
 	if stopped is None:
-		# udev re-reads the partition table after the disk device was closed from writing (MBR write, sgdisk).
+		# The holds are released and the partition table re-read: wait until udev shows every partition again.
 		_settle_partitions(disk, sorted(layout['parts']))
-		if raw_stopped is None:
-			for command in commands:
-				run_command_in_multicmd_with_path_check(command, strict=False)
-			_settle_partitions(disk, sorted(layout['parts']))
 	# Verify after the identity commands: sgdisk rewriting the GPT must not have undone a raw write.
 	written = 0
 	for entry in attempted:
@@ -7072,7 +7202,7 @@ def apply_disk_patch(volume_roots, target, mount_points, loop_devices, force=Fal
 		eprint(f"Raw area error: {entry['name']}: {reason}")
 	changed = 0
 	applied = ([change for change in changes if (change.number, change.field) not in skipped_identity]
-		if stopped is None and raw_stopped is None else [])
+		if stopped is None and raw_stopped is None and hold_error is None else [])
 	if applied:
 		after = read_disk_layout(disk)
 		for change in applied:
