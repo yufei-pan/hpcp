@@ -5925,6 +5925,28 @@ def _verify_across_sections(ran, max_workers, full_hash, compare_hash):
 			summary['failed'] += _verify_rows(rows, plan.target_root, compare_hash, full_hash, max_workers, plan.metadata,
 				written_rows=outcome.get('verified', ()), tz_tolerant=plan.tz_tolerant)
 
+def _trigger_automount(mount_point):
+	"""Enter mount_point so that its automount (autofs) mounts what it stands for: a lookup through it (mount_point/.),
+	since a plain stat of the mount point itself does not trigger one. A failure is left to the caller's new look at
+	mountinfo."""
+	try:
+		os.stat(os.path.join(mount_point, '.'))
+	except OSError:
+		pass
+
+def _trigger_automounts(target_root, rows, entries):
+	"""mountinfo entries after triggering each visible automount (autofs) at or below target_root that rows write into
+	(rows _rows_by_scope groups under it, the target's own scope included); entries as given when there is none.
+	Other automounts (/net, NFS home directories) are left alone."""
+	scopes = _mount_scopes(target_root, entries)
+	grouped = _rows_by_scope(rows, scopes)
+	real = os.path.realpath(target_root)
+	points = [os.path.join(real, prefix) if prefix else real
+		for prefix, fs_type, _ in scopes if fs_type == 'autofs' and prefix in grouped]
+	for point in points:
+		_trigger_automount(point)
+	return _mountinfo_entries() if points else entries
+
 def apply_patch_tree(volume_roots, target_root, force=False, max_workers=1, verbose=False, volume_names=None, store_note=False):
 	"""Apply a patch whose volumes are mounted (or unpacked) at volume_roots onto directory target_root.
 
@@ -5949,13 +5971,21 @@ def apply_patch_tree(volume_roots, target_root, force=False, max_workers=1, verb
 	and _restore_across_sections). With more than one mount patched, what one mount's rows or a
 	restore changed in another is verified again at the end (see _verify_across_sections), so a
 	contradictory patch fails as it would on a single filesystem.
+	An automount (autofs) the patch writes into is triggered before the scopes are planned (see _trigger_automounts); one that cannot be mounted is refused before anything changes.
 	"""
 	meta, rows, volume_roots = load_patch_volumes(volume_roots, volume_names)
 	if store_note and meta.get('layout') == 'store':
 		example = rows[0].path if rows else ''
 		print(f"Note: this patch uses image-store layout; paths such as {example!r} are resolved under {target_root}")
-	scopes = _mount_scopes(target_root, _mountinfo_entries())
+	# An automounted filesystem the patch writes into (an ESP systemd mounts on demand) is mounted first, so it is
+	# planned as what it holds; one that stays an automount is refused before anything changes.
+	scopes = _mount_scopes(target_root, _trigger_automounts(target_root, rows, _mountinfo_entries()))
 	grouped = _rows_by_scope(rows, scopes)
+	real = os.path.realpath(target_root)
+	for prefix, fs_type, _ in scopes:
+		if fs_type == 'autofs' and prefix in grouped:
+			point = os.path.join(real, prefix) if prefix else real
+			raise RuntimeError(f'Patch error: {point} is an automount (autofs) that could not be mounted; mount it and re-run')
 	with _patch_hash_settings(meta) as (compare_hash, full_hash):
 		plans = []
 		for prefix, fs_type, source in scopes:

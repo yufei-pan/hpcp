@@ -3995,3 +3995,112 @@ def test_recheck_judges_a_row_by_a_mount_on_the_file_itself(tmp_path, hpcp_mod, 
 	scan = {'started_ns': st.st_ctime_ns + 10 ** 9,
 		'stats': {key: (st.st_dev, st.st_ino, st.st_size + (0 if fresh else 1), st.st_mtime_ns, st.st_ctime_ns)}}
 	assert hpcp_mod._rows_to_recheck([row], '/', scan) == [row]
+
+
+def _automount_entries(target, triggered, net=False):
+	"""mountinfo for an ext4 / with an automounted ESP at target/boot/efi (autofs; vfat stacked on it once triggered),
+	and optionally an untouched automount at target/net."""
+	real = os.path.realpath(str(target))
+	esp = os.path.join(real, 'boot', 'efi')
+	entries = [
+		{'mount_id': 20, 'parent_id': 1, 'devnum': (8, 2), 'root': '/', 'mount_point': '/', 'options': ['rw'],
+			'fstype': 'ext4', 'source': '/dev/sda2', 'super_options': ['rw']},
+		{'mount_id': 30, 'parent_id': 20, 'devnum': (0, 50), 'root': '/', 'mount_point': esp, 'options': ['rw'],
+			'fstype': 'autofs', 'source': 'systemd-1', 'super_options': ['rw']},
+	]
+	if net:
+		entries.append({'mount_id': 40, 'parent_id': 20, 'devnum': (0, 51), 'root': '/', 'mount_point': os.path.join(real, 'net'),
+			'options': ['rw'], 'fstype': 'autofs', 'source': 'auto.net', 'super_options': ['rw']})
+	if triggered:
+		entries.append({'mount_id': 31, 'parent_id': 30, 'devnum': (8, 1), 'root': '/', 'mount_point': esp, 'options': ['rw'],
+			'fstype': 'vfat', 'source': '/dev/sda1', 'super_options': ['rw']})
+	return entries
+
+
+def _esp_patch(hpcp_mod, tmp_path):
+	"""A patch adding boot/efi/EFI/x.efi; returns (volume, target), the target holding boot/efi/ and net/."""
+	new, base = tmp_path / 'new', tmp_path / 'base'
+	_write(new / 'boot' / 'efi' / 'EFI' / 'x.efi', 'efi')
+	(base / 'boot' / 'efi').mkdir(parents=True)
+	for tree in (new, base):
+		(tree / 'net').mkdir()
+	vol = tmp_path / 'vol'
+	_patch_from(hpcp_mod, new, base, [vol])
+	target = tmp_path / 'target'
+	_clone(base, target)
+	return str(vol), target
+
+
+def _apply_until_preflight(hpcp_mod, monkeypatch, volume, target, state, net=False):
+	"""apply_patch_tree with faked mountinfo (see _automount_entries) up to the preflight; returns [(scope name,
+	metadata, tz_tolerant)] of the planned sections and the automounts triggered."""
+	triggered, planned = [], []
+	monkeypatch.setattr(hpcp_mod, '_mountinfo_entries', lambda *args, **kwargs: _automount_entries(target, state['mounted'], net))
+	def trigger(mount_point):
+		triggered.append(mount_point)
+		state['mounted'] = state['mounts_when_triggered']
+	monkeypatch.setattr(hpcp_mod, '_trigger_automount', trigger)
+	real_plan = hpcp_mod._plan_section
+	def plan(name, rows, volume_roots, target_root, compare_hash, full_hash, max_workers, metadata=True, case_insensitive=False, tz_tolerant=False):
+		planned.append((name, metadata, tz_tolerant))
+		return real_plan(name, rows, volume_roots, target_root, compare_hash, full_hash, max_workers, metadata, case_insensitive, tz_tolerant)
+	monkeypatch.setattr(hpcp_mod, '_plan_section', plan)
+	class Stop(Exception):
+		pass
+	def stop(plan):
+		raise Stop()
+	monkeypatch.setattr(hpcp_mod, '_preflight_section', stop)
+	with pytest.raises(Stop):
+		hpcp_mod.apply_patch_tree([volume], str(target), max_workers=1)
+	return planned, triggered
+
+
+def test_apply_triggers_the_automounted_esp_it_writes_into(trees, hpcp_mod, tmp_path, monkeypatch):
+	"""Spec Part 1 item 3: the ESP at boot/efi is an untriggered automount (autofs); once triggered it is planned as
+	the FAT filesystem it holds (content only, timezone tolerance)."""
+	volume, target = _esp_patch(hpcp_mod, tmp_path)
+	state = {'mounted': False, 'mounts_when_triggered': True}
+	planned, triggered = _apply_until_preflight(hpcp_mod, monkeypatch, volume, target, state)
+	assert triggered == [os.path.join(os.path.realpath(str(target)), 'boot', 'efi')]
+	assert ('boot/efi/', False, True) in planned
+
+
+def test_apply_refuses_an_automount_that_cannot_be_mounted(trees, hpcp_mod, tmp_path, monkeypatch):
+	volume, target = _esp_patch(hpcp_mod, tmp_path)
+	state = {'mounted': False, 'mounts_when_triggered': False}
+	monkeypatch.setattr(hpcp_mod, '_mountinfo_entries', lambda *args, **kwargs: _automount_entries(target, False))
+	monkeypatch.setattr(hpcp_mod, '_trigger_automount', lambda mount_point: None)
+	with pytest.raises(RuntimeError, match=r'^Patch error: .*boot/efi is an automount \(autofs\) that could not be mounted; mount it and re-run$'):
+		hpcp_mod.apply_patch_tree([volume], str(target), max_workers=1)
+	assert not (target / 'boot' / 'efi' / 'EFI').exists()
+
+
+def test_apply_leaves_unrelated_automounts_alone(trees, hpcp_mod, tmp_path, monkeypatch):
+	"""Review Focus 5: an automount the patch does not write into (net/) is never triggered."""
+	volume, target = _esp_patch(hpcp_mod, tmp_path)
+	state = {'mounted': False, 'mounts_when_triggered': True}
+	planned, triggered = _apply_until_preflight(hpcp_mod, monkeypatch, volume, target, state, net=True)
+	assert triggered == [os.path.join(os.path.realpath(str(target)), 'boot', 'efi')]
+
+
+def test_trigger_automount_enters_the_mount_point(tmp_path, hpcp_mod, monkeypatch):
+	"""A plain stat of an automount point does not trigger it; a lookup through it (mount_point/.) does."""
+	seen = []
+	real_stat = os.stat
+	monkeypatch.setattr(hpcp_mod.os, 'stat', lambda path, *args, **kwargs: seen.append(path) or real_stat(path, *args, **kwargs))
+	hpcp_mod._trigger_automount(str(tmp_path))
+	hpcp_mod._trigger_automount(str(tmp_path / 'missing'))
+	assert seen == [os.path.join(str(tmp_path), '.'), os.path.join(str(tmp_path / 'missing'), '.')]
+
+
+def test_generation_reads_mountinfo_after_its_listing_entered_any_automount(trees, hpcp_mod, tmp_path, monkeypatch):
+	"""Spec Part 1 item 3: generation needs no trigger, since its listing walks into an automount before mountinfo is
+	read (FAT detection then sees the mounted ESP). Pin that order."""
+	new, base = trees
+	_write(new / 'a.txt', 'a')
+	order = []
+	real_maps, real_entries = hpcp_mod.build_root_maps, hpcp_mod._mountinfo_entries
+	monkeypatch.setattr(hpcp_mod, 'build_root_maps', lambda *args, **kwargs: order.append('listing') or real_maps(*args, **kwargs))
+	monkeypatch.setattr(hpcp_mod, '_mountinfo_entries', lambda *args, **kwargs: order.append('mountinfo') or real_entries(*args, **kwargs))
+	_rows_before_mkfs(hpcp_mod, monkeypatch, [str(new)], None, [str(base)], None, str(tmp_path / 'p.img'), [], [], max_workers=1)
+	assert 'mountinfo' in order and order.index('listing') < order.index('mountinfo')
