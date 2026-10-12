@@ -5337,9 +5337,13 @@ def apply_patch_tree(volume_roots, target_root, force=False, max_workers=1, verb
 	scopes = _mount_scopes(target_root, _mountinfo_entries())
 	grouped = _rows_by_scope(rows, scopes)
 	with _patch_hash_settings(meta) as (compare_hash, full_hash):
-		plans = [_plan_section(prefix + '/' if prefix else 'root', grouped.get(prefix, []), volume_roots, target_root, compare_hash, full_hash,
-				max_workers, _has_posix_metadata(fs_type), _has_case_insensitive_names(fs_type, source))
-			for prefix, fs_type, source in scopes if not prefix or prefix in grouped]
+		plans = []
+		for prefix, fs_type, source in scopes:
+			if prefix and prefix not in grouped:
+				continue
+			fs_type = _scope_fs_type(fs_type, source)
+			plans.append(_plan_section(prefix + '/' if prefix else 'root', grouped.get(prefix, []), volume_roots, target_root,
+				compare_hash, full_hash, max_workers, _has_posix_metadata(fs_type), _has_case_insensitive_names(fs_type, source)))
 		for plan in plans:
 			_preflight_section(plan)
 		_resolve_section_conflicts(plans, force)
@@ -5937,39 +5941,59 @@ def _is_mount_point(path):
 	return any(entry['mount_point'] == real for entry in _mountinfo_entries())
 
 def _hidden_mounts(entries):
-	"""Indexes (into entries) of the mounts another mount covers: M1 is covered by an M2 whose mount point is M1's or
-	one of its parent paths and that is not an ancestor of M1 in mountinfo's parent chain (a mount made on top of
-	M1's place, not one M1 sits on: initramfs-time mounts are listed before the root they end up on). An entry
-	without ids (a test double) is never hidden and hides nothing."""
+	"""Indexes (into entries) of the mounts path lookup does not reach, so the files at their mount point are not theirs.
+
+	With mountinfo's ids: M is reached when its parent is not in the table, else when its parent is reached and, if M
+	is on another mount point than its parent, nothing else is stacked on the parent at the parent's mount point and no
+	other child of the parent sits on M's mount point or a parent path of it below the parent's (a mount made over M's
+	place). M is visible when it is reached and nothing is stacked on it at its own mount point. A cycle in the parent
+	ids counts as not reached (the safe side: the mount is left out). An entry without ids (a test double) is never
+	hidden and hides nothing."""
+	def point(entry):
+		return entry['mount_point'].rstrip(os.sep) or os.sep
 	by_id = {entry['mount_id']: entry for entry in entries if 'mount_id' in entry}
-	by_point = {}
-	for index, entry in enumerate(entries):
-		if 'mount_id' in entry:
-			by_point.setdefault(entry['mount_point'].rstrip(os.sep) or os.sep, []).append(index)
+	children = {}
+	for entry in by_id.values():
+		children.setdefault(entry['parent_id'], []).append(entry)
+	memo, pending = {}, set()
+	def reached(entry):
+		ident = entry['mount_id']
+		if ident in memo:
+			return memo[ident]
+		if ident in pending:
+			return False
+		pending.add(ident)
+		parent = by_id.get(entry['parent_id'])
+		if parent is None:
+			result = True
+		elif not reached(parent):
+			result = False
+		elif point(entry) == point(parent):
+			result = True
+		else:
+			names = set()
+			current = point(entry)
+			while len(current) > len(point(parent)) and current != os.path.dirname(current):
+				names.add(current)
+				current = os.path.dirname(current)
+			result = not any(other is not entry and (point(other) == point(parent) or point(other) in names)
+				for other in children.get(parent['mount_id'], ()))
+		pending.discard(ident)
+		memo[ident] = result
+		return result
 	hidden = set()
 	for index, entry in enumerate(entries):
 		if 'mount_id' not in entry:
 			continue
-		ancestors, current = set(), entry
-		while current is not None and current['parent_id'] not in ancestors:
-			ancestors.add(current['parent_id'])
-			current = by_id.get(current['parent_id'])
-		point = entry['mount_point'].rstrip(os.sep) or os.sep
-		while True:
-			if any(other != index and entries[other]['mount_id'] not in ancestors for other in by_point.get(point, ())):
-				hidden.add(index)
-				break
-			parent = os.path.dirname(point)
-			if parent == point:
-				break
-			point = parent
+		if not reached(entry) or any(other is not entry and point(other) == point(entry) for other in children.get(entry['mount_id'], ())):
+			hidden.add(index)
 	return hidden
 
 def _mount_scopes(path, entries):
-	"""[(key prefix, fstype, source)] for path: first ('', ...) for the mount holding path's real path, then one per
-	mount below it, deepest last. A mount another one covers (see _hidden_mounts) is left out, as on the system.
-	fstype and source '' when no mount holds path. A fuseblk type (ntfs-3g, exFAT through FUSE) is replaced by
-	what the device holds (_probe_fs_type) when that is known."""
+	"""[(key prefix, fstype, source)] for path: first ('', ...) for the visible mount holding path's real path (the
+	deepest), then one per visible mount below it, deepest last. A mount path lookup does not reach, or that another is
+	stacked on, is left out (see _hidden_mounts), as on the system. fstype and source '' when no mount holds path.
+	fstype is mountinfo's; see _scope_fs_type."""
 	hidden = _hidden_mounts(entries)
 	visible = [entry for index, entry in enumerate(entries) if index not in hidden]
 	real = os.path.realpath(path)
@@ -5984,12 +6008,14 @@ def _mount_scopes(path, entries):
 			below.append((os.path.relpath(entry['mount_point'], real), entry['fstype'], entry.get('source', '')))
 	below.sort(key=lambda scope: (scope[0].count('/'), scope[0]))
 	own = ('', holder['fstype'], holder.get('source', '')) if holder else ('', '', '')
-	scopes = []
-	for prefix, fs_type, source in [own] + below:
-		if (fs_type == 'fuseblk' or fs_type.startswith('fuseblk.')) and source.startswith('/dev/'):
-			fs_type = _probe_fs_type(source) or fs_type
-		scopes.append((prefix, fs_type, source))
-	return scopes
+	return [own] + below
+
+def _scope_fs_type(fs_type, source):
+	"""fs_type, a fuseblk one (ntfs-3g, exFAT through FUSE) replaced by what its device holds (_probe_fs_type) when
+	that is known. Probes only a block device, and only when asked: it may wake or stall a slow disk."""
+	if (fs_type == 'fuseblk' or fs_type.startswith('fuseblk.')) and source.startswith('/dev/'):
+		return _probe_fs_type(source) or fs_type
+	return fs_type
 
 def _rows_by_scope(rows, scopes):
 	"""{key prefix: rows}: each row under the deepest scope prefix it lies in ('' for the target's own)."""
@@ -6004,7 +6030,7 @@ def _rows_by_scope(rows, scopes):
 def _compare_metadata(roots, entries):
 	"""False when any of roots sits on a filesystem whose modes and owners come from mount options (FAT, exFAT,
 	NTFS): a single-filesystem patch between such trees compares content only (see states_equal)."""
-	return all(_has_posix_metadata(_mount_scopes(root, entries)[0][1]) for root in roots)
+	return all(_has_posix_metadata(_scope_fs_type(*_mount_scopes(root, entries)[0][1:])) for root in roots)
 
 def _swap_devices(swaps_path='/proc/swaps'):
 	"""Real paths of the active swap areas."""

@@ -2271,7 +2271,29 @@ def test_mountinfo_entries_parse_the_mount_and_parent_ids(tmp_path, hpcp_mod):
 		(35, 1, '/', 'ext4', '/dev/sda2', (8, 2)), (20, 35, '/sys', 'sysfs', 'sysfs', (0, 5))]
 
 
-def test_mount_scopes_classify_fuseblk_by_what_the_device_holds(tmp_path, hpcp_mod, monkeypatch):
+def test_mount_scopes_follow_what_path_lookup_reaches(tmp_path, hpcp_mod):
+	"""A buried mount stays hidden and does not hide what is mounted after the overmount."""
+	scopes = hpcp_mod._mount_scopes
+	mnt = tmp_path / 'mnt'
+	(mnt / 'boot').mkdir(parents=True)
+	root = _mount_entry(tmp_path, 'ext4', ids=(1897, 1))
+	# ESP at mnt/boot, root-ish xfs mounted over mnt, the ESP mounted at mnt/boot again (on the xfs).
+	entries = [root, _mount_entry(mnt / 'boot', 'hsrc', ids=(1925, 1897)), _mount_entry(mnt, 'xsrc', ids=(1926, 1897)),
+		_mount_entry(mnt / 'boot', 'msrc', ids=(1927, 1926))]
+	assert scopes(str(mnt / 'boot'), entries)[0][1] == 'msrc'
+	assert scopes(str(mnt), entries) == [('', 'xsrc', 'none'), ('boot', 'msrc', 'none')]
+	# Deeper: mnt2/data buried by a mount over mnt2, then a new mount at mnt2/data/sub.
+	mnt2 = tmp_path / 'mnt2'
+	(mnt2 / 'data' / 'sub').mkdir(parents=True)
+	entries = [root, _mount_entry(mnt2 / 'data', 'old', ids=(10, 1897)), _mount_entry(mnt2, 'over', ids=(11, 1897)),
+		_mount_entry(mnt2 / 'data' / 'sub', 'new', ids=(12, 11))]
+	assert scopes(str(mnt2 / 'data' / 'sub'), entries)[0][1] == 'new'
+	assert scopes(str(mnt2 / 'data'), entries)[0][1] == 'over'
+	# A cycle of parent ids ends (the mounts count as not reached).
+	assert scopes(str(mnt2), [_mount_entry(mnt2, 'a', ids=(1, 2)), _mount_entry(mnt2, 'b', ids=(2, 1))])[0][1] == ''
+
+
+def test_fuseblk_scopes_are_probed_only_where_used(tmp_path, hpcp_mod, monkeypatch):
 	probed = []
 	def probe(device):
 		probed.append(device)
@@ -2280,14 +2302,32 @@ def test_mount_scopes_classify_fuseblk_by_what_the_device_holds(tmp_path, hpcp_m
 	new, base = tmp_path / 'new', tmp_path / 'base'
 	new.mkdir()
 	base.mkdir()
-	entries = [_mount_entry('/', 'ext4'), _mount_entry(new, 'fuseblk', '/dev/fakeX')]
-	assert hpcp_mod._mount_scopes(str(new), entries)[0][1] == 'ntfs'
+	entries = [_mount_entry('/', 'ext4'), _mount_entry(new, 'fuseblk', '/dev/fakeX'), _mount_entry(base / 'below', 'fuseblk', '/dev/fakeY')]
+	assert hpcp_mod._mount_scopes(str(new), entries)[0][1] == 'fuseblk' and probed == []
+	assert hpcp_mod._scope_fs_type('fuseblk.exfat', '/dev/fakeX') == 'ntfs'
 	assert hpcp_mod._compare_metadata((str(new), str(base)), entries) is False
-	entries = [_mount_entry('/', 'ext4'), _mount_entry(new, 'fuseblk.exfat', '/dev/fakeX')]
-	assert hpcp_mod._mount_scopes(str(new), entries)[0][1] == 'ntfs'
+	assert probed == ['/dev/fakeX', '/dev/fakeX']
 	probed.clear()
-	assert hpcp_mod._mount_scopes(str(new), [_mount_entry(new, 'fuseblk', 'none')])[0][1] == 'fuseblk'
-	assert probed == []
+	assert hpcp_mod._scope_fs_type('fuseblk', 'none') == 'fuseblk' and probed == []
+
+
+def test_apply_probes_only_the_fuseblk_scopes_it_plans(trees, hpcp_mod, tmp_path, reset_hpcp_globals, monkeypatch):
+	new, base = trees
+	_write(new / 'a' / 'f', 'new')
+	_write(base / 'a' / 'f', 'old')
+	vol = tmp_path / 'vol'
+	_patch_from(hpcp_mod, new, base, [vol])
+	target = tmp_path / 'target'
+	_clone(base, target)
+	(target / 'unused').mkdir()
+	(target / 'ntfs').mkdir()
+	monkeypatch.setattr(hpcp_mod, '_mountinfo_entries', lambda *args, **kwargs: [
+		_mount_entry(target, 'ext4'), _mount_entry(target / 'unused', 'fuseblk', '/dev/unused'),
+		_mount_entry(target / 'a', 'fuseblk', '/dev/used')])
+	probed = []
+	monkeypatch.setattr(hpcp_mod, '_probe_fs_type', lambda device: probed.append(device) or 'ntfs')
+	hpcp_mod.apply_patch_tree([str(vol)], str(target), max_workers=1)
+	assert probed == ['/dev/used']
 
 
 def test_apply_stops_after_a_scope_that_failed(trees, hpcp_mod, tmp_path, reset_hpcp_globals, monkeypatch):
