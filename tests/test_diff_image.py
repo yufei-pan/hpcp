@@ -2136,6 +2136,21 @@ def test_restore_without_a_payload_is_a_failure(tmp_path, hpcp_mod, reset_hpcp_g
 	assert any(error.startswith('Incomplete patch: payload for EFI/Boot/x.efi') for error in hpcp_mod.ERRORS)
 
 
+def test_restore_across_sections_does_not_retry_a_failed_sections_own_restore(tmp_path, hpcp_mod, reset_hpcp_globals):
+	"""The section's own repair step already tried (and counted) the restore; the pass across sections, which runs
+	because the section removed something, leaves it alone."""
+	hpcp_mod.HASH_SIZE = 65536
+	target, vol, rows = _restore_scenario(hpcp_mod, tmp_path)
+	os.unlink(str(vol / 'EFI' / 'Boot' / 'x.efi'))
+	plan = hpcp_mod._plan_section('root', rows, [str(vol)], str(target), True, False, 1)
+	outcome = {}
+	summary = hpcp_mod._apply_section(plan, 1, False, False, True, outcome)
+	assert outcome == {'removed': True, 'restored': [rows[1]]}
+	hpcp_mod._restore_across_sections([(plan, summary, outcome)], 1, False, False, True)
+	assert (summary['restored'], summary['failed']) == (1, 1)
+	assert len([error for error in hpcp_mod.ERRORS if error.startswith('Incomplete patch')]) == 1
+
+
 def test_rerun_after_a_completed_apply_restores_nothing(trees, hpcp_mod, tmp_path):
 	new, base = trees
 	_write(base / 'gone.txt', 'bye')
@@ -2193,7 +2208,7 @@ def test_failed_forced_rmtree_still_runs_the_repair_step(tmp_path, hpcp_mod, res
 		os.unlink(str(target / 'keep.txt'))
 		raise OSError('boom')
 	monkeypatch.setattr(hpcp_mod.shutil, 'rmtree', partial_rmtree)
-	restored = hpcp_mod._apply_rows([row], [str(vol)], str(target), forced_rows=[row], skipped=[skipped])
+	restored, _ = hpcp_mod._apply_rows([row], [str(vol)], str(target), forced_rows=[row], skipped=[skipped])
 	assert restored == [skipped] and (target / 'keep.txt').read_text() == 'k'
 
 
@@ -2382,6 +2397,63 @@ def test_apply_stops_after_a_scope_that_failed(trees, hpcp_mod, tmp_path, reset_
 	assert applied == ['root'] and summary['failed'] == 1
 	assert (target / 'boot' / 'efi' / 'grub.cfg').read_text() == 'old cfg'
 	assert any(error.startswith('Patch verify error: stopping: scope root failed') for error in hpcp_mod.ERRORS)
+
+
+def _cross_scope_move(hpcp_mod, monkeypatch, tmp_path, new, base, into_mount):
+	"""The golden moves y/f to m/x/f (into_mount) or back; the node has y -> m/x, so both names are one file, and m is
+	a mount below the target. The delete applies in one scope, the add is skipped as already present in the other."""
+	moved, kept = ('m/x/f', 'y/f') if into_mount else ('y/f', 'm/x/f')
+	(new / 'y').mkdir()
+	(new / 'm' / 'x').mkdir(parents=True)
+	(base / 'y').mkdir()
+	(base / 'm' / 'x').mkdir(parents=True)
+	_write(new / moved, 'moved')
+	_write(base / kept, 'moved')
+	vol = tmp_path / 'vol'
+	rows, _ = _patch_from(hpcp_mod, new, base, [vol])
+	assert _ops(rows) == {('D', kept), ('A', moved)}
+	target = tmp_path / 'target'
+	_clone(base, target)
+	(target / kept).unlink()
+	(target / 'y').rmdir()
+	_write(target / 'm' / 'x' / 'f', 'moved')
+	os.symlink(os.path.join('m', 'x'), str(target / 'y'))
+	_fake_mounts(hpcp_mod, monkeypatch, (target, 'ext4'), (target / 'm', 'ext4'))
+	return vol, target
+
+
+@pytest.mark.parametrize('into_mount', [True, False])
+def test_skipped_write_a_delete_in_another_scope_took_away_is_restored(trees, hpcp_mod, tmp_path, reset_hpcp_globals,
+		monkeypatch, into_mount):
+	"""Final review C1: D y/f in the target's own scope removes m/x/f, which scope m/ skipped as already present (or
+	the reverse). The repair step of one scope never sees the other's removals; after every scope ran, the skipped
+	write is restored with its own scope's settings."""
+	new, base = trees
+	vol, target = _cross_scope_move(hpcp_mod, monkeypatch, tmp_path, new, base, into_mount)
+	summary = hpcp_mod.apply_patch_tree([str(vol)], str(target), max_workers=1)
+	assert (summary['deleted'], summary['restored'], summary['skipped'], summary['failed']) == (1, 1, 0, 0)
+	assert hpcp_mod.ERRORS == []
+	assert (target / 'm' / 'x' / 'f').read_text() == 'moved'
+	assert os.path.islink(str(target / 'y'))
+
+
+def test_cross_scope_restore_runs_after_a_scope_that_failed(trees, hpcp_mod, tmp_path, reset_hpcp_globals, monkeypatch):
+	"""Scope m/ deletes m/x/f, which the target's own scope skipped as y/f, and then fails: the loop stops, but the
+	skipped write is still restored."""
+	new, base = trees
+	vol, target = _cross_scope_move(hpcp_mod, monkeypatch, tmp_path, new, base, into_mount=False)
+	real_apply_section = hpcp_mod._apply_section
+	def apply_section(plan, *args):
+		summary = real_apply_section(plan, *args)
+		if plan.name == 'm/':
+			hpcp_mod.eprint('Patch verify error: simulated failure')
+			summary['failed'] = 1
+		return summary
+	monkeypatch.setattr(hpcp_mod, '_apply_section', apply_section)
+	summary = hpcp_mod.apply_patch_tree([str(vol)], str(target), max_workers=1)
+	assert (summary['restored'], summary['failed']) == (1, 1)
+	assert (target / 'm' / 'x' / 'f').read_text() == 'moved'
+	assert hpcp_mod.ERRORS == ['Patch verify error: simulated failure']
 
 
 @pytest.mark.parametrize('new_type, base_type, rows', [('vfat', 'ext4', 0), ('ext4', 'exfat', 0), ('ext4', 'ext4', 1)])

@@ -5137,7 +5137,7 @@ def _apply_rows(rows, volume_roots, target_root, max_workers=1, verbose=False, f
 	skipped: the A / M rows check_patch_target found already done. When the removals took anything
 	away, each one whose target is now missing or of another type (a delete that reached it through a
 	name differing only by case, or through a symlinked directory) is written again like any row.
-	Returns those restored rows.
+	Returns (those restored rows, the keys whose entries the removals took away).
 	With metadata False (a FAT / exFAT / NTFS target) only content and file times are
 	written: no mode, owner, xattrs or directory metadata (new directories get the target's
 	default mode).
@@ -5258,7 +5258,7 @@ def _apply_rows(rows, volume_roots, target_root, max_workers=1, verbose=False, f
 	if metadata:
 		for row in sorted(dir_rows, key=lambda r: _key_depth(r.path), reverse=True):
 			sync_dir(row)
-	return restored
+	return restored, removed
 
 def _verify_rows(rows, target_root, compare_hash=True, full_hash=False, max_workers=1, metadata=True):
 	"""Re-read every applied path and compare with its final expected state (content only with
@@ -5346,14 +5346,20 @@ def _preflight_section(plan):
 	if unsafe:
 		raise RuntimeError(f'Incomplete patch: payload missing or unsafe for {len(unsafe)} file(s), e.g. {unsafe[0].path}; nothing applied')
 
-def _apply_section(plan, max_workers, verbose, full_hash, compare_hash):
-	"""Apply a checked section and verify it (with the rows the repair step restored); returns its summary."""
+def _apply_section(plan, max_workers, verbose, full_hash, compare_hash, outcome=None):
+	"""Apply a checked section and verify it (with the rows the repair step restored); returns its summary.
+
+	outcome: a dict that receives 'removed' (True when a removal took anything away) and 'restored' (the rows the
+	repair step wrote again), for _restore_across_sections.
+	"""
 	conflicts = _section_conflicts(plan)
 	todo = _section_todo(plan)
 	skipped = [check.row for check in plan.checks if check.action == 'skip' and check.row.op != 'D']
-	restored = _apply_rows(todo, plan.volume_roots, plan.target_root, max_workers, verbose, full_hash,
+	restored, removed = _apply_rows(todo, plan.volume_roots, plan.target_root, max_workers, verbose, full_hash,
 		forced_rows=[check.row for check in conflicts], metadata=plan.metadata, skipped=skipped)
 	failed = _verify_rows(todo + restored, plan.target_root, compare_hash, full_hash, max_workers, plan.metadata)
+	if outcome is not None:
+		outcome.update(removed=bool(removed), restored=restored)
 	return {
 		'deleted': sum(1 for row in todo if row.op == 'D'),
 		'added': sum(1 for row in todo if row.op == 'A'),
@@ -5363,6 +5369,47 @@ def _apply_section(plan, max_workers, verbose, full_hash, compare_hash):
 		'forced': len(conflicts),
 		'failed': failed,
 	}
+
+def _restore_across_sections(ran, max_workers, verbose, full_hash, compare_hash):
+	"""The repair step across sections, once every section ran (or the loop stopped after a failed one).
+
+	A section's own repair step (_apply_rows) sees only its own removals, but a delete in one section can reach,
+	through a symlinked directory, an entry another section skipped as already done (a mount below the target, a
+	partition shown inside another). ran: [(plan, summary, outcome)] for the sections applied, outcome as
+	_apply_section fills it. When any of them removed anything, every one's skipped A / M rows are lstat'ed again; a
+	missing one is written again with its own section's root, payload and metadata setting, through the guarded
+	writes _apply_rows uses (the directories of every section first), and verified. Nothing is removed: an entry of
+	another type in a skipped row's place was put there by another row, so it is left and fails that row's verify. A
+	failed section's own restores (already verified and counted) are not tried twice. The summaries are updated
+	('restored', 'skipped', 'failed').
+	"""
+	if not any(outcome.get('removed') for _, _, outcome in ran):
+		return
+	lost = []
+	for plan, summary, outcome in ran:
+		tried = set(outcome.get('restored', ())) if summary['failed'] else set()
+		rows = [check.row for check in plan.checks if check.action == 'skip' and check.row.op != 'D' and check.row.path != './'
+			and check.row not in tried and not _holds_type(_key_path(plan.target_root, check.row.path), check.row.new)]
+		if rows:
+			lost.append((plan, summary, rows, []))
+	missing = [(plan, row) for plan, _, rows, _ in lost for row in rows if not os.path.lexists(_key_path(plan.target_root, row.path))]
+	if missing:
+		plan, row = missing[0]
+		example = row.path if plan.name == 'root' else f'[{plan.name}] {row.path}'
+		print(f"Restoring {len(missing)} entr{'y' if len(missing) == 1 else 'ies'} skipped as already done that a removal "
+			f"elsewhere in the patch took away, e.g. {example}")
+	for directories in (True, False):
+		for plan, _, rows, written in lost:
+			# Still missing: a restore of another section's row may have just written the same entry.
+			batch = [row for row in rows if row.new.startswith('d:') == directories
+				and not os.path.lexists(_key_path(plan.target_root, row.path))]
+			if batch:
+				_apply_rows(batch, plan.volume_roots, plan.target_root, max_workers, verbose, full_hash, metadata=plan.metadata)
+				written.extend(batch)
+	for plan, summary, rows, written in lost:
+		summary['restored'] = summary.get('restored', 0) + len(written)
+		summary['skipped'] -= len(written)
+		summary['failed'] += _verify_rows(rows, plan.target_root, compare_hash, full_hash, max_workers, plan.metadata)
 
 def apply_patch_tree(volume_roots, target_root, force=False, max_workers=1, verbose=False, volume_names=None, store_note=False):
 	"""Apply a patch whose volumes are mounted (or unpacked) at volume_roots onto directory target_root.
@@ -5384,7 +5431,8 @@ def apply_patch_tree(volume_roots, target_root, force=False, max_workers=1, verb
 	/proc/self/mountinfo): on FAT, exFAT or NTFS by content only, on FAT, exFAT or HFS+ (not HFSX) with
 	names matched case-insensitively (see check_patch_target). A write skipped as already done that a
 	delete then takes away (a case-insensitive filesystem hpcp does not recognise, a symlinked directory
-	alias) is written again and counted as restored (see _apply_rows).
+	alias, also from one mount into another) is written again and counted as restored (see _apply_rows
+	and _restore_across_sections).
 	"""
 	meta, rows, volume_roots = load_patch_volumes(volume_roots, volume_names)
 	if store_note and meta.get('layout') == 'store':
@@ -5403,12 +5451,15 @@ def apply_patch_tree(volume_roots, target_root, force=False, max_workers=1, verb
 		for plan in plans:
 			_preflight_section(plan)
 		_resolve_section_conflicts(plans, force)
-		summaries, stopped = [], None
+		ran, stopped = [], None
 		for plan in plans:
-			summaries.append(_apply_section(plan, max_workers, verbose, full_hash, compare_hash))
-			if summaries[-1]['failed']:
+			outcome = {}
+			ran.append((plan, _apply_section(plan, max_workers, verbose, full_hash, compare_hash, outcome), outcome))
+			if ran[-1][1]['failed']:
 				stopped = plan.name
 				break
+		_restore_across_sections(ran, max_workers, verbose, full_hash, compare_hash)
+	summaries = [summary for _, summary, _ in ran]
 	summary = {key: sum(part[key] for part in summaries) for key in summaries[0]}
 	print('Patch summary: ' + ', '.join(f'{key} {value}' for key, value in summary.items()))
 	if stopped is not None and len(summaries) < len(plans):
@@ -6589,6 +6640,9 @@ def apply_disk_patch(volume_roots, target, mount_points, loop_devices, force=Fal
 	applied first (partition order, ESP last), then raw partition areas, the MBR boot code
 	and identity changes; then everything is verified. A section that fails stops the apply
 	there: later sections, raw areas, boot code and identity changes are left for a re-run.
+	After the sections, a write one section skipped as already done that a delete in another took away
+	(through a symlinked directory) is restored (see _restore_across_sections); a restore that fails stops
+	the raw areas, boot code and identity changes the same way.
 	So does a raw area that cannot be written, or that does not hold the new content when read back
 	right after its write: later raw areas, the boot code and identity changes.
 	Returns {'sections', 'raw_written', 'raw_skipped', 'identity_changed', 'forced', 'failed'}.
@@ -6669,6 +6723,7 @@ def apply_disk_patch(volume_roots, target, mount_points, loop_devices, force=Fal
 			_preflight_section(plan)
 		_resolve_section_conflicts(plans, force, extra)
 		summaries = {}
+		ran = []
 		stopped = None
 		order = sorted(plans, key=lambda plan: (layout['parts'][int(plan.name[len('part'):])]['type_guid'].upper() == _ESP_TYPE_GUID,
 			int(plan.name[len('part'):])))
@@ -6676,9 +6731,17 @@ def apply_disk_patch(volume_roots, target, mount_points, loop_devices, force=Fal
 			# A failed section (ENOSPC on the root, say) stops everything after it: the ESP, raw areas,
 			# boot code and identity changes could otherwise leave the node unbootable.
 			if stopped is None:
-				summaries[plan.name] = _apply_section(plan, max_workers, verbose, full_hash, compare_hash)
+				outcome = {}
+				summaries[plan.name] = _apply_section(plan, max_workers, verbose, full_hash, compare_hash, outcome)
+				ran.append((plan, summaries[plan.name], outcome))
 				if summaries[plan.name]['failed']:
 					stopped = plan.name
+		# While every section is still mounted. A restore that fails stops the raw areas, boot code and identity
+		# changes like a failed section.
+		_restore_across_sections(ran, max_workers, verbose, full_hash, compare_hash)
+		if stopped is None:
+			stopped = next((plan.name for plan, summary, _ in ran if summary['failed']), None)
+		for plan in order:
 			_release_mount(plan.target_root, mount_points)
 	failed = sum(summary['failed'] for summary in summaries.values())
 	pending = [entry for entry in raw_plan if entry['action'] != 'skip'] if stopped is None else []
@@ -6749,7 +6812,8 @@ def apply_disk_patch(volume_roots, target, mount_points, loop_devices, force=Fal
 		f"identity changed {changed}, forced {summary['forced']}, failed {failed}")
 	if stopped is not None:
 		# Same category as the section's own failures (_verify_rows); a re-run skips what is done.
-		eprint(f'Patch verify error: stopping: section {stopped} failed; later sections, raw areas, boot code and identity changes '
+		later = 'later sections, raw areas' if len(summaries) < len(plans) else 'raw areas'
+		eprint(f'Patch verify error: stopping: section {stopped} failed; {later}, boot code and identity changes '
 			f'were not applied; fix the cause and re-run')
 	elif raw_stopped is not None:
 		later = 'the identity changes were' if raw_stopped == 'mbr' else 'later raw areas, the boot code and identity changes were'

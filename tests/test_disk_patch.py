@@ -1423,6 +1423,67 @@ def test_disk_apply_plans_each_section_by_filesystem_class(tmp_path, hpcp_mod, r
 	assert [(plan.name, plan.metadata, plan.case_insensitive) for plan in planned] == [('part1', metadata, case_insensitive)]
 
 
+def _cross_section_disk_patch(hpcp_mod, tmp_path, monkeypatch, delete_in, payload=True):
+	"""Part1's filesystem shows inside part3's at m (faked mounts), and part3 holds y -> m/x. One section deletes the
+	file (x/f in part1, y/f in part3) the other skips as already present. Returns (volume, part1's root)."""
+	hpcp_mod.HASH_SIZE = 65536
+	root3 = tmp_path / 'part3-root'
+	root1 = root3 / 'm'
+	_write(root1 / 'x' / 'f', 'moved')
+	os.symlink(os.path.join('m', 'x'), str(root3 / 'y'))
+	state = hpcp_mod.get_entry_state(str(root1 / 'x' / 'f'))
+	R = hpcp_mod.ChangeRow
+	if delete_in == 'part3':
+		sections = [('part1', [R('A', 'x/f', '-', state)]), ('part3', [R('D', 'y/f', state, '-')])]
+	else:
+		sections = [('part1', [R('D', 'x/f', state, '-')]), ('part3', [R('A', 'y/f', '-', state)])]
+	volume, layout = _hand_made_disk_patch(hpcp_mod, tmp_path, monkeypatch, sections=sections,
+		kinds={1: ('fs', 'ext4', 32 << 20), 3: ('fs', 'ext4', 40 << 20)}, open_target=True)
+	for name, rows in sections:
+		for row in rows:
+			if row.op == 'A' and payload:
+				_write(os.path.join(volume, name, row.path), 'moved')
+	roots = {'/dev/fake1': str(root1) + os.sep, '/dev/fake3': str(root3) + os.sep}
+	monkeypatch.setattr(hpcp_mod, '_refuse_if_image_in_use', lambda image: None)
+	monkeypatch.setattr(hpcp_mod, '_attach_disk', lambda path, ro, loops: '/dev/fake')
+	monkeypatch.setattr(hpcp_mod, '_partition_table_type', lambda device: 'gpt')
+	monkeypatch.setattr(hpcp_mod, 'read_disk_layout', lambda disk, name=None: layout)
+	monkeypatch.setattr(hpcp_mod, '_mountinfo_entries', lambda: [])
+	monkeypatch.setattr(hpcp_mod, '_swap_devices', lambda: set())
+	monkeypatch.setattr(hpcp_mod, '_device_number', lambda device: (7, 0))
+	monkeypatch.setattr(hpcp_mod, '_partition_in_use', lambda device, devnum, entries, swaps: '')
+	monkeypatch.setattr(hpcp_mod, '_mount_partition', lambda device, read_only, mount_points, entries: roots[device])
+	monkeypatch.setattr(hpcp_mod, '_settle_partitions', lambda disk, numbers, timeout=10: None)
+	return volume, root1
+
+
+@pytest.mark.parametrize('delete_in', ['part3', 'part1'])
+def test_skipped_write_a_delete_in_another_section_took_away_is_restored(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch,
+		delete_in):
+	"""Final review C1, disk sections: a delete in one section removes the file the other skipped as already present;
+	after every section ran, the skipped write is restored from its own section's payload, under its own root."""
+	volume, root1 = _cross_section_disk_patch(hpcp_mod, tmp_path, monkeypatch, delete_in)
+	summary = hpcp_mod.apply_disk_patch([volume], str(tmp_path / 'node.img'), [], [])
+	added_in = 'part1' if delete_in == 'part3' else 'part3'
+	assert summary['failed'] == 0 and hpcp_mod.ERRORS == []
+	assert (summary['sections'][delete_in]['deleted'], summary['sections'][added_in]['restored']) == (1, 1)
+	assert summary['sections'][added_in]['skipped'] == 0
+	assert (root1 / 'x' / 'f').read_text() == 'moved'
+
+
+def test_failed_restore_across_sections_stops_raw_areas_and_identity(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch, capsys):
+	"""Every section applied, but a restore after them fails (its payload is missing): like a failed section, it stops
+	the raw areas, boot code and identity changes."""
+	volume, root1 = _cross_section_disk_patch(hpcp_mod, tmp_path, monkeypatch, 'part3', payload=False)
+	summary = hpcp_mod.apply_disk_patch([volume], str(tmp_path / 'node.img'), [], [])
+	assert summary['sections']['part1']['restored'] == 1 and summary['sections']['part1']['failed'] == 1
+	assert summary['failed'] == 1
+	assert any(error.startswith('Incomplete patch: payload for x/f') for error in hpcp_mod.ERRORS)
+	assert 'Patch verify error: stopping: section part1 failed; raw areas, boot code and identity changes were not applied; ' \
+		'fix the cause and re-run' in hpcp_mod.ERRORS
+
+
+
 def _make_patch(hpcp_mod, tmp_path, **newer):
 	old, new, out = tmp_path / 'old.img', tmp_path / 'new.img', str(tmp_path / 'patch.img')
 	_make_golden(old)
