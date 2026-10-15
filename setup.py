@@ -5,7 +5,7 @@ setup(
     name='hpcp',
     version=__version__,
     description='Highly Parallel CoPy / HPC coPy: A simple script optimized for distributed file store / NVMe / SSD storage medias for use in High Performace Computing environments.',
-    long_description=open('README.md').read(),
+    long_description=open('README.md', encoding='utf-8').read(),
     long_description_content_type='text/markdown',
     author='Yufei Pan',
     author_email='pan@zopyr.us',
