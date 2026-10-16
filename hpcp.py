@@ -8034,7 +8034,8 @@ def remove_extra_dirs(src_paths, dests,exclude=None,dest_image=False):
 	Removes extra directories in destination that are not present in the source paths.
 
 	A destination directory is kept when its source counterpart exists: dirname(src) + its path below dest, or with
-	dest_image (process_copy's -di layout: each source at dest + its absolute path) '/' + its path below dest.
+	dest_image (process_copy's -di layout: each source at dest + its absolute path) when '/' + its path below dest is
+	a source, a parent of one, or below one and still there.
 	Excluded directories and mount points, with everything below them, are left alone, and so are symlinks; a
 	directory that still holds entries (excluded files, say) is kept.
 
@@ -8058,6 +8059,7 @@ def remove_extra_dirs(src_paths, dests,exclude=None,dest_image=False):
 	mapping = _src_to_dest_map(src_paths, dests, dest_image)
 	# leave out excluded source paths (a filtered copy: the caller's list is not touched)
 	src_paths = [src_path for src_path in src_paths if not (exclude and is_excluded(src_path,exclude))]
+	source_roots = [os.path.abspath(src_path) for src_path in src_paths]
 	extraDirs = set()
 	print(pformat(dests))
 	for dest in dests:
@@ -8079,7 +8081,11 @@ def remove_extra_dirs(src_paths, dests,exclude=None,dest_image=False):
 				relative_path = os.path.relpath(dest_dir_path, dest)
 				# Check if the directory exists in the source paths
 				if dest_image:
-					in_source = os.path.exists(os.path.join(os.path.sep, relative_path))
+					# The image mirrors this run's sources at their absolute paths: a directory is theirs when it lies on
+					# the way to one (a parent process_copy created) or below one and still exists there.
+					live_path = os.path.join(os.path.sep, relative_path)
+					in_source = any(source == live_path or source.startswith(live_path.rstrip(os.sep) + os.sep)
+						or (live_path.startswith(source.rstrip(os.sep) + os.sep) and os.path.exists(live_path)) for source in source_roots)
 				else:
 					in_source = any(os.path.exists(os.path.join(os.path.dirname(src_path), relative_path)) for src_path in src_paths)
 				if not in_source:

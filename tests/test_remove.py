@@ -405,3 +405,21 @@ def test_remove_extra_keeps_link_targets_that_tracking_placed(tmp_path, hpcp_mod
 	assert hpcp_mod.hpcp([str(src)], dest_paths=[dst], remove_extra=True, **opts) == 0
 	assert (tmp_path / 'dst' / 'src' / 'lnk').read_text() == 'x'
 	assert not (tmp_path / 'dst' / 'stale.txt').exists()
+
+
+def test_remove_extra_dirs_with_dest_image_follows_this_runs_sources(tmp_path, hpcp_mod, reset_hpcp_globals):
+	"""-rme -di mirrors the image to this run's sources: a directory left from another source goes, even though that
+	path exists on this host; the sources' own directories and their parents stay."""
+	live = tmp_path / 'live'
+	(live / 'a' / 'kept').mkdir(parents=True)
+	(live / 'b').mkdir()
+	image_root = tmp_path / 'mnt'
+	mirrored_a = image_root / os.path.relpath(str(live / 'a'), '/')
+	mirrored_b = image_root / os.path.relpath(str(live / 'b'), '/')
+	(mirrored_a / 'kept').mkdir(parents=True)
+	(mirrored_a / 'gone').mkdir()
+	(mirrored_b / 'old').mkdir(parents=True)
+	hpcp_mod.remove_extra_dirs([str(live / 'a')], [str(image_root) + os.sep], dest_image=True)
+	assert (mirrored_a / 'kept').is_dir()
+	assert not (mirrored_a / 'gone').exists()
+	assert not mirrored_b.exists()

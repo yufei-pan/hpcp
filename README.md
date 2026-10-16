@@ -26,7 +26,7 @@ By default, **hpcp** only checks:
 
 Although in most cases these checks should confirm that both files are identical, in certain scenarios (like bit rot), corrupted files might not be detected. If you need to verify file integrity rather than perform a quick sync, it is recommended to use the `-fh --full_hash` option.
 
-A file or directory that cannot be read, listed or written is reported and the rest of the copy goes on; hpcp then exits with a non-zero code (`Copy failed` 190, `Directory sync error` 193, `Listing error` 209, ...). A non-root copy does not keep another user's ownership, as with `cp -a`.
+A file or directory that cannot be read, listed or written is reported and the rest of the copy goes on; hpcp then exits with a non-zero code (`Copy failed` 190, `Directory sync error` 193, `Listing error` 209, ...). As with `cp -a`, a non-root copy keeps the group when the user belongs to it but cannot keep another user's ownership, and then does not keep set-user-ID / set-group-ID bits it could not keep the owner / group for.
 
 Symlinks are recreated as symlinks. Without `-nlt --no_link_tracking`, a relative symlink whose target is missing at the destination (it points outside the copied tree, say `../shared/lib`) gets its target copied to the same relative place, which can be outside the destination directory, so the link resolves there too. With several destinations a relative link goes to the destination that holds its target. A link whose path is taken by a real file or directory in the destination is not created and is reported.
 
@@ -139,7 +139,7 @@ Limitations:
 `-rme --remove_extra`: Especially when combined with `-rf`, **PLEASE PAY CLOSE ATTENTION TO YOUR TARGET DIRECTORY!**  
 `--remove_extra` will remove **all** files that are not in the source path. When you are copying a file into a folder, you almost certainly do not want to use this!
 
-It runs only after a copy that reported no errors: if a source path could not be listed, its copy in the destination would look extra. Otherwise hpcp leaves the destination as it is and exits with `Remove skipped` (212). With `-di` the image holds each source at its absolute path, and `-rme` compares against that layout. Excluded paths (`-e`, `-x`) are never removed, and a directory that still holds one is kept.
+It runs only after a copy that reported no errors: if a source path could not be listed, its copy in the destination would look extra. Otherwise hpcp leaves the destination as it is and exits with `Remove skipped` (212). With `-di` the image holds each source at its absolute path, and `-rme` compares against that layout: it mirrors the **whole image** to this run's sources, so another source copied into the same image on an earlier run is removed too. The destination's copy of an excluded source path (`-e`, `-x`, absolute or not) is never removed, and a directory that still holds one is kept, and so are link targets that link tracking placed in the destination. Directories of a filesystem mounted below the destination are left alone; files there are still compared and can be removed.
 
 ## Remove Feature Note
 
