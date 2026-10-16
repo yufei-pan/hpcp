@@ -77,7 +77,7 @@ def test_remove_extra_dirs_drops_empty_extra(tmp_tree, hpcp_mod, reset_hpcp_glob
 
 def test_remove_force_implies_remove(tmp_tree, hpcp_mod, reset_hpcp_globals, require_linux, copy_args, monkeypatch):
 	called = []
-	monkeypatch.setattr(hpcp_mod, 'process_remove', lambda *a, **k: called.append(True))
+	monkeypatch.setattr(hpcp_mod, 'remove_moved_sources', lambda *a, **k: called.append(True))
 	tmp_tree.add_file('a.txt', 'x')
 	srcs, opts = copy_args(remove=False, remove_force=True)
 	hpcp_mod.hpcp(srcs, **opts)
@@ -652,17 +652,19 @@ def test_lost_and_found_check_stops_at_the_root(hpcp_mod):
 
 
 @pytest.mark.parametrize('single_thread, parallel_file_listing', [(True, False), (False, False), (False, True)])
-def test_move_keeps_a_source_with_a_special_file_it_cannot_copy(tmp_tree, hpcp_mod, reset_hpcp_globals, require_linux, copy_args, single_thread, parallel_file_listing):
+def test_move_leaves_a_special_file_it_cannot_copy(tmp_tree, hpcp_mod, reset_hpcp_globals, require_linux, copy_args, single_thread, parallel_file_listing):
 	"""Ultrareview: the copy skips a FIFO (or socket, device node) without an error, and the move's rmtree then
-	deleted the only copy. The move is skipped instead."""
+	deleted the only copy. A move removes only what the copy listed: the FIFO and its directory stay."""
 	import stat
 	tmp_tree.add_file('a.txt', 'a')
 	tmp_tree.add_file('sub/b.txt', 'b')
 	os.mkfifo(str(tmp_tree.src / 'sub' / 'pipe') if parallel_file_listing else str(tmp_tree.src / 'pipe'))
 	srcs, opts = copy_args(remove_force=True, single_thread=single_thread, max_workers=1 if single_thread else 2,
 		parallel_file_listing=parallel_file_listing)
-	assert hpcp_mod.hpcp(srcs, **opts) == 212
+	assert hpcp_mod.hpcp(srcs, **opts) == 0
 	assert (tmp_tree.dst / 'a.txt').read_text() == 'a'
+	assert (tmp_tree.dst / 'sub' / 'b.txt').read_text() == 'b'
+	assert not (tmp_tree.src / 'a.txt').exists() and not (tmp_tree.src / 'sub' / 'b.txt').exists()
 	assert stat.S_ISFIFO(os.lstat(tmp_tree.src / 'sub' / 'pipe' if parallel_file_listing else tmp_tree.src / 'pipe').st_mode)
 
 
@@ -710,4 +712,70 @@ def test_special_file_kind_names_a_fifo(tmp_path, hpcp_mod):
 def test_overlong_path_is_no_error_while_removing(hpcp_mod, reset_hpcp_globals, lister):
 	"""-rm's own listing removes as it goes and leaves the rest to rmtree, which deletes deep paths by descriptor."""
 	getattr(hpcp_mod, lister)('/' + 'x' * 4100, remove_files_while_listing=True)
+	assert hpcp_mod.ERRORS == []
+
+
+# ---- 9.73: a move removes only what the copy listed ----
+
+@pytest.mark.parametrize('single_thread', [True, False])
+def test_move_keeps_a_file_created_in_the_source_after_the_copy_listed_it(tmp_tree, hpcp_mod, reset_hpcp_globals, require_linux, copy_args, monkeypatch, single_thread):
+	"""Ultrareview: the removal re-listed the source and removed whole trees, so a file written during the move went
+	with no copy. Only the copied files and links go, then directories that are empty."""
+	tmp_tree.add_file('a.txt', 'a')
+	tmp_tree.add_file('sub/b.txt', 'b')
+	tmp_tree.add_file('sub/deeper/c.txt', 'c')
+	tmp_tree.add_symlink('ln', 'a.txt')
+	real = hpcp_mod.create_sym_links
+	def create_sym_links(*args, **kwargs):
+		(tmp_tree.src / 'sub' / 'new.txt').write_text('written during the move')
+		return real(*args, **kwargs)
+	monkeypatch.setattr(hpcp_mod, 'create_sym_links', create_sym_links)
+	srcs, opts = copy_args(remove_force=True, single_thread=single_thread, max_workers=1 if single_thread else 2)
+	assert hpcp_mod.hpcp(srcs, **opts) == 0
+	assert (tmp_tree.src / 'sub' / 'new.txt').read_text() == 'written during the move'
+	assert sorted(os.listdir(tmp_tree.src)) == ['sub'] and os.listdir(tmp_tree.src / 'sub') == ['new.txt']
+	assert (tmp_tree.dst / 'sub' / 'deeper' / 'c.txt').read_text() == 'c'
+	assert os.readlink(tmp_tree.dst / 'ln') == 'a.txt'
+
+
+def test_move_reports_what_it_left(tmp_tree, hpcp_mod, reset_hpcp_globals, require_linux, copy_args, monkeypatch, capsys):
+	tmp_tree.add_file('a.txt', 'a')
+	real = hpcp_mod.create_sym_links
+	def create_sym_links(*args, **kwargs):
+		(tmp_tree.src / 'late.txt').write_text('late')
+		return real(*args, **kwargs)
+	monkeypatch.setattr(hpcp_mod, 'create_sym_links', create_sym_links)
+	srcs, opts = copy_args(remove_force=True)
+	assert hpcp_mod.hpcp(srcs, **opts) == 0
+	assert 'late.txt' in capsys.readouterr().err
+
+
+def test_move_with_an_exclude_leaves_the_excluded_paths(tmp_tree, hpcp_mod, reset_hpcp_globals, require_linux, copy_args, capsys):
+	tmp_tree.add_file('a.txt', 'a')
+	tmp_tree.add_file('cache/c.txt', 'cached')
+	srcs, opts = copy_args(remove_force=True, exclude=['cache'])
+	assert hpcp_mod.hpcp(srcs, **opts) == 0
+	assert (tmp_tree.src / 'cache' / 'c.txt').read_text() == 'cached'
+	assert not (tmp_tree.src / 'a.txt').exists()
+	assert not (tmp_tree.dst / 'cache').exists()
+	# Left as asked: not reported as left behind.
+	assert 'c.txt' not in capsys.readouterr().err
+
+
+def test_move_of_directories_only_removes_no_file(tmp_tree, hpcp_mod, reset_hpcp_globals, require_linux, copy_args):
+	"""-do copies the directory tree without files: a move then has no file to remove (before, it removed them all)."""
+	tmp_tree.add_file('sub/a.txt', 'a')
+	srcs, opts = copy_args(remove_force=True, directory_only=True)
+	hpcp_mod.hpcp(srcs, **opts)
+	assert (tmp_tree.src / 'sub' / 'a.txt').read_text() == 'a'
+
+
+def test_listed_file_that_became_a_directory_is_left(tmp_path, hpcp_mod, reset_hpcp_globals):
+	"""The move's remover only unlinks: a listed path that is now a directory keeps what it holds."""
+	(tmp_path / 'was-a-file').mkdir()
+	(tmp_path / 'was-a-file' / 'inside.txt').write_text('new')
+	(tmp_path / 'f.txt').write_text('f')
+	hpcp_mod._remove_listed_files([str(tmp_path / 'was-a-file'), str(tmp_path / 'f.txt'), str(tmp_path / 'gone.txt')])
+	assert (tmp_path / 'was-a-file' / 'inside.txt').read_text() == 'new'
+	assert not (tmp_path / 'f.txt').exists()
 	assert hpcp_mod.ERRORS == []

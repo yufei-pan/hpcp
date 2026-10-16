@@ -297,8 +297,10 @@ ERROR_TO_RETURNCODE_TABLE = {
 	# overall exit code. (Create fs error is a real failure, not a degrade -
 	# it keeps a non-zero code in the partition-failure family above.)
 	'FS param probe warning': 0,
-	# A FIFO, socket or device node: not copied (a note, rc 0), but a move (-rm) is skipped, see hpcp().
+	# A FIFO, socket or device node: not copied (a note, rc 0); a move (-rm) leaves it in place.
 	'Special file skipped': 0,
+	# A move left source entries the copy did not list (written during the move, special files): a note, rc 0.
+	'Move left entries': 0,
 	'FS param build warning': 0,
 	'FS param warning': 0,
 }
@@ -2736,7 +2738,7 @@ def get_file_list_serial(root,exclude=None,append_hash=False,full_hash=False,rec
 				elif not remove_files_while_listing:
 					kind = _special_file_kind(entry)
 					if kind:
-						# Not copied or compared, which a move (-rm) must not mistake for a copy (see hpcp()).
+						# Not copied or compared; a move (-rm) leaves it in place (remove_moved_sources).
 						eprint(f'Special file skipped: {entry.path} is a {kind}; hpcp does not copy FIFOs, sockets or device nodes')
 			except OSError as e:
 				# One entry that cannot be read (its hash, a link target) is recorded; the others are still listed.
@@ -2868,7 +2870,10 @@ def delete_file_bulk(paths, exclude=None):
 	endTime = time.monotonic()
 	return total_size, endTime - start_time
 
-def delete_file_list_parallel(file_list, max_workers, verbose=False,files_per_job=1,init_size=0):
+def delete_file_list_parallel(file_list, max_workers, verbose=False,files_per_job=1,init_size=0,remover=None):
+	"""Delete file_list in pool jobs; remover (a worker body taking a list of paths, returning (bytes, seconds)) is
+	delete_file_bulk unless given."""
+	remover = remover or delete_file_bulk
 	global FILES_RATE_LIMIT
 	global BYTES_RATE_LIMIT
 	total_files = len(file_list)
@@ -2894,12 +2899,12 @@ def delete_file_list_parallel(file_list, max_workers, verbose=False,files_per_jo
 				try:
 					for _ in range(round(files_per_job)):
 						delete_files.append(next(file_list_iterator))
-					future = _submit_task(executor, delete_file_bulk, delete_files)
+					future = _submit_task(executor, remover, delete_files)
 					futures[future] = delete_files
 					# counter += 1
 				except StopIteration:
 					if delete_files:
-						future = _submit_task(executor, delete_file_bulk, delete_files)
+						future = _submit_task(executor, remover, delete_files)
 						futures[future] = delete_files
 					file_list_iterator = None
 
@@ -8570,6 +8575,87 @@ def process_remove(src_paths: list,single_thread = False, max_workers = multipro
 		if batch and not single_thread:
 			break
 
+def _remove_listed_files(paths):
+	"""Worker body for remove_moved_sources: unlink these files and links. Never a directory: a listed path that is one
+	now (it changed since the copy listed it) is left with what it holds; one already gone is no error.
+	Returns (bytes, seconds), as delete_file_bulk does."""
+	total_size = 0
+	start_time = time.monotonic()
+	for path in paths:
+		try:
+			st = os.lstat(path)
+			if stat.S_ISDIR(st.st_mode):
+				continue
+			os.remove(path)
+			total_size += st.st_size
+		except FileNotFoundError:
+			continue
+		except Exception as exc:
+			eprint(f'Remove process exception:\n Deleting {path} generated an exception: {exc}')
+	return total_size, time.monotonic() - start_time
+
+def remove_moved_sources(src_paths, file_list, sym_links, single_thread=False, max_workers=multiprocessing.cpu_count(),
+		verbose=False, files_per_job=1, remove_force=False, exclude=None):
+	"""-rm with a destination (a move): remove what the copy listed, file_list and the links (sym_links' keys), then
+	each source directory that is empty after that, deepest first. Anything the copy did not list stays, with the
+	directories holding it: a file written to a source after the copy listed its directory, a special file, an excluded
+	path. What stays, other than excluded paths, is named in a 'Move left entries' note."""
+	roots = []
+	for src in src_paths:
+		path = os.path.abspath(src)
+		if not os.path.lexists(path):
+			continue
+		if exclude and is_excluded(path, exclude):
+			print(f'Skipping excluded path: {path}')
+			continue
+		roots.append(path)
+	listed = sorted(set(file_list) | set(sym_links or ()))
+	print(f"Removing the {len(listed)} files and links copied from {pformat(roots)} with {max_workers if not single_thread else '1'} workers")
+	if not remove_force:
+		if not sys.stdin.isatty():
+			raise RuntimeError("User requested stop: Not removing files as stdin is not a tty")
+		print("Do you want to continue? (y/n)")
+		if not input().lower().startswith('y'):
+			raise RuntimeError("User requested stop: Not removing files")
+	start_time = time.monotonic()
+	if single_thread or max_workers <= 1:
+		_remove_listed_files(listed)
+	elif listed:
+		delete_file_list_parallel(listed, max_workers, verbose, files_per_job, remover=_remove_listed_files)
+	directories = []
+	for root in roots:
+		if not os.path.isdir(root) or os.path.islink(root):
+			continue
+		for dirpath, dirnames, _ in os.walk(root):
+			directories.append(dirpath)
+			dirnames[:] = [name for name in dirnames if not (exclude and is_excluded(os.path.join(dirpath, name), exclude))]
+	kept = set()
+	for directory in sorted(directories, key=lambda path: path.count(os.sep), reverse=True):
+		try:
+			os.rmdir(directory)
+		except FileNotFoundError:
+			pass
+		except OSError as e:
+			if e.errno in (errno.ENOTEMPTY, errno.EEXIST, errno.EBUSY):
+				kept.add(directory)
+			else:
+				eprint(f'Remove directory failed: {directory}: {e}')
+	left = []
+	for directory in sorted(kept):
+		try:
+			names = os.listdir(directory)
+		except OSError:
+			continue
+		for name in names:
+			path = os.path.join(directory, name)
+			if path not in kept and not (exclude and is_excluded(path, exclude)):
+				left.append(path)
+	if left:
+		shown = ', '.join(pformat(path) for path in left[:10]) + (f' and {len(left) - 10} more' if len(left) > 10 else '')
+		eprint(f'Move left entries: {len(left)} source entries the copy did not list (written during the move, or special '
+			f'files) are left in place: {shown}')
+	print(f"Time taken to remove files: {time.monotonic()-start_time:0.4f} seconds")
+
 def get_dest_from_image(dest_image,mount_points: list,loop_devices: list):
 	dest = ''
 	target_mount_point = tempfile.mkdtemp()
@@ -9443,7 +9529,6 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = multipr
 				dests = create_image(dest_image,target_mount_point,loop_devices,src_paths,mount_points,max_workers=max_workers,parallel_file_listing=parallel_file_listing,exclude=exclude,dest_image_size = dest_image_size)
 
 		copy_failures = []
-		move_blockers = []
 		if dests != ...:
 			# The remove gate below judges the errors recorded from here on. A listing cached earlier (create_image's size
 			# scan, or a library caller's) would not record its errors again: list afresh.
@@ -9463,8 +9548,6 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = multipr
 			# A copy that reported errors is incomplete: removing the sources (a move) would lose what was not copied,
 			# and an unlisted source subtree would make its destination counterpart look extra.
 			copy_failures = [error for error in ERRORS[copy_error_start:] if _is_failure(error)]
-			# A skipped special file is no error, but removing the sources would delete its only copy.
-			move_blockers = copy_failures + [error for error in ERRORS[copy_error_start:] if error.startswith('Special file skipped:')]
 			if remove_extra and copy_failures:
 				eprint(f'Remove skipped: not removing extra files from {dests}: the copy reported {len(copy_failures)} error(s); '
 					'fix them (or exclude those paths with -e) and re-run')
@@ -9481,9 +9564,13 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = multipr
 				print(f"Number of files / links: {len(total_file_list)}")
 				print(f"Number of links: {len(total_sym_links)}")
 				print(f"Total time taken: {time.monotonic()-programStartTime:0.4f} seconds")
-		if remove and move_blockers:
-			eprint(f'Remove skipped: not removing {src_paths}: the copy reported {len(move_blockers)} error(s) or skipped special file(s); '
+		if remove and copy_failures:
+			eprint(f'Remove skipped: not removing {src_paths}: the copy reported {len(copy_failures)} error(s); '
 				'fix them (or exclude those paths with -e) and re-run')
+		elif remove and dests != ...:
+			# A move: only what the copy listed goes (see remove_moved_sources).
+			remove_moved_sources(src_paths, total_file_list, total_sym_links, single_thread=single_thread, max_workers=max_workers,
+						verbose=verbose, files_per_job=files_per_job, remove_force=remove_force, exclude=exclude)
 		elif remove:
 			process_remove(src_paths,single_thread=single_thread, max_workers=max_workers,verbose=verbose,
 						files_per_job=files_per_job, remove_force=remove_force,exclude=exclude,batch=batch,parallel_file_listing=parallel_file_listing)
