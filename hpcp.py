@@ -768,8 +768,12 @@ def _run_task(settings, func, *args, **kwargs):
 
 def _task_result(future, default, crash_prefix):
 	"""A _submit_task future's result in the parent. The errors the task recorded join ERRORS (the worker printed them);
-	a task that raised is recorded under crash_prefix and gives default. Either way the other tasks go on."""
-	result, errors, crash = future.result()
+	a task that raised, or whose worker died (BrokenProcessPool), is recorded under crash_prefix and gives default.
+	Either way the other tasks go on (a broken pool then fails the next submit)."""
+	try:
+		result, errors, crash = future.result()
+	except Exception as e:
+		result, errors, crash = None, [], f'{type(e).__name__}: {e}'
 	ERRORS.extend(errors)
 	if crash is not None:
 		eprint(f'{crash_prefix}: {crash}')

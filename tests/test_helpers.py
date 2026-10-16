@@ -75,3 +75,15 @@ def test_call_raising_recorded_failures_raises_only_failures(hpcp_mod, reset_hpc
 	with pytest.raises(RuntimeError, match='Copy failed: worker error'):
 		hpcp_mod._call_raising_recorded_failures(hpcp_mod.eprint, 'Copy failed: worker error')
 	assert hpcp_mod.ERRORS == ['Copy failed: parent error']
+
+
+def test_task_result_records_a_task_whose_worker_died(hpcp_mod, reset_hpcp_globals):
+	"""A worker killed mid-task (OOM) fails its future with BrokenProcessPool: recorded like a crash, not raised."""
+	from concurrent.futures.process import BrokenProcessPool
+
+	class DeadFuture:
+		def result(self):
+			raise BrokenProcessPool('A process in the process pool was terminated abruptly')
+
+	assert hpcp_mod._task_result(DeadFuture(), (0, 0), 'Remove process exception') == (0, 0)
+	assert [error.partition(':')[0] for error in hpcp_mod.ERRORS] == ['Remove process exception']
