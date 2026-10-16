@@ -297,6 +297,8 @@ ERROR_TO_RETURNCODE_TABLE = {
 	# overall exit code. (Create fs error is a real failure, not a degrade -
 	# it keeps a non-zero code in the partition-failure family above.)
 	'FS param probe warning': 0,
+	# A FIFO, socket or device node: not copied (a note, rc 0), but a move (-rm) is skipped, see hpcp().
+	'Special file skipped': 0,
 	'FS param build warning': 0,
 	'FS param warning': 0,
 }
@@ -2629,9 +2631,15 @@ def _scan_dir(root):
 	except OSError as e:
 		eprint(f'Listing error: {root}: {e}')
 
+def _special_file_kind(mode):
+	"""What a non-regular, non-directory, non-symlink mode is, for the 'Special file skipped' note."""
+	return ('FIFO' if stat.S_ISFIFO(mode) else 'socket' if stat.S_ISSOCK(mode) else 'block device' if stat.S_ISBLK(mode)
+		else 'character device' if stat.S_ISCHR(mode) else 'special file')
+
 def get_file_list_serial(root,exclude=None,append_hash=False,full_hash=False,recurse=True,_rate_limiter=None,respect_file_rate_limit=True,remove_files_while_listing=False):
-	# skip if path is longer than 4096 characters
+	# skip if path is longer than 4096 characters: not listed, so not copied (an error: a move must not delete it)
 	if len(root) > 4096:
+		eprint(f'Listing error: {root}: path longer than 4096 characters, not listed')
 		return frozenset() ,frozenset(),0,frozenset(),0
 	#print(f'Getting file list for {root}')
 	global FILES_RATE_LIMIT
@@ -2715,6 +2723,10 @@ def get_file_list_serial(root,exclude=None,append_hash=False,full_hash=False,rec
 						removed_count += dir_removed_count
 					else:
 						folders.add(entry.path)
+				elif not remove_files_while_listing:
+					# Not copied or compared, which a move (-rm) must not mistake for a copy (see hpcp()).
+					eprint(f'Special file skipped: {entry.path} is a {_special_file_kind(entry.stat(follow_symlinks=False).st_mode)}; '
+						'hpcp does not copy FIFOs, sockets or device nodes')
 			except OSError as e:
 				# One entry that cannot be read (its hash, a link target) is recorded; the others are still listed.
 				eprint(f'Listing error: {entry.path}: {e}')
@@ -2726,8 +2738,9 @@ def get_file_list_serial(root,exclude=None,append_hash=False,full_hash=False,rec
 
 def get_file_list_parallel(path,max_workers=56,exclude=None,append_hash=False,full_hash=False,remove_files_while_listing=False):
 	global FILES_RATE_LIMIT
-	# skip if path is longer than 4096 characters
+	# skip if path is longer than 4096 characters (an error, as in get_file_list_serial)
 	if len(path) > 4096:
+		eprint(f'Listing error: {path}: path longer than 4096 characters, not listed')
 		return frozenset() ,frozenset(),0,frozenset(),0
 	if exclude and is_excluded(path,exclude):
 		return frozenset() ,frozenset(),0,frozenset(),0
@@ -9408,6 +9421,7 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = multipr
 				dests = create_image(dest_image,target_mount_point,loop_devices,src_paths,mount_points,max_workers=max_workers,parallel_file_listing=parallel_file_listing,exclude=exclude,dest_image_size = dest_image_size)
 
 		copy_failures = []
+		move_blockers = []
 		if dests != ...:
 			# The remove gate below judges the errors recorded from here on. A listing cached earlier (create_image's size
 			# scan, or a library caller's) would not record its errors again: list afresh.
@@ -9427,6 +9441,8 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = multipr
 			# A copy that reported errors is incomplete: removing the sources (a move) would lose what was not copied,
 			# and an unlisted source subtree would make its destination counterpart look extra.
 			copy_failures = [error for error in ERRORS[copy_error_start:] if _is_failure(error)]
+			# A skipped special file is no error, but removing the sources would delete its only copy.
+			move_blockers = copy_failures + [error for error in ERRORS[copy_error_start:] if error.startswith('Special file skipped:')]
 			if remove_extra and copy_failures:
 				eprint(f'Remove skipped: not removing extra files from {dests}: the copy reported {len(copy_failures)} error(s); '
 					'fix them (or exclude those paths with -e) and re-run')
@@ -9443,8 +9459,8 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = multipr
 				print(f"Number of files / links: {len(total_file_list)}")
 				print(f"Number of links: {len(total_sym_links)}")
 				print(f"Total time taken: {time.monotonic()-programStartTime:0.4f} seconds")
-		if remove and copy_failures:
-			eprint(f'Remove skipped: not removing {src_paths}: the copy reported {len(copy_failures)} error(s); '
+		if remove and move_blockers:
+			eprint(f'Remove skipped: not removing {src_paths}: the copy reported {len(move_blockers)} error(s) or skipped special file(s); '
 				'fix them (or exclude those paths with -e) and re-run')
 		elif remove:
 			process_remove(src_paths,single_thread=single_thread, max_workers=max_workers,verbose=verbose,

@@ -649,3 +649,33 @@ def test_remove_extra_dirs_with_dest_image_keeps_the_image_lost_and_found(tmp_pa
 def test_lost_and_found_check_stops_at_the_root(hpcp_mod):
 	assert hpcp_mod._in_root_lost_and_found('/no/such/dir/file', '/') is False
 	assert hpcp_mod._in_root_lost_and_found('/lost+found/#12', '/') is os.path.ismount('/')
+
+
+@pytest.mark.parametrize('single_thread', [True, False])
+def test_move_keeps_a_source_with_a_special_file_it_cannot_copy(tmp_tree, hpcp_mod, reset_hpcp_globals, require_linux, copy_args, single_thread):
+	"""Ultrareview: the copy skips a FIFO (or socket, device node) without an error, and the move's rmtree then
+	deleted the only copy. The move is skipped instead."""
+	import stat
+	tmp_tree.add_file('a.txt', 'a')
+	os.mkfifo(str(tmp_tree.src / 'pipe'))
+	srcs, opts = copy_args(remove_force=True, single_thread=single_thread, max_workers=1 if single_thread else 2)
+	assert hpcp_mod.hpcp(srcs, **opts) == 212
+	assert (tmp_tree.dst / 'a.txt').read_text() == 'a'
+	assert stat.S_ISFIFO(os.lstat(tmp_tree.src / 'pipe').st_mode)
+
+
+def test_copy_with_a_special_file_still_succeeds_and_says_so(tmp_tree, hpcp_mod, reset_hpcp_globals, require_linux, copy_args, capsys):
+	tmp_tree.add_file('a.txt', 'a')
+	os.mkfifo(str(tmp_tree.src / 'pipe'))
+	srcs, opts = copy_args()
+	assert hpcp_mod.hpcp(srcs, **opts) == 0
+	assert not os.path.lexists(tmp_tree.dst / 'pipe')
+	assert 'Special file skipped' in capsys.readouterr().err
+
+
+@pytest.mark.parametrize('lister', ['get_file_list_serial', 'get_file_list_parallel'])
+def test_overlong_path_is_a_listing_error(hpcp_mod, reset_hpcp_globals, lister):
+	"""A path over 4096 characters is not listed, so not copied: an error (a move must not delete it)."""
+	result = getattr(hpcp_mod, lister)('/' + 'x' * 4100)
+	assert result[:2] == (frozenset(), frozenset())
+	assert [error.partition(':')[0] for error in hpcp_mod.ERRORS] == ['Listing error']
