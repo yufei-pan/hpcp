@@ -530,3 +530,20 @@ def test_link_tracking_never_copies_an_excluded_target(tmp_tree, hpcp_mod, reset
 		single_thread=True, batch=True, do_not_remove_files_while_listing=True) == 0
 	assert os.readlink(tmp_tree.dst / 'k') == 'secrets/key.pem'
 	assert not (tmp_tree.dst / 'secrets').exists()
+
+
+@pytest.mark.parametrize('group_allowed', [True, False])
+def test_non_root_ownership_falls_back_to_the_group_like_cp(tmp_tree, hpcp_mod, reset_hpcp_globals, require_linux, monkeypatch, group_allowed):
+	"""cp -a: when the owner cannot be kept, still keep the group (a group the user belongs to); neither is an error."""
+	src = tmp_tree.add_dir('d')
+	calls = []
+	def chown(path, uid, gid, **kwargs):
+		calls.append((uid, gid))
+		if uid != -1 or not group_allowed:
+			raise PermissionError(1, 'Operation not permitted')
+	monkeypatch.setattr(hpcp_mod.os, 'chown', chown)
+	monkeypatch.setattr(hpcp_mod.os, 'geteuid', lambda: 1000)
+	hpcp_mod.sync_directory_metadata(src, [str(tmp_tree.dst / 'd')])
+	st = os.stat(src)
+	assert calls == [(st.st_uid, st.st_gid), (-1, st.st_gid)]
+	assert hpcp_mod.ERRORS == []

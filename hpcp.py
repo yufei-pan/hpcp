@@ -2921,6 +2921,19 @@ def delete_files_parallel(paths, max_workers, verbose=False,files_per_job=1,excl
 	return delete_counter + removed_while_listing + 1, delete_size_counter
 
 #%% ---- Copy Files ----
+def _chown_like_cp(path, st):
+	"""Give path st's owner and group, as cp -a does: without privileges another user's ownership cannot be kept,
+	so keep at least the group (one the user belongs to) and treat the rest as no error. Root failures raise."""
+	try:
+		os.chown(path, st.st_uid, st.st_gid)
+	except PermissionError:
+		if os.geteuid() == 0:
+			raise
+		try:
+			os.chown(path, -1, st.st_gid)
+		except PermissionError:
+			pass
+
 def copy_file(src_path, dest_paths, full_hash=False, verbose=False, concurrent_processes=0):
 	"""
 	Copy a file from the source path to the destination path.
@@ -2955,12 +2968,7 @@ def copy_file(src_path, dest_paths, full_hash=False, verbose=False, concurrent_p
 					_remove_stale_xattrs(src_path, dest)
 					shutil.copystat(src_path, dest,follow_symlinks=False)
 					if os.name == 'posix':
-						try:
-							os.chown(dest, st.st_uid, st.st_gid)
-						except PermissionError:
-							# As cp -a: without privileges another user's ownership cannot be kept.
-							if os.geteuid() == 0:
-								raise
+						_chown_like_cp(dest, st)
 						#also copy the modes
 						os.chmod(dest, st.st_mode)
 					os.utime(dest, (st.st_atime, st.st_mtime),follow_symlinks=False)
@@ -3619,12 +3627,7 @@ def sync_directory_metadata(src_path, dest_paths):
 				_remove_stale_xattrs(src_path, dest_path)
 				shutil.copystat(src_path, dest_path)
 				if os.name == 'posix':
-					try:
-						os.chown(dest_path, st.st_uid, st.st_gid)
-					except PermissionError:
-						# As cp -a: without privileges another user's ownership cannot be kept.
-						if os.geteuid() == 0:
-							raise
+					_chown_like_cp(dest_path, st)
 				os.utime(dest_path, (st.st_atime, st.st_mtime))
 		except OSError as e:
 			eprint(f'Directory sync error: {src_path} to {dest_path}: {e}')
