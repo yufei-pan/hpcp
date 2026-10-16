@@ -250,6 +250,7 @@ ERROR_TO_RETURNCODE_TABLE = {
 	'Copy failed': 190,
 	'Copy process crashed': 191,
 	'Remove process exception': 192,
+	'Directory sync error': 193,
 	'Source path type error': 200,
 	'Source image mount error': 201,
 	'No valid destination': 202,
@@ -259,8 +260,10 @@ ERROR_TO_RETURNCODE_TABLE = {
 	'Source image not found': 206,
 	'Source path not found': 207,
 	'File list not found': 208,
+	'Listing error': 209,
 	'Remove file failed': 210,
 	'Remove directory failed': 211,
+	'Remove skipped': 212,
 	'Dest path DataType error': 220,
 	'Destination image broken': 221,
 	'Cannot fix destination image': 222,
@@ -287,6 +290,7 @@ ERROR_TO_RETURNCODE_TABLE = {
 	'Raw area error': 249,
 	'Identity change error': 250,
 	'Disk in use': 251,
+	'Patch error': 252,
 	# FS param mirroring warnings: each of these reports a successful copy that
 	# degraded to mkfs defaults (a probe/build failure, or mkfs rejecting the
 	# mirrored parameters), not a failed one, so they must not inflate the
@@ -727,16 +731,59 @@ def _on_worker_start():
 	t.start()
 
 _worker_initialized = False
-def _call_with_worker_init(func, *args, **kwargs):
-	"""Wrapper that ensures _on_worker_start() runs once per worker process.
+def _init_worker():
+	"""Run _on_worker_start() once per worker process.
 	Used instead of ProcessPoolExecutor's initializer parameter for Python 3.6 compatibility."""
 	global _worker_initialized
 	if not _worker_initialized:
 		_on_worker_start()
 		_worker_initialized = True
-	# ERRORS is process-local. Send failures back through the future instead of
-	# leaving the parent to report success after a worker logged a failed copy.
-	return _call_raising_recorded_failures(func, *args, **kwargs)
+
+# The run settings hpcp() keeps in module globals. A pool worker that did not fork from the parent
+# (spawn, forkserver) would otherwise run with the import-time defaults.
+_TASK_SETTINGS = ('CONTENT_ONLY', 'NO_CREATE_DIR', 'RANDOM_DESTINATION_SELECTION', 'HASH_SIZE', 'COMMAND_TIMEOUT',
+	'BYTES_RATE_LIMIT', 'FILES_RATE_LIMIT', 'MIRROR_FS_PARAMS', 'REMOVE_FILES_WHILE_LISTING')
+
+def _submit_task(executor, func, *args, **kwargs):
+	"""Submit func to a process pool with this process's run settings; collect it with _task_result."""
+	settings = {name: globals()[name] for name in _TASK_SETTINGS}
+	return executor.submit(_run_task, settings, func, *args, **kwargs)
+
+def _run_task(settings, func, *args, **kwargs):
+	"""Worker side of _submit_task: (result, the errors func recorded, None), or (None, errors, crash text) when it raised.
+
+	ERRORS is process-local, so the errors go back through the future; a reused worker never carries them into its next task.
+	"""
+	_init_worker()
+	globals().update(settings)
+	error_start = len(ERRORS)
+	try:
+		return func(*args, **kwargs), ERRORS[error_start:], None
+	except Exception as e:
+		return None, ERRORS[error_start:], f'{type(e).__name__}: {e}'
+	finally:
+		del ERRORS[error_start:]
+
+def _task_result(future, default, crash_prefix):
+	"""A _submit_task future's result in the parent. The errors the task recorded join ERRORS (the worker printed them);
+	a task that raised is recorded under crash_prefix and gives default. Either way the other tasks go on."""
+	result, errors, crash = future.result()
+	ERRORS.extend(errors)
+	if crash is not None:
+		eprint(f'{crash_prefix}: {crash}')
+		return default
+	return result
+
+def _raise_task_failures(future):
+	"""A _submit_task future's result, raising its recorded failures (and a crash) as one RuntimeError, as
+	_call_raising_recorded_failures does in-process."""
+	result, errors, crash = future.result()
+	failures = [error for error in errors if ERROR_TO_RETURNCODE_TABLE.get(error.partition(':')[0], 128) != 0]
+	if crash is not None:
+		failures.append(crash)
+	if failures:
+		raise RuntimeError('\n'.join(failures))
+	return result
 
 def _call_raising_recorded_failures(func, *args, **kwargs):
 	"""Run func; the failures it records in ERRORS are taken out of ERRORS and raised as one RuntimeError."""
@@ -2660,8 +2707,8 @@ def get_file_list_parallel(path,max_workers=56,exclude=None,append_hash=False,fu
 				)
 				while folders_to_expand and len(futures) < max_workers and under_rate_limit:
 					folder = folders_to_expand.popleft()
-					futures[executor.submit(
-						_call_with_worker_init,
+					futures[_submit_task(
+						executor,
 						get_file_list_serial,
 						folder,
 						exclude=exclude,
@@ -2682,7 +2729,8 @@ def get_file_list_parallel(path,max_workers=56,exclude=None,append_hash=False,fu
 				done, _ = concurrent.futures.wait(futures, return_when=concurrent.futures.FIRST_COMPLETED)
 				for doneTask in done:
 					folder_path = futures.pop(doneTask)
-					dir_file_list, dir_link_list, dir_size, dir_folder_list, dir_removed_count = doneTask.result()
+					dir_file_list, dir_link_list, dir_size, dir_folder_list, dir_removed_count = _task_result(
+						doneTask, (frozenset(), frozenset(), 0, frozenset(), 0), 'Listing error')
 					file_list.update(dir_file_list)
 					link_list.update(dir_link_list)
 					size += dir_size
@@ -2757,12 +2805,12 @@ def delete_file_list_parallel(file_list, max_workers, verbose=False,files_per_jo
 				try:
 					for _ in range(round(files_per_job)):
 						delete_files.append(next(file_list_iterator))
-					future = executor.submit(_call_with_worker_init, delete_file_bulk, delete_files)
+					future = _submit_task(executor, delete_file_bulk, delete_files)
 					futures[future] = delete_files
 					# counter += 1
 				except StopIteration:
 					if delete_files:
-						future = executor.submit(_call_with_worker_init, delete_file_bulk, delete_files)
+						future = _submit_task(executor, delete_file_bulk, delete_files)
 						futures[future] = delete_files
 					file_list_iterator = None
 
@@ -2772,11 +2820,7 @@ def delete_file_list_parallel(file_list, max_workers, verbose=False,files_per_jo
 			for doneTask in done:
 				delete_files = futures.pop(doneTask)
 				deleted_files_count_this_run = len(delete_files)
-				rmSize = rmTime = 0
-				try:
-					rmSize, rmTime = doneTask.result()
-				except Exception as exc:
-					eprint(f'Remove process exception:{doneTask} generated an exception: {exc}')
+				rmSize, rmTime = _task_result(doneTask, (0, 0), 'Remove process exception')
 				current_iteration_total_run_time += rmTime
 				apb.update(num_files=deleted_files_count_this_run,cpSize=rmSize,cpTime=rmTime,files_per_job=files_per_job)
 			apb.scheduled_jobs = len(futures)
@@ -3105,12 +3149,12 @@ def copy_file_list_parallel(file_list, links, src_path, dest_paths, max_workers,
 					for _ in range(max(1,round(files_per_job * noise))):
 						src_file = next(file_list_iterator)
 						src_files.append(src_file)
-					future = executor.submit(_call_with_worker_init, copy_files_bulk, src_files, dest_paths,src_path, full_hash, verbose,len(futures))
+					future = _submit_task(executor, copy_files_bulk, src_files, dest_paths,src_path, full_hash, verbose,len(futures))
 					futures[future] = src_files
 					# counter += 1
 				except StopIteration:
 					if src_files:
-						future = executor.submit(_call_with_worker_init, copy_files_bulk, src_files, dest_paths,src_path, full_hash, verbose,len(futures))
+						future = _submit_task(executor, copy_files_bulk, src_files, dest_paths,src_path, full_hash, verbose,len(futures))
 						futures[future] = src_files
 					file_list_iterator = None
 
@@ -3126,8 +3170,7 @@ def copy_file_list_parallel(file_list, links, src_path, dest_paths, max_workers,
 			for future in done:
 				src_files = futures.pop(future)
 				copied_file_count_this_run = len(src_files)
-				#try:
-				cpSize, cpTime, rtnSymLinks = future.result()
+				cpSize, cpTime, rtnSymLinks = _task_result(future, (0, 0, {}), 'Copy process crashed')
 				current_iteration_total_run_time += cpTime
 				apb.update(num_files=copied_file_count_this_run,cpSize=cpSize,cpTime=cpTime,files_per_job=files_per_job)
 				symLinks.update(rtnSymLinks)
@@ -3210,12 +3253,12 @@ def copy_file_list_parallel_batch(jobs, max_workers, full_hash=False, verbose=Fa
 					for _ in range(max(1,round(files_per_job * noise))):
 						job = next(job_list_iterator)
 						current_jobs.append(job)
-					future = executor.submit(_call_with_worker_init, copy_files_bulk_batch, current_jobs, full_hash, verbose,len(futures))
+					future = _submit_task(executor, copy_files_bulk_batch, current_jobs, full_hash, verbose,len(futures))
 					futures[future] = current_jobs
 					# counter += 1
 				except StopIteration:
 					if current_jobs:
-						future = executor.submit(_call_with_worker_init, copy_files_bulk_batch, current_jobs, full_hash, verbose,len(futures))
+						future = _submit_task(executor, copy_files_bulk_batch, current_jobs, full_hash, verbose,len(futures))
 						futures[future] = current_jobs
 					job_list_iterator = None
 
@@ -3231,8 +3274,7 @@ def copy_file_list_parallel_batch(jobs, max_workers, full_hash=False, verbose=Fa
 			for future in done:
 				current_jobs = futures.pop(future)
 				copied_file_count_this_run = len(current_jobs)
-				#try:
-				cpSize, cpTime, rtnSymLinks = future.result()
+				cpSize, cpTime, rtnSymLinks = _task_result(future, (0, 0, {}), 'Copy process crashed')
 				current_iteration_total_run_time += cpTime
 				apb.update(num_files=copied_file_count_this_run,cpSize=cpSize,cpTime=cpTime,files_per_job=files_per_job)
 				symLinks.update(rtnSymLinks)
@@ -3515,18 +3557,27 @@ def sync_directory_metadata(src_path, dest_paths):
 	# Create the directory if it does not exist
 	st = os.stat(src_path)
 	for dest_path in dest_paths:
+		# One directory that cannot be created or synced is recorded; the others (and the other dests) go on.
 		try:
-			if not (os.path.exists(dest_path) or os.path.ismount(dest_path)):
-				os.makedirs(dest_path, exist_ok=True)
-		except FileExistsError:
-			eprint(f"Destination path {dest_path} maybe a mounted dir, known issue with os.path.exists\nContinuing without creating dest folder...")
-		# Sync the metadata
-		if not CONTENT_ONLY:
-			_remove_stale_xattrs(src_path, dest_path)
-			shutil.copystat(src_path, dest_path)
-			if os.name == 'posix':
-				os.chown(dest_path, st.st_uid, st.st_gid)
-			os.utime(dest_path, (st.st_atime, st.st_mtime))
+			try:
+				if not (os.path.exists(dest_path) or os.path.ismount(dest_path)):
+					os.makedirs(dest_path, exist_ok=True)
+			except FileExistsError:
+				eprint(f"Destination path {dest_path} maybe a mounted dir, known issue with os.path.exists\nContinuing without creating dest folder...")
+			# Sync the metadata
+			if not CONTENT_ONLY:
+				_remove_stale_xattrs(src_path, dest_path)
+				shutil.copystat(src_path, dest_path)
+				if os.name == 'posix':
+					try:
+						os.chown(dest_path, st.st_uid, st.st_gid)
+					except PermissionError:
+						# As cp -a: without privileges another user's ownership cannot be kept.
+						if os.geteuid() == 0:
+							raise
+				os.utime(dest_path, (st.st_atime, st.st_mtime))
+		except OSError as e:
+			eprint(f'Directory sync error: {src_path} to {dest_path}: {e}')
 	return 1,time.monotonic()-start_time,frozenset()
 
 def sync_directory_metadata_bulk(src_paths, dest_paths,src_path):
@@ -3593,12 +3644,12 @@ def sync_directories_parallel(src, dests, max_workers, verbose=False,folder_per_
 					for _ in range(folder_per_job):
 						src_folder = next(folder_list_iterator)
 						src_folders.append(src_folder)
-					future = executor.submit(_call_with_worker_init, sync_directory_metadata_bulk, src_folders, dests,src)
+					future = _submit_task(executor, sync_directory_metadata_bulk, src_folders, dests,src)
 					futures[future] = src_folders
 					# counter += 1
 				except StopIteration:
 					if src_folders:
-						future = executor.submit(_call_with_worker_init, sync_directory_metadata_bulk, src_folders, dests,src)
+						future = _submit_task(executor, sync_directory_metadata_bulk, src_folders, dests,src)
 						futures[future] = src_folders
 					folder_list_iterator = None
 
@@ -3607,12 +3658,8 @@ def sync_directories_parallel(src, dests, max_workers, verbose=False,folder_per_
 			for future in done:
 				src_folders = futures.pop(future)
 				num_folders_copied_this_job = len(src_folders)
-				#try:
-				cpSize, cpTime, rtnSymLinks = future.result()
+				cpSize, cpTime, rtnSymLinks = _task_result(future, (0, 0, {}), 'Copy process crashed')
 				time_spent_this_iter += cpTime
-				#except Exception as exc:
-					#print(f'\n{future} generated an exception: {exc}')
-				#else:
 				apb.update(num_files=num_folders_copied_this_job, cpSize=cpSize, cpTime=cpTime , files_per_job=folder_per_job)
 				symLinks.update(rtnSymLinks)
 			apb.scheduled_jobs = len(futures)
@@ -3687,11 +3734,11 @@ def sync_directories_parallel_batch(jobs, max_workers, verbose=False,folder_per_
 				try:
 					for _ in range(folder_per_job):
 						currentJobs.append(next(job_iterator))
-					future = executor.submit(_call_with_worker_init, sync_directory_metadata_bulk_batch, currentJobs)
+					future = _submit_task(executor, sync_directory_metadata_bulk_batch, currentJobs)
 					futures[future] = currentJobs
 				except StopIteration:
 					if currentJobs:
-						future = executor.submit(_call_with_worker_init, sync_directory_metadata_bulk_batch, currentJobs)
+						future = _submit_task(executor, sync_directory_metadata_bulk_batch, currentJobs)
 						futures[future] = currentJobs
 					job_iterator = None
 
@@ -3700,12 +3747,8 @@ def sync_directories_parallel_batch(jobs, max_workers, verbose=False,folder_per_
 			for future in done:
 				currentJobs = futures.pop(future)
 				num_folders_copied_this_job = len(currentJobs)
-				#try:
-				cpSize, cpTime, rtnSymLinks = future.result()
+				cpSize, cpTime, rtnSymLinks = _task_result(future, (0, 0, {}), 'Copy process crashed')
 				time_spent_this_iter += cpTime
-				#except Exception as exc:
-					#print(f'\n{future} generated an exception: {exc}')
-				#else:
 				apb.update(num_files=num_folders_copied_this_job, cpSize=cpSize, cpTime=cpTime , files_per_job=folder_per_job)
 				symLinks.update(rtnSymLinks)
 			apb.scheduled_jobs = len(futures)
@@ -5308,10 +5351,10 @@ def _replace_files(files, target_root, max_workers=1, verbose=False, full_hash=F
 				functools.partial(_call_raising_recorded_failures, copy, source, [tmp], full_hash, verbose), metadata)
 		return
 	with ProcessPoolExecutor(max_workers=max_workers) as executor:
-		futures = {executor.submit(_call_with_worker_init, copy, source, [tmp], full_hash, verbose): (row, source, dest, tmp)
+		futures = {_submit_task(executor, copy, source, [tmp], full_hash, verbose): (row, source, dest, tmp)
 			for row, source, dest, tmp in jobs}
 		for future in concurrent.futures.as_completed(futures):
-			_finish_replace(futures[future], target_root, future.result, metadata)
+			_finish_replace(futures[future], target_root, functools.partial(_raise_task_failures, future), metadata)
 
 def _replace_with_symlink(row, link_target, dest, target_root):
 	"""Create the symlink at a temporary sibling of dest and rename it over dest."""
@@ -9105,7 +9148,9 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = multipr
 			else:
 				dests = create_image(dest_image,target_mount_point,loop_devices,src_paths,mount_points,max_workers=max_workers,parallel_file_listing=parallel_file_listing,exclude=exclude,dest_image_size = dest_image_size)
 
+		copy_failures = []
 		if dests != ...:
+			copy_error_start = len(ERRORS)
 			total_file_list, total_sym_links = process_copy(src_paths, dests, single_thread=single_thread, max_workers=max_workers,
 																			verbose=verbose, directory_only=directory_only,no_directory_sync=no_directory_sync,
 																			full_hash=full_hash, files_per_job=files_per_job, parallel_file_listing=parallel_file_listing,
@@ -9117,7 +9162,13 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = multipr
 				for link in total_sym_links:
 					print(f"Link: {link} -> {total_sym_links[link]}")
 			create_sym_links(total_sym_links,exclude=exclude,no_link_tracking=no_link_tracking)
-			if remove_extra:
+			# A copy that reported errors is incomplete: removing the sources (a move) would lose what was not copied,
+			# and an unlisted source subtree would make its destination counterpart look extra.
+			copy_failures = [error for error in ERRORS[copy_error_start:] if ERROR_TO_RETURNCODE_TABLE.get(error.partition(':')[0], 128) != 0]
+			if remove_extra and copy_failures:
+				eprint(f'Remove skipped: not removing extra files from {dests}: the copy reported {len(copy_failures)} error(s); '
+					'fix them (or exclude those paths with -e) and re-run')
+			elif remove_extra:
 				print('-'*80)
 				remove_extra_files(total_file_list, dests,max_workers,verbose,files_per_job,single_thread,exclude=exclude,parallel_file_listing=parallel_file_listing,src_paths=src_paths,sym_links=total_sym_links)
 				print('-'*80)
@@ -9129,7 +9180,10 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = multipr
 				print(f"Number of files / links: {len(total_file_list)}")
 				print(f"Number of links: {len(total_sym_links)}")
 				print(f"Total time taken: {time.monotonic()-programStartTime:0.4f} seconds")
-		if remove:
+		if remove and copy_failures:
+			eprint(f'Remove skipped: not removing {src_paths}: the copy reported {len(copy_failures)} error(s); '
+				'fix them (or exclude those paths with -e) and re-run')
+		elif remove:
 			process_remove(src_paths,single_thread=single_thread, max_workers=max_workers,verbose=verbose,
 						files_per_job=files_per_job, remove_force=remove_force,exclude=exclude,batch=batch,parallel_file_listing=parallel_file_listing)
 	except KeyboardInterrupt:

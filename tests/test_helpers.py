@@ -60,8 +60,18 @@ def test_error_status_preserves_unknown_failures(hpcp_mod, reset_hpcp_globals, m
 def test_worker_reports_only_current_task_errors(hpcp_mod, reset_hpcp_globals, monkeypatch):
 	monkeypatch.setattr(hpcp_mod, '_worker_initialized', True)
 	hpcp_mod.ERRORS.append('Copy failed: parent error')
-	hpcp_mod._call_with_worker_init(hpcp_mod.eprint, 'FS param warning: defaults')
+	settings = {name: getattr(hpcp_mod, name) for name in hpcp_mod._TASK_SETTINGS}
+	assert hpcp_mod._run_task(settings, hpcp_mod.eprint, 'FS param warning: defaults') == (None, ['FS param warning: defaults'], None)
+	assert hpcp_mod._run_task(settings, hpcp_mod.eprint, 'Copy failed: worker error') == (None, ['Copy failed: worker error'], None)
+	assert hpcp_mod._run_task(settings, int, '3') == (3, [], None)
+	result, errors, crash = hpcp_mod._run_task(settings, int, 'x')
+	assert result is None and errors == [] and crash.startswith('ValueError')
+	assert hpcp_mod.ERRORS == ['Copy failed: parent error']
+
+
+def test_call_raising_recorded_failures_raises_only_failures(hpcp_mod, reset_hpcp_globals):
+	hpcp_mod.ERRORS.append('Copy failed: parent error')
+	hpcp_mod._call_raising_recorded_failures(hpcp_mod.eprint, 'FS param warning: defaults')
 	with pytest.raises(RuntimeError, match='Copy failed: worker error'):
-		hpcp_mod._call_with_worker_init(hpcp_mod.eprint, 'Copy failed: worker error')
-	assert hpcp_mod._call_with_worker_init(int, '3') == 3
+		hpcp_mod._call_raising_recorded_failures(hpcp_mod.eprint, 'Copy failed: worker error')
 	assert hpcp_mod.ERRORS == ['Copy failed: parent error']

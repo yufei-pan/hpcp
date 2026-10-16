@@ -185,3 +185,41 @@ def test_remove_force_alone_removes_without_copying(tmp_tree, hpcp_mod, reset_hp
 	assert rc == 0
 	assert not os.path.lexists(src)
 	assert not (tmp_tree.dst / 'remove-me.txt').exists()
+
+
+# ---- 9.73: no removal after a copy that reported errors ----
+
+def _copy_with_one_failure(tmp_tree):
+	tmp_tree.add_file('ok/a.txt', 'a')
+	tmp_tree.add_file('missing/lost.txt', 'lost')
+	(tmp_tree.dst / 'ok').mkdir()
+
+
+@pytest.mark.parametrize('single_thread', [True, False])
+def test_move_keeps_the_sources_when_the_copy_failed(tmp_tree, hpcp_mod, reset_hpcp_globals, require_linux, copy_args, single_thread):
+	"""-rm with a destination is a move: a file that was not copied must not be deleted from the source."""
+	_copy_with_one_failure(tmp_tree)
+	srcs, opts = copy_args(single_thread=single_thread, max_workers=1 if single_thread else 2,
+		no_create_dir=True, no_directory_sync=True, remove_force=True)
+	rc = hpcp_mod.hpcp(srcs, **opts)
+	assert (tmp_tree.src / 'missing' / 'lost.txt').read_text() == 'lost'
+	assert (tmp_tree.src / 'ok' / 'a.txt').exists()
+	assert rc == 212
+
+
+def test_move_still_removes_the_sources_after_a_clean_copy(tmp_tree, hpcp_mod, reset_hpcp_globals, require_linux, copy_args):
+	tmp_tree.add_file('ok/a.txt', 'a')
+	srcs, opts = copy_args(remove_force=True)
+	assert hpcp_mod.hpcp(srcs, **opts) == 0
+	assert (tmp_tree.dst / 'ok' / 'a.txt').read_text() == 'a'
+	assert not tmp_tree.src.exists()
+
+
+def test_remove_extra_is_skipped_when_the_copy_failed(tmp_tree, hpcp_mod, reset_hpcp_globals, require_linux, copy_args, monkeypatch):
+	_copy_with_one_failure(tmp_tree)
+	extra = tmp_tree.add_file('ok/extra.txt', 'keep me', under='dst')
+	monkeypatch.setattr(sys.stdin, 'isatty', lambda: True)
+	monkeypatch.setattr('builtins.input', lambda: 'y')
+	srcs, opts = copy_args(no_create_dir=True, no_directory_sync=True, remove_extra=True)
+	assert hpcp_mod.hpcp(srcs, **opts) == 212
+	assert os.path.exists(extra)

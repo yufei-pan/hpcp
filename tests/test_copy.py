@@ -326,3 +326,111 @@ def test_sync_directory_metadata_removes_stale_xattr(tmp_tree, hpcp_mod, reset_h
 	hpcp_mod.CONTENT_ONLY = False
 	hpcp_mod.sync_directory_metadata(src, [dst])
 	assert 'user.stale' not in _xattr_names(dst)
+
+
+# ---- 9.73: one failed pool task must not stop the others (review C2) ----
+
+def _tree_with_one_unwritable_dest(tmp_tree, count=12):
+	"""Files under src/ok/ plus one under src/missing/; dst has ok/ only, so with NO_CREATE_DIR the missing/ copy fails."""
+	for index in range(count):
+		tmp_tree.add_file(f'ok/f{index}.txt', f'data {index}')
+	tmp_tree.add_file('missing/lost.txt', 'lost')
+	(tmp_tree.dst / 'ok').mkdir()
+
+
+def test_parallel_copy_keeps_going_after_a_failed_file(tmp_tree, hpcp_mod, reset_hpcp_globals, require_linux):
+	_tree_with_one_unwritable_dest(tmp_tree)
+	hpcp_mod.NO_CREATE_DIR = True
+	files, links, size, _ = hpcp_mod.get_file_list(str(tmp_tree.src), parallel_file_listing=False, drop_cache=True)
+	hpcp_mod.copy_file_list_parallel(sorted(files), links, str(tmp_tree.src), [str(tmp_tree.dst)], max_workers=2, files_per_job=1)
+	assert sorted(os.listdir(tmp_tree.dst / 'ok')) == sorted(f'f{index}.txt' for index in range(12))
+	assert any(error.startswith('Copy failed') for error in hpcp_mod.ERRORS)
+
+
+def test_parallel_batch_copy_keeps_going_after_a_failed_file(tmp_tree, hpcp_mod, reset_hpcp_globals, require_linux):
+	_tree_with_one_unwritable_dest(tmp_tree)
+	hpcp_mod.NO_CREATE_DIR = True
+	hpcp_mod.copy_files_parallel_batch([(str(tmp_tree.src) + os.sep, [str(tmp_tree.dst) + os.sep])], max_workers=2)
+	assert sorted(os.listdir(tmp_tree.dst / 'ok')) == sorted(f'f{index}.txt' for index in range(12))
+	assert hpcp_mod.get_rc_from_error() == 190
+
+
+def test_hpcp_parallel_copy_reports_a_failed_file_and_copies_the_rest(tmp_tree, hpcp_mod, reset_hpcp_globals, require_linux, copy_args):
+	_tree_with_one_unwritable_dest(tmp_tree)
+	srcs, opts = copy_args(single_thread=False, max_workers=2, no_create_dir=True, no_directory_sync=True)
+	assert hpcp_mod.hpcp(srcs, **opts) == 190
+	assert len(os.listdir(tmp_tree.dst / 'ok')) == 12
+
+
+def _tree_with_one_blocked_dir(tmp_tree, count=12):
+	"""Directories src/d<i>/ plus src/blocked/inner/; dst/blocked is a regular file, so syncing blocked/inner fails."""
+	for index in range(count):
+		tmp_tree.add_dir(f'd{index}/sub')
+	tmp_tree.add_dir('blocked/inner')
+	(tmp_tree.dst / 'blocked').write_text('in the way')
+
+
+def test_parallel_dir_sync_keeps_going_after_a_failed_directory(tmp_tree, hpcp_mod, reset_hpcp_globals, require_linux):
+	_tree_with_one_blocked_dir(tmp_tree)
+	hpcp_mod.sync_directories_parallel_batch([(str(tmp_tree.src) + os.sep, [str(tmp_tree.dst) + os.sep])], max_workers=8, folder_per_job=1)
+	assert all((tmp_tree.dst / f'd{index}' / 'sub').is_dir() for index in range(12))
+	assert hpcp_mod.ERRORS
+
+
+def test_parallel_single_dir_sync_keeps_going_after_a_failed_directory(tmp_tree, hpcp_mod, reset_hpcp_globals, require_linux):
+	_tree_with_one_blocked_dir(tmp_tree)
+	hpcp_mod.sync_directories_parallel(str(tmp_tree.src) + os.sep, [str(tmp_tree.dst) + os.sep], max_workers=8, folder_per_job=1)
+	assert all((tmp_tree.dst / f'd{index}' / 'sub').is_dir() for index in range(12))
+	assert hpcp_mod.ERRORS
+
+
+def test_dir_sync_job_keeps_going_after_a_failed_directory(tmp_tree, hpcp_mod, reset_hpcp_globals, require_linux):
+	"""A failed directory in a pool job must not cost the job's other directories."""
+	_tree_with_one_blocked_dir(tmp_tree, count=2)
+	src = str(tmp_tree.src)
+	folders = [os.path.join(src, 'blocked', 'inner'), os.path.join(src, 'd0', 'sub'), os.path.join(src, 'd1', 'sub')]
+	hpcp_mod.sync_directory_metadata_bulk(folders, [str(tmp_tree.dst)], src)
+	assert (tmp_tree.dst / 'd0' / 'sub').is_dir() and (tmp_tree.dst / 'd1' / 'sub').is_dir()
+	assert [error.partition(':')[0] for error in hpcp_mod.ERRORS] == ['Directory sync error']
+
+
+def test_serial_dir_sync_records_a_failed_directory_and_goes_on(tmp_tree, hpcp_mod, reset_hpcp_globals, require_linux):
+	_tree_with_one_blocked_dir(tmp_tree, count=3)
+	hpcp_mod.sync_directories_serial_batch([(str(tmp_tree.src) + os.sep, [str(tmp_tree.dst) + os.sep])])
+	assert all((tmp_tree.dst / f'd{index}' / 'sub').is_dir() for index in range(3))
+	assert hpcp_mod.get_rc_from_error() == 193
+
+
+def test_dir_sync_ignores_chown_permission_error_without_privileges(tmp_tree, hpcp_mod, reset_hpcp_globals, require_linux, monkeypatch):
+	"""As cp -a: a non-root copy cannot keep another user's ownership, and that is not an error."""
+	src = tmp_tree.add_dir('d')
+	def chown(*args, **kwargs):
+		raise PermissionError(1, 'Operation not permitted')
+	monkeypatch.setattr(hpcp_mod.os, 'chown', chown)
+	monkeypatch.setattr(hpcp_mod.os, 'geteuid', lambda: 1000)
+	hpcp_mod.sync_directory_metadata(src, [str(tmp_tree.dst / 'd')])
+	assert (tmp_tree.dst / 'd').is_dir()
+	assert hpcp_mod.ERRORS == []
+	monkeypatch.setattr(hpcp_mod.os, 'geteuid', lambda: 0)
+	hpcp_mod.sync_directory_metadata(src, [str(tmp_tree.dst / 'd')])
+	assert [error.partition(':')[0] for error in hpcp_mod.ERRORS] == ['Directory sync error']
+
+
+def test_spawned_workers_get_the_run_settings(tmp_tree, hpcp_mod, reset_hpcp_globals, require_linux, monkeypatch):
+	"""Review C5: a worker that did not fork (spawn: Windows, macOS, Linux on Python 3.14+) must see -co and -ncd."""
+	import concurrent.futures
+	import functools
+	import multiprocessing
+	monkeypatch.setattr(hpcp_mod, 'ProcessPoolExecutor', functools.partial(
+		concurrent.futures.ProcessPoolExecutor, mp_context=multiprocessing.get_context('spawn')))
+	old = time.time() - 10 * 365 * 86400
+	for name in ('a.txt', 'b.txt'):
+		os.utime(tmp_tree.add_file(name, name), (old, old))
+	tmp_tree.add_file('nodir/c.txt', 'c')
+	hpcp_mod.CONTENT_ONLY = True
+	hpcp_mod.NO_CREATE_DIR = True
+	files, links, _, _ = hpcp_mod.get_file_list(str(tmp_tree.src), parallel_file_listing=False, drop_cache=True)
+	hpcp_mod.copy_file_list_parallel(sorted(files), links, str(tmp_tree.src), [str(tmp_tree.dst)], max_workers=2)
+	# -co: cp -f, so the copies get fresh mtimes; -ncd: the missing nodir/ is not created.
+	assert all(os.stat(tmp_tree.dst / name).st_mtime > old + 86400 for name in ('a.txt', 'b.txt'))
+	assert not (tmp_tree.dst / 'nodir').exists()
