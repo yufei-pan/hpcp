@@ -2631,10 +2631,18 @@ def _scan_dir(root):
 	except OSError as e:
 		eprint(f'Listing error: {root}: {e}')
 
-def _special_file_kind(mode):
-	"""What a non-regular, non-directory, non-symlink mode is, for the 'Special file skipped' note."""
-	return ('FIFO' if stat.S_ISFIFO(mode) else 'socket' if stat.S_ISSOCK(mode) else 'block device' if stat.S_ISBLK(mode)
-		else 'character device' if stat.S_ISCHR(mode) else 'special file')
+def _special_file_kind(entry):
+	"""'FIFO', 'socket', 'block device' or 'character device' for such a scandir entry, else None: a regular file,
+	directory or link, or an entry deleted since the directory was read (without d_type, is_file() stats it, and a
+	deleted entry is then neither file nor directory nor link; it is gone, nothing to copy)."""
+	try:
+		mode = entry.stat(follow_symlinks=False).st_mode
+	except FileNotFoundError:
+		return None
+	for is_kind, kind in ((stat.S_ISFIFO, 'FIFO'), (stat.S_ISSOCK, 'socket'), (stat.S_ISBLK, 'block device'), (stat.S_ISCHR, 'character device')):
+		if is_kind(mode):
+			return kind
+	return None
 
 def get_file_list_serial(root,exclude=None,append_hash=False,full_hash=False,recurse=True,_rate_limiter=None,respect_file_rate_limit=True,remove_files_while_listing=False):
 	# skip if path is longer than 4096 characters: not listed, so not copied (an error: a move must not delete it)
@@ -2724,9 +2732,10 @@ def get_file_list_serial(root,exclude=None,append_hash=False,full_hash=False,rec
 					else:
 						folders.add(entry.path)
 				elif not remove_files_while_listing:
-					# Not copied or compared, which a move (-rm) must not mistake for a copy (see hpcp()).
-					eprint(f'Special file skipped: {entry.path} is a {_special_file_kind(entry.stat(follow_symlinks=False).st_mode)}; '
-						'hpcp does not copy FIFOs, sockets or device nodes')
+					kind = _special_file_kind(entry)
+					if kind:
+						# Not copied or compared, which a move (-rm) must not mistake for a copy (see hpcp()).
+						eprint(f'Special file skipped: {entry.path} is a {kind}; hpcp does not copy FIFOs, sockets or device nodes')
 			except OSError as e:
 				# One entry that cannot be read (its hash, a link target) is recorded; the others are still listed.
 				eprint(f'Listing error: {entry.path}: {e}')
@@ -6280,9 +6289,19 @@ def _rw_mount_command(device, mount_point):
 		return ['mount', '-o', 'nouuid', device, mount_point]
 	return ['mount', device, mount_point]
 
-def _ro_source_mount_command(device, mount_point):
-	"""The mount command for a -dd source partition, which is only read: read-only, with nouuid for a cloned xfs.
-	Unlike _ro_mount_options it keeps log / journal recovery, so a dirty source is copied in its recovered state."""
+def _dd_source_mount_command(device, mount_point, entries=None):
+	"""The mount command for a -dd source partition, which is only read. One not mounted yet is mounted read-only, with
+	nouuid for a cloned xfs; unlike _ro_mount_options this keeps log / journal recovery, so a dirty source is copied in
+	its recovered state. One already mounted (a live system disk) shares its live filesystem, and the kernel refuses a
+	mount that would change that filesystem's read-only state: it is mounted plainly when read-write (as before 9.73)."""
+	entries = _mountinfo_entries() if entries is None else entries
+	try:
+		devnum = _device_number(device)
+	except OSError:
+		devnum = None
+	live = [entry for entry in entries if _entry_matches(entry, devnum, device)]
+	if live and not any('ro' in entry['super_options'] for entry in live):
+		return ['mount', device, mount_point]
 	if _probe_fs_type(device) == 'xfs':
 		return ['mount', '-o', 'ro,nouuid', device, mount_point]
 	return ['mount', '-o', 'ro', device, mount_point]
@@ -9279,7 +9298,7 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = multipr
 				src_partition_path = [path for path in src_partition_paths if path.endswith(partition)][0]
 				dest_partition_path = [path for path in dest_partition_paths if path.endswith(partition)][0]
 				print(f"Mounting {src_partition_path} at {src_mount_point}")
-				run_command_in_multicmd_with_path_check(_ro_source_mount_command(src_partition_path, src_mount_point))
+				run_command_in_multicmd_with_path_check(_dd_source_mount_command(src_partition_path, src_mount_point))
 				# check if the mount is successful
 				if not any(os.scandir(src_mount_point)) and not os.path.ismount(src_mount_point) and is_device(src_partition_path):
 					# if the source is a device and currently mounted, try to find the current mount point, then try to bind mount it

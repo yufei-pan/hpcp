@@ -135,4 +135,13 @@ def test_dd_mounts_xfs_partitions_with_nouuid(tmp_path, hpcp_mod, reset_hpcp_glo
 @pytest.mark.parametrize('fs_type, options', [('ext4', 'ro'), ('btrfs', 'ro'), ('xfs', 'ro,nouuid')])
 def test_dd_source_mount_command_is_read_only(hpcp_mod, monkeypatch, fs_type, options):
 	monkeypatch.setattr(hpcp_mod, '_probe_fs_type', lambda device: fs_type)
-	assert hpcp_mod._ro_source_mount_command('/dev/sdb1', '/mnt/x') == ['mount', '-o', options, '/dev/sdb1', '/mnt/x']
+	assert hpcp_mod._dd_source_mount_command('/dev/sdb1', '/mnt/x', entries=[]) == ['mount', '-o', options, '/dev/sdb1', '/mnt/x']
+
+
+@pytest.mark.parametrize('super_options, expected', [(['rw'], ['mount', '/dev/sdb1', '/mnt/x']), (['ro'], ['mount', '-o', 'ro,nouuid', '/dev/sdb1', '/mnt/x'])])
+def test_dd_source_mount_of_a_live_partition_keeps_its_read_only_state(hpcp_mod, monkeypatch, super_options, expected):
+	"""A mounted source (a live system disk) shares its filesystem: a mount that would change its ro state fails."""
+	monkeypatch.setattr(hpcp_mod, '_probe_fs_type', lambda device: 'xfs')
+	monkeypatch.setattr(hpcp_mod, '_device_number', lambda device: (8, 17))
+	entries = [{'devnum': (8, 17), 'source': '/dev/sdb1', 'root': '/', 'mount_point': '/', 'options': ['rw'], 'super_options': super_options}]
+	assert hpcp_mod._dd_source_mount_command('/dev/sdb1', '/mnt/x', entries=entries) == expected

@@ -651,17 +651,19 @@ def test_lost_and_found_check_stops_at_the_root(hpcp_mod):
 	assert hpcp_mod._in_root_lost_and_found('/lost+found/#12', '/') is os.path.ismount('/')
 
 
-@pytest.mark.parametrize('single_thread', [True, False])
-def test_move_keeps_a_source_with_a_special_file_it_cannot_copy(tmp_tree, hpcp_mod, reset_hpcp_globals, require_linux, copy_args, single_thread):
+@pytest.mark.parametrize('single_thread, parallel_file_listing', [(True, False), (False, False), (False, True)])
+def test_move_keeps_a_source_with_a_special_file_it_cannot_copy(tmp_tree, hpcp_mod, reset_hpcp_globals, require_linux, copy_args, single_thread, parallel_file_listing):
 	"""Ultrareview: the copy skips a FIFO (or socket, device node) without an error, and the move's rmtree then
 	deleted the only copy. The move is skipped instead."""
 	import stat
 	tmp_tree.add_file('a.txt', 'a')
-	os.mkfifo(str(tmp_tree.src / 'pipe'))
-	srcs, opts = copy_args(remove_force=True, single_thread=single_thread, max_workers=1 if single_thread else 2)
+	tmp_tree.add_file('sub/b.txt', 'b')
+	os.mkfifo(str(tmp_tree.src / 'sub' / 'pipe') if parallel_file_listing else str(tmp_tree.src / 'pipe'))
+	srcs, opts = copy_args(remove_force=True, single_thread=single_thread, max_workers=1 if single_thread else 2,
+		parallel_file_listing=parallel_file_listing)
 	assert hpcp_mod.hpcp(srcs, **opts) == 212
 	assert (tmp_tree.dst / 'a.txt').read_text() == 'a'
-	assert stat.S_ISFIFO(os.lstat(tmp_tree.src / 'pipe').st_mode)
+	assert stat.S_ISFIFO(os.lstat(tmp_tree.src / 'sub' / 'pipe' if parallel_file_listing else tmp_tree.src / 'pipe').st_mode)
 
 
 def test_copy_with_a_special_file_still_succeeds_and_says_so(tmp_tree, hpcp_mod, reset_hpcp_globals, require_linux, copy_args, capsys):
@@ -679,3 +681,26 @@ def test_overlong_path_is_a_listing_error(hpcp_mod, reset_hpcp_globals, lister):
 	result = getattr(hpcp_mod, lister)('/' + 'x' * 4100)
 	assert result[:2] == (frozenset(), frozenset())
 	assert [error.partition(':')[0] for error in hpcp_mod.ERRORS] == ['Listing error']
+
+
+def test_entry_that_went_away_during_the_listing_is_no_special_file(tmp_path, hpcp_mod, reset_hpcp_globals):
+	"""Without d_type (xfs ftype=0, some NFS) is_file() stats the entry: one deleted meanwhile reads as neither file
+	nor directory nor link. It is gone, as in 9.72: no note and no error."""
+	class Gone:
+		path = str(tmp_path / 'gone.txt')
+		def is_symlink(self):
+			return False
+		def is_file(self, follow_symlinks=True):
+			return False
+		def is_dir(self, follow_symlinks=True):
+			return False
+		def stat(self, follow_symlinks=True):
+			raise FileNotFoundError(2, 'No such file or directory', self.path)
+	assert hpcp_mod._special_file_kind(Gone()) is None
+
+
+def test_special_file_kind_names_a_fifo(tmp_path, hpcp_mod):
+	os.mkfifo(str(tmp_path / 'p'))
+	(tmp_path / 'f').write_text('f')
+	kinds = {entry.name: hpcp_mod._special_file_kind(entry) for entry in os.scandir(tmp_path)}
+	assert kinds == {'p': 'FIFO', 'f': None}

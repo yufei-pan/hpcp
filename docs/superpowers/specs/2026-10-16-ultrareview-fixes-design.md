@@ -150,6 +150,20 @@ Each review after the first found fewer and narrower issues, almost all where `-
 3. **cas-toolbox: mid-week hotfix 2026.42.2** pinning `hpcp==9.73` (2026.42.1, published, ships 9.72 and its source-deleting `-rm` bugs).
 4. **Release order:** the user runs `/code-review ultra` on this branch first; its findings are fixed; then main is fast-forwarded and pushed, hpcp 9.73 published, cas-toolbox 2026.42.2 published, and the `ultrareview-*` branches and the worktree deleted.
 
+## Ultrareview of the fix branch (eaee294 against main)
+
+The user ran `/code-review ultra main` on the branch after the decisions above. Seven findings, all handled:
+
+1. **Normal, a regression of C3.** The listing goes on past a directory it cannot read, so `-diff` (and `-cfl`/`-dfl`) built a map without that directory's entries, and every base file under it became a delete row: applying the patch would delete them. `build_entry_map` now raises `Listing error` when its listing recorded a failure, before any patch exists (9.72 ended there too, with a crash).
+2. **Normal, a regression of D2.** An unhashed list whose every name has a ':' (a source root named `snap:…`) was read as a `-hs 0` list, its lines as `path:target` links. A list now counts as `-hs 0` only when a line is a bare `path:` (what `-hs 0` writes for a file) and every line has a ':'. A `-hs 0` list of links only reads as unhashed.
+3. **Nit, a regression of D1.** The `-dd` source was mounted read-write with `nouuid`, so a duplicate-UUID xfs clone (refused, and the run stopped, in 9.72) was mounted and written. A source partition that is not mounted is now mounted read-only (`ro`, plus `nouuid` for xfs). Recovery is kept (not `norecovery`/`noload`, as the reviewer proposed), so a dirty source is copied in its recovered state rather than inconsistent. The first version of this fix mounted every source read-only, which broke the documented live-disk clone: the kernel refuses a read-only mount of a partition mounted read-write ("would change RO state"), checked on this kernel for ext4 and xfs. A partition that is mounted is now mounted the way it is live (plainly when read-write, as in 9.72). A real test clones a loop disk whose partition is mounted read-write.
+4. **Nit.** `_link_dests` now builds the link destinations at all four copy paths.
+5. **Pre-existing.** `-rme` removed an empty `lost+found` at a filesystem root (a `-di` image, an ext4 destination), and would delete the orphans fsck puts there. A filesystem's own `lost+found`, directly at a mount point, and everything in it are left alone.
+6. **Pre-existing, left by D1.** An existing `-di` image was mounted without `nouuid`; a cloned xfs image then went to the repair prompt, whose default runs `xfs_repair -L`. Both mounts in `get_dest_from_image` use `_rw_mount_command`.
+7. **Pre-existing.** `-rm` removes whole source trees, so what the copy skipped without an error was deleted with no copy: FIFOs, sockets and device nodes, and paths over 4096 characters. A special file is now noted (`Special file skipped`, rc 0, so a plain copy still succeeds) and blocks `-rm`; an overlong path is a `Listing error`. A file created in the source after the copy listed it is still removed; the README says to stop writing to a source before moving it. The reviewer's fuller fix (remove only what was copied, then `rmdir` empty directories) is left for a later round: it changes how `-rm` deletes (the bulk `rmtree` is what makes it fast on Lustre).
+
+Found in the self-review of this wave: without d_type (xfs `ftype=0`, some NFS) `is_file()` stats an entry, and one deleted meanwhile is neither file nor directory nor link; the special-file check would have turned it into a `Listing error`. A deleted entry is skipped, as in 9.72.
+
 ## Testing
 
 - Every fix starts with a test that fails on 9.72.

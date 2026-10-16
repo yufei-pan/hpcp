@@ -1507,3 +1507,46 @@ def test_dd_copies_a_btrfs_partition_with_the_source_uuid_and_label(tmp_path):
 	finally:
 		_detach_loops_for_image(src)
 		_detach_loops_for_image(dest)
+
+
+@requires_root_and_tools
+@pytest.mark.parametrize('fs_type', ['ext4', 'xfs'])
+def test_dd_clones_a_disk_whose_partition_is_mounted_read_write(tmp_path, fs_type):
+	"""The documented -dd use: cloning a live system disk, its partitions mounted read-write. The kernel refuses a
+	read-only mount of such a partition ('would change RO state'), so -dd mounts it as it is live."""
+	if shutil.which(f'mkfs.{fs_type}') is None:
+		pytest.skip(f'needs mkfs.{fs_type}')
+	src = str(tmp_path / 'disk.img')
+	dest = str(tmp_path / 'dest.img')
+	live = str(tmp_path / 'live')
+	os.makedirs(live)
+	_run('truncate', '-s', '400M', src)
+	_run('sgdisk', '--clear', '--new=1:0:0', '--typecode=1:8300', src)
+	loop = _run('losetup', '--partscan', '--find', '--show', src).strip()
+	try:
+		subprocess.run(['udevadm', 'settle'], check=False, capture_output=True)
+		_run(f'mkfs.{fs_type}', '-q', '-f' if fs_type == 'xfs' else '-F', f'{loop}p1')
+		_run('mount', f'{loop}p1', live)
+		try:
+			with open(os.path.join(live, 'file1.txt'), 'w') as f:
+				f.write('live\n')
+			_run_hpcp_dd([], loop, dest)
+		finally:
+			_run('umount', live)
+	finally:
+		subprocess.run(['losetup', '-d', loop], check=False, capture_output=True)
+		_detach_loops_for_image(dest)
+	check = str(tmp_path / 'check')
+	os.makedirs(check)
+	loop = _run('losetup', '--partscan', '--find', '--show', '--read-only', dest).strip()
+	try:
+		subprocess.run(['udevadm', 'settle'], check=False, capture_output=True)
+		_run('mount', '-o', 'ro,nouuid' if fs_type == 'xfs' else 'ro', f'{loop}p1', check)
+		try:
+			with open(os.path.join(check, 'file1.txt')) as f:
+				assert f.read() == 'live\n'
+		finally:
+			_run('umount', check)
+	finally:
+		subprocess.run(['losetup', '-d', loop], check=False, capture_output=True)
+		_detach_loops_for_image(dest)
