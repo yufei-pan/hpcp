@@ -8636,40 +8636,205 @@ def _parent_below(root, root_id, rel):
 		raise
 	return fd, name, None
 
+def _remove_one_listed(root, root_id, rel):
+	"""Unlink one listed entry relative to its directory's descriptor (_parent_below), never a directory. For the root
+	itself (rel '.') and for platforms without descriptor support; _remove_listed_files does the rest."""
+	path = os.path.join(root, rel)
+	fd = None
+	try:
+		fd, name, identity = _parent_below(root, root_id, rel)
+		st = os.stat(name, dir_fd=fd, follow_symlinks=False) if fd is not None else os.lstat(path)
+		if identity is not None and (st.st_dev, st.st_ino) != tuple(identity):
+			raise _replaced(path)
+		if stat.S_ISDIR(st.st_mode):
+			return
+		if fd is not None:
+			os.unlink(name, dir_fd=fd)
+		else:
+			os.unlink(path)
+	except FileNotFoundError:
+		pass
+	except OSError as exc:
+		_report_unremoved(path, exc)
+	finally:
+		if fd is not None:
+			os.close(fd)
+
+def _report_unremoved(path, exc):
+	if exc.errno in (errno.ELOOP, errno.ENOTDIR, errno.ESTALE):
+		eprint(f'Remove process exception: not removing {path}: it, or a directory on its path, is no longer what the copy listed ({exc.strerror})')
+	else:
+		eprint(f'Remove process exception:\n Deleting {path} generated an exception: {exc}')
+
+def _unlink_failed(name, dir_fd, path, exc):
+	"""Report a failed unlink, unless name is a directory (macOS refuses one with EPERM, not EISDIR): left as it is."""
+	if isinstance(exc, PermissionError):
+		try:
+			if stat.S_ISDIR(os.stat(name, dir_fd=dir_fd, follow_symlinks=False).st_mode):
+				return
+		except OSError:
+			pass
+	_report_unremoved(path, exc)
+
 def _remove_listed_files(items):
 	"""Worker body for remove_moved_sources: unlink these (source root, its identity, path below it) entries, files and
-	links. Never a directory: a listed path that is one now (it changed since the copy listed it) keeps what it holds;
-	one already gone is no error. Each goes relative to its directory's descriptor (_parent_below): a source root
-	replaced, or a directory swapped for a symlink, in a tree other users can write to (this often runs as root) stops
-	the removal instead of deleting outside the source. Returns (bytes, seconds), as delete_file_bulk does."""
-	total_size = 0
+	links, in path order. Never a directory: unlink refuses one, so a listed path that became a directory keeps what it
+	holds; one already gone is no error. Each goes relative to its directory's descriptor, reached from the pinned root
+	(_open_source_root) one component at a time with O_NOFOLLOW: a source root replaced, or a directory swapped for a
+	symlink, in a tree other users can write to (this often runs as root) stops the removal instead of deleting outside
+	the source. The descriptors of the current directory and of the ones above it stay open while the entries share
+	them, so each directory is opened about once per job; nothing is stat'ed (a stat costs a server round trip on
+	Lustre). Returns (bytes, seconds) as delete_file_bulk does; bytes are not counted."""
 	start_time = time.monotonic()
-	for root, root_id, rel in items:
-		path = os.path.join(root, rel)
-		fd = None
-		try:
-			fd, name, identity = _parent_below(root, root_id, rel)
-			st = os.stat(name, dir_fd=fd, follow_symlinks=False) if fd is not None else os.lstat(path)
-			if identity is not None and (st.st_dev, st.st_ino) != tuple(identity):
-				raise _replaced(path)
-			if stat.S_ISDIR(st.st_mode):
+	if not _DIR_FD_WALK:
+		for root, root_id, rel in items:
+			_remove_one_listed(root, root_id, rel)
+		return 0, time.monotonic() - start_time
+	# stack: [(name, descriptor)], the root first (name None), then each directory down to the current one.
+	stack, current_root = [], None
+	# (root, components) of a directory that could not be entered: nothing listed below it is removed.
+	refused = None
+	# The directory the stack shows (root, its path below the root): the next file in it needs no descriptor work.
+	shown = None
+	try:
+		for root, root_id, rel in items:
+			if rel in ('', '.'):
+				_remove_one_listed(root, root_id, rel)
 				continue
-			if fd is not None:
-				os.unlink(name, dir_fd=fd)
+			parent_rel, _, name = rel.rpartition(os.sep)
+			if shown is not None and shown[0] == root and shown[1] == parent_rel:
+				try:
+					os.unlink(name, dir_fd=stack[-1][1])
+				except (FileNotFoundError, IsADirectoryError):
+					pass
+				except OSError as exc:
+					_unlink_failed(name, stack[-1][1], os.path.join(root, rel), exc)
+				continue
+			shown = None
+			parent = parent_rel.split(os.sep) if parent_rel else []
+			if refused is not None and refused[0] == root and parent[:len(refused[1])] == refused[1]:
+				continue
+			if root != current_root:
+				while stack:
+					os.close(stack.pop()[1])
+				current_root = None
+				shown = None
+				try:
+					stack.append((None, _open_source_root(root, root_id)))
+				except OSError as exc:
+					refused = (root, [])
+					if not isinstance(exc, FileNotFoundError):
+						_report_unremoved(root, exc)
+					continue
+				current_root = root
+			depth = 0
+			while depth < len(parent) and depth + 1 < len(stack) and stack[depth + 1][0] == parent[depth]:
+				depth += 1
+			while len(stack) > depth + 1:
+				os.close(stack.pop()[1])
+			try:
+				for part in parent[depth:]:
+					stack.append((part, os.open(part, _BELOW_FLAGS, dir_fd=stack[-1][1])))
+			except OSError as exc:
+				refused = (root, parent[:len(stack)])
+				if not isinstance(exc, FileNotFoundError):
+					_report_unremoved(os.path.join(root, *parent[:len(stack)]), exc)
+				continue
+			shown = (root, parent_rel)
+			try:
+				os.unlink(name, dir_fd=stack[-1][1])
+			except (FileNotFoundError, IsADirectoryError):
+				pass
+			except OSError as exc:
+				_unlink_failed(name, stack[-1][1], os.path.join(root, rel), exc)
+	finally:
+		while stack:
+			os.close(stack.pop()[1])
+	return 0, time.monotonic() - start_time
+
+def _remove_empty_source_dirs(root, root_id, exclude=None):
+	"""remove_moved_sources' second pass: rmdir the source root's directories that are empty once the listed entries are
+	gone, deepest first, walking by descriptors from the pinned root with O_NOFOLLOW, as shutil.rmtree does (one open
+	and one listing per directory). Excluded paths are not entered. Returns (entries left in place, excluded ones
+	aside; errors as (path, OSError)): a directory left holds one of them, or failed to go (an error)."""
+	left, errors = [], []
+	if not _DIR_FD_WALK:
+		directories = []
+		for dirpath, dirnames, filenames in os.walk(root):
+			directories.append(dirpath)
+			left.extend(os.path.join(dirpath, name) for name in filenames if not (exclude and is_excluded(os.path.join(dirpath, name), exclude)))
+			dirnames[:] = [name for name in dirnames if not (exclude and is_excluded(os.path.join(dirpath, name), exclude))]
+		for directory in sorted(directories, key=lambda path: path.count(os.sep), reverse=True):
+			e = _rmdir_below(root, root_id, os.path.relpath(directory, root))
+			if e is not None and e.errno not in (errno.ENOTEMPTY, errno.EEXIST, errno.EBUSY):
+				errors.append((directory, e))
+		return left, errors
+	try:
+		root_fd = _open_source_root(root, root_id)
+	except FileNotFoundError:
+		return left, errors
+	except OSError as e:
+		return left, [(root, e)]
+	# frames: [descriptor, path, subdirectory names, next one, name in the parent]
+	stack = []
+	def enter(fd, path, name):
+		try:
+			names = os.listdir(fd)
+		except OSError as e:
+			os.close(fd)
+			errors.append((path, e))
+			return
+		subdirectories = []
+		for entry in names:
+			child = os.path.join(path, entry)
+			if exclude and is_excluded(child, exclude):
+				continue
+			try:
+				mode = os.stat(entry, dir_fd=fd, follow_symlinks=False).st_mode
+			except FileNotFoundError:
+				continue
+			except OSError as e:
+				errors.append((child, e))
+				continue
+			if stat.S_ISDIR(mode):
+				subdirectories.append(entry)
 			else:
-				os.unlink(path)
-			total_size += st.st_size
-		except FileNotFoundError:
-			continue
-		except OSError as exc:
-			if exc.errno in (errno.ELOOP, errno.ENOTDIR, errno.ESTALE):
-				eprint(f'Remove process exception: not removing {path}: it, or a directory on its path, is no longer what the copy listed ({exc.strerror})')
+				left.append(child)
+		stack.append([fd, path, subdirectories, 0, name])
+	try:
+		enter(root_fd, root, None)
+		while stack:
+			frame = stack[-1]
+			if frame[3] < len(frame[2]):
+				entry = frame[2][frame[3]]
+				frame[3] += 1
+				try:
+					fd = os.open(entry, _BELOW_FLAGS, dir_fd=frame[0])
+				except FileNotFoundError:
+					continue
+				except OSError as e:
+					errors.append((os.path.join(frame[1], entry), e))
+					continue
+				enter(fd, os.path.join(frame[1], entry), entry)
+				continue
+			stack.pop()
+			os.close(frame[0])
+			if stack:
+				try:
+					os.rmdir(frame[4], dir_fd=stack[-1][0])
+				except FileNotFoundError:
+					pass
+				except OSError as e:
+					if e.errno not in (errno.ENOTEMPTY, errno.EEXIST, errno.EBUSY):
+						errors.append((frame[1], e))
 			else:
-				eprint(f'Remove process exception:\n Deleting {path} generated an exception: {exc}')
-		finally:
-			if fd is not None:
-				os.close(fd)
-	return total_size, time.monotonic() - start_time
+				e = _rmdir_below(root, root_id, '.')
+				if e is not None and e.errno not in (errno.ENOTEMPTY, errno.EEXIST, errno.EBUSY):
+					errors.append((root, e))
+	finally:
+		while stack:
+			os.close(stack.pop()[0])
+	return left, errors
 
 def _rmdir_below(root, root_id, rel):
 	"""rmdir root/rel relative to its parent's descriptor (_parent_below). Returns the OSError, or None when it is gone."""
@@ -8711,13 +8876,18 @@ def remove_moved_sources(src_paths, file_list, sym_links, single_thread=False, m
 		roots.append(path)
 	root_ids = {root: (root_ids or {}).get(root, _path_identity(root) if root_ids is None else None) for root in roots}
 	# Each listed entry with the outermost source root it lies below, so its removal is checked from there down.
-	by_length = sorted(roots, key=len)
+	by_length = [(root, root.rstrip(os.sep) + os.sep) for root in sorted(roots, key=len)]
 	listed = []
 	for path in sorted(set(file_list) | set(sym_links or ())):
-		path = os.path.abspath(path)
-		root = next((root for root in by_length if path == root or path.startswith(root.rstrip(os.sep) + os.sep)), None)
-		if root is not None:
-			listed.append((root, root_ids[root], os.path.relpath(path, root)))
+		if not os.path.isabs(path):
+			path = os.path.abspath(path)
+		for root, prefix in by_length:
+			if path.startswith(prefix):
+				listed.append((root, root_ids[root], path[len(prefix):]))
+				break
+			if path == root:
+				listed.append((root, root_ids[root], '.'))
+				break
 	print(f"Removing the {len(listed)} files and links copied from {pformat(roots)} with {max_workers if not single_thread else '1'} workers")
 	if not remove_force:
 		if not sys.stdin.isatty():
@@ -8729,36 +8899,20 @@ def remove_moved_sources(src_paths, file_list, sym_links, single_thread=False, m
 	if single_thread or max_workers <= 1:
 		_remove_listed_files(listed)
 	elif listed:
-		delete_file_list_parallel(listed, max_workers, verbose, files_per_job, remover=_remove_listed_files)
-	directories = []
+		# Jobs of neighbouring entries share their directories' descriptors (_remove_listed_files): start them large enough.
+		delete_file_list_parallel(listed, max_workers, verbose, max(files_per_job, min(256, len(listed) // (max_workers * 4) or 1)),
+			remover=_remove_listed_files)
+	left = []
 	for root in roots:
 		if not os.path.isdir(root) or os.path.islink(root):
 			continue
-		for dirpath, dirnames, _ in os.walk(root):
-			directories.append((root, dirpath))
-			dirnames[:] = [name for name in dirnames if not (exclude and is_excluded(os.path.join(dirpath, name), exclude))]
-	kept = set()
-	for root, directory in sorted(directories, key=lambda item: item[1].count(os.sep), reverse=True):
-		# Empty directories only, each relative to its parent's descriptor (a swapped symlink stops it, see _parent_below).
-		e = _rmdir_below(root, root_ids[root], os.path.relpath(directory, root))
-		if e is None:
-			continue
-		if e.errno in (errno.ENOTEMPTY, errno.EEXIST, errno.EBUSY):
-			kept.add(directory)
-		elif e.errno in (errno.ELOOP, errno.ENOTDIR, errno.ESTALE):
-			eprint(f'Remove directory failed: not removing {directory}: it, or a directory on its path, is no longer what the copy listed ({e.strerror})')
-		else:
-			eprint(f'Remove directory failed: {directory}: {e}')
-	left = []
-	for directory in sorted(kept):
-		try:
-			names = os.listdir(directory)
-		except OSError:
-			continue
-		for name in names:
-			path = os.path.join(directory, name)
-			if path not in kept and not (exclude and is_excluded(path, exclude)):
-				left.append(path)
+		root_left, errors = _remove_empty_source_dirs(root, root_ids[root], exclude)
+		left.extend(root_left)
+		for directory, e in errors:
+			if e.errno in (errno.ELOOP, errno.ENOTDIR, errno.ESTALE):
+				eprint(f'Remove directory failed: not removing {directory}: it, or a directory on its path, is no longer what the copy listed ({e.strerror})')
+			else:
+				eprint(f'Remove directory failed: {directory}: {e}')
 	if left:
 		shown = ', '.join(pformat(path) for path in left[:10]) + (f' and {len(left) - 10} more' if len(left) > 10 else '')
 		eprint(f'Move left entries: {len(left)} source entries the copy did not list (written during the move, or special '

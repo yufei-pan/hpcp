@@ -883,3 +883,41 @@ def test_move_of_a_source_root_replaced_during_the_copy_removes_nothing_from_the
 	srcs, opts = copy_args(remove_force=True)
 	hpcp_mod.hpcp(srcs, **opts)
 	assert (victim / 'f.txt').read_text() == 'not yours'
+
+
+def test_move_removal_opens_each_directory_about_once(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	"""9.72 removed by path; the safe removal must not reopen every directory above each file (Lustre: a server round
+	trip per open). Sorted entries share their directories' descriptors."""
+	root = tmp_path / 'src'
+	rels = []
+	for top in range(4):
+		for depth in range(4):
+			directory = os.path.join(*(['d%d' % top] + ['s%d' % level for level in range(depth)]))
+			os.makedirs(root / directory, exist_ok=True)
+			for index in range(6):
+				(root / directory / ('f%d' % index)).write_text('x')
+				rels.append(os.path.join(directory, 'f%d' % index))
+	directories = {os.path.dirname(rel) for rel in rels}
+	opens = []
+	real_open = os.open
+	monkeypatch.setattr(hpcp_mod.os, 'open', lambda *args, **kwargs: opens.append(args[0]) or real_open(*args, **kwargs))
+	root_id = hpcp_mod._path_identity(str(root))
+	hpcp_mod._remove_listed_files([(str(root), root_id, rel) for rel in sorted(rels)])
+	assert not any((root / rel).exists() for rel in rels)
+	# The root's parent and the root, then each directory once.
+	assert len(opens) <= len(directories) + 2
+
+
+def test_a_directory_the_move_cannot_enter_does_not_stop_its_siblings(tmp_path, hpcp_mod, reset_hpcp_globals):
+	root, victim = tmp_path / 'src', tmp_path / 'victim'
+	for name in ('a', 'b', 'c'):
+		(root / name).mkdir(parents=True)
+		(root / name / 'f').write_text(name)
+	victim.mkdir()
+	(victim / 'f').write_text('not yours')
+	root_id = hpcp_mod._path_identity(str(root))
+	_swap_for_a_symlink(root / 'b', victim)
+	hpcp_mod._remove_listed_files([(str(root), root_id, os.path.join(name, 'f')) for name in ('a', 'b', 'c')])
+	assert not (root / 'a' / 'f').exists() and not (root / 'c' / 'f').exists()
+	assert (victim / 'f').read_text() == 'not yours'
+	assert [error.partition(':')[0] for error in hpcp_mod.ERRORS] == ['Remove process exception']
