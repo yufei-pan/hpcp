@@ -9352,7 +9352,9 @@ def hpcp_gui():
 			if var_parallel_file_listing.get(): 
 				print(f"Parallel File Listing: {var_parallel_file_listing.get()}")
 
-			hpcp([src_entry.get()], dest_entry.get(), single_thread=var_single_thread.get(), max_workers=var_max_workers.get(),
+			# dest_paths is a list: a bare str would be taken one character per destination.
+			dest = dest_entry.get()
+			hpcp([src_entry.get()], [dest] if dest else [], single_thread=var_single_thread.get(), max_workers=var_max_workers.get(),
 				verbose=var_verbose.get(), directory_only=var_directory_only.get(), full_hash=var_full_hash.get(), files_per_job=var_files_per_job.get(),
 				target_file_list=var_file_list.get(), compare_file_list=var_compare_file_list.get(), remove=var_remove.get(), remove_extra=var_remove_extra.get(),
 				parallel_file_listing=var_parallel_file_listing.get())
