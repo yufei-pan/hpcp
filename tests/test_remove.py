@@ -325,3 +325,32 @@ def test_remove_extra_into_a_dest_image_removes_only_the_extra(tmp_path, hpcp_mo
 		assert not os.path.exists(os.path.join(mirrored, 'gonedir'))
 	finally:
 		hpcp_mod.clean_up(mount_points, loop_devices)
+
+
+def test_move_to_a_destination_glob_that_matches_nothing_removes_nothing(tmp_tree, hpcp_mod, reset_hpcp_globals, require_linux):
+	"""Requested destinations that all fall away must stop the run, not turn -rm into a plain delete."""
+	tmp_tree.add_file('a.txt', 'a')
+	rc = hpcp_mod.hpcp([str(tmp_tree.src) + os.sep], dest_paths=[str(tmp_tree.root / 'node*') + os.sep], remove_force=True,
+		single_thread=True, batch=True)
+	assert (tmp_tree.src / 'a.txt').read_text() == 'a'
+	assert rc == 202
+
+
+@pytest.mark.skipif(os.name == 'nt' or os.geteuid() != 0 or any(__import__('shutil').which(tool) is None for tool in _IMAGE_TOOLS),
+	reason='needs root and losetup/mkfs.ext4/mount/umount/lsblk')
+@pytest.mark.root
+@pytest.mark.loop
+def test_move_into_a_new_dest_image_creates_it_before_removing_the_sources(tmp_path, hpcp_mod, reset_hpcp_globals):
+	"""-rm -di NEW.img: the image is created and filled first; before 9.73 the sources were removed and no image made."""
+	src = tmp_path / 'live' / 'data'
+	src.mkdir(parents=True)
+	(src / 'keep.txt').write_text('keep')
+	image = str(tmp_path / 'moved.img')
+	assert hpcp_mod.hpcp([str(src)], dest_image=image, remove_force=True, single_thread=True, max_workers=1, batch=True) == 0
+	assert os.path.isfile(image) and not src.exists()
+	mount_points, loop_devices = [], []
+	try:
+		root = hpcp_mod._mount_single_fs_image(image, True, mount_points, loop_devices)
+		assert open(os.path.join(root, os.path.relpath(str(src), '/'), 'keep.txt')).read() == 'keep'
+	finally:
+		hpcp_mod.clean_up(mount_points, loop_devices)

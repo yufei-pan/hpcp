@@ -9215,7 +9215,15 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = multipr
 		for dest in dests_to_remove:
 			dests.remove(dest)
 		if not dests:
-			if remove:
+			if dest_image and target_mount_point:
+				# A -di image that does not exist yet: create it, with -rm too (a move into a new image).
+				dests = create_image(dest_image,target_mount_point,loop_devices,src_paths,mount_points,max_workers=max_workers,parallel_file_listing=parallel_file_listing,exclude=exclude,dest_image_size = dest_image_size)
+			elif dest_paths:
+				# Destinations were asked for and none is usable (a -d glob that matches nothing): with -rm, going on
+				# would delete the sources without copying them.
+				raise RuntimeError(f"No valid destination: none of {dest_paths} gives a destination; nothing copied"
+					f"{', sources not removed' if remove else ''}")
+			elif remove:
 				dests = ...
 			else:
 				dests = create_image(dest_image,target_mount_point,loop_devices,src_paths,mount_points,max_workers=max_workers,parallel_file_listing=parallel_file_listing,exclude=exclude,dest_image_size = dest_image_size)
