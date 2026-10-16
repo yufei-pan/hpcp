@@ -434,3 +434,16 @@ def test_spawned_workers_get_the_run_settings(tmp_tree, hpcp_mod, reset_hpcp_glo
 	# -co: cp -f, so the copies get fresh mtimes; -ncd: the missing nodir/ is not created.
 	assert all(os.stat(tmp_tree.dst / name).st_mtime > old + 86400 for name in ('a.txt', 'b.txt'))
 	assert not (tmp_tree.dst / 'nodir').exists()
+
+
+# ---- 9.73: symlinks (review C8, C9) ----
+
+@pytest.mark.parametrize('single_thread', [True, False])
+def test_directory_of_only_symlinks_is_copied(tmp_tree, hpcp_mod, reset_hpcp_globals, require_linux, copy_args, single_thread):
+	"""Review C9: with -s the early return for 'no files' dropped the symlinks the listing found."""
+	tmp_tree.add_symlink('links/abs', '/etc/hostname')
+	tmp_tree.add_symlink('links/rel', 'abs')
+	srcs, opts = copy_args(single_thread=single_thread, max_workers=1 if single_thread else 2)
+	assert hpcp_mod.hpcp(srcs, **opts) == 0
+	assert os.readlink(tmp_tree.dst / 'links' / 'abs') == '/etc/hostname'
+	assert os.readlink(tmp_tree.dst / 'links' / 'rel') == 'abs'

@@ -3470,7 +3470,12 @@ def copy_files_serial_batch(jobs, full_hash=False, verbose=False,exclude=None,ex
 	print(f"Number of files: {total_item_count}")
 	print(f"Estimated size: {format_bytes(total_size_count)}B")
 	if total_item_count == 0:
-		return 0, 0, set(), frozenset()
+		# Nothing to copy, but the directories may still hold symlinks to recreate.
+		for src_path, dest_paths, _, links, _ in newJobs:
+			for link in links:
+				srcRelativePath = os.path.relpath(link, src_path)
+				total_symLinks[link] = [os.path.join(dest_path, srcRelativePath) for dest_path in dest_paths]
+		return 0, 0, total_symLinks, frozenset()
 	start_time = time.monotonic()
 	apb = Adaptive_Progress_Bar(total_count=total_item_count,total_size=total_size_count,last_num_job_for_stats=1,process_word='Copied',suppress_all_output=verbose,bytes_rate_limit=BYTES_RATE_LIMIT,files_rate_limit=FILES_RATE_LIMIT)
 	apb.item_counter = copied_count
