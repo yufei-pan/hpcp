@@ -669,3 +669,18 @@ def test_symlinked_directory_note_prints_even_when_the_target_is_there(tmp_tree,
 	os.symlink(str(elsewhere / 'deep'), str(tmp_tree.dst / 'sub'))
 	hpcp_mod.create_sym_links({link: [str(tmp_tree.dst / 'l')]}, link_tracking=True)
 	assert 'goes through a symlinked directory' in capsys.readouterr().err
+
+
+
+def test_relative_directory_link_is_recreated_as_one_whatever_the_cwd(tmp_tree, hpcp_mod, reset_hpcp_globals, require_linux, monkeypatch):
+	"""Review of eaee294: target_is_directory tested a relative target against the CWD, not the link's directory
+	(on Windows a directory link then came out as a file link)."""
+	tmp_tree.add_dir('dir')
+	link = tmp_tree.add_symlink('sub/l', '../dir')
+	calls = []
+	real = os.symlink
+	monkeypatch.setattr(hpcp_mod.os, 'symlink', lambda target, path, target_is_directory=False, **kw: calls.append(target_is_directory) or real(target, path))
+	monkeypatch.chdir(tmp_tree.root)
+	(tmp_tree.dst / 'sub').mkdir()
+	hpcp_mod.create_sym_links({str(link): [str(tmp_tree.dst / 'sub' / 'l')]})
+	assert calls == [True]

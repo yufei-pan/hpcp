@@ -2307,26 +2307,29 @@ def create_sym_links(symLinks,exclude=None,link_tracking=False):
 			# Determine if the link is a absolute link or relative link
 			linkedTargetFile = os.readlink(src)
 			dest = ''
-			# The link's target at the source when tracking applies to it (relative, link tracking on); keep_target: its
-			# destination copy belongs to the copy (the target exists at the source), and -rme keeps it (_kept_paths).
+			# The link's target at the source (relative links); keep_target: its destination copy belongs to the copy (the
+			# target exists at the source, with tracking) or is the copy of an excluded path, and -rme keeps it (_kept_paths).
 			sourceLinkedFile = None
 			keep_target = False
 			if not os.path.isabs(linkedTargetFile):
 				# Files are spread over the dests: a relative link goes where its target is, so that it resolves.
 				destLinkedFiles = [os.path.join(os.path.dirname(d), linkedTargetFile) for d in dests]
 				dest = next((d for d, destLinkedFile in zip(dests, destLinkedFiles) if os.path.exists(destLinkedFile)), '')
+				# The target by the link's own spelling with '..' resolved, so -e patterns match it and the tracked tree;
+				# used only when the kernel resolves the link to that same file (no '..' after a symlinked directory).
+				linked = os.path.join(os.path.dirname(src), linkedTargetFile)
+				sourceLinkedFile = os.path.normpath(linked)
+				through_symlinked_dir = bool(link_tracking or exclude) and os.pardir in linkedTargetFile.split(os.sep) and os.path.realpath(sourceLinkedFile) != os.path.realpath(linked)
+				# Not copied, but an earlier copy of it in the destination is kept, as for any excluded path: with or
+				# without tracking (an -e protects it either way).
+				keep_target = bool(exclude) and not through_symlinked_dir and _excluded_or_below(sourceLinkedFile, exclude,
+					stop=os.path.commonpath([sourceLinkedFile, os.path.dirname(os.path.abspath(src))]))
 				if link_tracking:
-					# The target by the link's own spelling with '..' resolved, so -e patterns match it and the tracked tree;
-					# used only when the kernel resolves the link to that same file (no '..' after a symlinked directory).
-					linked = os.path.join(os.path.dirname(src), linkedTargetFile)
-					sourceLinkedFile = os.path.normpath(linked)
 					note = None
-					if os.pardir in linkedTargetFile.split(os.sep) and os.path.realpath(sourceLinkedFile) != os.path.realpath(linked):
+					if through_symlinked_dir:
 						# Said always: an earlier copy at the spelled path is not kept for this link.
 						print(f"\n{pformat(src)} -> {pformat(linkedTargetFile)} goes through a symlinked directory: its target is not tracked", file=sys.stderr)
-					elif _excluded_or_below(sourceLinkedFile, exclude, stop=os.path.commonpath([sourceLinkedFile, os.path.dirname(os.path.abspath(src))])):
-						# Not copied, but an earlier copy of it in the destination is kept, as for any excluded path.
-						keep_target = True
+					elif keep_target:
 						note = f"\n{pformat(sourceLinkedFile)}, linked by {pformat(src)}, is excluded: not copying it"
 					elif not os.path.exists(sourceLinkedFile):
 						# A dangling link is copied as it is: a note, not an error (eprint would record any path with a ':').
@@ -2352,7 +2355,8 @@ def create_sym_links(symLinks,exclude=None,link_tracking=False):
 				elif dest in dests:
 					dests.remove(dest)
 				try:
-					os.symlink(linkedTargetFile, dest, target_is_directory=os.path.isdir(linkedTargetFile))
+					# A relative target is resolved from the link's directory (Windows makes directory and file links apart).
+					os.symlink(linkedTargetFile, dest, target_is_directory=os.path.isdir(os.path.join(os.path.dirname(src), linkedTargetFile)))
 					if keep_target:
 						tracked_targets.add((os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(dest)), linkedTargetFile)),
 							sourceLinkedFile, os.path.abspath(dest)))
@@ -9605,6 +9609,9 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = multipr
 
 			if dest_image_size:
 				print(f"Applying dest_image_size {format_bytes(dest_image_size)}B to -dd destination image.")
+			if link_tracking and not no_link_tracking:
+				# Each partition is copied on its own: a tracked target could lie outside it (or outside the disk).
+				print("Note: -lt is ignored with -dd: each partition's symlinks are copied as they are.", file=sys.stderr)
 				
 			if not dest_path and src_path:
 				eprint(f"Destination path not specified, using {src_path[-1]} as destination")

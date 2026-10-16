@@ -97,7 +97,8 @@ def test_dd_partition_copy_status_ignores_errors_recorded_before_it(
 	assert rc == 152
 
 
-def test_dd_mounts_xfs_partitions_with_nouuid(tmp_path, hpcp_mod, reset_hpcp_globals, require_linux, monkeypatch):
+@pytest.mark.parametrize('link_tracking', [False, True])
+def test_dd_mounts_xfs_partitions_with_nouuid(tmp_path, hpcp_mod, reset_hpcp_globals, require_linux, monkeypatch, capsys, link_tracking):
 	"""A -dd source that is an image of a disk whose xfs is mounted (the live node it was taken from) has that UUID.
 	The source is only read, so it is mounted read-only (ultrareview: a read-write nouuid mount wrote to a clone)."""
 	roots = []
@@ -128,8 +129,10 @@ def test_dd_mounts_xfs_partitions_with_nouuid(tmp_path, hpcp_mod, reset_hpcp_glo
 	monkeypatch.setattr(hpcp_mod, 'run_command_in_multicmd_with_path_check', run)
 	monkeypatch.setattr(hpcp_mod, 'clean_up', lambda *a: None)
 	assert hpcp_mod.hpcp(['/dev/fake-source'], dest_image=str(tmp_path / 'dest.img'), dd=True,
-		single_thread=True, max_workers=1, no_directory_sync=True) == 0
+		single_thread=True, max_workers=1, no_directory_sync=True, link_tracking=link_tracking) == 0
 	assert [command[:3] for command in mounts] == [['mount', '-o', 'ro,nouuid'], ['mount', '-o', 'nouuid']]
+	# Review of eaee294: -lt does not apply to a partition's copy (a tracked target could lie outside it); say so.
+	assert ('-lt is ignored with -dd' in capsys.readouterr().err) is link_tracking
 
 
 @pytest.mark.parametrize('fs_type, options', [('ext4', 'ro'), ('btrfs', 'ro'), ('xfs', 'ro,nouuid')])

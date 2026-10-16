@@ -428,11 +428,12 @@ def test_remove_extra_dirs_with_dest_image_follows_this_runs_sources(tmp_path, h
 	assert not mirrored_b.exists()
 
 
-def test_move_with_a_dangling_link_whose_path_has_a_colon_goes_on(tmp_tree, hpcp_mod, reset_hpcp_globals, require_linux, copy_args):
+@pytest.mark.parametrize('link_tracking', [True, False])
+def test_move_with_a_dangling_link_whose_path_has_a_colon_goes_on(tmp_tree, hpcp_mod, reset_hpcp_globals, require_linux, copy_args, link_tracking):
 	"""A dangling relative link is copied as is; its note is not an error, even when the path holds ':' (rc 128)."""
 	tmp_tree.add_file('a.txt', 'a')
 	tmp_tree.add_symlink('at:12:00', 'missing:target')
-	srcs, opts = copy_args(remove_force=True, link_tracking=True)
+	srcs, opts = copy_args(remove_force=True, link_tracking=link_tracking)
 	assert hpcp_mod.hpcp(srcs, **opts) == 0
 	assert os.readlink(tmp_tree.dst / 'at:12:00') == 'missing:target'
 	assert not tmp_tree.src.exists()
@@ -454,21 +455,23 @@ def _rme(hpcp_mod, monkeypatch, srcs, dests, **kwargs):
 		do_not_remove_files_while_listing=True, **kwargs)
 
 
+@pytest.mark.parametrize('link_tracking', [True, False])
 @pytest.mark.parametrize('target', ['.', '..', 'releases/v3'])
-def test_in_tree_directory_link_does_not_shield_its_subtree_from_remove_extra(tmp_tree, hpcp_mod, reset_hpcp_globals, require_linux, monkeypatch, target):
+def test_in_tree_directory_link_does_not_shield_its_subtree_from_remove_extra(tmp_tree, hpcp_mod, reset_hpcp_globals, require_linux, monkeypatch, target, link_tracking):
 	"""usr/bin/X11 -> . (or current -> releases/v3): the target is part of the copy anyway, not a tracked extra."""
 	tmp_tree.add_file('sub/releases/v3/keep.txt', 'keep')
 	tmp_tree.add_symlink('sub/link', target)
 	stale = tmp_tree.add_file('sub/releases/v3/stale.txt', 'stale', under='dst')
-	assert _rme(hpcp_mod, monkeypatch, [str(tmp_tree.src) + os.sep], [str(tmp_tree.dst) + os.sep], link_tracking=True) == 0
+	assert _rme(hpcp_mod, monkeypatch, [str(tmp_tree.src) + os.sep], [str(tmp_tree.dst) + os.sep], link_tracking=link_tracking) == 0
 	assert not os.path.exists(stale)
 	assert (tmp_tree.dst / 'sub' / 'releases' / 'v3' / 'keep.txt').exists()
 
 
-def test_dangling_link_does_not_shield_a_stale_file_from_remove_extra(tmp_tree, hpcp_mod, reset_hpcp_globals, require_linux, monkeypatch):
+@pytest.mark.parametrize('link_tracking', [True, False])
+def test_dangling_link_does_not_shield_a_stale_file_from_remove_extra(tmp_tree, hpcp_mod, reset_hpcp_globals, require_linux, monkeypatch, link_tracking):
 	tmp_tree.add_symlink('dangle', 'gone.txt')
 	stale = tmp_tree.add_file('gone.txt', 'deleted at the source', under='dst')
-	assert _rme(hpcp_mod, monkeypatch, [str(tmp_tree.src) + os.sep], [str(tmp_tree.dst) + os.sep], link_tracking=True) == 0
+	assert _rme(hpcp_mod, monkeypatch, [str(tmp_tree.src) + os.sep], [str(tmp_tree.dst) + os.sep], link_tracking=link_tracking) == 0
 	assert not os.path.exists(stale)
 
 
@@ -526,7 +529,9 @@ def test_tracked_target_that_contains_the_copy_shields_nothing(tmp_path, hpcp_mo
 	assert not (dst / 'stale.txt').exists()
 
 
-def test_remove_extra_keeps_the_copy_of_an_excluded_link_target(tmp_path, hpcp_mod, reset_hpcp_globals, require_linux, monkeypatch):
+@pytest.mark.parametrize('link_tracking', [True, False])
+def test_remove_extra_keeps_the_copy_of_an_excluded_link_target(tmp_path, hpcp_mod, reset_hpcp_globals, require_linux, monkeypatch, link_tracking):
+	"""An excluded path's destination copy is never removed, tracking or not (review of eaee294: without -lt it went)."""
 	home = tmp_path / 'home'
 	(home / 'proj').mkdir(parents=True)
 	(home / 'shared').mkdir()
@@ -535,7 +540,7 @@ def test_remove_extra_keeps_the_copy_of_an_excluded_link_target(tmp_path, hpcp_m
 	dst = tmp_path / 'backup'
 	(dst / 'shared').mkdir(parents=True)
 	(dst / 'shared' / 'lib').write_text('earlier copy')
-	assert _rme(hpcp_mod, monkeypatch, [str(home / 'proj')], [str(dst) + os.sep], exclude=[str(home / 'shared' / 'lib')], link_tracking=True) == 0
+	assert _rme(hpcp_mod, monkeypatch, [str(home / 'proj')], [str(dst) + os.sep], exclude=[str(home / 'shared' / 'lib')], link_tracking=link_tracking) == 0
 	assert (dst / 'shared' / 'lib').read_text() == 'earlier copy'
 
 
