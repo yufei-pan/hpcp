@@ -8121,7 +8121,7 @@ def remove_extra_dirs(src_paths, dests,exclude=None,dest_image=False,keep=()):
 	source_roots = [os.path.abspath(src_path) for src_path in src_paths]
 	# {extra directory: the destination root it lies below}; each destination's identity before the walk.
 	extraDirs = {}
-	dest_ids = _source_identities(dests)
+	dest_roots = _destination_roots(dests)
 	print(pformat(dests))
 	for dest in dests:
 		for dirpath, dirnames, _ in os.walk(dest):
@@ -8160,13 +8160,8 @@ def remove_extra_dirs(src_paths, dests,exclude=None,dest_image=False,keep=()):
 			# Excluded trees and other filesystems are never walked into.
 			dirnames[:] = walk_into
 	# Deepest first, by descriptors from each pinned destination root without following symlinks (_remove_listed_files).
-	items = []
-	for directory in sorted(extraDirs, key=lambda path: (-len(pathlib.Path(path).parts), path)):
-		root = extraDirs[directory]
-		prefix = root.rstrip(os.sep) + os.sep
-		if directory.startswith(prefix):
-			items.append((root, dest_ids.get(root), directory[len(prefix):]))
-	_remove_listed_files(items, rmdir=True)
+	ordered = sorted(extraDirs, key=lambda path: (-len(pathlib.Path(path).parts), path))
+	_remove_listed_files(_items_below(((directory, extraDirs[directory]) for directory in ordered), dest_roots, sort=False), rmdir=True)
 
 def _src_to_dest_map(src_paths, dests, dest_image=False):
 	"""Build ``[(src_abs, [actual_dest_abs, ...]), ...]`` mirroring process_copy.
@@ -8304,7 +8299,7 @@ def remove_extra_files(total_file_list, dests,max_workers,verbose,files_per_job,
 		"""
 		print(f"Removing extra files from {dests} with {max_workers} workers")
 		# Each destination's identity before it is listed: the removal (after the prompt) goes from it by descriptors.
-		dest_ids = _source_identities(dests)
+		dest_roots = _destination_roots(dests)
 		# {extra path: the destination root it was listed below}
 		extra_roots = {}
 		src_entries = set(total_file_list) if total_file_list else set()
@@ -8343,7 +8338,7 @@ def remove_extra_files(total_file_list, dests,max_workers,verbose,files_per_job,
 				for file in dest_trimmed - src_entries:
 					path = os.path.join(dest_base, file)
 					inDestNotInSrc.add(path)
-					extra_roots[path] = os.path.abspath(dest)
+					extra_roots[path] = dest
 		print('-'*80)
 		print("Files in dest but not in src:")
 		for file in inDestNotInSrc:
@@ -8361,17 +8356,10 @@ def remove_extra_files(total_file_list, dests,max_workers,verbose,files_per_job,
 			start_time = time.monotonic()
 			# By descriptors from each pinned destination root, without following symlinks (_remove_listed_files): a
 			# destination directory swapped for a symlink while the prompt waited is not removed through.
-			items = []
-			for path in sorted(inDestNotInSrc):
-				root = os.path.abspath(extra_roots[path])
-				prefix = root.rstrip(os.sep) + os.sep
-				if path.startswith(prefix):
-					items.append((root, dest_ids.get(root), path[len(prefix):]))
-			if single_thread or max_workers <= 1:
-				_remove_listed_files(items)
-			elif items:
-				delete_file_list_parallel(items, max_workers, verbose, max(files_per_job, min(256, len(items) // (max_workers * 4) or 1)),
-					remover=_remove_listed_files)
+			_remove_items(_items_below(((path, extra_roots[path]) for path in inDestNotInSrc), dest_roots), single_thread, max_workers,
+				verbose, files_per_job)
+			# The destinations' listings (cached) still show what was removed.
+			_get_file_list_cache.clear()
 			endTime = time.monotonic()
 			print(f"Time taken to remove extra files: {endTime-start_time:0.4f} seconds")
 
@@ -8535,8 +8523,8 @@ def process_remove(src_paths: list,single_thread = False, max_workers = multipro
 	while this runs (a tree other users can write to; this often runs as root) is not removed from, and is reported.
 	Serially, one descriptor walk per source (_remove_tree_fd); with -pfl, pool jobs empty one directory each
 	(_remove_trees_parallel) before that walk; with -rwloff, the trees are listed first and the listed files removed
-	in pool jobs (_remove_listed_files)."""
-	global REMOVE_FILES_WHILE_LISTING
+	in pool jobs (_remove_listed_files). All sources are removed together, so batch (-b) changes nothing here. -F
+	(FILES_RATE_LIMIT) paces the unlinks."""
 	processedPaths = []
 	for src in src_paths:
 		if not os.path.exists(src):
@@ -8560,6 +8548,7 @@ def process_remove(src_paths: list,single_thread = False, max_workers = multipro
 			raise RuntimeError("User requested stop: Not removing files")
 	print('-'*80)
 	start_time = time.monotonic()
+	rate_limiter = {'start_time': start_time, 'count': 0, 'limit': FILES_RATE_LIMIT} if FILES_RATE_LIMIT > 0 else None
 	removed = 0
 	trees = []
 	for path in processedPaths:
@@ -8570,23 +8559,23 @@ def process_remove(src_paths: list,single_thread = False, max_workers = multipro
 	parallel = not single_thread and max_workers > 1
 	if trees and parallel and not REMOVE_FILES_WHILE_LISTING:
 		# -rwloff: list everything first, then remove the listed files in pool jobs.
-		items = []
+		pairs = []
 		for root in trees:
 			files, links, _, _ = get_file_list(root, max_workers=max_workers, exclude=exclude, parallel_file_listing=parallel_file_listing, drop_cache=True)
-			prefix = root.rstrip(os.sep) + os.sep
-			items.extend((root, source_ids[root], path[len(prefix):]) for path in sorted(set(files) | set(links)) if path.startswith(prefix))
-		if items:
-			removed += delete_file_list_parallel(items, max_workers, verbose, max(files_per_job, min(256, len(items) // (max_workers * 4) or 1)),
-				remover=_remove_listed_files)[0]
+			pairs.extend((path, root) for path in set(files) | set(links))
+		removed += _remove_items(_items_below(pairs, {root: (root, source_ids[root]) for root in trees}), single_thread, max_workers,
+			verbose, files_per_job)
 	elif trees and parallel and parallel_file_listing:
-		removed += _remove_trees_parallel([(root, source_ids[root]) for root in trees], max_workers, exclude)
+		removed += _remove_trees_parallel([(root, source_ids[root]) for root in trees], max_workers, exclude, rate_limiter)
 	for root in trees:
-		count, _, errors = _remove_tree_fd(root, source_ids[root], exclude, remove_files=True)
+		count, _, errors = _remove_tree_fd(root, source_ids[root], exclude, remove_files=True, rate_limiter=rate_limiter)
 		removed += count
 		for path, e in errors:
 			_report_unremoved(path, e)
 	print(f"Removed {removed} files and links from {pformat(processedPaths)} in {time.monotonic()-start_time:0.4f} seconds")
 	print('-'*80)
+	# A listing cached before (or by -rwloff) would show the removed trees.
+	_get_file_list_cache.clear()
 	# The -rwloff listing's copy notes (a special file, a path too long to list) are no errors here: the walk removes them.
 	ERRORS[error_start:] = [error for error in ERRORS[error_start:] if not (error.startswith('Special file skipped:')
 		or (error.startswith('Listing error:') and error.endswith(': path longer than 4096 characters, not listed')))]
@@ -8664,7 +8653,7 @@ def _parent_below(root, root_id, rel):
 def _remove_one_listed(root, root_id, rel):
 	"""Unlink one listed entry relative to its directory's descriptor (_parent_below), never a directory. For the root
 	itself (rel '.') and for platforms without descriptor support; _remove_listed_files does the rest."""
-	path = os.path.join(root, rel)
+	path = root if rel in ('', '.') else os.path.join(root, rel)
 	fd = None
 	try:
 		fd, name, identity = _parent_below(root, root_id, rel)
@@ -8803,41 +8792,110 @@ def _remove_listed_files(items, rmdir=False):
 
 _SCANDIR_FD = os.scandir in os.supports_fd
 
+def _destination_roots(dests):
+	"""{abspath(dest): (its real path, that path's _path_identity)} for -rme: a destination as given is trusted, a
+	symlink in it included ('link/' is where the copy wrote); what lies below it is reached by descriptors."""
+	roots = {}
+	for dest in dests:
+		listed = os.path.abspath(dest)
+		real = os.path.realpath(listed)
+		roots[listed] = (real, _path_identity(real))
+	return roots
+
+def _items_below(pairs, roots, sort=True):
+	"""[(root, its identity, path below it)] for pairs (path, the root it was listed below), for _remove_listed_files:
+	roots maps each listed root (abspath) to (the root to remove from, its identity). A relative path is taken from the
+	CWD and the root itself is '.'; a path not below its root (it cannot be) is reported, not removed. With sort, in
+	path order (neighbours share their directories' descriptors)."""
+	items = []
+	for path, listed_root in pairs:
+		if not os.path.isabs(path):
+			path = os.path.abspath(path)
+		listed_root = os.path.abspath(listed_root)
+		prefix = listed_root.rstrip(os.sep) + os.sep
+		if path == listed_root:
+			rel = '.'
+		elif path.startswith(prefix):
+			rel = path[len(prefix):]
+		else:
+			eprint(f'Remove process exception: not removing {path}: it is not below {listed_root}')
+			continue
+		root, identity = roots[listed_root]
+		items.append((root, identity, rel))
+	if sort:
+		items.sort(key=lambda item: (item[0], item[2]))
+	return items
+
+def _remove_items(items, single_thread=False, max_workers=1, verbose=False, files_per_job=1):
+	"""Unlink items (see _remove_listed_files) in this process, or in pool jobs of neighbouring entries, large enough
+	to share their directories' descriptors. Returns the number of items handled."""
+	if not items:
+		return 0
+	if single_thread or max_workers <= 1:
+		_remove_listed_files(items)
+		return len(items)
+	return delete_file_list_parallel(items, max_workers, verbose, max(files_per_job, min(256, len(items) // (max_workers * 4) or 1)),
+		remover=_remove_listed_files)[0]
+
 def _dir_entries(fd):
 	"""[(name, is a directory)] for directory descriptor fd, a symlink being no directory: from d_type where scandir
 	takes a descriptor (no stat per entry; a stat costs a server round trip on Lustre), else listdir and a stat each."""
+	result = []
 	if _SCANDIR_FD:
 		with os.scandir(fd) as entries:
-			return [(entry.name, entry.is_dir(follow_symlinks=False)) for entry in entries]
-	result = []
+			for entry in entries:
+				try:
+					result.append((entry.name, entry.is_dir(follow_symlinks=False)))
+				except OSError:
+					# Unknown (no d_type, and its stat failed): taken as no directory; an unlink then says what it is.
+					result.append((entry.name, False))
+		return result
 	for name in os.listdir(fd):
 		try:
 			result.append((name, stat.S_ISDIR(os.stat(name, dir_fd=fd, follow_symlinks=False).st_mode)))
 		except FileNotFoundError:
 			continue
+		except OSError:
+			result.append((name, False))
 	return result
 
-def _remove_tree_fd(root, root_id, exclude=None, remove_files=False):
+def _is_directory_now(name, dir_fd, exc):
+	"""True when an unlink of name failed because it is a directory (EISDIR; macOS says EPERM)."""
+	if isinstance(exc, IsADirectoryError):
+		return True
+	if isinstance(exc, PermissionError):
+		try:
+			return stat.S_ISDIR(os.stat(name, dir_fd=dir_fd, follow_symlinks=False).st_mode)
+		except OSError:
+			return False
+	return False
+
+def _remove_tree_fd(root, root_id, exclude=None, remove_files=False, rate_limiter=None):
 	"""Walk the directory tree at root by descriptors from the pinned root (_open_source_root), each directory opened
 	relative to its parent with O_NOFOLLOW, deepest first, as shutil.rmtree does (one open and one listing per directory):
 	rmdir each directory once its entries are handled. With remove_files (plain -rm) its other entries are unlinked
 	first; without (a move's second pass) they are left. Excluded paths are not entered or removed. Returns (entries
 	unlinked, entries left in place, excluded ones aside; errors as (path, OSError)): a directory swapped for a symlink,
-	or a root replaced, is an error and nothing below it is touched. A directory that still holds something stays."""
+	or a root replaced, is an error and nothing below it is touched. A directory that still holds something stays.
+	rate_limiter (a _file_list_rate_limit state, -F) paces the unlinks."""
 	removed, left, errors = 0, [], []
 	if not _DIR_FD_WALK:
 		directories = []
 		for dirpath, dirnames, filenames in os.walk(root):
 			directories.append(dirpath)
-			for name in filenames:
+			# os.walk lists a symlink to a directory among the directories: it is a link, removed like a file.
+			links = [name for name in dirnames if os.path.islink(os.path.join(dirpath, name))]
+			for name in filenames + links:
 				path = os.path.join(dirpath, name)
 				if exclude and is_excluded(path, exclude):
 					continue
 				if not remove_files:
 					left.append(path)
-				elif _remove_one_listed(root, root_id, os.path.relpath(path, root)):
-					removed += 1
-			dirnames[:] = [name for name in dirnames if not (exclude and is_excluded(os.path.join(dirpath, name), exclude))]
+				else:
+					_file_list_rate_limit(rate_limiter)
+					if _remove_one_listed(root, root_id, os.path.relpath(path, root)):
+						removed += 1
+			dirnames[:] = [name for name in dirnames if name not in links and not (exclude and is_excluded(os.path.join(dirpath, name), exclude))]
 		for directory in sorted(directories, key=lambda path: path.count(os.sep), reverse=True):
 			e = _rmdir_below(root, root_id, os.path.relpath(directory, root))
 			if e is not None and e.errno not in (errno.ENOTEMPTY, errno.EEXIST, errno.EBUSY):
@@ -8869,14 +8927,18 @@ def _remove_tree_fd(root, root_id, exclude=None, remove_files=False):
 			elif not remove_files:
 				left.append(child)
 			else:
+				_file_list_rate_limit(rate_limiter)
 				try:
 					os.unlink(entry, dir_fd=fd)
 					removed += 1
 				except FileNotFoundError:
 					pass
 				except OSError as e:
-					# A directory now (it changed since it was read) is left; an unlink refused is an error.
-					errors.append((child, e))
+					if _is_directory_now(entry, fd, e):
+						# A directory now (it changed since it was read, or its type was unknown): removed as one.
+						subdirectories.append(entry)
+					else:
+						errors.append((child, e))
 		stack.append([fd, path, subdirectories, 0, name])
 	busy = (errno.ENOTEMPTY, errno.EEXIST) if remove_files else (errno.ENOTEMPTY, errno.EEXIST, errno.EBUSY)
 	try:
@@ -8924,7 +8986,9 @@ def _remove_directory_entries(path, expected_id, exclude=None):
 	except FileNotFoundError:
 		return 0, []
 	except OSError as exc:
-		_report_unremoved(path, exc)
+		# Too deep to open by path: left to _remove_tree_fd, which reaches it relative to its parent.
+		if exc.errno != errno.ENAMETOOLONG:
+			_report_unremoved(path, exc)
 		return 0, []
 	removed, subdirectories = 0, []
 	try:
@@ -8947,49 +9011,67 @@ def _remove_directory_entries(path, expected_id, exclude=None):
 			try:
 				os.unlink(name, dir_fd=fd)
 				removed += 1
-			except (FileNotFoundError, IsADirectoryError):
+			except FileNotFoundError:
 				pass
 			except OSError as exc:
-				_unlink_failed(name, fd, child, exc)
+				if not _is_directory_now(name, fd, exc):
+					_report_unremoved(child, exc)
+					continue
+				# A directory now: queued like the others.
+				try:
+					child_st = os.stat(name, dir_fd=fd, follow_symlinks=False)
+				except OSError:
+					continue
+				subdirectories.append((child, (child_st.st_dev, child_st.st_ino)))
 	except OSError as exc:
 		_report_unremoved(path, exc)
 	finally:
 		os.close(fd)
 	return removed, subdirectories
 
-def _remove_trees_parallel(trees, max_workers, exclude=None):
+def _remove_trees_parallel(trees, max_workers, exclude=None, rate_limiter=None):
 	"""-pfl: empty the directories of trees ([(root, its identity)]) in pool jobs, one directory each
-	(_remove_directory_entries), queueing the subdirectories each job reports. Returns the entries unlinked; the
-	directories themselves are left for _remove_tree_fd."""
+	(_remove_directory_entries), queueing the subdirectories each job reports. With rate_limiter (-F), a job is only
+	queued while the entries unlinked so far are within the limit, as get_file_list_parallel paces its listing. Returns
+	the entries unlinked; the directories themselves are left for _remove_tree_fd."""
 	queue = deque(trees)
 	futures = {}
 	removed = 0
+	def under_limit():
+		return not rate_limiter or rate_limiter['count'] <= rate_limiter['limit'] * (time.monotonic() - rate_limiter['start_time'])
 	with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
 		while queue or futures:
-			while queue and len(futures) < max_workers * 2:
+			while queue and len(futures) < max_workers * 2 and under_limit():
 				path, identity = queue.popleft()
 				futures[_submit_task(executor, _remove_directory_entries, path, identity, exclude)] = path
-			done, _ = concurrent.futures.wait(futures, return_when=concurrent.futures.FIRST_COMPLETED)
+			if not futures:
+				time.sleep(0.05)
+				continue
+			done, _ = concurrent.futures.wait(futures, timeout=0.1, return_when=concurrent.futures.FIRST_COMPLETED)
 			for future in done:
 				futures.pop(future)
 				count, subdirectories = _task_result(future, (0, []), 'Remove process exception')
 				removed += count
+				if rate_limiter:
+					rate_limiter['count'] += count
 				queue.extend(subdirectories)
 	return removed
 
 def _rmdir_below(root, root_id, rel):
 	"""rmdir root/rel relative to its parent's descriptor (_parent_below). Returns the OSError, or None when it is gone."""
 	fd = None
+	# 'root/.' cannot be removed by path (EINVAL): the root itself is root.
+	path = root if rel in ('', '.') else os.path.join(root, rel)
 	try:
 		fd, name, identity = _parent_below(root, root_id, rel)
 		if identity is not None:
-			st = os.stat(name, dir_fd=fd, follow_symlinks=False) if fd is not None else os.lstat(os.path.join(root, rel))
+			st = os.stat(name, dir_fd=fd, follow_symlinks=False) if fd is not None else os.lstat(path)
 			if (st.st_dev, st.st_ino) != tuple(identity):
 				raise _replaced(root)
 		if fd is not None:
 			os.rmdir(name, dir_fd=fd)
 		else:
-			os.rmdir(os.path.join(root, rel))
+			os.rmdir(path)
 	except FileNotFoundError:
 		return None
 	except OSError as e:
@@ -9046,12 +9128,7 @@ def remove_moved_sources(src_paths, file_list, sym_links, single_thread=False, m
 		if not input().lower().startswith('y'):
 			raise RuntimeError("User requested stop: Not removing files")
 	start_time = time.monotonic()
-	if single_thread or max_workers <= 1:
-		_remove_listed_files(listed)
-	elif listed:
-		# Jobs of neighbouring entries share their directories' descriptors (_remove_listed_files): start them large enough.
-		delete_file_list_parallel(listed, max_workers, verbose, max(files_per_job, min(256, len(listed) // (max_workers * 4) or 1)),
-			remover=_remove_listed_files)
+	_remove_items(listed, single_thread, max_workers, verbose, files_per_job)
 	left = []
 	for root in roots:
 		# A root inside another one is walked with it.
@@ -9069,6 +9146,8 @@ def remove_moved_sources(src_paths, file_list, sym_links, single_thread=False, m
 		eprint(f'Move left entries: {len(left)} source entries the copy did not list (written during the move, or special '
 			f'files) are left in place: {shown}')
 	print(f"Time taken to remove files: {time.monotonic()-start_time:0.4f} seconds")
+	# The copy's listings (cached) still show the removed sources.
+	_get_file_list_cache.clear()
 
 def get_dest_from_image(dest_image,mount_points: list,loop_devices: list):
 	dest = ''

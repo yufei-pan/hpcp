@@ -215,3 +215,126 @@ def test_plain_remove_of_a_symlink_to_the_root_removes_the_link(tmp_path, hpcp_m
 	os.symlink(os.sep, str(tmp_path / 'to-root'))
 	hpcp_mod.process_remove([str(tmp_path / 'to-root')], single_thread=True, remove_force=True)
 	assert not os.path.lexists(tmp_path / 'to-root')
+
+
+# ---- 9.74: review of main..HEAD ----
+
+def _answer_yes(monkeypatch):
+	monkeypatch.setattr(sys.stdin, 'isatty', lambda: True)
+	monkeypatch.setattr('builtins.input', lambda: 'y')
+
+
+def test_remove_extra_into_a_symlinked_destination_removes_the_extras(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	"""`hpcp src/ /scratch/link/ -rme`, link -> a directory: the destination as given is trusted (9.73 removed there)."""
+	src, real = tmp_path / 'src', tmp_path / 'real'
+	src.mkdir()
+	(real / 'extra-dir').mkdir(parents=True)
+	(real / 'extra.txt').write_text('extra')
+	os.symlink(str(real), str(tmp_path / 'link'))
+	_answer_yes(monkeypatch)
+	dest = str(tmp_path / 'link') + os.sep
+	hpcp_mod.remove_extra_files([], [dest], 2, False, 1, single_thread=True, src_paths=[str(src) + os.sep])
+	hpcp_mod.remove_extra_dirs([str(src) + os.sep], [dest])
+	assert not (real / 'extra.txt').exists() and not (real / 'extra-dir').exists()
+	assert [error for error in hpcp_mod.ERRORS if hpcp_mod._is_failure(error)] == []
+
+
+def test_legacy_remove_extra_with_a_relative_destination_removes_the_extras(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	"""-fl list -rme data/ (no src_paths): the extras are built relative to the CWD; they were dropped silently."""
+	(tmp_path / 'data').mkdir()
+	(tmp_path / 'data' / 'extra').write_text('extra')
+	monkeypatch.chdir(tmp_path)
+	_answer_yes(monkeypatch)
+	hpcp_mod.remove_extra_files(set(), ['data/'], 2, False, 1, single_thread=True)
+	assert not (tmp_path / 'data' / 'extra').exists()
+
+
+def test_parallel_remove_of_a_tree_deeper_than_path_max_records_no_error(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	"""-pfl jobs open their directory by path; one too deep for that is left to the descriptor walk, which reaches it
+	relative to its parent: removed, and no false error (9.73 recorded none)."""
+	root = tmp_path / 'deep'
+	root.mkdir()
+	monkeypatch.chdir(root)
+	for _ in range(30):
+		os.mkdir('d' * 200)
+		os.chdir('d' * 200)
+	with open('bottom.txt', 'w') as f:
+		f.write('x')
+	os.chdir(str(tmp_path))
+	hpcp_mod.process_remove([str(root)], single_thread=False, max_workers=2, parallel_file_listing=True, remove_force=True)
+	assert not root.exists()
+	assert [error for error in hpcp_mod.ERRORS if hpcp_mod._is_failure(error)] == []
+
+
+def test_serial_plain_remove_honours_the_file_rate_limit(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	src = tmp_path / 'src'
+	_tree(src)
+	calls = []
+	monkeypatch.setattr(hpcp_mod, 'FILES_RATE_LIMIT', 1000)
+	monkeypatch.setattr(hpcp_mod, '_file_list_rate_limit', lambda state, increment=1: calls.append(increment))
+	hpcp_mod.process_remove([str(src)], single_thread=True, remove_force=True)
+	assert not src.exists()
+	assert len(calls) == 2
+
+
+def test_parallel_plain_remove_honours_the_file_rate_limit(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	"""-pfl -F 50: 60 files in 6 directories of 10. Jobs are queued only while under the limit, up to 4 at a time (as
+	9.73's paced listing): 40 go at once, the last 20 only at 40 / 50 = 0.8 s."""
+	import time
+	src = tmp_path / 'src'
+	for index in range(6):
+		(src / ('d%d' % index)).mkdir(parents=True)
+		for number in range(10):
+			(src / ('d%d' % index) / ('f%d' % number)).write_text('x')
+	monkeypatch.setattr(hpcp_mod, 'FILES_RATE_LIMIT', 50)
+	start = time.monotonic()
+	hpcp_mod.process_remove([str(src)], single_thread=False, max_workers=2, parallel_file_listing=True, remove_force=True)
+	assert not src.exists()
+	assert time.monotonic() - start >= 0.7
+
+
+def test_fallback_walk_removes_a_symlink_to_a_directory(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	"""Without descriptor support os.walk lists a link to a directory among the directories: it is a link, removed."""
+	src, other = tmp_path / 'src', tmp_path / 'other'
+	(src / 'sub').mkdir(parents=True)
+	other.mkdir()
+	(other / 'keep.txt').write_text('keep')
+	os.symlink('../../other', str(src / 'sub' / 'ln'))
+	monkeypatch.setattr(hpcp_mod, '_DIR_FD_WALK', False)
+	hpcp_mod.process_remove([str(src)], single_thread=True, remove_force=True)
+	assert not src.exists()
+	assert (other / 'keep.txt').read_text() == 'keep'
+
+
+def test_serial_walk_removes_an_entry_that_became_a_directory(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	"""Read as a file, a directory (with a file) by the time it is unlinked: removed as a directory, no error."""
+	src = tmp_path / 'src'
+	(src / 'x').mkdir(parents=True)
+	(src / 'x' / 'inside.txt').write_text('x')
+	real = hpcp_mod._dir_entries
+	def dir_entries(fd):
+		return [(name, False if name == 'x' else is_dir) for name, is_dir in real(fd)]
+	monkeypatch.setattr(hpcp_mod, '_dir_entries', dir_entries)
+	hpcp_mod.process_remove([str(src)], single_thread=True, remove_force=True)
+	assert not src.exists()
+	assert [error for error in hpcp_mod.ERRORS if hpcp_mod._is_failure(error)] == []
+
+
+@pytest.mark.parametrize('remove_while_listing', [True, False])
+def test_plain_remove_leaves_no_cached_listing_of_what_it_removed(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch, remove_while_listing):
+	src = tmp_path / 'src'
+	_tree(src)
+	monkeypatch.setattr(hpcp_mod, 'REMOVE_FILES_WHILE_LISTING', remove_while_listing)
+	hpcp_mod.process_remove([str(src)], single_thread=False, max_workers=2, remove_force=True)
+	assert not any(str(src) in str(key) for key in hpcp_mod._get_file_list_cache)
+
+
+def test_remove_extra_leaves_no_cached_listing_of_the_destination(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	src, dst = tmp_path / 'src', tmp_path / 'dst'
+	src.mkdir()
+	dst.mkdir()
+	(dst / 'extra.txt').write_text('extra')
+	_answer_yes(monkeypatch)
+	hpcp_mod.remove_extra_files([], [str(dst) + os.sep], 2, False, 1, single_thread=True, src_paths=[str(src) + os.sep])
+	assert not (dst / 'extra.txt').exists()
+	assert not any(str(dst) in str(key) for key in hpcp_mod._get_file_list_cache)
