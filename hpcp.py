@@ -6220,6 +6220,13 @@ def _ro_mount_options(device):
 	"""Read-only mount options that also work for cloned (duplicate-UUID) xfs and dirty ext3/4 journals."""
 	return {'xfs': 'ro,nouuid,norecovery', 'ext3': 'ro,noload', 'ext4': 'ro,noload'}.get(_probe_fs_type(device), 'ro')
 
+def _rw_mount_command(device, mount_point):
+	"""The read-write mount command for device: a clone of a mounted xfs (a golden image, an image of a live node's
+	disk) carries the same UUID, which xfs refuses to mount twice without nouuid."""
+	if _probe_fs_type(device) == 'xfs':
+		return ['mount', '-o', 'nouuid', device, mount_point]
+	return ['mount', device, mount_point]
+
 def _mount_single_fs_image(image, read_only, mount_points, loop_devices):
 	"""Attach image, mount its largest partition (or the whole partitionless image), return the mount point + os.sep."""
 	image = os.path.abspath(os.path.expanduser(image))
@@ -6239,11 +6246,8 @@ def _mount_single_fs_image(image, read_only, mount_points, loop_devices):
 		# lsblk reads udev's cache, which a fresh loop device may not have yet; blkid -p reads the device.
 		options = _ro_mount_options(target)
 		command = ['mount', '-o', options, target, mount_point]
-	elif _probe_fs_type(target) == 'xfs':
-		# A clone of a mounted xfs (a golden image, a node's disk) carries the same UUID, which xfs refuses to mount twice.
-		command = ['mount', '-o', 'nouuid', target, mount_point]
 	else:
-		command = ['mount', target, mount_point]
+		command = _rw_mount_command(target, mount_point)
 	run_command_in_multicmd_with_path_check(command, strict=False)
 	if not os.path.ismount(mount_point):
 		raise RuntimeError(f'Diff image error: cannot mount {target} from {image}')
@@ -7341,11 +7345,8 @@ def _mount_partition(device, read_only, mount_points, entries):
 			run_command_in_multicmd_with_path_check(['mount', '-o', 'remount,bind,ro', mount_point], quiet=True)
 	elif read_only:
 		run_command_in_multicmd_with_path_check(['mount', '-o', _ro_mount_options(device), device, mount_point], quiet=True)
-	elif _probe_fs_type(device) == 'xfs':
-		# A clone of a mounted xfs carries the same UUID, which xfs refuses to mount twice.
-		run_command_in_multicmd_with_path_check(['mount', '-o', 'nouuid', device, mount_point], quiet=True)
 	else:
-		run_command_in_multicmd_with_path_check(['mount', device, mount_point], quiet=True)
+		run_command_in_multicmd_with_path_check(_rw_mount_command(device, mount_point), quiet=True)
 	del ERRORS[error_count:]
 	if not _is_mount_point(mount_point):
 		_release_mount(mount_point, mount_points)
@@ -9117,7 +9118,7 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = multipr
 				src_partition_path = [path for path in src_partition_paths if path.endswith(partition)][0]
 				dest_partition_path = [path for path in dest_partition_paths if path.endswith(partition)][0]
 				print(f"Mounting {src_partition_path} at {src_mount_point}")
-				run_command_in_multicmd_with_path_check(['mount',src_partition_path,src_mount_point])
+				run_command_in_multicmd_with_path_check(_rw_mount_command(src_partition_path, src_mount_point))
 				# check if the mount is successful
 				if not any(os.scandir(src_mount_point)) and not os.path.ismount(src_mount_point) and is_device(src_partition_path):
 					# if the source is a device and currently mounted, try to find the current mount point, then try to bind mount it
@@ -9132,7 +9133,7 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = multipr
 					dd_partition(src_partition_path,dest_partition_path,partition,dd_src,dd_dest)
 					continue
 				print(f"Mounting {dest_partition_path} at {dest_mount_point}")
-				run_command_in_multicmd_with_path_check(['mount',dest_partition_path,dest_mount_point],strict=False)
+				run_command_in_multicmd_with_path_check(_rw_mount_command(dest_partition_path, dest_mount_point),strict=False)
 				# check if the mount is successful
 				if not any(os.scandir(dest_mount_point)) and not os.path.ismount(dest_mount_point) and is_device(dest_partition_path):
 					mtab = get_mount_table()

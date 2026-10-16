@@ -95,3 +95,37 @@ def test_dd_partition_copy_status_ignores_errors_recorded_before_it(
 	assert len(roots) == 4
 	assert (roots[3] / 'data.txt').read_text() == 'partition data'
 	assert rc == 152
+
+
+def test_dd_mounts_xfs_partitions_with_nouuid(tmp_path, hpcp_mod, reset_hpcp_globals, require_linux, monkeypatch):
+	"""A -dd source that is an image of a disk whose xfs is mounted (the live node it was taken from) has that UUID."""
+	roots = []
+	mounts = []
+	real_run = hpcp_mod.run_command_in_multicmd_with_path_check
+
+	def mount_dir():
+		path = tmp_path / ('mount' + str(len(roots)))
+		path.mkdir()
+		roots.append(path)
+		if len(roots) % 2 == 1:
+			(path / 'data.txt').write_text('partition data')
+		return str(path)
+
+	def run(command, **kwargs):
+		if command[0] == 'mount':
+			mounts.append(list(command))
+			return []
+		return real_run(command, **kwargs)
+
+	monkeypatch.setattr(hpcp_mod, 'validate_dd_source_path', lambda *a, **k: '/dev/fake-source')
+	monkeypatch.setattr(hpcp_mod, 'create_dd_dest_part_table', lambda *a, **k: ({'/dev/fake-source': {}, '1': {'size': 4096}}, [], None))
+	monkeypatch.setattr(hpcp_mod, 'get_partitions', lambda device: [device + '1'])
+	monkeypatch.setattr(hpcp_mod, '_probe_fs_type', lambda device: 'xfs')
+	monkeypatch.setattr(hpcp_mod.os, 'geteuid', lambda: 0)
+	monkeypatch.setattr(hpcp_mod, 'tempfile', SimpleNamespace(mkdtemp=mount_dir))
+	monkeypatch.setattr(hpcp_mod.os.path, 'ismount', lambda path: any(str(p) == str(path).rstrip(os.sep) for p in roots))
+	monkeypatch.setattr(hpcp_mod, 'run_command_in_multicmd_with_path_check', run)
+	monkeypatch.setattr(hpcp_mod, 'clean_up', lambda *a: None)
+	assert hpcp_mod.hpcp(['/dev/fake-source'], dest_image=str(tmp_path / 'dest.img'), dd=True,
+		single_thread=True, max_workers=1, no_directory_sync=True) == 0
+	assert [command[:3] for command in mounts] == [['mount', '-o', 'nouuid'], ['mount', '-o', 'nouuid']]
