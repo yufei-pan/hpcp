@@ -2306,7 +2306,9 @@ def create_sym_links(symLinks,exclude=None,no_link_tracking=False):
 				destLinkedFiles = [os.path.join(os.path.dirname(d), linkedTargetFile) for d in dests]
 				dest = next((d for d, destLinkedFile in zip(dests, destLinkedFiles) if os.path.exists(destLinkedFile)), '')
 				if not dest and not no_link_tracking:
-					sourceLinkedFile = os.path.join(os.path.dirname(src), linkedTargetFile)
+					# Normalized ('..' resolved), so the tracked tree is listed by the paths -e patterns name.
+					sourceLinkedFile = os.path.normpath(os.path.join(os.path.dirname(src), linkedTargetFile))
+					destLinkedFiles = [os.path.normpath(destLinkedFile) for destLinkedFile in destLinkedFiles]
 					# we also copy the pointed file if the file doesn't exist
 					if _excluded_or_below(sourceLinkedFile, exclude):
 						print(f"\n{pformat(sourceLinkedFile)}, linked by {pformat(src)}, is excluded: not copying it")

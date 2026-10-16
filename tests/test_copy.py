@@ -566,3 +566,20 @@ def test_non_root_skip_drops_setid_bits_it_cannot_keep_the_ids_for(tmp_tree, hpc
 	hpcp_mod.copy_file(src, [dst])
 	assert stat.S_IMODE(os.stat(dst).st_mode) == expected
 	assert hpcp_mod.ERRORS == []
+
+
+def test_link_tracking_honours_absolute_excludes_inside_the_tracked_tree(tmp_path, hpcp_mod, reset_hpcp_globals, require_linux):
+	"""src/lnk -> ../other: the tracked tree is listed by its real path, so -e /…/other/private leaves that part out."""
+	data = tmp_path / 'data'
+	(data / 'src').mkdir(parents=True)
+	(data / 'other' / 'pub').mkdir(parents=True)
+	(data / 'other' / 'private').mkdir()
+	(data / 'other' / 'pub' / 'x').write_text('x')
+	(data / 'other' / 'private' / 'y').write_text('secret')
+	os.symlink('../other', str(data / 'src' / 'lnk'))
+	backup = tmp_path / 'backup'
+	backup.mkdir()
+	assert hpcp_mod.hpcp([str(data / 'src')], dest_paths=[str(backup) + os.sep], exclude=[str(data / 'other' / 'private')],
+		single_thread=True, batch=True, do_not_remove_files_while_listing=True) == 0
+	assert (backup / 'other' / 'pub' / 'x').read_text() == 'x'
+	assert not (backup / 'other' / 'private').exists()
