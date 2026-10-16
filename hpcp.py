@@ -6275,6 +6275,13 @@ def _rw_mount_command(device, mount_point):
 		return ['mount', '-o', 'nouuid', device, mount_point]
 	return ['mount', device, mount_point]
 
+def _ro_source_mount_command(device, mount_point):
+	"""The mount command for a -dd source partition, which is only read: read-only, with nouuid for a cloned xfs.
+	Unlike _ro_mount_options it keeps log / journal recovery, so a dirty source is copied in its recovered state."""
+	if _probe_fs_type(device) == 'xfs':
+		return ['mount', '-o', 'ro,nouuid', device, mount_point]
+	return ['mount', '-o', 'ro', device, mount_point]
+
 def _mount_single_fs_image(image, read_only, mount_points, loop_devices):
 	"""Attach image, mount its largest partition (or the whole partitionless image), return the mount point + os.sep."""
 	image = os.path.abspath(os.path.expanduser(image))
@@ -9252,7 +9259,7 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = multipr
 				src_partition_path = [path for path in src_partition_paths if path.endswith(partition)][0]
 				dest_partition_path = [path for path in dest_partition_paths if path.endswith(partition)][0]
 				print(f"Mounting {src_partition_path} at {src_mount_point}")
-				run_command_in_multicmd_with_path_check(_rw_mount_command(src_partition_path, src_mount_point))
+				run_command_in_multicmd_with_path_check(_ro_source_mount_command(src_partition_path, src_mount_point))
 				# check if the mount is successful
 				if not any(os.scandir(src_mount_point)) and not os.path.ismount(src_mount_point) and is_device(src_partition_path):
 					# if the source is a device and currently mounted, try to find the current mount point, then try to bind mount it

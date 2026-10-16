@@ -98,7 +98,8 @@ def test_dd_partition_copy_status_ignores_errors_recorded_before_it(
 
 
 def test_dd_mounts_xfs_partitions_with_nouuid(tmp_path, hpcp_mod, reset_hpcp_globals, require_linux, monkeypatch):
-	"""A -dd source that is an image of a disk whose xfs is mounted (the live node it was taken from) has that UUID."""
+	"""A -dd source that is an image of a disk whose xfs is mounted (the live node it was taken from) has that UUID.
+	The source is only read, so it is mounted read-only (ultrareview: a read-write nouuid mount wrote to a clone)."""
 	roots = []
 	mounts = []
 	real_run = hpcp_mod.run_command_in_multicmd_with_path_check
@@ -128,4 +129,10 @@ def test_dd_mounts_xfs_partitions_with_nouuid(tmp_path, hpcp_mod, reset_hpcp_glo
 	monkeypatch.setattr(hpcp_mod, 'clean_up', lambda *a: None)
 	assert hpcp_mod.hpcp(['/dev/fake-source'], dest_image=str(tmp_path / 'dest.img'), dd=True,
 		single_thread=True, max_workers=1, no_directory_sync=True) == 0
-	assert [command[:3] for command in mounts] == [['mount', '-o', 'nouuid'], ['mount', '-o', 'nouuid']]
+	assert [command[:3] for command in mounts] == [['mount', '-o', 'ro,nouuid'], ['mount', '-o', 'nouuid']]
+
+
+@pytest.mark.parametrize('fs_type, options', [('ext4', 'ro'), ('btrfs', 'ro'), ('xfs', 'ro,nouuid')])
+def test_dd_source_mount_command_is_read_only(hpcp_mod, monkeypatch, fs_type, options):
+	monkeypatch.setattr(hpcp_mod, '_probe_fs_type', lambda device: fs_type)
+	assert hpcp_mod._ro_source_mount_command('/dev/sdb1', '/mnt/x') == ['mount', '-o', options, '/dev/sdb1', '/mnt/x']
