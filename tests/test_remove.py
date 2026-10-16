@@ -52,18 +52,10 @@ def test_process_remove_without_force_requires_tty(tmp_tree, hpcp_mod, reset_hpc
 		hpcp_mod.process_remove([str(tmp_tree.src)], single_thread=True, remove_force=False)
 
 
-def test_remove_files_while_listing_deletes_entries(tmp_tree, hpcp_mod, reset_hpcp_globals):
-	p = tmp_tree.add_file('gone.txt', 'x')
-	hpcp_mod.get_file_list(
-		str(tmp_tree.src), parallel_file_listing=False, drop_cache=True, remove_files_while_listing=True,
-	)
-	assert not os.path.exists(p)
-
-
 def test_rwloff_listing_leaves_files(tmp_tree, hpcp_mod, reset_hpcp_globals):
 	p = tmp_tree.add_file('stay.txt', 'x')
 	hpcp_mod.get_file_list(
-		str(tmp_tree.src), parallel_file_listing=False, drop_cache=True, remove_files_while_listing=False,
+		str(tmp_tree.src), parallel_file_listing=False, drop_cache=True,
 	)
 	assert os.path.exists(p)
 
@@ -82,56 +74,6 @@ def test_remove_force_implies_remove(tmp_tree, hpcp_mod, reset_hpcp_globals, req
 	srcs, opts = copy_args(remove=False, remove_force=True)
 	hpcp_mod.hpcp(srcs, **opts)
 	assert called
-
-
-def test_delete_files_parallel_counts_files_removed_while_listing(
-	tmp_tree, hpcp_mod, reset_hpcp_globals, capsys,
-):
-	"""Files unlinked during the scan must still be counted in the summary."""
-	hpcp_mod.REMOVE_FILES_WHILE_LISTING = True
-	for name in ('a.txt', 'b.txt', 'sub/c.txt'):
-		tmp_tree.add_file(name, 'x')
-	tmp_tree.add_symlink('l.lnk', 'a.txt')
-	count, _ = hpcp_mod.delete_files_parallel(
-		str(tmp_tree.src), max_workers=2, parallel_file_listing=False,
-	)
-	assert 'Number of files: 4' in capsys.readouterr().out
-	# 4 entries unlinked during the scan, +1 for the directory structure itself.
-	assert count == 5
-	assert not tmp_tree.src.exists()
-
-
-def test_delete_files_parallel_init_size_spans_all_paths(
-	tmp_tree, hpcp_mod, reset_hpcp_globals, monkeypatch,
-):
-	"""The progress-bar baseline must be the total over every path, not the last one."""
-	hpcp_mod.REMOVE_FILES_WHILE_LISTING = False
-	a = tmp_tree.add_file('one/a.txt', b'a' * 100)
-	b = tmp_tree.add_file('two/b.txt', b'b' * 5)
-	expected = hpcp_mod.get_file_size(a) + hpcp_mod.get_file_size(b)
-	seen = {}
-
-	def fake_delete(file_list, max_workers, *a, **k):
-		seen['init_size'] = k.get('init_size')
-		return len(file_list), 0
-
-	monkeypatch.setattr(hpcp_mod, 'delete_file_list_parallel', fake_delete)
-	hpcp_mod.delete_files_parallel(
-		[str(tmp_tree.src / 'one'), str(tmp_tree.src / 'two')],
-		max_workers=2, batch=True, parallel_file_listing=False,
-	)
-	assert seen['init_size'] == expected
-
-
-def test_cached_listing_still_removes_files(tmp_tree, hpcp_mod, reset_hpcp_globals):
-	"""A warm cache entry must not let remove-while-listing skip the actual unlink."""
-	p = tmp_tree.add_file('gone.txt', 'x')
-	hpcp_mod.get_file_list(str(tmp_tree.src), parallel_file_listing=False)
-	assert os.path.exists(p)
-	hpcp_mod.get_file_list(
-		str(tmp_tree.src), parallel_file_listing=False, remove_files_while_listing=True,
-	)
-	assert not os.path.exists(p)
 
 
 @pytest.mark.parametrize('single_thread,parallel_listing', [(True, False), (False, False), (False, True)])
@@ -711,13 +653,6 @@ def test_special_file_kind_names_a_fifo(tmp_path, hpcp_mod):
 	(tmp_path / 'f').write_text('f')
 	kinds = {entry.name: hpcp_mod._special_file_kind(entry) for entry in os.scandir(tmp_path)}
 	assert kinds == {'p': 'FIFO', 'f': None}
-
-
-@pytest.mark.parametrize('lister', ['get_file_list_serial', 'get_file_list_parallel'])
-def test_overlong_path_is_no_error_while_removing(hpcp_mod, reset_hpcp_globals, lister):
-	"""-rm's own listing removes as it goes and leaves the rest to rmtree, which deletes deep paths by descriptor."""
-	getattr(hpcp_mod, lister)('/' + 'x' * 4100, remove_files_while_listing=True)
-	assert hpcp_mod.ERRORS == []
 
 
 # ---- 9.73: a move removes only what the copy listed ----

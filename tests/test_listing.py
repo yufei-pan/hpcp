@@ -10,7 +10,6 @@ def test_get_file_list_serial_lists_files(tmp_tree, hpcp_mod, reset_hpcp_globals
 		str(tmp_tree.src),
 		parallel_file_listing=False,
 		drop_cache=True,
-		remove_files_while_listing=False,
 	)
 	joined = ' '.join(map(str, files))
 	assert 'a.txt' in joined
@@ -29,7 +28,6 @@ def test_get_file_list_respects_exclude(tmp_tree, hpcp_mod, reset_hpcp_globals):
 		exclude=exclude,
 		parallel_file_listing=False,
 		drop_cache=True,
-		remove_files_while_listing=False,
 	)
 	joined = ' '.join(map(str, files))
 	assert 'keep.txt' in joined
@@ -40,10 +38,10 @@ def test_get_file_list_parallel_matches_serial(tmp_tree, hpcp_mod, reset_hpcp_gl
 	tmp_tree.add_file('a.txt', 'A')
 	tmp_tree.add_file('sub/b.txt', 'B')
 	serial, _, _, _ = hpcp_mod.get_file_list(
-		str(tmp_tree.src), parallel_file_listing=False, drop_cache=True, remove_files_while_listing=False,
+		str(tmp_tree.src), parallel_file_listing=False, drop_cache=True,
 	)
 	parallel, _, _, _ = hpcp_mod.get_file_list(
-		str(tmp_tree.src), parallel_file_listing=True, drop_cache=True, max_workers=2, remove_files_while_listing=False,
+		str(tmp_tree.src), parallel_file_listing=True, drop_cache=True, max_workers=2,
 	)
 	assert set(serial) == set(parallel)
 
@@ -52,7 +50,7 @@ def test_get_file_list_puts_symlinks_in_links(tmp_tree, hpcp_mod, reset_hpcp_glo
 	tmp_tree.add_file('target.txt', 't')
 	tmp_tree.add_symlink('link', 'target.txt')
 	files, links, _, _ = hpcp_mod.get_file_list(
-		str(tmp_tree.src), parallel_file_listing=False, drop_cache=True, remove_files_while_listing=False,
+		str(tmp_tree.src), parallel_file_listing=False, drop_cache=True,
 	)
 	joined_files = ' '.join(map(str, files))
 	joined_links = ' '.join(map(str, links))
@@ -81,7 +79,6 @@ def test_get_file_list_append_hash(tmp_tree, hpcp_mod, reset_hpcp_globals):
 		append_hash=True,
 		parallel_file_listing=False,
 		drop_cache=True,
-		remove_files_while_listing=False,
 	)
 	assert any(':' in str(f) for f in files)
 
