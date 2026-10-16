@@ -64,9 +64,25 @@ The user asked for this round to run unattended overnight. These decisions are m
 - **D7: unregistered prefix.** `Patch error` is registered with rc 252.
 - **D8: dead code.** `_resolve_conflicts` is removed.
 
+## Post-round code review
+
+A local `/code-review high` of the whole branch found 10 items. I checked each against the code and fixed the valid ones, each with a test that failed first:
+
+1. **Valid, data loss.** `-rm` with `-d` destinations that all fall away (a glob that matches nothing) took the remove-only branch and deleted the sources without copying them. It also showed an older bug: `-rm -di NEW.img` deleted the sources and never created the image. Now a new `-di` image is created first, and requested destinations that give none raise `No valid destination` (202).
+2. **Valid.** Tracking a link into an excluded directory copied the excluded target. The target is now checked together with its parent directories (`_excluded_or_below`).
+3. **Valid.** `_task_result` let a `BrokenProcessPool` (a dead worker) escape. It is now recorded under the site's prefix.
+4. **Valid.** A name ending in `:` made an unhashed list "hashed". An empty digest now counts only when every file and link line has a `:`.
+5. **Valid (fragile, not live).** The remove gate could miss the errors of a listing cached before the copy. `hpcp()` now drops the listing cache when the copy starts.
+6. **Valid.** A source directory gone after its listing reached `copy_file` ("Copy process crashed"); the first test had patched `isdir`. It is now a `Directory sync error`.
+7. **Valid.** `remove_extra_dirs` walked into mount points below the destination. They are now pruned.
+8. **Valid.** Ignoring a non-root `chown` EPERM dropped the group. `_chown_like_cp` retries with the group only, as `cp -a` does.
+9. **Partly valid.** The `-dd` destination is not affected: its xfs UUID is set after the copy, through `delayed_commands`. The `-dd` source mount and the duplicated logic were real, so all read-write mounts now use `_rw_mount_command`.
+10. **Cleanup, accepted:** `_is_failure` and `_link_dests`. I kept both C4 fixes on purpose: `get_dests` passes `[dest]`, and `expand_paths` takes a str for any other caller.
+
 ## Not changed (noted for the user)
 
 - `-rme` in `-di` mode still mirrors the whole image to the sources, as `-rme` does for a plain destination.
+- `remove_extra_files` (unlike `remove_extra_dirs` now) still lists into filesystems mounted below the destination, so `-rme` can delete extra files there. This predates 9.73 and was left for the user.
 
 ## Questions for the user
 
