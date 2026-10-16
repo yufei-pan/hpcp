@@ -5108,6 +5108,8 @@ def _load_patch(volume_roots, volume_names=None):
 		number, _, count = str(meta.get('volume', '')).partition('/')
 		try:
 			number, count = int(number), int(count)
+			if count < 1 or not 1 <= number <= count:
+				raise ValueError
 		except ValueError:
 			raise RuntimeError(f'Patch format error: {name} has a bad volume field {meta.get("volume")!r}')
 		if total is None:
@@ -5172,10 +5174,6 @@ def _resolve_conflict_lines(lines, force):
 			raise RuntimeError(f'Patch conflict: {len(lines)} conflicting path(s); nothing applied')
 	for _, short in lines:
 		print(f"Warning: forcing {short}", file=sys.stderr)
-
-def _resolve_conflicts(conflicts, force):
-	"""Phase-1 entry point: one section's conflicting checks."""
-	_resolve_conflict_lines(_conflict_lines(conflicts), force)
 
 def _inside_root(root, path):
 	"""True when path's parent directory resolves inside root (no symlinked escape)."""
@@ -5922,6 +5920,9 @@ def _resolve_section_conflicts(plans, force, extra_lines=()):
 def _preflight_section(plan):
 	"""Refusals -fa cannot override, raised before anything changes."""
 	todo = _section_todo(plan)
+	if todo and not plan.volume_roots:
+		# The section's payload directory is a symlink on every volume (_section_volume_roots): a damaged or crafted patch.
+		raise RuntimeError(f'Incomplete patch: no usable payload directory for section {plan.name} (a symlink on every volume); nothing applied')
 	# Not forceable: the deletes would run and the writes be refused, leaving the patch half applied.
 	escaping = _rows_escaping_target(todo, plan.target_root)
 	if escaping:

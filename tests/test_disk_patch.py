@@ -3343,3 +3343,48 @@ def test_a_blank_x_line_does_not_empty_a_partition_comparison(tmp_path, hpcp_mod
 	exclude = hpcp_mod.format_exclude(None, str(xfile))
 	rows = hpcp_mod._partition_changes(str(new), str(base), [], [], exclude, False, 1, False)
 	assert ('M', 'etc/os-release') in {(row.op, row.path) for row in rows}
+
+
+# ---- 9.73: untrusted patch shapes refused before anything changes (review D4, D5, D7, D8) ----
+
+def test_preflight_refuses_a_section_without_a_usable_payload_directory(tmp_path, hpcp_mod, reset_hpcp_globals):
+	"""Review D4: partN a symlink on every volume leaves no payload root; a section of only deletes and directory rows
+	passed the file-payload check and then failed with IndexError after its deletes."""
+	hpcp_mod.HASH_SIZE = 65536
+	target = tmp_path / 'target'
+	gone = _write(target / 'gone.txt', 'bye')
+	(tmp_path / 'outside').mkdir()
+	volume = tmp_path / 'vol'
+	volume.mkdir()
+	os.symlink(str(tmp_path / 'outside'), str(volume / 'part1'))
+	R = hpcp_mod.ChangeRow
+	rows = [R('D', 'gone.txt', hpcp_mod.get_entry_state(gone), '-'), R('A', 'newdir/', '-', 'd:40755:0:0:-')]
+	roots = hpcp_mod._section_volume_roots([str(volume)], 'part1')
+	plan = hpcp_mod._plan_section('part1', rows, roots, str(target), True, False, 1)
+	with pytest.raises(RuntimeError, match=r'^Incomplete patch: .*part1.*nothing applied'):
+		hpcp_mod._preflight_section(plan)
+	assert os.path.exists(gone) and not (target / 'newdir').exists()
+
+
+@pytest.mark.parametrize('volume_field', ['1/0', '0/0', '1/-3', '2/1'])
+def test_load_patch_refuses_an_impossible_volume_field(tmp_path, hpcp_mod, reset_hpcp_globals, volume_field):
+	"""Review D5: a count below 1 (or a number outside 1..count) is a format error, not an IndexError."""
+	volume = tmp_path / 'vol'
+	diff_dir = volume / '.hpcp_diff'
+	diff_dir.mkdir(parents=True)
+	hpcp_mod.write_changes(str(diff_dir / 'part1.changes.tsv'), [])
+	meta = dict(_disk_meta(), patch_id='p1', volume=volume_field, sections=[('part1', 'part1', 'part1.changes.tsv')], raws=[])
+	hpcp_mod.write_manifest(str(diff_dir / 'manifest'), meta)
+	with pytest.raises(RuntimeError, match=r'^Patch format error: .*bad volume field'):
+		hpcp_mod._load_patch([str(volume)])
+
+
+def test_patch_error_has_its_own_return_code(hpcp_mod, reset_hpcp_globals):
+	"""Review D7: the autofs refusals ('Patch error: ...') are not mistaken for a failed command (128)."""
+	hpcp_mod.eprint('Patch error: /boot/efi is an automount (autofs) that could not be mounted; mount it and re-run')
+	assert hpcp_mod.get_rc_from_error() == 252
+
+
+def test_unused_conflict_entry_point_is_gone(hpcp_mod):
+	"""Review D8: every apply resolves conflicts through _resolve_section_conflicts."""
+	assert not hasattr(hpcp_mod, '_resolve_conflicts')
