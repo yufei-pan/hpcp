@@ -338,3 +338,22 @@ def test_remove_extra_leaves_no_cached_listing_of_the_destination(tmp_path, hpcp
 	hpcp_mod.remove_extra_files([], [str(dst) + os.sep], 2, False, 1, single_thread=True, src_paths=[str(src) + os.sep])
 	assert not (dst / 'extra.txt').exists()
 	assert not any(str(dst) in str(key) for key in hpcp_mod._get_file_list_cache)
+
+
+@pytest.mark.parametrize('legacy', [True, False])
+def test_remove_extra_never_unlinks_the_target_of_a_destination_that_is_a_symlink(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch, legacy):
+	"""Security review: `-rme src dst` where dst was replaced by a symlink to /etc/shadow (here: victim.txt). Listed
+	plainly, dst is the link, and an extra; resolving the destination would unlink its target. The link goes, as in
+	9.73 (os.remove(dest)), never what it points to."""
+	src = tmp_path / 'src'
+	src.mkdir()
+	(tmp_path / 'victim.txt').write_text('not yours')
+	dst = tmp_path / 'dst'
+	os.symlink(str(tmp_path / 'victim.txt'), str(dst))
+	_answer_yes(monkeypatch)
+	if legacy:
+		hpcp_mod.remove_extra_files(set(), [str(dst)], 2, False, 1, single_thread=True)
+	else:
+		hpcp_mod.remove_extra_files([], [str(dst)], 2, False, 1, single_thread=True, src_paths=[str(src) + os.sep])
+	assert (tmp_path / 'victim.txt').read_text() == 'not yours'
+	assert not os.path.lexists(dst)

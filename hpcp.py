@@ -8793,19 +8793,22 @@ def _remove_listed_files(items, rmdir=False):
 _SCANDIR_FD = os.scandir in os.supports_fd
 
 def _destination_roots(dests):
-	"""{abspath(dest): (its real path, that path's _path_identity)} for -rme: a destination as given is trusted, a
-	symlink in it included ('link/' is where the copy wrote); what lies below it is reached by descriptors."""
+	"""{abspath(dest): (its real path, that path's _path_identity, dest's own identity)} for -rme: what lies below a
+	destination is reached from its real path, as given (a symlink in it included: 'link/' is where the copy wrote) and
+	then by descriptors. The destination itself, should it be extra, is the name as given: a symlink there is the link,
+	never its target."""
 	roots = {}
 	for dest in dests:
 		listed = os.path.abspath(dest)
 		real = os.path.realpath(listed)
-		roots[listed] = (real, _path_identity(real))
+		roots[listed] = (real, _path_identity(real), _path_identity(listed))
 	return roots
 
 def _items_below(pairs, roots, sort=True):
 	"""[(root, its identity, path below it)] for pairs (path, the root it was listed below), for _remove_listed_files:
-	roots maps each listed root (abspath) to (the root to remove from, its identity). A relative path is taken from the
-	CWD and the root itself is '.'; a path not below its root (it cannot be) is reported, not removed. With sort, in
+	roots maps each listed root (abspath) to (the root to remove from, its identity[, the listed root's own identity]).
+	A relative path is taken from the CWD. The listed root itself is (listed root, its own identity, '.'): removed as
+	the name given, never resolved. A path not below its root (it cannot be) is reported, not removed. With sort, in
 	path order (neighbours share their directories' descriptors)."""
 	items = []
 	for path, listed_root in pairs:
@@ -8813,15 +8816,13 @@ def _items_below(pairs, roots, sort=True):
 			path = os.path.abspath(path)
 		listed_root = os.path.abspath(listed_root)
 		prefix = listed_root.rstrip(os.sep) + os.sep
+		entry = roots[listed_root]
 		if path == listed_root:
-			rel = '.'
+			items.append((listed_root, entry[2] if len(entry) > 2 else entry[1], '.'))
 		elif path.startswith(prefix):
-			rel = path[len(prefix):]
+			items.append((entry[0], entry[1], path[len(prefix):]))
 		else:
 			eprint(f'Remove process exception: not removing {path}: it is not below {listed_root}')
-			continue
-		root, identity = roots[listed_root]
-		items.append((root, identity, rel))
 	if sort:
 		items.sort(key=lambda item: (item[0], item[2]))
 	return items
