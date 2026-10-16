@@ -136,3 +136,17 @@ def test_copy_with_an_unreadable_directory_copies_the_rest(tmp_tree, hpcp_mod, r
 	srcs, opts = copy_args()
 	assert hpcp_mod.hpcp(srcs, **opts) == 209
 	assert (tmp_tree.dst / 'a.txt').read_text() == 'A'
+
+
+def test_move_after_a_cached_incomplete_listing_keeps_the_sources(tmp_tree, hpcp_mod, reset_hpcp_globals, require_linux, monkeypatch):
+	"""The remove gate sees the copy's listing errors even when that listing was cached before the copy started."""
+	tmp_tree.add_file('a.txt', 'A')
+	tmp_tree.add_file('secret/c.txt', 'C')
+	_deny_scandir(monkeypatch, hpcp_mod, tmp_tree.src / 'secret')
+	src = str(tmp_tree.src) + os.sep
+	hpcp_mod.get_file_list(src, exclude=hpcp_mod.format_exclude(None), parallel_file_listing=False)
+	hpcp_mod.ERRORS.clear()
+	rc = hpcp_mod.hpcp([src], dest_paths=[str(tmp_tree.dst) + os.sep], remove_force=True, single_thread=True,
+		batch=True, do_not_remove_files_while_listing=True)
+	assert (tmp_tree.src / 'secret' / 'c.txt').exists()
+	assert rc == 212

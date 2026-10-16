@@ -9246,6 +9246,9 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = multipr
 
 		copy_failures = []
 		if dests != ...:
+			# The remove gate below judges the errors recorded from here on. A listing cached earlier (create_image's size
+			# scan, or a library caller's) would not record its errors again: list afresh.
+			_get_file_list_cache.clear()
 			copy_error_start = len(ERRORS)
 			total_file_list, total_sym_links = process_copy(src_paths, dests, single_thread=single_thread, max_workers=max_workers,
 																			verbose=verbose, directory_only=directory_only,no_directory_sync=no_directory_sync,
