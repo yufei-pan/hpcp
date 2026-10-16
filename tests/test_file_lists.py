@@ -271,3 +271,34 @@ def test_process_compare_src_image_root_layout_uses_relative_keys(tmp_path, hpcp
 		diff_file_list=diff, src_image_roots=[root])
 	got = {(r.op, r.path) for r in hpcp_mod.read_changes(diff)}
 	assert got == {('A', 'only_src.txt'), ('M', 'sub/changed.txt'), ('D', 'only_store.txt')}
+
+
+# ---- 9.73: lists from -hs 0 or another hash algorithm (review D2) ----
+
+XXH = 'a' * 16
+BLAKE = 'b' * 128
+
+
+def test_unhashed_list_lines_are_files_with_unknown_content(hpcp_mod):
+	"""-hs 0 writes 'path:' (an empty digest) for files and 'path:target' for links."""
+	entries = hpcp_mod._parse_file_list_lines(['src/a.txt:', 'src/ln:target', 'src/sub/'], live_keys={'src/a.txt', 'src/ln'})
+	assert entries == {'src/a.txt': None, 'src/ln': 'target', 'src/sub/': None}
+
+
+@pytest.mark.parametrize('local_xxhash, foreign, own', [(False, XXH, BLAKE), (True, BLAKE, XXH)])
+def test_digest_of_the_other_algorithm_is_a_file_with_unknown_content(hpcp_mod, monkeypatch, local_xxhash, foreign, own):
+	monkeypatch.setattr(hpcp_mod, 'xxhash_available', local_xxhash)
+	entries = hpcp_mod._parse_file_list_lines([f'src/a.txt:{foreign}', f'src/b.txt:{own}', 'src/ln:target'], live_keys={'src/ln'})
+	assert entries == {'src/a.txt': None, 'src/b.txt': own, 'src/ln': 'target'}
+
+
+def test_compare_with_an_unhashed_list_reports_no_changes(tmp_tree, hpcp_mod, reset_hpcp_globals, require_linux):
+	tmp_tree.add_file('a.txt', 'A')
+	tmp_tree.add_file('sub/b.txt', 'B')
+	tmp_tree.add_symlink('ln', 'a.txt')
+	listing = str(tmp_tree.root / 'list.txt')
+	diff = str(tmp_tree.root / 'diff.tsv')
+	src = [str(tmp_tree.src)]
+	assert hpcp_mod.hpcp(src, target_file_list=listing, hash_size=0, single_thread=True) == 0
+	assert hpcp_mod.hpcp(src, target_file_list=listing, diff_file_list=diff, hash_size=0, single_thread=True) == 0
+	assert hpcp_mod.read_changes(diff) == []

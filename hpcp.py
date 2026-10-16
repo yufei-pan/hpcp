@@ -4540,17 +4540,22 @@ def report_changes(rows, diff_file_list=None, tar_diff_file_list=False):
 def _hash_hex_re():
 	return re.compile(r'[0-9a-f]{16}' if xxhash_available else r'[0-9a-f]{128}')
 
+# What -fl writes after a file's ':': an xxh64 or a blake2b digest, or nothing (-hs 0).
+_LIST_DIGEST_RE = re.compile(r'[0-9a-f]{16}|[0-9a-f]{128}|')
+
 def _parse_file_list_lines(lines, live_keys=()):
 	"""Parse -fl style lines into {key: value}.
 
 	value is the hash for files, the link target for symlinks, None when the list holds
-	neither. A line ending in '/' is a directory. A line ending in ':<digest>' is a file.
+	neither. A line ending in '/' is a directory. A line ending in ':<digest>' is a file, whatever
+	algorithm made the digest, and so is 'path:' (a list made with -hs 0); only a digest of this
+	system's algorithm is kept as the value, another one or none is None (not compared).
 	In a hashed list (any line has a digest) the remaining lines are symlinks 'path:target':
 	the longest live key followed by ':' is the path, else the text before the first ':'.
 	"""
 	hex_re = _hash_hex_re()
 	lines = [line for line in lines if line]
-	hashed = any(':' in line and not line.endswith('/') and hex_re.fullmatch(line.rpartition(':')[2]) for line in lines)
+	hashed = any(':' in line and not line.endswith('/') and _LIST_DIGEST_RE.fullmatch(line.rpartition(':')[2]) for line in lines)
 	live_keys = set(live_keys)
 	entries = {}
 	for line in lines:
@@ -4558,8 +4563,8 @@ def _parse_file_list_lines(lines, live_keys=()):
 			entries[line] = None
 			continue
 		path, sep, tail = line.rpartition(':')
-		if sep and hex_re.fullmatch(tail):
-			entries[path] = tail
+		if sep and _LIST_DIGEST_RE.fullmatch(tail):
+			entries[path] = tail if hex_re.fullmatch(tail) else None
 			continue
 		if hashed and ':' in line:
 			key = None
