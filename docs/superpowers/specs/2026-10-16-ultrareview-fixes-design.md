@@ -117,6 +117,21 @@ Declined: a target tracked through a symlinked directory (`sub/../t`) that an ea
 
 Most findings after the first review came from `-rme` meeting the revived link tracking. That bears on Question 1.
 
+## Fifth review, and why the review loop stops here
+
+Fixed, with tests:
+- A tracked directory that holds another source's copy lost its other contents. Only a target that holds its own link is dropped now, and the nearest container decides.
+- Tracking checked a target's parents above the source tree. Now only below the common ancestor of the link and its target.
+- A symlink source root is judged without a trailing `/`.
+- Excluded roots are computed once per pass.
+- The symlinked-directory note always prints.
+
+Declined:
+- Several sources merged into one destination with one of them excluded whole keeps every path there, since any of them may be its copy.
+- An excluded link target's destination copy is kept whether or not the source still has it.
+
+Each review after the first found fewer and narrower issues, almost all where `-rme` meets excludes, merged sources and the revived link tracking. More rounds would mostly refine behaviour that depends on Question 1. If tracking goes opt-in, the keep list (`create_sym_links`' triples, `_kept_paths`, `_is_kept`) only matters with the option and can be reviewed then.
+
 ## Not changed (noted for the user)
 
 - `-rme` in `-di` mode still mirrors the whole image to the sources, as `-rme` does for a plain destination.
