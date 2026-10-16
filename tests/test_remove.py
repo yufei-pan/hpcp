@@ -926,3 +926,73 @@ def test_a_directory_the_move_cannot_enter_does_not_stop_its_siblings(tmp_path, 
 	assert not (root / 'a' / 'f').exists() and not (root / 'c' / 'f').exists()
 	assert (victim / 'f').read_text() == 'not yours'
 	assert [error.partition(':')[0] for error in hpcp_mod.ERRORS] == ['Remove process exception']
+
+
+# ---- 9.73: review of eaee294..HEAD ----
+
+@pytest.mark.parametrize('layout', ['dest-is-source', 'dest-inside-source', 'file-onto-itself'])
+def test_move_onto_itself_is_refused_before_anything_changes(tmp_path, hpcp_mod, reset_hpcp_globals, require_linux, layout):
+	"""`hpcp -rf /data/w/x -d /data/w/` resolves the destination to the source: every file is identical to itself, the
+	copy skips it, and the move then removed the source (9.72 too). Refused, nothing copied or removed."""
+	w = tmp_path / 'w'
+	(w / 'x' / 'sub').mkdir(parents=True)
+	(w / 'x' / 'a.txt').write_text('a')
+	(w / 'x' / 'sub' / 'b.txt').write_text('b')
+	if layout == 'dest-is-source':
+		src, dest = str(w / 'x'), str(w) + os.sep
+	elif layout == 'dest-inside-source':
+		src, dest = str(w / 'x'), str(w / 'x' / 'sub') + os.sep
+	else:
+		src, dest = str(w / 'x' / 'a.txt'), str(w / 'x') + os.sep
+	rc = hpcp_mod.hpcp([src], dest_paths=[dest], remove_force=True, single_thread=True, batch=True)
+	assert rc == 241
+	assert (w / 'x' / 'a.txt').read_text() == 'a' and (w / 'x' / 'sub' / 'b.txt').read_text() == 'b'
+	assert not (w / 'x' / 'sub' / 'x').exists()
+
+
+def test_move_with_many_source_roots_matches_each_entry_in_linear_time(tmp_path, hpcp_mod, reset_hpcp_globals):
+	"""-sfl gives one root per file: matching every listed entry against every root was quadratic."""
+	import time
+	src = tmp_path / 'src'
+	src.mkdir()
+	roots = []
+	for index in range(30000):
+		path = src / ('f%05d' % index)
+		path.write_text('x')
+		roots.append(str(path))
+	ids = {root: hpcp_mod._path_identity(root) for root in roots}
+	start = time.monotonic()
+	hpcp_mod.remove_moved_sources(roots, roots, {}, single_thread=True, remove_force=True, root_ids=ids)
+	assert time.monotonic() - start < 3
+	assert os.listdir(src) == []
+
+
+def test_move_of_nested_sources_names_what_it_left_once(tmp_path, hpcp_mod, reset_hpcp_globals):
+	a = tmp_path / 'a'
+	(a / 'b').mkdir(parents=True)
+	(a / 'b' / 'new.txt').write_text('written during the move')
+	roots = [str(a), str(a / 'b')]
+	ids = {root: hpcp_mod._path_identity(root) for root in roots}
+	hpcp_mod.remove_moved_sources(roots, [], {}, single_thread=True, remove_force=True, root_ids=ids)
+	notes = [error for error in hpcp_mod.ERRORS if error.startswith('Move left entries')]
+	assert len(notes) == 1 and notes[0].count('new.txt') == 1 and 'Move left entries: 1 ' in notes[0]
+
+
+def test_source_identity_of_a_symlink_given_with_a_slash_is_the_links(tmp_path, hpcp_mod):
+	"""'ln/' is copied (and moved) as the link ln: its pinned identity must be the link's, not its target's."""
+	(tmp_path / 'real').mkdir()
+	os.symlink(str(tmp_path / 'real'), str(tmp_path / 'ln'))
+	ids = hpcp_mod._source_identities([str(tmp_path / 'ln') + os.sep])
+	assert ids == {str(tmp_path / 'ln'): hpcp_mod._path_identity(str(tmp_path / 'ln'))}
+	assert ids[str(tmp_path / 'ln')] != hpcp_mod._path_identity(str(tmp_path / 'real'))
+
+
+def test_plain_remove_without_remove_while_listing_reports_no_copy_notes(tmp_tree, hpcp_mod, reset_hpcp_globals, require_linux, monkeypatch):
+	"""-rm -rwloff (no destination): rmtree removes everything, special files included; the listing's copy notes are
+	not the run's errors."""
+	tmp_tree.add_file('a.txt', 'a')
+	os.mkfifo(str(tmp_tree.src / 'pipe'))
+	monkeypatch.setattr(hpcp_mod, 'REMOVE_FILES_WHILE_LISTING', False)
+	hpcp_mod.process_remove([str(tmp_tree.src)], single_thread=True, remove_force=True)
+	assert not tmp_tree.src.exists()
+	assert [error for error in hpcp_mod.ERRORS if error.startswith(('Special file skipped', 'Listing error'))] == []

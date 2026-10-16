@@ -684,3 +684,16 @@ def test_relative_directory_link_is_recreated_as_one_whatever_the_cwd(tmp_tree, 
 	(tmp_tree.dst / 'sub').mkdir()
 	hpcp_mod.create_sym_links({str(link): [str(tmp_tree.dst / 'sub' / 'l')]})
 	assert calls == [True]
+
+
+def test_an_exclude_without_tracking_resolves_only_excluded_link_targets(tmp_tree, hpcp_mod, reset_hpcp_globals, require_linux, monkeypatch):
+	"""Review: any -e made every relative '..' link cost two realpath calls without -lt. Only an excluded target needs
+	the symlinked-directory check."""
+	tmp_tree.add_file('shared/lib', 'lib')
+	link = tmp_tree.add_symlink('proj/lib', '../shared/lib')
+	(tmp_tree.dst / 'proj').mkdir()
+	calls = []
+	real = os.path.realpath
+	monkeypatch.setattr(hpcp_mod.os.path, 'realpath', lambda path, *a, **k: calls.append(path) or real(path, *a, **k))
+	hpcp_mod.create_sym_links({str(link): [str(tmp_tree.dst / 'proj' / 'lib')]}, exclude=hpcp_mod.format_exclude(['*.tmp']))
+	assert calls == []

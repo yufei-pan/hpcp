@@ -2273,9 +2273,10 @@ def get_mount_table():
 
 #%% -- Symbolic Links --
 def create_sym_links(symLinks,exclude=None,link_tracking=False):
-	"""Recreate symLinks ({src link: [dest paths]}). Returns, with link tracking (-lt), a (target's destination path, target's
-	source path, link's destination path) triple for each relative link whose target exists at the source (copied now
-	or already there, or excluded): -rme keeps those targets, except where the copy itself covers them (_kept_paths)."""
+	"""Recreate symLinks ({src link: [dest paths]}). Returns a (target's destination path, target's source path, link's
+	destination path) triple for each relative link whose target is excluded, and with link tracking (-lt) for each one
+	whose target exists at the source (copied now or already there): -rme keeps those targets, except where the copy
+	itself covers them (_kept_paths)."""
 	global RANDOM_DESTINATION_SELECTION
 	tracked_targets = set()
 	if len(symLinks) == 0:
@@ -2319,11 +2320,13 @@ def create_sym_links(symLinks,exclude=None,link_tracking=False):
 				# used only when the kernel resolves the link to that same file (no '..' after a symlinked directory).
 				linked = os.path.join(os.path.dirname(src), linkedTargetFile)
 				sourceLinkedFile = os.path.normpath(linked)
-				through_symlinked_dir = bool(link_tracking or exclude) and os.pardir in linkedTargetFile.split(os.sep) and os.path.realpath(sourceLinkedFile) != os.path.realpath(linked)
 				# Not copied, but an earlier copy of it in the destination is kept, as for any excluded path: with or
 				# without tracking (an -e protects it either way).
-				keep_target = bool(exclude) and not through_symlinked_dir and _excluded_or_below(sourceLinkedFile, exclude,
+				excluded_target = bool(exclude) and _excluded_or_below(sourceLinkedFile, exclude,
 					stop=os.path.commonpath([sourceLinkedFile, os.path.dirname(os.path.abspath(src))]))
+				# Two realpath calls, so only when tracking or an excluded target needs it.
+				through_symlinked_dir = bool(link_tracking or excluded_target) and os.pardir in linkedTargetFile.split(os.sep) and os.path.realpath(sourceLinkedFile) != os.path.realpath(linked)
+				keep_target = excluded_target and not through_symlinked_dir
 				if link_tracking:
 					note = None
 					if through_symlinked_dir:
@@ -4439,6 +4442,25 @@ def _logically_excluded(rel, logical_root, exclude):
 			return True
 	return False
 
+def _listing_error_path(error):
+	"""The path a recorded 'Listing error' names, or None (a crashed listing task names none)."""
+	prefix, overlong = 'Listing error: ', ': path longer than 4096 characters, not listed'
+	if not error.startswith(prefix):
+		return None
+	body = error[len(prefix):]
+	if body.endswith(overlong):
+		return body[:-len(overlong)]
+	index = body.rfind(': [Errno ')
+	return body[:index] if index > 0 else None
+
+def _listing_error_excluded(error, root, logical_root, exclude):
+	"""True when error is a 'Listing error' for a path below root that exclude leaves out (logically, see
+	_logically_excluded)."""
+	path = _listing_error_path(error)
+	if path is None or not (path == root or path.startswith(root.rstrip(os.sep) + os.sep)):
+		return False
+	return _logically_excluded(os.path.relpath(path, root), logical_root, exclude)
+
 def build_entry_map(root, prefix='', parents=None, exclude=None, logical_root=None,
 		max_workers=multiprocessing.cpu_count(), parallel_file_listing=False):
 	"""Map patch keys to absolute paths for one side of a diff.
@@ -4470,6 +4492,9 @@ def build_entry_map(root, prefix='', parents=None, exclude=None, logical_root=No
 	# The listing goes on past a directory it cannot read; a map without that directory's entries would show them as
 	# deleted (or, on the base side, as added), so a patch or diff list made from it would be wrong.
 	failures = [error for error in ERRORS[error_start:] if _is_failure(error)]
+	if post_filter:
+		# Listed without the excludes (matched below against logical paths): what they leave out does not count.
+		failures = [error for error in failures if not _listing_error_excluded(error, root, logical_root, exclude)]
 	if failures:
 		raise RuntimeError(f'Listing error: {root} could not be listed completely ({len(failures)} error(s)); '
 			'not comparing a partial tree: fix the paths above (or exclude them with -e) and re-run')
@@ -4653,6 +4678,13 @@ def _hash_hex_re():
 # What -fl writes after a file's ':': an xxh64 or a blake2b digest (or nothing, with -hs 0).
 _LIST_DIGEST_RE = re.compile(r'[0-9a-f]{16}|[0-9a-f]{128}')
 
+def _colon_lines_name_live_links(lines, live_keys):
+	"""For a list whose every line has a ':' but no digest and no bare 'path:' (a -hs 0 list of links only, or plain
+	names that hold a ':'): True when more lines read as 'live path:target' than as a live path themselves."""
+	as_links = sum(1 for line in lines if line not in live_keys
+		and any(char == ':' and line[:index] in live_keys for index, char in enumerate(line)))
+	return as_links > sum(1 for line in lines if line in live_keys)
+
 def _parse_file_list_lines(lines, live_keys=()):
 	"""Parse -fl style lines into {key: value}.
 
@@ -4662,15 +4694,16 @@ def _parse_file_list_lines(lines, live_keys=()):
 	this system's algorithm is kept as the value, another one or none is None (not compared).
 	A list is hashed when a line has a digest, or when a line is a bare 'path:' and every file and link
 	line has a ':' (a -hs 0 list; an unhashed list has plain paths, which may all hold a ':' when the
-	source root's name does). A -hs 0 list of symlinks only reads as unhashed. In a hashed list the remaining lines are symlinks
+	source root's name does); without either, the live tree decides (_colon_lines_name_live_links). In a hashed list the remaining lines are symlinks
 	'path:target': the longest live key followed by ':' is the path, else the text before the first ':'.
 	"""
 	hex_re = _hash_hex_re()
 	lines = [line for line in lines if line]
 	entry_lines = [line for line in lines if not line.endswith('/')]
-	hashed = (any(':' in line and _LIST_DIGEST_RE.fullmatch(line.rpartition(':')[2]) for line in entry_lines)
-		or (any(line.endswith(':') for line in entry_lines) and all(':' in line for line in entry_lines)))
 	live_keys = set(live_keys)
+	hashed = (any(':' in line and _LIST_DIGEST_RE.fullmatch(line.rpartition(':')[2]) for line in entry_lines)
+		or (bool(entry_lines) and all(':' in line for line in entry_lines)
+			and (any(line.endswith(':') for line in entry_lines) or _colon_lines_name_live_links(entry_lines, live_keys))))
 	entries = {}
 	for line in lines:
 		if line.endswith('/'):
@@ -5610,12 +5643,11 @@ def _remove_tree_by_path(top, top_dev, mount_points):
 					errors.append(f'{os.path.relpath(child, top)}: {e.strerror}')
 	return sorted(kept), errors
 
-def _open_below(root_real, rel, flags):
-	"""A descriptor of root_real/rel reached one component at a time from a descriptor of root_real, each opened with
-	flags (O_NOFOLLOW | O_DIRECTORY): a component that is a symlink or no directory raises OSError (ELOOP, ENOTDIR)."""
-	fd = os.open(root_real, os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0) | getattr(os, 'O_CLOEXEC', 0))
+def _descend(fd, parts, flags):
+	"""Open each of parts in turn, the first below descriptor fd, each with flags (O_NOFOLLOW | O_DIRECTORY): a component
+	that is a symlink or no directory raises OSError (ELOOP, ENOTDIR). Takes fd over (closed); returns the last one."""
 	try:
-		for part in ([] if rel in ('', '.') else rel.split(os.sep)):
+		for part in parts:
 			next_fd = os.open(part, flags, dir_fd=fd)
 			os.close(fd)
 			fd = next_fd
@@ -5623,6 +5655,11 @@ def _open_below(root_real, rel, flags):
 		os.close(fd)
 		raise
 	return fd
+
+def _open_below(root_real, rel, flags):
+	"""A descriptor of root_real/rel reached one component at a time from a descriptor of root_real (_descend)."""
+	fd = os.open(root_real, os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0) | getattr(os, 'O_CLOEXEC', 0))
+	return _descend(fd, [] if rel in ('', '.') else rel.split(os.sep), flags)
 
 def _remove_tree_around_mounts(path, mount_points=None, target_root=None):
 	"""Remove the directory tree at path as shutil.rmtree would, without entering a mount.
@@ -8559,6 +8596,7 @@ def process_remove(src_paths: list,single_thread = False, max_workers = multipro
 		else:
 			processedPaths.append(path)
 	print(f"Removing files from {pformat(processedPaths)} with {max_workers if not single_thread else '1'} workers")
+	error_start = len(ERRORS)
 	if not remove_force:
 		if not sys.stdin.isatty():
 			raise RuntimeError("User requested stop: Not removing files as stdin is not a tty")
@@ -8578,6 +8616,9 @@ def process_remove(src_paths: list,single_thread = False, max_workers = multipro
 		print('-'*80)
 		if batch and not single_thread:
 			break
+	# The listing's copy notes (a special file, a path too long to list) are no errors here: rmtree removes them too.
+	ERRORS[error_start:] = [error for error in ERRORS[error_start:] if not (error.startswith('Special file skipped:')
+		or (error.startswith('Listing error:') and error.endswith(': path longer than 4096 characters, not listed')))]
 
 _BELOW_FLAGS = os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0) | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_CLOEXEC', 0)
 
@@ -8588,6 +8629,24 @@ def _path_identity(path):
 	except OSError:
 		return None
 	return (st.st_dev, st.st_ino)
+
+def _source_identities(src_paths):
+	"""{source as the copy names it (abspath: 'ln/' is the link ln): its _path_identity}, taken before the copy."""
+	return {os.path.abspath(src): _path_identity(os.path.abspath(src)) for src in src_paths}
+
+def _same_or_inside(path, src):
+	"""True when path is src, by real path or inode (a bind mount), or lies below it. A symlink src is the link itself."""
+	if os.path.islink(src):
+		src_real = os.path.join(os.path.realpath(os.path.dirname(os.path.abspath(src))), os.path.basename(os.path.abspath(src)))
+	else:
+		src_real = os.path.realpath(src)
+	path_real = os.path.realpath(path)
+	if path_real == src_real or path_real.startswith(src_real.rstrip(os.sep) + os.sep):
+		return True
+	try:
+		return not os.path.islink(src) and os.path.exists(path) and os.path.samefile(path, src)
+	except OSError:
+		return False
 
 def _replaced(path):
 	return OSError(errno.ESTALE, 'it was replaced since the copy listed it', path)
@@ -8629,16 +8688,7 @@ def _parent_below(root, root_id, rel):
 		if os.path.realpath(os.path.join(root, parent_rel)) != os.path.normpath(os.path.join(os.path.realpath(root), parent_rel)):
 			raise OSError(errno.ELOOP, 'a directory on the path is a symlink', os.path.join(root, rel))
 		return None, name, None
-	fd = _open_source_root(root, root_id)
-	try:
-		for part in ([] if parent_rel in ('', '.') else parent_rel.split(os.sep)):
-			next_fd = os.open(part, _BELOW_FLAGS, dir_fd=fd)
-			os.close(fd)
-			fd = next_fd
-	except BaseException:
-		os.close(fd)
-		raise
-	return fd, name, None
+	return _descend(_open_source_root(root, root_id), [] if parent_rel in ('', '.') else parent_rel.split(os.sep), _BELOW_FLAGS), name, None
 
 def _remove_one_listed(root, root_id, rel):
 	"""Unlink one listed entry relative to its directory's descriptor (_parent_below), never a directory. For the root
@@ -8879,19 +8929,28 @@ def remove_moved_sources(src_paths, file_list, sym_links, single_thread=False, m
 			continue
 		roots.append(path)
 	root_ids = {root: (root_ids or {}).get(root, _path_identity(root) if root_ids is None else None) for root in roots}
-	# Each listed entry with the outermost source root it lies below, so its removal is checked from there down.
+	# Each listed entry with the outermost source root it lies below, so its removal is checked from there down: a scan
+	# of the roots when they are few, else a lookup of the entry's ancestors (-sfl gives one root per file).
 	by_length = [(root, root.rstrip(os.sep) + os.sep) for root in sorted(roots, key=len)]
+	root_set = set(roots)
+	def outermost_root(path):
+		if len(by_length) <= 16:
+			return next((root for root, prefix in by_length if path == root or path.startswith(prefix)), None)
+		found, candidate = None, path
+		while True:
+			if candidate in root_set:
+				found = candidate
+			parent = os.path.dirname(candidate)
+			if parent == candidate:
+				return found
+			candidate = parent
 	listed = []
 	for path in sorted(set(file_list) | set(sym_links or ())):
 		if not os.path.isabs(path):
 			path = os.path.abspath(path)
-		for root, prefix in by_length:
-			if path.startswith(prefix):
-				listed.append((root, root_ids[root], path[len(prefix):]))
-				break
-			if path == root:
-				listed.append((root, root_ids[root], '.'))
-				break
+		root = outermost_root(path)
+		if root is not None:
+			listed.append((root, root_ids[root], '.' if path == root else path[len(root.rstrip(os.sep)) + 1:]))
 	print(f"Removing the {len(listed)} files and links copied from {pformat(roots)} with {max_workers if not single_thread else '1'} workers")
 	if not remove_force:
 		if not sys.stdin.isatty():
@@ -8908,7 +8967,8 @@ def remove_moved_sources(src_paths, file_list, sym_links, single_thread=False, m
 			remover=_remove_listed_files)
 	left = []
 	for root in roots:
-		if not os.path.isdir(root) or os.path.islink(root):
+		# A root inside another one is walked with it.
+		if not os.path.isdir(root) or os.path.islink(root) or outermost_root(root) != root:
 			continue
 		root_left, errors = _remove_empty_source_dirs(root, root_ids[root], exclude)
 		left.extend(root_left)
@@ -9802,9 +9862,17 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = multipr
 		if dests != ...:
 			# The remove gate below judges the errors recorded from here on. A listing cached earlier (create_image's size
 			# scan, or a library caller's) would not record its errors again: list afresh.
+			if remove and not dest_image:
+				# A move onto itself: every file is identical to itself, so the copy skips it and the removal would delete
+				# the only copy (9.72 did). Refused before anything is copied.
+				for src_abs, actual_dests in _src_to_dest_map(src_paths, dests):
+					for actual in actual_dests:
+						if _same_or_inside(actual, src_abs):
+							raise RuntimeError(f'Invalid arguments: -rm would move {src_abs} onto itself ({actual} is it or lies inside it); '
+								'nothing is copied or removed')
 			_get_file_list_cache.clear()
 			# What each source is before the copy reads it: a move removes nothing below a source replaced since.
-			source_ids = {os.path.abspath(src): _path_identity(src) for src in src_paths}
+			source_ids = _source_identities(src_paths)
 			copy_error_start = len(ERRORS)
 			total_file_list, total_sym_links = process_copy(src_paths, dests, single_thread=single_thread, max_workers=max_workers,
 																			verbose=verbose, directory_only=directory_only,no_directory_sync=no_directory_sync,

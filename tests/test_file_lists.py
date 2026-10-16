@@ -318,3 +318,15 @@ def test_unhashed_list_whose_every_name_has_a_colon_stays_unhashed(hpcp_mod, lin
 	"""Ultrareview: a source root named 'snap:…' (or one timestamped file) puts ':' in every line of a plain -nhfl
 	list. Without a bare 'path:' line (what -hs 0 writes for a file) nothing marks the list as hashed."""
 	assert hpcp_mod._parse_file_list_lines(lines) == {line: None for line in lines}
+
+
+def test_hs0_list_of_links_only_is_read_as_hashed_by_the_live_tree(hpcp_mod):
+	"""Review: a -hs 0 list with links and no file has no bare 'path:' line; the live tree tells: 'l1' is a live key,
+	'l1:target1' is not."""
+	entries = hpcp_mod._parse_file_list_lines(['./', './l1:target1', './l2:t2'], live_keys={'./', './l1', './l2'})
+	assert entries == {'./': None, './l1': 'target1', './l2': 't2'}
+
+
+def test_unhashed_list_of_colon_names_stays_unhashed_against_the_live_tree(hpcp_mod):
+	lines = ['snap:1/', 'snap:1/a.txt', 'snap:1/10:00.log']
+	assert hpcp_mod._parse_file_list_lines(lines, live_keys=set(lines)) == {line: None for line in lines}

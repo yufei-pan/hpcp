@@ -4561,3 +4561,14 @@ def test_diff_with_an_unreadable_new_directory_writes_no_patch(tmp_path, hpcp_mo
 	assert hpcp_mod.hpcp([str(tmp_path / 'new')], dest_paths=[str(tmp_path / 'base')], get_diff_image=str(out),
 		max_workers=1, single_thread=True, batch=True) == 209
 	assert not out.exists()
+
+
+def test_build_entry_map_ignores_a_listing_error_inside_a_logically_excluded_subtree(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	"""The base side lists everything and filters by the new tree's excludes afterwards: an unreadable directory the
+	user excluded with -e must not refuse the diff (-e is the advice the refusal gives)."""
+	_write(tmp_path / 'base' / 'cache' / 'c.bin', 'c')
+	_write(tmp_path / 'base' / 'keep.txt', 'k')
+	_fail_scandir_at(hpcp_mod, monkeypatch, tmp_path / 'base' / 'cache')
+	entries = hpcp_mod.build_entry_map(str(tmp_path / 'base'), exclude=hpcp_mod.format_exclude(['*/cache']),
+		logical_root=str(tmp_path / 'new'), max_workers=1)
+	assert './' in entries and 'keep.txt' in entries and not any(key.startswith('cache') for key in entries)
