@@ -4799,7 +4799,7 @@ def _check_payload(rows, volume_roots, full_hash=False, max_workers=1, new_base=
 	"""Raise RuntimeError('Diff image error: ...') unless every A / M file row's payload is on a volume
 	and still matches its row; every failing row is checked and reported in one error.
 
-	copy_file_list_parallel reports failures only on stderr and skips full destinations: a row
+	copy_file_list_parallel records its failures in ERRORS and goes on (it skips full destinations too): a row
 	with no copy of the recorded size on any volume is an incomplete payload, unless its source
 	under new_base no longer has that size either (a live file that grew or went away). A live
 	source can also change between the change scan and the copy at the same size; that copy

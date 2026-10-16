@@ -4486,3 +4486,19 @@ def test_conflict_list_prints_undecodable_states(tmp_path, hpcp_mod, reset_hpcp_
 	hpcp_mod._resolve_conflict_lines(hpcp_mod._conflict_lines([check]), True)
 	stream.flush()
 	assert b'other\\xfd' in stream.buffer.getvalue()
+
+
+def test_payload_source_deleted_before_the_copy_is_diagnosed(trees, hpcp_mod, tmp_path):
+	"""Review D6: a live file that went away after the scan made the payload copy's failure escape before _check_payload
+	could name it; now the copy records it and the check reports the file as changed while the patch was built."""
+	new, base = trees
+	_write(new / 'stays.txt', 'stays')
+	_write(new / 'rotated.log', 'gone soon')
+	vol = tmp_path / 'vol'
+	vol.mkdir()
+	rows = _changes(hpcp_mod, new, base)
+	os.unlink(str(new / 'rotated.log'))
+	with pytest.raises(RuntimeError, match=r'^Diff image error: 1 file\(s\) changed while the patch was built \(e\.g\. rotated\.log\)'):
+		hpcp_mod.build_patch_tree(rows, str(new), [str(vol)], hpcp_mod.make_patch_meta(rows, 'n', 'b', 'root'), max_workers=2)
+	assert (vol / 'stays.txt').read_text() == 'stays'
+	assert not (vol / '.hpcp_diff').exists()
