@@ -8068,6 +8068,16 @@ def apply_disk_patch(volume_roots, target, mount_points, loop_devices, force=Fal
 	return summary
 
 #%% ---- Remove Extra ----
+def _in_root_lost_and_found(path, dest_root):
+	"""True for a filesystem's own lost+found (directly at a mount point) below dest_root, or anything in it: fsck's
+	recovered orphans, never extra."""
+	path, dest_root = os.path.abspath(path), os.path.abspath(dest_root)
+	while path != dest_root and path.startswith(dest_root.rstrip(os.sep) + os.sep):
+		if os.path.basename(path) == 'lost+found' and os.path.ismount(os.path.dirname(path)):
+			return True
+		path = os.path.dirname(path)
+	return False
+
 def remove_extra_dirs(src_paths, dests,exclude=None,dest_image=False,keep=()):
 	"""
 	Removes extra directories in destination that are not present in the source paths.
@@ -8075,9 +8085,9 @@ def remove_extra_dirs(src_paths, dests,exclude=None,dest_image=False,keep=()):
 	A destination directory is kept when its source counterpart exists: dirname(src) + its path below dest, or with
 	dest_image (process_copy's -di layout: each source at dest + its absolute path) when '/' + its path below dest is
 	a source, a parent of one, or below one and still there.
-	Excluded directories and mount points, with everything below them, are left alone, and so are symlinks and the
-	link targets create_sym_links tracked (keep, see _kept_paths); a directory that still holds entries (excluded
-	files, say) is kept.
+	Excluded directories, mount points and a filesystem's own lost+found, with everything below them, are left alone,
+	and so are symlinks and the link targets create_sym_links tracked (keep, see _kept_paths); a directory that still
+	holds entries (excluded files, say) is kept.
 
 	:param src_paths: list of source paths
 	:param dest: destination path
@@ -8123,6 +8133,10 @@ def remove_extra_dirs(src_paths, dests,exclude=None,dest_image=False,keep=()):
 				if os.path.ismount(dest_dir_path):
 					# Another filesystem: never walked into, so nothing in it is removed.
 					print(f"Skipping mount point: {dest_dir_path}")
+					continue
+				if dirname == 'lost+found' and os.path.ismount(dirpath):
+					# The filesystem's own (fsck's recovered orphans go there): not part of any copy.
+					print(f"Skipping lost+found: {dest_dir_path}")
 					continue
 				walk_into.append(dirname)
 				relative_path = os.path.relpath(dest_dir_path, dest)
@@ -8304,7 +8318,8 @@ def remove_extra_files(total_file_list, dests,max_workers,verbose,files_per_job,
 				for path in actual - expected:
 					if path == dest_abs_root or path.startswith(dest_abs_root + os.path.sep):
 						# The copy of an excluded source path is not extra: it was left out, not deleted.
-						if not _excluded_at_source(path, mapping, exclude, excluded_roots=excluded_roots) and not _is_kept(path, kept, dest_abs_root, copied_roots):
+						if (not _excluded_at_source(path, mapping, exclude, excluded_roots=excluded_roots) and not _is_kept(path, kept, dest_abs_root, copied_roots)
+								and not _in_root_lost_and_found(path, dest_abs_root)):
 							inDestNotInSrc.add(path)
 		else:
 			for dest in dests:

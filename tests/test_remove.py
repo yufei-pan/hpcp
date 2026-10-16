@@ -606,3 +606,46 @@ def test_symlink_source_root_is_judged_as_the_link_it_is_copied_as(tmp_path, hpc
 	os.symlink(str(real), str(root))
 	mapping = hpcp_mod._src_to_dest_map([str(root)], [str(tmp_path / 'd') + os.sep])
 	assert not hpcp_mod._excluded_at_source(str(tmp_path / 'd' / 'cache'), mapping, hpcp_mod.format_exclude(['cache/']))
+
+
+# ---- 9.73 ultrareview of the fix branch ----
+
+def _as_mount_root(hpcp_mod, monkeypatch, root):
+	real = os.path.ismount
+	monkeypatch.setattr(hpcp_mod.os.path, 'ismount', lambda path: os.path.abspath(path) == str(root) or real(path))
+
+
+def test_remove_extra_keeps_lost_and_found_at_a_filesystem_root(tmp_path, hpcp_mod, reset_hpcp_globals, require_linux, monkeypatch):
+	"""Ultrareview: -rme into an ext4 root removed lost+found (and would delete the orphans fsck put there)."""
+	src = tmp_path / 'src'
+	src.mkdir()
+	(src / 'a.txt').write_text('a')
+	dst = tmp_path / 'disk'
+	(dst / 'lost+found').mkdir(parents=True)
+	(dst / 'lost+found' / '#1234').write_text('recovered')
+	(dst / 'lost+found' / 'empty-orphan-dir').mkdir()
+	(dst / 'stale.txt').write_text('stale')
+	(dst / 'sub' / 'lost+found').mkdir(parents=True)
+	_as_mount_root(hpcp_mod, monkeypatch, dst)
+	assert _rme(hpcp_mod, monkeypatch, [str(src) + os.sep], [str(dst) + os.sep]) == 0
+	assert (dst / 'lost+found' / '#1234').read_text() == 'recovered'
+	assert (dst / 'lost+found' / 'empty-orphan-dir').is_dir()
+	assert not (dst / 'stale.txt').exists()
+	# Not at a filesystem root: an ordinary directory, judged like any other.
+	assert not (dst / 'sub').exists()
+
+
+def test_remove_extra_dirs_with_dest_image_keeps_the_image_lost_and_found(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	live = tmp_path / 'live'
+	(live / 'a').mkdir(parents=True)
+	image_root = tmp_path / 'mnt'
+	(image_root / 'lost+found').mkdir(parents=True)
+	(image_root / os.path.relpath(str(live / 'a'), '/')).mkdir(parents=True)
+	_as_mount_root(hpcp_mod, monkeypatch, image_root)
+	hpcp_mod.remove_extra_dirs([str(live / 'a')], [str(image_root) + os.sep], dest_image=True)
+	assert (image_root / 'lost+found').is_dir()
+
+
+def test_lost_and_found_check_stops_at_the_root(hpcp_mod):
+	assert hpcp_mod._in_root_lost_and_found('/no/such/dir/file', '/') is False
+	assert hpcp_mod._in_root_lost_and_found('/lost+found/#12', '/') is os.path.ismount('/')
