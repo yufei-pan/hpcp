@@ -308,3 +308,13 @@ def test_unhashed_list_with_a_name_ending_in_a_colon_stays_unhashed(hpcp_mod):
 	"""Only a list whose every file and link line has a ':' (as -fl with hashes writes it) can be a -hs 0 list."""
 	lines = ['notes:', 'logs/12:30:00.txt', 'plain.txt', 'logs/']
 	assert hpcp_mod._parse_file_list_lines(lines) == {line: None for line in lines}
+
+
+@pytest.mark.parametrize('lines', [
+	['snap:2026-10-16/', 'snap:2026-10-16/a.txt', 'snap:2026-10-16/logs/', 'snap:2026-10-16/logs/10:00.log'],
+	['logs/2026-10-16T10:00.log'],
+])
+def test_unhashed_list_whose_every_name_has_a_colon_stays_unhashed(hpcp_mod, lines):
+	"""Ultrareview: a source root named 'snap:…' (or one timestamped file) puts ':' in every line of a plain -nhfl
+	list. Without a bare 'path:' line (what -hs 0 writes for a file) nothing marks the list as hashed."""
+	assert hpcp_mod._parse_file_list_lines(lines) == {line: None for line in lines}

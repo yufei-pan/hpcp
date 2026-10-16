@@ -4634,15 +4634,16 @@ def _parse_file_list_lines(lines, live_keys=()):
 	neither. A line ending in '/' is a directory. A line ending in ':<digest>' is a file, whatever
 	algorithm made the digest, and in a hashed list so is 'path:' (made with -hs 0); only a digest of
 	this system's algorithm is kept as the value, another one or none is None (not compared).
-	A list is hashed when a line has a digest, or when every file and link line has a ':' (a -hs 0
-	list; an unhashed list has plain paths). In a hashed list the remaining lines are symlinks
+	A list is hashed when a line has a digest, or when a line is a bare 'path:' and every file and link
+	line has a ':' (a -hs 0 list; an unhashed list has plain paths, which may all hold a ':' when the
+	source root's name does). A -hs 0 list of symlinks only reads as unhashed. In a hashed list the remaining lines are symlinks
 	'path:target': the longest live key followed by ':' is the path, else the text before the first ':'.
 	"""
 	hex_re = _hash_hex_re()
 	lines = [line for line in lines if line]
 	entry_lines = [line for line in lines if not line.endswith('/')]
 	hashed = (any(':' in line and _LIST_DIGEST_RE.fullmatch(line.rpartition(':')[2]) for line in entry_lines)
-		or (bool(entry_lines) and all(':' in line for line in entry_lines)))
+		or (any(line.endswith(':') for line in entry_lines) and all(':' in line for line in entry_lines)))
 	live_keys = set(live_keys)
 	entries = {}
 	for line in lines:
