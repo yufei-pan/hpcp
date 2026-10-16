@@ -490,5 +490,65 @@ def test_remove_extra_dirs_keeps_tracked_link_target_directories(tmp_path, hpcp_
 	spool = image_root / os.path.relpath(str(live / 'shared' / 'spool'), '/')
 	spool.mkdir(parents=True)
 	(image_root / os.path.relpath(str(live / 'src'), '/')).mkdir(parents=True)
-	hpcp_mod.remove_extra_dirs([str(live / 'src')], [str(image_root) + os.sep], dest_image=True, keep={str(spool.parent)})
+	hpcp_mod.remove_extra_dirs([str(live / 'src')], [str(image_root) + os.sep], dest_image=True, keep={(str(spool.parent), str(live / 'shared'))})
 	assert spool.is_dir()
+
+
+# ---- 9.73 fourth review ----
+
+def test_exclude_that_drops_the_whole_source_root_shields_its_copy(tmp_path, hpcp_mod, reset_hpcp_globals, require_linux, monkeypatch):
+	"""-e 'cache/' matches the root as the listing names it ('…/cache/'): nothing is copied, and -rme removes nothing."""
+	src = tmp_path / 'u' / 'cache'
+	src.mkdir(parents=True)
+	(src / 'a.txt').write_text('a')
+	dst = tmp_path / 'backup'
+	dst.mkdir()
+	(dst / 'a.txt').write_text('earlier copy')
+	assert _rme(hpcp_mod, monkeypatch, [str(src) + os.sep], [str(dst) + os.sep], exclude=['cache/']) == 0
+	assert (dst / 'a.txt').read_text() == 'earlier copy'
+
+
+@pytest.mark.parametrize('target', ['..', '../..'])
+def test_tracked_target_that_contains_the_copy_shields_nothing(tmp_path, hpcp_mod, reset_hpcp_globals, require_linux, monkeypatch, target):
+	"""proj/up -> .. resolves to the destination root (or above): keeping it would keep everything."""
+	src = tmp_path / 'home' / 'proj'
+	(src / 'sub').mkdir(parents=True)
+	(src / 'a.txt').write_text('a')
+	os.symlink(target, str(src / 'sub' / 'up' if target == '../..' else src / 'up'))
+	dst = tmp_path / 'backup'
+	dst.mkdir()
+	(dst / 'stale.txt').write_text('stale')
+	assert _rme(hpcp_mod, monkeypatch, [str(src)], [str(dst) + os.sep]) == 0
+	assert (dst / 'proj' / 'a.txt').read_text() == 'a'
+	assert not (dst / 'stale.txt').exists()
+
+
+def test_remove_extra_keeps_the_copy_of_an_excluded_link_target(tmp_path, hpcp_mod, reset_hpcp_globals, require_linux, monkeypatch):
+	home = tmp_path / 'home'
+	(home / 'proj').mkdir(parents=True)
+	(home / 'shared').mkdir()
+	(home / 'shared' / 'lib').write_text('lib')
+	os.symlink('../shared/lib', str(home / 'proj' / 'lib'))
+	dst = tmp_path / 'backup'
+	(dst / 'shared').mkdir(parents=True)
+	(dst / 'shared' / 'lib').write_text('earlier copy')
+	assert _rme(hpcp_mod, monkeypatch, [str(home / 'proj')], [str(dst) + os.sep], exclude=[str(home / 'shared' / 'lib')]) == 0
+	assert (dst / 'shared' / 'lib').read_text() == 'earlier copy'
+
+
+def test_tracked_target_inside_another_sources_tree_is_kept(tmp_path, hpcp_mod, reset_hpcp_globals, require_linux, monkeypatch):
+	"""Sources /a/x and /b/y both go to /backup/: x/l -> ../y/f brings /a/y/f to /backup/y/f, inside /b/y's copy."""
+	a, b = tmp_path / 'a', tmp_path / 'b'
+	(a / 'x').mkdir(parents=True)
+	(a / 'y').mkdir()
+	(a / 'y' / 'f').write_text('tracked from a')
+	(b / 'y').mkdir(parents=True)
+	(b / 'y' / 'g').write_text('g')
+	os.symlink('../y/f', str(a / 'x' / 'l'))
+	dst = tmp_path / 'backup'
+	dst.mkdir()
+	opts = dict(single_thread=True, batch=True, do_not_remove_files_while_listing=True)
+	assert hpcp_mod.hpcp([str(a / 'x'), str(b / 'y')], dest_paths=[str(dst) + os.sep], **opts) == 0
+	assert (dst / 'x' / 'l').read_text() == 'tracked from a'
+	assert _rme(hpcp_mod, monkeypatch, [str(a / 'x'), str(b / 'y')], [str(dst) + os.sep]) == 0
+	assert (dst / 'x' / 'l').read_text() == 'tracked from a'

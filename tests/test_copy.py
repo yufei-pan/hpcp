@@ -631,3 +631,28 @@ def test_dir_sync_drops_setgid_for_a_group_it_could_not_keep(tmp_tree, hpcp_mod,
 	hpcp_mod.sync_directory_metadata(src, [dest])
 	assert stat.S_IMODE(os.stat(dest).st_mode) == 0o775
 	assert hpcp_mod.ERRORS == []
+
+
+def test_link_notes_only_when_a_copy_would_be_tried(tmp_tree, hpcp_mod, reset_hpcp_globals, require_linux, capsys):
+	"""A link whose target is already at the destination needs no tracking, so no note about it either."""
+	tmp_tree.add_file('cache/x', 'x')
+	tmp_tree.add_file('cache/x', 'x', under='dst')
+	link = tmp_tree.add_symlink('k', 'cache/x')
+	hpcp_mod.create_sym_links({link: [str(tmp_tree.dst / 'k')]}, exclude=hpcp_mod.format_exclude(['cache']))
+	captured = capsys.readouterr()
+	assert 'excluded' not in captured.out + captured.err
+	assert os.readlink(tmp_tree.dst / 'k') == 'cache/x'
+
+
+@pytest.mark.parametrize('now_uid_matches, now_gid_matches', [(True, False), (False, True), (False, False)])
+def test_chown_like_cp_reports_the_ids_the_path_ends_up_with(hpcp_mod, monkeypatch, now_uid_matches, now_gid_matches):
+	"""Runs without root: the outcome is read back, not inferred from which chown call failed."""
+	from types import SimpleNamespace
+	st = SimpleNamespace(st_uid=1001, st_gid=2002)
+	def chown(path, uid, gid, **kwargs):
+		raise PermissionError(1, 'Operation not permitted')
+	monkeypatch.setattr(hpcp_mod.os, 'chown', chown)
+	monkeypatch.setattr(hpcp_mod.os, 'geteuid', lambda: 1000)
+	monkeypatch.setattr(hpcp_mod.os, 'stat', lambda path: SimpleNamespace(
+		st_uid=1001 if now_uid_matches else 1000, st_gid=2002 if now_gid_matches else 1000))
+	assert hpcp_mod._chown_like_cp('/some/path', st) == (now_uid_matches, now_gid_matches)
