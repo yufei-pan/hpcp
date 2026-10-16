@@ -3571,7 +3571,12 @@ def sync_directory_metadata(src_path, dest_paths):
 	if not os.path.isdir(src_path):
 		return copy_file(src_path, dest_paths)
 	# Create the directory if it does not exist
-	st = os.stat(src_path)
+	try:
+		st = os.stat(src_path)
+	except OSError as e:
+		# A live tree: the directory went away (or became unreadable) after it was listed.
+		eprint(f'Directory sync error: {src_path}: {e}')
+		return 1,time.monotonic()-start_time,frozenset()
 	for dest_path in dest_paths:
 		# One directory that cannot be created or synced is recorded; the others (and the other dests) go on.
 		try:
