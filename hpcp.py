@@ -3208,10 +3208,7 @@ def copy_file_list_parallel(file_list, links, src_path, dest_paths, max_workers,
 	total_files = len(file_list)
 	futures = {}
 	files_per_job = max(1,files_per_job)
-	symLinks = {}
-	for link in links:
-		srcRelativePath = os.path.relpath(link, src_path)
-		symLinks[link] = [os.path.join(dest_path,srcRelativePath) for dest_path in dest_paths]
+	symLinks = _link_dests(links, src_path, dest_paths)
 	if len(file_list) == 0:
 		return 0, 0, symLinks , frozenset()
 	print(f"Processing {len(file_list)} files with {max_workers} workers")
@@ -3449,9 +3446,7 @@ def copy_files_parallel_batch(jobs, max_workers, full_hash=False, verbose=False,
 		total_link_count += len(links)
 		total_folder_count += len(folders)
 		total_files.extend(file_list)
-		for link in links:
-			srcRelativePath = os.path.relpath(link, src_path)
-			total_symLinks[link] = [os.path.join(dest_path,srcRelativePath) for dest_path in dest_paths]
+		total_symLinks.update(_link_dests(links, src_path, dest_paths))
 
 	print(f"Number of files: {total_item_count}")
 	print(f"Number of links: {total_link_count}")
@@ -3485,10 +3480,7 @@ def copy_files_serial(src_path, dest_paths, full_hash=False, verbose=False,exclu
 		apb.update(num_files=1,cpSize=size,cpTime=cpTime,files_per_job=1)
 		links.update(rtnSymLinks)
 		apb.rate_limit()
-	symLinks = {}
-	for link in links:
-		srcRelativePath = os.path.relpath(link, src_path)
-		symLinks[link] = [os.path.join(dest_path, srcRelativePath) for dest_path in dest_paths]
+	symLinks = _link_dests(links, src_path, dest_paths)
 	endTime = time.monotonic()
 	apb.stop()
 	_print_operation_summary(apb, endTime - start_time, show_bandwidth=True)
