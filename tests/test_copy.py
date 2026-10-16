@@ -520,3 +520,13 @@ def test_identical_file_skip_ignores_chown_permission_error_without_privileges(t
 	monkeypatch.setattr(hpcp_mod.os, 'geteuid', lambda: 1000)
 	assert hpcp_mod.copy_file(src, [dst])[0] == 0
 	assert hpcp_mod.ERRORS == []
+
+
+def test_link_tracking_never_copies_an_excluded_target(tmp_tree, hpcp_mod, reset_hpcp_globals, require_linux):
+	"""-e secrets keeps src/secrets/ out of the copy; tracking a link into it must not bring it back."""
+	tmp_tree.add_file('secrets/key.pem', 'private')
+	tmp_tree.add_symlink('k', 'secrets/key.pem')
+	assert hpcp_mod.hpcp([str(tmp_tree.src) + os.sep], dest_paths=[str(tmp_tree.dst) + os.sep], exclude=['secrets'],
+		single_thread=True, batch=True, do_not_remove_files_while_listing=True) == 0
+	assert os.readlink(tmp_tree.dst / 'k') == 'secrets/key.pem'
+	assert not (tmp_tree.dst / 'secrets').exists()

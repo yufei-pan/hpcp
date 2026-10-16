@@ -829,6 +829,20 @@ def is_excluded(path, exclude=None):
 			return True
 	return False
 
+def _excluded_or_below(path, exclude):
+	"""True when path, or a directory above it, matches exclude: the listing prunes an excluded directory with
+	everything below it, so a path reached another way (a symlink's target) is checked against its parents too."""
+	if not exclude:
+		return False
+	path = os.path.normpath(os.path.abspath(path))
+	while True:
+		if is_excluded(path, exclude):
+			return True
+		parent = os.path.dirname(path)
+		if parent == path:
+			return False
+		path = parent
+
 def format_exclude(exclude = None,exclude_file = None) -> frozenset:
 	"""
 	Format and normalize exclusion patterns for path matching.
@@ -2284,7 +2298,9 @@ def create_sym_links(symLinks,exclude=None,no_link_tracking=False):
 				if not dest and not no_link_tracking:
 					sourceLinkedFile = os.path.join(os.path.dirname(src), linkedTargetFile)
 					# we also copy the pointed file if the file doesn't exist
-					if not os.path.exists(sourceLinkedFile):
+					if _excluded_or_below(sourceLinkedFile, exclude):
+						print(f"\n{pformat(sourceLinkedFile)}, linked by {pformat(src)}, is excluded: not copying it")
+					elif not os.path.exists(sourceLinkedFile):
 						eprint(f"\nFile {sourceLinkedFile} which is linked by {src} doesn't exist! \nSkipping copying original file...")
 					else:
 						_, _ , rtnSymLinks , _ = copy_files_serial(sourceLinkedFile, destLinkedFiles,exclude=exclude)
