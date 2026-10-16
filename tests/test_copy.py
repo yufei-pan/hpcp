@@ -583,3 +583,17 @@ def test_link_tracking_honours_absolute_excludes_inside_the_tracked_tree(tmp_pat
 		single_thread=True, batch=True, do_not_remove_files_while_listing=True) == 0
 	assert (backup / 'other' / 'pub' / 'x').read_text() == 'x'
 	assert not (backup / 'other' / 'private').exists()
+
+
+def test_link_through_a_symlinked_directory_and_dotdot_is_not_tracked(tmp_tree, hpcp_mod, reset_hpcp_globals, require_linux):
+	"""src/l -> sub/../t with sub a symlink: the kernel reaches elsewhere/t, the spelling says src/t. Not tracked."""
+	elsewhere = tmp_tree.root / 'elsewhere'
+	(elsewhere / 'deep').mkdir(parents=True)
+	(elsewhere / 't').write_text('kernel target')
+	tmp_tree.add_file('t', 'lexical twin')
+	tmp_tree.add_symlink('sub', str(elsewhere / 'deep'))
+	link = tmp_tree.add_symlink('l', 'sub/../t')
+	tracked = hpcp_mod.create_sym_links({link: [str(tmp_tree.dst / 'l')]})
+	assert tracked == set()
+	assert os.readlink(tmp_tree.dst / 'l') == 'sub/../t'
+	assert not (tmp_tree.dst / 't').exists()
