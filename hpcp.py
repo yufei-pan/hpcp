@@ -7966,9 +7966,14 @@ def apply_disk_patch(volume_roots, target, mount_points, loop_devices, force=Fal
 	return summary
 
 #%% ---- Remove Extra ----
-def remove_extra_dirs(src_paths, dests,exclude=None):
+def remove_extra_dirs(src_paths, dests,exclude=None,dest_image=False):
 	"""
 	Removes extra directories in destination that are not present in the source paths.
+
+	A destination directory is kept when its source counterpart exists: dirname(src) + its path below dest, or with
+	dest_image (process_copy's -di layout: each source at dest + its absolute path) '/' + its path below dest.
+	Excluded directories and everything below them are left alone, and so are mount points and symlinks; a
+	directory that still holds entries (excluded files, say) is kept.
 
 	:param src_paths: list of source paths
 	:param dest: destination path
@@ -7987,30 +7992,47 @@ def remove_extra_dirs(src_paths, dests,exclude=None):
 	if not dests:
 		eprint(f'All destination paths are too long: Skipping {src_paths}')
 		return 0, 0, set(), frozenset()
-	# remove excluded paths from src_paths
-	for src_path in src_paths:
-		if exclude and is_excluded(src_path,exclude):
-			src_paths.remove(src_path)
+	# leave out excluded source paths (a filtered copy: the caller's list is not touched)
+	src_paths = [src_path for src_path in src_paths if not (exclude and is_excluded(src_path,exclude))]
 	extraDirs = set()
 	print(pformat(dests))
 	for dest in dests:
-		for dirpath, dirnames, _ in os.walk(dest, topdown=False):
+		for dirpath, dirnames, _ in os.walk(dest):
+			walk_into = []
 			for dirname in dirnames:
-				dirname += os.path.sep
+				# No trailing separator: excludes match a directory as the listing does ('*/cache').
 				dest_dir_path = os.path.join(dirpath, dirname)
+				if exclude and is_excluded(dest_dir_path,exclude):
+					print(f"Skipping excluded directory: {dest_dir_path}")
+					continue
+				if os.path.islink(dest_dir_path):
+					continue
+				walk_into.append(dirname)
+				relative_path = os.path.relpath(dest_dir_path, dest)
 				# Check if the directory exists in the source paths
-				if not any(os.path.exists(os.path.join(os.path.dirname(src_path), os.path.relpath(dest_dir_path, dest))) for src_path in src_paths):
-					if exclude and is_excluded(dest_dir_path,exclude):
-						print(f"Skipping excluded directory: {dest_dir_path}")
-					elif os.path.ismount(dest_dir_path):
-						print(f"Skipping mount point: {dest_dir_path}")
-					else:
-						print(f"Deleting extra directory: {dest_dir_path}")
-						extraDirs.add(dest_dir_path)
+				if dest_image:
+					in_source = os.path.exists(os.path.join(os.path.sep, relative_path))
+				else:
+					in_source = any(os.path.exists(os.path.join(os.path.dirname(src_path), relative_path)) for src_path in src_paths)
+				if in_source:
+					continue
+				if os.path.ismount(dest_dir_path):
+					print(f"Skipping mount point: {dest_dir_path}")
+				else:
+					print(f"Deleting extra directory: {dest_dir_path}")
+					extraDirs.add(dest_dir_path)
+			# Excluded trees are never walked into.
+			dirnames[:] = walk_into
 	for dir in sorted(extraDirs, key=lambda path: len(pathlib.Path(path).parts), reverse=True):
-		os.rmdir(dir)
+		try:
+			os.rmdir(dir)
+		except OSError as e:
+			if e.errno in (errno.ENOTEMPTY, errno.EEXIST):
+				print(f"Keeping non-empty directory: {dir}")
+			else:
+				eprint(f'Remove directory failed: {dir}: {e}')
 
-def _src_to_dest_map(src_paths, dests):
+def _src_to_dest_map(src_paths, dests, dest_image=False):
 	"""Build ``[(src_abs, [actual_dest_abs, ...]), ...]`` mirroring process_copy.
 
 	``process_copy`` decides per-src whether each ``dest`` gains the src
@@ -8019,6 +8041,8 @@ def _src_to_dest_map(src_paths, dests):
 	  * ``hpcp src/ dest/``  -> files land in ``dest/...``
 	  * ``hpcp src dest``    -> ``get_dest_from_path`` first appends ``/`` to
 	                            both, so it behaves like ``hpcp src/ dest/``
+	  * with ``dest_image`` (``-di``) -> files land in ``dest/<absolute src>/...``
+	                            for every dest, trailing separator or not
 
 	The list is sorted by ``src_abs`` length (longest first) so that nested
 	srcs are attributed to the most specific entry.
@@ -8032,7 +8056,9 @@ def _src_to_dest_map(src_paths, dests):
 		sourceFolderName = os.path.basename(src)
 		actual_dests = []
 		for dest in dests:
-			if os.path.basename(dest) == '' and sourceFolderName:
+			if dest_image:
+				actual_dests.append(os.path.abspath(dest + src_abs))
+			elif os.path.basename(dest) == '' and sourceFolderName:
 				actual_dests.append(os.path.abspath(os.path.join(dest, sourceFolderName)))
 			else:
 				actual_dests.append(os.path.abspath(dest))
@@ -8040,12 +8066,12 @@ def _src_to_dest_map(src_paths, dests):
 	mapping.sort(key=lambda item: len(item[0]), reverse=True)
 	return mapping
 
-def _expected_dest_paths(src_entries, src_paths, dests):
-	"""Compute the set of absolute dest paths each src entry should occupy."""
+def _expected_dest_paths(src_entries, src_paths, dests, dest_image=False):
+	"""Compute the set of absolute dest paths each src entry should occupy (dest_image: see _src_to_dest_map)."""
 	expected = set()
 	if not src_entries:
 		return expected
-	mapping = _src_to_dest_map(src_paths, dests)
+	mapping = _src_to_dest_map(src_paths, dests, dest_image)
 	for entry in src_entries:
 		if not entry or not os.path.isabs(entry):
 			continue
@@ -8061,7 +8087,7 @@ def _expected_dest_paths(src_entries, src_paths, dests):
 				break
 	return expected
 
-def remove_extra_files(total_file_list, dests,max_workers,verbose,files_per_job,single_thread=False,exclude=None,parallel_file_listing=False,src_paths=None,sym_links=None):
+def remove_extra_files(total_file_list, dests,max_workers,verbose,files_per_job,single_thread=False,exclude=None,parallel_file_listing=False,src_paths=None,sym_links=None,dest_image=False):
 		"""Remove files in ``dests`` that have no counterpart in ``total_file_list``.
 
 		``total_file_list`` may contain absolute src-side paths (as returned by
@@ -8073,7 +8099,8 @@ def remove_extra_files(total_file_list, dests,max_workers,verbose,files_per_job,
 		comparison is used (callers must then pass already-trimmed entries).
 		``sym_links`` is the ``{src_link: [dest_links]}`` mapping returned by
 		``process_copy``; its keys are added to the src side so legitimately
-		copied symlinks are not mistaken for extras.
+		copied symlinks are not mistaken for extras. ``dest_image``: the copy used
+		the ``-di`` layout (see ``_src_to_dest_map``).
 		"""
 		print(f"Removing extra files from {dests} with {max_workers} workers")
 		src_entries = set(total_file_list) if total_file_list else set()
@@ -8081,7 +8108,7 @@ def remove_extra_files(total_file_list, dests,max_workers,verbose,files_per_job,
 			src_entries.update(sym_links.keys() if hasattr(sym_links, 'keys') else sym_links)
 		inDestNotInSrc = set()
 		if src_paths:
-			expected = _expected_dest_paths(src_entries, src_paths, dests)
+			expected = _expected_dest_paths(src_entries, src_paths, dests, dest_image)
 			for dest in dests:
 				dest_file_list, links, _, _ = get_file_list(dest, max_workers=max_workers, exclude=exclude, parallel_file_listing=parallel_file_listing)
 				dest_abs_root = os.path.abspath(dest)
@@ -9183,10 +9210,11 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = multipr
 					'fix them (or exclude those paths with -e) and re-run')
 			elif remove_extra:
 				print('-'*80)
-				remove_extra_files(total_file_list, dests,max_workers,verbose,files_per_job,single_thread,exclude=exclude,parallel_file_listing=parallel_file_listing,src_paths=src_paths,sym_links=total_sym_links)
+				remove_extra_files(total_file_list, dests,max_workers,verbose,files_per_job,single_thread,exclude=exclude,parallel_file_listing=parallel_file_listing,src_paths=src_paths,sym_links=total_sym_links,
+					dest_image=bool(dest_image))
 				print('-'*80)
 				print("Removing extra directories...")
-				remove_extra_dirs(src_paths, dests,exclude=exclude)
+				remove_extra_dirs(src_paths, dests,exclude=exclude,dest_image=bool(dest_image))
 			print('-'*80)
 			if len(src_paths) > 1:
 				print("Overall Summary:")

@@ -223,3 +223,105 @@ def test_remove_extra_is_skipped_when_the_copy_failed(tmp_tree, hpcp_mod, reset_
 	srcs, opts = copy_args(no_create_dir=True, no_directory_sync=True, remove_extra=True)
 	assert hpcp_mod.hpcp(srcs, **opts) == 212
 	assert os.path.exists(extra)
+
+
+# ---- 9.73: -rme with -di (review C1) ----
+
+def test_src_to_dest_map_mirrors_dest_image_layout(hpcp_mod, tmp_path):
+	"""process_copy puts each source at dest + its absolute path in -di mode, trailing separator or not."""
+	dest = str(tmp_path / 'mnt') + os.sep
+	for src in ('/home/u/data', '/home/u/data/'):
+		assert hpcp_mod._src_to_dest_map([src], [dest], dest_image=True) == [(os.path.abspath(src), [os.path.join(str(tmp_path / 'mnt'), 'home/u/data')])]
+
+
+def test_remove_extra_after_dest_image_layout_copy_keeps_the_copies(tmp_path, hpcp_mod, reset_hpcp_globals, require_linux, monkeypatch):
+	"""A -di copy (here into a plain directory standing in for the mounted image) then -rme removes only the real extra."""
+	src = tmp_path / 'live' / 'data'
+	(src / 'sub').mkdir(parents=True)
+	(src / 'keep.txt').write_text('keep')
+	(src / 'sub' / 'deep.txt').write_text('deep')
+	dest = str(tmp_path / 'mnt') + os.sep
+	os.makedirs(dest)
+	files, links = hpcp_mod.process_copy([str(src)], [dest], single_thread=True, max_workers=1, dest_image='stand-in.img', batch=True)
+	mirrored = tmp_path / 'mnt' / os.path.relpath(str(src), '/')
+	assert (mirrored / 'sub' / 'deep.txt').read_text() == 'deep'
+	(mirrored / 'old.txt').write_text('extra')
+	(mirrored / 'olddir').mkdir()
+	monkeypatch.setattr(sys.stdin, 'isatty', lambda: True)
+	monkeypatch.setattr('builtins.input', lambda: 'y')
+	hpcp_mod.remove_extra_files(files, [dest], 1, False, 1, single_thread=True, src_paths=[str(src)], sym_links=links, dest_image=True)
+	hpcp_mod.remove_extra_dirs([str(src)], [dest], dest_image=True)
+	assert (mirrored / 'keep.txt').read_text() == 'keep'
+	assert (mirrored / 'sub' / 'deep.txt').read_text() == 'deep'
+	assert not (mirrored / 'old.txt').exists()
+	assert not (mirrored / 'olddir').exists()
+
+
+# ---- 9.73: remove_extra_dirs and excludes (review C10) ----
+
+def test_remove_extra_dirs_keeps_a_directory_holding_excluded_files(tmp_tree, hpcp_mod, reset_hpcp_globals):
+	kept = tmp_tree.add_file('old/a.log', 'log', under='dst')
+	empty = tmp_tree.add_dir('gone', under='dst')
+	exclude = hpcp_mod.format_exclude(['*.log'])
+	hpcp_mod.remove_extra_dirs([str(tmp_tree.src) + os.sep], [str(tmp_tree.dst) + os.sep], exclude=exclude)
+	assert os.path.exists(kept)
+	assert not os.path.exists(empty)
+	assert hpcp_mod.ERRORS == []
+
+
+def test_remove_extra_dirs_matches_dir_excludes_and_leaves_excluded_trees_alone(tmp_tree, hpcp_mod, reset_hpcp_globals):
+	cache_sub = tmp_tree.add_dir('x/cache/sub', under='dst')
+	empty = tmp_tree.add_dir('y', under='dst')
+	exclude = hpcp_mod.format_exclude(['cache'])
+	hpcp_mod.remove_extra_dirs([str(tmp_tree.src) + os.sep], [str(tmp_tree.dst) + os.sep], exclude=exclude)
+	assert os.path.isdir(cache_sub)
+	assert not os.path.exists(empty)
+	assert hpcp_mod.ERRORS == []
+
+
+def test_remove_extra_dirs_skips_symlinks_to_directories(tmp_tree, hpcp_mod, reset_hpcp_globals):
+	target = tmp_tree.add_dir('real', under='src')
+	link = tmp_tree.add_symlink('alias', target, under='dst')
+	hpcp_mod.remove_extra_dirs([str(tmp_tree.src) + os.sep], [str(tmp_tree.dst) + os.sep])
+	assert os.path.islink(link)
+
+
+def test_remove_extra_dirs_leaves_the_callers_source_list_alone(tmp_tree, hpcp_mod, reset_hpcp_globals):
+	src_paths = [str(tmp_tree.src / 'a.tmp'), str(tmp_tree.src / 'b.tmp'), str(tmp_tree.src) + os.sep]
+	hpcp_mod.remove_extra_dirs(src_paths, [str(tmp_tree.dst) + os.sep], exclude=hpcp_mod.format_exclude(['*.tmp']))
+	assert src_paths == [str(tmp_tree.src / 'a.tmp'), str(tmp_tree.src / 'b.tmp'), str(tmp_tree.src) + os.sep]
+
+
+_IMAGE_TOOLS = ('losetup', 'mkfs.ext4', 'mount', 'umount', 'lsblk')
+
+
+@pytest.mark.skipif(os.name == 'nt' or os.geteuid() != 0 or any(__import__('shutil').which(tool) is None for tool in _IMAGE_TOOLS),
+	reason='needs root and losetup/mkfs.ext4/mount/umount/lsblk')
+@pytest.mark.root
+@pytest.mark.loop
+def test_remove_extra_into_a_dest_image_removes_only_the_extra(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	"""Review C1 end to end: hpcp SRC -di IMG -rme on an existing image keeps every copied file."""
+	src = tmp_path / 'live' / 'data'
+	(src / 'sub').mkdir(parents=True)
+	(src / 'keep.txt').write_text('keep')
+	(src / 'sub' / 'deep.txt').write_text('deep')
+	(src / 'gone.txt').write_text('gone')
+	(src / 'gonedir').mkdir()
+	image = str(tmp_path / 'backup.img')
+	opts = dict(single_thread=True, max_workers=1, batch=True, do_not_remove_files_while_listing=True)
+	assert hpcp_mod.hpcp([str(src)], dest_image=image, **opts) == 0
+	(src / 'gone.txt').unlink()
+	(src / 'gonedir').rmdir()
+	monkeypatch.setattr(sys.stdin, 'isatty', lambda: True)
+	monkeypatch.setattr('builtins.input', lambda: 'y')
+	assert hpcp_mod.hpcp([str(src)], dest_image=image, remove_extra=True, **opts) == 0
+	mount_points, loop_devices = [], []
+	try:
+		root = hpcp_mod._mount_single_fs_image(image, True, mount_points, loop_devices)
+		mirrored = os.path.join(root, os.path.relpath(str(src), '/'))
+		assert open(os.path.join(mirrored, 'keep.txt')).read() == 'keep'
+		assert open(os.path.join(mirrored, 'sub', 'deep.txt')).read() == 'deep'
+		assert not os.path.exists(os.path.join(mirrored, 'gone.txt'))
+		assert not os.path.exists(os.path.join(mirrored, 'gonedir'))
+	finally:
+		hpcp_mod.clean_up(mount_points, loop_devices)
