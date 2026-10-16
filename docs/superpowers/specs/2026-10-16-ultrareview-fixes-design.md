@@ -91,6 +91,18 @@ A second `/code-review high` checked the README claims of the release commit aga
 6. and 8. The dangling-link note, the intermediate symlink retry lines, the dir-sync 'maybe a mounted dir' note and 'Destination path excluded' were recorded as rc-128 errors whenever a path held a ':'. With the gate, that refused a clean move. They are plain stderr notes now.
 7. A tracked tree was listed by its un-normalized path ('src/../other'), so absolute excludes inside it never matched. It is normalized now.
 
+## Third review (of the re-review wave)
+
+Fixed, with tests:
+- **The -rme keep list protected every relative link's target.** An in-tree link (`X11 -> .`, `current -> releases/v3`) shielded its subtree, and a dangling link kept a stale file. Now only targets that exist at the source are tracked, and only those outside the copied trees are kept (`_kept_paths`, checked through a set by walking up a path's parents).
+- **`_excluded_at_source` tested the source root itself,** which the copy listing never does for a directory (it lists `path/`). `-e cache` with `/home/u/cache/` as the source shielded the whole destination.
+- **`remove_extra_dirs` keeps tracked target directories too.**
+- **Lexical '..' resolution.** A tracked target is used by its normalized spelling, so excludes match, but only when the kernel resolves the link to the same file. A `..` after a symlinked directory is not tracked (a note).
+- **Setid bits.** `_chown_like_cp` reads back the owner and group the destination really has. Directory sync drops the set-user-ID / set-group-ID bits it could not keep the owner / group for.
+- **Performance.** `remove_extra_files` builds the source mapping once, and the directory walk checks only a directory's own source path.
+
+Declined: when several sources map to one destination path and one of them excludes it, `-rme` keeps it. Keeping is the safe answer when the sources disagree.
+
 ## Not changed (noted for the user)
 
 - `-rme` in `-di` mode still mirrors the whole image to the sources, as `-rme` does for a plain destination.
