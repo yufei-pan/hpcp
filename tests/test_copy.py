@@ -447,3 +447,53 @@ def test_directory_of_only_symlinks_is_copied(tmp_tree, hpcp_mod, reset_hpcp_glo
 	assert hpcp_mod.hpcp(srcs, **opts) == 0
 	assert os.readlink(tmp_tree.dst / 'links' / 'abs') == '/etc/hostname'
 	assert os.readlink(tmp_tree.dst / 'links' / 'rel') == 'abs'
+
+
+def _relative_link_outside_the_copy(tmp_tree):
+	"""src/proj/lib -> ../shared/lib.txt; only src/proj/ is copied."""
+	tmp_tree.add_file('shared/lib.txt', 'library')
+	tmp_tree.add_symlink('proj/lib', '../shared/lib.txt')
+	tmp_tree.add_file('proj/main.txt', 'main')
+	return [str(tmp_tree.src / 'proj') + os.sep], [str(tmp_tree.dst / 'proj') + os.sep]
+
+
+@pytest.mark.parametrize('single_thread', [True, False])
+def test_relative_link_target_outside_the_copy_is_tracked(tmp_tree, hpcp_mod, reset_hpcp_globals, require_linux, single_thread):
+	"""Review C8: without -nlt a relative link's missing target is copied next to it, so the link resolves."""
+	srcs, dests = _relative_link_outside_the_copy(tmp_tree)
+	assert hpcp_mod.hpcp(srcs, dest_paths=dests, single_thread=single_thread, max_workers=1 if single_thread else 2,
+		batch=True, do_not_remove_files_while_listing=True) == 0
+	assert os.readlink(tmp_tree.dst / 'proj' / 'lib') == '../shared/lib.txt'
+	assert (tmp_tree.dst / 'proj' / 'lib').read_text() == 'library'
+
+
+def test_no_link_tracking_leaves_the_target_alone(tmp_tree, hpcp_mod, reset_hpcp_globals, require_linux):
+	srcs, dests = _relative_link_outside_the_copy(tmp_tree)
+	assert hpcp_mod.hpcp(srcs, dest_paths=dests, single_thread=True, max_workers=1, no_link_tracking=True,
+		batch=True, do_not_remove_files_while_listing=True) == 0
+	assert os.readlink(tmp_tree.dst / 'proj' / 'lib') == '../shared/lib.txt'
+	assert not (tmp_tree.dst / 'shared').exists()
+
+
+def test_link_goes_to_the_destination_that_holds_its_target(tmp_tree, hpcp_mod, reset_hpcp_globals, require_linux):
+	"""Files are spread over the destinations: a relative link belongs where its target landed, not in the last one."""
+	src_link = tmp_tree.add_symlink('ln', 'target.txt')
+	first, second = tmp_tree.root / 'd1', tmp_tree.root / 'd2'
+	first.mkdir()
+	second.mkdir()
+	(first / 'target.txt').write_text('t')
+	hpcp_mod.create_sym_links({src_link: [str(first / 'ln'), str(second / 'ln')]}, no_link_tracking=True)
+	assert os.readlink(first / 'ln') == 'target.txt'
+	assert not os.path.lexists(second / 'ln')
+
+
+def test_link_is_skipped_when_a_destination_holds_a_real_entry_there(tmp_tree, hpcp_mod, reset_hpcp_globals, require_linux):
+	src_link = tmp_tree.add_symlink('ln', '/etc/hostname')
+	first, second = tmp_tree.root / 'd1', tmp_tree.root / 'd2'
+	first.mkdir()
+	second.mkdir()
+	(second / 'ln').write_text('a real file')
+	hpcp_mod.create_sym_links({src_link: [str(first / 'ln'), str(second / 'ln')]})
+	assert not os.path.lexists(first / 'ln')
+	assert (second / 'ln').read_text() == 'a real file'
+	assert [error.partition(':')[0] for error in hpcp_mod.ERRORS] == ['Failed to create symbolic link']

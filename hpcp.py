@@ -2264,36 +2264,32 @@ def create_sym_links(symLinks,exclude=None,no_link_tracking=False):
 			if exclude and is_excluded(src,exclude):
 				print(f"\n{pformat(src)} is excluded, skipping...")
 				continue
-			dest = ''
 			for d in dests:
 				if os.path.islink(d):
 					os.remove(d)
-				dest = d
-				if os.path.exists(d):
-					if os.path.isdir(d):
-						print(f"\n{pformat(d)} is a directory, skipping...")
-						#shutil.rmtree(dest)
-						continue
-					else:
-						print(f"\n{pformat(d)} is a file, skipping...")
-						#os.remove(dest)
-						continue
+			# A real file or directory already at the link's path (in any dest: a file lives in one) keeps its place.
+			occupied = next((d for d in dests if os.path.exists(d)), None)
+			if occupied is not None:
+				# An error, not a note: the destination does not match the source, and a move (-rm) must not go on.
+				eprint(f"Failed to create symbolic link: {pformat(occupied)} is a {'directory' if os.path.isdir(occupied) else 'file'} "
+					f"in the destination, skipping the link {pformat(src)}")
+				continue
 			# Determine if the link is a absolute link or relative link
 			linkedTargetFile = os.readlink(src)
-			if not os.path.isabs(linkedTargetFile) and not no_link_tracking:
-				sourceLinkedFile = os.path.join(os.path.dirname(src), linkedTargetFile)
-				# we also copy the pointed file if the file doesn't exist
+			dest = ''
+			if not os.path.isabs(linkedTargetFile):
+				# Files are spread over the dests: a relative link goes where its target is, so that it resolves.
 				destLinkedFiles = [os.path.join(os.path.dirname(d), linkedTargetFile) for d in dests]
-				for d,destLinkedFile in zip(dests,destLinkedFiles):
-					if os.path.exists(destLinkedFile):
-						dest = d
-						break
-				if not dest:
+				dest = next((d for d, destLinkedFile in zip(dests, destLinkedFiles) if os.path.exists(destLinkedFile)), '')
+				if not dest and not no_link_tracking:
+					sourceLinkedFile = os.path.join(os.path.dirname(src), linkedTargetFile)
+					# we also copy the pointed file if the file doesn't exist
 					if not os.path.exists(sourceLinkedFile):
 						eprint(f"\nFile {sourceLinkedFile} which is linked by {src} doesn't exist! \nSkipping copying original file...")
 					else:
 						_, _ , rtnSymLinks , _ = copy_files_serial(sourceLinkedFile, destLinkedFiles,exclude=exclude)
 						nestedSymLinks.update(rtnSymLinks)
+						dest = next((d for d, destLinkedFile in zip(dests, destLinkedFiles) if os.path.lexists(destLinkedFile)), '')
 			while dests:
 				if not dest:
 					if RANDOM_DESTINATION_SELECTION:
