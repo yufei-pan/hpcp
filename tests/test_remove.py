@@ -387,8 +387,10 @@ def test_remove_extra_keeps_the_copy_of_an_excluded_source_path(tmp_path, hpcp_m
 	assert (tmp_path / 'backup' / 'src' / 'a.txt').read_text() == 'a'
 
 
-def test_remove_extra_keeps_link_targets_that_tracking_placed(tmp_path, hpcp_mod, reset_hpcp_globals, require_linux, monkeypatch):
-	"""A tracked target belongs to the copy: -rme must not delete it (it would come back on every run)."""
+@pytest.mark.parametrize('track_on_rme', [True, False])
+def test_remove_extra_keeps_link_targets_that_tracking_placed(tmp_path, hpcp_mod, reset_hpcp_globals, require_linux, monkeypatch, track_on_rme):
+	"""A tracked target belongs to the copy: -rme -lt must not delete it (it would come back on every run). Without -lt
+	it is not part of the copy, so -rme removes it like any other extra."""
 	src = tmp_path / 's' / 'src'
 	src.mkdir(parents=True)
 	(tmp_path / 's' / 'other').mkdir()
@@ -397,13 +399,14 @@ def test_remove_extra_keeps_link_targets_that_tracking_placed(tmp_path, hpcp_mod
 	dst = str(tmp_path / 'dst') + os.sep
 	os.makedirs(dst)
 	opts = dict(single_thread=True, batch=True, do_not_remove_files_while_listing=True)
-	assert hpcp_mod.hpcp([str(src)], dest_paths=[dst], **opts) == 0
+	assert hpcp_mod.hpcp([str(src)], dest_paths=[dst], link_tracking=True, **opts) == 0
 	assert (tmp_path / 'dst' / 'src' / 'lnk').read_text() == 'x'
 	(tmp_path / 'dst' / 'stale.txt').write_text('extra')
 	monkeypatch.setattr(sys.stdin, 'isatty', lambda: True)
 	monkeypatch.setattr('builtins.input', lambda: 'y')
-	assert hpcp_mod.hpcp([str(src)], dest_paths=[dst], remove_extra=True, **opts) == 0
-	assert (tmp_path / 'dst' / 'src' / 'lnk').read_text() == 'x'
+	assert hpcp_mod.hpcp([str(src)], dest_paths=[dst], remove_extra=True, link_tracking=track_on_rme, **opts) == 0
+	assert (tmp_path / 'dst' / 'other' / 'x').exists() is track_on_rme
+	assert os.readlink(tmp_path / 'dst' / 'src' / 'lnk') == '../other/x'
 	assert not (tmp_path / 'dst' / 'stale.txt').exists()
 
 
@@ -429,7 +432,7 @@ def test_move_with_a_dangling_link_whose_path_has_a_colon_goes_on(tmp_tree, hpcp
 	"""A dangling relative link is copied as is; its note is not an error, even when the path holds ':' (rc 128)."""
 	tmp_tree.add_file('a.txt', 'a')
 	tmp_tree.add_symlink('at:12:00', 'missing:target')
-	srcs, opts = copy_args(remove_force=True)
+	srcs, opts = copy_args(remove_force=True, link_tracking=True)
 	assert hpcp_mod.hpcp(srcs, **opts) == 0
 	assert os.readlink(tmp_tree.dst / 'at:12:00') == 'missing:target'
 	assert not tmp_tree.src.exists()
@@ -457,7 +460,7 @@ def test_in_tree_directory_link_does_not_shield_its_subtree_from_remove_extra(tm
 	tmp_tree.add_file('sub/releases/v3/keep.txt', 'keep')
 	tmp_tree.add_symlink('sub/link', target)
 	stale = tmp_tree.add_file('sub/releases/v3/stale.txt', 'stale', under='dst')
-	assert _rme(hpcp_mod, monkeypatch, [str(tmp_tree.src) + os.sep], [str(tmp_tree.dst) + os.sep]) == 0
+	assert _rme(hpcp_mod, monkeypatch, [str(tmp_tree.src) + os.sep], [str(tmp_tree.dst) + os.sep], link_tracking=True) == 0
 	assert not os.path.exists(stale)
 	assert (tmp_tree.dst / 'sub' / 'releases' / 'v3' / 'keep.txt').exists()
 
@@ -465,7 +468,7 @@ def test_in_tree_directory_link_does_not_shield_its_subtree_from_remove_extra(tm
 def test_dangling_link_does_not_shield_a_stale_file_from_remove_extra(tmp_tree, hpcp_mod, reset_hpcp_globals, require_linux, monkeypatch):
 	tmp_tree.add_symlink('dangle', 'gone.txt')
 	stale = tmp_tree.add_file('gone.txt', 'deleted at the source', under='dst')
-	assert _rme(hpcp_mod, monkeypatch, [str(tmp_tree.src) + os.sep], [str(tmp_tree.dst) + os.sep]) == 0
+	assert _rme(hpcp_mod, monkeypatch, [str(tmp_tree.src) + os.sep], [str(tmp_tree.dst) + os.sep], link_tracking=True) == 0
 	assert not os.path.exists(stale)
 
 
@@ -518,7 +521,7 @@ def test_tracked_target_that_contains_the_copy_shields_nothing(tmp_path, hpcp_mo
 	dst = tmp_path / 'backup'
 	dst.mkdir()
 	(dst / 'stale.txt').write_text('stale')
-	assert _rme(hpcp_mod, monkeypatch, [str(src)], [str(dst) + os.sep]) == 0
+	assert _rme(hpcp_mod, monkeypatch, [str(src)], [str(dst) + os.sep], link_tracking=True) == 0
 	assert (dst / 'proj' / 'a.txt').read_text() == 'a'
 	assert not (dst / 'stale.txt').exists()
 
@@ -532,7 +535,7 @@ def test_remove_extra_keeps_the_copy_of_an_excluded_link_target(tmp_path, hpcp_m
 	dst = tmp_path / 'backup'
 	(dst / 'shared').mkdir(parents=True)
 	(dst / 'shared' / 'lib').write_text('earlier copy')
-	assert _rme(hpcp_mod, monkeypatch, [str(home / 'proj')], [str(dst) + os.sep], exclude=[str(home / 'shared' / 'lib')]) == 0
+	assert _rme(hpcp_mod, monkeypatch, [str(home / 'proj')], [str(dst) + os.sep], exclude=[str(home / 'shared' / 'lib')], link_tracking=True) == 0
 	assert (dst / 'shared' / 'lib').read_text() == 'earlier copy'
 
 
@@ -548,9 +551,9 @@ def test_tracked_target_inside_another_sources_tree_is_kept(tmp_path, hpcp_mod, 
 	dst = tmp_path / 'backup'
 	dst.mkdir()
 	opts = dict(single_thread=True, batch=True, do_not_remove_files_while_listing=True)
-	assert hpcp_mod.hpcp([str(a / 'x'), str(b / 'y')], dest_paths=[str(dst) + os.sep], **opts) == 0
+	assert hpcp_mod.hpcp([str(a / 'x'), str(b / 'y')], dest_paths=[str(dst) + os.sep], link_tracking=True, **opts) == 0
 	assert (dst / 'x' / 'l').read_text() == 'tracked from a'
-	assert _rme(hpcp_mod, monkeypatch, [str(a / 'x'), str(b / 'y')], [str(dst) + os.sep]) == 0
+	assert _rme(hpcp_mod, monkeypatch, [str(a / 'x'), str(b / 'y')], [str(dst) + os.sep], link_tracking=True) == 0
 	assert (dst / 'x' / 'l').read_text() == 'tracked from a'
 
 
@@ -569,7 +572,7 @@ def test_tracked_directory_holding_another_sources_copy_keeps_its_own_contents(t
 	os.makedirs(mnt)
 	srcs = [str(s / 'a'), str(s / 'c' / 'sub')]
 	files, links = hpcp_mod.process_copy(srcs, [mnt], single_thread=True, max_workers=1, dest_image='stand-in.img', batch=True)
-	keep = hpcp_mod.create_sym_links(links)
+	keep = hpcp_mod.create_sym_links(links, link_tracking=True)
 	image_c = tmp_path / 'mnt' / os.path.relpath(str(s / 'c'), '/')
 	# img/s/c exists (sub's parent), so tracking found its target there; other is from an earlier run.
 	(image_c / 'other').write_text('tracked content')
@@ -591,7 +594,7 @@ def test_exclude_above_the_source_root_does_not_stop_link_tracking(tmp_path, hpc
 	dst = tmp_path / 'd'
 	dst.mkdir()
 	assert hpcp_mod.hpcp([str(srv / 'proj')], dest_paths=[str(dst) + os.sep], exclude=['tmp'], single_thread=True,
-		batch=True, do_not_remove_files_while_listing=True) == 0
+		link_tracking=True, batch=True, do_not_remove_files_while_listing=True) == 0
 	assert (dst / 'proj' / 'l').read_text() == 'lib'
 
 

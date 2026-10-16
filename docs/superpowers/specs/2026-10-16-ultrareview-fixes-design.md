@@ -143,6 +143,13 @@ Each review after the first found fewer and narrower issues, almost all where `-
 2. The new remove gate skips `-rm` and `-rme` after any copy-phase error, including `Listing error` on an unreadable directory the user does not care about. The fix is `-e`. Is that the right default, or should listing errors outside the copied paths be ignored?
 3. Should cas-toolbox pick up 9.73 in Monday's roll-up, or as a mid-week hotfix? The `-rm` after a failed copy, `-rme -di` and `-d` glob bugs exist in released 9.72.
 
+## Decisions (user check-in, 2026-10-16)
+
+1. **Link tracking is opt-in.** New `-lt --link_tracking`; `-nlt` is kept and overrides `-lt` (so an alias with `-lt` can still turn it off). `hpcp()` takes `link_tracking=False` next to `no_link_tracking`; `create_sym_links` takes `link_tracking=False`. The default copies symlinks as they are, as `cp -a` does and as hpcp has behaved in effect since May 2025. The C8 fixes stay (links go where their target is; tracking works with `-lt`). Without `-lt` the keep list is empty, so `-rme` removes a target copy an earlier `-lt` run placed, like any other extra. The tracking tests now pass `link_tracking=True`.
+2. **The remove gate stays strict**: any copy-phase failure skips `-rm` and `-rme` (`Remove skipped`, 212), as rsync's `--delete` skips deletion after I/O errors. `-e` is the way around an unreadable path.
+3. **cas-toolbox: mid-week hotfix 2026.42.2** pinning `hpcp==9.73` (2026.42.1, published, ships 9.72 and its source-deleting `-rm` bugs).
+4. **Release order:** the user runs `/code-review ultra` on this branch first; its findings are fixed; then main is fast-forwarded and pushed, hpcp 9.73 published, cas-toolbox 2026.42.2 published, and the `ultrareview-*` branches and the worktree deleted.
+
 ## Testing
 
 - Every fix starts with a test that fails on 9.72.

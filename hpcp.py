@@ -2268,8 +2268,8 @@ def get_mount_table():
 	return mount_table
 
 #%% -- Symbolic Links --
-def create_sym_links(symLinks,exclude=None,no_link_tracking=False):
-	"""Recreate symLinks ({src link: [dest paths]}). Returns, with link tracking, a (target's destination path, target's
+def create_sym_links(symLinks,exclude=None,link_tracking=False):
+	"""Recreate symLinks ({src link: [dest paths]}). Returns, with link tracking (-lt), a (target's destination path, target's
 	source path, link's destination path) triple for each relative link whose target exists at the source (copied now
 	or already there, or excluded): -rme keeps those targets, except where the copy itself covers them (_kept_paths)."""
 	global RANDOM_DESTINATION_SELECTION
@@ -2279,8 +2279,8 @@ def create_sym_links(symLinks,exclude=None,no_link_tracking=False):
 	nestedSymLinks = {}
 	counter = 0
 	print(f"\nFound Symbolic Links:   {len(symLinks)}")
-	if no_link_tracking:
-		print("Skipping copying file as no_link_tracking ...\n")
+	if link_tracking:
+		print("Link tracking: copying the missing targets of relative links ...\n")
 	#print(symLinks)
 	start_time = time.monotonic()
 	for src, dests in symLinks.items():
@@ -2311,7 +2311,7 @@ def create_sym_links(symLinks,exclude=None,no_link_tracking=False):
 				# Files are spread over the dests: a relative link goes where its target is, so that it resolves.
 				destLinkedFiles = [os.path.join(os.path.dirname(d), linkedTargetFile) for d in dests]
 				dest = next((d for d, destLinkedFile in zip(dests, destLinkedFiles) if os.path.exists(destLinkedFile)), '')
-				if not no_link_tracking:
+				if link_tracking:
 					# The target by the link's own spelling with '..' resolved, so -e patterns match it and the tracked tree;
 					# used only when the kernel resolves the link to that same file (no '..' after a symlinked directory).
 					linked = os.path.join(os.path.dirname(src), linkedTargetFile)
@@ -2389,7 +2389,7 @@ Skipping...""")
 	print(f"Time taken:             {endTime-start_time:0.4f} seconds")
 	if len(nestedSymLinks) > 0:
 		print(f"\nNested Symbolic Links:   {len(nestedSymLinks)}")
-		tracked_targets |= create_sym_links(nestedSymLinks,exclude=exclude,no_link_tracking=no_link_tracking)
+		tracked_targets |= create_sym_links(nestedSymLinks,exclude=exclude,link_tracking=link_tracking)
 	return tracked_targets
 
 #%% -- File list --
@@ -9045,7 +9045,8 @@ def get_args(args = None):
 	parser.add_argument('-rwloff','--do_not_remove_files_while_listing', action='store_true', help='Do not remove files while listing. This is useful if you want to remove files after listing.')
 	parser.add_argument('-e', '--exclude', action='append', default=[], help='Exclude source files matching the pattern')
 	parser.add_argument('-x', '--exclude_file', type=str, help='Exclude source files matching the pattern in the file')
-	parser.add_argument('-nlt', '--no_link_tracking', action='store_true', help='Do not copy files that symlinks point to.')
+	parser.add_argument('-lt', '--link_tracking', action='store_true', help='Also copy the target of a relative symlink when the destination does not have it, to the same place relative to the link (this can be outside the destination). Default: off, symlinks are copied as they are.')
+	parser.add_argument('-nlt', '--no_link_tracking', action='store_true', help='Do not copy the files that symlinks point to (the default). Overrides -lt.')
 	parser.add_argument('-V', '--version', action='version', version=f"%(prog)s {version} @ {COMMIT_DATE} with {('XXHash' if xxhash_available else 'Blake2b')}, multiCMD V{multiCMD.version}, and [ {', '.join(_binPaths.keys())} ]; High Performance CoPy (HPC coPy) by pan@zopyr.us")
 	parser.add_argument('-pfl', '--parallel_file_listing', action='store_true', help='Use parallel processing for file listing')
 	parser.add_argument('src_path', nargs='*', type=str, help='Source Path')
@@ -9100,7 +9101,7 @@ def get_args(args = None):
 def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = multiprocessing.cpu_count(),
 			verbose = False, directory_only = False,no_directory_sync = False, full_hash = False, files_per_job = 1, target_file_list = "",
 			compare_file_list = False, diff_file_list = None, tar_diff_file_list = False, remove = False,remove_force = False, remove_extra = False, parallel_file_listing = False,
-			exclude=None,exclude_file = None,dest_image = None,dest_image_size = '0', no_link_tracking = False,src_image = None,dd = False,dd_resize = 0,
+			exclude=None,exclude_file = None,dest_image = None,dest_image_size = '0', no_link_tracking = False,link_tracking = False,src_image = None,dd = False,dd_resize = 0,
 			batch = False, append_hash_to_file_list = True, hash_size = ..., source_file_list = None, random_destination_selection = False, 
 			bytes_rate_limit = None, files_rate_limit = None,target_file_system = None, no_create_dir = False, content_only = False, command_timeout_limit = 0,
 			exit_not_enough_space = False,do_not_remove_files_while_listing = False,no_fs_param_mirror = False,
@@ -9400,7 +9401,7 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = multipr
 					print(f"Copied File: {file}")
 				for link in total_sym_links:
 					print(f"Link: {link} -> {total_sym_links[link]}")
-			link_targets = create_sym_links(total_sym_links,exclude=exclude,no_link_tracking=no_link_tracking)
+			link_targets = create_sym_links(total_sym_links,exclude=exclude,link_tracking=link_tracking and not no_link_tracking)
 			# A copy that reported errors is incomplete: removing the sources (a move) would lose what was not copied,
 			# and an unlisted source subtree would make its destination counterpart look extra.
 			copy_failures = [error for error in ERRORS[copy_error_start:] if _is_failure(error)]
@@ -9572,7 +9573,7 @@ def main():
 			 directory_only =  args.directory_only, no_directory_sync = args.no_directory_sync,full_hash = args.full_hash, files_per_job = args.files_per_job,
 			 target_file_list = args.target_file_list, compare_file_list = args.compare_file_list , diff_file_list = args.diff_file_list, tar_diff_file_list = args.tar_diff_file_list,remove = args.remove, remove_force =args.remove_force,
 			 remove_extra = args.remove_extra, parallel_file_listing = args.parallel_file_listing,exclude = args.exclude,exclude_file = args.exclude_file,
-			 dest_image = args.dest_image,dest_image_size=args.dest_image_size,no_link_tracking = args.no_link_tracking,src_image = args.src_image,dd=args.disk_dump,
+			 dest_image = args.dest_image,dest_image_size=args.dest_image_size,no_link_tracking = args.no_link_tracking,link_tracking = args.link_tracking,src_image = args.src_image,dd=args.disk_dump,
 			 dd_resize=args.dd_resize,batch=args.batch,append_hash_to_file_list=not args.no_hash_file_list, hash_size=args.hash_size,source_file_list=args.source_file_list,
 			 random_destination_selection = args.random_dest_selection,bytes_rate_limit = args.rate_limit,files_rate_limit = args.file_rate_limit,
 			 target_file_system = args.target_file_system, no_create_dir = args.no_create_dir, content_only = args.content_only, command_timeout_limit = args.command_timeout_limit,

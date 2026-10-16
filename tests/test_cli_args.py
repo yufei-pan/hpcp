@@ -65,6 +65,16 @@ def test_remaining_copy_mode_flags(hpcp_mod, restore_argv, reset_hpcp_globals):
 	assert args.max_workers == 2
 
 
+@pytest.mark.parametrize('flags,expected', [([], False), (['-lt'], True), (['--link_tracking'], True), (['-lt', '-nlt'], False), (['-nlt'], False)])
+def test_main_passes_link_tracking(hpcp_mod, restore_argv, reset_hpcp_globals, monkeypatch, flags, expected):
+	"""Link tracking is opt-in (-lt); -nlt is kept and wins, so an alias with -lt can still turn it off."""
+	seen = {}
+	monkeypatch.setattr(sys, 'argv', ['hpcp', *flags, '/nonexistent-src', '-d', '/nonexistent-dest'])
+	monkeypatch.setattr(hpcp_mod, 'hpcp', lambda *args, **kwargs: seen.update(kwargs) or 0)
+	hpcp_mod.main()
+	assert (seen['link_tracking'] and not seen['no_link_tracking']) is expected
+
+
 def test_file_list_cli_flags(hpcp_mod, restore_argv, reset_hpcp_globals):
 	args = _parse(hpcp_mod, [
 		'hpcp', '-sfl', 'src.txt', '-fl', 'out.txt', '-cfl', '-dfl', 'diff.txt',

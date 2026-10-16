@@ -28,7 +28,7 @@ Although in most cases these checks should confirm that both files are identical
 
 A file or directory that cannot be read, listed or written is reported and the rest of the copy goes on; hpcp then exits with a non-zero code (`Copy failed` 190, `Directory sync error` 193, `Listing error` 209, ...). As with `cp -a`, a non-root copy keeps the group when the user belongs to it but cannot keep another user's ownership, and then does not keep a set-user-ID / set-group-ID bit (on files or directories) for an owner / group it could not keep.
 
-Symlinks are recreated as symlinks. Without `-nlt --no_link_tracking`, a relative symlink whose target is missing at the destination (it points outside the copied tree, say `../shared/lib`) gets its target copied to the same relative place, which can be outside the destination directory, so the link resolves there too. With several destinations a relative link goes to the destination that holds its target. A link whose path is taken by a real file or directory in the destination is not created and is reported.
+Symlinks are recreated as symlinks, as `cp -a` does: a link whose target is outside the copied tree (say `../shared/lib`) is copied as it is and does not resolve at the destination unless the target is already there. With `-lt --link_tracking`, a relative symlink whose target is missing at the destination gets its target copied to the same relative place, which can be outside the destination directory (and can be a whole tree: `data -> ../../scratch`), so the link resolves there too. `-nlt --no_link_tracking` (the default) overrides `-lt`. With several destinations a relative link goes to the destination that holds its target. A link whose path is taken by a real file or directory in the destination is not created and is reported.
 
 Setting `-hs --hash_size` to `0` disables hash checks entirely. This can be helpful on HDDs, as they usually have suboptimal seek performance. However, HDDs are also more prone to bit rot. If the operator can accept that risk, it is possible to rely solely on mtime checks for file comparison by setting `hash_size` to `0`. (Though on a single HDD, the standard `cp` command is already well-optimized.)
 
@@ -139,7 +139,7 @@ Limitations:
 `-rme --remove_extra`: Especially when combined with `-rf`, **PLEASE PAY CLOSE ATTENTION TO YOUR TARGET DIRECTORY!**  
 `--remove_extra` will remove **all** files that are not in the source path. When you are copying a file into a folder, you almost certainly do not want to use this!
 
-It runs only after a copy that reported no errors: if a source path could not be listed, its copy in the destination would look extra. Otherwise hpcp leaves the destination as it is and exits with `Remove skipped` (212). With `-di` the image holds each source at its absolute path, and `-rme` compares against that layout: it mirrors the **whole image** to this run's sources, so another source copied into the same image on an earlier run is removed too. The destination's copy of an excluded source path (`-e`, `-x`, absolute or not) is never removed, and a directory that still holds one is kept, and so are link targets that link tracking placed in the destination. Directories of a filesystem mounted below the destination are left alone; files there are still compared and can be removed.
+It runs only after a copy that reported no errors: if a source path could not be listed, its copy in the destination would look extra. Otherwise hpcp leaves the destination as it is and exits with `Remove skipped` (212). With `-di` the image holds each source at its absolute path, and `-rme` compares against that layout: it mirrors the **whole image** to this run's sources, so another source copied into the same image on an earlier run is removed too. The destination's copy of an excluded source path (`-e`, `-x`, absolute or not) is never removed, and a directory that still holds one is kept. With `-lt`, so are link targets that link tracking placed in the destination; without it they are not part of the copy and are removed like any other extra file. Directories of a filesystem mounted below the destination are left alone; files there are still compared and can be removed.
 
 ## Remove Feature Note
 
@@ -157,7 +157,7 @@ usage: hpcp.py [-h] [-s] [-j MAX_WORKERS] [-b | -nb] [-v] [-do] [-nds] [-fh]
                [-hs HASH_SIZE] [-fpj FILES_PER_JOB] [-sfl SOURCE_FILE_LIST]
                [-fl TARGET_FILE_LIST] [-cfl] [-dfl [DIFF_FILE_LIST]] [-tdfl]
                [-nhfl] [-rm] [-rf] [-rme] [-rwloff] [-e EXCLUDE]
-               [-x EXCLUDE_FILE] [-nlt] [-V] [-pfl] [-si SRC_IMAGE]
+               [-x EXCLUDE_FILE] [-lt] [-nlt] [-V] [-pfl] [-si SRC_IMAGE]
                [-siff LOAD_DIFF_IMAGE] [-d DEST_PATH] [-rds] [-di DEST_IMAGE]
                [-dis DEST_IMAGE_SIZE] [-diff [GET_DIFF_IMAGE]] [-fa] [-dd]
                [-ddr DD_RESIZE] [-nfp] [-L RATE_LIMIT] [-F FILE_RATE_LIMIT]
@@ -228,8 +228,14 @@ options:
                         Exclude source files matching the pattern
   -x, --exclude_file EXCLUDE_FILE
                         Exclude source files matching the pattern in the file
+  -lt, --link_tracking  Also copy the target of a relative symlink when the
+                        destination does not have it, to the same place
+                        relative to the link (this can be outside the
+                        destination). Default: off, symlinks are copied as
+                        they are.
   -nlt, --no_link_tracking
-                        Do not copy files that symlinks point to.
+                        Do not copy the files that symlinks point to (the
+                        default). Overrides -lt.
   -V, --version         show program's version number and exit
   -pfl, --parallel_file_listing
                         Use parallel processing for file listing

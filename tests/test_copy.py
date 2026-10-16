@@ -460,18 +460,20 @@ def _relative_link_outside_the_copy(tmp_tree):
 
 @pytest.mark.parametrize('single_thread', [True, False])
 def test_relative_link_target_outside_the_copy_is_tracked(tmp_tree, hpcp_mod, reset_hpcp_globals, require_linux, single_thread):
-	"""Review C8: without -nlt a relative link's missing target is copied next to it, so the link resolves."""
+	"""Review C8: with -lt a relative link's missing target is copied next to it, so the link resolves."""
 	srcs, dests = _relative_link_outside_the_copy(tmp_tree)
 	assert hpcp_mod.hpcp(srcs, dest_paths=dests, single_thread=single_thread, max_workers=1 if single_thread else 2,
-		batch=True, do_not_remove_files_while_listing=True) == 0
+		link_tracking=True, batch=True, do_not_remove_files_while_listing=True) == 0
 	assert os.readlink(tmp_tree.dst / 'proj' / 'lib') == '../shared/lib.txt'
 	assert (tmp_tree.dst / 'proj' / 'lib').read_text() == 'library'
 
 
-def test_no_link_tracking_leaves_the_target_alone(tmp_tree, hpcp_mod, reset_hpcp_globals, require_linux):
+@pytest.mark.parametrize('flags', [{}, {'no_link_tracking': True}, {'link_tracking': True, 'no_link_tracking': True}])
+def test_link_tracking_is_opt_in(tmp_tree, hpcp_mod, reset_hpcp_globals, require_linux, flags):
+	"""Off by default, as it has been in effect since May 2025 (and as with cp -a); -nlt still turns it off."""
 	srcs, dests = _relative_link_outside_the_copy(tmp_tree)
-	assert hpcp_mod.hpcp(srcs, dest_paths=dests, single_thread=True, max_workers=1, no_link_tracking=True,
-		batch=True, do_not_remove_files_while_listing=True) == 0
+	assert hpcp_mod.hpcp(srcs, dest_paths=dests, single_thread=True, max_workers=1,
+		batch=True, do_not_remove_files_while_listing=True, **flags) == 0
 	assert os.readlink(tmp_tree.dst / 'proj' / 'lib') == '../shared/lib.txt'
 	assert not (tmp_tree.dst / 'shared').exists()
 
@@ -483,7 +485,7 @@ def test_link_goes_to_the_destination_that_holds_its_target(tmp_tree, hpcp_mod, 
 	first.mkdir()
 	second.mkdir()
 	(first / 'target.txt').write_text('t')
-	hpcp_mod.create_sym_links({src_link: [str(first / 'ln'), str(second / 'ln')]}, no_link_tracking=True)
+	hpcp_mod.create_sym_links({src_link: [str(first / 'ln'), str(second / 'ln')]})
 	assert os.readlink(first / 'ln') == 'target.txt'
 	assert not os.path.lexists(second / 'ln')
 
@@ -528,7 +530,7 @@ def test_link_tracking_never_copies_an_excluded_target(tmp_tree, hpcp_mod, reset
 	tmp_tree.add_file('secrets/key.pem', 'private')
 	tmp_tree.add_symlink('k', 'secrets/key.pem')
 	assert hpcp_mod.hpcp([str(tmp_tree.src) + os.sep], dest_paths=[str(tmp_tree.dst) + os.sep], exclude=['secrets'],
-		single_thread=True, batch=True, do_not_remove_files_while_listing=True) == 0
+		link_tracking=True, single_thread=True, batch=True, do_not_remove_files_while_listing=True) == 0
 	assert os.readlink(tmp_tree.dst / 'k') == 'secrets/key.pem'
 	assert not (tmp_tree.dst / 'secrets').exists()
 
@@ -582,7 +584,7 @@ def test_link_tracking_honours_absolute_excludes_inside_the_tracked_tree(tmp_pat
 	backup = tmp_path / 'backup'
 	backup.mkdir()
 	assert hpcp_mod.hpcp([str(data / 'src')], dest_paths=[str(backup) + os.sep], exclude=[str(data / 'other' / 'private')],
-		single_thread=True, batch=True, do_not_remove_files_while_listing=True) == 0
+		link_tracking=True, single_thread=True, batch=True, do_not_remove_files_while_listing=True) == 0
 	assert (backup / 'other' / 'pub' / 'x').read_text() == 'x'
 	assert not (backup / 'other' / 'private').exists()
 
@@ -595,7 +597,7 @@ def test_link_through_a_symlinked_directory_and_dotdot_is_not_tracked(tmp_tree, 
 	tmp_tree.add_file('t', 'lexical twin')
 	tmp_tree.add_symlink('sub', str(elsewhere / 'deep'))
 	link = tmp_tree.add_symlink('l', 'sub/../t')
-	tracked = hpcp_mod.create_sym_links({link: [str(tmp_tree.dst / 'l')]})
+	tracked = hpcp_mod.create_sym_links({link: [str(tmp_tree.dst / 'l')]}, link_tracking=True)
 	assert tracked == set()
 	assert os.readlink(tmp_tree.dst / 'l') == 'sub/../t'
 	assert not (tmp_tree.dst / 't').exists()
@@ -638,7 +640,7 @@ def test_link_notes_only_when_a_copy_would_be_tried(tmp_tree, hpcp_mod, reset_hp
 	tmp_tree.add_file('cache/x', 'x')
 	tmp_tree.add_file('cache/x', 'x', under='dst')
 	link = tmp_tree.add_symlink('k', 'cache/x')
-	hpcp_mod.create_sym_links({link: [str(tmp_tree.dst / 'k')]}, exclude=hpcp_mod.format_exclude(['cache']))
+	hpcp_mod.create_sym_links({link: [str(tmp_tree.dst / 'k')]}, exclude=hpcp_mod.format_exclude(['cache']), link_tracking=True)
 	captured = capsys.readouterr()
 	assert 'excluded' not in captured.out + captured.err
 	assert os.readlink(tmp_tree.dst / 'k') == 'cache/x'
@@ -665,5 +667,5 @@ def test_symlinked_directory_note_prints_even_when_the_target_is_there(tmp_tree,
 	tmp_tree.add_symlink('sub', str(elsewhere / 'deep'))
 	link = tmp_tree.add_symlink('l', 'sub/../t')
 	os.symlink(str(elsewhere / 'deep'), str(tmp_tree.dst / 'sub'))
-	hpcp_mod.create_sym_links({link: [str(tmp_tree.dst / 'l')]})
+	hpcp_mod.create_sym_links({link: [str(tmp_tree.dst / 'l')]}, link_tracking=True)
 	assert 'goes through a symlinked directory' in capsys.readouterr().err
