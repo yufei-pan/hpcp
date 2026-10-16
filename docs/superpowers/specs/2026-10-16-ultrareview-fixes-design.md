@@ -79,6 +79,18 @@ A local `/code-review high` of the whole branch found 10 items. I checked each a
 9. **Partly valid.** The `-dd` destination is not affected: its xfs UUID is set after the copy, through `delayed_commands`. The `-dd` source mount and the duplicated logic were real, so all read-write mounts now use `_rw_mount_command`.
 10. **Cleanup, accepted:** `_is_failure` and `_link_dests`. I kept both C4 fixes on purpose: `get_dests` passes `[dest]`, and `expand_paths` takes a str for any other caller.
 
+## Scoped re-review
+
+A second `/code-review high` checked the README claims of the release commit against the code. Its findings, all fixed with tests (#4 was already fixed by the time of this review):
+
+1. `-rme` deleted the destination copy of a source path excluded by an **absolute** `-e`: patterns name source paths, but they were matched against destination paths. That also made the 'Remove skipped' advice ("exclude those paths with -e") delete the backup copy of the very subtree the gate protected. Each destination path is now also mapped back to its source path (`_excluded_at_source`).
+2. Link targets that tracking placed in the destination looked extra to `-rme`. `create_sym_links` now returns them and `remove_extra_files` keeps them.
+3. `-rme -di` kept another source's directories (they exist on the host) while removing its files. Directories now follow this run's sources, and the README says that `-rme` mirrors the whole image.
+4. Already fixed (b539e91): a non-root copy keeps the group like `cp -a`. The README says so now.
+5. A non-root skip re-applied setuid/setgid bits for an owner or group it could not keep. They are now dropped, as `cp -a` does.
+6. and 8. The dangling-link note, the intermediate symlink retry lines, the dir-sync 'maybe a mounted dir' note and 'Destination path excluded' were recorded as rc-128 errors whenever a path held a ':'. With the gate, that refused a clean move. They are plain stderr notes now.
+7. A tracked tree was listed by its un-normalized path ('src/../other'), so absolute excludes inside it never matched. It is normalized now.
+
 ## Not changed (noted for the user)
 
 - `-rme` in `-di` mode still mirrors the whole image to the sources, as `-rme` does for a plain destination.
