@@ -145,7 +145,7 @@ It runs only after a copy that reported no errors: if a source path could not be
 
 `-rm --remove` can remove files in bulk. This might be helpful on distributed file systems like Lustre, as it only gathers the file list once and performs bulk deletion rather than the default recursive deletion in the Linux `rm` program.
 
-With a destination, `-rm` copies first and then removes the sources: a move. The sources are removed only if the copy reported no errors (a file that failed to copy, an unreadable directory, a link that could not be created); otherwise they are left in place and hpcp exits with `Remove skipped` (212).
+With a destination, `-rm` copies first and then removes the sources: a move. The sources are removed only if the copy reported no errors (a file that failed to copy, an unreadable directory, a link that could not be created); otherwise they are left in place and hpcp exits with `Remove skipped` (212). If none of the given destinations can be used (a `-d` glob that matches nothing), nothing is copied or removed (`No valid destination`, 202); a `-di` image that does not exist yet is created first.
 
 `-rf --remove_force` implies `--remove`. **Use with care!** This skips the interactive check requiring user confirmation before removing. If **hpcp** did not generate the correct file list from the specified source paths, hopefully you have fast enough reflexes to press `Ctrl + C` repeatedly to stop all parallel deletion processes if you realize a mistake.
 
