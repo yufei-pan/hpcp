@@ -1,5 +1,6 @@
 import os
 import random
+import stat
 import time
 import pytest
 
@@ -546,4 +547,22 @@ def test_non_root_ownership_falls_back_to_the_group_like_cp(tmp_tree, hpcp_mod, 
 	hpcp_mod.sync_directory_metadata(src, [str(tmp_tree.dst / 'd')])
 	st = os.stat(src)
 	assert calls == [(st.st_uid, st.st_gid), (-1, st.st_gid)]
+	assert hpcp_mod.ERRORS == []
+
+
+@pytest.mark.parametrize('group_allowed, expected', [(True, 0o2755), (False, 0o755)])
+def test_non_root_skip_drops_setid_bits_it_cannot_keep_the_ids_for(tmp_tree, hpcp_mod, reset_hpcp_globals, require_linux, monkeypatch, group_allowed, expected):
+	"""As cp -a: a set-user-ID file whose owner could not be kept must not become a setuid file of the copier."""
+	src, dst = _identical_files(tmp_tree)
+	os.chmod(src, 0o6755)
+	hpcp_mod.HASH_SIZE = 65536
+	real_chown = os.chown
+	def chown(path, uid, gid, **kwargs):
+		if uid != -1 or not group_allowed:
+			raise PermissionError(1, 'Operation not permitted')
+		real_chown(path, uid, gid, **kwargs)
+	monkeypatch.setattr(hpcp_mod.os, 'chown', chown)
+	monkeypatch.setattr(hpcp_mod.os, 'geteuid', lambda: 1000)
+	hpcp_mod.copy_file(src, [dst])
+	assert stat.S_IMODE(os.stat(dst).st_mode) == expected
 	assert hpcp_mod.ERRORS == []

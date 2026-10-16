@@ -2932,16 +2932,19 @@ def delete_files_parallel(paths, max_workers, verbose=False,files_per_job=1,excl
 #%% ---- Copy Files ----
 def _chown_like_cp(path, st):
 	"""Give path st's owner and group, as cp -a does: without privileges another user's ownership cannot be kept,
-	so keep at least the group (one the user belongs to) and treat the rest as no error. Root failures raise."""
+	so keep at least the group (one the user belongs to) and treat the rest as no error. Root failures raise.
+	Returns (owner kept, group kept)."""
 	try:
 		os.chown(path, st.st_uid, st.st_gid)
+		return True, True
 	except PermissionError:
 		if os.geteuid() == 0:
 			raise
 		try:
 			os.chown(path, -1, st.st_gid)
+			return False, True
 		except PermissionError:
-			pass
+			return False, False
 
 def copy_file(src_path, dest_paths, full_hash=False, verbose=False, concurrent_processes=0):
 	"""
@@ -2977,9 +2980,9 @@ def copy_file(src_path, dest_paths, full_hash=False, verbose=False, concurrent_p
 					_remove_stale_xattrs(src_path, dest)
 					shutil.copystat(src_path, dest,follow_symlinks=False)
 					if os.name == 'posix':
-						_chown_like_cp(dest, st)
-						#also copy the modes
-						os.chmod(dest, st.st_mode)
+						owner_kept, group_kept = _chown_like_cp(dest, st)
+						#also copy the modes (as cp -a: no set-user-ID / set-group-ID bit for an owner / group not kept)
+						os.chmod(dest, st.st_mode & ~((0 if owner_kept else stat.S_ISUID) | (0 if group_kept else stat.S_ISGID)))
 					os.utime(dest, (st.st_atime, st.st_mtime),follow_symlinks=False)
 				endTime = time.monotonic()
 				return 0, endTime - start_time , symLinks #, task_to_run
