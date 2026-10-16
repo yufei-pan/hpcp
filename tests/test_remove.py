@@ -775,7 +775,50 @@ def test_listed_file_that_became_a_directory_is_left(tmp_path, hpcp_mod, reset_h
 	(tmp_path / 'was-a-file').mkdir()
 	(tmp_path / 'was-a-file' / 'inside.txt').write_text('new')
 	(tmp_path / 'f.txt').write_text('f')
-	hpcp_mod._remove_listed_files([str(tmp_path / 'was-a-file'), str(tmp_path / 'f.txt'), str(tmp_path / 'gone.txt')])
+	hpcp_mod._remove_listed_files([(str(tmp_path), 'was-a-file'), (str(tmp_path), 'f.txt'), (str(tmp_path), 'gone.txt')])
 	assert (tmp_path / 'was-a-file' / 'inside.txt').read_text() == 'new'
 	assert not (tmp_path / 'f.txt').exists()
 	assert hpcp_mod.ERRORS == []
+
+
+
+def _swap_for_a_symlink(directory, target):
+	"""Replace directory (and what it holds) with a symlink to target, as another user writing the tree could."""
+	import shutil
+	shutil.rmtree(str(directory))
+	os.symlink(str(target), str(directory))
+
+
+def test_move_never_removes_through_a_directory_swapped_for_a_symlink(tmp_path, hpcp_mod, reset_hpcp_globals):
+	"""Security review: src/sub/passwd was listed; sub is then swapped for a symlink to /etc (here: victim). The unlink
+	goes by descriptors with O_NOFOLLOW, so it stops at sub instead of deleting victim/passwd."""
+	src, victim = tmp_path / 'src', tmp_path / 'victim'
+	(src / 'sub').mkdir(parents=True)
+	(src / 'sub' / 'passwd').write_text('listed')
+	victim.mkdir()
+	(victim / 'passwd').write_text('not yours')
+	(victim / 'empty').mkdir()
+	_swap_for_a_symlink(src / 'sub', victim)
+	hpcp_mod._remove_listed_files([(str(src), os.path.join('sub', 'passwd'))])
+	hpcp_mod._rmdir_below(str(src), os.path.join('sub', 'empty'))
+	assert (victim / 'passwd').read_text() == 'not yours'
+	assert (victim / 'empty').is_dir()
+	assert os.path.islink(src / 'sub')
+
+
+def test_move_whose_source_directory_is_swapped_during_the_copy_removes_nothing_outside(tmp_tree, hpcp_mod, reset_hpcp_globals, require_linux, copy_args, monkeypatch):
+	victim = tmp_tree.root / 'victim'
+	victim.mkdir()
+	(victim / 'f.txt').write_text('not yours')
+	(victim / 'empty').mkdir()
+	tmp_tree.add_file('sub/f.txt', 'listed')
+	tmp_tree.add_dir('sub/empty')
+	real = hpcp_mod.create_sym_links
+	def create_sym_links(*args, **kwargs):
+		_swap_for_a_symlink(tmp_tree.src / 'sub', victim)
+		return real(*args, **kwargs)
+	monkeypatch.setattr(hpcp_mod, 'create_sym_links', create_sym_links)
+	srcs, opts = copy_args(remove_force=True)
+	hpcp_mod.hpcp(srcs, **opts)
+	assert (victim / 'f.txt').read_text() == 'not yours'
+	assert (victim / 'empty').is_dir()
