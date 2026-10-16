@@ -143,7 +143,7 @@ It runs only after a copy that reported no errors: if a source path could not be
 
 ## Remove Feature Note
 
-`-rm --remove` can remove files in bulk. This might be helpful on distributed file systems like Lustre, as it only gathers the file list once and performs bulk deletion rather than the default recursive deletion in the Linux `rm` program.
+`-rm --remove` can remove files in bulk. This might be helpful on distributed file systems like Lustre: without a destination it walks each tree once, by directory descriptors (one open and one listing per directory, no stat per file), and with `-pfl` empties the directories in parallel jobs; `-rwloff` lists the trees first and then removes the listed files in parallel jobs. Every removal (plain `-rm`, a move, `-rme`) goes by directory descriptors from each source or destination, recorded before the confirmation prompt, without following symlinks: a source or destination replaced, or a directory in it swapped for a symlink, while hpcp runs (a tree other users can write to, with hpcp running as root) is not removed through, and is reported. Excluded paths stay, with the directories that hold them. As with `rm --preserve-root`, `hpcp -rm /` (or a bind mount of `/`) is refused (`Invalid arguments`, 241).
 
 With a destination, `-rm` copies first and then removes the sources: a move. A move whose destination is a source itself (`hpcp -rm /data/x -d /data/`) or lies inside it is refused before anything is copied (`Invalid arguments`, 241). The sources are removed only if the copy reported no errors (a file that failed to copy, an unreadable directory, a path longer than 4096 characters, a link that could not be created); otherwise they are left in place and hpcp exits with `Remove skipped` (212). A move removes only the files and links the copy listed, then each source directory that is empty after that. Anything else stays where it is, with the directories that hold it: a file written to a source after the copy listed its directory, a special file (a FIFO, socket or device node, which hpcp does not copy), an excluded path. What stays, excluded paths aside, is named in a `Move left entries` note (exit code 0). A file changed after it was copied is still removed, as with `mv`, so stop writing to a source before moving it. The removal goes by directory descriptors from each source root, without following symlinks: a source root, or a directory in it, that was replaced (by a symlink, say) while the copy ran is not removed from, and is reported. Without a destination, `-rm` removes the whole source trees. If none of the given destinations can be used (a `-d` glob that matches nothing), nothing is copied or removed (`No valid destination`, 202); a `-di` image that does not exist yet is created first.
 
@@ -222,8 +222,9 @@ options:
   -rme, --remove_extra  Remove all files and folders in dest_path that are not
                         in src_path
   -rwloff, --do_not_remove_files_while_listing
-                        Do not remove files while listing. This is useful if
-                        you want to remove files after listing.
+                        With -rm and no destination: list the trees first,
+                        then remove the listed files in parallel jobs
+                        (default: remove while walking the trees).
   -e, --exclude EXCLUDE
                         Exclude source files matching the pattern
   -x, --exclude_file EXCLUDE_FILE

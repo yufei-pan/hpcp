@@ -193,3 +193,25 @@ def test_plain_remove_after_a_cached_listing_still_removes_everything(tmp_path, 
 	monkeypatch.setattr(hpcp_mod, 'REMOVE_FILES_WHILE_LISTING', False)
 	hpcp_mod.process_remove([str(src)], single_thread=True, remove_force=True)
 	assert not src.exists()
+
+
+@pytest.mark.parametrize('root', ['/', '//', '/.', '/tmp/..'])
+def test_plain_remove_refuses_the_filesystem_root(hpcp_mod, reset_hpcp_globals, monkeypatch, root):
+	"""As rm's --preserve-root: `hpcp -rm /` is refused (9.73 hung in a loop on it). Every removal is stubbed to fail
+	the test first, so a missing guard cannot remove anything here."""
+	def refuse(*args, **kwargs):
+		raise AssertionError('a removal ran for the filesystem root')
+	for name in ('_remove_tree_fd', '_remove_one_listed', '_remove_trees_parallel', 'delete_file_list_parallel', '_remove_listed_files'):
+		monkeypatch.setattr(hpcp_mod, name, refuse)
+	with pytest.raises(RuntimeError, match='^Invalid arguments'):
+		hpcp_mod.process_remove([root], single_thread=True, remove_force=True)
+
+
+def test_plain_remove_of_a_symlink_to_the_root_removes_the_link(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	def refuse(*args, **kwargs):
+		raise AssertionError('a tree removal ran for a link to /')
+	for name in ('_remove_tree_fd', '_remove_trees_parallel', 'delete_file_list_parallel'):
+		monkeypatch.setattr(hpcp_mod, name, refuse)
+	os.symlink(os.sep, str(tmp_path / 'to-root'))
+	hpcp_mod.process_remove([str(tmp_path / 'to-root')], single_thread=True, remove_force=True)
+	assert not os.path.lexists(tmp_path / 'to-root')

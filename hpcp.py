@@ -194,7 +194,7 @@ except ImportError:
 	hasher = hashlib.blake2b()
 	xxhash_available = False
 
-version = '9.73'
+version = '9.74'
 __version__ = version
 COMMIT_DATE = '2026-10-16'
 
@@ -8519,6 +8519,14 @@ def store_file_list(file_list, src_paths: list, single_thread=False, max_workers
 			for file in fileList:
 				f.write(file + '\n')
 
+def _is_filesystem_root(path):
+	"""True when path is / itself, by device and inode (a bind mount of / too), as rm's --preserve-root checks; a
+	symlink to / is just a link."""
+	try:
+		return not os.path.islink(path) and os.path.samestat(os.stat(path), os.stat(os.sep))
+	except OSError:
+		return False
+
 def process_remove(src_paths: list,single_thread = False, max_workers = multiprocessing.cpu_count(),verbose = False,
 				  files_per_job = 1, remove_force = False,exclude=None,batch = False,parallel_file_listing=False):
 	"""-rm without a destination: remove the source trees; excluded paths stay, with the directories holding them.
@@ -8535,6 +8543,8 @@ def process_remove(src_paths: list,single_thread = False, max_workers = multipro
 			continue
 		# 'src/' is src itself ('ln/' the link ln, as the copy names it).
 		path = os.path.abspath(src)
+		if _is_filesystem_root(path):
+			raise RuntimeError(f'Invalid arguments: -rm will not remove the filesystem root ({src}), as rm --preserve-root')
 		if exclude and is_excluded(path,exclude):
 			print(f'Skipping excluded path: {path}')
 		else:
