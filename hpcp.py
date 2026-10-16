@@ -4438,8 +4438,15 @@ def build_entry_map(root, prefix='', parents=None, exclude=None, logical_root=No
 	if not os.path.isdir(root) or os.path.islink(root):
 		return entries
 	post_filter = bool(exclude) and logical_root is not None
+	error_start = len(ERRORS)
 	files, links, _, folders = get_file_list(root, exclude=None if post_filter else exclude, max_workers=max_workers,
 		drop_cache=True, parallel_file_listing=parallel_file_listing)
+	# The listing goes on past a directory it cannot read; a map without that directory's entries would show them as
+	# deleted (or, on the base side, as added), so a patch or diff list made from it would be wrong.
+	failures = [error for error in ERRORS[error_start:] if _is_failure(error)]
+	if failures:
+		raise RuntimeError(f'Listing error: {root} could not be listed completely ({len(failures)} error(s)); '
+			'not comparing a partial tree: fix the paths above (or exclude them with -e) and re-run')
 	entries[prefix or './'] = root
 	for paths, is_dir in ((files, False), (links, False), (folders, True)):
 		for path in paths:

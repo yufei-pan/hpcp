@@ -4518,3 +4518,46 @@ def test_clone_of_a_mounted_xfs_image_mounts_read_write(tmp_path, hpcp_mod, rese
 		root = hpcp_mod._mount_single_fs_image(clone, False, mount_points, loop_devices)
 		_write(os.path.join(root, 'written.txt'), 'w')
 		assert open(os.path.join(root, 'f.txt')).read() == 'f'
+
+
+# ---- 9.73 ultrareview of the fix branch ----
+
+def _fail_scandir_at(hpcp_mod, monkeypatch, failing):
+	real = os.scandir
+	def scandir(path='.'):
+		if os.path.abspath(os.fspath(path)) == str(failing):
+			raise PermissionError(errno.EACCES, 'Permission denied', str(path))
+		return real(path)
+	monkeypatch.setattr(hpcp_mod.os, 'scandir', scandir)
+
+
+def test_build_entry_map_refuses_a_partial_listing(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	"""A directory that could not be listed would show its entries as deleted: no map, and so no patch, from it."""
+	_write(tmp_path / 'new' / 'sub' / 'f.txt', 'f')
+	_fail_scandir_at(hpcp_mod, monkeypatch, tmp_path / 'new' / 'sub')
+	with pytest.raises(RuntimeError, match='^Listing error'):
+		hpcp_mod.build_entry_map(str(tmp_path / 'new'), max_workers=1)
+
+
+def test_build_entry_map_refuses_a_listing_whose_task_failed(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	"""The parallel listing records a crashed task and returns what it has: the same refusal."""
+	_write(tmp_path / 'new' / 'f.txt', 'f')
+	real = hpcp_mod.get_file_list
+	def partial(*args, **kwargs):
+		result = real(*args, **kwargs)
+		hpcp_mod.eprint('Listing error: a task crashed')
+		return result
+	monkeypatch.setattr(hpcp_mod, 'get_file_list', partial)
+	with pytest.raises(RuntimeError, match='^Listing error'):
+		hpcp_mod.build_entry_map(str(tmp_path / 'new'), max_workers=2, parallel_file_listing=True)
+
+
+def test_diff_with_an_unreadable_new_directory_writes_no_patch(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	"""Ultrareview: base/sub/f.txt exists, new/sub cannot be listed. A patch would delete sub/f.txt on apply."""
+	for side in ('new', 'base'):
+		_write(tmp_path / side / 'sub' / 'f.txt', 'f')
+	_fail_scandir_at(hpcp_mod, monkeypatch, tmp_path / 'new' / 'sub')
+	out = tmp_path / 'p.img'
+	assert hpcp_mod.hpcp([str(tmp_path / 'new')], dest_paths=[str(tmp_path / 'base')], get_diff_image=str(out),
+		max_workers=1, single_thread=True, batch=True) == 209
+	assert not out.exists()
