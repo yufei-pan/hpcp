@@ -385,3 +385,23 @@ def test_remove_extra_keeps_the_copy_of_an_excluded_source_path(tmp_path, hpcp_m
 	assert hpcp_mod.hpcp([str(src)], dest_paths=[backup], remove_extra=True, exclude=exclude, **opts) == 0
 	assert (tmp_path / 'backup' / 'src' / 'cache' / 'c.txt').read_text() == 'cached'
 	assert (tmp_path / 'backup' / 'src' / 'a.txt').read_text() == 'a'
+
+
+def test_remove_extra_keeps_link_targets_that_tracking_placed(tmp_path, hpcp_mod, reset_hpcp_globals, require_linux, monkeypatch):
+	"""A tracked target belongs to the copy: -rme must not delete it (it would come back on every run)."""
+	src = tmp_path / 's' / 'src'
+	src.mkdir(parents=True)
+	(tmp_path / 's' / 'other').mkdir()
+	(tmp_path / 's' / 'other' / 'x').write_text('x')
+	os.symlink('../other/x', str(src / 'lnk'))
+	dst = str(tmp_path / 'dst') + os.sep
+	os.makedirs(dst)
+	opts = dict(single_thread=True, batch=True, do_not_remove_files_while_listing=True)
+	assert hpcp_mod.hpcp([str(src)], dest_paths=[dst], **opts) == 0
+	assert (tmp_path / 'dst' / 'src' / 'lnk').read_text() == 'x'
+	(tmp_path / 'dst' / 'stale.txt').write_text('extra')
+	monkeypatch.setattr(sys.stdin, 'isatty', lambda: True)
+	monkeypatch.setattr('builtins.input', lambda: 'y')
+	assert hpcp_mod.hpcp([str(src)], dest_paths=[dst], remove_extra=True, **opts) == 0
+	assert (tmp_path / 'dst' / 'src' / 'lnk').read_text() == 'x'
+	assert not (tmp_path / 'dst' / 'stale.txt').exists()

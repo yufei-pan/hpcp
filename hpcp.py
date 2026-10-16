@@ -2268,9 +2268,12 @@ def get_mount_table():
 
 #%% -- Symbolic Links --
 def create_sym_links(symLinks,exclude=None,no_link_tracking=False):
+	"""Recreate symLinks ({src link: [dest paths]}). Returns, with link tracking, the destination paths of the relative
+	links' targets (copied now or already there): they belong to the copy, and -rme keeps them."""
 	global RANDOM_DESTINATION_SELECTION
+	tracked_targets = set()
 	if len(symLinks) == 0:
-		return
+		return tracked_targets
 	nestedSymLinks = {}
 	counter = 0
 	print(f"\nFound Symbolic Links:   {len(symLinks)}")
@@ -2324,6 +2327,8 @@ def create_sym_links(symLinks,exclude=None,no_link_tracking=False):
 					dests.remove(dest)
 				try:
 					os.symlink(linkedTargetFile, dest, target_is_directory=os.path.isdir(linkedTargetFile))
+					if not os.path.isabs(linkedTargetFile) and not no_link_tracking:
+						tracked_targets.add(os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(dest)), linkedTargetFile)))
 					break
 				except Exception:
 					eprint(f'Could not create symbolic link from {linkedTargetFile} to {dest}')
@@ -2360,7 +2365,8 @@ Skipping...""")
 	print(f"Time taken:             {endTime-start_time:0.4f} seconds")
 	if len(nestedSymLinks) > 0:
 		print(f"\nNested Symbolic Links:   {len(nestedSymLinks)}")
-		create_sym_links(nestedSymLinks,exclude=exclude,no_link_tracking=no_link_tracking)
+		tracked_targets |= create_sym_links(nestedSymLinks,exclude=exclude,no_link_tracking=no_link_tracking)
+	return tracked_targets
 
 #%% -- File list --
 def _natural_key(text):
@@ -8165,7 +8171,7 @@ def _expected_dest_paths(src_entries, src_paths, dests, dest_image=False):
 				break
 	return expected
 
-def remove_extra_files(total_file_list, dests,max_workers,verbose,files_per_job,single_thread=False,exclude=None,parallel_file_listing=False,src_paths=None,sym_links=None,dest_image=False):
+def remove_extra_files(total_file_list, dests,max_workers,verbose,files_per_job,single_thread=False,exclude=None,parallel_file_listing=False,src_paths=None,sym_links=None,dest_image=False,keep=()):
 		"""Remove files in ``dests`` that have no counterpart in ``total_file_list``.
 
 		``total_file_list`` may contain absolute src-side paths (as returned by
@@ -8178,7 +8184,9 @@ def remove_extra_files(total_file_list, dests,max_workers,verbose,files_per_job,
 		``sym_links`` is the ``{src_link: [dest_links]}`` mapping returned by
 		``process_copy``; its keys are added to the src side so legitimately
 		copied symlinks are not mistaken for extras. ``dest_image``: the copy used
-		the ``-di`` layout (see ``_src_to_dest_map``).
+		the ``-di`` layout (see ``_src_to_dest_map``). ``keep``: destination paths
+		(and everything below them) that are never extra: the link targets
+		create_sym_links tracked.
 		"""
 		print(f"Removing extra files from {dests} with {max_workers} workers")
 		src_entries = set(total_file_list) if total_file_list else set()
@@ -8198,7 +8206,8 @@ def remove_extra_files(total_file_list, dests,max_workers,verbose,files_per_job,
 				for path in actual - expected:
 					if path == dest_abs_root or path.startswith(dest_abs_root + os.path.sep):
 						# The copy of an excluded source path is not extra: it was left out, not deleted.
-						if not _excluded_at_source(path, mapping, exclude):
+						if not _excluded_at_source(path, mapping, exclude) and not any(
+								path == kept or path.startswith(kept.rstrip(os.sep) + os.sep) for kept in keep):
 							inDestNotInSrc.add(path)
 		else:
 			for dest in dests:
@@ -9301,7 +9310,7 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = multipr
 					print(f"Copied File: {file}")
 				for link in total_sym_links:
 					print(f"Link: {link} -> {total_sym_links[link]}")
-			create_sym_links(total_sym_links,exclude=exclude,no_link_tracking=no_link_tracking)
+			link_targets = create_sym_links(total_sym_links,exclude=exclude,no_link_tracking=no_link_tracking)
 			# A copy that reported errors is incomplete: removing the sources (a move) would lose what was not copied,
 			# and an unlisted source subtree would make its destination counterpart look extra.
 			copy_failures = [error for error in ERRORS[copy_error_start:] if _is_failure(error)]
@@ -9311,7 +9320,7 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = multipr
 			elif remove_extra:
 				print('-'*80)
 				remove_extra_files(total_file_list, dests,max_workers,verbose,files_per_job,single_thread,exclude=exclude,parallel_file_listing=parallel_file_listing,src_paths=src_paths,sym_links=total_sym_links,
-					dest_image=bool(dest_image))
+					dest_image=bool(dest_image),keep=link_targets)
 				print('-'*80)
 				print("Removing extra directories...")
 				remove_extra_dirs(src_paths, dests,exclude=exclude,dest_image=bool(dest_image))
