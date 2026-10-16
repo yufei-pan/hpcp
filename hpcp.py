@@ -2311,7 +2311,8 @@ def create_sym_links(symLinks,exclude=None,no_link_tracking=False):
 					if _excluded_or_below(sourceLinkedFile, exclude):
 						print(f"\n{pformat(sourceLinkedFile)}, linked by {pformat(src)}, is excluded: not copying it")
 					elif not os.path.exists(sourceLinkedFile):
-						eprint(f"\nFile {sourceLinkedFile} which is linked by {src} doesn't exist! \nSkipping copying original file...")
+						# A dangling link is copied as it is: a note, not an error (eprint would record any path with a ':').
+						print(f"\nFile {sourceLinkedFile} which is linked by {src} doesn't exist! \nSkipping copying original file...", file=sys.stderr)
 					else:
 						_, _ , rtnSymLinks , _ = copy_files_serial(sourceLinkedFile, destLinkedFiles,exclude=exclude)
 						nestedSymLinks.update(rtnSymLinks)
@@ -2331,9 +2332,10 @@ def create_sym_links(symLinks,exclude=None,no_link_tracking=False):
 						tracked_targets.add(os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(dest)), linkedTargetFile)))
 					break
 				except Exception:
-					eprint(f'Could not create symbolic link from {linkedTargetFile} to {dest}')
+					# Notes: only 'Failed to create symbolic link' below, when every destination failed, is the error.
+					print(f'Could not create symbolic link from {linkedTargetFile} to {dest}', file=sys.stderr)
 					if dests:
-						eprint("Trying next destination...")
+						print("Trying next destination...", file=sys.stderr)
 						dest = ''
 						continue
 					else:
@@ -3632,7 +3634,7 @@ def sync_directory_metadata(src_path, dest_paths):
 				if not (os.path.exists(dest_path) or os.path.ismount(dest_path)):
 					os.makedirs(dest_path, exist_ok=True)
 			except FileExistsError:
-				eprint(f"Destination path {dest_path} maybe a mounted dir, known issue with os.path.exists\nContinuing without creating dest folder...")
+				print(f"Destination path {dest_path} maybe a mounted dir, known issue with os.path.exists\nContinuing without creating dest folder...", file=sys.stderr)
 			# Sync the metadata
 			if not CONTENT_ONLY:
 				_remove_stale_xattrs(src_path, dest_path)
@@ -8052,12 +8054,15 @@ def remove_extra_dirs(src_paths, dests,exclude=None,dest_image=False):
 		if len(d) > 4096:
 			eprint(f'Destination path length error: {d} is too long')
 		elif exclude and is_excluded(d,exclude):
-			eprint(f'Destination path excluded: {d} is excluded')
+			# A note: an excluded destination is left alone, as asked.
+			print(f'Destination path excluded: {d} is excluded', file=sys.stderr)
 		else:
 			newDests.append(d)
+	too_long = any(len(d) > 4096 for d in dests)
 	dests = newDests
 	if not dests:
-		eprint(f'All destination paths are too long: Skipping {src_paths}')
+		if too_long:
+			eprint(f'All destination paths are too long: Skipping {src_paths}')
 		return 0, 0, set(), frozenset()
 	mapping = _src_to_dest_map(src_paths, dests, dest_image)
 	# leave out excluded source paths (a filtered copy: the caller's list is not touched)

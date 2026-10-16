@@ -423,3 +423,20 @@ def test_remove_extra_dirs_with_dest_image_follows_this_runs_sources(tmp_path, h
 	assert (mirrored_a / 'kept').is_dir()
 	assert not (mirrored_a / 'gone').exists()
 	assert not mirrored_b.exists()
+
+
+def test_move_with_a_dangling_link_whose_path_has_a_colon_goes_on(tmp_tree, hpcp_mod, reset_hpcp_globals, require_linux, copy_args):
+	"""A dangling relative link is copied as is; its note is not an error, even when the path holds ':' (rc 128)."""
+	tmp_tree.add_file('a.txt', 'a')
+	tmp_tree.add_symlink('at:12:00', 'missing:target')
+	srcs, opts = copy_args(remove_force=True)
+	assert hpcp_mod.hpcp(srcs, **opts) == 0
+	assert os.readlink(tmp_tree.dst / 'at:12:00') == 'missing:target'
+	assert not tmp_tree.src.exists()
+
+
+def test_excluded_destination_is_a_note_not_an_error(tmp_tree, hpcp_mod, reset_hpcp_globals):
+	tmp_tree.add_dir('extra', under='dst')
+	hpcp_mod.remove_extra_dirs([str(tmp_tree.src) + os.sep], [str(tmp_tree.dst)], exclude=hpcp_mod.format_exclude(['dst']))
+	assert hpcp_mod.ERRORS == []
+	assert (tmp_tree.dst / 'extra').is_dir()
