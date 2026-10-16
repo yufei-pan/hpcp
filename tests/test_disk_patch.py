@@ -3388,3 +3388,20 @@ def test_patch_error_has_its_own_return_code(hpcp_mod, reset_hpcp_globals):
 def test_unused_conflict_entry_point_is_gone(hpcp_mod):
 	"""Review D8: every apply resolves conflicts through _resolve_section_conflicts."""
 	assert not hasattr(hpcp_mod, '_resolve_conflicts')
+
+
+def test_preflight_refuses_a_payloadless_section_even_when_everything_is_already_done(tmp_path, hpcp_mod, reset_hpcp_globals):
+	"""Rows skipped as already done may still be restored after another section's delete (_restore_across_sections),
+	which needs the payload root too: a section with rows and no usable payload directory is refused outright."""
+	hpcp_mod.HASH_SIZE = 65536
+	target = tmp_path / 'target'
+	(target / 'newdir').mkdir(parents=True)
+	(tmp_path / 'outside').mkdir()
+	volume = tmp_path / 'vol'
+	volume.mkdir()
+	os.symlink(str(tmp_path / 'outside'), str(volume / 'part1'))
+	rows = [hpcp_mod.ChangeRow('A', 'newdir/', '-', hpcp_mod.get_entry_state(str(target / 'newdir')))]
+	plan = hpcp_mod._plan_section('part1', rows, hpcp_mod._section_volume_roots([str(volume)], 'part1'), str(target), True, False, 1)
+	assert [check.action for check in plan.checks] == ['skip']
+	with pytest.raises(RuntimeError, match=r'^Incomplete patch: .*part1.*nothing applied'):
+		hpcp_mod._preflight_section(plan)

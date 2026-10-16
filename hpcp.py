@@ -5920,8 +5920,9 @@ def _resolve_section_conflicts(plans, force, extra_lines=()):
 def _preflight_section(plan):
 	"""Refusals -fa cannot override, raised before anything changes."""
 	todo = _section_todo(plan)
-	if todo and not plan.volume_roots:
+	if plan.rows and not plan.volume_roots:
 		# The section's payload directory is a symlink on every volume (_section_volume_roots): a damaged or crafted patch.
+		# Refused even when every row is already done: a later restore (_restore_across_sections) needs the payload too.
 		raise RuntimeError(f'Incomplete patch: no usable payload directory for section {plan.name} (a symlink on every volume); nothing applied')
 	# Not forceable: the deletes would run and the writes be refused, leaving the patch half applied.
 	escaping = _rows_escaping_target(todo, plan.target_root)
