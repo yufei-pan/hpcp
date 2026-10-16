@@ -302,3 +302,9 @@ def test_compare_with_an_unhashed_list_reports_no_changes(tmp_tree, hpcp_mod, re
 	assert hpcp_mod.hpcp(src, target_file_list=listing, hash_size=0, single_thread=True) == 0
 	assert hpcp_mod.hpcp(src, target_file_list=listing, diff_file_list=diff, hash_size=0, single_thread=True) == 0
 	assert hpcp_mod.read_changes(diff) == []
+
+
+def test_unhashed_list_with_a_name_ending_in_a_colon_stays_unhashed(hpcp_mod):
+	"""Only a list whose every file and link line has a ':' (as -fl with hashes writes it) can be a -hs 0 list."""
+	lines = ['notes:', 'logs/12:30:00.txt', 'plain.txt', 'logs/']
+	assert hpcp_mod._parse_file_list_lines(lines) == {line: None for line in lines}
