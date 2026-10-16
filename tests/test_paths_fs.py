@@ -62,3 +62,20 @@ def test_source_validation_removes_all_missing_entries(tmp_path, hpcp_mod, reset
 			hpcp_mod.verify_src_path(paths)
 		assert paths == []
 	assert len(hpcp_mod.ERRORS) == 2
+
+
+def test_dest_glob_expands_as_one_pattern(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	"""Review C4: -d '/mnt/disk*' must expand the pattern, not glob each character ('/' and '*' in cwd)."""
+	for name in ('disk1', 'disk2', 'other'):
+		(tmp_path / name).mkdir()
+	monkeypatch.chdir(tmp_path / 'other')
+	src = [str(tmp_path / 'src') + os.sep]
+	(tmp_path / 'src').mkdir()
+	dests, _, _ = hpcp_mod.get_dests([str(tmp_path / 'disk*') + os.sep], None, [], [], list(src), list(src))
+	assert sorted(dests) == [str(tmp_path / 'disk1') + os.sep, str(tmp_path / 'disk2') + os.sep]
+
+
+def test_expand_paths_takes_a_single_pattern_string(tmp_tree, hpcp_mod, reset_hpcp_globals, require_linux):
+	tmp_tree.add_file('a.txt', 'a')
+	pattern = str(tmp_tree.src / '*.txt')
+	assert hpcp_mod.expand_paths(pattern) == hpcp_mod.expand_paths([pattern]) == [str(tmp_tree.src / 'a.txt')]

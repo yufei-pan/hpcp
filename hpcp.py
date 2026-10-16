@@ -702,11 +702,13 @@ def expand_paths(paths):
 	Expand a list of paths with glob patterns.
 
 	Args:
-		paths (list): The list of paths to expand.
+		paths (list): The list of paths to expand (a single str is one pattern, not a list of characters).
 
 	Returns:
 		list: The list of expanded paths.
 	"""
+	if isinstance(paths, str):
+		paths = [paths]
 	output_list = []
 	for src_pattern in paths:
 		src_pattern = os.path.expanduser(src_pattern)
@@ -8465,7 +8467,8 @@ def get_dests(dest_paths,dest_image,mount_points: list,loop_devices: list,src_pa
 	if dest_paths:
 		for dest in dest_paths:
 			if '*' in dest or '?' in dest or '[' in dest:
-				expanded_dests = expand_paths(dest)
+				# One pattern: expand_paths takes a list (a bare str would be globbed per character, '/' included).
+				expanded_dests = expand_paths([dest])
 			else:
 				expanded_dests = [os.path.expanduser(dest)]
 			for path in expanded_dests:
