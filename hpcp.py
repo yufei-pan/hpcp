@@ -3589,6 +3589,10 @@ def sync_directory_metadata(src_path, dest_paths):
 	start_time = time.monotonic()
 	if os.path.islink(src_path):
 		return 0,time.monotonic()-start_time,{src_path: dest_paths}
+	if not os.path.lexists(src_path):
+		# A live tree: the directory went away after it was listed. The destination keeps what it has.
+		eprint(f'Directory sync error: {src_path} no longer exists')
+		return 1,time.monotonic()-start_time,frozenset()
 	if not os.path.isdir(src_path):
 		return copy_file(src_path, dest_paths)
 	# Create the directory if it does not exist

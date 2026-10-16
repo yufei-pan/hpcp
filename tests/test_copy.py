@@ -504,9 +504,9 @@ def test_dir_sync_records_a_source_directory_that_went_away(tmp_tree, hpcp_mod, 
 	src = str(tmp_tree.src)
 	tmp_tree.add_dir('d0')
 	folders = [os.path.join(src, 'vanished'), os.path.join(src, 'd0')]
-	monkeypatch.setattr(hpcp_mod.os.path, 'isdir', lambda path: True)
+	tmp_tree.add_dir('vanished', under='dst')  # synced on an earlier run
 	hpcp_mod.sync_directory_metadata_bulk(folders, [str(tmp_tree.dst)], src)
-	assert (tmp_tree.dst / 'd0').is_dir()
+	assert (tmp_tree.dst / 'd0').is_dir() and (tmp_tree.dst / 'vanished').is_dir()
 	assert [error.partition(':')[0] for error in hpcp_mod.ERRORS] == ['Directory sync error']
 
 
