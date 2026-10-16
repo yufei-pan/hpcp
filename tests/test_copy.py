@@ -508,3 +508,15 @@ def test_dir_sync_records_a_source_directory_that_went_away(tmp_tree, hpcp_mod, 
 	hpcp_mod.sync_directory_metadata_bulk(folders, [str(tmp_tree.dst)], src)
 	assert (tmp_tree.dst / 'd0').is_dir()
 	assert [error.partition(':')[0] for error in hpcp_mod.ERRORS] == ['Directory sync error']
+
+
+def test_identical_file_skip_ignores_chown_permission_error_without_privileges(tmp_tree, hpcp_mod, reset_hpcp_globals, require_linux, monkeypatch):
+	"""As cp -a and the directory sync: a non-root re-run over unchanged files cannot keep another user's ownership."""
+	src, dst = _identical_files(tmp_tree)
+	hpcp_mod.HASH_SIZE = 65536
+	def chown(*args, **kwargs):
+		raise PermissionError(1, 'Operation not permitted')
+	monkeypatch.setattr(hpcp_mod.os, 'chown', chown)
+	monkeypatch.setattr(hpcp_mod.os, 'geteuid', lambda: 1000)
+	assert hpcp_mod.copy_file(src, [dst])[0] == 0
+	assert hpcp_mod.ERRORS == []

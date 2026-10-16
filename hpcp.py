@@ -194,9 +194,9 @@ except ImportError:
 	hasher = hashlib.blake2b()
 	xxhash_available = False
 
-version = '9.72'
+version = '9.73'
 __version__ = version
-COMMIT_DATE = '2026-10-12'
+COMMIT_DATE = '2026-10-16'
 
 MAGIC_NUMBER = 1.61803398875
 RANDOM_DESTINATION_SELECTION = False
@@ -2935,7 +2935,12 @@ def copy_file(src_path, dest_paths, full_hash=False, verbose=False, concurrent_p
 					_remove_stale_xattrs(src_path, dest)
 					shutil.copystat(src_path, dest,follow_symlinks=False)
 					if os.name == 'posix':
-						os.chown(dest, st.st_uid, st.st_gid)
+						try:
+							os.chown(dest, st.st_uid, st.st_gid)
+						except PermissionError:
+							# As cp -a: without privileges another user's ownership cannot be kept.
+							if os.geteuid() == 0:
+								raise
 						#also copy the modes
 						os.chmod(dest, st.st_mode)
 					os.utime(dest, (st.st_atime, st.st_mtime),follow_symlinks=False)
