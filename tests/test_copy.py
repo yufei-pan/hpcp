@@ -656,3 +656,14 @@ def test_chown_like_cp_reports_the_ids_the_path_ends_up_with(hpcp_mod, monkeypat
 	monkeypatch.setattr(hpcp_mod.os, 'stat', lambda path: SimpleNamespace(
 		st_uid=1001 if now_uid_matches else 1000, st_gid=2002 if now_gid_matches else 1000))
 	assert hpcp_mod._chown_like_cp('/some/path', st) == (now_uid_matches, now_gid_matches)
+
+
+def test_symlinked_directory_note_prints_even_when_the_target_is_there(tmp_tree, hpcp_mod, reset_hpcp_globals, require_linux, capsys):
+	elsewhere = tmp_tree.root / 'elsewhere'
+	(elsewhere / 'deep').mkdir(parents=True)
+	(elsewhere / 't').write_text('t')
+	tmp_tree.add_symlink('sub', str(elsewhere / 'deep'))
+	link = tmp_tree.add_symlink('l', 'sub/../t')
+	os.symlink(str(elsewhere / 'deep'), str(tmp_tree.dst / 'sub'))
+	hpcp_mod.create_sym_links({link: [str(tmp_tree.dst / 'l')]})
+	assert 'goes through a symlinked directory' in capsys.readouterr().err

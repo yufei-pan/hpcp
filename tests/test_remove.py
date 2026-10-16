@@ -490,7 +490,7 @@ def test_remove_extra_dirs_keeps_tracked_link_target_directories(tmp_path, hpcp_
 	spool = image_root / os.path.relpath(str(live / 'shared' / 'spool'), '/')
 	spool.mkdir(parents=True)
 	(image_root / os.path.relpath(str(live / 'src'), '/')).mkdir(parents=True)
-	hpcp_mod.remove_extra_dirs([str(live / 'src')], [str(image_root) + os.sep], dest_image=True, keep={(str(spool.parent), str(live / 'shared'))})
+	hpcp_mod.remove_extra_dirs([str(live / 'src')], [str(image_root) + os.sep], dest_image=True, keep={(str(spool.parent), str(live / 'shared'), str(image_root / os.path.relpath(str(live / 'src' / 'l'), '/')))})
 	assert spool.is_dir()
 
 
@@ -552,3 +552,54 @@ def test_tracked_target_inside_another_sources_tree_is_kept(tmp_path, hpcp_mod, 
 	assert (dst / 'x' / 'l').read_text() == 'tracked from a'
 	assert _rme(hpcp_mod, monkeypatch, [str(a / 'x'), str(b / 'y')], [str(dst) + os.sep]) == 0
 	assert (dst / 'x' / 'l').read_text() == 'tracked from a'
+
+
+# ---- 9.73 fifth review ----
+
+def test_tracked_directory_holding_another_sources_copy_keeps_its_own_contents(tmp_path, hpcp_mod, reset_hpcp_globals, require_linux, monkeypatch):
+	"""-di, sources s/a and s/c/sub, link a/l -> ../c: img/s/c is tracked and holds sub's copy. Its other contents are
+	kept; sub's copy is still judged as sub's (a stale file there goes)."""
+	s = tmp_path / 's'
+	(s / 'a').mkdir(parents=True)
+	(s / 'c' / 'sub').mkdir(parents=True)
+	(s / 'c' / 'other').write_text('tracked content')
+	(s / 'c' / 'sub' / 'f').write_text('f')
+	os.symlink('../c', str(s / 'a' / 'l'))
+	mnt = str(tmp_path / 'mnt') + os.sep
+	os.makedirs(mnt)
+	srcs = [str(s / 'a'), str(s / 'c' / 'sub')]
+	files, links = hpcp_mod.process_copy(srcs, [mnt], single_thread=True, max_workers=1, dest_image='stand-in.img', batch=True)
+	keep = hpcp_mod.create_sym_links(links)
+	image_c = tmp_path / 'mnt' / os.path.relpath(str(s / 'c'), '/')
+	# img/s/c exists (sub's parent), so tracking found its target there; other is from an earlier run.
+	(image_c / 'other').write_text('tracked content')
+	(image_c / 'sub' / 'stale').write_text('stale')
+	monkeypatch.setattr(sys.stdin, 'isatty', lambda: True)
+	monkeypatch.setattr('builtins.input', lambda: 'y')
+	hpcp_mod.remove_extra_files(files, [mnt], 1, False, 1, single_thread=True, src_paths=srcs, sym_links=links, dest_image=True, keep=keep)
+	assert (image_c / 'other').read_text() == 'tracked content'
+	assert not (image_c / 'sub' / 'stale').exists()
+
+
+def test_exclude_above_the_source_root_does_not_stop_link_tracking(tmp_path, hpcp_mod, reset_hpcp_globals, require_linux):
+	"""Source /srv/tmp/proj with -e tmp: the copy runs (the listing never tests above its root), and so does tracking."""
+	srv = tmp_path / 'srv' / 'tmp'
+	(srv / 'proj').mkdir(parents=True)
+	(srv / 'shared').mkdir()
+	(srv / 'shared' / 'lib').write_text('lib')
+	os.symlink('../shared/lib', str(srv / 'proj' / 'l'))
+	dst = tmp_path / 'd'
+	dst.mkdir()
+	assert hpcp_mod.hpcp([str(srv / 'proj')], dest_paths=[str(dst) + os.sep], exclude=['tmp'], single_thread=True,
+		batch=True, do_not_remove_files_while_listing=True) == 0
+	assert (dst / 'proj' / 'l').read_text() == 'lib'
+
+
+def test_symlink_source_root_is_judged_as_the_link_it_is_copied_as(tmp_path, hpcp_mod, reset_hpcp_globals):
+	"""A source root that is a symlink is recreated as a link (no 'path/' listing): '*/cache/' does not exclude it."""
+	real = tmp_path / 'real'
+	real.mkdir()
+	root = tmp_path / 'cache'
+	os.symlink(str(real), str(root))
+	mapping = hpcp_mod._src_to_dest_map([str(root)], [str(tmp_path / 'd') + os.sep])
+	assert not hpcp_mod._excluded_at_source(str(tmp_path / 'd' / 'cache'), mapping, hpcp_mod.format_exclude(['cache/']))
