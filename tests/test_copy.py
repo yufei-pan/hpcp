@@ -550,11 +550,13 @@ def test_non_root_ownership_falls_back_to_the_group_like_cp(tmp_tree, hpcp_mod, 
 	assert hpcp_mod.ERRORS == []
 
 
+@pytest.mark.skipif(os.name == 'nt' or os.geteuid() != 0, reason='needs root to give the destination another owner')
 @pytest.mark.parametrize('group_allowed, expected', [(True, 0o2755), (False, 0o755)])
 def test_non_root_skip_drops_setid_bits_it_cannot_keep_the_ids_for(tmp_tree, hpcp_mod, reset_hpcp_globals, require_linux, monkeypatch, group_allowed, expected):
 	"""As cp -a: a set-user-ID file whose owner could not be kept must not become a setuid file of the copier."""
 	src, dst = _identical_files(tmp_tree)
 	os.chmod(src, 0o6755)
+	os.chown(dst, os.stat(src).st_uid + 1, os.stat(src).st_gid + 1)  # the copier's file
 	hpcp_mod.HASH_SIZE = 65536
 	real_chown = os.chown
 	def chown(path, uid, gid, **kwargs):
@@ -597,3 +599,35 @@ def test_link_through_a_symlinked_directory_and_dotdot_is_not_tracked(tmp_tree, 
 	assert tracked == set()
 	assert os.readlink(tmp_tree.dst / 'l') == 'sub/../t'
 	assert not (tmp_tree.dst / 't').exists()
+
+
+def _refuse_chown(hpcp_mod, monkeypatch):
+	def chown(path, uid, gid, **kwargs):
+		raise PermissionError(1, 'Operation not permitted')
+	monkeypatch.setattr(hpcp_mod.os, 'chown', chown)
+	monkeypatch.setattr(hpcp_mod.os, 'geteuid', lambda: 1000)
+
+
+@pytest.mark.skipif(os.name == 'nt' or os.geteuid() != 0, reason='needs root to give the destination another group')
+def test_setuid_survives_when_only_the_group_could_not_be_kept(tmp_tree, hpcp_mod, reset_hpcp_globals, require_linux, monkeypatch):
+	"""The destination already has the source's owner; only the group change fails: the owner was kept, so is setuid."""
+	src, dst = _identical_files(tmp_tree)
+	os.chmod(src, 0o6755)
+	os.chown(dst, os.stat(src).st_uid, os.stat(src).st_gid + 1)
+	hpcp_mod.HASH_SIZE = 65536
+	_refuse_chown(hpcp_mod, monkeypatch)
+	hpcp_mod.copy_file(src, [dst])
+	assert stat.S_IMODE(os.stat(dst).st_mode) == 0o4755
+	assert hpcp_mod.ERRORS == []
+
+
+@pytest.mark.skipif(os.name == 'nt' or os.geteuid() != 0, reason='needs root to give the destination another group')
+def test_dir_sync_drops_setgid_for_a_group_it_could_not_keep(tmp_tree, hpcp_mod, reset_hpcp_globals, require_linux, monkeypatch):
+	src = tmp_tree.add_dir('shared')
+	os.chmod(src, 0o2775)
+	dest = tmp_tree.add_dir('shared', under='dst')
+	os.chown(dest, os.stat(src).st_uid, os.stat(src).st_gid + 1)
+	_refuse_chown(hpcp_mod, monkeypatch)
+	hpcp_mod.sync_directory_metadata(src, [dest])
+	assert stat.S_IMODE(os.stat(dest).st_mode) == 0o775
+	assert hpcp_mod.ERRORS == []

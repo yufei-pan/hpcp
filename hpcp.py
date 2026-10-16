@@ -2946,7 +2946,7 @@ def delete_files_parallel(paths, max_workers, verbose=False,files_per_job=1,excl
 def _chown_like_cp(path, st):
 	"""Give path st's owner and group, as cp -a does: without privileges another user's ownership cannot be kept,
 	so keep at least the group (one the user belongs to) and treat the rest as no error. Root failures raise.
-	Returns (owner kept, group kept)."""
+	Returns (owner kept, group kept), as path has them now (it may have had the right owner already)."""
 	try:
 		os.chown(path, st.st_uid, st.st_gid)
 		return True, True
@@ -2955,9 +2955,10 @@ def _chown_like_cp(path, st):
 			raise
 		try:
 			os.chown(path, -1, st.st_gid)
-			return False, True
 		except PermissionError:
-			return False, False
+			pass
+	now = os.stat(path)
+	return now.st_uid == st.st_uid, now.st_gid == st.st_gid
 
 def copy_file(src_path, dest_paths, full_hash=False, verbose=False, concurrent_processes=0):
 	"""
@@ -3651,7 +3652,11 @@ def sync_directory_metadata(src_path, dest_paths):
 				_remove_stale_xattrs(src_path, dest_path)
 				shutil.copystat(src_path, dest_path)
 				if os.name == 'posix':
-					_chown_like_cp(dest_path, st)
+					owner_kept, group_kept = _chown_like_cp(dest_path, st)
+					# copystat set the mode before the chown: no set-user-ID / set-group-ID bit for an owner / group not kept.
+					lost = (0 if owner_kept else stat.S_ISUID) | (0 if group_kept else stat.S_ISGID)
+					if st.st_mode & lost:
+						os.chmod(dest_path, stat.S_IMODE(st.st_mode) & ~lost)
 				os.utime(dest_path, (st.st_atime, st.st_mtime))
 		except OSError as e:
 			eprint(f'Directory sync error: {src_path} to {dest_path}: {e}')

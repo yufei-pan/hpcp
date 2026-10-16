@@ -26,7 +26,7 @@ By default, **hpcp** only checks:
 
 Although in most cases these checks should confirm that both files are identical, in certain scenarios (like bit rot), corrupted files might not be detected. If you need to verify file integrity rather than perform a quick sync, it is recommended to use the `-fh --full_hash` option.
 
-A file or directory that cannot be read, listed or written is reported and the rest of the copy goes on; hpcp then exits with a non-zero code (`Copy failed` 190, `Directory sync error` 193, `Listing error` 209, ...). As with `cp -a`, a non-root copy keeps the group when the user belongs to it but cannot keep another user's ownership, and then does not keep a file's set-user-ID / set-group-ID bit when it could not keep its owner / group.
+A file or directory that cannot be read, listed or written is reported and the rest of the copy goes on; hpcp then exits with a non-zero code (`Copy failed` 190, `Directory sync error` 193, `Listing error` 209, ...). As with `cp -a`, a non-root copy keeps the group when the user belongs to it but cannot keep another user's ownership, and then does not keep a set-user-ID / set-group-ID bit (on files or directories) for an owner / group it could not keep.
 
 Symlinks are recreated as symlinks. Without `-nlt --no_link_tracking`, a relative symlink whose target is missing at the destination (it points outside the copied tree, say `../shared/lib`) gets its target copied to the same relative place, which can be outside the destination directory, so the link resolves there too. With several destinations a relative link goes to the destination that holds its target. A link whose path is taken by a real file or directory in the destination is not created and is reported.
 
