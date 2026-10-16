@@ -2269,7 +2269,8 @@ def get_mount_table():
 #%% -- Symbolic Links --
 def create_sym_links(symLinks,exclude=None,no_link_tracking=False):
 	"""Recreate symLinks ({src link: [dest paths]}). Returns, with link tracking, the destination paths of the relative
-	links' targets (copied now or already there): they belong to the copy, and -rme keeps them."""
+	links' targets that exist at the source (copied now or already there): they belong to the copy, and -rme keeps the
+	ones outside the copied trees (see _kept_paths)."""
 	global RANDOM_DESTINATION_SELECTION
 	tracked_targets = set()
 	if len(symLinks) == 0:
@@ -2301,24 +2302,32 @@ def create_sym_links(symLinks,exclude=None,no_link_tracking=False):
 			# Determine if the link is a absolute link or relative link
 			linkedTargetFile = os.readlink(src)
 			dest = ''
+			# Tracked: link tracking is on and the link's target exists at the source, so it belongs to the copy.
+			tracked = False
 			if not os.path.isabs(linkedTargetFile):
 				# Files are spread over the dests: a relative link goes where its target is, so that it resolves.
 				destLinkedFiles = [os.path.join(os.path.dirname(d), linkedTargetFile) for d in dests]
 				dest = next((d for d, destLinkedFile in zip(dests, destLinkedFiles) if os.path.exists(destLinkedFile)), '')
-				if not dest and not no_link_tracking:
-					# Normalized ('..' resolved), so the tracked tree is listed by the paths -e patterns name.
-					sourceLinkedFile = os.path.normpath(os.path.join(os.path.dirname(src), linkedTargetFile))
-					destLinkedFiles = [os.path.normpath(destLinkedFile) for destLinkedFile in destLinkedFiles]
-					# we also copy the pointed file if the file doesn't exist
-					if _excluded_or_below(sourceLinkedFile, exclude):
+				if not no_link_tracking:
+					# The target by the link's own spelling with '..' resolved, so -e patterns match it and the tracked tree;
+					# used only when the kernel resolves the link to that same file (no '..' after a symlinked directory).
+					linked = os.path.join(os.path.dirname(src), linkedTargetFile)
+					sourceLinkedFile = os.path.normpath(linked)
+					if os.path.realpath(sourceLinkedFile) != os.path.realpath(linked):
+						print(f"\n{pformat(src)} -> {pformat(linkedTargetFile)} goes through a symlinked directory: its target is not tracked", file=sys.stderr)
+					elif _excluded_or_below(sourceLinkedFile, exclude):
 						print(f"\n{pformat(sourceLinkedFile)}, linked by {pformat(src)}, is excluded: not copying it")
 					elif not os.path.exists(sourceLinkedFile):
 						# A dangling link is copied as it is: a note, not an error (eprint would record any path with a ':').
 						print(f"\nFile {sourceLinkedFile} which is linked by {src} doesn't exist! \nSkipping copying original file...", file=sys.stderr)
 					else:
-						_, _ , rtnSymLinks , _ = copy_files_serial(sourceLinkedFile, destLinkedFiles,exclude=exclude)
-						nestedSymLinks.update(rtnSymLinks)
-						dest = next((d for d, destLinkedFile in zip(dests, destLinkedFiles) if os.path.lexists(destLinkedFile)), '')
+						tracked = True
+						if not dest:
+							# we also copy the pointed file if the file doesn't exist
+							destLinkedFiles = [os.path.normpath(destLinkedFile) for destLinkedFile in destLinkedFiles]
+							_, _ , rtnSymLinks , _ = copy_files_serial(sourceLinkedFile, destLinkedFiles,exclude=exclude)
+							nestedSymLinks.update(rtnSymLinks)
+							dest = next((d for d, destLinkedFile in zip(dests, destLinkedFiles) if os.path.lexists(destLinkedFile)), '')
 			while dests:
 				if not dest:
 					if RANDOM_DESTINATION_SELECTION:
@@ -2330,7 +2339,7 @@ def create_sym_links(symLinks,exclude=None,no_link_tracking=False):
 					dests.remove(dest)
 				try:
 					os.symlink(linkedTargetFile, dest, target_is_directory=os.path.isdir(linkedTargetFile))
-					if not os.path.isabs(linkedTargetFile) and not no_link_tracking:
+					if tracked:
 						tracked_targets.add(os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(dest)), linkedTargetFile)))
 					break
 				except Exception:
@@ -8036,15 +8045,16 @@ def apply_disk_patch(volume_roots, target, mount_points, loop_devices, force=Fal
 	return summary
 
 #%% ---- Remove Extra ----
-def remove_extra_dirs(src_paths, dests,exclude=None,dest_image=False):
+def remove_extra_dirs(src_paths, dests,exclude=None,dest_image=False,keep=()):
 	"""
 	Removes extra directories in destination that are not present in the source paths.
 
 	A destination directory is kept when its source counterpart exists: dirname(src) + its path below dest, or with
 	dest_image (process_copy's -di layout: each source at dest + its absolute path) when '/' + its path below dest is
 	a source, a parent of one, or below one and still there.
-	Excluded directories and mount points, with everything below them, are left alone, and so are symlinks; a
-	directory that still holds entries (excluded files, say) is kept.
+	Excluded directories and mount points, with everything below them, are left alone, and so are symlinks and the
+	link targets create_sym_links tracked (keep, see _kept_paths); a directory that still holds entries (excluded
+	files, say) is kept.
 
 	:param src_paths: list of source paths
 	:param dest: destination path
@@ -8067,6 +8077,7 @@ def remove_extra_dirs(src_paths, dests,exclude=None,dest_image=False):
 			eprint(f'All destination paths are too long: Skipping {src_paths}')
 		return 0, 0, set(), frozenset()
 	mapping = _src_to_dest_map(src_paths, dests, dest_image)
+	kept = _kept_paths(keep, mapping)
 	# leave out excluded source paths (a filtered copy: the caller's list is not touched)
 	src_paths = [src_path for src_path in src_paths if not (exclude and is_excluded(src_path,exclude))]
 	source_roots = [os.path.abspath(src_path) for src_path in src_paths]
@@ -8078,7 +8089,8 @@ def remove_extra_dirs(src_paths, dests,exclude=None,dest_image=False):
 			for dirname in dirnames:
 				# No trailing separator: excludes match a directory as the listing does ('*/cache').
 				dest_dir_path = os.path.join(dirpath, dirname)
-				if exclude and (is_excluded(dest_dir_path,exclude) or _excluded_at_source(os.path.abspath(dest_dir_path), mapping, exclude)):
+				# The walk already pruned excluded parents: only the directory's own source path is left to check.
+				if exclude and (is_excluded(dest_dir_path,exclude) or _excluded_at_source(os.path.abspath(dest_dir_path), mapping, exclude, parents_checked=True)):
 					print(f"Skipping excluded directory: {dest_dir_path}")
 					continue
 				if os.path.islink(dest_dir_path):
@@ -8098,7 +8110,7 @@ def remove_extra_dirs(src_paths, dests,exclude=None,dest_image=False):
 						or (live_path.startswith(source.rstrip(os.sep) + os.sep) and os.path.exists(live_path)) for source in source_roots)
 				else:
 					in_source = any(os.path.exists(os.path.join(os.path.dirname(src_path), relative_path)) for src_path in src_paths)
-				if not in_source:
+				if not in_source and not _is_kept(os.path.abspath(dest_dir_path), kept, os.path.abspath(dest)):
 					print(f"Deleting extra directory: {dest_dir_path}")
 					extraDirs.add(dest_dir_path)
 			# Excluded trees and other filesystems are never walked into.
@@ -8146,10 +8158,11 @@ def _src_to_dest_map(src_paths, dests, dest_image=False):
 	mapping.sort(key=lambda item: len(item[0]), reverse=True)
 	return mapping
 
-def _excluded_at_source(dest_path, mapping, exclude):
-	"""True when dest_path is the copy of a source path that exclude leaves out (that path, or a directory above it
-	up to its source root). -e names source paths: an absolute pattern never matches the destination side itself.
-	mapping: _src_to_dest_map's result."""
+def _excluded_at_source(dest_path, mapping, exclude, parents_checked=False):
+	"""True when dest_path is the copy of a source path that exclude leaves out: that path, or a directory above it
+	below its source root (parents_checked: the caller already pruned those). -e names source paths: an absolute
+	pattern never matches the destination side itself. A source directory root is listed as 'path/', which a
+	pattern such as '*/cache' never matches, so it is not checked either. mapping: _src_to_dest_map's result."""
 	if not exclude:
 		return False
 	for src_abs, actual_dests in mapping:
@@ -8157,21 +8170,46 @@ def _excluded_at_source(dest_path, mapping, exclude):
 			if dest_path != actual_dest and not dest_path.startswith(actual_dest.rstrip(os.sep) + os.sep):
 				continue
 			source = os.path.normpath(os.path.join(src_abs, os.path.relpath(dest_path, actual_dest)))
-			while True:
+			if source == src_abs:
+				if not os.path.isdir(src_abs) and is_excluded(source, exclude):
+					return True
+				continue
+			while source != src_abs:
 				if is_excluded(source, exclude):
 					return True
-				parent = os.path.dirname(source)
-				if source == src_abs or parent == source:
+				if parents_checked:
 					break
-				source = parent
+				source = os.path.dirname(source)
 	return False
 
-def _expected_dest_paths(src_entries, src_paths, dests, dest_image=False):
-	"""Compute the set of absolute dest paths each src entry should occupy (dest_image: see _src_to_dest_map)."""
+def _kept_paths(keep, mapping):
+	"""The link targets (create_sym_links) -rme must keep: the ones outside the copied trees. A target inside them is
+	the copy of a source path like any other and is judged as one."""
+	return {os.path.abspath(path) for path in keep
+		if not any(os.path.abspath(path) == actual_dest or os.path.abspath(path).startswith(actual_dest.rstrip(os.sep) + os.sep)
+			for _, actual_dests in mapping for actual_dest in actual_dests)}
+
+def _is_kept(path, kept, root):
+	"""True when path, or a directory above it up to root, is one of the kept paths (_kept_paths)."""
+	if not kept:
+		return False
+	root = root.rstrip(os.sep) or os.sep
+	while True:
+		if path in kept:
+			return True
+		parent = os.path.dirname(path)
+		if path == root or parent == path:
+			return False
+		path = parent
+
+def _expected_dest_paths(src_entries, src_paths, dests, dest_image=False, mapping=None):
+	"""Compute the set of absolute dest paths each src entry should occupy (dest_image: see _src_to_dest_map;
+	mapping: its result, when the caller has it)."""
 	expected = set()
 	if not src_entries:
 		return expected
-	mapping = _src_to_dest_map(src_paths, dests, dest_image)
+	if mapping is None:
+		mapping = _src_to_dest_map(src_paths, dests, dest_image)
 	for entry in src_entries:
 		if not entry or not os.path.isabs(entry):
 			continue
@@ -8202,7 +8240,7 @@ def remove_extra_files(total_file_list, dests,max_workers,verbose,files_per_job,
 		copied symlinks are not mistaken for extras. ``dest_image``: the copy used
 		the ``-di`` layout (see ``_src_to_dest_map``). ``keep``: destination paths
 		(and everything below them) that are never extra: the link targets
-		create_sym_links tracked.
+		create_sym_links tracked (see _kept_paths).
 		"""
 		print(f"Removing extra files from {dests} with {max_workers} workers")
 		src_entries = set(total_file_list) if total_file_list else set()
@@ -8210,8 +8248,9 @@ def remove_extra_files(total_file_list, dests,max_workers,verbose,files_per_job,
 			src_entries.update(sym_links.keys() if hasattr(sym_links, 'keys') else sym_links)
 		inDestNotInSrc = set()
 		if src_paths:
-			expected = _expected_dest_paths(src_entries, src_paths, dests, dest_image)
 			mapping = _src_to_dest_map(src_paths, dests, dest_image)
+			expected = _expected_dest_paths(src_entries, src_paths, dests, dest_image, mapping)
+			kept = _kept_paths(keep, mapping)
 			for dest in dests:
 				dest_file_list, links, _, _ = get_file_list(dest, max_workers=max_workers, exclude=exclude, parallel_file_listing=parallel_file_listing)
 				dest_abs_root = os.path.abspath(dest)
@@ -8222,8 +8261,7 @@ def remove_extra_files(total_file_list, dests,max_workers,verbose,files_per_job,
 				for path in actual - expected:
 					if path == dest_abs_root or path.startswith(dest_abs_root + os.path.sep):
 						# The copy of an excluded source path is not extra: it was left out, not deleted.
-						if not _excluded_at_source(path, mapping, exclude) and not any(
-								path == kept or path.startswith(kept.rstrip(os.sep) + os.sep) for kept in keep):
+						if not _excluded_at_source(path, mapping, exclude) and not _is_kept(path, kept, dest_abs_root):
 							inDestNotInSrc.add(path)
 		else:
 			for dest in dests:
@@ -9339,7 +9377,7 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = multipr
 					dest_image=bool(dest_image),keep=link_targets)
 				print('-'*80)
 				print("Removing extra directories...")
-				remove_extra_dirs(src_paths, dests,exclude=exclude,dest_image=bool(dest_image))
+				remove_extra_dirs(src_paths, dests,exclude=exclude,dest_image=bool(dest_image),keep=link_targets)
 			print('-'*80)
 			if len(src_paths) > 1:
 				print("Overall Summary:")

@@ -440,3 +440,55 @@ def test_excluded_destination_is_a_note_not_an_error(tmp_tree, hpcp_mod, reset_h
 	hpcp_mod.remove_extra_dirs([str(tmp_tree.src) + os.sep], [str(tmp_tree.dst)], exclude=hpcp_mod.format_exclude(['dst']))
 	assert hpcp_mod.ERRORS == []
 	assert (tmp_tree.dst / 'extra').is_dir()
+
+
+# ---- 9.73 third review: what -rme keeps ----
+
+def _rme(hpcp_mod, monkeypatch, srcs, dests, **kwargs):
+	monkeypatch.setattr(sys.stdin, 'isatty', lambda: True)
+	monkeypatch.setattr('builtins.input', lambda: 'y')
+	return hpcp_mod.hpcp(srcs, dest_paths=dests, remove_extra=True, single_thread=True, batch=True,
+		do_not_remove_files_while_listing=True, **kwargs)
+
+
+@pytest.mark.parametrize('target', ['.', '..', 'releases/v3'])
+def test_in_tree_directory_link_does_not_shield_its_subtree_from_remove_extra(tmp_tree, hpcp_mod, reset_hpcp_globals, require_linux, monkeypatch, target):
+	"""usr/bin/X11 -> . (or current -> releases/v3): the target is part of the copy anyway, not a tracked extra."""
+	tmp_tree.add_file('sub/releases/v3/keep.txt', 'keep')
+	tmp_tree.add_symlink('sub/link', target)
+	stale = tmp_tree.add_file('sub/releases/v3/stale.txt', 'stale', under='dst')
+	assert _rme(hpcp_mod, monkeypatch, [str(tmp_tree.src) + os.sep], [str(tmp_tree.dst) + os.sep]) == 0
+	assert not os.path.exists(stale)
+	assert (tmp_tree.dst / 'sub' / 'releases' / 'v3' / 'keep.txt').exists()
+
+
+def test_dangling_link_does_not_shield_a_stale_file_from_remove_extra(tmp_tree, hpcp_mod, reset_hpcp_globals, require_linux, monkeypatch):
+	tmp_tree.add_symlink('dangle', 'gone.txt')
+	stale = tmp_tree.add_file('gone.txt', 'deleted at the source', under='dst')
+	assert _rme(hpcp_mod, monkeypatch, [str(tmp_tree.src) + os.sep], [str(tmp_tree.dst) + os.sep]) == 0
+	assert not os.path.exists(stale)
+
+
+def test_exclude_matching_the_source_root_name_does_not_shield_the_whole_destination(tmp_path, hpcp_mod, reset_hpcp_globals, require_linux, monkeypatch):
+	"""hpcp /home/u/cache/ /backup/ -rme -e cache: the copy runs (the root is listed as 'cache/'); so must -rme."""
+	src = tmp_path / 'u' / 'cache'
+	src.mkdir(parents=True)
+	(src / 'a.txt').write_text('a')
+	dst = tmp_path / 'backup'
+	dst.mkdir()
+	(dst / 'stale.txt').write_text('stale')
+	assert _rme(hpcp_mod, monkeypatch, [str(src) + os.sep], [str(dst) + os.sep], exclude=['cache']) == 0
+	assert (dst / 'a.txt').read_text() == 'a'
+	assert not (dst / 'stale.txt').exists()
+
+
+def test_remove_extra_dirs_keeps_tracked_link_target_directories(tmp_path, hpcp_mod, reset_hpcp_globals):
+	"""-di: an empty directory that link tracking placed outside this run's sources is kept like tracked files."""
+	live = tmp_path / 'live'
+	(live / 'src').mkdir(parents=True)
+	image_root = tmp_path / 'mnt'
+	spool = image_root / os.path.relpath(str(live / 'shared' / 'spool'), '/')
+	spool.mkdir(parents=True)
+	(image_root / os.path.relpath(str(live / 'src'), '/')).mkdir(parents=True)
+	hpcp_mod.remove_extra_dirs([str(live / 'src')], [str(image_root) + os.sep], dest_image=True, keep={str(spool.parent)})
+	assert spool.is_dir()
