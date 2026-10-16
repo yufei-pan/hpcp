@@ -775,7 +775,8 @@ def test_listed_file_that_became_a_directory_is_left(tmp_path, hpcp_mod, reset_h
 	(tmp_path / 'was-a-file').mkdir()
 	(tmp_path / 'was-a-file' / 'inside.txt').write_text('new')
 	(tmp_path / 'f.txt').write_text('f')
-	hpcp_mod._remove_listed_files([(str(tmp_path), 'was-a-file'), (str(tmp_path), 'f.txt'), (str(tmp_path), 'gone.txt')])
+	root_id = hpcp_mod._path_identity(str(tmp_path))
+	hpcp_mod._remove_listed_files([(str(tmp_path), root_id, rel) for rel in ('was-a-file', 'f.txt', 'gone.txt')])
 	assert (tmp_path / 'was-a-file' / 'inside.txt').read_text() == 'new'
 	assert not (tmp_path / 'f.txt').exists()
 	assert hpcp_mod.ERRORS == []
@@ -798,9 +799,10 @@ def test_move_never_removes_through_a_directory_swapped_for_a_symlink(tmp_path, 
 	victim.mkdir()
 	(victim / 'passwd').write_text('not yours')
 	(victim / 'empty').mkdir()
+	root_id = hpcp_mod._path_identity(str(src))
 	_swap_for_a_symlink(src / 'sub', victim)
-	hpcp_mod._remove_listed_files([(str(src), os.path.join('sub', 'passwd'))])
-	hpcp_mod._rmdir_below(str(src), os.path.join('sub', 'empty'))
+	hpcp_mod._remove_listed_files([(str(src), root_id, os.path.join('sub', 'passwd'))])
+	hpcp_mod._rmdir_below(str(src), root_id, os.path.join('sub', 'empty'))
 	assert (victim / 'passwd').read_text() == 'not yours'
 	assert (victim / 'empty').is_dir()
 	assert os.path.islink(src / 'sub')
@@ -822,3 +824,62 @@ def test_move_whose_source_directory_is_swapped_during_the_copy_removes_nothing_
 	hpcp_mod.hpcp(srcs, **opts)
 	assert (victim / 'f.txt').read_text() == 'not yours'
 	assert (victim / 'empty').is_dir()
+
+
+
+@pytest.mark.parametrize('swap', ['symlink', 'directory'])
+def test_move_never_removes_through_a_source_root_replaced_since_the_copy(tmp_path, hpcp_mod, reset_hpcp_globals, swap):
+	"""Security review: the root itself was opened by path for every removal. A user who can write its parent renames it
+	away and leaves a symlink (or another directory) there: nothing below the replaced root is removed."""
+	src, victim = tmp_path / 'src', tmp_path / 'victim'
+	src.mkdir()
+	(src / 'f.txt').write_text('listed')
+	(src / 'empty').mkdir()
+	victim.mkdir()
+	(victim / 'f.txt').write_text('not yours')
+	(victim / 'empty').mkdir()
+	root_id = hpcp_mod._path_identity(str(src))
+	os.rename(str(src), str(tmp_path / 'moved-away'))
+	if swap == 'symlink':
+		os.symlink(str(victim), str(src))
+	else:
+		os.rename(str(victim), str(src))
+		victim = src
+	hpcp_mod._remove_listed_files([(str(src), root_id, 'f.txt')])
+	hpcp_mod._rmdir_below(str(src), root_id, 'empty')
+	assert (victim / 'f.txt').read_text() == 'not yours'
+	assert (victim / 'empty').is_dir()
+	assert (tmp_path / 'moved-away' / 'f.txt').read_text() == 'listed'
+
+
+def test_move_of_nested_sources_never_removes_through_the_inner_one_swapped(tmp_tree, hpcp_mod, reset_hpcp_globals, require_linux, monkeypatch):
+	"""Sources src and src/sub: sub swapped for a symlink during the copy is stopped like any directory below src."""
+	victim = tmp_tree.root / 'victim'
+	victim.mkdir()
+	(victim / 'f.txt').write_text('not yours')
+	tmp_tree.add_file('a.txt', 'a')
+	tmp_tree.add_file('sub/f.txt', 'listed')
+	real = hpcp_mod.create_sym_links
+	def create_sym_links(*args, **kwargs):
+		_swap_for_a_symlink(tmp_tree.src / 'sub', victim)
+		return real(*args, **kwargs)
+	monkeypatch.setattr(hpcp_mod, 'create_sym_links', create_sym_links)
+	hpcp_mod.hpcp([str(tmp_tree.src), str(tmp_tree.src / 'sub')], dest_paths=[str(tmp_tree.dst) + os.sep], remove_force=True,
+		single_thread=True, batch=True, do_not_remove_files_while_listing=True)
+	assert (victim / 'f.txt').read_text() == 'not yours'
+
+
+def test_move_of_a_source_root_replaced_during_the_copy_removes_nothing_from_the_new_one(tmp_tree, hpcp_mod, reset_hpcp_globals, require_linux, copy_args, monkeypatch):
+	tmp_tree.add_file('f.txt', 'listed')
+	victim = tmp_tree.root / 'victim'
+	victim.mkdir()
+	(victim / 'f.txt').write_text('not yours')
+	real = hpcp_mod.create_sym_links
+	def create_sym_links(*args, **kwargs):
+		os.rename(str(tmp_tree.src), str(tmp_tree.root / 'moved-away'))
+		os.symlink(str(victim), str(tmp_tree.src))
+		return real(*args, **kwargs)
+	monkeypatch.setattr(hpcp_mod, 'create_sym_links', create_sym_links)
+	srcs, opts = copy_args(remove_force=True)
+	hpcp_mod.hpcp(srcs, **opts)
+	assert (victim / 'f.txt').read_text() == 'not yours'
