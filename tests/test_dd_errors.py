@@ -55,3 +55,43 @@ def test_dd_propagates_partition_copy_status(
 		assert len(roots) == 4
 		assert (roots[1] / 'sub' / 'data.txt').read_text() == 'partition data'
 		assert (roots[3] / 'sub' / 'data.txt').read_text() == 'partition data'
+
+
+def test_dd_partition_copy_status_ignores_errors_recorded_before_it(
+	tmp_path, hpcp_mod, reset_hpcp_globals, require_linux, monkeypatch,
+):
+	"""Review C6: an error the outer -dd setup recorded (an NTFS UUID that cannot be set) must not make the first
+	partition's copy look failed; it stays in the run's result."""
+	roots = []
+	real_run = hpcp_mod.run_command_in_multicmd_with_path_check
+
+	def mount_dir():
+		path = tmp_path / ('mount' + str(len(roots)))
+		path.mkdir()
+		roots.append(path)
+		if len(roots) % 2 == 1:
+			(path / 'data.txt').write_text('partition data')
+		return str(path)
+
+	def run(command, **kwargs):
+		if command[0] == 'mount':
+			return []
+		return real_run(command, **kwargs)
+
+	def part_table(*args, **kwargs):
+		hpcp_mod.eprint('Cannot set fs uuid for ntfs: Skipping.')
+		return {'/dev/fake-source': {}, '1': {'size': 4096}, '2': {'size': 4096}}, [], None
+
+	monkeypatch.setattr(hpcp_mod, 'validate_dd_source_path', lambda *a, **k: '/dev/fake-source')
+	monkeypatch.setattr(hpcp_mod, 'create_dd_dest_part_table', part_table)
+	monkeypatch.setattr(hpcp_mod, 'get_partitions', lambda device: [device + '1', device + '2'])
+	monkeypatch.setattr(hpcp_mod.os, 'geteuid', lambda: 0)
+	monkeypatch.setattr(hpcp_mod, 'tempfile', SimpleNamespace(mkdtemp=mount_dir))
+	monkeypatch.setattr(hpcp_mod.os.path, 'ismount', lambda path: any(str(p) == str(path).rstrip(os.sep) for p in roots))
+	monkeypatch.setattr(hpcp_mod, 'run_command_in_multicmd_with_path_check', run)
+	monkeypatch.setattr(hpcp_mod, 'clean_up', lambda *a: None)
+	rc = hpcp_mod.hpcp(['/dev/fake-source'], dest_image=str(tmp_path / 'dest.img'), dd=True,
+		single_thread=True, max_workers=1, no_directory_sync=True)
+	assert len(roots) == 4
+	assert (roots[3] / 'data.txt').read_text() == 'partition data'
+	assert rc == 152

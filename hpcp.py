@@ -9096,13 +9096,20 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = multipr
 					continue
 				# copy the partition files
 				print(f"Copying partition {partition} files from {src_mount_point} to {dest_mount_point}")
-				copy_rc = hpcp([src_mount_point], dest_paths = [dest_mount_point], single_thread=single_thread, max_workers=max_workers,
-					verbose=verbose, directory_only=directory_only,no_directory_sync=no_directory_sync,full_hash=full_hash, 
-					files_per_job=files_per_job, parallel_file_listing=parallel_file_listing,exclude=exclude,no_link_tracking = True,
-					batch=batch,append_hash_to_file_list = append_hash_to_file_list, hash_size = hash_size, source_file_list = source_file_list,
-					random_destination_selection = random_destination_selection, bytes_rate_limit = bytes_rate_limit, files_rate_limit = files_rate_limit,
-					target_file_system = target_file_system, no_create_dir = no_create_dir, content_only = content_only, command_timeout_limit = command_timeout_limit,
-					exit_not_enough_space = exit_not_enough_space)
+				# The nested run judges (and clears) ERRORS: give it a clean list, so only this partition's copy decides
+				# copy_rc, and put this run's own errors back afterwards.
+				outer_errors = ERRORS[:]
+				ERRORS.clear()
+				try:
+					copy_rc = hpcp([src_mount_point], dest_paths = [dest_mount_point], single_thread=single_thread, max_workers=max_workers,
+						verbose=verbose, directory_only=directory_only,no_directory_sync=no_directory_sync,full_hash=full_hash, 
+						files_per_job=files_per_job, parallel_file_listing=parallel_file_listing,exclude=exclude,no_link_tracking = True,
+						batch=batch,append_hash_to_file_list = append_hash_to_file_list, hash_size = hash_size, source_file_list = source_file_list,
+						random_destination_selection = random_destination_selection, bytes_rate_limit = bytes_rate_limit, files_rate_limit = files_rate_limit,
+						target_file_system = target_file_system, no_create_dir = no_create_dir, content_only = content_only, command_timeout_limit = command_timeout_limit,
+						exit_not_enough_space = exit_not_enough_space)
+				finally:
+					ERRORS[:0] = outer_errors
 				if copy_rc:
 					raise RuntimeError(f"Partition copy error: Copying partition {partition} failed with return code {copy_rc}.")
 			# sort the output partitions
