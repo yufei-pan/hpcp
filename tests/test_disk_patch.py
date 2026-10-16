@@ -3405,3 +3405,35 @@ def test_preflight_refuses_a_payloadless_section_even_when_everything_is_already
 	assert [check.action for check in plan.checks] == ['skip']
 	with pytest.raises(RuntimeError, match=r'^Incomplete patch: .*part1.*nothing applied'):
 		hpcp_mod._preflight_section(plan)
+
+
+@pytest.mark.parametrize('first_mount_works', [True, False])
+def test_existing_dest_image_of_a_cloned_xfs_mounts_with_nouuid(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch, first_mount_works):
+	"""Ultrareview: -di clone.img (an xfs whose UUID is mounted on the host) failed a plain mount, and the default
+	answer then ran xfs_repair -L on a healthy image. Both mounts (first, and after a repair) use nouuid."""
+	image = tmp_path / 'clone.img'
+	image.write_bytes(b'')
+	calls = []
+	mounted = []
+	def run(argv, **kwargs):
+		calls.append(list(argv))
+		if argv[0] == 'mount' and (first_mount_works or len([c for c in calls if c[0] == 'mount']) > 1):
+			mounted.append(argv[-1])
+		return []
+	monkeypatch.setattr(hpcp_mod, 'create_loop_device', lambda path, **kw: '/dev/loop-fake')
+	monkeypatch.setattr(hpcp_mod, 'get_largest_partition', lambda device: '/dev/loop-fake')
+	monkeypatch.setattr(hpcp_mod, '_probe_fs_type', lambda device: 'xfs')
+	monkeypatch.setattr(hpcp_mod, 'get_fs_type', lambda device: 'xfs')
+	monkeypatch.setattr(hpcp_mod, 'fix_fs', lambda *a: None)
+	monkeypatch.setattr(hpcp_mod, 'run_command_in_multicmd_with_path_check', run)
+	monkeypatch.setattr(hpcp_mod.os.path, 'ismount', lambda path: path in mounted)
+	monkeypatch.setattr(hpcp_mod.sys.stdin, 'isatty', lambda: False)
+	mount_points = []
+	try:
+		dest, mount_point = hpcp_mod.get_dest_from_image(str(image), mount_points, [])
+	finally:
+		for path in mount_points:
+			os.rmdir(path)
+	assert dest == mount_point + os.sep
+	mounts = [c for c in calls if c[0] == 'mount']
+	assert mounts and all(c[:3] == ['mount', '-o', 'nouuid'] for c in mounts)

@@ -8542,7 +8542,7 @@ def get_dest_from_image(dest_image,mount_points: list,loop_devices: list):
 		target_partition = get_largest_partition(target_loop_device_dest)
 		# mount the loop device to a temporary folder
 		print(f"Mounting {target_partition} at {target_mount_point}")
-		run_command_in_multicmd_with_path_check(["mount",target_partition,target_mount_point],strict=False)
+		run_command_in_multicmd_with_path_check(_rw_mount_command(target_partition, target_mount_point),strict=False)
 		# verify mount 
 		if os.path.ismount(target_mount_point):
 			dest = target_mount_point + os.path.sep
@@ -8560,7 +8560,7 @@ def get_dest_from_image(dest_image,mount_points: list,loop_devices: list):
 					fs_type = get_fs_type(target_partition)
 					fix_fs(target_partition,fs_type)
 					# mount it again
-					run_command_in_multicmd_with_path_check(["mount",target_partition,target_mount_point],strict=False)
+					run_command_in_multicmd_with_path_check(_rw_mount_command(target_partition, target_mount_point),strict=False)
 					# verify mount
 					if os.path.ismount(target_mount_point):
 						dest = target_mount_point + os.path.sep
