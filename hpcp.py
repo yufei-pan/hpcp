@@ -8016,7 +8016,7 @@ def remove_extra_dirs(src_paths, dests,exclude=None,dest_image=False):
 
 	A destination directory is kept when its source counterpart exists: dirname(src) + its path below dest, or with
 	dest_image (process_copy's -di layout: each source at dest + its absolute path) '/' + its path below dest.
-	Excluded directories and everything below them are left alone, and so are mount points and symlinks; a
+	Excluded directories and mount points, with everything below them, are left alone, and so are symlinks; a
 	directory that still holds entries (excluded files, say) is kept.
 
 	:param src_paths: list of source paths
@@ -8051,6 +8051,10 @@ def remove_extra_dirs(src_paths, dests,exclude=None,dest_image=False):
 					continue
 				if os.path.islink(dest_dir_path):
 					continue
+				if os.path.ismount(dest_dir_path):
+					# Another filesystem: never walked into, so nothing in it is removed.
+					print(f"Skipping mount point: {dest_dir_path}")
+					continue
 				walk_into.append(dirname)
 				relative_path = os.path.relpath(dest_dir_path, dest)
 				# Check if the directory exists in the source paths
@@ -8058,14 +8062,10 @@ def remove_extra_dirs(src_paths, dests,exclude=None,dest_image=False):
 					in_source = os.path.exists(os.path.join(os.path.sep, relative_path))
 				else:
 					in_source = any(os.path.exists(os.path.join(os.path.dirname(src_path), relative_path)) for src_path in src_paths)
-				if in_source:
-					continue
-				if os.path.ismount(dest_dir_path):
-					print(f"Skipping mount point: {dest_dir_path}")
-				else:
+				if not in_source:
 					print(f"Deleting extra directory: {dest_dir_path}")
 					extraDirs.add(dest_dir_path)
-			# Excluded trees are never walked into.
+			# Excluded trees and other filesystems are never walked into.
 			dirnames[:] = walk_into
 	for dir in sorted(extraDirs, key=lambda path: len(pathlib.Path(path).parts), reverse=True):
 		try:
