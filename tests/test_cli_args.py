@@ -133,3 +133,16 @@ def test_main_passes_diff_image_flags(hpcp_mod):
 	src = inspect.getsource(hpcp_mod.main)
 	for text in ('get_diff_image = args.get_diff_image', 'load_diff_image = args.load_diff_image', 'force_apply = args.force_apply'):
 		assert text in src
+
+
+def test_main_never_lets_an_undecodable_name_crash_a_print(hpcp_mod, restore_argv, reset_hpcp_globals, monkeypatch):
+	"""Review D3 safety net: under a strict UTF-8 stdout (LANG=en_US.UTF-8) a surrogate-escaped name prints escaped."""
+	import io
+	import os
+	stream = io.TextIOWrapper(io.BytesIO(), encoding='utf-8', errors='strict')
+	monkeypatch.setattr(sys, 'stdout', stream)
+	monkeypatch.setattr(sys, 'argv', ['hpcp', '/nonexistent-src', '-d', '/nonexistent-dest'])
+	monkeypatch.setattr(hpcp_mod, 'hpcp', lambda *args, **kwargs: print(os.fsdecode(b'name\xff')) or 0)
+	hpcp_mod.main()
+	stream.flush()
+	assert b'name\\udcff' in stream.buffer.getvalue()

@@ -4429,3 +4429,60 @@ def test_remove_tree_around_mounts_refuses_dot_components(tmp_path, hpcp_mod, la
 	kept, errors = hpcp_mod._remove_tree_around_mounts(str(target) + '/' + last, set(), target_root=str(target))
 	assert errors and 'refusing to remove . or ..' in errors[0]
 	assert (target / 'f').read_text() == 'x' and (tmp_path / 'sibling' / 'keep').read_text() == 'k'
+
+
+# ---- 9.73: undecodable names never abort an apply halfway (review D3) ----
+
+def _strict_utf8_stdout(monkeypatch):
+	"""stdout as under LANG=en_US.UTF-8: encoding errors are fatal."""
+	import io
+	stream = io.TextIOWrapper(io.BytesIO(), encoding='utf-8', errors='strict')
+	monkeypatch.setattr(sys, 'stdout', stream)
+	return stream
+
+
+def _undecodable_restore_scenario(hpcp_mod, tmp_path):
+	"""_restore_scenario with a file name that is not valid UTF-8."""
+	name = os.fsdecode(b'x\xff.efi')
+	target, vol = tmp_path / 'target', tmp_path / 'vol'
+	_write(target / 'EFI' / 'BOOT' / name, 'loader')
+	os.symlink('BOOT', str(target / 'EFI' / 'Boot'))
+	_write(vol / 'EFI' / 'Boot' / name, 'loader')
+	state = hpcp_mod.get_entry_state
+	R = hpcp_mod.ChangeRow
+	rows = [R('D', f'EFI/BOOT/{name}', state(str(target / 'EFI' / 'BOOT' / name)), '-'),
+		R('A', f'EFI/Boot/{name}', '-', state(str(vol / 'EFI' / 'Boot' / name)))]
+	return target, vol, rows
+
+
+def test_apply_restore_note_prints_an_undecodable_name(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	hpcp_mod.HASH_SIZE = 65536
+	target, vol, rows = _undecodable_restore_scenario(hpcp_mod, tmp_path)
+	plan = hpcp_mod._plan_section('root', rows, [str(vol)], str(target), True, False, 1)
+	stream = _strict_utf8_stdout(monkeypatch)
+	summary = hpcp_mod._apply_section(plan, 1, False, False, True)
+	assert summary['restored'] == 1 and summary['failed'] == 0
+	stream.flush()
+	assert b'x\\xff.efi' in stream.buffer.getvalue()
+
+
+def test_restore_across_sections_note_prints_an_undecodable_name(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	hpcp_mod.HASH_SIZE = 65536
+	target, vol, rows = _undecodable_restore_scenario(hpcp_mod, tmp_path)
+	os.unlink(str(vol / 'EFI' / 'Boot' / rows[1].path.rpartition('/')[2]))
+	plan = hpcp_mod._plan_section('root', rows, [str(vol)], str(target), True, False, 1)
+	outcome = {}
+	_strict_utf8_stdout(monkeypatch)
+	summary = hpcp_mod._apply_section(plan, 1, False, False, True, outcome)
+	hpcp_mod._restore_across_sections([(plan, summary, outcome)], 1, False, False, True)
+	assert summary['failed'] == 1
+
+
+def test_conflict_list_prints_undecodable_states(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	name = os.fsdecode(b'l\xfe')
+	row = hpcp_mod.ChangeRow('M', name, 'l:' + os.fsdecode(b'old\xff'), 'l:new')
+	check = hpcp_mod.PatchCheck(row, 'conflict', 'l:' + os.fsdecode(b'other\xfd'), 'differs')
+	stream = _strict_utf8_stdout(monkeypatch)
+	hpcp_mod._resolve_conflict_lines(hpcp_mod._conflict_lines([check]), True)
+	stream.flush()
+	assert b'other\\xfd' in stream.buffer.getvalue()

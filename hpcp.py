@@ -5156,7 +5156,8 @@ def _resolve_conflict_lines(lines, force):
 	"""Print conflicts, then prompt (default abort), abort without a tty, or force with warnings."""
 	print(f"{len(lines)} path(s) on the target differ from the state this patch expects:")
 	for detail, _ in lines:
-		print(f"  {detail}")
+		# The states can hold link targets with undecodable bytes; stdout may be strict UTF-8.
+		print(f"  {_printable_path(detail)}")
 	if not force:
 		if not sys.stdin.isatty():
 			raise RuntimeError(f'Patch conflict: {len(lines)} conflicting path(s) and stdin is not a tty; nothing applied (use -fa to force)')
@@ -5767,7 +5768,7 @@ def _apply_rows(rows, volume_roots, target_root, max_workers=1, verbose=False, f
 			remove_other_type(row)
 		if restored:
 			print(f"Restoring {len(restored)} entr{'y' if len(restored) == 1 else 'ies'} skipped as already done that a removal "
-				f"took away, e.g. {restored[0].path}")
+				f"took away, e.g. {_printable_path(restored[0].path)}")
 		payload = payload + restored
 	dir_rows = []
 	for row in sorted((r for r in payload if r.new.startswith('d:')), key=lambda r: _key_depth(r.path)):
@@ -5907,7 +5908,7 @@ def _resolve_section_conflicts(plans, force, extra_lines=()):
 			if below:
 				first = os.path.normpath(os.path.join(row.path.rstrip('/'), below[0]))
 				more = f' (and {len(below) - 1} more)' if len(below) > 1 else ''
-				print(f'Note: forced removal of {where}{row.path} stops at the mount at {first}{more}; that row will fail verify')
+				print(_printable_path(f'Note: forced removal of {where}{row.path} stops at the mount at {first}{more}; that row will fail verify'))
 	lines += list(extra_lines)
 	if lines:
 		_resolve_conflict_lines(lines, force)
@@ -6002,7 +6003,7 @@ def _restore_across_sections(ran, max_workers, verbose, full_hash, compare_hash)
 		plan, row = missing[0]
 		example = row.path if plan.name == 'root' else f'[{plan.name}] {row.path}'
 		print(f"Restoring {len(missing)} entr{'y' if len(missing) == 1 else 'ies'} skipped as already done that a removal "
-			f"elsewhere in the patch took away, e.g. {example}")
+			f"elsewhere in the patch took away, e.g. {_printable_path(example)}")
 	for directories in (True, False):
 		for plan, _, _, rows, written in lost:
 			# Still missing: a restore of another section's row may have just written the same entry.
@@ -9359,6 +9360,12 @@ def hpcp_gui():
 #%% ---- CLI ----
 def main():
 	global RANDOM_DESTINATION_SELECTION
+	# Paths with bytes that are not UTF-8 arrive surrogate-escaped; under a UTF-8 locale stdout is strict, and one
+	# print of such a name would end the run partway. Show them escaped instead (stderr already does).
+	try:
+		sys.stdout.reconfigure(errors='backslashreplace')
+	except (AttributeError, ValueError):
+		pass
 	args = get_args()
 	# we run gui if the current platform is windows and src_path is not specified
 	if os.name == 'nt' and len(args.src_path) == 0:
