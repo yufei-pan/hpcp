@@ -90,3 +90,49 @@ def test_trim_paths_relative(hpcp_mod):
 	base = '/home/user/project/main.py'
 	got = hpcp_mod.trim_paths({'/home/user/project/file1.py', '/home/user/project/file2.py'}, base)
 	assert got == {'file1.py', 'file2.py'}
+
+
+# ---- 9.73: an unreadable entry is recorded, the rest is still listed (review C3) ----
+
+def _deny_scandir(monkeypatch, hpcp_mod, denied):
+	real = os.scandir
+	def scandir(path='.'):
+		if os.path.abspath(path) == os.path.abspath(denied):
+			raise PermissionError(13, 'Permission denied', path)
+		return real(path)
+	monkeypatch.setattr(hpcp_mod.os, 'scandir', scandir)
+
+
+@pytest.mark.parametrize('parallel', [False, True])
+def test_unreadable_directory_is_recorded_and_the_rest_listed(tmp_tree, hpcp_mod, reset_hpcp_globals, monkeypatch, parallel):
+	tmp_tree.add_file('a.txt', 'A')
+	tmp_tree.add_file('ok/b.txt', 'B')
+	tmp_tree.add_file('secret/c.txt', 'C')
+	_deny_scandir(monkeypatch, hpcp_mod, tmp_tree.src / 'secret')
+	files, _, _, _ = hpcp_mod.get_file_list(str(tmp_tree.src), parallel_file_listing=parallel, max_workers=2, drop_cache=True)
+	names = sorted(os.path.relpath(path, tmp_tree.src) for path in files)
+	assert names == ['a.txt', os.path.join('ok', 'b.txt')]
+	assert [error.partition(':')[0] for error in hpcp_mod.ERRORS] == ['Listing error']
+
+
+def test_unreadable_file_hash_is_recorded_and_the_rest_listed(tmp_tree, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	tmp_tree.add_file('a.txt', 'A')
+	denied = tmp_tree.add_file('b.txt', 'B')
+	real = hpcp_mod.hash_file
+	def hash_file(path, *args, **kwargs):
+		if path == denied:
+			raise PermissionError(13, 'Permission denied', path)
+		return real(path, *args, **kwargs)
+	monkeypatch.setattr(hpcp_mod, 'hash_file', hash_file)
+	files, _, _, _ = hpcp_mod.get_file_list(str(tmp_tree.src), append_hash=True, parallel_file_listing=False, drop_cache=True)
+	assert [os.path.basename(entry.rpartition(':')[0]) for entry in files] == ['a.txt']
+	assert [error.partition(':')[0] for error in hpcp_mod.ERRORS] == ['Listing error']
+
+
+def test_copy_with_an_unreadable_directory_copies_the_rest(tmp_tree, hpcp_mod, reset_hpcp_globals, require_linux, copy_args, monkeypatch):
+	tmp_tree.add_file('a.txt', 'A')
+	tmp_tree.add_file('secret/c.txt', 'C')
+	_deny_scandir(monkeypatch, hpcp_mod, tmp_tree.src / 'secret')
+	srcs, opts = copy_args()
+	assert hpcp_mod.hpcp(srcs, **opts) == 209
+	assert (tmp_tree.dst / 'a.txt').read_text() == 'A'

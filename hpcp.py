@@ -2569,6 +2569,15 @@ def _remove_file_or_link(path):
 		eprint(f'Remove process exception:\n Deleting {path} generated an exception: {exc}')
 		return False
 
+def _scan_dir(root):
+	"""os.scandir(root)'s entries. A directory that cannot be opened or read on (EACCES, EIO) is recorded as a
+	'Listing error' and gives the entries read so far, so the rest of the tree is still listed."""
+	try:
+		with os.scandir(root) as entries:
+			yield from entries
+	except OSError as e:
+		eprint(f'Listing error: {root}: {e}')
+
 def get_file_list_serial(root,exclude=None,append_hash=False,full_hash=False,recurse=True,_rate_limiter=None,respect_file_rate_limit=True,remove_files_while_listing=False):
 	# skip if path is longer than 4096 characters
 	if len(root) > 4096:
@@ -2604,7 +2613,7 @@ def get_file_list_serial(root,exclude=None,append_hash=False,full_hash=False,rec
 	globalStartTIme = start_time
 	if os.path.isdir(root):
 		folders.add(root)
-		for entry in os.scandir(root):
+		for entry in _scan_dir(root):
 			# update the progress bar every 0.5 seconds
 			currentTime = time.monotonic()
 			if currentTime - start_time > 0.5:
@@ -2628,32 +2637,36 @@ def get_file_list_serial(root,exclude=None,append_hash=False,full_hash=False,rec
 				multiCMD.print_progress_bar(iteration=iteration, total=0, prefix=f'{root}'[-50:], suffix=suffix)
 			if exclude and is_excluded(entry.path,exclude):
 				continue
-			if entry.is_symlink():
-				_file_list_rate_limit(_rate_limiter)
-				realSize = get_file_size(entry.path)
-				size += realSize
-				if remove_files_while_listing:
-					removed_count += int(_remove_file_or_link(entry.path))
-				else:
-					links.add(get_file_repr(entry.path,append_hash,full_hash))
-			elif entry.is_file(follow_symlinks=False):
-				_file_list_rate_limit(_rate_limiter)
-				realSize = get_file_size(entry.path)
-				size += realSize
-				if remove_files_while_listing:
-					removed_count += int(_remove_file_or_link(entry.path))
-				else:
-					file_list.add(get_file_repr(entry.path,append_hash,full_hash))
-			elif entry.is_dir(follow_symlinks=False):
-				if recurse:
-					dir_files, dir_links, dir_size, dir_folders, dir_removed_count = get_file_list_serial(entry.path,exclude=exclude,append_hash=append_hash,full_hash=full_hash,_rate_limiter=_rate_limiter,respect_file_rate_limit=respect_file_rate_limit,remove_files_while_listing=remove_files_while_listing)
-					file_list.update(dir_files)
-					links.update(dir_links)
-					size += dir_size
-					folders.update(dir_folders)
-					removed_count += dir_removed_count
-				else:
-					folders.add(entry.path)
+			try:
+				if entry.is_symlink():
+					_file_list_rate_limit(_rate_limiter)
+					realSize = get_file_size(entry.path)
+					size += realSize
+					if remove_files_while_listing:
+						removed_count += int(_remove_file_or_link(entry.path))
+					else:
+						links.add(get_file_repr(entry.path,append_hash,full_hash))
+				elif entry.is_file(follow_symlinks=False):
+					_file_list_rate_limit(_rate_limiter)
+					realSize = get_file_size(entry.path)
+					size += realSize
+					if remove_files_while_listing:
+						removed_count += int(_remove_file_or_link(entry.path))
+					else:
+						file_list.add(get_file_repr(entry.path,append_hash,full_hash))
+				elif entry.is_dir(follow_symlinks=False):
+					if recurse:
+						dir_files, dir_links, dir_size, dir_folders, dir_removed_count = get_file_list_serial(entry.path,exclude=exclude,append_hash=append_hash,full_hash=full_hash,_rate_limiter=_rate_limiter,respect_file_rate_limit=respect_file_rate_limit,remove_files_while_listing=remove_files_while_listing)
+						file_list.update(dir_files)
+						links.update(dir_links)
+						size += dir_size
+						folders.update(dir_folders)
+						removed_count += dir_removed_count
+					else:
+						folders.add(entry.path)
+			except OSError as e:
+				# One entry that cannot be read (its hash, a link target) is recorded; the others are still listed.
+				eprint(f'Listing error: {entry.path}: {e}')
 		#multiCMD.print_progress_bar(iteration=iteration, total=iteration, prefix=f'{root}', suffix=f'Files: {format_bytes(len(file_list),use_1024_bytes=False,to_str=True)} Links: {format_bytes(len(links),use_1024_bytes=False,to_str=True)} Folders: {format_bytes(len(folders),use_1024_bytes=False,to_str=True)} Size: {format_bytes(size)}B')
 	else:
 		eprint(f'Source path type error: {root} is not a file or directory')
