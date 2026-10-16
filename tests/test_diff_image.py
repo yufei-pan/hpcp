@@ -4502,3 +4502,19 @@ def test_payload_source_deleted_before_the_copy_is_diagnosed(trees, hpcp_mod, tm
 		hpcp_mod.build_patch_tree(rows, str(new), [str(vol)], hpcp_mod.make_patch_meta(rows, 'n', 'b', 'root'), max_workers=2)
 	assert (vol / 'stays.txt').read_text() == 'stays'
 	assert not (vol / '.hpcp_diff').exists()
+
+
+@requires_root_and_image_tools
+@pytest.mark.skipif(shutil.which('mkfs.xfs') is None, reason='needs mkfs.xfs')
+@pytest.mark.root
+@pytest.mark.loop
+def test_clone_of_a_mounted_xfs_image_mounts_read_write(tmp_path, hpcp_mod, reset_hpcp_globals):
+	"""Review D1: -siff PATCH -di CLONE.img mounts the target read-write; a clone of a mounted xfs has the same UUID."""
+	golden, clone = str(tmp_path / 'golden.img'), str(tmp_path / 'clone.img')
+	_make_xfs_image(hpcp_mod, golden, lambda root: _write(os.path.join(root, 'f.txt'), 'f'))
+	subprocess.run(['cp', '--sparse=always', golden, clone], check=True)
+	with _mount_session(hpcp_mod) as (mount_points, loop_devices):
+		hpcp_mod._mount_single_fs_image(golden, False, mount_points, loop_devices)
+		root = hpcp_mod._mount_single_fs_image(clone, False, mount_points, loop_devices)
+		_write(os.path.join(root, 'written.txt'), 'w')
+		assert open(os.path.join(root, 'f.txt')).read() == 'f'

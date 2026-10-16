@@ -6192,6 +6192,9 @@ def _mount_single_fs_image(image, read_only, mount_points, loop_devices):
 		# lsblk reads udev's cache, which a fresh loop device may not have yet; blkid -p reads the device.
 		options = _ro_mount_options(target)
 		command = ['mount', '-o', options, target, mount_point]
+	elif _probe_fs_type(target) == 'xfs':
+		# A clone of a mounted xfs (a golden image, a node's disk) carries the same UUID, which xfs refuses to mount twice.
+		command = ['mount', '-o', 'nouuid', target, mount_point]
 	else:
 		command = ['mount', target, mount_point]
 	run_command_in_multicmd_with_path_check(command, strict=False)
