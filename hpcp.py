@@ -2645,9 +2645,11 @@ def _special_file_kind(entry):
 	return None
 
 def get_file_list_serial(root,exclude=None,append_hash=False,full_hash=False,recurse=True,_rate_limiter=None,respect_file_rate_limit=True,remove_files_while_listing=False):
-	# skip if path is longer than 4096 characters: not listed, so not copied (an error: a move must not delete it)
+	# skip if path is longer than 4096 characters: not listed, so not copied (an error: a move must not delete it).
+	# -rm's own listing (removing as it goes) leaves it to rmtree, which deletes it.
 	if len(root) > 4096:
-		eprint(f'Listing error: {root}: path longer than 4096 characters, not listed')
+		if not remove_files_while_listing:
+			eprint(f'Listing error: {root}: path longer than 4096 characters, not listed')
 		return frozenset() ,frozenset(),0,frozenset(),0
 	#print(f'Getting file list for {root}')
 	global FILES_RATE_LIMIT
@@ -2749,7 +2751,8 @@ def get_file_list_parallel(path,max_workers=56,exclude=None,append_hash=False,fu
 	global FILES_RATE_LIMIT
 	# skip if path is longer than 4096 characters (an error, as in get_file_list_serial)
 	if len(path) > 4096:
-		eprint(f'Listing error: {path}: path longer than 4096 characters, not listed')
+		if not remove_files_while_listing:
+			eprint(f'Listing error: {path}: path longer than 4096 characters, not listed')
 		return frozenset() ,frozenset(),0,frozenset(),0
 	if exclude and is_excluded(path,exclude):
 		return frozenset() ,frozenset(),0,frozenset(),0

@@ -704,3 +704,10 @@ def test_special_file_kind_names_a_fifo(tmp_path, hpcp_mod):
 	(tmp_path / 'f').write_text('f')
 	kinds = {entry.name: hpcp_mod._special_file_kind(entry) for entry in os.scandir(tmp_path)}
 	assert kinds == {'p': 'FIFO', 'f': None}
+
+
+@pytest.mark.parametrize('lister', ['get_file_list_serial', 'get_file_list_parallel'])
+def test_overlong_path_is_no_error_while_removing(hpcp_mod, reset_hpcp_globals, lister):
+	"""-rm's own listing removes as it goes and leaves the rest to rmtree, which deletes deep paths by descriptor."""
+	getattr(hpcp_mod, lister)('/' + 'x' * 4100, remove_files_while_listing=True)
+	assert hpcp_mod.ERRORS == []
