@@ -103,6 +103,20 @@ Fixed, with tests:
 
 Declined: when several sources map to one destination path and one of them excludes it, `-rme` keeps it. Keeping is the safe answer when the sources disagree.
 
+## Fourth review
+
+Fixed, with tests:
+- An exclude that drops a whole source root as the listing names it (`-e 'cache/'` matches `…/cache/`) left nothing copied, and `-rme` then emptied the destination. This was also true on 9.72. The root is now tested in that `path/` form.
+- A tracked target that holds a copied tree (`up -> ..`) kept everything. Such targets are left out of the keep list.
+- Tracked targets are (destination, source) pairs. One inside another source's copied tree is kept; one that is just its own tree's copy is judged like any other path.
+- The destination copy of an excluded link target is kept.
+- The link notes print only when a copy would have been tried, and `realpath` runs only for a target with a `..`.
+- One `_path_and_parents` walk replaces three loops. `_chown_like_cp` has a non-root unit test.
+
+Declined: a target tracked through a symlinked directory (`sub/../t`) that an earlier run copied by its lexical path. 9.72 never tracked links (the code was dead), and the lexical path is not the link's real target.
+
+Most findings after the first review came from `-rme` meeting the revived link tracking. That bears on Question 1.
+
 ## Not changed (noted for the user)
 
 - `-rme` in `-di` mode still mirrors the whole image to the sources, as `-rme` does for a plain destination.
