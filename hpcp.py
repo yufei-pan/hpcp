@@ -335,6 +335,10 @@ def get_rc_from_error():
 	ERRORS.clear()
 	return rc
 
+def _is_failure(error):
+	"""True for a recorded error whose prefix has a non-zero return code (unregistered ones count: 128)."""
+	return ERROR_TO_RETURNCODE_TABLE.get(error.partition(':')[0], 128) != 0
+
 def _validate_paths(src, dests):
 	"""Validate path lengths (4096 char limit). Returns filtered dest list, or None if invalid."""
 	if len(src) > 4096:
@@ -784,7 +788,7 @@ def _raise_task_failures(future):
 	"""A _submit_task future's result, raising its recorded failures (and a crash) as one RuntimeError, as
 	_call_raising_recorded_failures does in-process."""
 	result, errors, crash = future.result()
-	failures = [error for error in errors if ERROR_TO_RETURNCODE_TABLE.get(error.partition(':')[0], 128) != 0]
+	failures = [error for error in errors if _is_failure(error)]
 	if crash is not None:
 		failures.append(crash)
 	if failures:
@@ -796,8 +800,7 @@ def _call_raising_recorded_failures(func, *args, **kwargs):
 	error_start = len(ERRORS)
 	try:
 		result = func(*args, **kwargs)
-		failures = [error for error in ERRORS[error_start:]
-			if ERROR_TO_RETURNCODE_TABLE.get(error.partition(':')[0], 128) != 0]
+		failures = [error for error in ERRORS[error_start:] if _is_failure(error)]
 		if failures:
 			raise RuntimeError('\n'.join(failures))
 		return result
@@ -3457,6 +3460,10 @@ def copy_files_serial(src_path, dest_paths, full_hash=False, verbose=False,exclu
 	_print_operation_summary(apb, endTime - start_time, show_bandwidth=True)
 	return apb.item_counter, apb.size_counter , symLinks , frozenset(file_list)
 
+def _link_dests(links, src_path, dest_paths):
+	"""{link: [where it goes in each dest]} for the symlinks a listing of src_path found."""
+	return {link: [os.path.join(dest_path, os.path.relpath(link, src_path)) for dest_path in dest_paths] for link in links}
+
 def copy_files_serial_batch(jobs, full_hash=False, verbose=False,exclude=None,exit_not_enough_space=False):
 	# skip if src path or dest path is longer than 4096 characters
 	global FILES_RATE_LIMIT
@@ -3501,9 +3508,7 @@ def copy_files_serial_batch(jobs, full_hash=False, verbose=False,exclude=None,ex
 	if total_item_count == 0:
 		# Nothing to copy, but the directories may still hold symlinks to recreate.
 		for src_path, dest_paths, _, links, _ in newJobs:
-			for link in links:
-				srcRelativePath = os.path.relpath(link, src_path)
-				total_symLinks[link] = [os.path.join(dest_path, srcRelativePath) for dest_path in dest_paths]
+			total_symLinks.update(_link_dests(links, src_path, dest_paths))
 		return 0, 0, total_symLinks, frozenset()
 	start_time = time.monotonic()
 	apb = Adaptive_Progress_Bar(total_count=total_item_count,total_size=total_size_count,last_num_job_for_stats=1,process_word='Copied',suppress_all_output=verbose,bytes_rate_limit=BYTES_RATE_LIMIT,files_rate_limit=FILES_RATE_LIMIT)
@@ -3517,10 +3522,7 @@ def copy_files_serial_batch(jobs, full_hash=False, verbose=False,exclude=None,ex
 			apb.update(num_files=1,cpSize=size,cpTime=cpTime,files_per_job=1)
 			links.update(rtnSymLinks)
 			apb.rate_limit()
-		
-		for link in links:
-			srcRelativePath = os.path.relpath(link, src_path)
-			total_symLinks[link] = [os.path.join(dest_path, srcRelativePath) for dest_path in dest_paths]
+		total_symLinks.update(_link_dests(links, src_path, dest_paths))
 	endTime = time.monotonic()
 	apb.stop()
 	_print_operation_summary(apb, endTime - start_time, show_bandwidth=True)
@@ -9278,7 +9280,7 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = multipr
 			create_sym_links(total_sym_links,exclude=exclude,no_link_tracking=no_link_tracking)
 			# A copy that reported errors is incomplete: removing the sources (a move) would lose what was not copied,
 			# and an unlisted source subtree would make its destination counterpart look extra.
-			copy_failures = [error for error in ERRORS[copy_error_start:] if ERROR_TO_RETURNCODE_TABLE.get(error.partition(':')[0], 128) != 0]
+			copy_failures = [error for error in ERRORS[copy_error_start:] if _is_failure(error)]
 			if remove_extra and copy_failures:
 				eprint(f'Remove skipped: not removing extra files from {dests}: the copy reported {len(copy_failures)} error(s); '
 					'fix them (or exclude those paths with -e) and re-run')
