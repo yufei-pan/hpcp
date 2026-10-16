@@ -26,6 +26,10 @@ By default, **hpcp** only checks:
 
 Although in most cases these checks should confirm that both files are identical, in certain scenarios (like bit rot), corrupted files might not be detected. If you need to verify file integrity rather than perform a quick sync, it is recommended to use the `-fh --full_hash` option.
 
+A file or directory that cannot be read, listed or written is reported and the rest of the copy goes on; hpcp then exits with a non-zero code (`Copy failed` 190, `Directory sync error` 193, `Listing error` 209, ...). A non-root copy does not keep another user's ownership, as with `cp -a`.
+
+Symlinks are recreated as symlinks. Without `-nlt --no_link_tracking`, a relative symlink whose target is missing at the destination (it points outside the copied tree, say `../shared/lib`) gets its target copied to the same relative place, which can be outside the destination directory, so the link resolves there too. With several destinations a relative link goes to the destination that holds its target. A link whose path is taken by a real file or directory in the destination is not created and is reported.
+
 Setting `-hs --hash_size` to `0` disables hash checks entirely. This can be helpful on HDDs, as they usually have suboptimal seek performance. However, HDDs are also more prone to bit rot. If the operator can accept that risk, it is possible to rely solely on mtime checks for file comparison by setting `hash_size` to `0`. (Though on a single HDD, the standard `cp` command is already well-optimized.)
 
 ## Installation
@@ -135,9 +139,13 @@ Limitations:
 `-rme --remove_extra`: Especially when combined with `-rf`, **PLEASE PAY CLOSE ATTENTION TO YOUR TARGET DIRECTORY!**  
 `--remove_extra` will remove **all** files that are not in the source path. When you are copying a file into a folder, you almost certainly do not want to use this!
 
+It runs only after a copy that reported no errors: if a source path could not be listed, its copy in the destination would look extra. Otherwise hpcp leaves the destination as it is and exits with `Remove skipped` (212). With `-di` the image holds each source at its absolute path, and `-rme` compares against that layout. Excluded paths (`-e`, `-x`) are never removed, and a directory that still holds one is kept.
+
 ## Remove Feature Note
 
 `-rm --remove` can remove files in bulk. This might be helpful on distributed file systems like Lustre, as it only gathers the file list once and performs bulk deletion rather than the default recursive deletion in the Linux `rm` program.
+
+With a destination, `-rm` copies first and then removes the sources: a move. The sources are removed only if the copy reported no errors (a file that failed to copy, an unreadable directory, a link that could not be created); otherwise they are left in place and hpcp exits with `Remove skipped` (212).
 
 `-rf --remove_force` implies `--remove`. **Use with care!** This skips the interactive check requiring user confirmation before removing. If **hpcp** did not generate the correct file list from the specified source paths, hopefully you have fast enough reflexes to press `Ctrl + C` repeatedly to stop all parallel deletion processes if you realize a mistake.
 

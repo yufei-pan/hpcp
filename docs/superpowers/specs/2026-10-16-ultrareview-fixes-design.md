@@ -14,7 +14,8 @@ The user asked for this round to run unattended overnight. These decisions are m
   - Fix: pool tasks go through a new `_run_task`. It returns `(result, failures)` instead of raising, so the parent keeps both the partial result and the errors.
   - A parent helper `_task_result` adds the failures to the parent's `ERRORS` and returns the result. The worker printed them already.
   - An unexpected exception in a task (a crash) is recorded under the site's prefix, and the run goes on.
-  - `_call_with_worker_init` keeps its raising contract for `_replace_files`. A failed temp copy there must not be renamed over the destination.
+  - `_replace_files` keeps the raising contract through `_raise_task_failures`. A failed temp copy there must not be renamed over the destination. `_call_with_worker_init` is gone; `_call_raising_recorded_failures` remains for in-process callers.
+  - Found while fixing: a pool job crashed by one directory dropped its siblings in the same job. `sync_directory_metadata` now records a failed directory (or destination) as `Directory sync error` (new prefix, rc 193) and goes on. That covers a source directory that vanished after the listing too. As with `cp -a`, a non-root `chown` EPERM is not an error, here and in `copy_file`'s identical-file path (a re-run over unchanged files).
 - **New (found while fixing C2): `-rm` and `-rme` run after a failed copy.** With a destination, `-rm` copies and then deletes the sources, a move. In serial mode this already happened when a copy failed, so a file that failed to copy was deleted from the source. Once parallel failures stop aborting, the same would happen in every mode. `-rme` has the same problem: a source subtree that could not be listed makes its destination counterpart look extra.
   - Fix: `hpcp()` takes note of the errors recorded from the start of the copy through symlink creation. If any has a non-zero code, it skips `-rme` and `-rm` and records `Remove skipped: ...`, a new prefix with rc 212.
   - FS-param warnings (rc 0) do not count, and neither do errors recorded before the copy (e.g. 'Permission warning').
@@ -45,7 +46,7 @@ The user asked for this round to run unattended overnight. These decisions are m
 - **C7: the Windows GUI passes the destination as a str.** It passes `[dest]`, or `[]` when the field is empty.
 - **C8: symlink link tracking is dead, and links always go to the last destination.** This restores the original (pre-multi-destination) behaviour, carried over to several destinations:
   - Stale links at each destination are removed first.
-  - If any destination already holds a real file or directory at the link's path, the link is skipped (as before May 2025).
+  - If any destination already holds a real file or directory at the link's path, the link is skipped (as before May 2025). This is recorded as `Failed to create symbolic link` (rc 162), the code the failed `os.symlink` gave in 9.72, so the remove gate stops a move.
   - A relative link goes to the destination where its target already exists.
   - Without `-nlt`, a missing relative target is copied (`copy_files_serial`) and the link placed where the copy landed.
   - Otherwise the first destination is used (a random one with `-rds`).
@@ -57,19 +58,19 @@ The user asked for this round to run unattended overnight. These decisions are m
 
 ### Group 3: nits
 
-- **D4: a section whose payload directory is a symlink on every volume.** `_preflight_section` refuses a section with rows to apply and no usable payload root (`Incomplete patch`), before anything changes.
+- **D4: a section whose payload directory is a symlink on every volume.** `_preflight_section` refuses a section with rows and no usable payload root (`Incomplete patch`), before anything changes.
+  - It refuses even when every row is already done, because a later restore (`_restore_across_sections`) would need the payload too. An automated security review raised this point on the first version of the fix.
 - **D5: volume count 0.** `_load_patch` refuses a count below 1 and a volume number outside 1..count (`Patch format error`).
 - **D7: unregistered prefix.** `Patch error` is registered with rc 252.
 - **D8: dead code.** `_resolve_conflicts` is removed.
 
 ## Not changed (noted for the user)
 
-- `sync_directory_metadata` does not catch `chown`/`copystat` failures. A non-root copy of files owned by others still stops at the first directory, in both serial and parallel mode. This predates 9.73 and was not in the review.
 - `-rme` in `-di` mode still mirrors the whole image to the sources, as `-rme` does for a plain destination.
 
 ## Questions for the user
 
-1. C8 restores default link tracking. Without `-nlt`, a relative symlink whose target is missing at the destination gets the target copied next to it, even when that is outside the destination tree (e.g. `../shared/lib`). That was the original design and is what `-nlt`'s help text describes, but it has been dead since 9.x in May 2025. Keep the restored default, or make tracking opt-in?
+1. C8 restores default link tracking. Without `-nlt`, a relative symlink whose target is missing at the destination gets the target copied next to it, even when that is outside the destination tree (e.g. `../shared/lib`). A link to a large external tree (`data -> ../../mnt/big`) copies that tree as well. This was the original design and is what `-nlt`'s help text describes, but it has been dead since the multi-destination change of 2025-05-08 (499ee42). Keep the restored default, or make tracking opt-in?
 2. The new remove gate skips `-rm` and `-rme` after any copy-phase error, including `Listing error` on an unreadable directory the user does not care about. The fix is `-e`. Is that the right default, or should listing errors outside the copied paths be ignored?
 3. Should cas-toolbox pick up 9.73 in Monday's roll-up, or as a mid-week hotfix? The `-rm` after a failed copy, `-rme -di` and `-d` glob bugs exist in released 9.72.
 
