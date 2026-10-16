@@ -132,6 +132,17 @@ Declined:
 
 Each review after the first found fewer and narrower issues, almost all where `-rme` meets excludes, merged sources and the revived link tracking. More rounds would mostly refine behaviour that depends on Question 1. If tracking goes opt-in, the keep list (`create_sym_links`' triples, `_kept_paths`, `_is_kept`) only matters with the option and can be reviewed then.
 
+## Security review and performance of the move removal
+
+- The automated security review flagged path-based deletion in the new move removal: a directory swapped for a symlink during the copy (a tree other users can write; hpcp often runs as root) led the unlink outside the source (reproduced). Each listed entry is now removed relative to a descriptor of its directory, reached from the source root with `O_NOFOLLOW` (`_descend`), and each source root is pinned: its `(st_dev, st_ino)` is taken before the copy, and it is reopened from its parent with `O_NOFOLLOW` and checked. Entries are tied to the outermost source root containing them.
+- The user asked that hpcp not get slower. The first descriptor version reopened the parent chain for every file (about depth + 1 opens per file). `_remove_listed_files` now keeps the current directory's descriptors open over the sorted entries and does not stat before unlinking; the empty-directory pass is one descriptor walk. Removal phase, 9.72 against now: about 55k against 29k metadata syscalls for 20k files (23.6k against 905 stats); FUSE 0.87-0.91 s against 0.72-0.76 s single-threaded and 0.93 s against 0.25 s with 32 workers; tmpfs 0.34 s against 0.26 s and 0.35 s against 0.12 s for 100k files. A test pins the open count.
+- Left as before (path-based, pre-existing): the plain `-rm` listing that removes while it lists, and `-rme`'s removals in the destination.
+
+## Local reviews after the ultrareview
+
+- `/code-review high eaee294` reviewed that one commit (link tracking opt-in): an excluded link target's copy was removed by `-rme` without `-lt` (reproduced; fixed: the excluded-target keep no longer depends on tracking), `-lt` with `-dd` was ignored silently (now said), `target_is_directory` was resolved against the CWD (fixed), tests now run with and without tracking, README contradictions fixed. Declined: one argument for `link_tracking` / `no_link_tracking` (both are library API).
+- `/code-review high eaee294..HEAD` (the fix wave): a move onto itself (`hpcp -rf /data/w/x -d /data/w/`) deleted the source (reproduced, also in 9.72; now refused, 241); root matching was quadratic with many roots (`-sfl`); a nested root was walked twice; `ln/` pinned the target's identity; `-diff`'s base side refused for errors inside excluded subtrees; a `-hs 0` list of links only read as unhashed (the live tree now decides); a plain `-rm -rwloff` exited 209 for paths rmtree removes anyway; `-e` without `-lt` cost two realpath calls per `..` link. All fixed with tests. Declined: merging the empty-directory walk with `_remove_tree_around_mounts` (that one removes files and skips mounts).
+
 ## Not changed (noted for the user)
 
 - `-rme` in `-di` mode still mirrors the whole image to the sources, as `-rme` does for a plain destination.
