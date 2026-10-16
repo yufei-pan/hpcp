@@ -8049,6 +8049,7 @@ def remove_extra_dirs(src_paths, dests,exclude=None,dest_image=False):
 	if not dests:
 		eprint(f'All destination paths are too long: Skipping {src_paths}')
 		return 0, 0, set(), frozenset()
+	mapping = _src_to_dest_map(src_paths, dests, dest_image)
 	# leave out excluded source paths (a filtered copy: the caller's list is not touched)
 	src_paths = [src_path for src_path in src_paths if not (exclude and is_excluded(src_path,exclude))]
 	extraDirs = set()
@@ -8059,7 +8060,7 @@ def remove_extra_dirs(src_paths, dests,exclude=None,dest_image=False):
 			for dirname in dirnames:
 				# No trailing separator: excludes match a directory as the listing does ('*/cache').
 				dest_dir_path = os.path.join(dirpath, dirname)
-				if exclude and is_excluded(dest_dir_path,exclude):
+				if exclude and (is_excluded(dest_dir_path,exclude) or _excluded_at_source(os.path.abspath(dest_dir_path), mapping, exclude)):
 					print(f"Skipping excluded directory: {dest_dir_path}")
 					continue
 				if os.path.islink(dest_dir_path):
@@ -8123,6 +8124,26 @@ def _src_to_dest_map(src_paths, dests, dest_image=False):
 	mapping.sort(key=lambda item: len(item[0]), reverse=True)
 	return mapping
 
+def _excluded_at_source(dest_path, mapping, exclude):
+	"""True when dest_path is the copy of a source path that exclude leaves out (that path, or a directory above it
+	up to its source root). -e names source paths: an absolute pattern never matches the destination side itself.
+	mapping: _src_to_dest_map's result."""
+	if not exclude:
+		return False
+	for src_abs, actual_dests in mapping:
+		for actual_dest in actual_dests:
+			if dest_path != actual_dest and not dest_path.startswith(actual_dest.rstrip(os.sep) + os.sep):
+				continue
+			source = os.path.normpath(os.path.join(src_abs, os.path.relpath(dest_path, actual_dest)))
+			while True:
+				if is_excluded(source, exclude):
+					return True
+				parent = os.path.dirname(source)
+				if source == src_abs or parent == source:
+					break
+				source = parent
+	return False
+
 def _expected_dest_paths(src_entries, src_paths, dests, dest_image=False):
 	"""Compute the set of absolute dest paths each src entry should occupy (dest_image: see _src_to_dest_map)."""
 	expected = set()
@@ -8166,6 +8187,7 @@ def remove_extra_files(total_file_list, dests,max_workers,verbose,files_per_job,
 		inDestNotInSrc = set()
 		if src_paths:
 			expected = _expected_dest_paths(src_entries, src_paths, dests, dest_image)
+			mapping = _src_to_dest_map(src_paths, dests, dest_image)
 			for dest in dests:
 				dest_file_list, links, _, _ = get_file_list(dest, max_workers=max_workers, exclude=exclude, parallel_file_listing=parallel_file_listing)
 				dest_abs_root = os.path.abspath(dest)
@@ -8175,7 +8197,9 @@ def remove_extra_files(total_file_list, dests,max_workers,verbose,files_per_job,
 				# never accidentally point os.remove outside of the destination.
 				for path in actual - expected:
 					if path == dest_abs_root or path.startswith(dest_abs_root + os.path.sep):
-						inDestNotInSrc.add(path)
+						# The copy of an excluded source path is not extra: it was left out, not deleted.
+						if not _excluded_at_source(path, mapping, exclude):
+							inDestNotInSrc.add(path)
 		else:
 			for dest in dests:
 				dest_file_list,links,_ ,_ = get_file_list(dest, max_workers=max_workers,exclude=exclude,parallel_file_listing=parallel_file_listing)

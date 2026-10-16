@@ -364,3 +364,24 @@ def test_remove_extra_dirs_never_enters_a_mount_point(tmp_tree, hpcp_mod, reset_
 	monkeypatch.setattr(hpcp_mod.os.path, 'ismount', lambda path: os.path.normpath(path) == mount_point or real_ismount(path))
 	hpcp_mod.remove_extra_dirs([str(tmp_tree.src) + os.sep], [str(tmp_tree.dst) + os.sep])
 	assert os.path.isdir(inner)
+
+
+# ---- 9.73 re-review: -e names source paths, also for -rme ----
+
+@pytest.mark.parametrize('pattern', ['absolute', 'relative'])
+def test_remove_extra_keeps_the_copy_of_an_excluded_source_path(tmp_path, hpcp_mod, reset_hpcp_globals, require_linux, monkeypatch, pattern):
+	"""-e /data/src/cache leaves the source's cache out; -rme must not delete the destination's earlier copy of it."""
+	src = tmp_path / 'data' / 'src'
+	(src / 'cache').mkdir(parents=True)
+	(src / 'a.txt').write_text('a')
+	(src / 'cache' / 'c.txt').write_text('cached')
+	backup = str(tmp_path / 'backup') + os.sep
+	os.makedirs(backup)
+	opts = dict(single_thread=True, batch=True, do_not_remove_files_while_listing=True)
+	assert hpcp_mod.hpcp([str(src)], dest_paths=[backup], **opts) == 0
+	monkeypatch.setattr(sys.stdin, 'isatty', lambda: True)
+	monkeypatch.setattr('builtins.input', lambda: 'y')
+	exclude = [str(src / 'cache')] if pattern == 'absolute' else ['cache']
+	assert hpcp_mod.hpcp([str(src)], dest_paths=[backup], remove_extra=True, exclude=exclude, **opts) == 0
+	assert (tmp_path / 'backup' / 'src' / 'cache' / 'c.txt').read_text() == 'cached'
+	assert (tmp_path / 'backup' / 'src' / 'a.txt').read_text() == 'a'
