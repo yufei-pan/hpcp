@@ -32,6 +32,19 @@ Measured on FUSE, median of 5 alternating runs, 9.75 against 9.76:
 - whole `-rme`, serial: 0.875 s against 0.882 s;
 - whole `-rme`, 32 workers: 0.292 s against 0.290 s.
 
+## Re-review of c4d89da..HEAD (user: "re-review then release")
+
+Fixed, with tests:
+- **The cursor reopened every released directory from the root by name** (reproduced): 540,257 opens for a 1,500-level `-rme` directory pass, and 150,213 for an 800-level move chain, against about one per level in 9.75. Nor did it check the device or the identity of a reopened directory. The walk and the cursor now share one helper, `_HeldDirs`:
+  - it holds at most 32 descriptors below the root, as a suffix of the path, so each step is O(1);
+  - a released directory is reopened through its child's `..`, one open per level, which stays in the child's filesystem; if the child is gone, it is reopened by name from the deepest held directory;
+  - every reopen is checked against the identity kept when the directory was released (ESTALE when it was moved or mounted on).
+- **`..` of a directory removed meanwhile is ENOENT.** The walk now reopens the parent by name and goes on, where it used to stop and leave every sibling; a parent that is gone too is skipped. `fstat` failures are recorded and no descriptor leaks.
+- **`_rmtree` takes the path as the kernel resolves it.** `''` used to remove the current directory; `link/..` was collapsed lexically.
+- **The fallback without descriptors spells paths as given,** so relative excludes match there too.
+- **`_makedirs` returns early for a `.` tail only after making a missing head,** as `os.makedirs` does.
+- **`-pfl` folders listed by their parent get one `lstat` (`known_dir`).**
+
 ## Testing
 
 `tests/test_deep_trees.py` uses a 1,500-level tree. It covers:
