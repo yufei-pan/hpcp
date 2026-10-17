@@ -194,7 +194,7 @@ except ImportError:
 	hasher = hashlib.blake2b()
 	xxhash_available = False
 
-version = '9.76'
+version = '9.77'
 __version__ = version
 COMMIT_DATE = '2026-10-16'
 
@@ -2649,15 +2649,25 @@ def _makedirs(name, mode=0o777, exist_ok=False):
 		if not exist_ok or not os.path.isdir(name):
 			raise
 
-def _walk(top):
+def _walk(top, device=None):
 	"""os.walk(top) top-down, symlinks to directories listed but not entered, unreadable directories skipped, without
-	recursion (os.walk recursed once per level before Python 3.12). The caller may prune dirnames in place."""
+	recursion (os.walk recursed once per level before Python 3.12). The caller may prune dirnames in place. With
+	device, a directory below top on another device once entered (an NFSv4 submount, an automount) is not walked."""
 	pending = [top]
 	while pending:
 		dirpath = pending.pop()
 		dirnames, filenames = [], []
+		fd = None
 		try:
-			with os.scandir(dirpath) as entries:
+			if device is not None and _SCANDIR_FD:
+				# top is the destination (its device is device): opened, not checked.
+				if dirpath is top:
+					fd = os.open(dirpath, _ENTER_FLAGS)
+				else:
+					fd, foreign = _entered_on_another_device(dirpath, device)
+					if foreign:
+						continue
+			with os.scandir(fd if fd is not None else dirpath) as entries:
 				for entry in entries:
 					try:
 						is_dir = entry.is_dir()
@@ -2666,6 +2676,9 @@ def _walk(top):
 					(dirnames if is_dir else filenames).append(entry.name)
 		except OSError:
 			continue
+		finally:
+			if fd is not None:
+				os.close(fd)
 		yield dirpath, dirnames, filenames
 		for name in reversed(dirnames):
 			path = os.path.join(dirpath, name)
@@ -2694,14 +2707,34 @@ def _rmtree(path, exclude=None, report=False):
 	if not exclude and os.path.lexists(absolute):
 		raise OSError(errno.ENOTEMPTY, os.strerror(errno.ENOTEMPTY), path)
 
-def _scan_dir(root):
-	"""os.scandir(root)'s entries. A directory that cannot be opened or read on (EACCES, EIO) is recorded as a
-	'Listing error' and gives the entries read so far, so the rest of the tree is still listed."""
+def _scan_dir(root, label=None):
+	"""os.scandir(root)'s entries (root a path or a directory descriptor; label names it). A directory that cannot be
+	opened or read on (EACCES, EIO) is recorded as a 'Listing error' and gives the entries read so far, so the rest of
+	the tree is still listed."""
 	try:
 		with os.scandir(root) as entries:
 			yield from entries
 	except OSError as e:
-		eprint(f'Listing error: {root}: {e}')
+		eprint(f'Listing error: {label if label is not None else root}: {e}')
+
+# A directory -rme's destination listing (or walk) enters: opened first, so a filesystem mounted on entering it (an
+# NFSv4 submount, an automount) is mounted, and its device checked, before anything in it is read.
+_ENTER_FLAGS = os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0) | getattr(os, 'O_CLOEXEC', 0)
+
+def _entered_on_another_device(path, device):
+	"""(descriptor of directory path, or None, whether it is on another device than device), path opened as a listing
+	enters it: an untriggered automount or NFSv4 submount below has its parent's device and no mountinfo entry until
+	then. Raises OSError when it cannot be opened."""
+	fd = os.open(path, _ENTER_FLAGS | getattr(os, 'O_NOFOLLOW', 0))
+	try:
+		foreign = os.fstat(fd).st_dev != device
+	except BaseException:
+		os.close(fd)
+		raise
+	if foreign:
+		os.close(fd)
+		return None, True
+	return fd, False
 
 def _special_file_kind(entry):
 	"""'FIFO', 'socket', 'block device' or 'character device' for such a scandir entry, else None: a regular file,
@@ -2798,56 +2831,79 @@ def get_file_list_serial(root,exclude=None,append_hash=False,full_hash=False,rec
 			eprint(f'Source path type error: {current} is not a file or directory')
 			file_list.add(current)
 			continue
-		folders.add(current)
-		for entry in _scan_dir(current):
-			# update the progress bar every 0.5 seconds
-			currentTime = time.monotonic()
-			if currentTime - start_time > 0.5:
-				start_time = currentTime
-				# use the time passed as the iteration number
-				iteration = int(currentTime - globalStartTIme)
-				suffix = ''
-				if file_list:
-					suffix += f'Files: {format_bytes(len(file_list),use_1024_bytes=False,to_str=True)} '
-				if links:
-					suffix += f'Links: {format_bytes(len(links),use_1024_bytes=False,to_str=True)} '
-				if folders:
-					suffix += f'Folders: {format_bytes(len(folders),use_1024_bytes=False,to_str=True)} '
-				if size:
-					suffix += f'Size: {format_bytes(size)}B '
-				if _rate_limiter:
-					suffix += f'| Overall: {format_bytes(_rate_limiter["count"],use_1024_bytes=False,to_str=True)} Files'
-				# if the root is longer than 50 characters, we only show the last 50 characters
-				multiCMD.print_progress_bar(iteration=iteration, total=0, prefix=f'{current}'[-50:], suffix=suffix)
-			if exclude and is_excluded(entry.path,exclude):
-				continue
+		scan_fd = None
+		if boundary is not None and boundary[1] is not None and _SCANDIR_FD:
+			# -rme's destination listing: a directory below the root on another device once entered (an NFSv4
+			# submount, an automount: no mountinfo entry and its parent's device before) is another filesystem, left
+			# alone; the device is that of the open directory, so nothing in it is read.
+			# The listing's own root is the destination (its device is the boundary's): opened, not checked.
 			try:
-				# -rme's destination listing: another filesystem below the destination is left alone, unlisted.
-				if boundary is not None and _across_boundary(entry.path, boundary, entry.is_dir(follow_symlinks=False), entry):
-					continue
-				if entry.is_symlink():
-					_file_list_rate_limit(_rate_limiter)
-					if boundary is None:
-						size += get_file_size(entry.path)
-					links.add(get_file_repr(entry.path,append_hash,full_hash))
-				elif entry.is_file(follow_symlinks=False):
-					_file_list_rate_limit(_rate_limiter)
-					if boundary is None:
-						size += get_file_size(entry.path)
-					file_list.add(get_file_repr(entry.path,append_hash,full_hash))
-				elif entry.is_dir(follow_symlinks=False):
-					if recurse:
-						pending.append(entry.path)
-					else:
-						folders.add(entry.path)
+				if current is not root or known_dir:
+					scan_fd, foreign = _entered_on_another_device(current, boundary[1])
+					if foreign:
+						continue
 				else:
-					kind = _special_file_kind(entry)
-					if kind:
-						# Not copied or compared; a move (-rm) leaves it in place (remove_moved_sources).
-						eprint(f'Special file skipped: {entry.path} is a {kind}; hpcp does not copy FIFOs, sockets or device nodes')
+					scan_fd = os.open(current, _ENTER_FLAGS)
 			except OSError as e:
-				# One entry that cannot be read (its hash, a link target) is recorded; the others are still listed.
-				eprint(f'Listing error: {entry.path}: {e}')
+				eprint(f'Listing error: {current}: {e}')
+				continue
+		folders.add(current)
+		try:
+			for entry in _scan_dir(scan_fd if scan_fd is not None else current, current):
+				path = os.path.join(current, entry.name) if scan_fd is not None else entry.path
+				# update the progress bar every 0.5 seconds
+				currentTime = time.monotonic()
+				if currentTime - start_time > 0.5:
+					start_time = currentTime
+					# use the time passed as the iteration number
+					iteration = int(currentTime - globalStartTIme)
+					suffix = ''
+					if file_list:
+						suffix += f'Files: {format_bytes(len(file_list),use_1024_bytes=False,to_str=True)} '
+					if links:
+						suffix += f'Links: {format_bytes(len(links),use_1024_bytes=False,to_str=True)} '
+					if folders:
+						suffix += f'Folders: {format_bytes(len(folders),use_1024_bytes=False,to_str=True)} '
+					if size:
+						suffix += f'Size: {format_bytes(size)}B '
+					if _rate_limiter:
+						suffix += f'| Overall: {format_bytes(_rate_limiter["count"],use_1024_bytes=False,to_str=True)} Files'
+					# if the root is longer than 50 characters, we only show the last 50 characters
+					multiCMD.print_progress_bar(iteration=iteration, total=0, prefix=f'{current}'[-50:], suffix=suffix)
+				if exclude and is_excluded(path,exclude):
+					continue
+				try:
+					# -rme's destination listing: another filesystem below the destination is left alone, unlisted: a
+					# mount point by name here (nothing stat'ed), a directory on another device once entered (above).
+					if boundary is not None and (path in boundary[0] or (boundary[1] is not None and not _SCANDIR_FD
+							and _across_boundary(path, boundary, entry.is_dir(follow_symlinks=False), entry))):
+						continue
+					if entry.is_symlink():
+						_file_list_rate_limit(_rate_limiter)
+						if boundary is None:
+							size += get_file_size(path)
+						links.add(get_file_repr(path,append_hash,full_hash))
+					elif entry.is_file(follow_symlinks=False):
+						_file_list_rate_limit(_rate_limiter)
+						if boundary is None:
+							size += get_file_size(path)
+						file_list.add(get_file_repr(path,append_hash,full_hash))
+					elif entry.is_dir(follow_symlinks=False):
+						if recurse:
+							pending.append(path)
+						else:
+							folders.add(path)
+					else:
+						kind = _special_file_kind(entry)
+						if kind:
+							# Not copied or compared; a move (-rm) leaves it in place (remove_moved_sources).
+							eprint(f'Special file skipped: {path} is a {kind}; hpcp does not copy FIFOs, sockets or device nodes')
+				except OSError as e:
+					# One entry that cannot be read (its hash, a link target) is recorded; the others are still listed.
+					eprint(f'Listing error: {path}: {e}')
+		finally:
+			if scan_fd is not None:
+				os.close(scan_fd)
 	return frozenset(file_list), frozenset(links) , size, frozenset(folders - set(['.', '..']))
 
 def get_file_list_parallel(path,max_workers=56,exclude=None,append_hash=False,full_hash=False,boundary=None):
@@ -8257,7 +8313,7 @@ def remove_extra_dirs(src_paths, dests,exclude=None,dest_image=False,keep=(),des
 	for dest in dests:
 		# Another filesystem below it (a mount or bind mount, another device), as remove_extra_files' listing.
 		boundary = _filesystem_boundary(dest, dest_roots[os.path.abspath(dest)][0], visible_mounts)
-		for dirpath, dirnames, _ in _walk(dest):
+		for dirpath, dirnames, _ in _walk(dest, device=boundary[1]):
 			walk_into = []
 			for dirname in dirnames:
 				# No trailing separator: excludes match a directory as the listing does ('*/cache').

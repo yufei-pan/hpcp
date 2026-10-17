@@ -336,3 +336,92 @@ def test_rmdir_ebusy_that_is_no_mount_point_is_an_error(tmp_path, hpcp_mod, rese
 	monkeypatch.setattr(hpcp_mod.os, 'rmdir', rmdir)
 	hpcp_mod._remove_listed_files([(str(root), hpcp_mod._path_identity(str(root)), 'extra')], rmdir=True, one_filesystem=True)
 	assert [error.partition(':')[0] for error in _failures(hpcp_mod)] == ['Remove directory failed']
+
+
+# ---- 9.77: a filesystem that appears only when its directory is entered (an NFSv4 submount, an automount) ----
+
+class _StatAsParent:
+	"""A scandir entry whose stat says the parent's device for one name: what an untriggered automount point (an
+	NFSv4 crossmnt submount) looks like before it is entered."""
+	def __init__(self, entry, name, device):
+		self._entry, self._name, self._device = entry, name, device
+	def __getattr__(self, attribute):
+		return getattr(self._entry, attribute)
+	def stat(self, follow_symlinks=True):
+		st = self._entry.stat(follow_symlinks=follow_symlinks)
+		if self._entry.name != self._name:
+			return st
+		fields = list(st)[:10]
+		fields[2] = self._device
+		return os.stat_result(fields)
+
+
+class _Scandir:
+	def __init__(self, real, target, name, device):
+		self._iterator, self._name, self._device = real(target), name, device
+	def __enter__(self):
+		return self
+	def __exit__(self, *exc):
+		self._iterator.close()
+	def __iter__(self):
+		return (_StatAsParent(entry, self._name, self._device) for entry in self._iterator)
+	def close(self):
+		self._iterator.close()
+
+
+def _looks_unmounted(hpcp_mod, monkeypatch, name, device):
+	"""Hide mountinfo and make the scandir entry 'name' report the parent's device (before it is entered)."""
+	monkeypatch.setattr(hpcp_mod, '_mountinfo_entries', lambda *args, **kwargs: [])
+	real = os.scandir
+	monkeypatch.setattr(hpcp_mod.os, 'scandir', lambda target='.': _Scandir(real, target, name, device))
+
+
+def test_remove_extra_prompt_lists_nothing_from_a_filesystem_mounted_on_entering(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch, capsys):
+	"""9.75 follow-up: an NFSv4 submount not mounted yet has its parent's device and no mountinfo entry, so it passed
+	the boundary until the listing entered it; its files reached the y/n prompt (the backstop then kept them). The
+	listing checks the device of each directory once open."""
+	src, dst = tmp_path / 'src', tmp_path / 'dst'
+	src.mkdir()
+	dst.mkdir()
+	(dst / 'stale.txt').write_text('stale')
+	with _mounted(dst / 'sub'):
+		_fill(dst / 'sub')
+		_looks_unmounted(hpcp_mod, monkeypatch, 'sub', os.stat(str(dst)).st_dev)
+		_answer_yes(monkeypatch)
+		hpcp_mod.remove_extra_files([], [str(dst) + os.sep], 2, False, 1, single_thread=True, src_paths=[str(src) + os.sep])
+		assert (dst / 'sub' / 'x.txt').exists() and (dst / 'sub' / 'sub' / 'y.txt').exists()
+	output = capsys.readouterr().out
+	assert 'x.txt' not in output and 'y.txt' not in output and 'stale.txt' in output
+	assert not (dst / 'stale.txt').exists()
+	assert not any(error.startswith('Other filesystem left') for error in hpcp_mod.ERRORS)
+	assert _failures(hpcp_mod) == []
+
+
+@pytest.mark.parametrize('parallel', [False, True])
+def test_destination_listing_stops_at_a_filesystem_mounted_on_entering(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch, parallel):
+	dst = tmp_path / 'dst'
+	dst.mkdir()
+	(dst / 'own.txt').write_text('own')
+	with _mounted(dst / 'sub'):
+		_fill(dst / 'sub')
+		_looks_unmounted(hpcp_mod, monkeypatch, 'sub', os.stat(str(dst)).st_dev)
+		boundary = hpcp_mod._filesystem_boundary(str(dst) + os.sep, str(dst), visible=frozenset())
+		files, links, size, folders = hpcp_mod.get_file_list(str(dst) + os.sep, max_workers=2, parallel_file_listing=parallel, boundary=boundary)
+	assert sorted(os.path.basename(path) for path in files) == ['own.txt']
+
+
+def test_remove_extra_dirs_does_not_walk_a_filesystem_mounted_on_entering(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch, capsys):
+	src, dst = tmp_path / 'src', tmp_path / 'dst'
+	src.mkdir()
+	dst.mkdir()
+	with _mounted(dst / 'sub'):
+		(dst / 'sub' / 'empty').mkdir()
+		monkeypatch.setattr(hpcp_mod, '_mountinfo_entries', lambda *args, **kwargs: [])
+		# The check before entering sees no mount point (as for an automount not triggered yet).
+		monkeypatch.setattr(hpcp_mod, '_across_boundary', lambda path, boundary, is_dir, entry=None: path in boundary[0])
+		hpcp_mod.remove_extra_dirs([str(src) + os.sep], [str(dst) + os.sep])
+		assert (dst / 'sub' / 'empty').is_dir()
+	output = capsys.readouterr().out
+	assert 'empty' not in output
+	assert not any(error.startswith('Other filesystem left') for error in hpcp_mod.ERRORS)
+	assert _failures(hpcp_mod) == []
