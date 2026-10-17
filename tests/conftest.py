@@ -10,6 +10,41 @@ if _ROOT not in sys.path:
 
 import hpcp
 
+if sys.version_info < (3, 7):
+	# The tests' own subprocess calls use capture_output and text (Python 3.7). Translated for calls from the tests
+	# only, so one in hpcp would still fail here, as it would for a user.
+	import subprocess
+	_TESTS_DIR = os.path.dirname(os.path.abspath(__file__)) + os.sep
+	_subprocess_run = subprocess.run
+
+	def _run_for_python_36(*args, **kwargs):
+		if sys._getframe(1).f_code.co_filename.startswith(_TESTS_DIR):
+			if kwargs.pop('capture_output', False):
+				kwargs.setdefault('stdout', subprocess.PIPE)
+				kwargs.setdefault('stderr', subprocess.PIPE)
+			if 'text' in kwargs:
+				kwargs['universal_newlines'] = kwargs.pop('text')
+		return _subprocess_run(*args, **kwargs)
+
+	subprocess.run = _run_for_python_36
+
+
+_REAL_SCANDIR_FD = hpcp._SCANDIR_FD
+
+
+@pytest.fixture(params=['fd', 'proc', 'path'])
+def scan_mode(request, monkeypatch):
+	"""How hpcp reads a directory it holds open: scandir on the descriptor (Python 3.7+), /proc/self/fd/N (3.6 on
+	Linux), or by its path with the descriptor held (3.6 elsewhere)."""
+	mode = request.param
+	if mode == 'fd' and not _REAL_SCANDIR_FD:
+		pytest.skip('this Python has no scandir on a descriptor')
+	if mode == 'proc' and not os.path.isdir('/proc/self/fd'):
+		pytest.skip('no /proc/self/fd')
+	monkeypatch.setattr(hpcp, '_SCANDIR_FD', mode == 'fd')
+	monkeypatch.setattr(hpcp, '_PROC_FD', mode == 'proc', raising=False)
+	return mode
+
 
 @pytest.fixture
 def hpcp_mod():

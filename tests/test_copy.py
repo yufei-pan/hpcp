@@ -1,5 +1,6 @@
 import os
 import random
+import sys
 import stat
 import time
 import pytest
@@ -417,6 +418,7 @@ def test_dir_sync_ignores_chown_permission_error_without_privileges(tmp_tree, hp
 	assert [error.partition(':')[0] for error in hpcp_mod.ERRORS] == ['Directory sync error']
 
 
+@pytest.mark.skipif(sys.version_info < (3, 7), reason='Python 3.6 pools only fork: no mp_context to spawn with')
 def test_spawned_workers_get_the_run_settings(tmp_tree, hpcp_mod, reset_hpcp_globals, require_linux, monkeypatch):
 	"""Review C5: a worker that did not fork (spawn: Windows, macOS, Linux on Python 3.14+) must see -co and -ncd."""
 	import concurrent.futures

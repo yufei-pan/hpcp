@@ -141,8 +141,10 @@ def test_remove_extra_dirs_never_follows_a_directory_swapped_after_the_walk(tmp_
 	assert _victim_intact(victim)
 
 
-def test_plain_remove_opens_each_directory_once(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
-	"""No slower than 9.73: one open per directory and no stat per file (a server round trip each on Lustre)."""
+@pytest.mark.parametrize('scan_mode', ['fd', 'proc'], indirect=True)
+def test_plain_remove_opens_each_directory_once(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch, scan_mode):
+	"""No slower than 9.73: one open per directory and no stat per file (a server round trip each on Lustre), on
+	Python 3.6 too (/proc/self/fd/N: 9.74 stat'ed each entry there)."""
 	src = tmp_path / 'src'
 	directories = 0
 	for top in range(3):

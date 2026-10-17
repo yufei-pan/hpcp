@@ -2392,7 +2392,7 @@ def test_partition_held_by_another_process_is_refused_up_front(tmp_path, hpcp_mo
 	with _attached(target) as loop:
 		holder = subprocess.Popen([sys.executable, '-c',
 			'import os, sys, time; fd = os.open(sys.argv[1], os.O_RDONLY | os.O_EXCL); print("held", flush=True); time.sleep(60)',
-			loop + 'p2'], stdout=subprocess.PIPE, text=True)
+			loop + 'p2'], stdout=subprocess.PIPE, universal_newlines=True)
 		try:
 			assert holder.stdout.readline().strip() == 'held'
 			with pytest.raises(RuntimeError, match='^' + re.escape('Disk in use: partition 2 is mounted, active swap or held (LVM, md, dm), '
@@ -2419,7 +2419,7 @@ def test_partition_mounted_in_another_namespace_is_refused_up_front(tmp_path, hp
 	with _attached(target) as loop:
 		child = subprocess.Popen(['unshare', '-m', '--propagation', 'private', 'sh', '-c',
 			'mount "$1" "$2" && echo ready && exec sleep 60', 'sh', loop + 'p3', str(mount_point)],
-			stdout=subprocess.PIPE, text=True)
+			stdout=subprocess.PIPE, universal_newlines=True)
 		try:
 			assert child.stdout.readline().strip() == 'ready'
 			assert not os.path.ismount(str(mount_point))
@@ -2428,6 +2428,18 @@ def test_partition_mounted_in_another_namespace_is_refused_up_front(tmp_path, hp
 		finally:
 			child.kill()
 			child.wait()
+
+
+def _lock_comes_free(device, seconds=3.0):
+	"""flock -n of device succeeds within seconds. udev takes a shared lock on a disk while it handles the change event
+	that closing a write open of it sends, so the lock can stay busy a moment after the hold lets it go; a lock the hold
+	kept would stay busy throughout."""
+	deadline = time.monotonic() + seconds
+	while subprocess.run(['flock', '-n', device, 'true']).returncode != 0:
+		if time.monotonic() > deadline:
+			return False
+		time.sleep(0.05)
+	return True
 
 
 @requires_root_and_disk_tools
@@ -2456,7 +2468,7 @@ def test_write_phase_holds_partitions_and_locks_the_disk(tmp_path, hpcp_mod, res
 	monkeypatch.setattr(hpcp_mod, '_write_area', write_area)
 	with _attached(target) as loop:
 		summary = _apply(hpcp_mod, patch, loop)
-		assert subprocess.run(['flock', '-n', loop, 'true']).returncode == 0
+		assert _lock_comes_free(loop)
 		os.close(os.open(loop + 'p2', os.O_RDONLY | os.O_EXCL))
 	assert summary['failed'] == 0 and summary['raw_written'] == 2
 	assert seen['flock'] != 0 and seen['excl'] == errno.EBUSY
@@ -2501,7 +2513,7 @@ def test_a_hold_lost_before_the_write_phase_stops_raw_areas_and_identity(tmp_pat
 	with _attached(target) as loop:
 		before = _identity_on_disk(hpcp_mod, loop)
 		summary = _apply(hpcp_mod, patch, loop)
-		assert subprocess.run(['flock', '-n', loop, 'true']).returncode == 0
+		assert _lock_comes_free(loop)
 		for device in (loop + 'p2', loop + 'p3'):
 			os.close(os.open(device, os.O_RDONLY | os.O_EXCL))
 		assert _identity_on_disk(hpcp_mod, loop) == before
@@ -2556,7 +2568,7 @@ def test_a_hold_not_taken_again_after_a_dropped_command_stops_the_write_phase(tm
 		assert ['e2fsck', '-f', '-y', loop + 'p3'] in ran
 		assert not [command for command in ran if isinstance(command, list) and (command[:2] == ['tune2fs', '-U']
 			or command[0] == 'e2label' or command[0] == 'sgdisk' and any(arg.startswith('--change-name') for arg in command))]
-		assert subprocess.run(['flock', '-n', loop, 'true']).returncode == 0
+		assert _lock_comes_free(loop)
 		os.close(os.open(loop + 'p3', os.O_RDONLY | os.O_EXCL))
 		# The raw areas and the boot code were written before the identity commands; the identity is unchanged.
 		assert _identity_on_disk(hpcp_mod, loop)[2:] == before[2:]
@@ -2642,7 +2654,7 @@ def test_disk_write_hold_releases_on_an_error_inside(tmp_path, hpcp_mod, reset_h
 				assert set(holds) == {loop + 'p2', loop + 'p3'}
 				assert subprocess.run(['flock', '-n', loop, 'true']).returncode != 0
 				raise ValueError('boom')
-		assert subprocess.run(['flock', '-n', loop, 'true']).returncode == 0
+		assert _lock_comes_free(loop)
 		for device in (loop + 'p2', loop + 'p3'):
 			os.close(os.open(device, os.O_RDONLY | os.O_EXCL))
 

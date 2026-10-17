@@ -156,3 +156,15 @@ def test_main_never_lets_an_undecodable_name_crash_a_print(hpcp_mod, restore_arg
 	hpcp_mod.main()
 	stream.flush()
 	assert b'name\\udcff' in stream.buffer.getvalue()
+
+
+def test_explicit_args_are_parsed_where_intermixed_parsing_is_missing(hpcp_mod, restore_argv, reset_hpcp_globals, monkeypatch):
+	"""Python 3.6 has no parse_intermixed_args: its fallback parsed sys.argv, not the args get_args was given."""
+	import argparse
+	def missing(self, args=None, namespace=None):
+		raise AttributeError("'ArgumentParser' object has no attribute 'parse_intermixed_args'")
+	monkeypatch.setattr(argparse.ArgumentParser, 'parse_intermixed_args', missing, raising=False)
+	sys.argv = ['hpcp', '/not/these']
+	args = hpcp_mod.get_args(['-fh', '-d', '/tmp', '/tmp/src'])
+	assert args.full_hash is True
+	assert args.src_path == ['/tmp/src']

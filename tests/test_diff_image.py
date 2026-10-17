@@ -175,6 +175,7 @@ def test_special_file_at_added_path_is_a_conflict(tmp_path, hpcp_mod, reset_hpcp
 	assert hpcp_mod.ERRORS == []
 
 
+@pytest.mark.skipif(sys.version_info < (3, 7), reason='Python 3.6 pools only fork: no mp_context to spawn with')
 def test_states_for_paths_workers_use_callers_hash_size(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
 	"""F15: workers that do not inherit module globals (spawn) still hash with the caller's HASH_SIZE."""
 	import functools

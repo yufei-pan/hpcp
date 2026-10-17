@@ -2654,8 +2654,8 @@ def _walk(top, device=None, foreign=None):
 	recursion (os.walk recursed once per level before Python 3.12). The caller may prune dirnames in place. With
 	device (-rme), each directory below top is opened as it is entered (_enter_directory, which refuses a symlink) and
 	one then on another device (a filesystem mounted on entering it: an NFSv4 submount, an automount) is not walked;
-	foreign, when given, is called with its path."""
-	enter = device is not None and _SCANDIR_FD
+	foreign, when given, is called with its path. Each is read through its descriptor (_scan_target)."""
+	enter = device is not None
 	pending = [top]
 	while pending:
 		dirpath = pending.pop()
@@ -2669,7 +2669,7 @@ def _walk(top, device=None, foreign=None):
 					if foreign is not None:
 						foreign(dirpath)
 					continue
-			with os.scandir(fd if fd is not None else dirpath) as entries:
+			with os.scandir(_scan_target(fd, dirpath) if fd is not None else dirpath) as entries:
 				for entry in entries:
 					try:
 						is_dir = entry.is_dir()
@@ -2772,19 +2772,6 @@ def _filesystem_boundary(listed_root, real_root, visible=None):
 		device = identity[0] if identity else None
 	return (points, device)
 
-def _across_boundary(path, boundary, is_dir, entry=None):
-	"""True when path (as the listing names it) is a mount point of the boundary (a string lookup, nothing stat'ed), or a
-	directory on another device (from entry, a DirEntry: a stat; else an lstat)."""
-	points, device = boundary
-	if path in points:
-		return True
-	if is_dir and device is not None:
-		try:
-			return (entry.stat(follow_symlinks=False) if entry is not None else os.lstat(path)).st_dev != device
-		except OSError:
-			return False
-	return False
-
 def get_file_list_serial(root,exclude=None,append_hash=False,full_hash=False,recurse=True,_rate_limiter=None,respect_file_rate_limit=True,boundary=None,known_dir=False):
 	"""(files, links, size, folders) below root. Iterative: a tree deeper than Python's recursion limit (about 1000
 	levels) is listed too; each directory below root gets the checks a call for it as root would (length, exclude,
@@ -2804,8 +2791,9 @@ def get_file_list_serial(root,exclude=None,append_hash=False,full_hash=False,rec
 	# -rme's destination listing: each directory below the root is opened before anything else (_enter_directory), so a
 	# filesystem mounted on entering it (an NFSv4 submount, an automount: its parent's device, and no mountinfo entry,
 	# until then) is mounted and its device checked before anything in it is read; another device is another
-	# filesystem, left alone. The root is the destination (its device is the boundary's): opened, not checked.
-	enter = boundary is not None and boundary[1] is not None and _SCANDIR_FD
+	# filesystem, left alone. The root is the destination (its device is the boundary's): opened, not checked. Each is
+	# read through its descriptor (_scan_target).
+	enter = boundary is not None and boundary[1] is not None
 	pending = [root]
 	while pending:
 		current = pending.pop()
@@ -2861,7 +2849,7 @@ def get_file_list_serial(root,exclude=None,append_hash=False,full_hash=False,rec
 				eprint(f'Listing error: {current}: {enter_error}')
 				continue
 		try:
-			for entry in _scan_dir(scan_fd if scan_fd is not None else current, current):
+			for entry in _scan_dir(_scan_target(scan_fd, current) if scan_fd is not None else current, current):
 				path = os.path.join(current, entry.name) if scan_fd is not None else entry.path
 				# update the progress bar every 0.5 seconds
 				currentTime = time.monotonic()
@@ -2886,10 +2874,8 @@ def get_file_list_serial(root,exclude=None,append_hash=False,full_hash=False,rec
 					continue
 				try:
 					# -rme's destination listing: another filesystem below the destination is left alone, unlisted: a
-					# mount point by name here (nothing stat'ed), a directory on another device once entered (above;
-					# without scandir on a descriptor, by its entry's device here).
-					if boundary is not None and (path in boundary[0] if enter
-							else _across_boundary(path, boundary, entry.is_dir(follow_symlinks=False), entry)):
+					# mount point by name here (nothing stat'ed), a directory on another device once entered (above).
+					if boundary is not None and path in boundary[0]:
 						continue
 					if entry.is_symlink():
 						_file_list_rate_limit(_rate_limiter)
@@ -8348,12 +8334,8 @@ def remove_extra_dirs(src_paths, dests,exclude=None,dest_image=False,keep=(),des
 				if dest_dir_path in boundary[0]:
 					print(f"Skipping mount point: {dest_dir_path}")
 					continue
+				# Another filesystem by device: the walk checks it as it enters it (entered_elsewhere).
 				if os.path.islink(dest_dir_path):
-					continue
-				# Another filesystem: never walked into, so nothing in it is removed. Its device is checked as the walk
-				# enters it (entered_elsewhere), or here without scandir on a descriptor.
-				if not _SCANDIR_FD and _across_boundary(dest_dir_path, boundary, True):
-					print(f"Skipping mount point: {dest_dir_path}")
 					continue
 				if dirname == 'lost+found' and os.path.ismount(dirpath):
 					# The filesystem's own (fsck's recovered orphans go there): not part of any copy.
@@ -9216,6 +9198,19 @@ def _remove_listed_files(items, rmdir=False, rate_limiter=None, one_filesystem=F
 	return 0, time.monotonic() - start_time
 
 _SCANDIR_FD = os.scandir in os.supports_fd
+# Python 3.6 has no scandir on a descriptor. On Linux /proc/self/fd/N is the very directory descriptor N is open on (no
+# lookup by path), and scandir of it reads d_type as scandir of N does.
+_PROC_FD = not _SCANDIR_FD and os.path.isdir('/proc/self/fd')
+
+def _scan_target(fd, path):
+	"""What os.scandir reads directory descriptor fd (open on directory path) through: fd itself; else /proc/self/fd/N
+	(Python 3.6 on Linux); else path, so a directory swapped in there since the open is read instead (the descriptor,
+	still held, keeps an automount there mounted)."""
+	if _SCANDIR_FD:
+		return fd
+	if _PROC_FD:
+		return '/proc/self/fd/%d' % fd
+	return path
 
 def _destination_roots(dests):
 	"""{abspath(dest): (its real path, that path's _path_identity, dest's own identity)} for -rme: what lies below a
@@ -9291,12 +9286,12 @@ def _remove_items(items, single_thread=False, max_workers=1, verbose=False, file
 	return delete_file_list_parallel(items, max_workers, verbose, job_size, remover=remover)[0]
 
 def _dir_entries(fd):
-	"""[(name, is a directory)] for directory descriptor fd, a symlink being no directory: from d_type where scandir
-	takes a descriptor (no stat per entry; a stat costs a server round trip on Lustre), else listdir and a stat each.
-	None: unknown (no d_type, and its stat failed)."""
+	"""[(name, is a directory)] for directory descriptor fd, a symlink being no directory: from d_type where scandir can
+	read the descriptor (_scan_target; no stat per entry, a server round trip each on Lustre), else listdir and a stat
+	each. None: unknown (no d_type, and its stat failed)."""
 	result = []
-	if _SCANDIR_FD:
-		with os.scandir(fd) as entries:
+	if _SCANDIR_FD or _PROC_FD:
+		with os.scandir(_scan_target(fd, None)) as entries:
 			for entry in entries:
 				try:
 					result.append((entry.name, entry.is_dir(follow_symlinks=False)))
@@ -9552,25 +9547,38 @@ def _remove_trees_parallel(trees, max_workers, exclude=None, rate_limiter=None):
 	(_remove_directory_entries), queueing the subdirectories each job reports. With rate_limiter (-F), the jobs pace
 	each unlink from one shared count (_shared_rate_wait), and the count carries on into the walk after. Returns the
 	entries unlinked; the directories themselves are left for _remove_tree_fd."""
+	global _RATE_SHARE
 	queue = deque(trees)
 	futures = {}
 	removed = 0
 	pool = {}
+	inherited = False
 	if rate_limiter:
 		# Every job paces each unlink from one shared count (a wide directory too, not just the queueing of jobs).
 		counter = multiprocessing.Value('d', rate_limiter['count'])
-		pool = dict(initializer=_init_rate_share, initargs=(counter, rate_limiter['start_time'], rate_limiter['limit']))
-	with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers, **pool) as executor:
-		while queue or futures:
-			while queue and len(futures) < max_workers * 2:
-				path, identity = queue.popleft()
-				futures[_submit_task(executor, _remove_directory_entries, path, identity, exclude)] = path
-			done, _ = concurrent.futures.wait(futures, return_when=concurrent.futures.FIRST_COMPLETED)
-			for future in done:
-				futures.pop(future)
-				count, subdirectories = _task_result(future, (0, []), 'Remove process exception')
-				removed += count
-				queue.extend(subdirectories)
+		share = (counter, rate_limiter['start_time'], rate_limiter['limit'])
+		if sys.version_info >= (3, 7):
+			pool = dict(initializer=_init_rate_share, initargs=share)
+		else:
+			# Python 3.6's pool takes no initializer: its workers fork from this process at the first submit (its
+			# start method outside Windows) and inherit the share instead.
+			_init_rate_share(*share)
+			inherited = True
+	try:
+		with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers, **pool) as executor:
+			while queue or futures:
+				while queue and len(futures) < max_workers * 2:
+					path, identity = queue.popleft()
+					futures[_submit_task(executor, _remove_directory_entries, path, identity, exclude)] = path
+				done, _ = concurrent.futures.wait(futures, return_when=concurrent.futures.FIRST_COMPLETED)
+				for future in done:
+					futures.pop(future)
+					count, subdirectories = _task_result(future, (0, []), 'Remove process exception')
+					removed += count
+					queue.extend(subdirectories)
+	finally:
+		if inherited:
+			_RATE_SHARE = None
 	if rate_limiter:
 		rate_limiter['count'] = counter.value
 	return removed
@@ -10228,7 +10236,7 @@ def get_args(args = None):
 		args = parser.parse_intermixed_args(args)
 	except Exception:
 		# try to parse the arguments using parse_known_args
-		args, unknown = parser.parse_known_args()
+		args, unknown = parser.parse_known_args(args)
 		# if there are unknown arguments, we will try to parse them again using parse_args
 		if unknown:
 			print(f"Warning: Unknown arguments, treating all as Source Path: {unknown!r}")
@@ -10731,14 +10739,36 @@ def hpcp_gui():
 	root.mainloop()
 
 #%% ---- CLI ----
-def main():
-	global RANDOM_DESTINATION_SELECTION
-	# Paths with bytes that are not UTF-8 arrive surrogate-escaped; under a UTF-8 locale stdout is strict, and one
-	# print of such a name would end the run partway. Show them escaped instead (stderr already does).
+# Python 3.6's stdout, replaced by _escape_unencodable_stdout: kept, since collected it would close the buffer.
+_STRICT_STDOUT = None
+
+def _escape_unencodable_stdout():
+	"""Paths with bytes that are not UTF-8 arrive surrogate-escaped; under a UTF-8 locale stdout is strict, and one
+	print of such a name would end the run partway. Show them escaped instead (stderr already does)."""
+	global _STRICT_STDOUT
 	try:
 		sys.stdout.reconfigure(errors='backslashreplace')
-	except (AttributeError, ValueError):
+		return
+	except ValueError:
+		return
+	except AttributeError:
 		pass
+	# Python 3.6 has no reconfigure: the same buffer through a new wrapper, which holds no text of its own.
+	import io
+	stdout = sys.stdout
+	if getattr(stdout, 'buffer', None) is None or getattr(stdout, 'errors', None) != 'strict':
+		return
+	try:
+		stdout.flush()
+		sys.stdout = io.TextIOWrapper(stdout.buffer, encoding=stdout.encoding, errors='backslashreplace',
+			line_buffering=stdout.line_buffering, write_through=True)
+	except (AttributeError, ValueError, OSError):
+		return
+	_STRICT_STDOUT = stdout
+
+def main():
+	global RANDOM_DESTINATION_SELECTION
+	_escape_unencodable_stdout()
 	args = get_args()
 	# we run gui if the current platform is windows and src_path is not specified
 	if os.name == 'nt' and len(args.src_path) == 0:

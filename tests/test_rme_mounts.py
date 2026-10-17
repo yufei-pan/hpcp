@@ -376,7 +376,7 @@ def _looks_unmounted(hpcp_mod, monkeypatch, name, device):
 	monkeypatch.setattr(hpcp_mod.os, 'scandir', lambda target='.': _Scandir(real, target, name, device))
 
 
-def test_remove_extra_prompt_lists_nothing_from_a_filesystem_mounted_on_entering(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch, capsys):
+def test_remove_extra_prompt_lists_nothing_from_a_filesystem_mounted_on_entering(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch, scan_mode, capsys):
 	"""9.75 follow-up: an NFSv4 submount not mounted yet has its parent's device and no mountinfo entry, so it passed
 	the boundary until the listing entered it; its files reached the y/n prompt (the backstop then kept them). The
 	listing checks the device of each directory once open."""
@@ -398,7 +398,7 @@ def test_remove_extra_prompt_lists_nothing_from_a_filesystem_mounted_on_entering
 
 
 @pytest.mark.parametrize('parallel', [False, True])
-def test_destination_listing_stops_at_a_filesystem_mounted_on_entering(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch, parallel):
+def test_destination_listing_stops_at_a_filesystem_mounted_on_entering(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch, scan_mode, parallel):
 	dst = tmp_path / 'dst'
 	dst.mkdir()
 	(dst / 'own.txt').write_text('own')
@@ -410,15 +410,14 @@ def test_destination_listing_stops_at_a_filesystem_mounted_on_entering(tmp_path,
 	assert sorted(os.path.basename(path) for path in files) == ['own.txt']
 
 
-def test_remove_extra_dirs_does_not_walk_a_filesystem_mounted_on_entering(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch, capsys):
+def test_remove_extra_dirs_does_not_walk_a_filesystem_mounted_on_entering(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch, scan_mode, capsys):
 	src, dst = tmp_path / 'src', tmp_path / 'dst'
 	src.mkdir()
 	dst.mkdir()
 	with _mounted(dst / 'sub'):
 		(dst / 'sub' / 'empty').mkdir()
 		monkeypatch.setattr(hpcp_mod, '_mountinfo_entries', lambda *args, **kwargs: [])
-		# The check before entering sees no mount point (as for an automount not triggered yet).
-		monkeypatch.setattr(hpcp_mod, '_across_boundary', lambda path, boundary, is_dir, entry=None: path in boundary[0])
+		_stub_until_opened(hpcp_mod, monkeypatch, dst / 'sub', os.stat(str(dst)).st_dev)
 		hpcp_mod.remove_extra_dirs([str(src) + os.sep], [str(dst) + os.sep])
 		assert (dst / 'sub' / 'empty').is_dir()
 	output = capsys.readouterr().out
@@ -429,7 +428,7 @@ def test_remove_extra_dirs_does_not_walk_a_filesystem_mounted_on_entering(tmp_pa
 
 # ---- 9.77: review of main..HEAD ----
 
-def test_remove_extra_dirs_does_not_offer_an_automount_point_itself(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch, capsys):
+def test_remove_extra_dirs_does_not_offer_an_automount_point_itself(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch, scan_mode, capsys):
 	"""Review: the parent's loop decided before entering: the untriggered mount point was 'Deleting extra directory'
 	and rmdir'd (EBUSY saved it; an expired automount would leave the stub to rmdir)."""
 	src, dst = tmp_path / 'src', tmp_path / 'dst'
@@ -438,7 +437,7 @@ def test_remove_extra_dirs_does_not_offer_an_automount_point_itself(tmp_path, hp
 	(dst / 'stale').mkdir()
 	with _mounted(dst / 'sub'):
 		monkeypatch.setattr(hpcp_mod, '_mountinfo_entries', lambda *args, **kwargs: [])
-		monkeypatch.setattr(hpcp_mod, '_across_boundary', lambda path, boundary, is_dir, entry=None: path in boundary[0])
+		_stub_until_opened(hpcp_mod, monkeypatch, dst / 'sub', os.stat(str(dst)).st_dev)
 		hpcp_mod.remove_extra_dirs([str(src) + os.sep], [str(dst) + os.sep])
 		assert (dst / 'sub').is_dir()
 	output = capsys.readouterr().out
@@ -447,9 +446,9 @@ def test_remove_extra_dirs_does_not_offer_an_automount_point_itself(tmp_path, hp
 	assert _failures(hpcp_mod) == []
 
 
-def _stub_until_opened(hpcp_mod, monkeypatch, path):
-	"""stat and lstat of path (by name) report another identity than the directory opened there: an NFSv4 submount (an
-	automount) not mounted yet, which a stat does not mount and an open does."""
+def _stub_until_opened(hpcp_mod, monkeypatch, path, device=None):
+	"""stat and lstat of path (by name) report another identity than the directory opened there (device: that device,
+	its parent's): an NFSv4 submount (an automount) not mounted yet, which a stat does not mount and an open does."""
 	def stubbed(real):
 		def call(target, *args, **kwargs):
 			st = real(target, *args, **kwargs)
@@ -458,7 +457,7 @@ def _stub_until_opened(hpcp_mod, monkeypatch, path):
 				result_type, (fields, extra) = st.__reduce__()
 				fields = list(fields)
 				fields[1] += 777
-				fields[2] += 12345
+				fields[2] = device if device is not None else fields[2] + 12345
 				return result_type(fields, extra)
 			return st
 		return call
@@ -505,7 +504,7 @@ def test_rmtree_removes_a_directory_mounted_on_entering(tmp_path, hpcp_mod, rese
 	assert not tree.exists()
 
 
-def test_parallel_listing_leaves_a_foreign_folder_out_of_its_folders(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+def test_parallel_listing_leaves_a_foreign_folder_out_of_its_folders(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch, scan_mode):
 	dst = tmp_path / 'dst'
 	(dst / 'own').mkdir(parents=True)
 	with _mounted(dst / 'sub'):
@@ -516,7 +515,7 @@ def test_parallel_listing_leaves_a_foreign_folder_out_of_its_folders(tmp_path, h
 	assert os.path.join(str(dst), 'sub') not in folders and os.path.join(str(dst), 'own') in folders
 
 
-def test_boundary_listing_does_not_lstat_each_directory(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+def test_boundary_listing_does_not_lstat_each_directory(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch, scan_mode):
 	"""Review: an lstat, then an open and an fstat, per directory: the open says ELOOP / ENOTDIR for a swapped entry."""
 	dst = tmp_path / 'dst'
 	for index in range(20):
@@ -530,7 +529,7 @@ def test_boundary_listing_does_not_lstat_each_directory(tmp_path, hpcp_mod, rese
 	assert len(calls) <= 2
 
 
-def test_a_directory_swapped_for_a_symlink_before_it_is_entered_is_listed_as_a_link(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+def test_a_directory_swapped_for_a_symlink_before_it_is_entered_is_listed_as_a_link(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch, scan_mode):
 	"""Review: the open's ELOOP became a 'Listing error'; 9.76 listed the entry as the link it had become."""
 	dst = tmp_path / 'dst'
 	(dst / 'sub').mkdir(parents=True)
@@ -545,16 +544,3 @@ def test_a_directory_swapped_for_a_symlink_before_it_is_entered_is_listed_as_a_l
 	files, links, _, folders = hpcp_mod.get_file_list_serial(str(dst), boundary=boundary)
 	assert os.path.join(str(dst), 'sub') in links
 	assert _failures(hpcp_mod) == []
-
-
-def test_boundary_without_descriptor_scandir_checks_the_device_before_entering(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
-	"""Review: the fallback (no scandir on a descriptor) keeps 9.76's per-entry device check; now tested."""
-	dst = tmp_path / 'dst'
-	dst.mkdir()
-	(dst / 'own.txt').write_text('own')
-	with _mounted(dst / 'sub'):
-		_fill(dst / 'sub')
-		monkeypatch.setattr(hpcp_mod, '_SCANDIR_FD', False)
-		boundary = hpcp_mod._filesystem_boundary(str(dst) + os.sep, str(dst), visible=frozenset())
-		files, _, _, _ = hpcp_mod.get_file_list_serial(str(dst) + os.sep, boundary=boundary)
-	assert sorted(os.path.basename(path) for path in files) == ['own.txt']
