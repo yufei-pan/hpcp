@@ -8081,7 +8081,7 @@ def _in_root_lost_and_found(path, dest_root):
 		path = os.path.dirname(path)
 	return False
 
-def remove_extra_dirs(src_paths, dests,exclude=None,dest_image=False,keep=()):
+def remove_extra_dirs(src_paths, dests,exclude=None,dest_image=False,keep=(),dest_roots=None):
 	"""
 	Removes extra directories in destination that are not present in the source paths.
 
@@ -8119,9 +8119,12 @@ def remove_extra_dirs(src_paths, dests,exclude=None,dest_image=False,keep=()):
 	# leave out excluded source paths (a filtered copy: the caller's list is not touched)
 	src_paths = [src_path for src_path in src_paths if not (exclude and is_excluded(src_path,exclude))]
 	source_roots = [os.path.abspath(src_path) for src_path in src_paths]
-	# {extra directory: the destination root it lies below}; each destination's identity before the walk.
+	# {extra directory: the destination root it lies below}; each destination's identity before the walk (pinned before
+	# the copy when hpcp() runs it, see remove_extra_files): one that now leads elsewhere is not cleaned.
 	extraDirs = {}
-	dest_roots = _destination_roots(dests)
+	if dest_roots is None:
+		dest_roots = _destination_roots(dests)
+	dests = [dest for dest in dests if os.path.abspath(dest) in dest_roots]
 	print(pformat(dests))
 	for dest in dests:
 		for dirpath, dirnames, _ in os.walk(dest):
@@ -8280,7 +8283,7 @@ def _expected_dest_paths(src_entries, src_paths, dests, dest_image=False, mappin
 				break
 	return expected
 
-def remove_extra_files(total_file_list, dests,max_workers,verbose,files_per_job,single_thread=False,exclude=None,parallel_file_listing=False,src_paths=None,sym_links=None,dest_image=False,keep=()):
+def remove_extra_files(total_file_list, dests,max_workers,verbose,files_per_job,single_thread=False,exclude=None,parallel_file_listing=False,src_paths=None,sym_links=None,dest_image=False,keep=(),dest_roots=None):
 		"""Remove files in ``dests`` that have no counterpart in ``total_file_list``.
 
 		``total_file_list`` may contain absolute src-side paths (as returned by
@@ -8295,11 +8298,16 @@ def remove_extra_files(total_file_list, dests,max_workers,verbose,files_per_job,
 		copied symlinks are not mistaken for extras. ``dest_image``: the copy used
 		the ``-di`` layout (see ``_src_to_dest_map``). ``keep``: destination paths
 		(and everything below them) that are never extra: the link targets
-		create_sym_links tracked (see _kept_paths).
+		create_sym_links tracked (see _kept_paths). ``dest_roots``: the
+		destinations as _checked_destination_roots gave them (pinned before
+		the copy); a destination left out of it is not cleaned.
 		"""
 		print(f"Removing extra files from {dests} with {max_workers} workers")
-		# Each destination's identity before it is listed: the removal (after the prompt) goes from it by descriptors.
-		dest_roots = _destination_roots(dests)
+		# Each destination's identity, before it is listed (pinned before the copy when hpcp() runs it): the removal,
+		# after the prompt, goes from it by descriptors. A destination that now leads elsewhere is not cleaned.
+		if dest_roots is None:
+			dest_roots = _destination_roots(dests)
+		dests = [dest for dest in dests if os.path.abspath(dest) in dest_roots]
 		# {extra path: the destination root it was listed below}
 		extra_roots = {}
 		src_entries = set(total_file_list) if total_file_list else set()
@@ -8334,7 +8342,8 @@ def remove_extra_files(total_file_list, dests,max_workers,verbose,files_per_job,
 				# trim_paths roots everything at os.path.dirname(dest); rebuild
 				# absolute paths against the same base or we'd double up the
 				# dest basename when ``dest`` lacks a trailing separator.
-				dest_base = os.path.dirname(dest) or os.path.sep
+				# A bare name ('data', '.') has no directory part: its extras are relative to the CWD (not to /).
+				dest_base = os.path.dirname(dest) or os.curdir
 				for file in dest_trimmed - src_entries:
 					path = os.path.join(dest_base, file)
 					inDestNotInSrc.add(path)
@@ -8548,13 +8557,15 @@ def process_remove(src_paths: list,single_thread = False, max_workers = multipro
 			raise RuntimeError("User requested stop: Not removing files")
 	print('-'*80)
 	start_time = time.monotonic()
-	rate_limiter = {'start_time': start_time, 'count': 0, 'limit': FILES_RATE_LIMIT} if FILES_RATE_LIMIT > 0 else None
+	rate_limiter = _new_rate_limiter()
 	removed = 0
 	trees = []
 	for path in processedPaths:
 		if os.path.isdir(path) and not os.path.islink(path):
 			trees.append(path)
-		elif _remove_one_listed(path, source_ids[path], '.'):
+			continue
+		_file_list_rate_limit(rate_limiter)
+		if _remove_one_listed(path, source_ids[path], '.'):
 			removed += 1
 	parallel = not single_thread and max_workers > 1
 	if trees and parallel and not REMOVE_FILES_WHILE_LISTING:
@@ -8563,8 +8574,10 @@ def process_remove(src_paths: list,single_thread = False, max_workers = multipro
 		for root in trees:
 			files, links, _, _ = get_file_list(root, max_workers=max_workers, exclude=exclude, parallel_file_listing=parallel_file_listing, drop_cache=True)
 			pairs.extend((path, root) for path in set(files) | set(links))
-		removed += _remove_items(_items_below(pairs, {root: (root, source_ids[root]) for root in trees}), single_thread, max_workers,
+		removed += _remove_items(_items_below(pairs, {root: (root, source_ids[root], source_ids[root]) for root in trees}), single_thread, max_workers,
 			verbose, files_per_job)
+		# The walk's -F pace starts after the listing (its time is no credit).
+		rate_limiter = _new_rate_limiter()
 	elif trees and parallel and parallel_file_listing:
 		removed += _remove_trees_parallel([(root, source_ids[root]) for root in trees], max_workers, exclude, rate_limiter)
 	for root in trees:
@@ -8689,16 +8702,11 @@ def _report_unremoved(path, exc):
 		eprint(f'Remove process exception:\n Deleting {path} generated an exception: {exc}')
 
 def _unlink_failed(name, dir_fd, path, exc):
-	"""Report a failed unlink, unless name is a directory (macOS refuses one with EPERM, not EISDIR): left as it is."""
-	if isinstance(exc, PermissionError):
-		try:
-			if stat.S_ISDIR(os.stat(name, dir_fd=dir_fd, follow_symlinks=False).st_mode):
-				return
-		except OSError:
-			pass
-	_report_unremoved(path, exc)
+	"""Report a failed unlink, unless name is a directory (_is_directory_now): left as it is."""
+	if not _is_directory_now(name, dir_fd, exc):
+		_report_unremoved(path, exc)
 
-def _remove_listed_files(items, rmdir=False):
+def _remove_listed_files(items, rmdir=False, rate_limiter=None):
 	"""Worker body for remove_moved_sources and remove_extra_files: unlink these (root, its identity, path below it)
 	entries, files and links, in path order (with rmdir, remove_extra_dirs: rmdir them, non-empty ones kept). Never a directory: unlink refuses one, so a listed path that became a directory keeps what it
 	holds; one already gone is no error. Each goes relative to its directory's descriptor, reached from the pinned root
@@ -8706,13 +8714,15 @@ def _remove_listed_files(items, rmdir=False):
 	symlink, in a tree other users can write to (this often runs as root) stops the removal instead of deleting outside
 	the source. The descriptors of the current directory and of the ones above it stay open while the entries share
 	them, so each directory is opened about once per job; nothing is stat'ed (a stat costs a server round trip on
-	Lustre). Returns (bytes, seconds) as delete_file_bulk does; bytes are not counted."""
+	Lustre). rate_limiter (-F, in this process) paces the unlinks. Returns (bytes, seconds) as delete_file_bulk does;
+	bytes are not counted."""
 	start_time = time.monotonic()
 	def remove(name, fd, path):
 		try:
 			if rmdir:
 				os.rmdir(name, dir_fd=fd)
 			else:
+				_file_list_rate_limit(rate_limiter)
 				os.unlink(name, dir_fd=fd)
 		except (FileNotFoundError, IsADirectoryError):
 			pass
@@ -8725,15 +8735,17 @@ def _remove_listed_files(items, rmdir=False):
 				_report_rmdir_failed(path, exc)
 	def remove_one(root, root_id, rel):
 		if not rmdir:
+			_file_list_rate_limit(rate_limiter)
 			_remove_one_listed(root, root_id, rel)
 			return
 		e = _rmdir_below(root, root_id, rel)
 		if e is None:
 			return
+		path = root if rel in ('', '.') else os.path.join(root, rel)
 		if e.errno in (errno.ENOTEMPTY, errno.EEXIST):
-			print(f"Keeping non-empty directory: {os.path.join(root, rel)}")
+			print(f"Keeping non-empty directory: {path}")
 		else:
-			_report_rmdir_failed(os.path.join(root, rel), e)
+			_report_rmdir_failed(path, e)
 	if not _DIR_FD_WALK:
 		for root, root_id, rel in items:
 			remove_one(root, root_id, rel)
@@ -8804,16 +8816,34 @@ def _destination_roots(dests):
 		roots[listed] = (real, _path_identity(real), _path_identity(listed))
 	return roots
 
+def _checked_destination_roots(dests, pinned=None):
+	"""_destination_roots now, checked against pinned (taken before the copy): a destination that resolves elsewhere
+	now (swapped for a symlink, or a directory on its path), or that existed then and is another directory now, is
+	reported and left out, so -rme does not clean it. One the copy created gets its identity now."""
+	current = _destination_roots(dests)
+	if pinned is None:
+		return current
+	checked = {}
+	for listed, now in current.items():
+		before = pinned.get(listed)
+		if before is not None and (now[0] != before[0] or (before[1] is not None and now[1] != before[1])):
+			eprint(f'Remove skipped: not removing extra entries from {listed}: it now leads to {now[0]}, not to the '
+				f'destination the copy wrote ({before[0]})')
+			continue
+		checked[listed] = now
+	return checked
+
 def _items_below(pairs, roots, sort=True):
 	"""[(root, its identity, path below it)] for pairs (path, the root it was listed below), for _remove_listed_files:
-	roots maps each listed root (abspath) to (the root to remove from, its identity[, the listed root's own identity]).
+	roots maps each listed root (abspath) to (the root to remove from, its identity, the listed root's own identity).
 	A relative path is taken from the CWD. The listed root itself is (listed root, its own identity, '.'): removed as
 	the name given, never resolved. A path not below its root (it cannot be) is reported, not removed. With sort, in
 	path order (neighbours share their directories' descriptors)."""
 	items = []
 	# Per listed root (a few): its absolute path, prefix and roots entry.
 	known = {}
-	for path, listed_root in pairs:
+	# Paths compare natively; each root's entries stay together (they share its prefix).
+	for path, listed_root in (sorted(pairs) if sort else pairs):
 		root_info = known.get(listed_root)
 		if root_info is None:
 			absolute = os.path.abspath(listed_root)
@@ -8824,27 +8854,31 @@ def _items_below(pairs, roots, sort=True):
 		if path.startswith(prefix):
 			items.append((entry[0], entry[1], path[len(prefix):]))
 		elif path == absolute:
-			items.append((absolute, entry[2] if len(entry) > 2 else entry[1], '.'))
+			items.append((absolute, entry[2], '.'))
 		else:
 			eprint(f'Remove process exception: not removing {path}: it is not below {absolute}')
-	if sort:
-		items.sort(key=lambda item: (item[0], item[2]))
 	return items
 
+def _new_rate_limiter():
+	"""A _file_list_rate_limit state for -F (FILES_RATE_LIMIT) starting now, or None without -F."""
+	return {'start_time': time.monotonic(), 'count': 0, 'limit': FILES_RATE_LIMIT} if FILES_RATE_LIMIT > 0 else None
+
 def _remove_items(items, single_thread=False, max_workers=1, verbose=False, files_per_job=1):
-	"""Unlink items (see _remove_listed_files) in this process, or in pool jobs of neighbouring entries, large enough
-	to share their directories' descriptors. Returns the number of items handled."""
+	"""Unlink items (see _remove_listed_files) in this process, paced by -F, or in pool jobs of neighbouring entries,
+	large enough to share their directories' descriptors (with -F as given, as delete_file_list_parallel paces by
+	job). Returns the number of items handled."""
 	if not items:
 		return 0
 	if single_thread or max_workers <= 1:
-		_remove_listed_files(items)
+		_remove_listed_files(items, rate_limiter=_new_rate_limiter())
 		return len(items)
-	return delete_file_list_parallel(items, max_workers, verbose, max(files_per_job, min(256, len(items) // (max_workers * 4) or 1)),
-		remover=_remove_listed_files)[0]
+	job_size = files_per_job if FILES_RATE_LIMIT > 0 else max(files_per_job, min(256, len(items) // (max_workers * 4) or 1))
+	return delete_file_list_parallel(items, max_workers, verbose, job_size, remover=_remove_listed_files)[0]
 
 def _dir_entries(fd):
 	"""[(name, is a directory)] for directory descriptor fd, a symlink being no directory: from d_type where scandir
-	takes a descriptor (no stat per entry; a stat costs a server round trip on Lustre), else listdir and a stat each."""
+	takes a descriptor (no stat per entry; a stat costs a server round trip on Lustre), else listdir and a stat each.
+	None: unknown (no d_type, and its stat failed)."""
 	result = []
 	if _SCANDIR_FD:
 		with os.scandir(fd) as entries:
@@ -8852,8 +8886,8 @@ def _dir_entries(fd):
 				try:
 					result.append((entry.name, entry.is_dir(follow_symlinks=False)))
 				except OSError:
-					# Unknown (no d_type, and its stat failed): taken as no directory; an unlink then says what it is.
-					result.append((entry.name, False))
+					# Unknown (no d_type, and its stat failed): None; the walk tries it as a directory first.
+					result.append((entry.name, None))
 		return result
 	for name in os.listdir(fd):
 		try:
@@ -8861,7 +8895,7 @@ def _dir_entries(fd):
 		except FileNotFoundError:
 			continue
 		except OSError:
-			result.append((name, False))
+			result.append((name, None))
 	return result
 
 def _is_directory_now(name, dir_fd, exc):
@@ -8927,8 +8961,11 @@ def _remove_tree_fd(root, root_id, exclude=None, remove_files=False, rate_limite
 			child = os.path.join(path, entry)
 			if exclude and is_excluded(child, exclude):
 				continue
-			if is_dir:
-				subdirectories.append(entry)
+			if is_dir is None:
+				# Unknown: tried as a directory first (its open says ENOTDIR / ELOOP if it is none).
+				subdirectories.append((entry, True))
+			elif is_dir:
+				subdirectories.append((entry, False))
 			elif not remove_files:
 				left.append(child)
 			else:
@@ -8940,8 +8977,8 @@ def _remove_tree_fd(root, root_id, exclude=None, remove_files=False, rate_limite
 					pass
 				except OSError as e:
 					if _is_directory_now(entry, fd, e):
-						# A directory now (it changed since it was read, or its type was unknown): removed as one.
-						subdirectories.append(entry)
+						# A directory now (it changed since it was read): removed as one.
+						subdirectories.append((entry, False))
 					else:
 						errors.append((child, e))
 		stack.append([fd, path, subdirectories, 0, name])
@@ -8951,14 +8988,28 @@ def _remove_tree_fd(root, root_id, exclude=None, remove_files=False, rate_limite
 		while stack:
 			frame = stack[-1]
 			if frame[3] < len(frame[2]):
-				entry = frame[2][frame[3]]
+				entry, unknown = frame[2][frame[3]]
 				frame[3] += 1
 				try:
 					fd = os.open(entry, _BELOW_FLAGS, dir_fd=frame[0])
 				except FileNotFoundError:
 					continue
 				except OSError as e:
-					errors.append((os.path.join(frame[1], entry), e))
+					child = os.path.join(frame[1], entry)
+					if not (unknown and e.errno in (errno.ENOTDIR, errno.ELOOP)):
+						errors.append((child, e))
+					elif not remove_files:
+						left.append(child)
+					else:
+						# No directory after all (a file or a symlink): unlinked.
+						_file_list_rate_limit(rate_limiter)
+						try:
+							os.unlink(entry, dir_fd=frame[0])
+							removed += 1
+						except FileNotFoundError:
+							pass
+						except OSError as unlink_error:
+							errors.append((child, unlink_error))
 					continue
 				enter(fd, os.path.join(frame[1], entry), entry)
 				continue
@@ -8980,6 +9031,26 @@ def _remove_tree_fd(root, root_id, exclude=None, remove_files=False, rate_limite
 		while stack:
 			os.close(stack.pop()[0])
 	return removed, left, errors
+
+# (shared count, start time, files per second) in a -pfl pool's workers under -F (_init_rate_share)
+_RATE_SHARE = None
+
+def _init_rate_share(counter, start_time, limit):
+	"""Pool initializer for -pfl under -F: the jobs take their unlink slots from one shared counter."""
+	global _RATE_SHARE
+	_RATE_SHARE = (counter, start_time, limit)
+
+def _shared_rate_wait():
+	"""-F across pool jobs: take the next slot of the shared count and sleep until its time (a no-op without -F)."""
+	if _RATE_SHARE is None:
+		return
+	counter, start_time, limit = _RATE_SHARE
+	with counter.get_lock():
+		counter.value += 1
+		slot = counter.value
+	wait = slot / limit - (time.monotonic() - start_time)
+	if wait > 0:
+		time.sleep(wait)
 
 def _remove_directory_entries(path, expected_id, exclude=None):
 	"""Worker body for the parallel plain -rm (-pfl): unlink the entries of directory path that are no directories,
@@ -9005,14 +9076,20 @@ def _remove_directory_entries(path, expected_id, exclude=None):
 			child = os.path.join(path, name)
 			if exclude and is_excluded(child, exclude):
 				continue
-			if is_dir:
+			if is_dir or is_dir is None:
 				try:
 					child_st = os.stat(name, dir_fd=fd, follow_symlinks=False)
 				except FileNotFoundError:
 					continue
+				except OSError as exc:
+					_report_unremoved(child, exc)
+					continue
 				if stat.S_ISDIR(child_st.st_mode):
 					subdirectories.append((child, (child_st.st_dev, child_st.st_ino)))
-				continue
+					continue
+				if is_dir:
+					continue
+			_shared_rate_wait()
 			try:
 				os.unlink(name, dir_fd=fd)
 				removed += 1
@@ -9036,30 +9113,30 @@ def _remove_directory_entries(path, expected_id, exclude=None):
 
 def _remove_trees_parallel(trees, max_workers, exclude=None, rate_limiter=None):
 	"""-pfl: empty the directories of trees ([(root, its identity)]) in pool jobs, one directory each
-	(_remove_directory_entries), queueing the subdirectories each job reports. With rate_limiter (-F), a job is only
-	queued while the entries unlinked so far are within the limit, as get_file_list_parallel paces its listing. Returns
-	the entries unlinked; the directories themselves are left for _remove_tree_fd."""
+	(_remove_directory_entries), queueing the subdirectories each job reports. With rate_limiter (-F), the jobs pace
+	each unlink from one shared count (_shared_rate_wait), and the count carries on into the walk after. Returns the
+	entries unlinked; the directories themselves are left for _remove_tree_fd."""
 	queue = deque(trees)
 	futures = {}
 	removed = 0
-	def under_limit():
-		return not rate_limiter or rate_limiter['count'] <= rate_limiter['limit'] * (time.monotonic() - rate_limiter['start_time'])
-	with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
+	pool = {}
+	if rate_limiter:
+		# Every job paces each unlink from one shared count (a wide directory too, not just the queueing of jobs).
+		counter = multiprocessing.Value('d', rate_limiter['count'])
+		pool = dict(initializer=_init_rate_share, initargs=(counter, rate_limiter['start_time'], rate_limiter['limit']))
+	with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers, **pool) as executor:
 		while queue or futures:
-			while queue and len(futures) < max_workers * 2 and under_limit():
+			while queue and len(futures) < max_workers * 2:
 				path, identity = queue.popleft()
 				futures[_submit_task(executor, _remove_directory_entries, path, identity, exclude)] = path
-			if not futures:
-				time.sleep(0.05)
-				continue
-			done, _ = concurrent.futures.wait(futures, timeout=0.1, return_when=concurrent.futures.FIRST_COMPLETED)
+			done, _ = concurrent.futures.wait(futures, return_when=concurrent.futures.FIRST_COMPLETED)
 			for future in done:
 				futures.pop(future)
 				count, subdirectories = _task_result(future, (0, []), 'Remove process exception')
 				removed += count
-				if rate_limiter:
-					rate_limiter['count'] += count
 				queue.extend(subdirectories)
+	if rate_limiter:
+		rate_limiter['count'] = counter.value
 	return removed
 
 def _rmdir_below(root, root_id, rel):
@@ -9118,13 +9195,14 @@ def remove_moved_sources(src_paths, file_list, sym_links, single_thread=False, m
 			if parent == candidate:
 				return found
 			candidate = parent
-	listed = []
-	for path in sorted(set(file_list) | set(sym_links or ())):
+	pairs = []
+	for path in set(file_list) | set(sym_links or ()):
 		if not os.path.isabs(path):
 			path = os.path.abspath(path)
 		root = outermost_root(path)
 		if root is not None:
-			listed.append((root, root_ids[root], '.' if path == root else path[len(root.rstrip(os.sep)) + 1:]))
+			pairs.append((path, root))
+	listed = _items_below(pairs, {root: (root, root_ids[root], root_ids[root]) for root in roots})
 	print(f"Removing the {len(listed)} files and links copied from {pformat(roots)} with {max_workers if not single_thread else '1'} workers")
 	if not remove_force:
 		if not sys.stdin.isatty():
@@ -10044,6 +10122,8 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = multipr
 			_get_file_list_cache.clear()
 			# What each source is before the copy reads it: a move removes nothing below a source replaced since.
 			source_ids = _source_identities(src_paths)
+			# -rme cleans the destinations the copy writes: pinned now, checked before -rme (_checked_destination_roots).
+			pinned_dest_roots = _destination_roots(dests) if remove_extra else None
 			copy_error_start = len(ERRORS)
 			total_file_list, total_sym_links = process_copy(src_paths, dests, single_thread=single_thread, max_workers=max_workers,
 																			verbose=verbose, directory_only=directory_only,no_directory_sync=no_directory_sync,
@@ -10064,11 +10144,12 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = multipr
 					'fix them (or exclude those paths with -e) and re-run')
 			elif remove_extra:
 				print('-'*80)
+				dest_roots = _checked_destination_roots(dests, pinned_dest_roots)
 				remove_extra_files(total_file_list, dests,max_workers,verbose,files_per_job,single_thread,exclude=exclude,parallel_file_listing=parallel_file_listing,src_paths=src_paths,sym_links=total_sym_links,
-					dest_image=bool(dest_image),keep=link_targets)
+					dest_image=bool(dest_image),keep=link_targets,dest_roots=dest_roots)
 				print('-'*80)
 				print("Removing extra directories...")
-				remove_extra_dirs(src_paths, dests,exclude=exclude,dest_image=bool(dest_image),keep=link_targets)
+				remove_extra_dirs(src_paths, dests,exclude=exclude,dest_image=bool(dest_image),keep=link_targets,dest_roots=dest_roots)
 			print('-'*80)
 			if len(src_paths) > 1:
 				print("Overall Summary:")

@@ -357,3 +357,128 @@ def test_remove_extra_never_unlinks_the_target_of_a_destination_that_is_a_symlin
 		hpcp_mod.remove_extra_files([], [str(dst)], 2, False, 1, single_thread=True, src_paths=[str(src) + os.sep])
 	assert (tmp_path / 'victim.txt').read_text() == 'not yours'
 	assert not os.path.lexists(dst)
+
+
+# ---- 9.74: re-review of 418ca7e..HEAD ----
+
+@pytest.mark.parametrize('dest', ['data', '.'])
+def test_legacy_remove_extra_with_a_bare_relative_destination_removes_the_extras(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch, dest):
+	"""`hpcp data -fl list -rme`: dirname('data') is '', and the fallback to '/' put every extra under / (9.73 removed
+	'/data/extra'; 9.74 refused them all). The fallback is the CWD."""
+	work = tmp_path / 'work'
+	(work / 'data').mkdir(parents=True)
+	(work / 'data' / 'extra').write_text('extra')
+	monkeypatch.chdir(work if dest == 'data' else work / 'data')
+	_answer_yes(monkeypatch)
+	hpcp_mod.remove_extra_files(set(), [dest], 2, False, 1, single_thread=True)
+	assert not (work / 'data' / 'extra').exists()
+	assert [error for error in hpcp_mod.ERRORS if hpcp_mod._is_failure(error)] == []
+
+
+def test_remove_extra_refuses_a_destination_replaced_after_the_copy(tmp_path, hpcp_mod, reset_hpcp_globals, require_linux, monkeypatch):
+	"""Re-review: destinations were pinned when -rme started, after the copy. dst renamed away and replaced by a symlink
+	to the victim's home in between: -rme listed the victim and removed what the source lacks. Pinned before the copy,
+	a destination that now leads elsewhere is not cleaned."""
+	src, dst = tmp_path / 'src', tmp_path / 'dst'
+	src.mkdir()
+	(src / 'a.txt').write_text('a')
+	dst.mkdir()
+	(dst / 'stale.txt').write_text('stale')
+	victim = _victim(tmp_path)
+	real = hpcp_mod.create_sym_links
+	def create_sym_links(*args, **kwargs):
+		os.rename(str(dst), str(tmp_path / 'moved-away'))
+		os.symlink(str(victim), str(dst))
+		return real(*args, **kwargs)
+	monkeypatch.setattr(hpcp_mod, 'create_sym_links', create_sym_links)
+	_answer_yes(monkeypatch)
+	rc = hpcp_mod.hpcp([str(src) + os.sep], dest_paths=[str(dst) + os.sep], remove_extra=True, single_thread=True, batch=True)
+	assert _victim_intact(victim)
+	assert rc != 0
+	assert (tmp_path / 'moved-away' / 'a.txt').read_text() == 'a'
+
+
+def test_parallel_remove_paces_a_wide_directory(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	"""Re-review: -pfl gated only the queueing of jobs, so one directory of many files went at full speed. The jobs
+	share one counter: 100 files at -F 100 take about a second."""
+	import time
+	src = tmp_path / 'src'
+	(src / 'wide').mkdir(parents=True)
+	for number in range(100):
+		(src / 'wide' / ('f%d' % number)).write_text('x')
+	monkeypatch.setattr(hpcp_mod, 'FILES_RATE_LIMIT', 100)
+	start = time.monotonic()
+	hpcp_mod.process_remove([str(src)], single_thread=False, max_workers=2, parallel_file_listing=True, remove_force=True)
+	assert not src.exists()
+	assert time.monotonic() - start >= 0.8
+
+
+def test_serial_remove_extra_and_move_honour_the_file_rate_limit(tmp_path, hpcp_mod, reset_hpcp_globals, require_linux, monkeypatch):
+	calls = []
+	monkeypatch.setattr(hpcp_mod, 'FILES_RATE_LIMIT', 1000)
+	monkeypatch.setattr(hpcp_mod, '_file_list_rate_limit', lambda state, increment=1: calls.append(state is not None))
+	src, dst = tmp_path / 'src', tmp_path / 'dst'
+	src.mkdir()
+	(dst / 'sub').mkdir(parents=True)
+	for name in ('x1', 'x2', 'sub/x3'):
+		(dst / name).write_text('extra')
+	monkeypatch.setattr(sys.stdin, 'isatty', lambda: True)
+	# The listing is paced too (as in 9.73): count from the prompt on, the removal only.
+	monkeypatch.setattr('builtins.input', lambda: calls.clear() or 'y')
+	hpcp_mod.remove_extra_files([], [str(dst) + os.sep], 2, False, 1, single_thread=True, src_paths=[str(src) + os.sep])
+	assert calls == [True] * 3
+	calls.clear()
+	moved = tmp_path / 'moved'
+	(moved / 'sub').mkdir(parents=True)
+	files = [str(moved / 'a'), str(moved / 'sub' / 'b')]
+	for path in files:
+		open(path, 'w').close()
+	hpcp_mod.remove_moved_sources([str(moved)], files, {}, single_thread=True, remove_force=True,
+		root_ids=hpcp_mod._source_identities([str(moved)]))
+	assert calls == [True] * 2
+
+
+def test_rwloff_walk_is_paced_from_when_it_starts(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	"""The walk after -rwloff's listing must not inherit the listing's time as credit: 10 entries left for the walk
+	at -F 10 take about a second even after a slow listing."""
+	import time
+	src = tmp_path / 'src'
+	src.mkdir()
+	real = hpcp_mod.get_file_list
+	def slow_listing(*args, **kwargs):
+		result = real(*args, **kwargs)
+		time.sleep(1.2)
+		for number in range(10):
+			(src / ('late%d' % number)).write_text('x')
+		return result
+	monkeypatch.setattr(hpcp_mod, 'get_file_list', slow_listing)
+	monkeypatch.setattr(hpcp_mod, 'REMOVE_FILES_WHILE_LISTING', False)
+	monkeypatch.setattr(hpcp_mod, 'FILES_RATE_LIMIT', 10)
+	start = time.monotonic()
+	hpcp_mod.process_remove([str(src)], single_thread=False, max_workers=2, remove_force=True)
+	assert not src.exists()
+	# 1.2 s of listing, then about 0.9 s for the 10 paced unlinks (with the listing's time as credit: none).
+	assert time.monotonic() - start >= 1.2 + 0.7
+
+
+def test_move_second_pass_enters_a_directory_whose_type_check_failed(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	"""Re-review: an entry whose lstat failed (no d_type) was taken as a file: in a move's second pass a directory left
+	in place and named as unlisted. It is tried as a directory first."""
+	root = tmp_path / 'src'
+	(root / 'sub' / 'empty').mkdir(parents=True)
+	real = hpcp_mod._dir_entries
+	monkeypatch.setattr(hpcp_mod, '_dir_entries', lambda fd: [(name, None if name == 'sub' else is_dir) for name, is_dir in real(fd)])
+	_, left, errors = hpcp_mod._remove_tree_fd(str(root), hpcp_mod._path_identity(str(root)))
+	assert (left, errors) == ([], [])
+	assert not root.exists()
+
+
+def test_walk_unlinks_a_file_whose_type_check_failed(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	root = tmp_path / 'src'
+	root.mkdir()
+	(root / 'f.txt').write_text('x')
+	real = hpcp_mod._dir_entries
+	monkeypatch.setattr(hpcp_mod, '_dir_entries', lambda fd: [(name, None) for name, _ in real(fd)])
+	removed, left, errors = hpcp_mod._remove_tree_fd(str(root), hpcp_mod._path_identity(str(root)), remove_files=True)
+	assert (removed, left, errors) == (1, [], [])
+	assert not root.exists()
