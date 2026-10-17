@@ -2636,27 +2636,34 @@ def _special_file_kind(entry):
 			return kind
 	return None
 
-def _filesystem_boundary(listed_root, real_root, entries=None):
-	"""What -rme leaves alone below a destination, as rsync -x: (listed_root + sep, real_root + sep, the visible mount
-	points strictly below real_root (mountinfo, hidden mounts aside: bind mounts, of files too), real_root's device). A
-	listing given it skips those mount points and the directories on another device (a btrfs subvolume, a mount
-	mountinfo does not show), whole."""
+def _visible_mount_points(entries=None):
+	"""The mount points of mountinfo (entries) that path lookup reaches: a mount hidden under a later one is left out."""
 	entries = _mountinfo_entries() if entries is None else entries
 	hidden = _hidden_mounts(entries)
+	return frozenset(entry['mount_point'] for index, entry in enumerate(entries) if index not in hidden)
+
+def _filesystem_boundary(listed_root, real_root, visible=None):
+	"""What -rme leaves alone below a destination, as rsync -x: (the visible mount points strictly below real_root,
+	spelled as a listing of listed_root names them (the destination as given: 'dst/share' for 'dst/'), real_root's
+	device, None on Windows, whose DirEntry.stat reports no device). A listing given it skips those mount points (bind
+	mounts, of files too) and the directories on another device (a btrfs subvolume, a mount mountinfo does not show)."""
+	visible = _visible_mount_points() if visible is None else visible
 	real_prefix = real_root.rstrip(os.sep) + os.sep
-	points = frozenset(entry['mount_point'] for index, entry in enumerate(entries)
-		if index not in hidden and entry['mount_point'].startswith(real_prefix))
-	try:
-		device = os.stat(real_root).st_dev
-	except OSError:
-		device = None
-	return (listed_root.rstrip(os.sep) + os.sep, real_prefix, points, device)
+	listed_prefix = os.path.join(listed_root, '')
+	points = frozenset(listed_prefix + point[len(real_prefix):] for point in visible if point.startswith(real_prefix))
+	device = None
+	if os.name != 'nt':
+		try:
+			device = os.stat(real_root).st_dev
+		except OSError:
+			pass
+	return (points, device)
 
 def _across_boundary(path, boundary, is_dir, entry=None):
-	"""True when path (below the boundary's listed root) is a mount point of the boundary, or a directory on another
-	device (from entry, a DirEntry: a stat; else an lstat)."""
-	listed_prefix, real_prefix, points, device = boundary
-	if points and path.startswith(listed_prefix) and (real_prefix + path[len(listed_prefix):]) in points:
+	"""True when path (as the listing names it) is a mount point of the boundary (a string lookup, nothing stat'ed), or a
+	directory on another device (from entry, a DirEntry: a stat; else an lstat)."""
+	points, device = boundary
+	if path in points:
 		return True
 	if is_dir and device is not None:
 		try:
@@ -8162,11 +8169,11 @@ def remove_extra_dirs(src_paths, dests,exclude=None,dest_image=False,keep=(),des
 	if dest_roots is None:
 		dest_roots = _destination_roots(dests)
 	dests = [dest for dest in dests if os.path.abspath(dest) in dest_roots]
-	mount_entries = _mountinfo_entries()
+	visible_mounts = _visible_mount_points()
 	print(pformat(dests))
 	for dest in dests:
 		# Another filesystem below it (a mount or bind mount, another device), as remove_extra_files' listing.
-		boundary = _filesystem_boundary(os.path.abspath(dest), dest_roots[os.path.abspath(dest)][0], mount_entries)
+		boundary = _filesystem_boundary(dest, dest_roots[os.path.abspath(dest)][0], visible_mounts)
 		for dirpath, dirnames, _ in os.walk(dest):
 			walk_into = []
 			for dirname in dirnames:
@@ -8176,9 +8183,13 @@ def remove_extra_dirs(src_paths, dests,exclude=None,dest_image=False,keep=(),des
 				if exclude and (is_excluded(dest_dir_path,exclude) or _excluded_at_source(os.path.abspath(dest_dir_path), mapping, exclude, parents_checked=True, excluded_roots=excluded_roots)):
 					print(f"Skipping excluded directory: {dest_dir_path}")
 					continue
+				# A mount point first, by name (an lstat of it would reach the mounted filesystem: a dead NFS server hangs).
+				if dest_dir_path in boundary[0]:
+					print(f"Skipping mount point: {dest_dir_path}")
+					continue
 				if os.path.islink(dest_dir_path):
 					continue
-				if _across_boundary(os.path.abspath(dest_dir_path), boundary, True):
+				if _across_boundary(dest_dir_path, boundary, True):
 					# Another filesystem: never walked into, so nothing in it is removed.
 					print(f"Skipping mount point: {dest_dir_path}")
 					continue
@@ -8349,7 +8360,7 @@ def remove_extra_files(total_file_list, dests,max_workers,verbose,files_per_job,
 		if dest_roots is None:
 			dest_roots = _destination_roots(dests)
 		dests = [dest for dest in dests if os.path.abspath(dest) in dest_roots]
-		mount_entries = _mountinfo_entries()
+		visible_mounts = _visible_mount_points()
 		# {extra path: the destination root it was listed below}
 		extra_roots = {}
 		src_entries = set(total_file_list) if total_file_list else set()
@@ -8366,7 +8377,7 @@ def remove_extra_files(total_file_list, dests,max_workers,verbose,files_per_job,
 				dest_abs_root = os.path.abspath(dest)
 				# A filesystem mounted below the destination is left alone, as rsync -x: not even listed.
 				dest_file_list, links, _, _ = get_file_list(dest, max_workers=max_workers, exclude=exclude, parallel_file_listing=parallel_file_listing,
-					boundary=_filesystem_boundary(dest_abs_root, dest_roots[dest_abs_root][0], mount_entries))
+					boundary=_filesystem_boundary(dest, dest_roots[dest_abs_root][0], visible_mounts))
 				actual = {os.path.abspath(p) for p in dest_file_list}
 				actual.update({os.path.abspath(p) for p in links})
 				# Only consider entries that actually live under this dest so we
@@ -8382,7 +8393,7 @@ def remove_extra_files(total_file_list, dests,max_workers,verbose,files_per_job,
 			for dest in dests:
 				listed_root = os.path.abspath(dest)
 				dest_file_list,links,_ ,_ = get_file_list(dest, max_workers=max_workers,exclude=exclude,parallel_file_listing=parallel_file_listing,
-					boundary=_filesystem_boundary(listed_root, dest_roots[listed_root][0], mount_entries))
+					boundary=_filesystem_boundary(dest, dest_roots[listed_root][0], visible_mounts))
 				dest_trimmed = trim_paths(dest_file_list,dest)
 				dest_trimmed.update(trim_paths(links,dest))
 				# trim_paths roots everything at os.path.dirname(dest); rebuild
@@ -8670,7 +8681,7 @@ def _same_or_inside(path, src):
 def _replaced(path):
 	return OSError(errno.ESTALE, 'it was replaced since the copy listed it', path)
 
-def _open_source_root(root, root_id, with_device=False):
+def _open_source_root(root, root_id):
 	"""A descriptor of the source root directory, opened from its parent with O_NOFOLLOW and checked against root_id (its
 	identity when the copy started): a root renamed away and replaced by a symlink or another directory raises (ELOOP,
 	ESTALE) instead of leading the removal into the replacement. The parent is opened by the path as given."""
@@ -8686,7 +8697,7 @@ def _open_source_root(root, root_id, with_device=False):
 	if root_id is None or (st.st_dev, st.st_ino) != tuple(root_id):
 		os.close(fd)
 		raise _replaced(root)
-	return (fd, st.st_dev) if with_device else fd
+	return fd
 
 def _parent_below(root, root_id, rel):
 	"""(descriptor or None, name, identity or None) for entry rel below the source root. The descriptor is rel's
@@ -8779,18 +8790,27 @@ def _remove_listed_files(items, rmdir=False, rate_limiter=None, one_filesystem=F
 				_unlink_failed(name, fd, path, exc)
 			elif exc.errno in (errno.ENOTEMPTY, errno.EEXIST):
 				print(f"Keeping non-empty directory: {path}")
-			elif exc.errno == errno.EBUSY:
+			elif exc.errno == errno.EBUSY and _is_mount_point(path):
 				# Mounted on since it was listed: another filesystem, left alone.
 				print(f"Keeping mount point: {path}")
 			else:
 				_report_rmdir_failed(path, exc)
 	fallback_devices = {}
+	fallback_foreign = {}
 	def foreign(root, rel):
-		"""Without descriptors: rel's directory is on another device than root (one_filesystem)."""
+		"""Without descriptors: a directory between root and rel is on another device than root (one_filesystem), as
+		the descriptor cursor checks each one it opens. Each directory is looked at once."""
 		try:
 			if root not in fallback_devices:
 				fallback_devices[root] = os.lstat(root).st_dev
-			return os.lstat(os.path.dirname(os.path.join(root, rel))).st_dev != fallback_devices[root]
+			path = root
+			for part in rel.split(os.sep)[:-1]:
+				path = os.path.join(path, part)
+				if path not in fallback_foreign:
+					fallback_foreign[path] = os.lstat(path).st_dev != fallback_devices[root]
+				if fallback_foreign[path]:
+					return True
+			return False
 		except OSError:
 			return False
 	def remove_one(root, root_id, rel):
@@ -8804,7 +8824,7 @@ def _remove_listed_files(items, rmdir=False, rate_limiter=None, one_filesystem=F
 		path = root if rel in ('', '.') else os.path.join(root, rel)
 		if e.errno in (errno.ENOTEMPTY, errno.EEXIST):
 			print(f"Keeping non-empty directory: {path}")
-		elif e.errno == errno.EBUSY:
+		elif e.errno == errno.EBUSY and _is_mount_point(path):
 			print(f"Keeping mount point: {path}")
 		else:
 			_report_rmdir_failed(path, e)
@@ -8843,8 +8863,9 @@ def _remove_listed_files(items, rmdir=False, rate_limiter=None, one_filesystem=F
 				current_root = None
 				shown = None
 				try:
-					root_fd, root_dev = _open_source_root(root, root_id, with_device=True)
-					stack.append((None, root_fd))
+					stack.append((None, _open_source_root(root, root_id)))
+					if one_filesystem:
+						root_dev = os.fstat(stack[0][1]).st_dev
 				except OSError as exc:
 					refused = (root, [])
 					if not isinstance(exc, FileNotFoundError):
@@ -8860,7 +8881,13 @@ def _remove_listed_files(items, rmdir=False, rate_limiter=None, one_filesystem=F
 			try:
 				for part in parent[depth:]:
 					fd = os.open(part, _BELOW_FLAGS, dir_fd=stack[-1][1])
-					if one_filesystem and os.fstat(fd).st_dev != root_dev:
+					if one_filesystem:
+						try:
+							device = os.fstat(fd).st_dev
+						except OSError:
+							os.close(fd)
+							raise
+					if one_filesystem and device != root_dev:
 						# Another device below the root (one the listing did not see): not entered, closed now.
 						os.close(fd)
 						refused = (root, parent[:len(stack)])

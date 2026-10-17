@@ -244,3 +244,95 @@ def test_fallback_removal_stops_at_another_device(tmp_path, hpcp_mod, reset_hpcp
 		assert (dst / 'mnt' / 'x.txt').exists() and (dst / 'mnt' / 'sub' / 'y.txt').exists()
 	assert not (dst / 'stale.txt').exists()
 	assert _failures(hpcp_mod) == []
+
+
+# ---- 9.75: re-review of 127f141..HEAD ----
+
+@pytest.mark.parametrize('dest', ['dst/', './dst/', 'x/../dst/'])
+def test_remove_extra_with_a_relative_destination_leaves_a_bind_mount_below_it(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch, dest):
+	"""Re-review: the listing names entries as the destination was typed ('dst/share'), the mount points were absolute:
+	a bind mount of the same filesystem below a relative destination was listed and its files removed."""
+	(tmp_path / 'src').mkdir()
+	(tmp_path / 'dst').mkdir()
+	(tmp_path / 'x').mkdir()
+	(tmp_path / 'dst' / 'stale.txt').write_text('stale')
+	other = tmp_path / 'other'
+	other.mkdir()
+	with _mounted(tmp_path / 'dst' / 'share', bind_source=other):
+		_fill(tmp_path / 'dst' / 'share')
+		monkeypatch.chdir(tmp_path)
+		_answer_yes(monkeypatch)
+		hpcp_mod.remove_extra_files([], [dest], 2, False, 1, single_thread=True, src_paths=['src/'])
+		hpcp_mod.remove_extra_dirs(['src/'], [dest])
+		assert (other / 'x.txt').read_text() == 'other filesystem' and (other / 'sub' / 'empty').is_dir()
+	assert not (tmp_path / 'dst' / 'stale.txt').exists()
+	assert _failures(hpcp_mod) == []
+
+
+def test_remove_extra_dirs_does_not_stat_into_a_mount_point(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	"""Re-review: an lstat (islink) of a mount point goes to the mounted filesystem: a dead NFS server hangs it. The
+	mountinfo check, a string lookup, comes first."""
+	src, dst = tmp_path / 'src', tmp_path / 'dst'
+	src.mkdir()
+	dst.mkdir()
+	with _mounted(dst / 'nfs'):
+		looked_at = []
+		real_islink, real_lstat = os.path.islink, os.lstat
+		monkeypatch.setattr(hpcp_mod.os.path, 'islink', lambda path: looked_at.append(os.path.abspath(path)) or real_islink(path))
+		monkeypatch.setattr(hpcp_mod.os, 'lstat', lambda path, *a, **k: looked_at.append(os.path.abspath(path)) or real_lstat(path, *a, **k))
+		hpcp_mod.remove_extra_dirs([str(src) + os.sep], [str(dst) + os.sep])
+		assert str(dst / 'nfs') not in looked_at
+
+
+def test_no_device_boundary_on_windows(tmp_path, hpcp_mod, monkeypatch):
+	"""Re-review: DirEntry.stat reports st_dev 0 on Windows (os.stat the volume serial): every directory looked foreign."""
+	monkeypatch.setattr(hpcp_mod.os, 'name', 'nt')
+	boundary = hpcp_mod._filesystem_boundary(str(tmp_path), str(tmp_path), visible=frozenset())
+	assert boundary[-1] is None
+
+
+def test_cursor_closes_a_directory_whose_fstat_failed(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	root = tmp_path / 'dst'
+	(root / 'sub').mkdir(parents=True)
+	(root / 'sub' / 'f').write_text('x')
+	real_fstat = os.fstat
+	calls = []
+	def fstat(fd):
+		calls.append(fd)
+		if len(calls) == 3:
+			raise OSError(116, 'Stale file handle')
+		return real_fstat(fd)
+	before = len(os.listdir('/proc/self/fd'))
+	monkeypatch.setattr(hpcp_mod.os, 'fstat', fstat)
+	hpcp_mod._remove_listed_files([(str(root), hpcp_mod._path_identity(str(root)), 'sub/f')], one_filesystem=True)
+	monkeypatch.setattr(hpcp_mod.os, 'fstat', real_fstat)
+	assert len(calls) >= 3
+	assert len(os.listdir('/proc/self/fd')) == before
+
+
+def test_fallback_backstop_checks_every_directory_above_the_entry(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	"""Re-review: root (dev A)/mnt is dev B, root/mnt/back a bind of a dev-A directory: the entry's parent is dev A, but
+	it lies below another filesystem. The descriptor cursor stops at mnt; the fallback must too."""
+	dst, other = tmp_path / 'dst', tmp_path / 'other'
+	dst.mkdir()
+	other.mkdir()
+	(other / 'f.txt').write_text('keep')
+	with _mounted(dst / 'mnt'):
+		with _mounted(dst / 'mnt' / 'back', bind_source=other):
+			monkeypatch.setattr(hpcp_mod, '_DIR_FD_WALK', False)
+			hpcp_mod._remove_items([(str(dst), hpcp_mod._path_identity(str(dst)), 'mnt/back/f.txt')], single_thread=True, one_filesystem=True)
+			assert (other / 'f.txt').read_text() == 'keep'
+
+
+def test_rmdir_ebusy_that_is_no_mount_point_is_an_error(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	"""Re-review: only a directory that is a mount point now is kept as one; another EBUSY (a FUSE server's) is reported."""
+	root = tmp_path / 'dst'
+	(root / 'extra').mkdir(parents=True)
+	real_rmdir = os.rmdir
+	def rmdir(path, *args, **kwargs):
+		if os.fspath(path) == 'extra':
+			raise OSError(16, 'Device or resource busy', 'extra')
+		return real_rmdir(path, *args, **kwargs)
+	monkeypatch.setattr(hpcp_mod.os, 'rmdir', rmdir)
+	hpcp_mod._remove_listed_files([(str(root), hpcp_mod._path_identity(str(root)), 'extra')], rmdir=True, one_filesystem=True)
+	assert [error.partition(':')[0] for error in _failures(hpcp_mod)] == ['Remove directory failed']
