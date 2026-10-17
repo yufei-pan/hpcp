@@ -13,6 +13,25 @@ This was a follow-up noted in 9.75: `get_file_list_serial`, the listing behind t
   - `shutil.rmtree` recursed before 3.13. It is replaced by `_rmtree`, which goes through the existing descriptor walk `_remove_tree_fd` and raises its first error. `_remove_entry`, used in patch building, and `delete_file_bulk` use it. `delete_file_bulk`'s exclude recursion goes through the same walk.
 - **Not changed:** `create_sym_links` recurses once per chain of nested tracked links, not per tree level; `_stable_fs_params` and the `-dd` nested `hpcp()` call are unrelated.
 
+## Review of the first version (local /code-review)
+
+Fixed, with tests:
+- **The descriptor walks held one directory descriptor per level** (`_remove_tree_fd`, and the removal cursor for moves and `-rme`). A tree deeper than the open-files limit (commonly 1024, and 256 on macOS) failed with EMFILE (reproduced). Both now hold at most 32 (`_WALK_FD_BUDGET`):
+  - the walk lets the shallowest go, keeping each one's identity, and reopens it through its child's `..`, checked against that identity; a directory moved meanwhile stops the walk with an error;
+  - the cursor reopens a released descriptor by name with `O_NOFOLLOW`, from the deepest one still held.
+
+  Ordinary trees never reach the budget, so they pay nothing extra.
+- **`delete_file_bulk`'s excludes were matched against absolute paths**, so relative patterns stopped protecting anything (reproduced). They are matched against the paths as the caller spelled them again. Every failure is recorded, and the function shares `_rmtree`.
+- **`_rmtree` keeps `shutil.rmtree`'s contract:** a missing path raises; a tree that is not gone raises with the full path. Parents are opened with `O_PATH`, so search permission is enough, as with `rmtree`; a mode-0333 drop box works as `nobody`.
+- **`_makedirs` follows `os.makedirs` step for step,** including `x/y/.`, the empty path, and a dangling symlink on the way.
+- **The listing gives each subdirectory one `lstat`** instead of `islink`, `isfile` and `isdir`. The root keeps its checks.
+
+Measured on FUSE, median of 5 alternating runs, 9.75 against 9.76:
+- listing: 0.299 s against 0.291 s;
+- plain `-rm`, serial: 0.810 s against 0.811 s;
+- whole `-rme`, serial: 0.875 s against 0.882 s;
+- whole `-rme`, 32 workers: 0.292 s against 0.290 s.
+
 ## Testing
 
 `tests/test_deep_trees.py` uses a 1,500-level tree. It covers:
@@ -21,6 +40,10 @@ This was a follow-up noted in 9.75: `get_file_list_serial`, the listing behind t
 - `-rme`;
 - plain `-rm` and a move, serial and with `-pfl`;
 - `build_entry_map` for `-diff`;
-- `_makedirs`' contract.
+- `_makedirs`' contract and its match with `os.makedirs`;
+- removal under an open-files limit of 256;
+- `delete_file_bulk` with relative excludes, and reporting every failure;
+- `_rmtree`'s contract and the drop box, as `nobody`;
+- one `lstat` per subdirectory.
 
 An autouse fixture removes the deep trees with `_rmtree` before pytest's own `shutil.rmtree` cleanup would recurse on them under Python older than 3.13. The file passes on Python 3.10, 3.11, 3.12, 3.13 and 3.14.
