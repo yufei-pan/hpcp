@@ -56,25 +56,49 @@ The 9.73 move helpers carry over:
 
 ## Performance
 
-Measured on the removal phase.
+Removal phase, 20,000 files in 900 directories.
 
-**Syscalls**, 20,000 files in 900 directories, single process:
+**Syscalls**, single process:
 
 | | 9.73 | 9.74 |
 |---|---|---|
 | plain `-rm` | 52.6k, of which 23.6k stats | 24.5k, of which 6 stats |
 | `-rme` | 44.5k | 25.4k |
 
-**FUSE (mergerfs)**, two runs, 9.73 against 9.74:
-- plain `-rm`, serial: 0.86–0.89 s against 0.81–0.82 s;
-- `-pfl`, 32 workers: 0.28–0.29 s against 0.25–0.26 s;
-- `-rwloff`, 32 workers: 0.54 s against 0.53–0.55 s;
-- `-rme`, serial: 0.63 s against 0.61–0.62 s;
-- `-rme`, 32 workers: 0.14 s in both.
+**FUSE (mergerfs)**, median of 5 to 7 alternating runs at normal load, 9.73 against 9.74:
 
-**tmpfs**, 50,000 files: plain `-rm` serial 0.16 s against 0.10 s; the other modes are equal or faster.
+| Mode | 9.73 | 9.74 |
+|---|---|---|
+| plain `-rm`, serial | 0.914 s | 0.822 s |
+| plain `-rm -pfl`, 32 workers | 0.291 s | 0.263 s |
+| plain `-rm -rwloff`, 32 workers | 0.549 s | 0.538 s |
+| `-rme`, serial | 0.621 s | 0.623 s |
+| `-rme`, 32 workers | 0.143 s | 0.142 s |
+
+`-rme` with 32 workers was 3% slower until `_items_below` stopped re-resolving the listed root for every entry.
+
+**tmpfs**, 50,000 files: plain `-rm` serial 0.16 s against 0.10 s.
 
 A test pins one open per directory and no `stat` per file.
+
+## Review of main..HEAD (local /code-review)
+
+Fixed, with tests:
+- **`-rme` into a symlinked destination (`link/`) removed nothing:** it was pinned with `lstat` and opened with `O_NOFOLLOW`. A destination as given is trusted, so its real path is pinned now (`_destination_roots`).
+  - The security review that followed found a gap: an extra equal to the destination itself (a destination replaced by a symlink to `/etc/shadow`) then resolved to the target. The destination itself is removed as the name given, pinned by `lstat`.
+- **Legacy `-fl -rme` with a relative destination dropped its extras silently.** `_items_below` now takes paths from the CWD, treats the root as `'.'`, and reports a path that is not below its root.
+- **Plain `-rm` ignored `-F`.** The walk now paces each unlink, and `-pfl` queues a job only while under the limit, as 9.73's paced listing did.
+- **`-pfl` recorded a false error for a directory too deep to open by path.** Such a directory is left to the descriptor walk.
+- **Type changes mid-walk:**
+  - an entry that became a directory is removed as one;
+  - a failing type check no longer skips its directory;
+  - without descriptor support, a symlink to a directory is unlinked.
+- **Without descriptor support, the root itself is no longer `root/.`,** which `rmdir` refuses with EINVAL. This also affected the move's fallback in 9.73.
+- **The listing cache is cleared after plain `-rm`, a move and `-rme`.**
+- **Shared helpers `_items_below` and `_remove_items` replace four copies.** `batch` is documented as implied.
+
+Declined:
+- **A single parallel pass for `-pfl`:** 9.73 also made two passes (a parallel listing, then `rmtree`), and 9.74 measured faster than it.
 
 ## Testing
 
