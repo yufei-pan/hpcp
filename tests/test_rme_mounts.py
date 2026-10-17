@@ -197,13 +197,13 @@ def test_a_directory_mounted_on_after_the_walk_is_kept_without_an_error(tmp_path
 	(dst / 'extra').mkdir(parents=True)
 	if os.geteuid() != 0:
 		pytest.skip('needs root to mount')
-	real_walk = os.walk
+	real_walk = hpcp_mod._walk
 	mounted = []
 	def walk(*args, **kwargs):
 		yield from real_walk(*args, **kwargs)
 		if not mounted and subprocess.run(['mount', '-t', 'tmpfs', 'hpcp-test', str(dst / 'extra')], capture_output=True).returncode == 0:
 			mounted.append(True)
-	monkeypatch.setattr(hpcp_mod.os, 'walk', walk)
+	monkeypatch.setattr(hpcp_mod, '_walk', walk)
 	try:
 		hpcp_mod.remove_extra_dirs([str(src) + os.sep], [str(dst) + os.sep])
 		assert mounted and (dst / 'extra').is_dir()

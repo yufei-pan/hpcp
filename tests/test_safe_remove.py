@@ -130,12 +130,14 @@ def test_remove_extra_dirs_never_follows_a_directory_swapped_after_the_walk(tmp_
 	src.mkdir()
 	(dst / 'extra' / 'empty').mkdir(parents=True)
 	victim = _victim(tmp_path)
-	real_walk = os.walk
+	real_walk = hpcp_mod._walk
 	def walk(*args, **kwargs):
 		yield from real_walk(*args, **kwargs)
 		_swap_for_a_symlink(dst / 'extra', victim)
-	monkeypatch.setattr(hpcp_mod.os, 'walk', walk)
+	monkeypatch.setattr(hpcp_mod, '_walk', walk)
 	hpcp_mod.remove_extra_dirs([str(src) + os.sep], [str(dst) + os.sep])
+	# The swap did happen (the hook ran): dst/extra is the symlink now, and nothing was removed through it.
+	assert os.path.islink(dst / 'extra')
 	assert _victim_intact(victim)
 
 
