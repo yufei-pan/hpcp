@@ -40,7 +40,30 @@ Fixed, with tests:
 
 Not changed: the shared listing (`get_file_list_serial`) recurses once per directory level, so a tree about 1,000 levels deep raises `RecursionError` in a copy too. This predates 9.75; the deep-tree test uses 600 levels.
 
+## Re-review of 127f141..HEAD (user: "re-review then release")
+
+Fixed, with tests:
+- **Relative destinations (reproduced).** The listing names entries as the destination was given (`dst/share` for `dst/`), but the boundary's mount points were absolute. Below a relative destination, a bind mount of the same filesystem was therefore listed, and its files removed. The boundary now spells the visible mount points as the listing does, computed once, so each check is a single set lookup with no string built per entry.
+- **No `stat` into a mount point.** `remove_extra_dirs` looks a directory up among the mount points before any `lstat` of it; an `lstat` of a mount point reaches the mounted filesystem, and a dead NFS server would hang.
+- **No device boundary on Windows**, where `DirEntry.stat` reports `st_dev` 0.
+- **The cursor closes a directory whose `fstat` failed.** `_open_source_root` again returns only a descriptor.
+- **The no-descriptor fallback checks every directory above the entry**, as the cursor does.
+- **An rmdir EBUSY is treated as a kept mount point only when the directory is one now** (`_is_mount_point`); any other EBUSY is still an error.
+- **Hidden mounts are worked out once per call.**
+
+Deferred:
+- **An NFSv4 submount (crossmnt or referral) that is not mounted yet** has its parent's device and is not in mountinfo, so it passes the boundary until the listing enters it. Its entries can be offered at the prompt; the backstop then keeps them, with a note, and nothing is removed. Catching it before the prompt needs a descriptor-based listing.
+
 ## Performance
+
+Final measurements after the re-review, FUSE, median of 5 alternating runs, 9.74 against 9.75:
+- whole `-rme` call, serial: 0.991 s against 0.869 s;
+- whole `-rme` call, 32 workers: 0.509 s against 0.291 s;
+- deletion phase alone, serial: 0.625 s against 0.739 s.
+
+The deletion phase got slower, but the whole call got faster. 9.74's listing `stat`ed every file, and that warmed the lookup cache its unlinks then used. The boundary listing takes no sizes, so each file's first touch is its unlink. A 9.75 copy whose listing still takes sizes deletes in 0.627 s, level with 9.74. The `stat` per file saved in the listing costs more than the lookup moved into the deletion; on Lustre a file `stat` also asks the storage servers for the size.
+
+### Earlier measurements
 
 Whole `-rme` call (listing, prompt and deletion), 20,000 files in 900 directories on FUSE, median of 7 alternating runs, 9.74 against 9.75:
 - serial: 1.012 s against 0.895 s;
