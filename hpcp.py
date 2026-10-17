@@ -8811,18 +8811,22 @@ def _items_below(pairs, roots, sort=True):
 	the name given, never resolved. A path not below its root (it cannot be) is reported, not removed. With sort, in
 	path order (neighbours share their directories' descriptors)."""
 	items = []
+	# Per listed root (a few): its absolute path, prefix and roots entry.
+	known = {}
 	for path, listed_root in pairs:
+		root_info = known.get(listed_root)
+		if root_info is None:
+			absolute = os.path.abspath(listed_root)
+			root_info = known[listed_root] = (absolute, absolute.rstrip(os.sep) + os.sep, roots[absolute])
+		absolute, prefix, entry = root_info
 		if not os.path.isabs(path):
 			path = os.path.abspath(path)
-		listed_root = os.path.abspath(listed_root)
-		prefix = listed_root.rstrip(os.sep) + os.sep
-		entry = roots[listed_root]
-		if path == listed_root:
-			items.append((listed_root, entry[2] if len(entry) > 2 else entry[1], '.'))
-		elif path.startswith(prefix):
+		if path.startswith(prefix):
 			items.append((entry[0], entry[1], path[len(prefix):]))
+		elif path == absolute:
+			items.append((absolute, entry[2] if len(entry) > 2 else entry[1], '.'))
 		else:
-			eprint(f'Remove process exception: not removing {path}: it is not below {listed_root}')
+			eprint(f'Remove process exception: not removing {path}: it is not below {absolute}')
 	if sort:
 		items.sort(key=lambda item: (item[0], item[2]))
 	return items
