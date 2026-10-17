@@ -2653,8 +2653,9 @@ def _walk(top, device=None, foreign=None):
 	"""os.walk(top) top-down, symlinks to directories listed but not entered, unreadable directories skipped, without
 	recursion (os.walk recursed once per level before Python 3.12). The caller may prune dirnames in place. With
 	device (-rme), each directory below top is opened as it is entered (_enter_directory, which refuses a symlink) and
-	one then on another device (a filesystem mounted on entering it: an NFSv4 submount, an automount) is not walked;
-	foreign, when given, is called with its path. Each is read through its descriptor (_scan_target)."""
+	one then on another device (a filesystem mounted on entering it: an NFSv4 submount, an automount; or, not opened,
+	by its lstat) is not walked; foreign, when given, is called with its path. Each is read through its descriptor
+	(_scan_target), and a symlink is among the filenames (its d_type: no lstat)."""
 	enter = device is not None
 	pending = [top]
 	while pending:
@@ -2664,15 +2665,27 @@ def _walk(top, device=None, foreign=None):
 		try:
 			if enter:
 				# top is the destination (its device is device): opened, not checked.
-				fd = os.open(dirpath, _DIRECTORY_FLAGS) if dirpath is top else _enter_directory(dirpath, device)
-				if fd is None:
-					if foreign is not None:
-						foreign(dirpath)
-					continue
-			with os.scandir(_scan_target(fd, dirpath) if fd is not None else dirpath) as entries:
+				if dirpath is top:
+					fd = os.open(dirpath, _DIRECTORY_FLAGS)
+				else:
+					try:
+						fd = _enter_directory(dirpath, device)
+					except OSError:
+						# Not opened (EACCES, EIO, a mount that failed): its device as lstat says, as before 9.77.
+						if foreign is not None and _lstat_device(dirpath) not in (None, device):
+							foreign(dirpath)
+						continue
+					if fd is None:
+						if foreign is not None:
+							foreign(dirpath)
+						continue
+			target = _scan_target(fd, dirpath) if fd is not None else dirpath
+			if target is None:
+				continue
+			with os.scandir(target) as entries:
 				for entry in entries:
 					try:
-						is_dir = entry.is_dir()
+						is_dir = entry.is_dir(follow_symlinks=not enter)
 					except OSError:
 						is_dir = False
 					(dirnames if is_dir else filenames).append(entry.name)
@@ -2721,6 +2734,13 @@ def _scan_dir(root, label=None):
 
 # A directory opened to be listed, as given ('link/' is the link's target).
 _DIRECTORY_FLAGS = os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0) | getattr(os, 'O_CLOEXEC', 0)
+
+def _lstat_device(path):
+	"""path's st_dev as lstat says (a filesystem mounted on entering it not mounted yet: its parent's), or None."""
+	try:
+		return os.lstat(path).st_dev
+	except OSError:
+		return None
 
 def _enter_directory(path, device):
 	"""A descriptor of directory path opened as a listing enters it, or None when it is then on another device than
@@ -2849,7 +2869,11 @@ def get_file_list_serial(root,exclude=None,append_hash=False,full_hash=False,rec
 				eprint(f'Listing error: {current}: {enter_error}')
 				continue
 		try:
-			for entry in _scan_dir(_scan_target(scan_fd, current) if scan_fd is not None else current, current):
+			target = _scan_target(scan_fd, current) if scan_fd is not None else current
+			if target is None:
+				eprint(f'Listing error: {current}: it was replaced since it was opened')
+				continue
+			for entry in _scan_dir(target, current):
 				path = os.path.join(current, entry.name) if scan_fd is not None else entry.path
 				# update the progress bar every 0.5 seconds
 				currentTime = time.monotonic()
@@ -2937,6 +2961,8 @@ def get_file_list_parallel(path,max_workers=56,exclude=None,append_hash=False,fu
 		futures = {}
 		listing_start_time = time.monotonic()
 		listed_items = len(file_list) + len(link_list)
+		# A folder's listing that crashed (this default): its folder stays, as before 9.77.
+		no_result = (frozenset(), frozenset(), 0, frozenset())
 		with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
 			while folders_to_expand or futures:
 				under_rate_limit = (
@@ -2968,11 +2994,11 @@ def get_file_list_parallel(path,max_workers=56,exclude=None,append_hash=False,fu
 				done, _ = concurrent.futures.wait(futures, return_when=concurrent.futures.FIRST_COMPLETED)
 				for doneTask in done:
 					folder_path = futures.pop(doneTask)
-					dir_file_list, dir_link_list, dir_size, dir_folder_list = _task_result(
-						doneTask, (frozenset(), frozenset(), 0, frozenset()), 'Listing error')
-					if folder_path not in dir_folder_list:
+					result = _task_result(doneTask, no_result, 'Listing error')
+					dir_file_list, dir_link_list, dir_size, dir_folder_list = result
+					if result is not no_result and folder_path not in dir_folder_list:
 						# Its listing did not list it as a directory (another filesystem once entered, -rme; a link or
-						# a file since; an error): not a folder, as in a serial listing.
+						# a file since; one too long): not a folder, as in a serial listing.
 						folder_list.discard(folder_path)
 					file_list.update(dir_file_list)
 					link_list.update(dir_link_list)
@@ -8317,10 +8343,19 @@ def remove_extra_dirs(src_paths, dests,exclude=None,dest_image=False,keep=(),des
 	for dest in dests:
 		# Another filesystem below it (a mount or bind mount, another device), as remove_extra_files' listing.
 		boundary = _filesystem_boundary(dest, dest_roots[os.path.abspath(dest)][0], visible_mounts)
+		dest_root = os.path.abspath(dest)
+		dest_prefix = dest_root.rstrip(os.sep) + os.sep
+		def keep_holding(path):
+			# Another filesystem is in it: it, and the directories holding it, are not extra (up to the destination,
+			# '/' too: dirname('/') is '/').
+			path = os.path.abspath(path)
+			while path != dest_root and path.startswith(dest_prefix):
+				extraDirs.pop(path, None)
+				path = os.path.dirname(path)
 		def entered_elsewhere(path):
 			# A filesystem mounted on entering it (an NFSv4 submount, an automount): not walked, and not extra.
 			print(f"Skipping mount point: {path}")
-			extraDirs.pop(os.path.abspath(path), None)
+			keep_holding(path)
 		for dirpath, dirnames, _ in _walk(dest, device=boundary[1], foreign=entered_elsewhere):
 			walk_into = []
 			for dirname in dirnames:
@@ -8333,9 +8368,11 @@ def remove_extra_dirs(src_paths, dests,exclude=None,dest_image=False,keep=(),des
 				# A mount point first, by name (an lstat of it would reach the mounted filesystem: a dead NFS server hangs).
 				if dest_dir_path in boundary[0]:
 					print(f"Skipping mount point: {dest_dir_path}")
+					keep_holding(dest_dir_path)
 					continue
-				# Another filesystem by device: the walk checks it as it enters it (entered_elsewhere).
-				if os.path.islink(dest_dir_path):
+				# Another filesystem by device: the walk checks it as it enters it (entered_elsewhere). A symlink is
+				# among the walk's filenames then (its d_type); without a device boundary (Windows), among dirnames.
+				if boundary[1] is None and os.path.islink(dest_dir_path):
 					continue
 				if dirname == 'lost+found' and os.path.ismount(dirpath):
 					# The filesystem's own (fsck's recovered orphans go there): not part of any copy.
@@ -9204,13 +9241,17 @@ _PROC_FD = not _SCANDIR_FD and os.path.isdir('/proc/self/fd')
 
 def _scan_target(fd, path):
 	"""What os.scandir reads directory descriptor fd (open on directory path) through: fd itself; else /proc/self/fd/N
-	(Python 3.6 on Linux); else path, so a directory swapped in there since the open is read instead (the descriptor,
-	still held, keeps an automount there mounted)."""
+	(Python 3.6 on Linux); else path while it still names the directory held (one stat; the descriptor, still held,
+	keeps an automount there mounted), None when it no longer does (swapped since the open, for a symlink say)."""
 	if _SCANDIR_FD:
 		return fd
 	if _PROC_FD:
 		return '/proc/self/fd/%d' % fd
-	return path
+	try:
+		held, named = os.fstat(fd), os.stat(path)
+	except OSError:
+		return None
+	return path if (held.st_dev, held.st_ino) == (named.st_dev, named.st_ino) else None
 
 def _destination_roots(dests):
 	"""{abspath(dest): (its real path, that path's _path_identity, dest's own identity)} for -rme: what lies below a
@@ -10754,9 +10795,10 @@ def _escape_unencodable_stdout():
 	except AttributeError:
 		pass
 	# Python 3.6 has no reconfigure: the same buffer through a new wrapper, which holds no text of its own.
+	# Only a genuine TextIOWrapper (a tee or logging proxy in its place is left alone: it would be bypassed).
 	import io
 	stdout = sys.stdout
-	if getattr(stdout, 'buffer', None) is None or getattr(stdout, 'errors', None) != 'strict':
+	if type(stdout) is not io.TextIOWrapper or stdout.errors != 'strict':
 		return
 	try:
 		stdout.flush()

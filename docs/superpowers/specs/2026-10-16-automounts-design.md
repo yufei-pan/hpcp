@@ -44,3 +44,44 @@ A local review of `main..1504353` gave nine findings. They are fixed, each with 
 5. **A double device check in `remove_extra_dirs`**, gone with 1.
 6. and 7. **One helper:** `_enter_directory` (a descriptor, or None) with `_BELOW_FLAGS`, which now shares `_DIRECTORY_FLAGS`.
 8. **The fallback without `scandir` on a descriptor** is now tested.
+
+## Python 3.6 to 3.9
+
+`setup.py` promises Python 3.6 or newer, but 9.74 to 9.76 had been tested only on 3.10 and newer. The whole suite now runs on 3.6.15 (the official build), 3.7.17, 3.8, 3.9 and 3.10 to 3.14. The runs found:
+
+- **`-rm -pfl -F` raised a TypeError on 3.6.** It passed `ProcessPoolExecutor` an `initializer`, which 3.6 lacks. On 3.6 the workers inherit the shared rate count instead: they fork at the first submit.
+- **The 9.77 checks did not run on 3.6.** Its `scandir` takes no descriptor, so the listing and the walk fell back to 9.76's checks made before entering. Every directory is now entered on every Python. One held open is read through `_scan_target`:
+  - the descriptor itself;
+  - else `/proc/self/fd/N` (Linux), which is the open directory itself, looked up without its path;
+  - else its path, while it still names the held directory.
+- **On 3.6, `_dir_entries` stat'ed every entry** (since 9.74; a round trip each on Lustre). `/proc/self/fd/N` gives `d_type`.
+- **`get_args`' fallback parsed `sys.argv`, not the `args` it was given.** It runs where `parse_intermixed_args` is missing (3.6).
+- **`stdout.reconfigure` is 3.7+.** On 3.6 a name with non-UTF-8 bytes ended the run at its first print. A genuine `TextIOWrapper` stdout is rewrapped with `backslashreplace` instead.
+
+Test-only changes:
+- a `scan_mode` fixture runs the descriptor-read tests all three ways;
+- on 3.6, the tests' own `subprocess.run` calls get `capture_output` and `text` translated;
+- the two `mp_context` tests skip below 3.7;
+- the disk-lock checks wait out udev's brief shared lock (a flake seen once in six runs).
+
+## Re-review
+
+A review of `1504353..499c981` gave seven findings. Six are fixed, each with a test that failed first:
+
+1. **A directory on another device that the walk could not open stayed extra** (EACCES, EIO, a mount that failed). An empty btrfs subvolume, which is not a mount point, would have been given an `rmdir`. One not opened is now checked by its `lstat`, as in 9.76; this costs nothing when the open succeeds.
+2. **The 3.6 stdout rewrap also replaced a tee or logging proxy** without `reconfigure` on 3.7+. Now only a genuine `TextIOWrapper` is rewrapped.
+3. **The directories holding a mount point were offered too, then kept as non-empty.** A mount point, by name or found on entering, now keeps the directories above it out of the extras.
+4. **`-pfl` dropped a folder whose listing task crashed.** It stays, as in 9.76.
+5. **`remove_extra_dirs` still `lstat`ed each directory for a link.** In enter mode the walk puts a symlink among the filenames by its `d_type`.
+6. **Without descriptor `scandir` or `/proc`**, a directory swapped for a symlink after the open was read through the link. The path is now read only while it names the held directory.
+
+One was not changed: `_parent_below`'s path fallback compares an `lstat` with the opened pin. That fallback runs only where descriptor walks are missing (Windows). There a directory cannot be opened, so the pin is the `lstat` too.
+
+## Cost (after the review)
+
+FUSE, median of 5 alternating runs, 9.76 against this branch:
+- a whole serial `-rme`: 0.956 s against 0.955 s;
+- 32 workers: 0.297 s against 0.299 s;
+- the `remove_extra_dirs` walk: 0.053 s against 0.052 s.
+
+The walk now makes one `lstat` fewer per directory than that run measured.

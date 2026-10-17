@@ -1,5 +1,6 @@
 """9.75: -rme leaves a filesystem mounted below the destination alone, its files as well as its directories."""
 import contextlib
+import errno
 import os
 import subprocess
 import sys
@@ -544,3 +545,106 @@ def test_a_directory_swapped_for_a_symlink_before_it_is_entered_is_listed_as_a_l
 	files, links, _, folders = hpcp_mod.get_file_list_serial(str(dst), boundary=boundary)
 	assert os.path.join(str(dst), 'sub') in links
 	assert _failures(hpcp_mod) == []
+
+
+# ---- 9.77: re-review of 1504353..499c981 ----
+
+def test_remove_extra_dirs_keeps_a_directory_on_another_device_it_cannot_open(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch, capsys):
+	"""Re-review: the parent's lstat device check went with 9.77's check on entering, so a directory on another device
+	that the walk could not open (EACCES, EIO, a mount that failed) stayed extra: an empty btrfs subvolume (not a mount
+	point) would have been rmdir'd. One not opened is checked by its lstat, as in 9.76."""
+	src, dst = tmp_path / 'src', tmp_path / 'dst'
+	src.mkdir()
+	dst.mkdir()
+	with _mounted(dst / 'sub'):
+		monkeypatch.setattr(hpcp_mod, '_mountinfo_entries', lambda *args, **kwargs: [])
+		real = hpcp_mod._enter_directory
+		def enter(path, device):
+			if os.path.basename(path) == 'sub':
+				raise PermissionError(errno.EACCES, os.strerror(errno.EACCES), path)
+			return real(path, device)
+		monkeypatch.setattr(hpcp_mod, '_enter_directory', enter)
+		removed = []
+		real_rmdir = os.rmdir
+		monkeypatch.setattr(hpcp_mod.os, 'rmdir', lambda path, *args, **kwargs: removed.append(path) or real_rmdir(path, *args, **kwargs))
+		hpcp_mod.remove_extra_dirs([str(src) + os.sep], [str(dst) + os.sep])
+		assert (dst / 'sub').is_dir()
+	assert 'Deleting extra directory: ' + str(dst / 'sub') not in capsys.readouterr().out.splitlines()
+	assert 'sub' not in removed and str(dst / 'sub') not in removed
+
+
+@pytest.mark.parametrize('how', ['by name', 'on entering'])
+def test_remove_extra_dirs_does_not_offer_the_directories_holding_a_mount_point(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch, capsys, how):
+	"""Re-review: the directories above a mount point were still offered ('Deleting extra directory'), then kept as
+	non-empty: they hold another filesystem."""
+	src, dst = tmp_path / 'src', tmp_path / 'dst'
+	src.mkdir()
+	(dst / 'x').mkdir(parents=True)
+	(dst / 'stale').mkdir()
+	with _mounted(dst / 'x' / 'mnt'):
+		if how == 'on entering':
+			monkeypatch.setattr(hpcp_mod, '_mountinfo_entries', lambda *args, **kwargs: [])
+			_stub_until_opened(hpcp_mod, monkeypatch, dst / 'x' / 'mnt', os.stat(str(dst)).st_dev)
+		hpcp_mod.remove_extra_dirs([str(src) + os.sep], [str(dst) + os.sep])
+		assert (dst / 'x' / 'mnt').is_dir()
+	output = capsys.readouterr().out
+	assert 'Deleting extra directory: ' + str(dst / 'x') not in output.splitlines()
+	assert 'Keeping non-empty directory' not in output
+	assert not (dst / 'stale').exists()
+
+
+def test_parallel_listing_keeps_a_folder_whose_listing_crashed(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	"""Re-review: a folder whose listing task crashed (its default result) was dropped from folders too; kept, as in
+	9.76 (its 'Listing error' is recorded)."""
+	src = tmp_path / 'src'
+	(src / 'boom').mkdir(parents=True)
+	(src / 'fine').mkdir()
+	boom = os.path.join(str(src), 'boom')
+	real = hpcp_mod._task_result
+	def task_result(future, default, crash_prefix):
+		result = real(future, default, crash_prefix)
+		if result is not default and boom in result[3]:
+			hpcp_mod.eprint(f'{crash_prefix}: simulated crash')
+			return default
+		return result
+	monkeypatch.setattr(hpcp_mod, '_task_result', task_result)
+	_, _, _, folders = hpcp_mod.get_file_list(str(src), max_workers=2, parallel_file_listing=True)
+	assert boom in folders and os.path.join(str(src), 'fine') in folders
+
+
+def test_remove_extra_dirs_does_not_lstat_each_directory(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch, scan_mode):
+	"""Re-review: the parent's loop still lstat'ed each directory for a link (a round trip each on Lustre); the walk's
+	d_type says it."""
+	src, dst = tmp_path / 'src', tmp_path / 'dst'
+	for index in range(20):
+		(src / ('d%d' % index)).mkdir(parents=True)
+		(dst / ('d%d' % index)).mkdir(parents=True)
+	os.symlink(str(tmp_path), str(dst / 'link'))
+	calls = []
+	real_lstat = os.lstat
+	monkeypatch.setattr(hpcp_mod.os, 'lstat', lambda path, *args, **kwargs: calls.append(path) or real_lstat(path, *args, **kwargs))
+	hpcp_mod.remove_extra_dirs([str(src) + os.sep], [str(dst) + os.sep])
+	assert [path for path in calls if isinstance(path, str) and path.startswith(str(dst) + os.sep)] == []
+	assert (dst / 'link').is_symlink() and len(list(dst.iterdir())) == 21
+
+
+@pytest.mark.parametrize('scan_mode', ['path'], indirect=True)
+def test_a_directory_swapped_after_it_is_opened_is_not_read_by_its_path(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch, scan_mode):
+	"""Re-review: without scandir on a descriptor or /proc (Python 3.6 off Linux) the held directory was read by its
+	path: one swapped for a symlink after the open had the link's target listed as if below the destination."""
+	dst, outside = tmp_path / 'dst', tmp_path / 'outside'
+	(dst / 'sub').mkdir(parents=True)
+	outside.mkdir()
+	(outside / 'secret.txt').write_text('x')
+	boundary = hpcp_mod._filesystem_boundary(str(dst), str(dst), visible=frozenset())
+	real = hpcp_mod._enter_directory
+	def enter(path, device):
+		fd = real(path, device)
+		if os.path.basename(path) == 'sub':
+			os.rename(path, path + '.away')
+			os.symlink(str(outside), path)
+		return fd
+	monkeypatch.setattr(hpcp_mod, '_enter_directory', enter)
+	files, _, _, _ = hpcp_mod.get_file_list_serial(str(dst), boundary=boundary)
+	assert not any('secret.txt' in path for path in files)
+	assert any(error.startswith('Listing error: ' + str(dst / 'sub') + ':') for error in hpcp_mod.ERRORS)

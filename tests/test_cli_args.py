@@ -168,3 +168,20 @@ def test_explicit_args_are_parsed_where_intermixed_parsing_is_missing(hpcp_mod, 
 	args = hpcp_mod.get_args(['-fh', '-d', '/tmp', '/tmp/src'])
 	assert args.full_hash is True
 	assert args.src_path == ['/tmp/src']
+
+
+def test_a_stdout_wrapper_without_reconfigure_is_left_alone(hpcp_mod, monkeypatch):
+	"""Re-review: the Python 3.6 rewrap ran for any stdout without reconfigure, a tee or logging proxy on 3.7+ too,
+	which was then bypassed for the rest of the run."""
+	import io
+	class Tee:
+		def __init__(self):
+			self.buffer, self.errors, self.encoding, self.line_buffering = io.BytesIO(), 'strict', 'utf-8', False
+		def write(self, text):
+			return len(text)
+		def flush(self):
+			pass
+	tee = Tee()
+	monkeypatch.setattr(sys, 'stdout', tee)
+	hpcp_mod._escape_unencodable_stdout()
+	assert sys.stdout is tee
