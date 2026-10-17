@@ -2649,24 +2649,26 @@ def _makedirs(name, mode=0o777, exist_ok=False):
 		if not exist_ok or not os.path.isdir(name):
 			raise
 
-def _walk(top, device=None):
+def _walk(top, device=None, foreign=None):
 	"""os.walk(top) top-down, symlinks to directories listed but not entered, unreadable directories skipped, without
 	recursion (os.walk recursed once per level before Python 3.12). The caller may prune dirnames in place. With
-	device, a directory below top on another device once entered (an NFSv4 submount, an automount) is not walked."""
+	device (-rme), each directory below top is opened as it is entered (_enter_directory, which refuses a symlink) and
+	one then on another device (a filesystem mounted on entering it: an NFSv4 submount, an automount) is not walked;
+	foreign, when given, is called with its path."""
+	enter = device is not None and _SCANDIR_FD
 	pending = [top]
 	while pending:
 		dirpath = pending.pop()
 		dirnames, filenames = [], []
 		fd = None
 		try:
-			if device is not None and _SCANDIR_FD:
+			if enter:
 				# top is the destination (its device is device): opened, not checked.
-				if dirpath is top:
-					fd = os.open(dirpath, _ENTER_FLAGS)
-				else:
-					fd, foreign = _entered_on_another_device(dirpath, device)
-					if foreign:
-						continue
+				fd = os.open(dirpath, _DIRECTORY_FLAGS) if dirpath is top else _enter_directory(dirpath, device)
+				if fd is None:
+					if foreign is not None:
+						foreign(dirpath)
+					continue
 			with os.scandir(fd if fd is not None else dirpath) as entries:
 				for entry in entries:
 					try:
@@ -2682,7 +2684,7 @@ def _walk(top, device=None):
 		yield dirpath, dirnames, filenames
 		for name in reversed(dirnames):
 			path = os.path.join(dirpath, name)
-			if not os.path.islink(path):
+			if enter or not os.path.islink(path):
 				pending.append(path)
 
 def _rmtree(path, exclude=None, report=False):
@@ -2696,7 +2698,7 @@ def _rmtree(path, exclude=None, report=False):
 	absolute = path.rstrip(os.sep) or path
 	if not path or not os.path.lexists(absolute):
 		raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), path)
-	_, _, errors = _remove_tree_fd(absolute, _path_identity(absolute), exclude, remove_files=True, spelled=path)
+	_, _, errors = _remove_tree_fd(absolute, _directory_identity(absolute), exclude, remove_files=True, spelled=path)
 	if report:
 		for failed, error in errors:
 			eprint(f'Remove process exception:\n Deleting {failed} generated an exception: {error}')
@@ -2717,24 +2719,23 @@ def _scan_dir(root, label=None):
 	except OSError as e:
 		eprint(f'Listing error: {label if label is not None else root}: {e}')
 
-# A directory -rme's destination listing (or walk) enters: opened first, so a filesystem mounted on entering it (an
-# NFSv4 submount, an automount) is mounted, and its device checked, before anything in it is read.
-_ENTER_FLAGS = os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0) | getattr(os, 'O_CLOEXEC', 0)
+# A directory opened to be listed, as given ('link/' is the link's target).
+_DIRECTORY_FLAGS = os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0) | getattr(os, 'O_CLOEXEC', 0)
 
-def _entered_on_another_device(path, device):
-	"""(descriptor of directory path, or None, whether it is on another device than device), path opened as a listing
-	enters it: an untriggered automount or NFSv4 submount below has its parent's device and no mountinfo entry until
-	then. Raises OSError when it cannot be opened."""
-	fd = os.open(path, _ENTER_FLAGS | getattr(os, 'O_NOFOLLOW', 0))
+def _enter_directory(path, device):
+	"""A descriptor of directory path opened as a listing enters it, or None when it is then on another device than
+	device: a filesystem mounted on entering it (an automount, an NFSv4 submount) has its parent's device and no
+	mountinfo entry until it is opened (lstat does not mount it). Raises OSError when it cannot be opened: ELOOP or
+	ENOTDIR when it is no longer a directory (_BELOW_FLAGS: a symlink is not followed)."""
+	fd = os.open(path, _BELOW_FLAGS)
 	try:
-		foreign = os.fstat(fd).st_dev != device
+		if os.fstat(fd).st_dev == device:
+			return fd
 	except BaseException:
 		os.close(fd)
 		raise
-	if foreign:
-		os.close(fd)
-		return None, True
-	return fd, False
+	os.close(fd)
+	return None
 
 def _special_file_kind(entry):
 	"""'FIFO', 'socket', 'block device' or 'character device' for such a scandir entry, else None: a regular file,
@@ -2766,10 +2767,9 @@ def _filesystem_boundary(listed_root, real_root, visible=None):
 	points = frozenset(listed_prefix + point[len(real_prefix):] for point in visible if point.startswith(real_prefix))
 	device = None
 	if os.name != 'nt':
-		try:
-			device = os.stat(real_root).st_dev
-		except OSError:
-			pass
+		# As opened (mounted, should it be mounted on entering it): what the listing and the walk find there.
+		identity = _directory_identity(real_root)
+		device = identity[0] if identity else None
 	return (points, device)
 
 def _across_boundary(path, boundary, is_dir, entry=None):
@@ -2788,8 +2788,9 @@ def _across_boundary(path, boundary, is_dir, entry=None):
 def get_file_list_serial(root,exclude=None,append_hash=False,full_hash=False,recurse=True,_rate_limiter=None,respect_file_rate_limit=True,boundary=None,known_dir=False):
 	"""(files, links, size, folders) below root. Iterative: a tree deeper than Python's recursion limit (about 1000
 	levels) is listed too; each directory below root gets the checks a call for it as root would (length, exclude,
-	link, file, directory). recurse False lists root's entries only. boundary: see get_file_list. known_dir: root comes
-	from a parent's listing (-pfl), which said directory: one lstat, as for a directory below root."""
+	link, file, directory). recurse False lists root's entries only (its directories in folders, unchecked: a listing of
+	each says). boundary: see get_file_list. known_dir: root comes from a parent's listing (-pfl), which said directory:
+	checked as a directory below root is."""
 	global FILES_RATE_LIMIT
 	if _rate_limiter is None and respect_file_rate_limit and FILES_RATE_LIMIT > 0:
 		_rate_limiter = {'start_time': time.monotonic(), 'count': 0, 'limit': FILES_RATE_LIMIT}
@@ -2800,6 +2801,11 @@ def get_file_list_serial(root,exclude=None,append_hash=False,full_hash=False,rec
 	iteration = 0
 	start_time = time.monotonic()
 	globalStartTIme = start_time
+	# -rme's destination listing: each directory below the root is opened before anything else (_enter_directory), so a
+	# filesystem mounted on entering it (an NFSv4 submount, an automount: its parent's device, and no mountinfo entry,
+	# until then) is mounted and its device checked before anything in it is read; another device is another
+	# filesystem, left alone. The root is the destination (its device is the boundary's): opened, not checked.
+	enter = boundary is not None and boundary[1] is not None and _SCANDIR_FD
 	pending = [root]
 	while pending:
 		current = pending.pop()
@@ -2807,17 +2813,30 @@ def get_file_list_serial(root,exclude=None,append_hash=False,full_hash=False,rec
 		if len(current) > 4096:
 			eprint(f'Listing error: {current}: path longer than 4096 characters, not listed')
 			continue
+		scan_fd = enter_error = None
 		if current is root and not known_dir:
 			if exclude and is_excluded(current,exclude):
 				continue
 			is_link, is_file, is_dir = os.path.islink(current), None, None
 		else:
-			# Its parent's entry passed exclude and said directory: one lstat sees a swap since (to a link, a file).
-			try:
-				mode = os.lstat(current).st_mode
-			except OSError:
-				mode = 0
-			is_link, is_file, is_dir = stat.S_ISLNK(mode), stat.S_ISREG(mode), stat.S_ISDIR(mode)
+			if enter:
+				try:
+					scan_fd = _enter_directory(current, boundary[1])
+					if scan_fd is None:
+						continue
+				except OSError as e:
+					# No longer a directory (ELOOP, ENOTDIR: the lstat below says what it is), or one that cannot be
+					# opened, reported once the lstat says directory.
+					enter_error = e
+			if scan_fd is not None:
+				is_link, is_file, is_dir = False, False, True
+			else:
+				# Its parent's entry passed exclude and said directory: one lstat sees a swap since (to a link, a file).
+				try:
+					mode = os.lstat(current).st_mode
+				except OSError:
+					mode = 0
+				is_link, is_file, is_dir = stat.S_ISLNK(mode), stat.S_ISREG(mode), stat.S_ISDIR(mode)
 		if is_link:
 			_file_list_rate_limit(_rate_limiter)
 			links.add(get_file_repr(current,append_hash,full_hash))
@@ -2831,23 +2850,16 @@ def get_file_list_serial(root,exclude=None,append_hash=False,full_hash=False,rec
 			eprint(f'Source path type error: {current} is not a file or directory')
 			file_list.add(current)
 			continue
-		scan_fd = None
-		if boundary is not None and boundary[1] is not None and _SCANDIR_FD:
-			# -rme's destination listing: a directory below the root on another device once entered (an NFSv4
-			# submount, an automount: no mountinfo entry and its parent's device before) is another filesystem, left
-			# alone; the device is that of the open directory, so nothing in it is read.
-			# The listing's own root is the destination (its device is the boundary's): opened, not checked.
-			try:
-				if current is not root or known_dir:
-					scan_fd, foreign = _entered_on_another_device(current, boundary[1])
-					if foreign:
-						continue
-				else:
-					scan_fd = os.open(current, _ENTER_FLAGS)
-			except OSError as e:
-				eprint(f'Listing error: {current}: {e}')
-				continue
 		folders.add(current)
+		if enter and scan_fd is None:
+			if enter_error is None:
+				try:
+					scan_fd = os.open(current, _DIRECTORY_FLAGS)
+				except OSError as e:
+					enter_error = e
+			if enter_error is not None:
+				eprint(f'Listing error: {current}: {enter_error}')
+				continue
 		try:
 			for entry in _scan_dir(scan_fd if scan_fd is not None else current, current):
 				path = os.path.join(current, entry.name) if scan_fd is not None else entry.path
@@ -2874,9 +2886,10 @@ def get_file_list_serial(root,exclude=None,append_hash=False,full_hash=False,rec
 					continue
 				try:
 					# -rme's destination listing: another filesystem below the destination is left alone, unlisted: a
-					# mount point by name here (nothing stat'ed), a directory on another device once entered (above).
-					if boundary is not None and (path in boundary[0] or (boundary[1] is not None and not _SCANDIR_FD
-							and _across_boundary(path, boundary, entry.is_dir(follow_symlinks=False), entry))):
+					# mount point by name here (nothing stat'ed), a directory on another device once entered (above;
+					# without scandir on a descriptor, by its entry's device here).
+					if boundary is not None and (path in boundary[0] if enter
+							else _across_boundary(path, boundary, entry.is_dir(follow_symlinks=False), entry)):
 						continue
 					if entry.is_symlink():
 						_file_list_rate_limit(_rate_limiter)
@@ -2971,6 +2984,10 @@ def get_file_list_parallel(path,max_workers=56,exclude=None,append_hash=False,fu
 					folder_path = futures.pop(doneTask)
 					dir_file_list, dir_link_list, dir_size, dir_folder_list = _task_result(
 						doneTask, (frozenset(), frozenset(), 0, frozenset()), 'Listing error')
+					if folder_path not in dir_folder_list:
+						# Its listing did not list it as a directory (another filesystem once entered, -rme; a link or
+						# a file since; an error): not a folder, as in a serial listing.
+						folder_list.discard(folder_path)
 					file_list.update(dir_file_list)
 					link_list.update(dir_link_list)
 					size += dir_size
@@ -8302,8 +8319,9 @@ def remove_extra_dirs(src_paths, dests,exclude=None,dest_image=False,keep=(),des
 	# leave out excluded source paths (a filtered copy: the caller's list is not touched)
 	src_paths = [src_path for src_path in src_paths if not (exclude and is_excluded(src_path,exclude))]
 	source_roots = [os.path.abspath(src_path) for src_path in src_paths]
-	# {extra directory: the destination root it lies below}; each destination's identity before the walk (pinned before
-	# the copy when hpcp() runs it, see remove_extra_files): one that now leads elsewhere is not cleaned.
+	# {extra directory: (the destination root it lies below, its name as the walk spells it)}; each destination's
+	# identity before the walk (pinned before the copy when hpcp() runs it, see remove_extra_files): one that now leads
+	# elsewhere is not cleaned.
 	extraDirs = {}
 	if dest_roots is None:
 		dest_roots = _destination_roots(dests)
@@ -8313,7 +8331,11 @@ def remove_extra_dirs(src_paths, dests,exclude=None,dest_image=False,keep=(),des
 	for dest in dests:
 		# Another filesystem below it (a mount or bind mount, another device), as remove_extra_files' listing.
 		boundary = _filesystem_boundary(dest, dest_roots[os.path.abspath(dest)][0], visible_mounts)
-		for dirpath, dirnames, _ in _walk(dest, device=boundary[1]):
+		def entered_elsewhere(path):
+			# A filesystem mounted on entering it (an NFSv4 submount, an automount): not walked, and not extra.
+			print(f"Skipping mount point: {path}")
+			extraDirs.pop(os.path.abspath(path), None)
+		for dirpath, dirnames, _ in _walk(dest, device=boundary[1], foreign=entered_elsewhere):
 			walk_into = []
 			for dirname in dirnames:
 				# No trailing separator: excludes match a directory as the listing does ('*/cache').
@@ -8328,8 +8350,9 @@ def remove_extra_dirs(src_paths, dests,exclude=None,dest_image=False,keep=(),des
 					continue
 				if os.path.islink(dest_dir_path):
 					continue
-				if _across_boundary(dest_dir_path, boundary, True):
-					# Another filesystem: never walked into, so nothing in it is removed.
+				# Another filesystem: never walked into, so nothing in it is removed. Its device is checked as the walk
+				# enters it (entered_elsewhere), or here without scandir on a descriptor.
+				if not _SCANDIR_FD and _across_boundary(dest_dir_path, boundary, True):
 					print(f"Skipping mount point: {dest_dir_path}")
 					continue
 				if dirname == 'lost+found' and os.path.ismount(dirpath):
@@ -8348,13 +8371,15 @@ def remove_extra_dirs(src_paths, dests,exclude=None,dest_image=False,keep=(),des
 				else:
 					in_source = any(os.path.exists(os.path.join(os.path.dirname(src_path), relative_path)) for src_path in src_paths)
 				if not in_source and not _is_kept(os.path.abspath(dest_dir_path), kept, os.path.abspath(dest), copied_roots):
-					print(f"Deleting extra directory: {dest_dir_path}")
-					extraDirs[os.path.abspath(dest_dir_path)] = os.path.abspath(dest)
+					extraDirs[os.path.abspath(dest_dir_path)] = (os.path.abspath(dest), dest_dir_path)
 			# Excluded trees and other filesystems are never walked into.
 			dirnames[:] = walk_into
+	# Once the walks have entered them all (one on another device then is no longer here).
+	for _, name in extraDirs.values():
+		print(f"Deleting extra directory: {name}")
 	# Deepest first, by descriptors from each pinned destination root without following symlinks (_remove_listed_files).
 	ordered = sorted(extraDirs, key=lambda path: (-len(pathlib.Path(path).parts), path))
-	_remove_listed_files(_items_below(((directory, extraDirs[directory]) for directory in ordered), dest_roots, sort=False), rmdir=True,
+	_remove_listed_files(_items_below(((directory, extraDirs[directory][0]) for directory in ordered), dest_roots, sort=False), rmdir=True,
 		one_filesystem=True)
 
 def _src_to_dest_map(src_paths, dests, dest_image=False):
@@ -8789,7 +8814,7 @@ def process_remove(src_paths: list,single_thread = False, max_workers = multipro
 	ERRORS[error_start:] = [error for error in ERRORS[error_start:] if not (error.startswith('Special file skipped:')
 		or (error.startswith('Listing error:') and error.endswith(': path longer than 4096 characters, not listed')))]
 
-_BELOW_FLAGS = os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0) | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_CLOEXEC', 0)
+_BELOW_FLAGS = _DIRECTORY_FLAGS | getattr(os, 'O_NOFOLLOW', 0)
 # A parent only looked up in (its entry removed, or opened below it): O_PATH where there is one, so search permission
 # is enough, as for shutil.rmtree (a drop box, mode 0333).
 _PARENT_FLAGS = (getattr(os, 'O_PATH', 0) or os.O_RDONLY) | getattr(os, 'O_DIRECTORY', 0) | getattr(os, 'O_CLOEXEC', 0)
@@ -8805,9 +8830,32 @@ def _path_identity(path):
 		return None
 	return (st.st_dev, st.st_ino)
 
+def _directory_identity(path):
+	"""_path_identity of path, a directory as opened: a filesystem mounted on entering it (an automount, an NFSv4
+	submount not mounted yet) is mounted, so this is what the removal, which opens it (_open_source_root), finds there;
+	lstat and stat do not mount one and report the directory below it. Anything else (a symlink, a file: one lstat), or
+	a directory that cannot be opened: as _path_identity."""
+	try:
+		st = os.lstat(path)
+	except OSError:
+		return None
+	if stat.S_ISDIR(st.st_mode):
+		try:
+			fd = os.open(path, _BELOW_FLAGS)
+		except OSError:
+			pass
+		else:
+			try:
+				st = os.fstat(fd)
+			except OSError:
+				return None
+			finally:
+				os.close(fd)
+	return (st.st_dev, st.st_ino)
+
 def _source_identities(src_paths):
-	"""{source as the copy names it (abspath: 'ln/' is the link ln): its _path_identity}, taken before the copy."""
-	return {os.path.abspath(src): _path_identity(os.path.abspath(src)) for src in src_paths}
+	"""{source as the copy names it (abspath: 'ln/' is the link ln): its _directory_identity}, taken before the copy."""
+	return {os.path.abspath(src): _directory_identity(os.path.abspath(src)) for src in src_paths}
 
 def _same_or_inside(path, src):
 	"""True when path is src, by real path or inode (a bind mount), or lies below it. A symlink src is the link itself."""
@@ -9178,7 +9226,7 @@ def _destination_roots(dests):
 	for dest in dests:
 		listed = os.path.abspath(dest)
 		real = os.path.realpath(listed)
-		roots[listed] = (real, _path_identity(real), _path_identity(listed))
+		roots[listed] = (real, _directory_identity(real), _path_identity(listed))
 	return roots
 
 def _checked_destination_roots(dests, pinned=None):
@@ -9557,7 +9605,7 @@ def remove_moved_sources(src_paths, file_list, sym_links, single_thread=False, m
 	each source directory that is empty after that, deepest first. Anything the copy did not list stays, with the
 	directories holding it: a file written to a source after the copy listed its directory, a special file, an excluded
 	path. What stays, other than excluded paths, is named in a 'Move left entries' note. root_ids: {source root: its
-	_path_identity when the copy started}; a root no longer that one removes nothing (taken now when not given)."""
+	_directory_identity when the copy started}; a root no longer that one removes nothing (taken now when not given)."""
 	roots = []
 	for src in src_paths:
 		path = os.path.abspath(src)
@@ -9567,7 +9615,7 @@ def remove_moved_sources(src_paths, file_list, sym_links, single_thread=False, m
 			print(f'Skipping excluded path: {path}')
 			continue
 		roots.append(path)
-	root_ids = {root: (root_ids or {}).get(root, _path_identity(root) if root_ids is None else None) for root in roots}
+	root_ids = {root: (root_ids or {}).get(root, _directory_identity(root) if root_ids is None else None) for root in roots}
 	# Each listed entry with the outermost source root it lies below, so its removal is checked from there down: a scan
 	# of the roots when they are few, else a lookup of the entry's ancestors (-sfl gives one root per file).
 	by_length = [(root, root.rstrip(os.sep) + os.sep) for root in sorted(roots, key=len)]

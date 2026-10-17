@@ -160,7 +160,8 @@ def test_plain_remove_opens_each_directory_once(tmp_path, hpcp_mod, reset_hpcp_g
 	monkeypatch.setattr(hpcp_mod.os, 'stat', lambda *a, **k: stats.append(a[0]) or real_stat(*a, **k))
 	hpcp_mod.process_remove([str(src)], single_thread=True, remove_force=True)
 	assert not src.exists()
-	assert len(opens) <= directories + 2
+	# And the root's pin, opened (_directory_identity: a filesystem mounted on entering it is mounted).
+	assert len(opens) <= directories + 3
 	# A few checks of the root itself (exists, isdir, its identity); none per file (60 here).
 	assert len(stats) <= 6
 
