@@ -194,7 +194,7 @@ except ImportError:
 	hasher = hashlib.blake2b()
 	xxhash_available = False
 
-version = '9.75'
+version = '9.76'
 __version__ = version
 COMMIT_DATE = '2026-10-16'
 
@@ -2614,6 +2614,63 @@ def _file_list_rate_limit(limiter_state, increment=1):
 		wait_for = (count - allowed) / limit
 		time.sleep(min(0.1, max(0.01, wait_for)))
 
+def _makedirs(path, mode=0o777, exist_ok=False):
+	"""os.makedirs(path, mode, exist_ok) without its recursion (one frame per missing level, so a tree deeper than about
+	1000 levels raised RecursionError): each missing directory is made in turn, the last with mode, the others with the
+	default (as os.makedirs since Python 3.7). An existing path raises FileExistsError unless exist_ok and a directory."""
+	path = os.fspath(path)
+	leaf = path.rstrip(os.sep) or path
+	if os.path.exists(leaf):
+		if exist_ok and os.path.isdir(leaf):
+			return
+		raise FileExistsError(errno.EEXIST, 'File exists', path)
+	missing = []
+	head = leaf
+	while head and not os.path.exists(head):
+		missing.append(head)
+		parent = os.path.dirname(head)
+		if parent == head:
+			break
+		head = parent
+	for directory in reversed(missing):
+		try:
+			os.mkdir(directory, mode if directory == leaf else 0o777)
+		except FileExistsError:
+			# Made meanwhile (another job, another process): fine when it is a directory, and the leaf is allowed to exist.
+			if not os.path.isdir(directory) or (directory == leaf and not exist_ok):
+				raise
+
+def _walk(top):
+	"""os.walk(top) top-down, symlinks to directories listed but not entered, unreadable directories skipped, without
+	recursion (os.walk recursed once per level before Python 3.12). The caller may prune dirnames in place."""
+	pending = [top]
+	while pending:
+		dirpath = pending.pop()
+		dirnames, filenames = [], []
+		try:
+			with os.scandir(dirpath) as entries:
+				for entry in entries:
+					try:
+						is_dir = entry.is_dir()
+					except OSError:
+						is_dir = False
+					(dirnames if is_dir else filenames).append(entry.name)
+		except OSError:
+			continue
+		yield dirpath, dirnames, filenames
+		for name in reversed(dirnames):
+			path = os.path.join(dirpath, name)
+			if not os.path.islink(path):
+				pending.append(path)
+
+def _rmtree(path):
+	"""shutil.rmtree(path) without recursion (it recursed once per level before Python 3.13): by directory descriptors
+	(_remove_tree_fd), the first error raised."""
+	path = os.path.abspath(path)
+	_, _, errors = _remove_tree_fd(path, _path_identity(path), remove_files=True)
+	if errors:
+		raise errors[0][1]
+
 def _scan_dir(root):
 	"""os.scandir(root)'s entries. A directory that cannot be opened or read on (EACCES, EIO) is recorded as a
 	'Listing error' and gives the entries read so far, so the rest of the tree is still listed."""
@@ -2673,23 +2730,12 @@ def _across_boundary(path, boundary, is_dir, entry=None):
 	return False
 
 def get_file_list_serial(root,exclude=None,append_hash=False,full_hash=False,recurse=True,_rate_limiter=None,respect_file_rate_limit=True,boundary=None):
-	# skip if path is longer than 4096 characters: not listed, so not copied (an error: a move must not delete it).
-	if len(root) > 4096:
-		eprint(f'Listing error: {root}: path longer than 4096 characters, not listed')
-		return frozenset() ,frozenset(),0,frozenset()
-	#print(f'Getting file list for {root}')
+	"""(files, links, size, folders) below root. Iterative: a tree deeper than Python's recursion limit (about 1000
+	levels) is listed too; each directory below root gets the checks a call for it as root would (length, exclude,
+	link, file, directory). recurse False lists root's entries only. boundary: see get_file_list."""
 	global FILES_RATE_LIMIT
 	if _rate_limiter is None and respect_file_rate_limit and FILES_RATE_LIMIT > 0:
 		_rate_limiter = {'start_time': time.monotonic(), 'count': 0, 'limit': FILES_RATE_LIMIT}
-	if exclude and is_excluded(root,exclude):
-		return frozenset() ,frozenset(),0,frozenset()
-	if os.path.islink(root):
-		_file_list_rate_limit(_rate_limiter)
-		return frozenset() ,frozenset([get_file_repr(root,append_hash,full_hash)]),0,frozenset()
-	if os.path.isfile(root):
-		_file_list_rate_limit(_rate_limiter)
-		realSize = get_file_size(root)
-		return frozenset([get_file_repr(root,append_hash,full_hash)]) ,frozenset(), realSize,frozenset()
 	file_list = set()
 	links = set()
 	folders = set()
@@ -2697,9 +2743,30 @@ def get_file_list_serial(root,exclude=None,append_hash=False,full_hash=False,rec
 	iteration = 0
 	start_time = time.monotonic()
 	globalStartTIme = start_time
-	if os.path.isdir(root):
-		folders.add(root)
-		for entry in _scan_dir(root):
+	pending = [root]
+	while pending:
+		current = pending.pop()
+		# skip if path is longer than 4096 characters: not listed, so not copied (an error: a move must not delete it).
+		if len(current) > 4096:
+			eprint(f'Listing error: {current}: path longer than 4096 characters, not listed')
+			continue
+		if exclude and is_excluded(current,exclude):
+			continue
+		if os.path.islink(current):
+			_file_list_rate_limit(_rate_limiter)
+			links.add(get_file_repr(current,append_hash,full_hash))
+			continue
+		if os.path.isfile(current):
+			_file_list_rate_limit(_rate_limiter)
+			size += get_file_size(current)
+			file_list.add(get_file_repr(current,append_hash,full_hash))
+			continue
+		if not os.path.isdir(current):
+			eprint(f'Source path type error: {current} is not a file or directory')
+			file_list.add(current)
+			continue
+		folders.add(current)
+		for entry in _scan_dir(current):
 			# update the progress bar every 0.5 seconds
 			currentTime = time.monotonic()
 			if currentTime - start_time > 0.5:
@@ -2718,7 +2785,7 @@ def get_file_list_serial(root,exclude=None,append_hash=False,full_hash=False,rec
 				if _rate_limiter:
 					suffix += f'| Overall: {format_bytes(_rate_limiter["count"],use_1024_bytes=False,to_str=True)} Files'
 				# if the root is longer than 50 characters, we only show the last 50 characters
-				multiCMD.print_progress_bar(iteration=iteration, total=0, prefix=f'{root}'[-50:], suffix=suffix)
+				multiCMD.print_progress_bar(iteration=iteration, total=0, prefix=f'{current}'[-50:], suffix=suffix)
 			if exclude and is_excluded(entry.path,exclude):
 				continue
 			try:
@@ -2737,11 +2804,7 @@ def get_file_list_serial(root,exclude=None,append_hash=False,full_hash=False,rec
 					file_list.add(get_file_repr(entry.path,append_hash,full_hash))
 				elif entry.is_dir(follow_symlinks=False):
 					if recurse:
-						dir_files, dir_links, dir_size, dir_folders = get_file_list_serial(entry.path,exclude=exclude,append_hash=append_hash,full_hash=full_hash,_rate_limiter=_rate_limiter,respect_file_rate_limit=respect_file_rate_limit,boundary=boundary)
-						file_list.update(dir_files)
-						links.update(dir_links)
-						size += dir_size
-						folders.update(dir_folders)
+						pending.append(entry.path)
 					else:
 						folders.add(entry.path)
 				else:
@@ -2752,10 +2815,6 @@ def get_file_list_serial(root,exclude=None,append_hash=False,full_hash=False,rec
 			except OSError as e:
 				# One entry that cannot be read (its hash, a link target) is recorded; the others are still listed.
 				eprint(f'Listing error: {entry.path}: {e}')
-		#multiCMD.print_progress_bar(iteration=iteration, total=iteration, prefix=f'{root}', suffix=f'Files: {format_bytes(len(file_list),use_1024_bytes=False,to_str=True)} Links: {format_bytes(len(links),use_1024_bytes=False,to_str=True)} Folders: {format_bytes(len(folders),use_1024_bytes=False,to_str=True)} Size: {format_bytes(size)}B')
-	else:
-		eprint(f'Source path type error: {root} is not a file or directory')
-		return frozenset([root]) ,frozenset(), 0,frozenset()
 	return frozenset(file_list), frozenset(links) , size, frozenset(folders - set(['.', '..']))
 
 def get_file_list_parallel(path,max_workers=56,exclude=None,append_hash=False,full_hash=False,boundary=None):
@@ -2849,19 +2908,11 @@ def delete_file_bulk(paths, exclude=None):
 			try:
 				total_size += os.lstat(path).st_size
 				if os.path.isdir(path) and not os.path.islink(path):
-					if exclude:
-						# The listing pass may have left protected entries behind.
-						# Recheck exclusions during cleanup, including empty directories.
-						with os.scandir(path) as entries:
-							children = [entry.path for entry in entries]
-						total_size += delete_file_bulk(children, exclude=exclude)[0]
-						try:
-							os.rmdir(path)
-						except OSError as exc:
-							if exc.errno not in (errno.ENOTEMPTY, errno.EEXIST):
-								raise
-					else:
-						shutil.rmtree(path)
+					# By descriptors, without recursion; excluded entries (and the directories holding them) stay.
+					absolute = os.path.abspath(path)
+					_, _, errors = _remove_tree_fd(absolute, _path_identity(absolute), exclude, remove_files=True)
+					if errors:
+						raise errors[0][1]
 				else:
 					os.remove(path)
 			except Exception as exc:
@@ -3059,7 +3110,7 @@ def copy_file(src_path, dest_paths, full_hash=False, verbose=False, concurrent_p
 					try:
 						# if the parent path for the file does not exist, create it
 						if not NO_CREATE_DIR:
-							os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+							_makedirs(os.path.dirname(dest_path), exist_ok=True)
 						if os.name == 'posix':
 							cp_command = ["cp", "-f" if CONTENT_ONLY else "-af"]
 							if cp_supports_sparse():
@@ -3650,7 +3701,7 @@ def sync_directory_metadata(src_path, dest_paths):
 		try:
 			try:
 				if not (os.path.exists(dest_path) or os.path.ismount(dest_path)):
-					os.makedirs(dest_path, exist_ok=True)
+					_makedirs(dest_path, exist_ok=True)
 			except FileExistsError:
 				print(f"Destination path {dest_path} maybe a mounted dir, known issue with os.path.exists\nContinuing without creating dest folder...", file=sys.stderr)
 			# Sync the metadata
@@ -4742,7 +4793,7 @@ def _remove_entry(path):
 	"""Remove a file, symlink or whole directory tree; a missing path is fine."""
 	try:
 		if os.path.isdir(path) and not os.path.islink(path):
-			shutil.rmtree(path)
+			_rmtree(path)
 		else:
 			os.unlink(path)
 	except FileNotFoundError:
@@ -4751,7 +4802,7 @@ def _remove_entry(path):
 def _place_symlink(target, dest):
 	if os.path.lexists(dest):
 		_remove_entry(dest)
-	os.makedirs(os.path.dirname(dest), exist_ok=True)
+	_makedirs(os.path.dirname(dest), exist_ok=True)
 	os.symlink(target, dest)
 
 def _payload_bytes(rows):
@@ -4970,7 +5021,7 @@ def write_patch_metadata(volume_roots, rows, meta):
 	total = len(volume_roots)
 	for volume_root in volume_roots:
 		diff_dir = os.path.join(volume_root, DIFF_DIR_NAME)
-		os.makedirs(diff_dir, exist_ok=True)
+		_makedirs(diff_dir, exist_ok=True)
 		write_changes(os.path.join(diff_dir, 'changes.tsv'), rows)
 	for index, volume_root in enumerate(volume_roots, start=1):
 		diff_dir = os.path.join(volume_root, DIFF_DIR_NAME)
@@ -4996,7 +5047,7 @@ def _build_payload(rows, new_base, volume_roots, max_workers=1, verbose=False, e
 			dir_keys.add(row.path)
 	for key in sorted(dir_keys, key=_key_depth):
 		for volume_root in volume_roots:
-			os.makedirs(_key_path(volume_root, key), exist_ok=True)
+			_makedirs(_key_path(volume_root, key), exist_ok=True)
 	files = [_key_path(new_base, row.path) for row in payload if row.new.startswith('f:')]
 	if files:
 		copy_file_list_parallel(files, [], new_base, list(volume_roots), max(1, max_workers), verbose=verbose,
@@ -5898,7 +5949,7 @@ def _apply_rows(rows, volume_roots, target_root, max_workers=1, verbose=False, f
 			continue
 		try:
 			# 0700 until sync_dir sets the payload's metadata; a content-only target keeps its default mode.
-			os.makedirs(path, mode=0o700 if metadata else 0o777, exist_ok=True)
+			_makedirs(path, mode=0o700 if metadata else 0o777, exist_ok=True)
 		except OSError as e:
 			eprint(f'Copy failed: {row.path}: {e}')
 			continue
@@ -7546,7 +7597,7 @@ def write_disk_patch_metadata(volume_roots, sections, disk_rows, meta):
 	total = len(volume_roots)
 	for volume_root in volume_roots:
 		diff_dir = os.path.join(volume_root, DIFF_DIR_NAME)
-		os.makedirs(diff_dir, exist_ok=True)
+		_makedirs(diff_dir, exist_ok=True)
 		for number, rows in sections:
 			write_changes(os.path.join(diff_dir, f'part{number}.changes.tsv'), rows)
 		write_disk_tsv(os.path.join(diff_dir, meta['disk']), disk_rows)
@@ -7560,7 +7611,7 @@ def _store_raw(volume_roots, raw_file, device, size, new_sha):
 	for volume_root in volume_roots:
 		if shutil.disk_usage(volume_root).free > size + (1 << 20):
 			dest = os.path.join(volume_root, raw_file)
-			os.makedirs(os.path.dirname(dest), exist_ok=True)
+			_makedirs(os.path.dirname(dest), exist_ok=True)
 			if _copy_area(device, dest, 0, size) != new_sha:
 				raise RuntimeError(f'Raw area error: {raw_file} changed while it was copied; patch metadata not written')
 			return dest
@@ -7699,7 +7750,7 @@ def process_get_disk_diff_image(src_paths, dest_paths, output, mount_points, loo
 	for number, new_root, rows, scan in sections:
 		section_roots = [os.path.join(volume_root, f'part{number}') for volume_root in volume_roots]
 		for root in section_roots:
-			os.makedirs(root, exist_ok=True)
+			_makedirs(root, exist_ok=True)
 		_build_payload(rows, new_root, section_roots, max_workers, verbose, _payload_bytes(rows), full_hash, scan=scan)
 	write_disk_patch_metadata(volume_roots, section_rows, disk_rows, meta)
 	extra = f" (+{len(volume_roots) - 1} more volume(s))" if len(volume_roots) > 1 else ''
@@ -8174,7 +8225,7 @@ def remove_extra_dirs(src_paths, dests,exclude=None,dest_image=False,keep=(),des
 	for dest in dests:
 		# Another filesystem below it (a mount or bind mount, another device), as remove_extra_files' listing.
 		boundary = _filesystem_boundary(dest, dest_roots[os.path.abspath(dest)][0], visible_mounts)
-		for dirpath, dirnames, _ in os.walk(dest):
+		for dirpath, dirnames, _ in _walk(dest):
 			walk_into = []
 			for dirname in dirnames:
 				# No trailing separator: excludes match a directory as the listing does ('*/cache').
@@ -9030,7 +9081,7 @@ def _remove_tree_fd(root, root_id, exclude=None, remove_files=False, rate_limite
 	removed, left, errors = 0, [], []
 	if not _DIR_FD_WALK:
 		directories = []
-		for dirpath, dirnames, filenames in os.walk(root):
+		for dirpath, dirnames, filenames in _walk(root):
 			directories.append(dirpath)
 			# os.walk lists a symlink to a directory among the directories: it is a link, removed like a file.
 			links = [name for name in dirnames if os.path.islink(os.path.join(dirpath, name))]
@@ -9649,7 +9700,7 @@ def process_copy(src_paths: list, dests:list = [], single_thread = False, max_wo
 				print("Skipping directory sync")
 				if not NO_CREATE_DIR:
 					for dest in dests:
-						os.makedirs(dest, exist_ok=True)
+						_makedirs(dest, exist_ok=True)
 			else:
 				cs.add_dir_sync(src, dests)
 		if not directory_only:
@@ -10192,7 +10243,7 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = multipr
 							eprint(f"Destination path does not exist: {dest} does not exist, skipping as --no_create_dir is specified, ignoring {dest}.")
 							dests_to_remove.append(dest)
 						else:
-							os.makedirs(dest, exist_ok=True)
+							_makedirs(dest, exist_ok=True)
 					elif target_file_system:
 						destfs = get_fs_type_from_path(dest)
 						if destfs and destfs.lower() != target_file_system.lower():
