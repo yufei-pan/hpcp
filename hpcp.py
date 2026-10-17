@@ -2614,31 +2614,39 @@ def _file_list_rate_limit(limiter_state, increment=1):
 		wait_for = (count - allowed) / limit
 		time.sleep(min(0.1, max(0.01, wait_for)))
 
-def _makedirs(path, mode=0o777, exist_ok=False):
-	"""os.makedirs(path, mode, exist_ok) without its recursion (one frame per missing level, so a tree deeper than about
-	1000 levels raised RecursionError): each missing directory is made in turn, the last with mode, the others with the
-	default (as os.makedirs since Python 3.7). An existing path raises FileExistsError unless exist_ok and a directory."""
-	path = os.fspath(path)
-	leaf = path.rstrip(os.sep) or path
-	if os.path.exists(leaf):
-		if exist_ok and os.path.isdir(leaf):
-			return
-		raise FileExistsError(errno.EEXIST, 'File exists', path)
+def _makedirs(name, mode=0o777, exist_ok=False):
+	"""os.makedirs(name, mode, exist_ok) without its recursion (one frame per missing level: a tree deeper than about 1000
+	levels raised RecursionError), step for step: the missing heads are made from the top (default mode, one made
+	meanwhile is fine, an 'xxx/.' head is skipped), then name with mode, unless it ends in '.'; an existing name is
+	fine only with exist_ok when it is a directory."""
+	name = os.fspath(name)
+	head, tail = os.path.split(name)
+	if not tail:
+		head, tail = os.path.split(head)
 	missing = []
-	head = leaf
-	while head and not os.path.exists(head):
-		missing.append(head)
-		parent = os.path.dirname(head)
-		if parent == head:
-			break
-		head = parent
+	part_head, part_tail = head, tail
+	while part_head and part_tail and not os.path.exists(part_head):
+		missing.append(part_head)
+		part_head, part_tail = os.path.split(part_head)
+		if not part_tail:
+			part_head, part_tail = os.path.split(part_head)
 	for directory in reversed(missing):
+		directory_head, directory_tail = os.path.split(directory)
+		if not directory_tail:
+			directory_head, directory_tail = os.path.split(directory_head)
+		if directory_tail == os.curdir:
+			continue
 		try:
-			os.mkdir(directory, mode if directory == leaf else 0o777)
+			os.mkdir(directory)
 		except FileExistsError:
-			# Made meanwhile (another job, another process): fine when it is a directory, and the leaf is allowed to exist.
-			if not os.path.isdir(directory) or (directory == leaf and not exist_ok):
-				raise
+			pass
+	if tail == os.curdir:
+		return
+	try:
+		os.mkdir(name, mode)
+	except OSError:
+		if not exist_ok or not os.path.isdir(name):
+			raise
 
 def _walk(top):
 	"""os.walk(top) top-down, symlinks to directories listed but not entered, unreadable directories skipped, without
@@ -2663,13 +2671,25 @@ def _walk(top):
 			if not os.path.islink(path):
 				pending.append(path)
 
-def _rmtree(path):
-	"""shutil.rmtree(path) without recursion (it recursed once per level before Python 3.13): by directory descriptors
-	(_remove_tree_fd), the first error raised."""
-	path = os.path.abspath(path)
-	_, _, errors = _remove_tree_fd(path, _path_identity(path), remove_files=True)
+def _rmtree(path, exclude=None, report=False):
+	"""shutil.rmtree(path) without recursion (it recursed once per level before Python 3.13), by directory descriptors
+	(_remove_tree_fd): a missing path raises FileNotFoundError, and a tree that is not gone raises the first error, with
+	the full path as its filename (an ENOTEMPTY one when nothing failed). With report (delete_file_bulk) every error is
+	recorded instead ('Remove process exception'). exclude: patterns matched against the paths as path spells them;
+	what they match stays, with the directories holding it."""
+	absolute = os.path.abspath(path)
+	if not os.path.lexists(absolute):
+		raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), path)
+	_, _, errors = _remove_tree_fd(absolute, _path_identity(absolute), exclude, remove_files=True, spelled=path)
+	if report:
+		for failed, error in errors:
+			eprint(f'Remove process exception:\n Deleting {failed} generated an exception: {error}')
+		return
 	if errors:
-		raise errors[0][1]
+		failed, error = errors[0]
+		raise type(error)(error.errno, error.strerror, failed) if isinstance(error.errno, int) else error
+	if not exclude and os.path.lexists(absolute):
+		raise OSError(errno.ENOTEMPTY, os.strerror(errno.ENOTEMPTY), path)
 
 def _scan_dir(root):
 	"""os.scandir(root)'s entries. A directory that cannot be opened or read on (EACCES, EIO) is recorded as a
@@ -2750,18 +2770,27 @@ def get_file_list_serial(root,exclude=None,append_hash=False,full_hash=False,rec
 		if len(current) > 4096:
 			eprint(f'Listing error: {current}: path longer than 4096 characters, not listed')
 			continue
-		if exclude and is_excluded(current,exclude):
-			continue
-		if os.path.islink(current):
+		if current is root:
+			if exclude and is_excluded(current,exclude):
+				continue
+			is_link, is_file, is_dir = os.path.islink(current), None, None
+		else:
+			# Its parent's entry passed exclude and said directory: one lstat sees a swap since (to a link, a file).
+			try:
+				mode = os.lstat(current).st_mode
+			except OSError:
+				mode = 0
+			is_link, is_file, is_dir = stat.S_ISLNK(mode), stat.S_ISREG(mode), stat.S_ISDIR(mode)
+		if is_link:
 			_file_list_rate_limit(_rate_limiter)
 			links.add(get_file_repr(current,append_hash,full_hash))
 			continue
-		if os.path.isfile(current):
+		if is_file or (is_file is None and os.path.isfile(current)):
 			_file_list_rate_limit(_rate_limiter)
 			size += get_file_size(current)
 			file_list.add(get_file_repr(current,append_hash,full_hash))
 			continue
-		if not os.path.isdir(current):
+		if not (is_dir or (is_dir is None and os.path.isdir(current))):
 			eprint(f'Source path type error: {current} is not a file or directory')
 			file_list.add(current)
 			continue
@@ -2908,11 +2937,9 @@ def delete_file_bulk(paths, exclude=None):
 			try:
 				total_size += os.lstat(path).st_size
 				if os.path.isdir(path) and not os.path.islink(path):
-					# By descriptors, without recursion; excluded entries (and the directories holding them) stay.
-					absolute = os.path.abspath(path)
-					_, _, errors = _remove_tree_fd(absolute, _path_identity(absolute), exclude, remove_files=True)
-					if errors:
-						raise errors[0][1]
+					# By descriptors, without recursion, every failure recorded; excluded entries (matched as path spells
+					# them) stay, with the directories holding them.
+					_rmtree(path, exclude, report=True)
 				else:
 					os.remove(path)
 			except Exception as exc:
@@ -8702,6 +8729,12 @@ def process_remove(src_paths: list,single_thread = False, max_workers = multipro
 		or (error.startswith('Listing error:') and error.endswith(': path longer than 4096 characters, not listed')))]
 
 _BELOW_FLAGS = os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0) | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_CLOEXEC', 0)
+# A parent only looked up in (its entry removed, or opened below it): O_PATH where there is one, so search permission
+# is enough, as for shutil.rmtree (a drop box, mode 0333).
+_PARENT_FLAGS = (getattr(os, 'O_PATH', 0) or os.O_RDONLY) | getattr(os, 'O_DIRECTORY', 0) | getattr(os, 'O_CLOEXEC', 0)
+# The directory descriptors one walk or cursor holds at most (a tree deeper than the open-files limit): beyond, the
+# shallowest are let go and opened again when needed.
+_WALK_FD_BUDGET = 32
 
 def _path_identity(path):
 	"""(st_dev, st_ino) of path itself (a symlink is not followed), or None when it cannot be read."""
@@ -8739,7 +8772,7 @@ def _open_source_root(root, root_id):
 	if os.path.dirname(root) == root:
 		fd = os.open(root, os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0) | getattr(os, 'O_CLOEXEC', 0))
 	else:
-		parent_fd = os.open(os.path.dirname(root), os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0) | getattr(os, 'O_CLOEXEC', 0))
+		parent_fd = os.open(os.path.dirname(root) or os.curdir, _PARENT_FLAGS)
 		try:
 			fd = os.open(os.path.basename(root), _BELOW_FLAGS, dir_fd=parent_fd)
 		finally:
@@ -8760,8 +8793,8 @@ def _parent_below(root, root_id, rel):
 	if rel in ('', '.'):
 		if not _DIR_FD_WALK:
 			return None, os.path.basename(root), root_id
-		parent = os.path.dirname(root) or os.sep
-		return os.open(parent, os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0) | getattr(os, 'O_CLOEXEC', 0)), os.path.basename(root), root_id
+		parent = os.path.dirname(root) or os.curdir
+		return os.open(parent, _PARENT_FLAGS), os.path.basename(root), root_id
 	parent_rel, name = os.path.split(rel)
 	if not _DIR_FD_WALK:
 		if os.path.islink(root) or _path_identity(root) != (tuple(root_id) if root_id else None):
@@ -8910,11 +8943,13 @@ def _remove_listed_files(items, rmdir=False, rate_limiter=None, one_filesystem=F
 				continue
 			if root != current_root:
 				while stack:
-					os.close(stack.pop()[1])
+					fd = stack.pop()[1]
+					if fd is not None:
+						os.close(fd)
 				current_root = None
 				shown = None
 				try:
-					stack.append((None, _open_source_root(root, root_id)))
+					stack.append([None, _open_source_root(root, root_id)])
 					if one_filesystem:
 						root_dev = os.fstat(stack[0][1]).st_dev
 				except OSError as exc:
@@ -8927,7 +8962,25 @@ def _remove_listed_files(items, rmdir=False, rate_limiter=None, one_filesystem=F
 			while depth < len(parent) and depth + 1 < len(stack) and stack[depth + 1][0] == parent[depth]:
 				depth += 1
 			while len(stack) > depth + 1:
-				os.close(stack.pop()[1])
+				fd = stack.pop()[1]
+				if fd is not None:
+					os.close(fd)
+			# A directory kept on the path whose descriptor was let go (a deep tree): opened again, from the deepest one
+			# still held, by name with O_NOFOLLOW as the first time.
+			if stack[-1][1] is None:
+				index = max(k for k in range(len(stack)) if stack[k][1] is not None) + 1
+				try:
+					while index < len(stack):
+						stack[index][1] = os.open(stack[index][0], _BELOW_FLAGS, dir_fd=stack[index - 1][1])
+						if index - 1 > 0 and len(stack) - index > 1:
+							os.close(stack[index - 1][1])
+							stack[index - 1][1] = None
+						index += 1
+				except OSError as exc:
+					refused = (root, parent[:index])
+					if not isinstance(exc, FileNotFoundError):
+						_report_unremoved(os.path.join(root, *parent[:index]), exc)
+					continue
 			other_filesystem = False
 			try:
 				for part in parent[depth:]:
@@ -8946,7 +8999,12 @@ def _remove_listed_files(items, rmdir=False, rate_limiter=None, one_filesystem=F
 							'nothing in it is removed')
 						other_filesystem = True
 						break
-					stack.append((part, fd))
+					stack.append([part, fd])
+					# Hold at most _WALK_FD_BUDGET below the root: the shallowest go (opened again when needed, above).
+					held = [entry for entry in stack[1:] if entry[1] is not None]
+					for entry in held[:max(0, len(held) - _WALK_FD_BUDGET)]:
+						os.close(entry[1])
+						entry[1] = None
 			except OSError as exc:
 				refused = (root, parent[:len(stack)])
 				if not isinstance(exc, FileNotFoundError):
@@ -8958,7 +9016,9 @@ def _remove_listed_files(items, rmdir=False, rate_limiter=None, one_filesystem=F
 			remove(name, stack[-1][1], os.path.join(root, rel))
 	finally:
 		while stack:
-			os.close(stack.pop()[1])
+			fd = stack.pop()[1]
+			if fd is not None:
+				os.close(fd)
 	return 0, time.monotonic() - start_time
 
 _SCANDIR_FD = os.scandir in os.supports_fd
@@ -9070,14 +9130,17 @@ def _is_directory_now(name, dir_fd, exc):
 			return False
 	return False
 
-def _remove_tree_fd(root, root_id, exclude=None, remove_files=False, rate_limiter=None):
+def _remove_tree_fd(root, root_id, exclude=None, remove_files=False, rate_limiter=None, spelled=None):
 	"""Walk the directory tree at root by descriptors from the pinned root (_open_source_root), each directory opened
 	relative to its parent with O_NOFOLLOW, deepest first, as shutil.rmtree does (one open and one listing per directory):
 	rmdir each directory once its entries are handled. With remove_files (plain -rm) its other entries are unlinked
 	first; without (a move's second pass) they are left. Excluded paths are not entered or removed. Returns (entries
 	unlinked, entries left in place, excluded ones aside; errors as (path, OSError)): a directory swapped for a symlink,
 	or a root replaced, is an error and nothing below it is touched. A directory that still holds something stays.
-	rate_limiter (a _file_list_rate_limit state, -F) paces the unlinks."""
+	rate_limiter (a _file_list_rate_limit state, -F) paces the unlinks. spelled: root as the caller wrote it, the base of
+	the paths excludes are matched against (and errors name). At most _WALK_FD_BUDGET descriptors are held: deeper, the
+	shallowest are let go (their identity kept) and each is opened again through '..' of its child, checked against that
+	identity (a directory moved meanwhile stops the walk, an error)."""
 	removed, left, errors = 0, [], []
 	if not _DIR_FD_WALK:
 		directories = []
@@ -9107,8 +9170,16 @@ def _remove_tree_fd(root, root_id, exclude=None, remove_files=False, rate_limite
 		return removed, left, errors
 	except OSError as e:
 		return removed, left, [(root, e)]
-	# frames: [descriptor, path, subdirectory names, next one, name in the parent]
+	# frames: [descriptor (None when let go), path, subdirectory names, next one, name in the parent, identity]
 	stack = []
+	def shed():
+		"""Let the shallowest descriptors go (never the root's) while more than _WALK_FD_BUDGET are held."""
+		held = [frame for frame in stack[1:] if frame[0] is not None]
+		for frame in held[:max(0, len(held) - _WALK_FD_BUDGET)]:
+			st = os.fstat(frame[0])
+			frame[5] = (st.st_dev, st.st_ino)
+			os.close(frame[0])
+			frame[0] = None
 	def enter(fd, path, name):
 		nonlocal removed
 		try:
@@ -9143,10 +9214,11 @@ def _remove_tree_fd(root, root_id, exclude=None, remove_files=False, rate_limite
 						subdirectories.append((entry, False))
 					else:
 						errors.append((child, e))
-		stack.append([fd, path, subdirectories, 0, name])
+		stack.append([fd, path, subdirectories, 0, name, None])
+		shed()
 	busy = (errno.ENOTEMPTY, errno.EEXIST) if remove_files else (errno.ENOTEMPTY, errno.EEXIST, errno.EBUSY)
 	try:
-		enter(root_fd, root, None)
+		enter(root_fd, spelled if spelled is not None else root, None)
 		while stack:
 			frame = stack[-1]
 			if frame[3] < len(frame[2]):
@@ -9176,6 +9248,22 @@ def _remove_tree_fd(root, root_id, exclude=None, remove_files=False, rate_limite
 				enter(fd, os.path.join(frame[1], entry), entry)
 				continue
 			stack.pop()
+			if stack and stack[-1][0] is None:
+				# The parent was let go: opened again through '..', and it must still be that directory.
+				parent = stack[-1]
+				try:
+					up = os.open(os.pardir, os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0) | getattr(os, 'O_CLOEXEC', 0), dir_fd=frame[0])
+				except OSError as e:
+					os.close(frame[0])
+					errors.append((parent[1], e))
+					break
+				st = os.fstat(up)
+				if (st.st_dev, st.st_ino) != parent[5]:
+					os.close(up)
+					os.close(frame[0])
+					errors.append((parent[1], _replaced(parent[1])))
+					break
+				parent[0] = up
 			os.close(frame[0])
 			if stack:
 				try:
@@ -9191,7 +9279,9 @@ def _remove_tree_fd(root, root_id, exclude=None, remove_files=False, rate_limite
 					errors.append((root, e))
 	finally:
 		while stack:
-			os.close(stack.pop()[0])
+			fd = stack.pop()[0]
+			if fd is not None:
+				os.close(fd)
 	return removed, left, errors
 
 # (shared count, start time, files per second) in a -pfl pool's workers under -F (_init_rate_share)
