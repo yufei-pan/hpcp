@@ -274,3 +274,169 @@ def test_listing_stats_each_subdirectory_once(tmp_path, hpcp_mod, reset_hpcp_glo
 	assert len(folders) == 41
 	# The root's own checks, then one lstat per subdirectory (40).
 	assert len(calls) <= 40 + 3
+
+
+# ---- 9.76: re-review of c4d89da..HEAD ----
+
+def _count_opens(monkeypatch, hpcp_mod):
+	opens = []
+	real_open = os.open
+	monkeypatch.setattr(hpcp_mod.os, 'open', lambda *a, **k: opens.append(a[0]) or real_open(*a, **k))
+	return opens
+
+
+def test_remove_extra_dirs_of_a_deep_tree_opens_each_level_about_once(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	"""Re-review: the cursor opened every released directory again from the root: 540257 opens for a 1500-level -rme
+	directory pass (9.75: about 1500). Going back up is one '..' a level now."""
+	(tmp_path / 'src').mkdir()
+	(tmp_path / 'dst').mkdir()
+	_deep(tmp_path / 'dst' / 'x', name='d')
+	for path in ('middle.txt', 'bottom.txt'):
+		pass
+	for dirpath, dirnames, filenames in hpcp_mod._walk(str(tmp_path / 'dst')):
+		for name in filenames:
+			os.unlink(os.path.join(dirpath, name))
+	opens = _count_opens(monkeypatch, hpcp_mod)
+	hpcp_mod.remove_extra_dirs([str(tmp_path / 'src') + os.sep], [str(tmp_path / 'dst') + os.sep])
+	assert os.listdir(str(tmp_path / 'dst')) == []
+	assert len(opens) <= 4 * DEPTH
+
+
+def test_a_move_of_a_deep_chain_with_a_file_per_level_opens_each_level_about_once(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	root = tmp_path / 'chain'
+	path = str(root)
+	os.mkdir(path)
+	files = []
+	for level in range(800):
+		path = os.path.join(path, 'l%03d' % level)
+		os.mkdir(path)
+		# 'z' sorts after the next level's name: the deeper paths come first, so the cursor climbs one level per file.
+		files.append(os.path.join(path, 'z'))
+		open(files[-1], 'w').close()
+	opens = _count_opens(monkeypatch, hpcp_mod)
+	hpcp_mod.remove_moved_sources([str(root)], files, {}, single_thread=True, remove_force=True, root_ids=hpcp_mod._source_identities([str(root)]))
+	assert not root.exists()
+	assert len(opens) <= 4 * 800
+
+
+def test_a_released_directory_mounted_on_meanwhile_is_not_entered(tmp_path, hpcp_mod, reset_hpcp_globals):
+	"""Re-review: a directory the cursor let go and opened again by name crossed into a filesystem mounted on it since."""
+	if os.geteuid() != 0:
+		pytest.skip('needs root to mount')
+	root = tmp_path / 'dst'
+	path = str(root)
+	os.mkdir(path)
+	chain = []
+	for level in range(60):
+		path = os.path.join(path, 'c%02d' % level)
+		os.mkdir(path)
+		chain.append(path)
+	open(os.path.join(chain[3], 'x'), 'w').close()
+	open(os.path.join(chain[-1], 'deep'), 'w').close()
+	root_fd = hpcp_mod._open_source_root(str(root), hpcp_mod._path_identity(str(root)))
+	held = hpcp_mod._HeldDirs(root_fd)
+	try:
+		for level in range(60):
+			held.push('c%02d' % level, os.open('c%02d' % level, hpcp_mod._BELOW_FLAGS, dir_fd=held.top()))
+		assert subprocess.run(['mount', '-t', 'tmpfs', 'hpcp-test', chain[3]], capture_output=True).returncode == 0
+		try:
+			open(os.path.join(chain[3], 'mounted'), 'w').close()
+			try:
+				held.truncate(4)
+				os.unlink('x', dir_fd=held.top())
+			except OSError as e:
+				assert e.errno == 116
+			assert os.path.exists(os.path.join(chain[3], 'mounted'))
+		finally:
+			subprocess.run(['umount', '-l', chain[3]], capture_output=True)
+	finally:
+		held.close_all()
+
+
+def test_walk_goes_on_when_a_released_parent_s_child_is_removed_meanwhile(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	"""Re-review: '..' of a directory removed by another process is ENOENT; the walk stopped and left every sibling."""
+	root = tmp_path / 'tree'
+	_deep(root, depth=80)
+	for index in range(5):
+		(root / ('sibling%d' % index)).mkdir()
+		(root / ('sibling%d' % index) / 'f').write_text('x')
+	real_open = os.open
+	failed = []
+	def flaky_open(path, *args, **kwargs):
+		if path == os.pardir and not failed:
+			failed.append(True)
+			raise FileNotFoundError(2, 'No such file or directory', path)
+		return real_open(path, *args, **kwargs)
+	monkeypatch.setattr(hpcp_mod.os, 'open', flaky_open)
+	hpcp_mod._rmtree(str(root))
+	assert failed and not root.exists()
+
+
+def test_rmtree_of_an_empty_path_removes_nothing(tmp_path, hpcp_mod, monkeypatch):
+	"""Re-review: _rmtree('') removed the whole working directory; shutil.rmtree('') raises and touches nothing."""
+	(tmp_path / 'work' / 'keep').mkdir(parents=True)
+	monkeypatch.chdir(tmp_path / 'work')
+	with pytest.raises(FileNotFoundError):
+		hpcp_mod._rmtree('')
+	assert (tmp_path / 'work' / 'keep').is_dir()
+
+
+def test_rmtree_resolves_the_path_as_the_kernel_does(tmp_path, hpcp_mod, monkeypatch):
+	"""'link/..' is the link target's parent, as shutil.rmtree sees it, not the lexical one."""
+	(tmp_path / 'far' / 'target').mkdir(parents=True)
+	(tmp_path / 'near').mkdir()
+	(tmp_path / 'near' / 'keep').write_text('keep')
+	os.symlink(str(tmp_path / 'far' / 'target'), str(tmp_path / 'near' / 'link'))
+	monkeypatch.chdir(tmp_path / 'near')
+	try:
+		hpcp_mod._rmtree('link/..')
+	except OSError:
+		# shutil.rmtree raises here once 'link' dangles (its final rmdir); either way the same entries go.
+		pass
+	# What shutil.rmtree('link/..') does: far's contents go, near (the lexical 'link/..') is untouched.
+	assert (tmp_path / 'near' / 'keep').read_text() == 'keep'
+	assert not (tmp_path / 'far' / 'target').exists()
+
+
+@pytest.mark.parametrize('name, exist_ok', [('x/.', False), ('.', False), ('file/.', True)])
+def test_makedirs_raises_where_os_makedirs_does(tmp_path, hpcp_mod, monkeypatch, name, exist_ok):
+	monkeypatch.chdir(tmp_path)
+	(tmp_path / 'x').mkdir()
+	(tmp_path / 'file').write_text('f')
+	with pytest.raises(OSError) as theirs:
+		os.makedirs(name, exist_ok=exist_ok)
+	with pytest.raises(OSError) as ours:
+		hpcp_mod._makedirs(name, exist_ok=exist_ok)
+	assert type(ours.value) is type(theirs.value)
+
+
+def test_a_failing_fstat_on_the_way_back_is_recorded_not_raised(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	root = tmp_path / 'tree'
+	_deep(root, depth=60)
+	real_fstat = os.fstat
+	calls = []
+	def fstat(fd):
+		calls.append(fd)
+		if len(calls) == 40:
+			raise OSError(5, 'Input/output error')
+		return real_fstat(fd)
+	before = len(os.listdir('/proc/self/fd'))
+	monkeypatch.setattr(hpcp_mod.os, 'fstat', fstat)
+	removed, left, errors = hpcp_mod._remove_tree_fd(str(root), hpcp_mod._path_identity(str(root)), remove_files=True)
+	monkeypatch.setattr(hpcp_mod.os, 'fstat', real_fstat)
+	assert len(os.listdir('/proc/self/fd')) == before
+	assert isinstance(errors, list)
+
+
+def test_a_parallel_listing_folder_gets_one_lstat(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	"""Re-review: -pfl lists each folder as a root (recurse=False): islink, isfile, isdir again. A folder from a parent's
+	listing (known_dir) gets one lstat."""
+	(tmp_path / 'folder' / 'sub').mkdir(parents=True)
+	(tmp_path / 'folder' / 'f').write_text('x')
+	calls = []
+	real_stat, real_lstat = os.stat, os.lstat
+	monkeypatch.setattr(hpcp_mod.os, 'stat', lambda *a, **k: calls.append(('stat', a[0])) or real_stat(*a, **k))
+	monkeypatch.setattr(hpcp_mod.os, 'lstat', lambda *a, **k: calls.append(('lstat', a[0])) or real_lstat(*a, **k))
+	files, links, size, folders = hpcp_mod.get_file_list_serial(str(tmp_path / 'folder'), recurse=False, known_dir=True)
+	assert str(tmp_path / 'folder' / 'sub') in folders
+	assert [call for call in calls if call[1] == str(tmp_path / 'folder')] == [('lstat', str(tmp_path / 'folder'))]
