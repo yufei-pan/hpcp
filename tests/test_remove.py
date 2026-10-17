@@ -301,9 +301,11 @@ def test_move_into_a_new_dest_image_creates_it_before_removing_the_sources(tmp_p
 def test_remove_extra_dirs_never_enters_a_mount_point(tmp_tree, hpcp_mod, reset_hpcp_globals, monkeypatch):
 	"""A filesystem mounted below the destination is skipped whole, not just its root directory."""
 	inner = tmp_tree.add_dir('scratch/a', under='dst')
-	mount_point = str(tmp_tree.dst / 'scratch')
-	real_ismount = os.path.ismount
-	monkeypatch.setattr(hpcp_mod.os.path, 'ismount', lambda path: os.path.normpath(path) == mount_point or real_ismount(path))
+	# A mount point at dst/scratch, as _filesystem_boundary would find it (tests/test_rme_mounts.py mounts for real).
+	def boundary(listed_root, real_root, entries=None):
+		return (listed_root.rstrip(os.sep) + os.sep, real_root.rstrip(os.sep) + os.sep,
+			frozenset([os.path.join(real_root, 'scratch')]), None)
+	monkeypatch.setattr(hpcp_mod, '_filesystem_boundary', boundary)
 	hpcp_mod.remove_extra_dirs([str(tmp_tree.src) + os.sep], [str(tmp_tree.dst) + os.sep])
 	assert os.path.isdir(inner)
 

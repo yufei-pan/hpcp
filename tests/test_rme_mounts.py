@@ -106,3 +106,141 @@ def test_removal_cursor_stops_at_another_device_it_was_not_told_about(tmp_path, 
 	assert not (dst / 'stale.txt').exists()
 	assert _failures(hpcp_mod) == []
 	assert any(error.startswith('Other filesystem left') for error in hpcp_mod.ERRORS)
+
+
+# ---- 9.75: review of main..HEAD ----
+
+def test_remove_extra_does_not_list_into_a_mounted_filesystem(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch, capsys):
+	"""Review: the destination listing went into the mount and filtered after it: a hung NFS mount stalled -rme, an
+	unreadable FUSE mount failed the run. As rsync -x, the listing stops at the mount."""
+	src, dst = tmp_path / 'src', tmp_path / 'dst'
+	src.mkdir()
+	dst.mkdir()
+	(dst / 'stale.txt').write_text('stale')
+	with _mounted(dst / 'share'):
+		_fill(dst / 'share')
+		real = os.scandir
+		def scandir(path='.'):
+			if isinstance(path, (str, bytes, os.PathLike)) and os.fspath(path).startswith(str(dst / 'share')):
+				raise PermissionError(13, 'Permission denied (an unreadable FUSE mount)', os.fspath(path))
+			return real(path)
+		monkeypatch.setattr(hpcp_mod.os, 'scandir', scandir)
+		_answer_yes(monkeypatch)
+		hpcp_mod.remove_extra_files([], [str(dst) + os.sep], 2, False, 1, single_thread=True, src_paths=[str(src) + os.sep])
+	assert not (dst / 'stale.txt').exists()
+	assert _failures(hpcp_mod) == []
+
+
+def test_remove_extra_prompt_lists_nothing_on_another_device_mountinfo_does_not_show(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch, capsys):
+	"""Review: a btrfs subvolume (another device, not a mount) was offered for deletion, then refused. Here a tmpfs that
+	mountinfo is made not to show stands in for it: the listing stops at the device, so the prompt does not offer it."""
+	src, dst = tmp_path / 'src', tmp_path / 'dst'
+	src.mkdir()
+	dst.mkdir()
+	(dst / 'stale.txt').write_text('stale')
+	with _mounted(dst / 'subvol'):
+		_fill(dst / 'subvol')
+		monkeypatch.setattr(hpcp_mod, '_mountinfo_entries', lambda *args, **kwargs: [])
+		_answer_yes(monkeypatch)
+		hpcp_mod.remove_extra_files([], [str(dst) + os.sep], 2, False, 1, single_thread=True, src_paths=[str(src) + os.sep])
+		hpcp_mod.remove_extra_dirs([str(src) + os.sep], [str(dst) + os.sep])
+		assert (dst / 'subvol' / 'x.txt').exists() and (dst / 'subvol' / 'sub' / 'empty').is_dir()
+	output = capsys.readouterr().out
+	assert 'x.txt' not in output and 'stale.txt' in output
+	assert not (dst / 'stale.txt').exists()
+	assert _failures(hpcp_mod) == []
+
+
+def test_remove_extra_leaves_a_bind_mounted_file(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	"""Review: a file that is a mount point (/etc/hosts in a container) was offered and failed to unlink (EBUSY)."""
+	src, dst = tmp_path / 'src', tmp_path / 'dst'
+	src.mkdir()
+	dst.mkdir()
+	(tmp_path / 'hosts-source').write_text('127.0.0.1 localhost')
+	(dst / 'hosts').write_text('')
+	if os.geteuid() != 0:
+		pytest.skip('needs root to mount')
+	result = subprocess.run(['mount', '--bind', str(tmp_path / 'hosts-source'), str(dst / 'hosts')], capture_output=True, text=True)
+	if result.returncode:
+		pytest.skip(f'mount failed: {result.stderr.strip()}')
+	try:
+		_answer_yes(monkeypatch)
+		hpcp_mod.remove_extra_files([], [str(dst) + os.sep], 2, False, 1, single_thread=True, src_paths=[str(src) + os.sep])
+		assert (dst / 'hosts').read_text() == '127.0.0.1 localhost'
+	finally:
+		subprocess.run(['umount', '-l', str(dst / 'hosts')], capture_output=True)
+	assert _failures(hpcp_mod) == []
+
+
+def test_a_mount_hidden_under_a_later_mount_does_not_shield_the_visible_directory(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	"""Review: dst/share was a mount, then a filesystem was mounted over dst: the share mountinfo still lists is hidden,
+	and dst/share is a plain directory of the visible filesystem, cleaned like any other."""
+	src, dst = tmp_path / 'src', tmp_path / 'dst'
+	src.mkdir()
+	with _mounted(dst / 'share'):
+		(dst / 'share' / 'old.txt').write_text('on the hidden mount')
+		with _mounted(dst):
+			(dst / 'share').mkdir()
+			(dst / 'share' / 'stale.txt').write_text('stale')
+			_answer_yes(monkeypatch)
+			hpcp_mod.remove_extra_files([], [str(dst) + os.sep], 2, False, 1, single_thread=True, src_paths=[str(src) + os.sep])
+			hpcp_mod.remove_extra_dirs([str(src) + os.sep], [str(dst) + os.sep])
+			assert not (dst / 'share').exists()
+		assert (dst / 'share' / 'old.txt').read_text() == 'on the hidden mount'
+	assert _failures(hpcp_mod) == []
+
+
+def test_a_directory_mounted_on_after_the_walk_is_kept_without_an_error(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	"""Review: an extra directory mounted on between the walk and its rmdir failed with EBUSY as an error."""
+	src, dst = tmp_path / 'src', tmp_path / 'dst'
+	src.mkdir()
+	(dst / 'extra').mkdir(parents=True)
+	if os.geteuid() != 0:
+		pytest.skip('needs root to mount')
+	real_walk = os.walk
+	mounted = []
+	def walk(*args, **kwargs):
+		yield from real_walk(*args, **kwargs)
+		if not mounted and subprocess.run(['mount', '-t', 'tmpfs', 'hpcp-test', str(dst / 'extra')], capture_output=True).returncode == 0:
+			mounted.append(True)
+	monkeypatch.setattr(hpcp_mod.os, 'walk', walk)
+	try:
+		hpcp_mod.remove_extra_dirs([str(src) + os.sep], [str(dst) + os.sep])
+		assert mounted and (dst / 'extra').is_dir()
+	finally:
+		subprocess.run(['umount', '-l', str(dst / 'extra')], capture_output=True)
+	assert _failures(hpcp_mod) == []
+
+
+def test_deep_destination_with_a_mount_below_it(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	"""Review: the mount check recursed once per path component (a deep chain hit Python's recursion limit); the
+	listing now stops at mounts itself. 600 levels: the listing's own recursion (pre-existing, also in the copy) stops
+	near 1000."""
+	src, dst = tmp_path / 'src', tmp_path / 'dst'
+	src.mkdir()
+	deep = dst
+	dst.mkdir()
+	for _ in range(600):
+		deep = deep / 'a'
+		os.mkdir(str(deep))
+	(deep / 'stale.txt').write_text('stale')
+	with _mounted(dst / 'mnt'):
+		_answer_yes(monkeypatch)
+		hpcp_mod.remove_extra_files([], [str(dst) + os.sep], 2, False, 1, single_thread=True, src_paths=[str(src) + os.sep])
+	assert not (deep / 'stale.txt').exists()
+
+
+def test_fallback_removal_stops_at_another_device(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	"""Review: without descriptor support the one_filesystem backstop did not exist."""
+	dst = tmp_path / 'dst'
+	dst.mkdir()
+	(dst / 'stale.txt').write_text('stale')
+	with _mounted(dst / 'mnt'):
+		_fill(dst / 'mnt')
+		monkeypatch.setattr(hpcp_mod, '_DIR_FD_WALK', False)
+		root_id = hpcp_mod._path_identity(str(dst))
+		items = [(str(dst), root_id, rel) for rel in ('mnt/sub/y.txt', 'mnt/x.txt', 'stale.txt')]
+		hpcp_mod._remove_items(items, single_thread=True, one_filesystem=True)
+		assert (dst / 'mnt' / 'x.txt').exists() and (dst / 'mnt' / 'sub' / 'y.txt').exists()
+	assert not (dst / 'stale.txt').exists()
+	assert _failures(hpcp_mod) == []

@@ -2572,14 +2572,15 @@ def trim_paths(paths, baseDir):
 #%% ---- Generate File List ----
 _get_file_list_cache = {}
 
-def _get_file_list_cache_key(path, exclude, append_hash, full_hash):
+def _get_file_list_cache_key(path, exclude, append_hash, full_hash, boundary=None):
 	exclude_key = frozenset(exclude) if isinstance(exclude, (list, set)) else exclude
-	return (path, exclude_key, append_hash, full_hash)
+	return (path, exclude_key, append_hash, full_hash, boundary)
 
-def get_file_list(path, exclude=None, append_hash=False, full_hash=False, max_workers=56, drop_cache=False, parallel_file_listing=True):
+def get_file_list(path, exclude=None, append_hash=False, full_hash=False, max_workers=56, drop_cache=False, parallel_file_listing=True, boundary=None):
 	"""Unified file list getter with a single cache. Dispatches to get_file_list_serial or get_file_list_parallel based on serial.
-	Listing only reads: -rm removes by descriptors (process_remove), not while listing."""
-	cache_key = _get_file_list_cache_key(path, exclude, append_hash, full_hash)
+	Listing only reads: -rm removes by descriptors (process_remove), not while listing. boundary (-rme's destination
+	listing, _filesystem_boundary): stop at another filesystem below the root, and take no sizes."""
+	cache_key = _get_file_list_cache_key(path, exclude, append_hash, full_hash, boundary)
 	if drop_cache:
 		_get_file_list_cache.pop(cache_key, None)
 	if cache_key in _get_file_list_cache:
@@ -2587,9 +2588,9 @@ def get_file_list(path, exclude=None, append_hash=False, full_hash=False, max_wo
 	start_time = time.monotonic()
 	print(f"Getting file list for {path}")
 	if parallel_file_listing:
-		file_list, links, size, folders = get_file_list_parallel(path, max_workers=max_workers, exclude=exclude, append_hash=append_hash, full_hash=full_hash)
+		file_list, links, size, folders = get_file_list_parallel(path, max_workers=max_workers, exclude=exclude, append_hash=append_hash, full_hash=full_hash, boundary=boundary)
 	else:
-		file_list, links, size, folders = get_file_list_serial(path, exclude=exclude, append_hash=append_hash, full_hash=full_hash)
+		file_list, links, size, folders = get_file_list_serial(path, exclude=exclude, append_hash=append_hash, full_hash=full_hash, boundary=boundary)
 	result = (file_list, links, size, folders)
 	_get_file_list_cache[cache_key] = result
 	print(f"Time taken to get file list: {time.monotonic() - start_time:0.4f} seconds")
@@ -2635,7 +2636,36 @@ def _special_file_kind(entry):
 			return kind
 	return None
 
-def get_file_list_serial(root,exclude=None,append_hash=False,full_hash=False,recurse=True,_rate_limiter=None,respect_file_rate_limit=True):
+def _filesystem_boundary(listed_root, real_root, entries=None):
+	"""What -rme leaves alone below a destination, as rsync -x: (listed_root + sep, real_root + sep, the visible mount
+	points strictly below real_root (mountinfo, hidden mounts aside: bind mounts, of files too), real_root's device). A
+	listing given it skips those mount points and the directories on another device (a btrfs subvolume, a mount
+	mountinfo does not show), whole."""
+	entries = _mountinfo_entries() if entries is None else entries
+	hidden = _hidden_mounts(entries)
+	real_prefix = real_root.rstrip(os.sep) + os.sep
+	points = frozenset(entry['mount_point'] for index, entry in enumerate(entries)
+		if index not in hidden and entry['mount_point'].startswith(real_prefix))
+	try:
+		device = os.stat(real_root).st_dev
+	except OSError:
+		device = None
+	return (listed_root.rstrip(os.sep) + os.sep, real_prefix, points, device)
+
+def _across_boundary(path, boundary, is_dir, entry=None):
+	"""True when path (below the boundary's listed root) is a mount point of the boundary, or a directory on another
+	device (from entry, a DirEntry: a stat; else an lstat)."""
+	listed_prefix, real_prefix, points, device = boundary
+	if points and path.startswith(listed_prefix) and (real_prefix + path[len(listed_prefix):]) in points:
+		return True
+	if is_dir and device is not None:
+		try:
+			return (entry.stat(follow_symlinks=False) if entry is not None else os.lstat(path)).st_dev != device
+		except OSError:
+			return False
+	return False
+
+def get_file_list_serial(root,exclude=None,append_hash=False,full_hash=False,recurse=True,_rate_limiter=None,respect_file_rate_limit=True,boundary=None):
 	# skip if path is longer than 4096 characters: not listed, so not copied (an error: a move must not delete it).
 	if len(root) > 4096:
 		eprint(f'Listing error: {root}: path longer than 4096 characters, not listed')
@@ -2685,19 +2715,22 @@ def get_file_list_serial(root,exclude=None,append_hash=False,full_hash=False,rec
 			if exclude and is_excluded(entry.path,exclude):
 				continue
 			try:
+				# -rme's destination listing: another filesystem below the destination is left alone, unlisted.
+				if boundary is not None and _across_boundary(entry.path, boundary, entry.is_dir(follow_symlinks=False), entry):
+					continue
 				if entry.is_symlink():
 					_file_list_rate_limit(_rate_limiter)
-					realSize = get_file_size(entry.path)
-					size += realSize
+					if boundary is None:
+						size += get_file_size(entry.path)
 					links.add(get_file_repr(entry.path,append_hash,full_hash))
 				elif entry.is_file(follow_symlinks=False):
 					_file_list_rate_limit(_rate_limiter)
-					realSize = get_file_size(entry.path)
-					size += realSize
+					if boundary is None:
+						size += get_file_size(entry.path)
 					file_list.add(get_file_repr(entry.path,append_hash,full_hash))
 				elif entry.is_dir(follow_symlinks=False):
 					if recurse:
-						dir_files, dir_links, dir_size, dir_folders = get_file_list_serial(entry.path,exclude=exclude,append_hash=append_hash,full_hash=full_hash,_rate_limiter=_rate_limiter,respect_file_rate_limit=respect_file_rate_limit)
+						dir_files, dir_links, dir_size, dir_folders = get_file_list_serial(entry.path,exclude=exclude,append_hash=append_hash,full_hash=full_hash,_rate_limiter=_rate_limiter,respect_file_rate_limit=respect_file_rate_limit,boundary=boundary)
 						file_list.update(dir_files)
 						links.update(dir_links)
 						size += dir_size
@@ -2718,7 +2751,7 @@ def get_file_list_serial(root,exclude=None,append_hash=False,full_hash=False,rec
 		return frozenset([root]) ,frozenset(), 0,frozenset()
 	return frozenset(file_list), frozenset(links) , size, frozenset(folders - set(['.', '..']))
 
-def get_file_list_parallel(path,max_workers=56,exclude=None,append_hash=False,full_hash=False):
+def get_file_list_parallel(path,max_workers=56,exclude=None,append_hash=False,full_hash=False,boundary=None):
 	global FILES_RATE_LIMIT
 	# skip if path is longer than 4096 characters (an error, as in get_file_list_serial)
 	if len(path) > 4096:
@@ -2740,6 +2773,7 @@ def get_file_list_parallel(path,max_workers=56,exclude=None,append_hash=False,fu
 			full_hash=full_hash,
 			recurse=False,
 			respect_file_rate_limit=False,
+			boundary=boundary,
 		)
 		file_list = set(file_list)
 		link_list = set(link_list)
@@ -2766,6 +2800,7 @@ def get_file_list_parallel(path,max_workers=56,exclude=None,append_hash=False,fu
 						full_hash=full_hash,
 						recurse=False,
 						respect_file_rate_limit=False,
+						boundary=boundary,
 					)] = folder
 					under_rate_limit = (
 						FILES_RATE_LIMIT <= 0
@@ -8127,12 +8162,11 @@ def remove_extra_dirs(src_paths, dests,exclude=None,dest_image=False,keep=(),des
 	if dest_roots is None:
 		dest_roots = _destination_roots(dests)
 	dests = [dest for dest in dests if os.path.abspath(dest) in dest_roots]
+	mount_entries = _mountinfo_entries()
 	print(pformat(dests))
 	for dest in dests:
-		# Mount points below it (mountinfo: bind mounts of the same filesystem too, which os.path.ismount misses).
-		real_root = dest_roots[os.path.abspath(dest)][0]
-		mount_points = _mount_points_below(real_root)
-		dest_prefix = os.path.abspath(dest).rstrip(os.sep) + os.sep
+		# Another filesystem below it (a mount or bind mount, another device), as remove_extra_files' listing.
+		boundary = _filesystem_boundary(os.path.abspath(dest), dest_roots[os.path.abspath(dest)][0], mount_entries)
 		for dirpath, dirnames, _ in os.walk(dest):
 			walk_into = []
 			for dirname in dirnames:
@@ -8144,7 +8178,7 @@ def remove_extra_dirs(src_paths, dests,exclude=None,dest_image=False,keep=(),des
 					continue
 				if os.path.islink(dest_dir_path):
 					continue
-				if os.path.ismount(dest_dir_path) or (mount_points and os.path.join(real_root, os.path.abspath(dest_dir_path)[len(dest_prefix):]) in mount_points):
+				if _across_boundary(os.path.abspath(dest_dir_path), boundary, True):
 					# Another filesystem: never walked into, so nothing in it is removed.
 					print(f"Skipping mount point: {dest_dir_path}")
 					continue
@@ -8315,6 +8349,7 @@ def remove_extra_files(total_file_list, dests,max_workers,verbose,files_per_job,
 		if dest_roots is None:
 			dest_roots = _destination_roots(dests)
 		dests = [dest for dest in dests if os.path.abspath(dest) in dest_roots]
+		mount_entries = _mountinfo_entries()
 		# {extra path: the destination root it was listed below}
 		extra_roots = {}
 		src_entries = set(total_file_list) if total_file_list else set()
@@ -8328,11 +8363,10 @@ def remove_extra_files(total_file_list, dests,max_workers,verbose,files_per_job,
 			copied_roots = {actual_dest for _, actual_dests in mapping for actual_dest in actual_dests}
 			excluded_roots = _excluded_roots(mapping, exclude)
 			for dest in dests:
-				dest_file_list, links, _, _ = get_file_list(dest, max_workers=max_workers, exclude=exclude, parallel_file_listing=parallel_file_listing)
 				dest_abs_root = os.path.abspath(dest)
-				# A filesystem mounted below the destination is left alone (as remove_extra_dirs does): not extra.
-				real_root = dest_roots[dest_abs_root][0]
-				in_mount = _below_a_mount(dest_abs_root, real_root, _mount_points_below(real_root))
+				# A filesystem mounted below the destination is left alone, as rsync -x: not even listed.
+				dest_file_list, links, _, _ = get_file_list(dest, max_workers=max_workers, exclude=exclude, parallel_file_listing=parallel_file_listing,
+					boundary=_filesystem_boundary(dest_abs_root, dest_roots[dest_abs_root][0], mount_entries))
 				actual = {os.path.abspath(p) for p in dest_file_list}
 				actual.update({os.path.abspath(p) for p in links})
 				# Only consider entries that actually live under this dest so we
@@ -8341,16 +8375,16 @@ def remove_extra_files(total_file_list, dests,max_workers,verbose,files_per_job,
 					if path == dest_abs_root or path.startswith(dest_abs_root + os.path.sep):
 						# The copy of an excluded source path is not extra: it was left out, not deleted.
 						if (not _excluded_at_source(path, mapping, exclude, excluded_roots=excluded_roots) and not _is_kept(path, kept, dest_abs_root, copied_roots)
-								and not _in_root_lost_and_found(path, dest_abs_root) and not in_mount(path)):
+								and not _in_root_lost_and_found(path, dest_abs_root)):
 							inDestNotInSrc.add(path)
 							extra_roots[path] = dest_abs_root
 		else:
 			for dest in dests:
-				dest_file_list,links,_ ,_ = get_file_list(dest, max_workers=max_workers,exclude=exclude,parallel_file_listing=parallel_file_listing)
+				listed_root = os.path.abspath(dest)
+				dest_file_list,links,_ ,_ = get_file_list(dest, max_workers=max_workers,exclude=exclude,parallel_file_listing=parallel_file_listing,
+					boundary=_filesystem_boundary(listed_root, dest_roots[listed_root][0], mount_entries))
 				dest_trimmed = trim_paths(dest_file_list,dest)
 				dest_trimmed.update(trim_paths(links,dest))
-				listed_root = os.path.abspath(dest)
-				in_mount = _below_a_mount(listed_root, dest_roots[listed_root][0], _mount_points_below(dest_roots[listed_root][0]))
 				# trim_paths roots everything at os.path.dirname(dest); rebuild
 				# absolute paths against the same base or we'd double up the
 				# dest basename when ``dest`` lacks a trailing separator.
@@ -8358,8 +8392,6 @@ def remove_extra_files(total_file_list, dests,max_workers,verbose,files_per_job,
 				dest_base = os.path.dirname(dest) or os.curdir
 				for file in dest_trimmed - src_entries:
 					path = os.path.join(dest_base, file)
-					if in_mount(os.path.abspath(path)):
-						continue
 					inDestNotInSrc.add(path)
 					extra_roots[path] = dest
 		print('-'*80)
@@ -8638,7 +8670,7 @@ def _same_or_inside(path, src):
 def _replaced(path):
 	return OSError(errno.ESTALE, 'it was replaced since the copy listed it', path)
 
-def _open_source_root(root, root_id):
+def _open_source_root(root, root_id, with_device=False):
 	"""A descriptor of the source root directory, opened from its parent with O_NOFOLLOW and checked against root_id (its
 	identity when the copy started): a root renamed away and replaced by a symlink or another directory raises (ELOOP,
 	ESTALE) instead of leading the removal into the replacement. The parent is opened by the path as given."""
@@ -8654,7 +8686,7 @@ def _open_source_root(root, root_id):
 	if root_id is None or (st.st_dev, st.st_ino) != tuple(root_id):
 		os.close(fd)
 		raise _replaced(root)
-	return fd
+	return (fd, st.st_dev) if with_device else fd
 
 def _parent_below(root, root_id, rel):
 	"""(descriptor or None, name, identity or None) for entry rel below the source root. The descriptor is rel's
@@ -8747,8 +8779,20 @@ def _remove_listed_files(items, rmdir=False, rate_limiter=None, one_filesystem=F
 				_unlink_failed(name, fd, path, exc)
 			elif exc.errno in (errno.ENOTEMPTY, errno.EEXIST):
 				print(f"Keeping non-empty directory: {path}")
+			elif exc.errno == errno.EBUSY:
+				# Mounted on since it was listed: another filesystem, left alone.
+				print(f"Keeping mount point: {path}")
 			else:
 				_report_rmdir_failed(path, exc)
+	fallback_devices = {}
+	def foreign(root, rel):
+		"""Without descriptors: rel's directory is on another device than root (one_filesystem)."""
+		try:
+			if root not in fallback_devices:
+				fallback_devices[root] = os.lstat(root).st_dev
+			return os.lstat(os.path.dirname(os.path.join(root, rel))).st_dev != fallback_devices[root]
+		except OSError:
+			return False
 	def remove_one(root, root_id, rel):
 		if not rmdir:
 			_file_list_rate_limit(rate_limiter)
@@ -8760,10 +8804,16 @@ def _remove_listed_files(items, rmdir=False, rate_limiter=None, one_filesystem=F
 		path = root if rel in ('', '.') else os.path.join(root, rel)
 		if e.errno in (errno.ENOTEMPTY, errno.EEXIST):
 			print(f"Keeping non-empty directory: {path}")
+		elif e.errno == errno.EBUSY:
+			print(f"Keeping mount point: {path}")
 		else:
 			_report_rmdir_failed(path, e)
 	if not _DIR_FD_WALK:
 		for root, root_id, rel in items:
+			if one_filesystem and rel not in ('', '.') and foreign(root, rel):
+				eprint(f'Other filesystem left: {os.path.dirname(os.path.join(root, rel))} is another filesystem below {root}: '
+					'nothing in it is removed')
+				continue
 			remove_one(root, root_id, rel)
 		return 0, time.monotonic() - start_time
 	# stack: [(name, descriptor)], the root first (name None), then each directory down to the current one.
@@ -8793,34 +8843,38 @@ def _remove_listed_files(items, rmdir=False, rate_limiter=None, one_filesystem=F
 				current_root = None
 				shown = None
 				try:
-					stack.append((None, _open_source_root(root, root_id)))
+					root_fd, root_dev = _open_source_root(root, root_id, with_device=True)
+					stack.append((None, root_fd))
 				except OSError as exc:
 					refused = (root, [])
 					if not isinstance(exc, FileNotFoundError):
 						_report_unremoved(root, exc)
 					continue
 				current_root = root
-				if one_filesystem:
-					root_dev = os.fstat(stack[0][1]).st_dev
 			depth = 0
 			while depth < len(parent) and depth + 1 < len(stack) and stack[depth + 1][0] == parent[depth]:
 				depth += 1
 			while len(stack) > depth + 1:
 				os.close(stack.pop()[1])
+			other_filesystem = False
 			try:
 				for part in parent[depth:]:
-					stack.append((part, os.open(part, _BELOW_FLAGS, dir_fd=stack[-1][1])))
-					if one_filesystem and os.fstat(stack[-1][1]).st_dev != root_dev:
-						refused = (root, parent[:len(stack) - 1])
+					fd = os.open(part, _BELOW_FLAGS, dir_fd=stack[-1][1])
+					if one_filesystem and os.fstat(fd).st_dev != root_dev:
+						# Another device below the root (one the listing did not see): not entered, closed now.
+						os.close(fd)
+						refused = (root, parent[:len(stack)])
 						eprint(f'Other filesystem left: {os.path.join(root, *refused[1])} is another filesystem below {root}: '
 							'nothing in it is removed')
+						other_filesystem = True
 						break
+					stack.append((part, fd))
 			except OSError as exc:
 				refused = (root, parent[:len(stack)])
 				if not isinstance(exc, FileNotFoundError):
 					_report_unremoved(os.path.join(root, *parent[:len(stack)]), exc)
 				continue
-			if refused is not None and refused[0] == root and parent[:len(refused[1])] == refused[1]:
+			if other_filesystem:
 				continue
 			shown = (root, parent_rel)
 			remove(name, stack[-1][1], os.path.join(root, rel))
@@ -8842,35 +8896,6 @@ def _destination_roots(dests):
 		real = os.path.realpath(listed)
 		roots[listed] = (real, _path_identity(real), _path_identity(listed))
 	return roots
-
-def _mount_points_below(real_root):
-	"""The mount points (mountinfo, bind mounts included) strictly below real_root: filesystems -rme leaves alone."""
-	prefix = real_root.rstrip(os.sep) + os.sep
-	return frozenset(entry['mount_point'] for entry in _mountinfo_entries() if entry['mount_point'].startswith(prefix))
-
-def _below_a_mount(listed_root, real_root, mount_points):
-	"""A function telling whether a path below listed_root lies in a filesystem mounted below it (one of mount_points,
-	real paths below real_root): its path below the root is placed under real_root (the listing does not follow
-	symlinks below the root) and its directories are looked up, each once. Without mounts below, always False."""
-	if not mount_points:
-		return lambda path: False
-	prefix = listed_root.rstrip(os.sep) + os.sep
-	real_prefix = real_root.rstrip(os.sep) + os.sep
-	known = {}
-	def inside(directory):
-		# directory: a path below the root, relative, '/'-joined by os.sep ('' is the root itself)
-		if directory in known:
-			return known[directory]
-		parent = os.path.dirname(directory)
-		result = (real_prefix + directory) in mount_points or (bool(parent) and inside(parent))
-		known[directory] = result
-		return result
-	def below(path):
-		if not path.startswith(prefix):
-			return False
-		directory = os.path.dirname(path[len(prefix):])
-		return bool(directory) and inside(directory)
-	return below
 
 def _checked_destination_roots(dests, pinned=None):
 	"""_destination_roots now, checked against pinned (taken before the copy): a destination that resolves elsewhere
