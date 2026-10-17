@@ -8722,7 +8722,8 @@ def _remove_listed_files(items, rmdir=False, rate_limiter=None):
 			if rmdir:
 				os.rmdir(name, dir_fd=fd)
 			else:
-				_file_list_rate_limit(rate_limiter)
+				if rate_limiter is not None:
+					_file_list_rate_limit(rate_limiter)
 				os.unlink(name, dir_fd=fd)
 		except (FileNotFoundError, IsADirectoryError):
 			pass
@@ -8969,7 +8970,8 @@ def _remove_tree_fd(root, root_id, exclude=None, remove_files=False, rate_limite
 			elif not remove_files:
 				left.append(child)
 			else:
-				_file_list_rate_limit(rate_limiter)
+				if rate_limiter is not None:
+					_file_list_rate_limit(rate_limiter)
 				try:
 					os.unlink(entry, dir_fd=fd)
 					removed += 1

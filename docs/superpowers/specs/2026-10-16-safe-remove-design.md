@@ -100,6 +100,18 @@ Fixed, with tests:
 Declined:
 - **A single parallel pass for `-pfl`:** 9.73 also made two passes (a parallel listing, then `rmtree`), and 9.74 measured faster than it.
 
+## Re-review of 418ca7e..HEAD (user: "re-review then release")
+
+Fixed, with tests:
+- **Destinations are pinned before the copy, as sources are.** A destination swapped for a symlink between the copy and `-rme` used to be followed; one that now resolves elsewhere is not cleaned (`Remove skipped`, `_checked_destination_roots`).
+- **Legacy `-fl -rme` with a bare relative destination** (`data`, `.`) built its extras under `/`. 9.73 removed `/data/extra`; the previous fix refused everything. The fallback is now the CWD.
+- **`-F` is honoured everywhere:**
+  - `-pfl` jobs pace each unlink from one shared counter, so a wide directory is paced too (checked under spawn, forkserver and fork);
+  - the serial cursor (moves, `-rme`), file sources, and the walk after `-rwloff` (paced from its own start) are paced;
+  - under `-F`, pool jobs keep `-fpj`'s size.
+- **An entry whose type check fails is tried as a directory first.**
+- **Cleanup:** the move builds its items with `_items_below`; roots map values are always 3-tuples; paths sort natively; a single macOS EPERM check; root messages print the root, not `root/.`.
+
 ## Testing
 
 `tests/test_safe_remove.py`:
