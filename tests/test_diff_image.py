@@ -1245,10 +1245,16 @@ def test_apply_store_layout_leaves_other_trees(tmp_path, hpcp_mod, reset_hpcp_gl
 	assert (store / rel_other / 'g.txt').read_text() == 'other tree'
 	left = hpcp_mod.compute_changes(*hpcp_mod.build_store_maps(str(new), str(store), max_workers=1), max_workers=1)
 	if hasattr(os, 'geteuid') and os.geteuid() != 0:
-		# without root, apply cannot give the store's copy of a directory above the tree (/tmp) its owner
+		# without root, apply cannot give the store's copy of a directory above the tree (/tmp) its owner:
+		# its row is let through when the owner is all that differs (a lost sticky bit still fails)
 		foreign = {os.path.relpath(str(p), '/') + '/' for p in new.parents
 			if str(p) != '/' and os.stat(str(p)).st_uid != os.geteuid()}
-		left = [row for row in left if not (row.op == 'M' and row.path in foreign)]
+
+		def unowned(state):
+			info = hpcp_mod.decode_state(state)
+			return {k: v for k, v in info.items() if k not in ('uid', 'gid')} if info else info
+		left = [row for row in left
+			if not (row.op == 'M' and row.path in foreign and unowned(row.old) == unowned(row.new))]
 	assert left == []
 
 
