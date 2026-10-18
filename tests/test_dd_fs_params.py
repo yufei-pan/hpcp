@@ -585,9 +585,29 @@ def test_ext_mkfs_knows_feature_fail_open_when_probe_cannot_run(monkeypatch):
 	assert hpcp._ext_mkfs_knows_feature('orphan_file') is True
 
 
+def test_ext_mkfs_probe_leaves_nothing_behind(monkeypatch):
+	# e2fsprogs 1.46 creates the regular file it is given before it parses -O: the probe ran it on
+	# /hpcp-ext-feature-probe and left that file in / on every host with 1.46 (Debian 11, Ubuntu 22.04, EL9)
+	hpcp._EXT_MKFS_FEATURE_KNOWN.clear()
+	targets = []
+
+	def fake_run(commands, **kwargs):
+		for command in commands:
+			targets.append(command[-2])
+			if os.path.dirname(command[-2]) != os.sep:
+				# as 1.46 does; never in / itself, where the test would leave the file
+				open(command[-2], 'w').close()
+		return [_FakeTask(0) for _ in commands]
+
+	monkeypatch.setattr(hpcp.multiCMD, 'run_commands', fake_run)
+	assert hpcp._ext_mkfs_knows_feature('orphan_file') is True
+	assert targets and not targets[0].startswith('/hpcp-ext-feature-probe')
+	assert not os.path.exists(os.path.dirname(targets[0]))
+
+
 @pytest.mark.skipif(
-	shutil.which('mkfs') is None and shutil.which('mkfs.ext4') is None,
-	reason='mkfs.ext4 not available')
+	shutil.which('mkfs') is None or shutil.which('mkfs.ext4') is None,
+	reason='mkfs or mkfs.ext4 not available (mkfs -t ext4 runs mkfs.ext4)')
 def test_ext_mkfs_knows_feature_matches_real_mke2fs():
 	hpcp._EXT_MKFS_FEATURE_KNOWN.clear()
 	assert hpcp._ext_mkfs_knows_feature('has_journal') is True
@@ -595,9 +615,9 @@ def test_ext_mkfs_knows_feature_matches_real_mke2fs():
 
 
 @pytest.mark.skipif(
-	shutil.which('mkfs') is None and shutil.which('mkfs.ext4') is None,
-	reason='mkfs.ext4 not available')
-def test_build_ext_emitted_dash_o_is_accepted_by_local_mke2fs():
+	shutil.which('mkfs') is None or shutil.which('mkfs.ext4') is None,
+	reason='mkfs or mkfs.ext4 not available (mkfs -t ext4 runs mkfs.ext4)')
+def test_build_ext_emitted_dash_o_is_accepted_by_local_mke2fs(tmp_path):
 	# The 1.45.6 failure: a source without orphan_file/fast_commit still
 	# emitted ^orphan_file,^fast_commit, and mke2fs rejected the whole -O
 	# list. Whatever we emit now must parse on this host.
@@ -613,7 +633,7 @@ def test_build_ext_emitted_dash_o_is_accepted_by_local_mke2fs():
 	option_set = args[args.index('-O') + 1]
 	mkfs = hpcp._binPaths.get('mkfs', shutil.which('mkfs') or 'mkfs')
 	result = subprocess.run(
-		[mkfs, '-t', 'ext4', '-n', '-F', '-O', option_set, '/hpcp-ext-feature-probe', '256'],
+		[mkfs, '-t', 'ext4', '-n', '-F', '-O', option_set, str(tmp_path / 'probe'), '256'],
 		capture_output=True, text=True)
 	assert 'Invalid filesystem option set' not in (result.stderr or '')
 	assert 'Invalid filesystem option set' not in (result.stdout or '')

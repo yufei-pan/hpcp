@@ -1187,19 +1187,23 @@ def _ext_mkfs_task_text(task):
 def _ext_mkfs_probe_features(names):
 	"""Ask local mke2fs whether each -O feature name parses. Cache the answers.
 
-	Uses `mke2fs -n` against a nonexistent path so nothing is created. An
-	unknown name fails immediately with 'Invalid filesystem option set'; a
-	known name gets past option parsing and then fails on the dummy path,
-	which still means the name is known. Probe failures fail open (known)
-	so a missing mkfs does not strip a usable -O list.
+	Uses `mke2fs -n` against a path in a directory of our own, removed
+	afterwards: e2fsprogs 1.46 creates the regular file it is given before
+	it parses -O (and, where it cannot create it, stops there without
+	parsing -O); 1.47 creates nothing. An unknown name fails with 'Invalid
+	filesystem option set'; a known name gets past option parsing, whether
+	or not mke2fs then fails on the dummy path. Probe failures fail open
+	(known) so a missing mkfs does not strip a usable -O list.
 	"""
 	todo = [n for n in dict.fromkeys(names) if n and n not in _EXT_MKFS_FEATURE_KNOWN]
 	if not todo:
 		return
+	probe_dir = None
 	try:
 		mkfs = _binPaths.get('mkfs', 'mkfs')
+		probe_dir = tempfile.mkdtemp(prefix='hpcp-ext-probe-')
 		commands = [
-			[mkfs, '-t', 'ext4', '-n', '-F', '-O', name, '/hpcp-ext-feature-probe', '256']
+			[mkfs, '-t', 'ext4', '-n', '-F', '-O', name, os.path.join(probe_dir, 'probe'), '256']
 			for name in todo
 		]
 		tasks = multiCMD.run_commands(
@@ -1217,6 +1221,12 @@ def _ext_mkfs_probe_features(names):
 	except Exception:
 		for name in todo:
 			_EXT_MKFS_FEATURE_KNOWN.setdefault(name, True)
+	finally:
+		if probe_dir is not None:
+			with contextlib.suppress(OSError):
+				os.remove(os.path.join(probe_dir, 'probe'))
+			with contextlib.suppress(OSError):
+				os.rmdir(probe_dir)
 
 def _ext_mkfs_knows_feature(name):
 	"""True if local mke2fs parses this -O feature name.
