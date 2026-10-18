@@ -1187,23 +1187,21 @@ def _ext_mkfs_task_text(task):
 def _ext_mkfs_probe_features(names):
 	"""Ask local mke2fs whether each -O feature name parses. Cache the answers.
 
-	Uses `mke2fs -n` against a path in a directory of our own, removed
-	afterwards: e2fsprogs 1.46 creates the regular file it is given before
-	it parses -O (and, where it cannot create it, stops there without
-	parsing -O); 1.47 creates nothing. An unknown name fails with 'Invalid
-	filesystem option set'; a known name gets past option parsing, whether
-	or not mke2fs then fails on the dummy path. Probe failures fail open
-	(known) so a missing mkfs does not strip a usable -O list.
+	Uses `mke2fs -n` against /dev/null, in the C locale, where an unknown
+	name fails with 'Invalid filesystem option set' (translated elsewhere,
+	where every name would count as known) and a known name gets past
+	option parsing. Never a path to make: e2fsprogs 1.45 and 1.46 create
+	the regular file they are given before they parse -O, and where they
+	cannot create it, stop there without parsing -O. Probe failures fail
+	open (known) so a missing mkfs does not strip a usable -O list.
 	"""
 	todo = [n for n in dict.fromkeys(names) if n and n not in _EXT_MKFS_FEATURE_KNOWN]
 	if not todo:
 		return
-	probe_dir = None
 	try:
 		mkfs = _binPaths.get('mkfs', 'mkfs')
-		probe_dir = tempfile.mkdtemp(prefix='hpcp-ext-probe-')
 		commands = [
-			[mkfs, '-t', 'ext4', '-n', '-F', '-O', name, os.path.join(probe_dir, 'probe'), '256']
+			['env', 'LC_ALL=C', mkfs, '-t', 'ext4', '-n', '-F', '-O', name, os.devnull, '256']
 			for name in todo
 		]
 		tasks = multiCMD.run_commands(
@@ -1221,12 +1219,6 @@ def _ext_mkfs_probe_features(names):
 	except Exception:
 		for name in todo:
 			_EXT_MKFS_FEATURE_KNOWN.setdefault(name, True)
-	finally:
-		if probe_dir is not None:
-			with contextlib.suppress(OSError):
-				os.remove(os.path.join(probe_dir, 'probe'))
-			with contextlib.suppress(OSError):
-				os.rmdir(probe_dir)
 
 def _ext_mkfs_knows_feature(name):
 	"""True if local mke2fs parses this -O feature name.
