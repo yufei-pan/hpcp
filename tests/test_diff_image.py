@@ -1243,7 +1243,13 @@ def test_apply_store_layout_leaves_other_trees(tmp_path, hpcp_mod, reset_hpcp_gl
 	hpcp_mod.build_patch_tree(rows, '/', [str(vol)], hpcp_mod.make_patch_meta(rows, 'a', 'store', 'store'), max_workers=1)
 	hpcp_mod.apply_patch_tree([str(vol)], str(store), max_workers=1)
 	assert (store / rel_other / 'g.txt').read_text() == 'other tree'
-	assert hpcp_mod.compute_changes(*hpcp_mod.build_store_maps(str(new), str(store), max_workers=1), max_workers=1) == []
+	left = hpcp_mod.compute_changes(*hpcp_mod.build_store_maps(str(new), str(store), max_workers=1), max_workers=1)
+	if hasattr(os, 'geteuid') and os.geteuid() != 0:
+		# without root, apply cannot give the store's copy of a directory above the tree (/tmp) its owner
+		foreign = {os.path.relpath(str(p), '/') + '/' for p in new.parents
+			if str(p) != '/' and os.stat(str(p)).st_uid != os.geteuid()}
+		left = [row for row in left if not (row.op == 'M' and row.path in foreign)]
+	assert left == []
 
 
 def _states(hpcp_mod, tmp_path):
