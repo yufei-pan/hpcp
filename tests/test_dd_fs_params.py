@@ -551,10 +551,16 @@ def test_build_ext_omits_dash_o_when_all_features_unknown(monkeypatch):
 	assert args[:2] == ['-b', '4096']
 
 
+@pytest.fixture(autouse=True)
+def _own_mke2fs_verdicts(monkeypatch):
+	"""Each test starts with no cached mke2fs verdict and leaves none of its fakes to later tests."""
+	monkeypatch.setattr(hpcp, '_EXT_MKFS_FEATURE_KNOWN', {})
+
+
 def test_ext_mkfs_knows_feature_false_on_invalid_option_set(monkeypatch):
 	# mke2fs prints this and exits 1 before touching the device. That is the
-	# only signal that the *name* is unknown; other non-zero exits mean the
-	# name parsed and something later failed (dummy path, size, ...).
+	# only signal that the *name* is unknown; any other outcome means the name
+	# parsed (on /dev/null mke2fs -n then exits 0).
 	hpcp._EXT_MKFS_FEATURE_KNOWN.clear()
 	def fake_run(commands, **kwargs):
 		return [_FakeTask(1, [
@@ -569,8 +575,12 @@ def test_ext_mkfs_knows_feature_false_on_invalid_option_set(monkeypatch):
 def test_ext_mkfs_knows_feature_true_when_name_parses(monkeypatch):
 	hpcp._EXT_MKFS_FEATURE_KNOWN.clear()
 	def fake_run(commands, **kwargs):
-		return [_FakeTask(1, [
-			'mkfs.ext4: No such file or directory while trying to determine hardware sector size',
+		return [_FakeTask(0, [
+			'mke2fs 1.47.2 (1-Jan-2025)',
+			'warning: Unable to get device geometry for /dev/null',
+			'',
+			'Filesystem too small for a journal',
+			'Creating filesystem with 256 1k blocks and 32 inodes',
 		])]
 	monkeypatch.setattr(hpcp, '_binPaths', {'mkfs': '/usr/sbin/mkfs'})
 	monkeypatch.setattr(hpcp.multiCMD, 'run_commands', fake_run)
@@ -585,20 +595,44 @@ def test_ext_mkfs_knows_feature_fail_open_when_probe_cannot_run(monkeypatch):
 	assert hpcp._ext_mkfs_knows_feature('orphan_file') is True
 
 
-def test_ext_mkfs_probe_makes_no_file_and_reads_the_c_locale(monkeypatch):
+def _fake_tool(directory, name, body):
+	path = os.path.join(str(directory), name)
+	with open(path, 'w') as f:
+		f.write('#!/bin/sh\n' + body)
+	os.chmod(path, 0o755)
+	return path
+
+
+@pytest.mark.skipif(os.name != 'posix', reason='runs a shell script as mkfs')
+def test_ext_mkfs_probe_makes_no_file_and_reads_the_c_locale(tmp_path, monkeypatch):
 	# e2fsprogs 1.45 and 1.46 create the regular file they are given before they parse -O: the probe ran
 	# them on /hpcp-ext-feature-probe and left that file in / (EL8, Ubuntu 20.04 and 22.04, Debian 11, EL9).
-	# The verdict reads mke2fs's message, which a translated locale changes.
-	hpcp._EXT_MKFS_FEATURE_KNOWN.clear()
-	run = []
+	# The verdict reads mke2fs's message, which a translated locale changes: this mkfs speaks German
+	# unless the C locale reaches it, and says which device it was given.
+	devices = tmp_path / 'devices'
+	mkfs = _fake_tool(tmp_path, 'mkfs', (
+		'printf "%s\\n" "$7" >> "$HPCP_TEST_DEVICES"\n'
+		'if [ "$LC_ALL" = C ]; then echo "Invalid filesystem option set: $6" >&2\n'
+		'else echo "Ungültiger Satz von Dateisystem-Optionen: $6" >&2; fi\n'
+		'exit 1\n'))
+	monkeypatch.setenv('HPCP_TEST_DEVICES', str(devices))
+	monkeypatch.setenv('LC_ALL', 'de_DE.UTF-8')
+	monkeypatch.setitem(hpcp._binPaths, 'mkfs', mkfs)
+	assert hpcp._ext_mkfs_knows_feature('nosuch_hpcp_feature') is False
+	assert devices.read_text().splitlines() == [os.devnull]
 
-	def fake_run(commands, **kwargs):
-		run.extend(commands)
-		return [_FakeTask(0) for _ in commands]
 
-	monkeypatch.setattr(hpcp.multiCMD, 'run_commands', fake_run)
-	assert hpcp._ext_mkfs_knows_feature('orphan_file') is True
-	assert run and all(command[:2] == ['env', 'LC_ALL=C'] and command[-2] == os.devnull for command in run)
+@pytest.mark.skipif(os.name != 'posix', reason='runs shell scripts as env and mkfs')
+def test_ext_mkfs_probe_finds_env_as_hpcp_finds_its_tools(tmp_path, monkeypatch):
+	# env is looked up like every other tool (ENV_PATH, then PATH): the one found is the one run.
+	marker = tmp_path / 'env-ran'
+	real_env = shutil.which('env')
+	env = _fake_tool(tmp_path, 'env', ': > "%s"\nexec %s "$@"\n' % (marker, real_env))
+	mkfs = _fake_tool(tmp_path, 'mkfs', 'echo "Invalid filesystem option set: $6" >&2\nexit 1\n')
+	monkeypatch.setitem(hpcp._binPaths, 'env', env)
+	monkeypatch.setitem(hpcp._binPaths, 'mkfs', mkfs)
+	assert hpcp._ext_mkfs_knows_feature('nosuch_hpcp_feature') is False
+	assert marker.exists()
 
 
 @pytest.mark.skipif(
@@ -682,6 +716,24 @@ def test_probe_xfs_parses_sections(monkeypatch):
 	assert params['naming']['bsize'] == '8192'
 	assert params['log']['bsize'] == '4096'
 	assert params['data']['imaxpct'] == '25'
+
+
+@pytest.mark.skipif(os.name != 'posix', reason='runs a shell script as xfs_info')
+def test_probe_xfs_reads_the_c_locale(tmp_path, monkeypatch):
+	# xfsprogs translates the section names (Debian's pl: metadane, dane, nazwy); in them no value would
+	# land where _build_xfs looks, and isize, sectsz, bsize and ftype would silently not be mirrored.
+	english = tmp_path / 'en.txt'
+	english.write_text('\n'.join(_XFS_INFO_OUTPUT) + '\n')
+	polish = tmp_path / 'pl.txt'
+	polish.write_text(english.read_text().replace('meta-data=', 'metadane= ').replace(
+		'data     =', 'dane     =').replace('naming   =', 'nazwy    ='))
+	_fake_tool(tmp_path, 'xfs_info', 'if [ "$LC_ALL" = C ]; then cat "%s"; else cat "%s"; fi\n' % (english, polish))
+	monkeypatch.setenv('PATH', str(tmp_path) + os.pathsep + os.environ.get('PATH', ''))
+	monkeypatch.setenv('LC_ALL', 'pl_PL.UTF-8')
+	monkeypatch.setitem(hpcp._binPaths, 'xfs_info', str(tmp_path / 'xfs_info'))
+	params = hpcp._probe_xfs('/dev/fake3')
+	assert params['meta-data']['isize'] == '1024'
+	assert params['naming']['bsize'] == '8192'
 
 
 def test_build_xfs_mirrors_geometry_and_features(monkeypatch):
@@ -1299,9 +1351,9 @@ def test_dd_roundtrip_uses_defaults_with_no_fs_param_mirror(tmp_path):
 
 
 def test_version_bumped():
-	assert hpcp.version == '9.77'
+	assert hpcp.version == '9.78'
 	assert hpcp.__version__ == hpcp.version
-	assert hpcp.COMMIT_DATE == '2026-10-16'
+	assert hpcp.COMMIT_DATE == '2026-10-19'
 
 
 #%% -- Pre-existing -dd defects found while building the mirroring feature --

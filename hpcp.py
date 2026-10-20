@@ -194,9 +194,9 @@ except ImportError:
 	hasher = hashlib.blake2b()
 	xxhash_available = False
 
-version = '9.77'
+version = '9.78'
 __version__ = version
-COMMIT_DATE = '2026-10-16'
+COMMIT_DATE = '2026-10-19'
 
 MAGIC_NUMBER = 1.61803398875
 RANDOM_DESTINATION_SELECTION = False
@@ -504,10 +504,15 @@ _binCalled = {'lsblk', 'losetup', 'sgdisk', 'blkid', 'umount', 'mount','dd','cp'
 			  'fsck.fat', 'fsck.exfat', 'dump.exfat', 'fsck.hfsplus',
 			  'fsck.hfs', 'fsck.jfs', 'fsck.reiserfs', 'fsck.ufs', 'fsck.minix',
 			  'tune2fs', 'dumpe2fs', 'xfs_admin', 'exfatlabel', 'udflabel', 'udfinfo', 'jfs_tune',
-			  'reiserfstune', 'debugreiserfs', 'swaplabel', 'udevadm', 'e2label', 'fatlabel', 'ntfslabel', 'btrfstune', 'f2fslabel'}
+			  'reiserfstune', 'debugreiserfs', 'swaplabel', 'udevadm', 'e2label', 'fatlabel', 'ntfslabel', 'btrfstune', 'f2fslabel',
+			  'env'}
 [check_path(program) for program in _binCalled]
 
-def run_command_in_multicmd_with_path_check(command, timeout=...,max_threads=1,quiet=False,dry_run=False,strict=False):
+def _in_c_locale(command):
+	"""command run through env in the C locale, for a tool whose output is read by its English wording."""
+	return [_binPaths.get('env', 'env'), 'LC_ALL=C'] + list(command)
+
+def run_command_in_multicmd_with_path_check(command, timeout=...,max_threads=1,quiet=False,dry_run=False,strict=False,c_locale=False):
 	"""
 	Run a command in multiCMD with path check.
 
@@ -518,13 +523,14 @@ def run_command_in_multicmd_with_path_check(command, timeout=...,max_threads=1,q
 		quiet (bool, optional): Whether to suppress the output. Defaults to False.
 		dry_run (bool, optional): Whether to perform a dry run. Defaults to False.
 		strict (bool, optional): Whether to exit if the command fails to find the bin. Defaults to True.
+		c_locale (bool, optional): Run it in the C locale (_in_c_locale), for output read by its wording.
 
 	Returns:
 		list: The output of the command.
 	"""
-	return run_commands_in_multicmd_with_path_check([command], timeout=timeout, max_threads=max_threads, quiet=quiet, dry_run=dry_run, strict=strict)[0]
+	return run_commands_in_multicmd_with_path_check([command], timeout=timeout, max_threads=max_threads, quiet=quiet, dry_run=dry_run, strict=strict, c_locale=c_locale)[0]
 
-def run_commands_in_multicmd_with_path_check(commands, timeout=...,max_threads=1,quiet=False,dry_run=False,strict=False):
+def run_commands_in_multicmd_with_path_check(commands, timeout=...,max_threads=1,quiet=False,dry_run=False,strict=False,c_locale=False):
 	"""
 	Run commands in multiCMD with path check.
 
@@ -535,6 +541,8 @@ def run_commands_in_multicmd_with_path_check(commands, timeout=...,max_threads=1
 		quiet (bool, optional): Whether to suppress the output. Defaults to False.
 		dry_run (bool, optional): Whether to perform a dry run. Defaults to False.
 		strict (bool, optional): Whether to exit if the command fails to find the bin. Defaults to True.
+		c_locale (bool, optional): Run them in the C locale (_in_c_locale), for output read by its wording.
+			The path check still names the tool itself.
 
 	Returns:
 		list: The outputs of the commands.
@@ -556,9 +564,9 @@ def run_commands_in_multicmd_with_path_check(commands, timeout=...,max_threads=1
 			command[0] = str(command[0])
 		if command[0] not in _binPaths and not check_path(command[0]):
 			eprint(f"Command not found: Command '{command[0]}' not found. Please consider installing it then retry.")
-			if strict: 
+			if strict:
 				raise RuntimeError(f"Command not found: Command '{command[0]}' not found. Please consider installing it then retry.")
-		newCommands.append(command)
+		newCommands.append(_in_c_locale(command) if c_locale else command)
 	# Run the command
 	tasks = multiCMD.run_commands(newCommands, timeout=timeout, max_threads=max_threads, quiet=quiet, dry_run=dry_run,return_object=True)
 	for task in tasks:
@@ -1201,7 +1209,7 @@ def _ext_mkfs_probe_features(names):
 	try:
 		mkfs = _binPaths.get('mkfs', 'mkfs')
 		commands = [
-			['env', 'LC_ALL=C', mkfs, '-t', 'ext4', '-n', '-F', '-O', name, os.devnull, '256']
+			_in_c_locale([mkfs, '-t', 'ext4', '-n', '-F', '-O', name, os.devnull, '256'])
 			for name in todo
 		]
 		tasks = multiCMD.run_commands(
@@ -1298,11 +1306,12 @@ def _probe_xfs(device):
 	xfs_info groups values into sections (meta-data / data / naming / log /
 	realtime) and reuses key names across them - `bsize` is the block size under
 	`data` but the directory block size under `naming` - so values are bucketed
-	by section rather than flattened.
+	by section rather than flattened. It runs in the C locale: xfsprogs translates
+	the section names (pl: 'metadane', 'dane', 'nazwy').
 	"""
 	params = {}
 	section = ''
-	for line in run_command_in_multicmd_with_path_check(['xfs_info', device], quiet=True):
+	for line in run_command_in_multicmd_with_path_check(['xfs_info', device], quiet=True, c_locale=True):
 		if not line.strip():
 			continue
 		if not line[0].isspace():
