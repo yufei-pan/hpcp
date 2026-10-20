@@ -109,9 +109,14 @@ def test_unreadable_directory_is_recorded_and_the_rest_listed(tmp_tree, hpcp_mod
 		if 'fork' not in multiprocessing.get_all_start_methods():
 			pytest.skip('workers cannot fork here, and only forked ones see the denied scandir')
 		import concurrent.futures
-		import functools
-		monkeypatch.setattr(concurrent.futures, 'ProcessPoolExecutor', functools.partial(
-			concurrent.futures.ProcessPoolExecutor, mp_context=multiprocessing.get_context('fork')))
+
+		class ForkingPool(concurrent.futures.ProcessPoolExecutor):
+			def __init__(self, *args, **kwargs):
+				kwargs.setdefault('mp_context', multiprocessing.get_context('fork'))
+				super().__init__(*args, **kwargs)
+		# hpcp names the pool both ways
+		monkeypatch.setattr(concurrent.futures, 'ProcessPoolExecutor', ForkingPool)
+		monkeypatch.setattr(hpcp_mod, 'ProcessPoolExecutor', ForkingPool)
 	tmp_tree.add_file('a.txt', 'A')
 	tmp_tree.add_file('ok/b.txt', 'B')
 	tmp_tree.add_file('secret/c.txt', 'C')

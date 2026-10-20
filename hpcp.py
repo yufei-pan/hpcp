@@ -504,13 +504,13 @@ _binCalled = {'lsblk', 'losetup', 'sgdisk', 'blkid', 'umount', 'mount','dd','cp'
 			  'fsck.fat', 'fsck.exfat', 'dump.exfat', 'fsck.hfsplus',
 			  'fsck.hfs', 'fsck.jfs', 'fsck.reiserfs', 'fsck.ufs', 'fsck.minix',
 			  'tune2fs', 'dumpe2fs', 'xfs_admin', 'exfatlabel', 'udflabel', 'udfinfo', 'jfs_tune',
-			  'reiserfstune', 'debugreiserfs', 'swaplabel', 'udevadm', 'e2label', 'fatlabel', 'ntfslabel', 'btrfstune', 'f2fslabel',
-			  'env'}
+			  'reiserfstune', 'debugreiserfs', 'swaplabel', 'udevadm', 'e2label', 'fatlabel', 'ntfslabel', 'btrfstune', 'f2fslabel'}
 [check_path(program) for program in _binCalled]
 
 def _in_c_locale(command):
-	"""command run through env in the C locale, for a tool whose output is read by its English wording."""
-	return [_binPaths.get('env', 'env'), 'LC_ALL=C'] + list(command)
+	"""command run through env in the C locale, for a tool whose output is read by its English wording. env is
+	found on PATH, as POSIX puts it there: not in _binPaths, whose ENV_PATH override is too common a name."""
+	return ['env', 'LC_ALL=C'] + list(command)
 
 def run_command_in_multicmd_with_path_check(command, timeout=...,max_threads=1,quiet=False,dry_run=False,strict=False,c_locale=False):
 	"""
@@ -542,7 +542,7 @@ def run_commands_in_multicmd_with_path_check(commands, timeout=...,max_threads=1
 		dry_run (bool, optional): Whether to perform a dry run. Defaults to False.
 		strict (bool, optional): Whether to exit if the command fails to find the bin. Defaults to True.
 		c_locale (bool, optional): Run them in the C locale (_in_c_locale), for output read by its wording.
-			The path check still names the tool itself.
+			The tool runs as found (<TOOL>_PATH included), and errors name it and judge its exit.
 
 	Returns:
 		list: The outputs of the commands.
@@ -553,6 +553,7 @@ def run_commands_in_multicmd_with_path_check(commands, timeout=...,max_threads=1
 	if timeout is ...:
 		timeout = COMMAND_TIMEOUT
 	newCommands = []
+	originals = []
 	for command in commands:
 		# Check the path of the command
 		if isinstance(command, str):
@@ -566,18 +567,21 @@ def run_commands_in_multicmd_with_path_check(commands, timeout=...,max_threads=1
 			eprint(f"Command not found: Command '{command[0]}' not found. Please consider installing it then retry.")
 			if strict:
 				raise RuntimeError(f"Command not found: Command '{command[0]}' not found. Please consider installing it then retry.")
-		newCommands.append(_in_c_locale(command) if c_locale else command)
+		originals.append(command)
+		newCommands.append(_in_c_locale([_binPaths.get(command[0], command[0])] + command[1:]) if c_locale else command)
 	# Run the command
 	tasks = multiCMD.run_commands(newCommands, timeout=timeout, max_threads=max_threads, quiet=quiet, dry_run=dry_run,return_object=True)
-	for task in tasks:
+	for task, original in zip(tasks, originals):
+		# the command as given: under c_locale, the tool and not env
+		shown = original if c_locale else task.command
 		error = ''
 		if task.returncode == 124 and task.stderr[-1].strip().startswith('Timeout!'):
-			error = f"Command timeout: Command '{task.command}' timed out after {timeout} seconds."
+			error = f"Command timeout: Command '{shown}' timed out after {timeout} seconds."
 		elif task.returncode == 137 and task.stderr[-1].strip().startswith('Ctrl C detected, Emergency Stop!'):
-			error = f"Keyboard Interrupt: Command '{task.command}' was interrupted by user."
+			error = f"Keyboard Interrupt: Command '{shown}' was interrupted by user."
 		elif task.returncode != 0:
 			program = ''
-			cmd = getattr(task, 'command', None)
+			cmd = shown
 			if isinstance(cmd, (list, tuple)) and cmd:
 				program = os.path.basename(str(cmd[0]))
 			elif isinstance(cmd, str) and cmd.strip():
@@ -588,7 +592,7 @@ def run_commands_in_multicmd_with_path_check(commands, timeout=...,max_threads=1
 			if program == 'e2fsck' and task.returncode in (1, 2, 3):
 				error = ''
 			else:
-				error = f"Task return code error: Command '{task.command}' failed with return code {task.returncode}."
+				error = f"Task return code error: Command '{shown}' failed with return code {task.returncode}."
 		if error:
 			if not quiet:
 				eprint(error)

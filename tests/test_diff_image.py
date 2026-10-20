@@ -1249,8 +1249,9 @@ def test_apply_store_layout_leaves_other_trees(tmp_path, hpcp_mod, reset_hpcp_gl
 		# nor a group the user is not in: its row is let through when the owner is all that differs (a lost
 		# sticky bit still fails)
 		groups = set(os.getgroups()) | {os.getegid()}
-		foreign = {os.path.relpath(str(p), '/') + '/' for p in new.parents
-			if str(p) != '/' and (os.stat(str(p)).st_uid != os.geteuid() or os.stat(str(p)).st_gid not in groups)}
+		parents = [(p, os.stat(str(p))) for p in new.parents if str(p) != '/']
+		foreign = {os.path.relpath(str(p), '/') + '/' for p, st in parents
+			if st.st_uid != os.geteuid() or st.st_gid not in groups}
 
 		def unowned(state):
 			info = hpcp_mod.decode_state(state)
