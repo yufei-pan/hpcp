@@ -104,7 +104,14 @@ def _deny_scandir(monkeypatch, hpcp_mod, denied):
 @pytest.mark.parametrize('parallel', [False, True])
 def test_unreadable_directory_is_recorded_and_the_rest_listed(tmp_tree, hpcp_mod, reset_hpcp_globals, monkeypatch, parallel):
 	if parallel and multiprocessing.get_start_method() != 'fork':
-		pytest.skip('the denied scandir is patched in this process: workers that do not fork (forkserver, Python 3.14) list with the real one')
+		# the denied scandir is patched in this process: workers that do not fork (forkserver, Python 3.14)
+		# would list with the real one, so the pool forks here
+		if 'fork' not in multiprocessing.get_all_start_methods():
+			pytest.skip('workers cannot fork here, and only forked ones see the denied scandir')
+		import concurrent.futures
+		import functools
+		monkeypatch.setattr(concurrent.futures, 'ProcessPoolExecutor', functools.partial(
+			concurrent.futures.ProcessPoolExecutor, mp_context=multiprocessing.get_context('fork')))
 	tmp_tree.add_file('a.txt', 'A')
 	tmp_tree.add_file('ok/b.txt', 'B')
 	tmp_tree.add_file('secret/c.txt', 'C')
