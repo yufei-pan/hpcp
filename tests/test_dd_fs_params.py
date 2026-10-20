@@ -637,22 +637,12 @@ def test_ext_mkfs_probe_makes_no_file_and_reads_the_c_locale(tmp_path, monkeypat
 @pytest.mark.skipif(os.name != 'posix', reason='runs a shell script as mkfs')
 def test_ext_mkfs_probe_runs_env_from_path_whatever_env_path_says(tmp_path, monkeypatch):
 	# ENV_PATH is too common a name to be hpcp's override for env: a dotenv file there must not become
-	# the program every C-locale command runs.
+	# the program the probe runs, whether read from the environment or found by hpcp's tool lookup.
 	monkeypatch.setenv('HPCP_TEST_DEVICES', str(tmp_path / 'devices'))
+	monkeypatch.setenv('ENV_PATH', str(tmp_path / '.env'))
 	monkeypatch.setitem(hpcp._binPaths, 'env', str(tmp_path / '.env'))
 	monkeypatch.setitem(hpcp._binPaths, 'mkfs', _translated_mkfs(tmp_path))
 	assert hpcp._ext_mkfs_knows_feature('nosuch_hpcp_feature') is False
-
-
-@pytest.mark.skipif(os.name != 'posix', reason='runs a shell script as e2fsck')
-def test_c_locale_commands_run_the_tool_found_and_judge_its_exit(tmp_path, monkeypatch, reset_hpcp_globals):
-	# Under c_locale the tool runs as hpcp found it (<TOOL>_PATH, not PATH again through env: this one is
-	# on no PATH), and an error names it, not env: e2fsck's 'errors corrected' exit 1 stays a success.
-	e2fsck = _fake_tool(tmp_path, 'e2fsck', 'echo "locale=$LC_ALL"\nexit 1\n')
-	monkeypatch.setitem(hpcp._binPaths, 'e2fsck', e2fsck)
-	output = hpcp.run_command_in_multicmd_with_path_check(['e2fsck', '-fy', '/dev/fake'], quiet=True, c_locale=True)
-	assert output == ['locale=C']
-	assert hpcp.ERRORS == []
 
 
 @pytest.mark.skipif(
@@ -734,23 +724,6 @@ def test_probe_xfs_parses_sections(monkeypatch):
 	assert params['naming']['bsize'] == '8192'
 	assert params['log']['bsize'] == '4096'
 	assert params['data']['imaxpct'] == '25'
-
-
-@pytest.mark.skipif(os.name != 'posix', reason='runs a shell script as xfs_info')
-def test_probe_xfs_reads_the_c_locale(tmp_path, monkeypatch):
-	# xfsprogs translates the section names (Debian's pl: metadane, dane, nazwy); in them no value would
-	# land where _build_xfs looks, and isize, sectsz, bsize and ftype would silently not be mirrored.
-	english = tmp_path / 'en.txt'
-	english.write_text('\n'.join(_XFS_INFO_OUTPUT) + '\n')
-	polish = tmp_path / 'pl.txt'
-	polish.write_text(english.read_text().replace('meta-data=', 'metadane= ').replace(
-		'data     =', 'dane     =').replace('naming   =', 'nazwy    ='))
-	_fake_tool(tmp_path, 'xfs_info', 'if [ "$LC_ALL" = C ]; then cat "%s"; else cat "%s"; fi\n' % (english, polish))
-	monkeypatch.setenv('LC_ALL', 'pl_PL.UTF-8')
-	monkeypatch.setitem(hpcp._binPaths, 'xfs_info', str(tmp_path / 'xfs_info'))
-	params = hpcp._probe_xfs('/dev/fake3')
-	assert params['meta-data']['isize'] == '1024'
-	assert params['naming']['bsize'] == '8192'
 
 
 def test_build_xfs_mirrors_geometry_and_features(monkeypatch):

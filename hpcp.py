@@ -507,12 +507,7 @@ _binCalled = {'lsblk', 'losetup', 'sgdisk', 'blkid', 'umount', 'mount','dd','cp'
 			  'reiserfstune', 'debugreiserfs', 'swaplabel', 'udevadm', 'e2label', 'fatlabel', 'ntfslabel', 'btrfstune', 'f2fslabel'}
 [check_path(program) for program in _binCalled]
 
-def _in_c_locale(command):
-	"""command run through env in the C locale, for a tool whose output is read by its English wording. env is
-	found on PATH, as POSIX puts it there: not in _binPaths, whose ENV_PATH override is too common a name."""
-	return ['env', 'LC_ALL=C'] + list(command)
-
-def run_command_in_multicmd_with_path_check(command, timeout=...,max_threads=1,quiet=False,dry_run=False,strict=False,c_locale=False):
+def run_command_in_multicmd_with_path_check(command, timeout=...,max_threads=1,quiet=False,dry_run=False,strict=False):
 	"""
 	Run a command in multiCMD with path check.
 
@@ -523,14 +518,13 @@ def run_command_in_multicmd_with_path_check(command, timeout=...,max_threads=1,q
 		quiet (bool, optional): Whether to suppress the output. Defaults to False.
 		dry_run (bool, optional): Whether to perform a dry run. Defaults to False.
 		strict (bool, optional): Whether to exit if the command fails to find the bin. Defaults to True.
-		c_locale (bool, optional): Run it in the C locale (_in_c_locale), for output read by its wording.
 
 	Returns:
 		list: The output of the command.
 	"""
-	return run_commands_in_multicmd_with_path_check([command], timeout=timeout, max_threads=max_threads, quiet=quiet, dry_run=dry_run, strict=strict, c_locale=c_locale)[0]
+	return run_commands_in_multicmd_with_path_check([command], timeout=timeout, max_threads=max_threads, quiet=quiet, dry_run=dry_run, strict=strict)[0]
 
-def run_commands_in_multicmd_with_path_check(commands, timeout=...,max_threads=1,quiet=False,dry_run=False,strict=False,c_locale=False):
+def run_commands_in_multicmd_with_path_check(commands, timeout=...,max_threads=1,quiet=False,dry_run=False,strict=False):
 	"""
 	Run commands in multiCMD with path check.
 
@@ -541,8 +535,6 @@ def run_commands_in_multicmd_with_path_check(commands, timeout=...,max_threads=1
 		quiet (bool, optional): Whether to suppress the output. Defaults to False.
 		dry_run (bool, optional): Whether to perform a dry run. Defaults to False.
 		strict (bool, optional): Whether to exit if the command fails to find the bin. Defaults to True.
-		c_locale (bool, optional): Run them in the C locale (_in_c_locale), for output read by its wording.
-			The tool runs as found (<TOOL>_PATH included), and errors name it and judge its exit.
 
 	Returns:
 		list: The outputs of the commands.
@@ -553,7 +545,6 @@ def run_commands_in_multicmd_with_path_check(commands, timeout=...,max_threads=1
 	if timeout is ...:
 		timeout = COMMAND_TIMEOUT
 	newCommands = []
-	originals = []
 	for command in commands:
 		# Check the path of the command
 		if isinstance(command, str):
@@ -565,23 +556,20 @@ def run_commands_in_multicmd_with_path_check(commands, timeout=...,max_threads=1
 			command[0] = str(command[0])
 		if command[0] not in _binPaths and not check_path(command[0]):
 			eprint(f"Command not found: Command '{command[0]}' not found. Please consider installing it then retry.")
-			if strict:
+			if strict: 
 				raise RuntimeError(f"Command not found: Command '{command[0]}' not found. Please consider installing it then retry.")
-		originals.append(command)
-		newCommands.append(_in_c_locale([_binPaths.get(command[0], command[0])] + command[1:]) if c_locale else command)
+		newCommands.append(command)
 	# Run the command
 	tasks = multiCMD.run_commands(newCommands, timeout=timeout, max_threads=max_threads, quiet=quiet, dry_run=dry_run,return_object=True)
-	for task, original in zip(tasks, originals):
-		# the command as given: under c_locale, the tool and not env
-		shown = original if c_locale else task.command
+	for task in tasks:
 		error = ''
 		if task.returncode == 124 and task.stderr[-1].strip().startswith('Timeout!'):
-			error = f"Command timeout: Command '{shown}' timed out after {timeout} seconds."
+			error = f"Command timeout: Command '{task.command}' timed out after {timeout} seconds."
 		elif task.returncode == 137 and task.stderr[-1].strip().startswith('Ctrl C detected, Emergency Stop!'):
-			error = f"Keyboard Interrupt: Command '{shown}' was interrupted by user."
+			error = f"Keyboard Interrupt: Command '{task.command}' was interrupted by user."
 		elif task.returncode != 0:
 			program = ''
-			cmd = shown
+			cmd = getattr(task, 'command', None)
 			if isinstance(cmd, (list, tuple)) and cmd:
 				program = os.path.basename(str(cmd[0]))
 			elif isinstance(cmd, str) and cmd.strip():
@@ -592,7 +580,7 @@ def run_commands_in_multicmd_with_path_check(commands, timeout=...,max_threads=1
 			if program == 'e2fsck' and task.returncode in (1, 2, 3):
 				error = ''
 			else:
-				error = f"Task return code error: Command '{shown}' failed with return code {task.returncode}."
+				error = f"Task return code error: Command '{task.command}' failed with return code {task.returncode}."
 		if error:
 			if not quiet:
 				eprint(error)
@@ -1213,7 +1201,7 @@ def _ext_mkfs_probe_features(names):
 	try:
 		mkfs = _binPaths.get('mkfs', 'mkfs')
 		commands = [
-			_in_c_locale([mkfs, '-t', 'ext4', '-n', '-F', '-O', name, os.devnull, '256'])
+			['env', 'LC_ALL=C', mkfs, '-t', 'ext4', '-n', '-F', '-O', name, os.devnull, '256']
 			for name in todo
 		]
 		tasks = multiCMD.run_commands(
@@ -1310,12 +1298,11 @@ def _probe_xfs(device):
 	xfs_info groups values into sections (meta-data / data / naming / log /
 	realtime) and reuses key names across them - `bsize` is the block size under
 	`data` but the directory block size under `naming` - so values are bucketed
-	by section rather than flattened. It runs in the C locale: xfsprogs translates
-	the section names (pl: 'metadane', 'dane', 'nazwy').
+	by section rather than flattened.
 	"""
 	params = {}
 	section = ''
-	for line in run_command_in_multicmd_with_path_check(['xfs_info', device], quiet=True, c_locale=True):
+	for line in run_command_in_multicmd_with_path_check(['xfs_info', device], quiet=True):
 		if not line.strip():
 			continue
 		if not line[0].isspace():
