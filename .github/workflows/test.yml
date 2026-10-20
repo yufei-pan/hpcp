@@ -8,12 +8,15 @@ permissions:
 jobs:
   pytest:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
         python-version: ["3.9", "3.12", "3.14"]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: ${{ matrix.python-version }}
@@ -22,9 +25,12 @@ jobs:
   # setup-python no longer ships 3.6, the oldest Python hpcp supports: it runs in a container
   pytest-py36:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     container: python:3.6
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - run: python -m pip install "pytest<7.1"
       # as root, the tests that need loop devices and mounts would run, which the container cannot do
       - run: useradd -m tester && chown -R tester . && su tester -c "python -m pytest -q -p no:cacheprovider"
