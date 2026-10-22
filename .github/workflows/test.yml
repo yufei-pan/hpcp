@@ -5,9 +5,10 @@ on:
   pull_request:
 permissions:
   contents: read
+# ubuntu-latest is moving to 26.04, where actions/setup-python has no Python 3.9
 jobs:
   pytest:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     strategy:
       fail-fast: false
@@ -24,9 +25,10 @@ jobs:
       - run: python -m pytest -q
   # setup-python no longer ships 3.6, the oldest Python hpcp supports: it runs in a container
   pytest-py36:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
-    container: python:3.6
+    # pinned by digest: the image is not rebuilt under us (python:3.6 is end of life)
+    container: python:3.6@sha256:f8652afaf88c25f0d22354d547d892591067aa4026a7fa9a6819df9f300af6fc
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
