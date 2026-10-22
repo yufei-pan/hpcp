@@ -2995,7 +2995,7 @@ def get_file_list_parallel(path,max_workers=56,exclude=None,append_hash=False,fu
 		listed_items = len(file_list) + len(link_list)
 		# A folder's listing that crashed (this default): its folder stays, as before 9.77.
 		no_result = (frozenset(), frozenset(), 0, frozenset())
-		with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
+		with ProcessPoolExecutor(max_workers=max_workers) as executor:
 			while folders_to_expand or futures:
 				under_rate_limit = (
 					FILES_RATE_LIMIT <= 0
@@ -9638,7 +9638,7 @@ def _remove_trees_parallel(trees, max_workers, exclude=None, rate_limiter=None):
 			_init_rate_share(*share)
 			inherited = True
 	try:
-		with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers, **pool) as executor:
+		with ProcessPoolExecutor(max_workers=max_workers, **pool) as executor:
 			while queue or futures:
 				while queue and len(futures) < max_workers * 2:
 					path, identity = queue.popleft()

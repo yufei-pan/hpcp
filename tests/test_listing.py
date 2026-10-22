@@ -114,8 +114,6 @@ def test_unreadable_directory_is_recorded_and_the_rest_listed(tmp_tree, hpcp_mod
 			def __init__(self, *args, **kwargs):
 				kwargs.setdefault('mp_context', multiprocessing.get_context('fork'))
 				super().__init__(*args, **kwargs)
-		# hpcp names the pool both ways
-		monkeypatch.setattr(concurrent.futures, 'ProcessPoolExecutor', ForkingPool)
 		monkeypatch.setattr(hpcp_mod, 'ProcessPoolExecutor', ForkingPool)
 	tmp_tree.add_file('a.txt', 'A')
 	tmp_tree.add_file('ok/b.txt', 'B')
@@ -162,3 +160,10 @@ def test_move_after_a_cached_incomplete_listing_keeps_the_sources(tmp_tree, hpcp
 		batch=True, do_not_remove_files_while_listing=True)
 	assert (tmp_tree.src / 'secret' / 'c.txt').exists()
 	assert rc == 212
+
+
+def test_hpcp_names_the_process_pool_one_way():
+	# a test that swaps the pool patches one name; a second spelling in hpcp.py would keep the real pool
+	with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'hpcp.py'), encoding='utf-8') as f:
+		source = f.read()
+	assert 'concurrent.futures.ProcessPoolExecutor' not in source
