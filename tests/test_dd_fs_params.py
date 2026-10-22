@@ -513,8 +513,8 @@ def _fresh_check_path(monkeypatch):
 
 
 @pytest.mark.skipif(os.name != 'posix', reason='executable bits')
-def test_check_path_validates_a_tool_path_override(tmp_path, monkeypatch, capsys, _fresh_check_path):
-	good = _fake_tool(tmp_path, 'mytool', 'exit 0\n')
+def test_check_path_validates_a_tool_path_override(tmp_path, exec_dir, monkeypatch, capsys, _fresh_check_path):
+	good = _fake_tool(exec_dir, 'mytool', 'exit 0\n')
 	monkeypatch.setenv('HPCPTESTTOOL_PATH', good)
 	assert hpcp.check_path('hpcptesttool') is True
 	assert hpcp._binPaths['hpcptesttool'] == good
@@ -701,14 +701,14 @@ def _translated_mkfs(directory):
 
 
 @pytest.mark.skipif(os.name != 'posix', reason='runs a shell script as mkfs')
-def test_ext_mkfs_probe_makes_no_file_and_reads_the_c_locale(tmp_path, monkeypatch):
+def test_ext_mkfs_probe_makes_no_file_and_reads_the_c_locale(tmp_path, exec_dir, monkeypatch):
 	# e2fsprogs 1.45 and 1.46 create the regular file they are given before they parse -O: the probe ran
 	# them on /hpcp-ext-feature-probe and left that file in / (EL8, Ubuntu 20.04 and 22.04, Debian 11, EL9).
 	# The verdict reads mke2fs's message, which a translated locale changes.
 	devices = tmp_path / 'devices'
 	monkeypatch.setenv('HPCP_TEST_DEVICES', str(devices))
 	monkeypatch.setenv('LC_ALL', 'de_DE.UTF-8')
-	monkeypatch.setitem(hpcp._binPaths, 'mkfs', _translated_mkfs(tmp_path))
+	monkeypatch.setitem(hpcp._binPaths, 'mkfs', _translated_mkfs(exec_dir))
 	hpcp._ext_mkfs_probe_features(['nosuch_a', 'has_journal', 'nosuch_b'])
 	assert hpcp._EXT_MKFS_FEATURE_KNOWN == {'nosuch_a': False, 'has_journal': True, 'nosuch_b': False}
 	# one run for the whole list, which mke2fs rejects as a whole, then one run per name
@@ -716,11 +716,11 @@ def test_ext_mkfs_probe_makes_no_file_and_reads_the_c_locale(tmp_path, monkeypat
 
 
 @pytest.mark.skipif(os.name != 'posix', reason='runs a shell script as mkfs')
-def test_ext_mkfs_probe_is_one_run_when_every_name_parses(tmp_path, monkeypatch):
+def test_ext_mkfs_probe_is_one_run_when_every_name_parses(tmp_path, exec_dir, monkeypatch):
 	# hpcp asks about some forty names and mke2fs knows nearly all of them: one spawn, not forty.
 	devices = tmp_path / 'devices'
 	monkeypatch.setenv('HPCP_TEST_DEVICES', str(devices))
-	monkeypatch.setitem(hpcp._binPaths, 'mkfs', _fake_tool(tmp_path, 'mkfs', (
+	monkeypatch.setitem(hpcp._binPaths, 'mkfs', _fake_tool(exec_dir, 'mkfs', (
 		'printf "%s\\n" "$6" >> "$HPCP_TEST_DEVICES"\nexit 0\n')))
 	hpcp._ext_mkfs_probe_features(['has_journal', 'extent', 'has_journal', '64bit'])
 	assert hpcp._EXT_MKFS_FEATURE_KNOWN == {'has_journal': True, 'extent': True, '64bit': True}
@@ -730,11 +730,11 @@ def test_ext_mkfs_probe_is_one_run_when_every_name_parses(tmp_path, monkeypatch)
 
 
 @pytest.mark.skipif(os.name != 'posix', reason='runs a shell script as mkfs')
-def test_ext_mkfs_verdict_ignores_a_rejection_of_somebody_elses_feature(tmp_path, monkeypatch):
+def test_ext_mkfs_verdict_ignores_a_rejection_of_somebody_elses_feature(tmp_path, exec_dir, monkeypatch):
 	# mke2fs reads mke2fs.conf before -O, and a feature the floppy stanza lists that this e2fsprogs does not
 	# know ends the run with the same words: 'Invalid filesystem option set: nosuch_x'. Every name asked
 	# about would have been judged unknown (and dropped from the -O list) by the bare substring.
-	monkeypatch.setitem(hpcp._binPaths, 'mkfs', _fake_tool(tmp_path, 'mkfs', (
+	monkeypatch.setitem(hpcp._binPaths, 'mkfs', _fake_tool(exec_dir, 'mkfs', (
 		'case "$MKE2FS_CONFIG" in /dev/null) case "$6" in *nosuch*) echo "Invalid filesystem option set: $6" >&2; exit 1;; esac; exit 0;; esac\n'
 		'echo "Invalid filesystem option set: nosuch_x" >&2\nexit 1\n')))
 	hpcp._ext_mkfs_probe_features(['has_journal', 'nosuch', 'extent'])
@@ -758,13 +758,13 @@ def test_ext_mkfs_verdict_survives_a_floppy_stanza_with_a_bad_feature(tmp_path, 
 
 
 @pytest.mark.skipif(os.name != 'posix', reason='runs a shell script as mkfs')
-def test_ext_mkfs_probe_runs_env_from_path_whatever_env_path_says(tmp_path, monkeypatch):
+def test_ext_mkfs_probe_runs_env_from_path_whatever_env_path_says(tmp_path, exec_dir, monkeypatch):
 	# ENV_PATH is too common a name to be hpcp's override for env: a dotenv file there must not become
 	# the program the probe runs, whether read from the environment or found by hpcp's tool lookup.
 	monkeypatch.setenv('HPCP_TEST_DEVICES', str(tmp_path / 'devices'))
 	monkeypatch.setenv('ENV_PATH', str(tmp_path / '.env'))
 	monkeypatch.setitem(hpcp._binPaths, 'env', str(tmp_path / '.env'))
-	monkeypatch.setitem(hpcp._binPaths, 'mkfs', _translated_mkfs(tmp_path))
+	monkeypatch.setitem(hpcp._binPaths, 'mkfs', _translated_mkfs(exec_dir))
 	assert hpcp._ext_mkfs_knows_feature('nosuch_hpcp_feature') is False
 
 

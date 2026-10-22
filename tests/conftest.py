@@ -1,6 +1,8 @@
 import os
 import sys
 import shutil
+import subprocess
+import tempfile
 import pytest
 
 # Repo root on path for `import hpcp` if pythonpath not honored
@@ -199,3 +201,41 @@ def copy_args(tmp_tree):
 	def _args(**kwargs):
 		return trailing_copy_args(tmp_tree, **kwargs)
 	return _args
+
+
+def _runs_scripts(directory):
+	"""True if a script written to `directory` can be executed there (it is not a noexec mount)."""
+	try:
+		path = os.path.join(directory, 'hpcp_exec_probe')
+		with open(path, 'w') as f:
+			f.write('#!/bin/sh\nexit 0\n')
+		os.chmod(path, 0o755)
+		try:
+			return subprocess.call([path]) == 0
+		finally:
+			os.unlink(path)
+	except OSError:
+		return False
+
+
+@pytest.fixture
+def exec_dir(tmp_path):
+	"""A directory that allows executing the scripts a test writes as fake tools: tmp_path unless it is on a
+	noexec mount (a hardened /tmp), else the first of the usual alternatives that is not one; skip when none."""
+	if os.name != 'posix':
+		pytest.skip('runs shell scripts')
+	if _runs_scripts(str(tmp_path)):
+		yield tmp_path
+		return
+	for base in ('/dev/shm', '/var/tmp', os.path.expanduser('~'), os.getcwd()):
+		if not os.path.isdir(base) or not os.access(base, os.W_OK):
+			continue
+		directory = tempfile.mkdtemp(prefix='hpcp-test-', dir=base)
+		if _runs_scripts(directory):
+			try:
+				yield type(tmp_path)(directory)
+			finally:
+				shutil.rmtree(directory, ignore_errors=True)
+			return
+		shutil.rmtree(directory, ignore_errors=True)
+	pytest.skip('no writable directory allows executing scripts (every candidate is mounted noexec)')
