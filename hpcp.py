@@ -1184,38 +1184,59 @@ def _ext_mkfs_task_text(task):
 			chunks.extend(str(line) for line in val)
 	return '\n'.join(chunks)
 
+def _ext_mkfs_rejects(task, option_set):
+	"""False if mke2fs said it rejects exactly this -O argument, True if it said nothing of the kind,
+	None if it rejected an -O argument that is not ours (a stanza of a mke2fs.conf it read)."""
+	text = _ext_mkfs_task_text(task)
+	if 'Invalid filesystem option set' not in text:
+		return True
+	return False if any(line.strip() == f"Invalid filesystem option set: {option_set}" for line in text.splitlines()) else None
+
+def _ext_mkfs_probe_run(option_sets):
+	"""Run `mke2fs -n` on /dev/null once per -O argument; one verdict per argument, see _ext_mkfs_rejects
+	(None as well when the run did not happen). MKE2FS_CONFIG is /dev/null so that no usage-type stanza of
+	the host's mke2fs.conf (a 256-block device is a `floppy`) can put its own features in the way."""
+	commands = [
+		['env', 'LC_ALL=C', f"MKE2FS_CONFIG={os.devnull}", _binPaths.get('mkfs', 'mkfs'),
+		 '-t', 'ext4', '-n', '-F', '-O', option_set, os.devnull, '256']
+		for option_set in option_sets
+	]
+	tasks = multiCMD.run_commands(
+		commands, timeout=COMMAND_TIMEOUT, max_threads=min(8, len(commands)),
+		return_object=True, quiet=True) or []
+	verdicts = [_ext_mkfs_rejects(task, option_set) for task, option_set in zip(tasks, option_sets)]
+	return verdicts + [None] * (len(option_sets) - len(verdicts))
+
 def _ext_mkfs_probe_features(names):
 	"""Ask local mke2fs whether each -O feature name parses. Cache the answers.
 
 	Uses `mke2fs -n` against /dev/null, in the C locale, where an unknown
-	name fails with 'Invalid filesystem option set' (translated elsewhere,
-	where every name would count as known) and a known name gets past
-	option parsing. Never a path to make: e2fsprogs 1.45 and 1.46 create
-	the regular file they are given before they parse -O, and where they
-	cannot create it, stop there without parsing -O. Probe failures fail
-	open (known) so a missing mkfs does not strip a usable -O list.
+	name fails with 'Invalid filesystem option set: <the -O argument>'
+	(translated elsewhere, where every name would count as known) and a
+	known name gets past option parsing. Only that exact message counts:
+	mke2fs reads mke2fs.conf first and has the same words for a bad
+	feature of its own, which says nothing about ours. Never a path to
+	make: e2fsprogs 1.45 and 1.46 create the regular file they are given
+	before they parse -O, and where they cannot create it, stop there
+	without parsing -O. Probe failures fail open (known) so a missing
+	mkfs does not strip a usable -O list.
+
+	All the names go in one -O list first: mke2fs stops at the first bad
+	name and prints the whole list, so only a rejection of that list sends
+	each name to a run of its own.
 	"""
 	todo = [n for n in dict.fromkeys(names) if n and n not in _EXT_MKFS_FEATURE_KNOWN]
 	if not todo:
 		return
 	try:
-		mkfs = _binPaths.get('mkfs', 'mkfs')
-		commands = [
-			['env', 'LC_ALL=C', mkfs, '-t', 'ext4', '-n', '-F', '-O', name, os.devnull, '256']
-			for name in todo
-		]
-		tasks = multiCMD.run_commands(
-			commands, timeout=COMMAND_TIMEOUT, max_threads=min(8, len(commands)),
-			return_object=True, quiet=True)
-		if not tasks:
-			for name in todo:
-				_EXT_MKFS_FEATURE_KNOWN.setdefault(name, True)
-			return
-		for name, task in zip(todo, tasks):
-			text = _ext_mkfs_task_text(task)
-			_EXT_MKFS_FEATURE_KNOWN[name] = 'Invalid filesystem option set' not in text
-		for name in todo[len(tasks):]:
-			_EXT_MKFS_FEATURE_KNOWN.setdefault(name, True)
+		verdicts = None
+		if len(todo) > 1:
+			if _ext_mkfs_probe_run([','.join(todo)])[0] is not False:
+				verdicts = [True] * len(todo)
+		if verdicts is None:
+			verdicts = _ext_mkfs_probe_run(todo)
+		for name, verdict in zip(todo, verdicts):
+			_EXT_MKFS_FEATURE_KNOWN[name] = verdict is not False
 	except Exception:
 		for name in todo:
 			_EXT_MKFS_FEATURE_KNOWN.setdefault(name, True)

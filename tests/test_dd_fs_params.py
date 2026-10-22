@@ -631,7 +631,50 @@ def test_ext_mkfs_probe_makes_no_file_and_reads_the_c_locale(tmp_path, monkeypat
 	monkeypatch.setitem(hpcp._binPaths, 'mkfs', _translated_mkfs(tmp_path))
 	hpcp._ext_mkfs_probe_features(['nosuch_a', 'has_journal', 'nosuch_b'])
 	assert hpcp._EXT_MKFS_FEATURE_KNOWN == {'nosuch_a': False, 'has_journal': True, 'nosuch_b': False}
-	assert devices.read_text().splitlines() == [os.devnull] * 3
+	# one run for the whole list, which mke2fs rejects as a whole, then one run per name
+	assert devices.read_text().splitlines() == [os.devnull] * 4
+
+
+@pytest.mark.skipif(os.name != 'posix', reason='runs a shell script as mkfs')
+def test_ext_mkfs_probe_is_one_run_when_every_name_parses(tmp_path, monkeypatch):
+	# hpcp asks about some forty names and mke2fs knows nearly all of them: one spawn, not forty.
+	devices = tmp_path / 'devices'
+	monkeypatch.setenv('HPCP_TEST_DEVICES', str(devices))
+	monkeypatch.setitem(hpcp._binPaths, 'mkfs', _fake_tool(tmp_path, 'mkfs', (
+		'printf "%s\\n" "$6" >> "$HPCP_TEST_DEVICES"\nexit 0\n')))
+	hpcp._ext_mkfs_probe_features(['has_journal', 'extent', 'has_journal', '64bit'])
+	assert hpcp._EXT_MKFS_FEATURE_KNOWN == {'has_journal': True, 'extent': True, '64bit': True}
+	assert devices.read_text().splitlines() == ['has_journal,extent,64bit']
+	hpcp._ext_mkfs_probe_features(['extent', '64bit'])
+	assert len(devices.read_text().splitlines()) == 1
+
+
+@pytest.mark.skipif(os.name != 'posix', reason='runs a shell script as mkfs')
+def test_ext_mkfs_verdict_ignores_a_rejection_of_somebody_elses_feature(tmp_path, monkeypatch):
+	# mke2fs reads mke2fs.conf before -O, and a feature the floppy stanza lists that this e2fsprogs does not
+	# know ends the run with the same words: 'Invalid filesystem option set: nosuch_x'. Every name asked
+	# about would have been judged unknown (and dropped from the -O list) by the bare substring.
+	monkeypatch.setitem(hpcp._binPaths, 'mkfs', _fake_tool(tmp_path, 'mkfs', (
+		'case "$MKE2FS_CONFIG" in /dev/null) case "$6" in *nosuch*) echo "Invalid filesystem option set: $6" >&2; exit 1;; esac; exit 0;; esac\n'
+		'echo "Invalid filesystem option set: nosuch_x" >&2\nexit 1\n')))
+	hpcp._ext_mkfs_probe_features(['has_journal', 'nosuch', 'extent'])
+	assert hpcp._EXT_MKFS_FEATURE_KNOWN == {'has_journal': True, 'nosuch': False, 'extent': True}
+	task = _FakeTask(1, ['Invalid filesystem option set: nosuch_x'])
+	assert hpcp._ext_mkfs_rejects(task, 'has_journal') is None
+	assert hpcp._ext_mkfs_rejects(_FakeTask(0, []), 'has_journal') is True
+	assert hpcp._ext_mkfs_rejects(_FakeTask(1, ['Invalid filesystem option set: a,b']), 'a,b') is False
+
+
+@pytest.mark.skipif(
+	shutil.which('mkfs') is None or shutil.which('mkfs.ext4') is None,
+	reason='mkfs or mkfs.ext4 not available (mkfs -t ext4 runs mkfs.ext4)')
+def test_ext_mkfs_verdict_survives_a_floppy_stanza_with_a_bad_feature(tmp_path, monkeypatch):
+	# The real mke2fs, told by MKE2FS_CONFIG that floppies have a feature it has never heard of.
+	conf = tmp_path / 'mke2fs.conf'
+	conf.write_text('[fs_types]\n\tfloppy = {\n\t\tfeatures = nosuch_x\n\t}\n')
+	monkeypatch.setenv('MKE2FS_CONFIG', str(conf))
+	hpcp._ext_mkfs_probe_features(['has_journal', 'nosuch_hpcp_feature_xyz', 'extent'])
+	assert hpcp._EXT_MKFS_FEATURE_KNOWN == {'has_journal': True, 'nosuch_hpcp_feature_xyz': False, 'extent': True}
 
 
 @pytest.mark.skipif(os.name != 'posix', reason='runs a shell script as mkfs')
