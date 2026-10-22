@@ -63,7 +63,7 @@ _DISK_HEAD = 'format\thpcp-diff\nformat_version\t2\nlayout\tdisk\ndisk\tdisk.tsv
 ])
 def test_disk_manifest_rejects_bad_entries(tmp_path, hpcp_mod, line):
 	path = tmp_path / 'manifest'
-	path.write_text(_DISK_HEAD + line + '\n')
+	path.write_text(_DISK_HEAD + line + '\n', encoding='utf-8')
 	with pytest.raises(RuntimeError, match='Patch format error'):
 		hpcp_mod.read_manifest(str(path))
 
@@ -112,10 +112,10 @@ def test_disk_tsv_round_trip(tmp_path, hpcp_mod):
 ])
 def test_disk_tsv_rejects_bad_rows(tmp_path, hpcp_mod, body):
 	path = tmp_path / 'disk.tsv'
-	path.write_text('#hpcp-disk\t1\n' + body)
+	path.write_text('#hpcp-disk\t1\n' + body, encoding='utf-8')
 	with pytest.raises(RuntimeError, match='Patch format error'):
 		hpcp_mod.read_disk_tsv(str(path))
-	path.write_text('#hpcp-disk\t\u00b2\n')
+	path.write_text('#hpcp-disk\t\u00b2\n', encoding='utf-8')
 	with pytest.raises(RuntimeError, match='Patch format error'):
 		hpcp_mod.read_disk_tsv(str(path))
 	path.write_text('#hpcp-disk\t2\n')
