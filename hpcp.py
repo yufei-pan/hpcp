@@ -1216,18 +1216,17 @@ def _ext_mkfs_task_text(task):
 			chunks.extend(str(line) for line in val)
 	return '\n'.join(chunks)
 
-def _ext_mkfs_rejects(task, option_set):
-	"""False if mke2fs said it rejects exactly this -O argument, True if it said nothing of the kind,
-	None if it rejected an -O argument that is not ours (a stanza of a mke2fs.conf it read)."""
+def _ext_mkfs_accepts(task, option_set):
+	"""False if mke2fs said it rejects exactly this -O argument, else True (fail open: any other outcome says nothing
+	against the name). The probe runs with MKE2FS_CONFIG=/dev/null, so no stanza of a mke2fs.conf can make
+	mke2fs reject an -O argument that is not ours."""
 	text = _ext_mkfs_task_text(task)
-	if 'Invalid filesystem option set' not in text:
-		return True
-	return False if any(line.strip() == f"Invalid filesystem option set: {option_set}" for line in text.splitlines()) else None
+	return not any(line.strip() == f"Invalid filesystem option set: {option_set}" for line in text.splitlines())
 
 def _ext_mkfs_probe_run(option_sets):
-	"""Run `mke2fs -n` on /dev/null once per -O argument; one verdict per argument, see _ext_mkfs_rejects
-	(None as well when the run did not happen). MKE2FS_CONFIG is /dev/null so that no usage-type stanza of
-	the host's mke2fs.conf (a 256-block device is a `floppy`) can put its own features in the way."""
+	"""Run `mke2fs -n` on /dev/null once per -O argument; one verdict per argument, True if mke2fs accepts it
+	(also when the run did not happen), see _ext_mkfs_accepts. MKE2FS_CONFIG is /dev/null so that no usage-type
+	stanza of the host's mke2fs.conf (a 256-block device is a `floppy`) can put its own features in the way."""
 	commands = [
 		['env', 'LC_ALL=C', f"MKE2FS_CONFIG={os.devnull}", _bin('mkfs'),
 		 '-t', 'ext4', '-n', '-F', '-O', option_set, os.devnull, '256']
@@ -1236,8 +1235,8 @@ def _ext_mkfs_probe_run(option_sets):
 	tasks = multiCMD.run_commands(
 		commands, timeout=COMMAND_TIMEOUT, max_threads=min(8, len(commands)),
 		return_object=True, quiet=True) or []
-	verdicts = [_ext_mkfs_rejects(task, option_set) for task, option_set in zip(tasks, option_sets)]
-	return verdicts + [None] * (len(option_sets) - len(verdicts))
+	verdicts = [_ext_mkfs_accepts(task, option_set) for task, option_set in zip(tasks, option_sets)]
+	return verdicts + [True] * (len(option_sets) - len(verdicts))
 
 def _ext_mkfs_probe_features(names):
 	"""Ask local mke2fs whether each -O feature name parses. Cache the answers.
@@ -1253,22 +1252,32 @@ def _ext_mkfs_probe_features(names):
 	without parsing -O. Probe failures fail open (known) so a missing
 	mkfs does not strip a usable -O list.
 
-	All the names go in one -O list first: mke2fs stops at the first bad
-	name and prints the whole list, so only a rejection of that list sends
-	each name to a run of its own.
+	mke2fs stops at the first bad name and prints the whole list, never the
+	bad name, so the names are asked about as lists: all of them in one run,
+	and each rejected list split in halves (the halves of one level run
+	together) until a list of one name is rejected. The verdicts equal one run
+	per name; with k unknown names of n it is about k*log2(n) runs, and 1 when
+	mke2fs knows them all.
 	"""
 	todo = [n for n in dict.fromkeys(names) if n and n not in _EXT_MKFS_FEATURE_KNOWN]
 	if not todo:
 		return
 	try:
-		verdicts = None
-		if len(todo) > 1:
-			if _ext_mkfs_probe_run([','.join(todo)])[0] is not False:
-				verdicts = [True] * len(todo)
-		if verdicts is None:
-			verdicts = _ext_mkfs_probe_run(todo)
-		for name, verdict in zip(todo, verdicts):
-			_EXT_MKFS_FEATURE_KNOWN[name] = verdict is not False
+		verdicts = {}
+		groups = [todo]
+		while groups:
+			accepted = _ext_mkfs_probe_run([','.join(group) for group in groups])
+			rejected = []
+			for group, ok in zip(groups, accepted):
+				if ok:
+					verdicts.update((name, True) for name in group)
+				elif len(group) == 1:
+					verdicts[group[0]] = False
+				else:
+					half = len(group) // 2
+					rejected.extend((group[:half], group[half:]))
+			groups = rejected
+		_EXT_MKFS_FEATURE_KNOWN.update(verdicts)
 	except Exception:
 		for name in todo:
 			_EXT_MKFS_FEATURE_KNOWN.setdefault(name, True)

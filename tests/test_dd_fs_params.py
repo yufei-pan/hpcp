@@ -778,8 +778,8 @@ def test_ext_mkfs_probe_makes_no_file_and_reads_the_c_locale(tmp_path, exec_dir,
 	monkeypatch.setitem(hpcp._binPaths, 'mkfs', _translated_mkfs(exec_dir))
 	hpcp._ext_mkfs_probe_features(['nosuch_a', 'has_journal', 'nosuch_b'])
 	assert hpcp._EXT_MKFS_FEATURE_KNOWN == {'nosuch_a': False, 'has_journal': True, 'nosuch_b': False}
-	# one run for the whole list, which mke2fs rejects as a whole, then one run per name
-	assert devices.read_text().splitlines() == [os.devnull] * 4
+	# the whole list (rejected), then its halves [nosuch_a] and [has_journal, nosuch_b], then those two names
+	assert devices.read_text().splitlines() == [os.devnull] * 5
 
 
 @pytest.mark.skipif(os.name != 'posix', reason='runs a shell script as mkfs')
@@ -807,9 +807,25 @@ def test_ext_mkfs_verdict_ignores_a_rejection_of_somebody_elses_feature(tmp_path
 	hpcp._ext_mkfs_probe_features(['has_journal', 'nosuch', 'extent'])
 	assert hpcp._EXT_MKFS_FEATURE_KNOWN == {'has_journal': True, 'nosuch': False, 'extent': True}
 	task = _FakeTask(1, ['Invalid filesystem option set: nosuch_x'])
-	assert hpcp._ext_mkfs_rejects(task, 'has_journal') is None
-	assert hpcp._ext_mkfs_rejects(_FakeTask(0, []), 'has_journal') is True
-	assert hpcp._ext_mkfs_rejects(_FakeTask(1, ['Invalid filesystem option set: a,b']), 'a,b') is False
+	assert hpcp._ext_mkfs_accepts(task, 'has_journal') is True
+	assert hpcp._ext_mkfs_accepts(_FakeTask(0, []), 'has_journal') is True
+	assert hpcp._ext_mkfs_accepts(_FakeTask(1, ['Invalid filesystem option set: a,b']), 'a,b') is False
+
+
+@pytest.mark.skipif(os.name != 'posix', reason='runs a shell script as mkfs')
+@pytest.mark.parametrize('unknown, runs', [(0, 1), (1, 9), (3, 23)])
+def test_ext_mkfs_probe_splits_a_rejected_list_in_halves(tmp_path, exec_dir, monkeypatch, unknown, runs):
+	# 31 names, the way a pre-1.47 mke2fs rejects orphan_file: not one run per name
+	names = ['feat%d' % i for i in range(31)]
+	bad = names[::13][:unknown] if unknown else []
+	devices = tmp_path / 'devices'
+	monkeypatch.setenv('HPCP_TEST_DEVICES', str(devices))
+	monkeypatch.setitem(hpcp._binPaths, 'mkfs', _fake_tool(exec_dir, 'mkfs', (
+		'printf "%s\\n" "$6" >> "$HPCP_TEST_DEVICES"\n'
+		'case ",$6," in ' + ('|'.join('*,%s,*' % b for b in bad) or 'NEVER') + ') echo "Invalid filesystem option set: $6" >&2; exit 1;; esac\nexit 0\n')))
+	hpcp._ext_mkfs_probe_features(names)
+	assert hpcp._EXT_MKFS_FEATURE_KNOWN == {n: n not in bad for n in names}
+	assert len(devices.read_text().splitlines()) == runs
 
 
 @pytest.mark.skipif(
