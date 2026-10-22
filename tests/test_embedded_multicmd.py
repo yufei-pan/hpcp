@@ -34,3 +34,16 @@ def test_embedded_multicmd_reads_terminal_columns_when_stdout_is_piped(tmp_path)
 		os.close(slave)
 		os.close(master)
 	assert out.split() == ['200', '40']
+
+
+def test_declared_multicmd_floor_is_the_one_the_import_gate_enforces():
+	# below the gate hpcp ignores an installed multiCMD for its embedded copy, so a lower floor in setup.py
+	# (or in the script header) would install a multiCMD that is never used
+	import re
+	with open(os.path.join(_ROOT, 'hpcp.py'), encoding='utf-8') as f:
+		source = f.read()
+	gate = re.search(r"\) < \((\d+), (\d+)\):\n\t\traise ImportError\('multiCMD too old'\)", source)
+	floor = '%s.%s' % gate.groups()
+	with open(os.path.join(_ROOT, 'setup.py'), encoding='utf-8') as f:
+		assert "'multiCMD>=%s'" % floor in f.read()
+	assert '"multiCMD>=%s"' % floor in source

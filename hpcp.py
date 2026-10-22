@@ -3,7 +3,7 @@
 # requires-python = ">=3.6"
 # dependencies = [
 #     "xxhash",
-#     "multiCMD>1.19",
+#     "multiCMD>=1.54",
 # ]
 # ///
 import argparse
