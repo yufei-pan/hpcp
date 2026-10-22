@@ -485,9 +485,14 @@ def check_path(program_name):
 	#global __configs_from_file
 	global _binPaths
 	config_key = f'_{program_name}Path'
+	override = os.environ.get(program_name.upper() + '_PATH')
+	if override and not (os.path.isfile(override) and os.access(override, os.X_OK)):
+		# A typo or a directory there would be handed to multiCMD as the program and fail every use of the tool.
+		print(f"Warning: {program_name.upper()}_PATH={override} is not an executable file; looking for {program_name} elsewhere.", file=sys.stderr)
+		override = None
 	program_path = (
 		#__configs_from_file.get(config_key) or
-		os.environ.get(program_name.upper() + '_PATH') or
+		override or
 		globals().get(config_key) or
 		shutil.which(program_name)
 	)
@@ -563,9 +568,13 @@ def run_commands_in_multicmd_with_path_check(commands, timeout=...,max_threads=1
 	tasks = multiCMD.run_commands(newCommands, timeout=timeout, max_threads=max_threads, quiet=quiet, dry_run=dry_run,return_object=True)
 	for task in tasks:
 		error = ''
-		if task.returncode == 124 and task.stderr[-1].strip().startswith('Timeout!'):
+		if dry_run and task.returncode is None:
+			# multiCMD ran nothing, so there is no exit status to judge
+			continue
+		last_stderr = (task.stderr[-1] if task.stderr else '').strip()
+		if task.returncode == 124 and last_stderr.startswith('Timeout!'):
 			error = f"Command timeout: Command '{task.command}' timed out after {timeout} seconds."
-		elif task.returncode == 137 and task.stderr[-1].strip().startswith('Ctrl C detected, Emergency Stop!'):
+		elif task.returncode == 137 and last_stderr.startswith('Ctrl C detected, Emergency Stop!'):
 			error = f"Keyboard Interrupt: Command '{task.command}' was interrupted by user."
 		elif task.returncode != 0:
 			program = ''

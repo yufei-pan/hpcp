@@ -456,6 +456,86 @@ def test_e2fsck_exit_4_is_still_a_task_error(monkeypatch):
 		hpcp.ERRORS.extend(saved_errors)
 
 
+class _RunnerTask:
+	def __init__(self, command, returncode, stdout=(), stderr=()):
+		self.command = command
+		self.returncode = returncode
+		self.stdout = list(stdout)
+		self.stderr = list(stderr)
+
+
+def _runner_errors(monkeypatch, task, **kwargs):
+	"""Run one command through the runner with multiCMD answering `task`; return what it recorded as errors."""
+	saved_errors = list(hpcp.ERRORS)
+	hpcp.ERRORS.clear()
+	monkeypatch.setattr(hpcp, '_binPaths', {'true': '/bin/true'})
+	monkeypatch.setattr(hpcp.multiCMD, 'run_commands', lambda commands, **kw: [task])
+	try:
+		hpcp.run_commands_in_multicmd_with_path_check([['true']], quiet=True, **kwargs)
+		return list(hpcp.ERRORS)
+	finally:
+		hpcp.ERRORS.clear()
+		hpcp.ERRORS.extend(saved_errors)
+
+
+@pytest.mark.parametrize('returncode', [124, 137])
+def test_runner_survives_a_timeout_or_interrupt_with_empty_stderr(monkeypatch, returncode):
+	# exit 124 / 137 from the tool itself (timeout(1), a SIGKILL) leave no multiCMD message: stderr[-1] raised IndexError
+	errors = _runner_errors(monkeypatch, _RunnerTask(['true'], returncode))
+	assert len(errors) == 1 and errors[0].startswith('Task return code error:')
+
+
+def test_runner_still_names_multicmd_timeouts(monkeypatch):
+	errors = _runner_errors(monkeypatch, _RunnerTask(['true'], 124, stderr=['Timeout!']), timeout=5)
+	assert len(errors) == 1 and errors[0].startswith('Command timeout:')
+
+
+def test_runner_dry_run_is_not_a_failure(monkeypatch):
+	# a dry run has no exit status (returncode None); None != 0 recorded a failure for every command
+	assert _runner_errors(monkeypatch, _RunnerTask(['true'], None), dry_run=True) == []
+	# a command that did not run outside a dry run is still one
+	assert len(_runner_errors(monkeypatch, _RunnerTask(['true'], None))) == 1
+
+
+def test_runner_dry_run_through_the_real_multicmd(monkeypatch):
+	monkeypatch.setattr(hpcp, '_binPaths', {'true': '/bin/true'})
+	hpcp.ERRORS.clear()
+	assert hpcp.run_command_in_multicmd_with_path_check(['true'], quiet=True, dry_run=True, strict=True) == []
+	assert hpcp.ERRORS == []
+
+
+@pytest.fixture
+def _fresh_check_path(monkeypatch):
+	monkeypatch.setattr(hpcp, '_binPaths', {})
+	hpcp.check_path.cache_clear()
+	yield
+	hpcp.check_path.cache_clear()
+
+
+@pytest.mark.skipif(os.name != 'posix', reason='executable bits')
+def test_check_path_validates_a_tool_path_override(tmp_path, monkeypatch, capsys, _fresh_check_path):
+	good = _fake_tool(tmp_path, 'mytool', 'exit 0\n')
+	monkeypatch.setenv('HPCPTESTTOOL_PATH', good)
+	assert hpcp.check_path('hpcptesttool') is True
+	assert hpcp._binPaths['hpcptesttool'] == good
+	for name, bad in (('typo', str(tmp_path / 'nope')), ('dir', str(tmp_path)), ('noexec', str(tmp_path / 'data'))):
+		(tmp_path / 'data').write_text('x')
+		os.chmod(str(tmp_path / 'data'), 0o644)
+		tool = 'hpcptest' + name
+		monkeypatch.setenv(tool.upper() + '_PATH', bad)
+		# not an executable file: not used, and not found elsewhere either
+		assert hpcp.check_path(tool) is False
+		assert tool not in hpcp._binPaths
+		assert f'{tool.upper()}_PATH={bad} is not an executable file' in capsys.readouterr().err
+
+
+@pytest.mark.skipif(os.name != 'posix', reason='executable bits')
+def test_check_path_falls_back_to_path_when_the_override_is_bad(tmp_path, monkeypatch, capsys, _fresh_check_path):
+	monkeypatch.setenv('TRUE_PATH', str(tmp_path / 'nope'))
+	assert hpcp.check_path('true') is True
+	assert hpcp._binPaths['true'] == shutil.which('true')
+
+
 _DUMPE2FS_OUTPUT = """dumpe2fs 1.47.2 (1-Jan-2025)
 Filesystem volume name:   BOOTFS
 Last mounted on:          /tmp/tmp.BJpz2N4pR0
