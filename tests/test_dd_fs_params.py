@@ -507,26 +507,42 @@ def test_runner_dry_run_through_the_real_multicmd(monkeypatch):
 @pytest.fixture
 def _fresh_check_path(monkeypatch):
 	monkeypatch.setattr(hpcp, '_binPaths', {})
+	monkeypatch.setattr(hpcp, '_badOverrides', {})
+	monkeypatch.setattr(hpcp, '_warnedOverrides', set())
 	hpcp.check_path.cache_clear()
 	yield
 	hpcp.check_path.cache_clear()
 
 
 @pytest.mark.skipif(os.name != 'posix', reason='executable bits')
-def test_check_path_validates_a_tool_path_override(tmp_path, exec_dir, monkeypatch, capsys, _fresh_check_path):
+def test_check_path_uses_a_tool_path_override_that_runs(exec_dir, monkeypatch, _fresh_check_path):
 	good = _fake_tool(exec_dir, 'mytool', 'exit 0\n')
 	monkeypatch.setenv('HPCPTESTTOOL_PATH', good)
 	assert hpcp.check_path('hpcptesttool') is True
 	assert hpcp._binPaths['hpcptesttool'] == good
+
+
+@pytest.mark.skipif(os.name != 'posix', reason='executable bits')
+def test_check_path_accepts_a_bare_command_name_override(monkeypatch, _fresh_check_path):
+	# MKFS_PATH=mke2fs, CP_PATH=gcp: a name multiCMD finds on PATH worked in 9.78
+	monkeypatch.setenv('HPCPTESTTOOL_PATH', 'true')
+	assert hpcp.check_path('hpcptesttool') is True
+	assert hpcp._binPaths['hpcptesttool'] == shutil.which('true')
+	assert hpcp._badOverrides == {}
+
+
+@pytest.mark.skipif(os.name != 'posix', reason='executable bits')
+def test_check_path_ignores_a_bad_override_silently(tmp_path, monkeypatch, capsys, _fresh_check_path):
+	(tmp_path / 'data').write_text('x')
+	os.chmod(str(tmp_path / 'data'), 0o644)
 	for name, bad in (('typo', str(tmp_path / 'nope')), ('dir', str(tmp_path)), ('noexec', str(tmp_path / 'data'))):
-		(tmp_path / 'data').write_text('x')
-		os.chmod(str(tmp_path / 'data'), 0o644)
 		tool = 'hpcptest' + name
 		monkeypatch.setenv(tool.upper() + '_PATH', bad)
-		# not an executable file: not used, and not found elsewhere either
+		# not an executable: not used, not found elsewhere, and nothing printed (this runs at import)
 		assert hpcp.check_path(tool) is False
 		assert tool not in hpcp._binPaths
-		assert f'{tool.upper()}_PATH={bad} is not an executable file' in capsys.readouterr().err
+		assert hpcp._badOverrides[tool] == bad
+	assert capsys.readouterr().err == ''
 
 
 @pytest.mark.skipif(os.name != 'posix', reason='executable bits')
@@ -534,6 +550,33 @@ def test_check_path_falls_back_to_path_when_the_override_is_bad(tmp_path, monkey
 	monkeypatch.setenv('TRUE_PATH', str(tmp_path / 'nope'))
 	assert hpcp.check_path('true') is True
 	assert hpcp._binPaths['true'] == shutil.which('true')
+
+
+def test_bad_override_warns_once_and_only_when_the_tool_is_needed(tmp_path, monkeypatch, capsys, _fresh_check_path):
+	monkeypatch.setenv('HPCPTESTTOOL_PATH', str(tmp_path))
+	hpcp.check_path('hpcptesttool')
+	assert capsys.readouterr().err == ''
+	hpcp._bin('losetup')
+	assert capsys.readouterr().err == ''
+	hpcp._bin('hpcptesttool')
+	hpcp._bin('hpcptesttool')
+	err = capsys.readouterr().err
+	assert err.count('HPCPTESTTOOL_PATH=') == 1 and 'is not an executable file' in err
+
+
+def test_bad_override_does_not_warn_in_a_worker(tmp_path, monkeypatch, capsys, _fresh_check_path):
+	monkeypatch.setenv('HPCPTESTTOOL_PATH', str(tmp_path))
+	hpcp.check_path('hpcptesttool')
+	monkeypatch.setattr(hpcp.multiprocessing.current_process(), 'name', 'SpawnPoolWorker-1')
+	hpcp._bin('hpcptesttool')
+	assert capsys.readouterr().err == ''
+
+
+def test_importing_hpcp_prints_nothing_for_a_directory_in_mount_path(tmp_path):
+	env = dict(os.environ, MOUNT_PATH=str(tmp_path), CP_PATH=str(tmp_path), DD_PATH='/nonexistent/dd')
+	result = subprocess.run([sys.executable, '-c', 'import sys; sys.path.insert(0, %r); import hpcp' % os.path.dirname(os.path.abspath(hpcp.__file__))],
+		env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+	assert result.returncode == 0 and result.stderr == ''
 
 
 _DUMPE2FS_OUTPUT = """dumpe2fs 1.47.2 (1-Jan-2025)

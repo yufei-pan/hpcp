@@ -471,6 +471,24 @@ class Adaptive_Progress_Bar:
 
 
 _binPaths = {}
+_badOverrides = {}  # tool name -> the <TOOL>_PATH value check_path ignored
+_warnedOverrides = set()
+
+def _warn_bad_override(program_name):
+	"""Say once per process, from the main process only, that <TOOL>_PATH is not an executable and is ignored."""
+	override = _badOverrides.get(program_name)
+	if override is None or program_name in _warnedOverrides:
+		return
+	_warnedOverrides.add(program_name)
+	if multiprocessing.current_process().name == 'MainProcess':
+		print(f"Warning: {program_name.upper()}_PATH={override} is not an executable file; using {program_name} from PATH.", file=sys.stderr)
+
+def _bin(program_name):
+	"""The program to run for a tool hpcp starts by its _binPaths path (mkfs, losetup): the <TOOL>_PATH
+	override if it is one, else the one found on PATH, else the bare name."""
+	_warn_bad_override(program_name)
+	return _binPaths.get(program_name, program_name)
+
 @functools.lru_cache(maxsize=None)
 def check_path(program_name):
 	"""
@@ -486,10 +504,16 @@ def check_path(program_name):
 	global _binPaths
 	config_key = f'_{program_name}Path'
 	override = os.environ.get(program_name.upper() + '_PATH')
-	if override and not (os.path.isfile(override) and os.access(override, os.X_OK)):
-		# A typo or a directory there would be handed to multiCMD as the program and fail every use of the tool.
-		print(f"Warning: {program_name.upper()}_PATH={override} is not an executable file; looking for {program_name} elsewhere.", file=sys.stderr)
-		override = None
+	if override:
+		# which() takes a bare command name (found on PATH) or a path, and wants an executable file either way.
+		# Silent here: this runs at import for every tool, and names like MOUNT_PATH or CP_PATH are common
+		# variables that mean something else. _warn_bad_override says so when hpcp needs that tool.
+		# An override takes effect only where hpcp runs the tool by its _binPaths path (_bin: mkfs, losetup);
+		# the command runner starts every other tool by its bare name from PATH.
+		resolved = shutil.which(override)
+		if resolved is None:
+			_badOverrides[program_name] = override
+		override = resolved
 	program_path = (
 		#__configs_from_file.get(config_key) or
 		override or
@@ -563,6 +587,7 @@ def run_commands_in_multicmd_with_path_check(commands, timeout=...,max_threads=1
 			eprint(f"Command not found: Command '{command[0]}' not found. Please consider installing it then retry.")
 			if strict: 
 				raise RuntimeError(f"Command not found: Command '{command[0]}' not found. Please consider installing it then retry.")
+		_warn_bad_override(command[0])
 		newCommands.append(command)
 	# Run the command
 	tasks = multiCMD.run_commands(newCommands, timeout=timeout, max_threads=max_threads, quiet=quiet, dry_run=dry_run,return_object=True)
@@ -608,12 +633,12 @@ def get_free_space_bytes(path):
 @functools.lru_cache(maxsize=None)
 def cp_supports_sparse():
 	"""
-	Whether the cp found on PATH accepts --sparse (GNU coreutils does, BSD / macOS cp does not).
+	Whether the cp the copy runs (bare `cp`, from PATH; CP_PATH is not used for it) accepts --sparse (GNU coreutils does, BSD / macOS cp does not).
 	"""
 	if os.name != 'posix':
 		return False
 	try:
-		task = multiCMD.run_commands([[_binPaths.get('cp', 'cp'), '--version']], timeout=10, quiet=True, return_object=True)[0]
+		task = multiCMD.run_commands([['cp', '--version']], timeout=10, quiet=True, return_object=True)[0]
 		return task.returncode == 0 and 'GNU' in '\n'.join(task.stdout)
 	except Exception:
 		return False
@@ -1139,7 +1164,7 @@ def _run_mkfs_with_fallback(base_command, param_args, target_partition, fs_type)
 		bool: True if the filesystem was created by any attempted tier.
 	"""
 	def _attempt(command):
-		resolved = [_binPaths.get(command[0], command[0])] + list(command[1:])
+		resolved = [_bin(command[0])] + list(command[1:])
 		tasks = multiCMD.run_commands([resolved], timeout=COMMAND_TIMEOUT, max_threads=1, return_object=True)
 		if not tasks:
 			return 1, ''
@@ -1206,7 +1231,7 @@ def _ext_mkfs_probe_run(option_sets):
 	(None as well when the run did not happen). MKE2FS_CONFIG is /dev/null so that no usage-type stanza of
 	the host's mke2fs.conf (a 256-block device is a `floppy`) can put its own features in the way."""
 	commands = [
-		['env', 'LC_ALL=C', f"MKE2FS_CONFIG={os.devnull}", _binPaths.get('mkfs', 'mkfs'),
+		['env', 'LC_ALL=C', f"MKE2FS_CONFIG={os.devnull}", _bin('mkfs'),
 		 '-t', 'ext4', '-n', '-F', '-O', option_set, os.devnull, '256']
 		for option_set in option_sets
 	]
@@ -10181,7 +10206,7 @@ def detach_loop_device(loop_device, retries=5, delay=0.5):
 	"""Detach a loop device with sync and retries for intermittent EBUSY."""
 	if not loop_device:
 		return True
-	losetup = _binPaths.get('losetup', 'losetup')
+	losetup = _bin('losetup')
 	for attempt in range(1, retries + 1):
 		try:
 			os.sync()
