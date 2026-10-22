@@ -230,7 +230,10 @@ def exec_dir(tmp_path):
 	for base in ('/dev/shm', '/var/tmp', os.path.expanduser('~'), os.getcwd()):
 		if not os.path.isdir(base) or not os.access(base, os.W_OK):
 			continue
-		directory = tempfile.mkdtemp(prefix='hpcp-test-', dir=base)
+		try:
+			directory = tempfile.mkdtemp(prefix='hpcp-test-', dir=base)
+		except OSError:
+			continue  # writable by access(2) but no room or not allowed (ENOSPC, SELinux): try the next
 		if _runs_scripts(directory):
 			try:
 				yield type(tmp_path)(directory)
