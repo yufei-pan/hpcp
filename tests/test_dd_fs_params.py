@@ -478,16 +478,35 @@ def _runner_errors(monkeypatch, task, **kwargs):
 		hpcp.ERRORS.extend(saved_errors)
 
 
-@pytest.mark.parametrize('returncode', [124, 137])
-def test_runner_survives_a_timeout_or_interrupt_with_empty_stderr(monkeypatch, returncode):
-	# exit 124 / 137 from the tool itself (timeout(1), a SIGKILL) leave no multiCMD message: stderr[-1] raised IndexError
-	errors = _runner_errors(monkeypatch, _RunnerTask(['true'], returncode))
+def test_runner_survives_a_timeout_with_empty_stderr(monkeypatch):
+	# exit 124 from the tool itself (timeout(1)) leaves no multiCMD message: stderr[-1] raised IndexError
+	errors = _runner_errors(monkeypatch, _RunnerTask(['true'], 124))
 	assert len(errors) == 1 and errors[0].startswith('Task return code error:')
 
 
 def test_runner_still_names_multicmd_timeouts(monkeypatch):
 	errors = _runner_errors(monkeypatch, _RunnerTask(['true'], 124, stderr=['Timeout!']), timeout=5)
 	assert len(errors) == 1 and errors[0].startswith('Command timeout:')
+
+
+def test_runner_names_a_timeout_whatever_the_tool_prints_while_it_is_interrupted(monkeypatch):
+	# multiCMD appends 'Timeout!' and then sends SIGINT: a tool's reply to SIGINT (dd prints its record counts) lands after it
+	errors = _runner_errors(monkeypatch, _RunnerTask(['true'], 124, stderr=['Timeout!', 'interrupted']), timeout=5)
+	assert len(errors) == 1 and errors[0].startswith('Command timeout:')
+
+
+@pytest.mark.skipif(os.name != 'posix', reason='runs sh')
+def test_runner_names_a_real_timeout_of_a_tool_that_answers_sigint(monkeypatch):
+	saved_errors = list(hpcp.ERRORS)
+	hpcp.ERRORS.clear()
+	monkeypatch.setattr(hpcp, '_binPaths', {'sh': shutil.which('sh')})
+	try:
+		hpcp.run_command_in_multicmd_with_path_check(
+			['sh', '-c', 'trap "echo interrupted >&2; exit 130" INT; while :; do sleep 0.1; done'], timeout=1, quiet=True)
+		assert len(hpcp.ERRORS) == 1 and hpcp.ERRORS[0].startswith('Command timeout:')
+	finally:
+		hpcp.ERRORS.clear()
+		hpcp.ERRORS.extend(saved_errors)
 
 
 def test_runner_dry_run_is_not_a_failure(monkeypatch):
@@ -499,9 +518,14 @@ def test_runner_dry_run_is_not_a_failure(monkeypatch):
 
 def test_runner_dry_run_through_the_real_multicmd(monkeypatch):
 	monkeypatch.setattr(hpcp, '_binPaths', {'true': '/bin/true'})
+	saved_errors = list(hpcp.ERRORS)
 	hpcp.ERRORS.clear()
-	assert hpcp.run_command_in_multicmd_with_path_check(['true'], quiet=True, dry_run=True, strict=True) == []
-	assert hpcp.ERRORS == []
+	try:
+		assert hpcp.run_command_in_multicmd_with_path_check(['true'], quiet=True, dry_run=True, strict=True) == []
+		assert hpcp.ERRORS == []
+	finally:
+		hpcp.ERRORS.clear()
+		hpcp.ERRORS.extend(saved_errors)
 
 
 @pytest.fixture

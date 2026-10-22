@@ -596,11 +596,9 @@ def run_commands_in_multicmd_with_path_check(commands, timeout=...,max_threads=1
 		if dry_run and task.returncode is None:
 			# multiCMD ran nothing, so there is no exit status to judge
 			continue
-		last_stderr = (task.stderr[-1] if task.stderr else '').strip()
-		if task.returncode == 124 and last_stderr.startswith('Timeout!'):
+		# multiCMD appends 'Timeout!' and then sends SIGINT, so whatever the tool prints while dying lands after it
+		if task.returncode == 124 and any(line.strip() == 'Timeout!' for line in task.stderr):
 			error = f"Command timeout: Command '{task.command}' timed out after {timeout} seconds."
-		elif task.returncode == 137 and last_stderr.startswith('Ctrl C detected, Emergency Stop!'):
-			error = f"Keyboard Interrupt: Command '{task.command}' was interrupted by user."
 		elif task.returncode != 0:
 			program = ''
 			cmd = getattr(task, 'command', None)
