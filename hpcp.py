@@ -255,9 +255,9 @@ except ImportError:
 	hasher = hashlib.blake2b()
 	xxhash_available = False
 
-version = '9.78'
+version = '9.79'
 __version__ = version
-COMMIT_DATE = '2026-10-19'
+COMMIT_DATE = '2026-10-23'
 
 MAGIC_NUMBER = 1.61803398875
 RANDOM_DESTINATION_SELECTION = False
