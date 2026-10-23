@@ -545,8 +545,9 @@ def _warn_bad_override(program_name):
 		print(f"Warning: {program_name.upper()}_PATH={override} is not an executable file; using {program_name} from PATH.", file=sys.stderr)
 
 def _bin(program_name):
-	"""The program to run for a tool hpcp starts by its _binPaths path (mkfs, losetup): the <TOOL>_PATH
-	override if it is one, else the one found on PATH, else the bare name."""
+	"""The program to run for a tool hpcp starts itself with multiCMD, not through the command runner (which does
+	the same for the tools it starts): the <TOOL>_PATH override if it is one, else the one found on PATH, else
+	the bare name."""
 	_warn_bad_override(program_name)
 	return _binPaths.get(program_name, program_name)
 
@@ -569,8 +570,8 @@ def check_path(program_name):
 		# which() takes a bare command name (found on PATH) or a path, and wants an executable file either way.
 		# Silent here: this runs at import for every tool, and names like MOUNT_PATH or CP_PATH are common
 		# variables that mean something else. _warn_bad_override says so when hpcp needs that tool.
-		# An override takes effect only where hpcp runs the tool by its _binPaths path (_bin: mkfs, losetup);
-		# the command runner starts every other tool by its bare name from PATH.
+		# Every start of the tool uses it (the command runner and _bin both start _binPaths[tool]), so a stray
+		# variable that names an executable file, MOUNT_PATH=/usr/bin/true, makes hpcp run that file as mount.
 		resolved = shutil.which(override)
 		if resolved is None:
 			_badOverrides[program_name] = override
@@ -645,24 +646,29 @@ def run_commands_in_multicmd_with_path_check(commands, timeout=...,max_threads=1
 	if timeout is ...:
 		timeout = COMMAND_TIMEOUT
 	newCommands = []
+	tools = []
 	for command in commands:
 		# Check the path of the command
 		if isinstance(command, str):
 			command = command.split()
+		else:
+			command = list(command)
 		if not command:
 			eprint("Command is empty: The input command is empty")
 			continue
-		if not isinstance(command[0],str):
-			command[0] = str(command[0])
-		if command[0] not in _binPaths and not check_path(command[0]):
-			eprint(f"Command not found: Command '{command[0]}' not found. Please consider installing it then retry.")
+		tool = str(command[0])
+		if tool not in _binPaths and not check_path(tool):
+			eprint(f"Command not found: Command '{tool}' not found. Please consider installing it then retry.")
 			if strict: 
-				raise RuntimeError(f"Command not found: Command '{command[0]}' not found. Please consider installing it then retry.")
-		_warn_bad_override(command[0])
-		newCommands.append(command)
+				raise RuntimeError(f"Command not found: Command '{tool}' not found. Please consider installing it then retry.")
+		_warn_bad_override(tool)
+		tools.append(os.path.basename(tool))
+		# Start the program check_path found (the <TOOL>_PATH override, else the one on PATH), not the bare name.
+		# A tool it did not find is started by its name and fails the way a missing command does.
+		newCommands.append([_binPaths.get(tool, tool)] + command[1:])
 	# Run the command
 	tasks = multiCMD.run_commands(newCommands, timeout=timeout, max_threads=max_threads, quiet=quiet, dry_run=dry_run,return_object=True, extra_env=extra_env)
-	for task in tasks:
+	for index, task in enumerate(tasks):
 		error = ''
 		if dry_run and task.returncode is None:
 			# multiCMD ran nothing, so there is no exit status to judge
@@ -671,11 +677,12 @@ def run_commands_in_multicmd_with_path_check(commands, timeout=...,max_threads=1
 		if task.returncode == 124 and any(line.strip() == 'Timeout!' for line in task.stderr):
 			error = f"Command timeout: Command '{task.command}' timed out after {timeout} seconds."
 		elif task.returncode != 0:
-			program = ''
+			# the tool as the caller named it: an override may be a program of any other name
+			program = tools[index] if index < len(tools) else ''
 			cmd = getattr(task, 'command', None)
-			if isinstance(cmd, (list, tuple)) and cmd:
+			if not program and isinstance(cmd, (list, tuple)) and cmd:
 				program = os.path.basename(str(cmd[0]))
-			elif isinstance(cmd, str) and cmd.strip():
+			elif not program and isinstance(cmd, str) and cmd.strip():
 				program = os.path.basename(cmd.split()[0])
 			# e2fsck encodes "errors corrected" as bits 0 and 1 (exit 1, 2, or 3).
 			# A live clone's journal replay is exit 1; that is success, not a
@@ -702,12 +709,12 @@ def get_free_space_bytes(path):
 @functools.lru_cache(maxsize=None)
 def cp_supports_sparse():
 	"""
-	Whether the cp the copy runs (bare `cp`, from PATH; CP_PATH is not used for it) accepts --sparse (GNU coreutils does, BSD / macOS cp does not).
+	Whether the cp the copy runs (CP_PATH, else `cp` from PATH) accepts --sparse (GNU coreutils does, BSD / macOS cp does not).
 	"""
 	if os.name != 'posix':
 		return False
 	try:
-		task = multiCMD.run_commands([['cp', '--version']], timeout=10, quiet=True, return_object=True, extra_env=_C_LOCALE)[0]
+		task = multiCMD.run_commands([[_bin('cp'), '--version']], timeout=10, quiet=True, return_object=True, extra_env=_C_LOCALE)[0]
 		return task.returncode == 0 and 'GNU' in '\n'.join(task.stdout)
 	except Exception:
 		return False
@@ -10294,9 +10301,8 @@ def detach_loop_device(loop_device, retries=5, delay=0.5):
 			return True
 		if attempt > 1:
 			# Give udev / partition holders a moment to release after a busy failure.
-			udevadm = shutil.which('udevadm')
-			if udevadm:
-				multiCMD.run_commands([[udevadm, 'settle', '--timeout=5']], timeout=10, max_threads=1, quiet=True)
+			if 'udevadm' in _binPaths:
+				multiCMD.run_commands([[_bin('udevadm'), 'settle', '--timeout=5']], timeout=10, max_threads=1, quiet=True)
 			time.sleep(delay * attempt)
 		tasks = multiCMD.run_commands([[losetup, '-d', loop_device]], timeout=COMMAND_TIMEOUT, max_threads=1, quiet=True, return_object=True)
 		if tasks and getattr(tasks[0], 'returncode', 1) == 0:

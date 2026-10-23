@@ -841,12 +841,11 @@ def test_ext_mkfs_verdict_survives_a_floppy_stanza_with_a_bad_feature(tmp_path, 
 
 
 @pytest.mark.skipif(os.name != 'posix', reason='runs a shell script as mkfs')
-def test_ext_mkfs_probe_runs_env_from_path_whatever_env_path_says(tmp_path, exec_dir, monkeypatch):
-	# ENV_PATH is too common a name to be hpcp's override for env: a dotenv file there must not become
-	# the program the probe runs, whether read from the environment or found by hpcp's tool lookup.
+def test_ext_mkfs_probe_starts_no_env_whatever_env_path_says(tmp_path, exec_dir, monkeypatch):
+	# The probe sets LC_ALL and MKE2FS_CONFIG through multiCMD, so no env program is started; ENV_PATH is a
+	# common name (a dotenv file) and means nothing to it.
 	monkeypatch.setenv('HPCP_TEST_DEVICES', str(tmp_path / 'devices'))
 	monkeypatch.setenv('ENV_PATH', str(tmp_path / '.env'))
-	monkeypatch.setitem(hpcp._binPaths, 'env', str(tmp_path / '.env'))
 	monkeypatch.setitem(hpcp._binPaths, 'mkfs', _translated_mkfs(exec_dir))
 	assert hpcp._ext_mkfs_knows_feature('nosuch_hpcp_feature') is False
 
