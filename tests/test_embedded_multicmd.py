@@ -15,7 +15,7 @@ def _run_with_embedded_multicmd(tmp_path, code, **kwargs):
 
 
 def test_embedded_multicmd_is_used_when_the_installed_one_is_older(tmp_path):
-	assert _run_with_embedded_multicmd(tmp_path, 'import hpcp; print(hpcp.multiCMD.version)').strip() == '1.54'
+	assert _run_with_embedded_multicmd(tmp_path, 'import hpcp; print(hpcp.multiCMD.version)').strip() == '1.55'
 
 
 @pytest.mark.skipif(os.name != 'posix', reason='needs a pseudo-terminal')

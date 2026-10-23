@@ -18,7 +18,7 @@ setup(
     },
     install_requires=[
 		'xxhash',
-		'multiCMD>=1.54',
+		'multiCMD>=1.55',
     ],
     classifiers=[
         'Programming Language :: Python :: 3',
