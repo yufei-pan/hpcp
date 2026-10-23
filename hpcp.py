@@ -597,7 +597,13 @@ _binCalled = {'lsblk', 'losetup', 'sgdisk', 'blkid', 'umount', 'mount','dd','cp'
 			  'reiserfstune', 'debugreiserfs', 'swaplabel', 'udevadm', 'e2label', 'fatlabel', 'ntfslabel', 'btrfstune', 'f2fslabel'}
 [check_path(program) for program in _binCalled]
 
-def run_command_in_multicmd_with_path_check(command, timeout=...,max_threads=1,quiet=False,dry_run=False,strict=False):
+# The environment of a command whose output hpcp parses or matches against text. Tools translate section names
+# and messages (xfs_info in pl_PL prints metadane/dane/nazwy, mke2fs its 'Invalid filesystem option set'), and
+# hpcp looks for the English ones. multiCMD sets it for that command alone: it never reaches another command,
+# and the user's locale stays for every command whose output is shown or not read.
+_C_LOCALE = {'LC_ALL': 'C'}
+
+def run_command_in_multicmd_with_path_check(command, timeout=...,max_threads=1,quiet=False,dry_run=False,strict=False,extra_env=None):
 	"""
 	Run a command in multiCMD with path check.
 
@@ -608,13 +614,15 @@ def run_command_in_multicmd_with_path_check(command, timeout=...,max_threads=1,q
 		quiet (bool, optional): Whether to suppress the output. Defaults to False.
 		dry_run (bool, optional): Whether to perform a dry run. Defaults to False.
 		strict (bool, optional): Whether to exit if the command fails to find the bin. Defaults to True.
+		extra_env (dict, optional): Environment variables set for these commands only, on top of the inherited ones
+			(a None value removes one). Pass _C_LOCALE for a tool whose output is parsed. Defaults to none.
 
 	Returns:
 		list: The output of the command.
 	"""
-	return run_commands_in_multicmd_with_path_check([command], timeout=timeout, max_threads=max_threads, quiet=quiet, dry_run=dry_run, strict=strict)[0]
+	return run_commands_in_multicmd_with_path_check([command], timeout=timeout, max_threads=max_threads, quiet=quiet, dry_run=dry_run, strict=strict, extra_env=extra_env)[0]
 
-def run_commands_in_multicmd_with_path_check(commands, timeout=...,max_threads=1,quiet=False,dry_run=False,strict=False):
+def run_commands_in_multicmd_with_path_check(commands, timeout=...,max_threads=1,quiet=False,dry_run=False,strict=False,extra_env=None):
 	"""
 	Run commands in multiCMD with path check.
 
@@ -625,6 +633,8 @@ def run_commands_in_multicmd_with_path_check(commands, timeout=...,max_threads=1
 		quiet (bool, optional): Whether to suppress the output. Defaults to False.
 		dry_run (bool, optional): Whether to perform a dry run. Defaults to False.
 		strict (bool, optional): Whether to exit if the command fails to find the bin. Defaults to True.
+		extra_env (dict, optional): Environment variables set for these commands only, on top of the inherited ones
+			(a None value removes one). Pass _C_LOCALE for a tool whose output is parsed. Defaults to none.
 
 	Returns:
 		list: The outputs of the commands.
@@ -651,7 +661,7 @@ def run_commands_in_multicmd_with_path_check(commands, timeout=...,max_threads=1
 		_warn_bad_override(command[0])
 		newCommands.append(command)
 	# Run the command
-	tasks = multiCMD.run_commands(newCommands, timeout=timeout, max_threads=max_threads, quiet=quiet, dry_run=dry_run,return_object=True)
+	tasks = multiCMD.run_commands(newCommands, timeout=timeout, max_threads=max_threads, quiet=quiet, dry_run=dry_run,return_object=True, extra_env=extra_env)
 	for task in tasks:
 		error = ''
 		if dry_run and task.returncode is None:
@@ -697,7 +707,7 @@ def cp_supports_sparse():
 	if os.name != 'posix':
 		return False
 	try:
-		task = multiCMD.run_commands([['cp', '--version']], timeout=10, quiet=True, return_object=True)[0]
+		task = multiCMD.run_commands([['cp', '--version']], timeout=10, quiet=True, return_object=True, extra_env=_C_LOCALE)[0]
 		return task.returncode == 0 and 'GNU' in '\n'.join(task.stdout)
 	except Exception:
 		return False
@@ -795,7 +805,7 @@ def get_fs_type_from_path(path):
 					return line.partition(':')[-1].strip()
 			return ''
 		else:
-			fs_type = run_command_in_multicmd_with_path_check(["df", "-PT", path],quiet=True)[-1].split()[1]
+			fs_type = run_command_in_multicmd_with_path_check(["df", "-PT", path],quiet=True,extra_env=_C_LOCALE)[-1].split()[1]
 		return fs_type
 	except Exception:
 		return ''
@@ -1020,7 +1030,7 @@ def _lsblk_disk_rows(disk, columns):
 	shift the columns.
 	"""
 	names = columns.split(',')
-	lines = run_command_in_multicmd_with_path_check(['lsblk', '-p', '-nb', '-P', '-o', columns + ',KNAME,PKNAME,TYPE', disk], strict=True)
+	lines = run_command_in_multicmd_with_path_check(['lsblk', '-p', '-nb', '-P', '-o', columns + ',KNAME,PKNAME,TYPE', disk], strict=True, extra_env=_C_LOCALE)
 	rows = [_lsblk_pairs(line) for line in lines if line.strip()]
 	if not rows:
 		raise RuntimeError(f'Disk error: lsblk printed nothing for {disk}')
@@ -1068,7 +1078,7 @@ def get_fs_type(path):
 	Returns:
 		str: The filesystem type of the path.
 	"""
-	fs_type = run_command_in_multicmd_with_path_check(["lsblk", '-nbl', '-o', 'FSTYPE', path],strict=True)[0].strip()
+	fs_type = run_command_in_multicmd_with_path_check(["lsblk", '-nbl', '-o', 'FSTYPE', path],strict=True,extra_env=_C_LOCALE)[0].strip()
 	return fs_type
 
 _FS_FIX_COMMANDS = {
@@ -1289,13 +1299,12 @@ def _ext_mkfs_probe_run(option_sets):
 	(also when the run did not happen), see _ext_mkfs_accepts. MKE2FS_CONFIG is /dev/null so that no usage-type
 	stanza of the host's mke2fs.conf (a 256-block device is a `floppy`) can put its own features in the way."""
 	commands = [
-		['env', 'LC_ALL=C', f"MKE2FS_CONFIG={os.devnull}", _bin('mkfs'),
-		 '-t', 'ext4', '-n', '-F', '-O', option_set, os.devnull, '256']
+		[_bin('mkfs'), '-t', 'ext4', '-n', '-F', '-O', option_set, os.devnull, '256']
 		for option_set in option_sets
 	]
 	tasks = multiCMD.run_commands(
 		commands, timeout=COMMAND_TIMEOUT, max_threads=min(8, len(commands)),
-		return_object=True, quiet=True) or []
+		return_object=True, quiet=True, extra_env=dict(_C_LOCALE, MKE2FS_CONFIG=os.devnull)) or []
 	verdicts = [_ext_mkfs_accepts(task, option_set) for task, option_set in zip(tasks, option_sets)]
 	return verdicts + [True] * (len(option_sets) - len(verdicts))
 
@@ -1357,7 +1366,7 @@ def _ext_mkfs_knows_feature(name):
 def _probe_ext(device):
 	"""Read ext2/3/4 geometry and features from dumpe2fs."""
 	params = {}
-	for line in run_command_in_multicmd_with_path_check(['dumpe2fs', '-h', device], quiet=True):
+	for line in run_command_in_multicmd_with_path_check(['dumpe2fs', '-h', device], quiet=True, extra_env=_C_LOCALE):
 		key, sep, value = line.partition(':')
 		if not sep:
 			continue
@@ -1425,7 +1434,7 @@ def _probe_xfs(device):
 	"""
 	params = {}
 	section = ''
-	for line in run_command_in_multicmd_with_path_check(['xfs_info', device], quiet=True):
+	for line in run_command_in_multicmd_with_path_check(['xfs_info', device], quiet=True, extra_env=_C_LOCALE):
 		if not line.strip():
 			continue
 		if not line[0].isspace():
@@ -1496,7 +1505,7 @@ def _probe_btrfs(device):
 	"""Read btrfs geometry, checksum type and feature flags from the superblock."""
 	params = {'incompat_flags': [], 'compat_ro_flags': []}
 	current = None
-	for line in run_command_in_multicmd_with_path_check(['btrfs', 'inspect-internal', 'dump-super', device], quiet=True):
+	for line in run_command_in_multicmd_with_path_check(['btrfs', 'inspect-internal', 'dump-super', device], quiet=True, extra_env=_C_LOCALE):
 		stripped = line.strip()
 		if not stripped:
 			continue
@@ -1550,13 +1559,13 @@ def _probe_vfat(device):
 	into FAT16 that firmware refuses to boot.
 	"""
 	params = {}
-	for line in run_command_in_multicmd_with_path_check(['blkid', '-p', '-o', 'export', device], quiet=True):
+	for line in run_command_in_multicmd_with_path_check(['blkid', '-p', '-o', 'export', device], quiet=True, extra_env=_C_LOCALE):
 		key, sep, value = line.partition('=')
 		if sep and key.strip() == 'VERSION':
 			version = value.strip().upper()
 			if version.startswith('FAT') and version[3:].isdigit():
 				params['fat_bits'] = int(version[3:])
-	for line in run_command_in_multicmd_with_path_check(['fsck.fat', '-nv', device], quiet=True):
+	for line in run_command_in_multicmd_with_path_check(['fsck.fat', '-nv', device], quiet=True, extra_env=_C_LOCALE):
 		fields = line.split()
 		if not fields or not fields[0].isdigit():
 			continue
@@ -1596,7 +1605,7 @@ del _fat_alias
 def _probe_ntfs(device):
 	"""Read ntfs cluster and sector size from ntfsinfo."""
 	params = {}
-	for line in run_command_in_multicmd_with_path_check(['ntfsinfo', '-m', device], quiet=True):
+	for line in run_command_in_multicmd_with_path_check(['ntfsinfo', '-m', device], quiet=True, extra_env=_C_LOCALE):
 		key, sep, value = line.partition(':')
 		if not sep:
 			continue
@@ -1620,7 +1629,7 @@ def _build_ntfs(params):
 def _probe_exfat(device):
 	"""Read exfat sector and cluster size from dump.exfat."""
 	params = {}
-	for line in run_command_in_multicmd_with_path_check(['dump.exfat', device], quiet=True):
+	for line in run_command_in_multicmd_with_path_check(['dump.exfat', device], quiet=True, extra_env=_C_LOCALE):
 		key, sep, value = line.partition(':')
 		if not sep:
 			continue
@@ -1664,7 +1673,7 @@ _F2FS_CURATED_FEATURES = (
 def _probe_f2fs(device):
 	"""Read f2fs geometry and features from dump.f2fs."""
 	params = {}
-	for line in run_command_in_multicmd_with_path_check(['dump.f2fs', '-d', '1', device], quiet=True):
+	for line in run_command_in_multicmd_with_path_check(['dump.f2fs', '-d', '1', device], quiet=True, extra_env=_C_LOCALE):
 		if 'superblock features' in line:
 			names = line.rpartition(':')[2]
 			params['features'] = [n.strip() for n in names.replace(',', ' ').split() if n.strip()]
@@ -1707,7 +1716,7 @@ _FS_MKFS_BUILDERS.update({'ntfs': _build_ntfs, 'exfat': _build_exfat, 'f2fs': _b
 def _probe_udf(device):
 	"""Read udf block size and revision from udfinfo."""
 	params = {}
-	for line in run_command_in_multicmd_with_path_check(['udfinfo', device], quiet=True):
+	for line in run_command_in_multicmd_with_path_check(['udfinfo', device], quiet=True, extra_env=_C_LOCALE):
 		key, sep, value = line.partition('=')
 		if not sep:
 			continue
@@ -1731,7 +1740,7 @@ def _build_udf(params):
 def _probe_reiserfs(device):
 	"""Read reiserfs block size, on-disk format and hash from debugreiserfs."""
 	params = {}
-	for line in run_command_in_multicmd_with_path_check(['debugreiserfs', device], quiet=True):
+	for line in run_command_in_multicmd_with_path_check(['debugreiserfs', device], quiet=True, extra_env=_C_LOCALE):
 		stripped = line.strip()
 		if stripped.lower().startswith('blocksize:'):
 			value = stripped.partition(':')[2].strip()
@@ -1946,7 +1955,7 @@ def get_partition_details(device, partition,sector_size=512, identity=True):
 		- If the device is an image file, a loop device is temporarily created and then detached.
 	"""
 	# Get the partition info from the source
-	result = run_command_in_multicmd_with_path_check(["sgdisk", '--info='+partition, device],strict=True)
+	result = run_command_in_multicmd_with_path_check(["sgdisk", '--info='+partition, device],strict=True,extra_env=_C_LOCALE)
 	rtnDic = {'partition_guid_code': '', 'unique_partition_guid': '', 'partition_name': '', 'partition_attrs': '', 'fs_type': '', 'fs_uuid': '', 'fs_label': '', 'size': 0, 'fs_params': {}}
 	for line in result:
 		# Each field is matched at the start of its line: a GPT name may hold another field's label ('guid code: x').
@@ -2018,7 +2027,7 @@ def get_partition_infos(device, identity=True):
 	"""
 	# partitions = run_command_in_multicmd_with_path_check(f"lsblk -nbl -o NAME,SIZE {device}")
 	# partition_info = {part.split()[0]: int(part.split()[1]) for part in partitions}
-	partitions = run_command_in_multicmd_with_path_check(["sgdisk", '--print', device],strict=True)
+	partitions = run_command_in_multicmd_with_path_check(["sgdisk", '--print', device],strict=True,extra_env=_C_LOCALE)
 	line = partitions.pop(0)
 	partition_info = {}
 	disk_size_sector = 0
@@ -2276,7 +2285,7 @@ def create_partition_table(image, partition_infos,sorted_partitions):
 		# Create the partitions
 		delayed_commands = []
 		for partition in sorted_partitions:
-			start_sector = int(run_command_in_multicmd_with_path_check(["sgdisk", '--first-aligned-in-largest', image])[0].strip())
+			start_sector = int(run_command_in_multicmd_with_path_check(["sgdisk", '--first-aligned-in-largest', image], extra_env=_C_LOCALE)[0].strip())
 			end_sector = start_sector + int(partition_infos[partition]['size']/partition_infos[src_disk_path]['sector_size']) -1
 			# Create the partition
 			run_command_in_multicmd_with_path_check(["sgdisk", f'--new={partition}:{start_sector}:{end_sector}', image])
@@ -6579,7 +6588,7 @@ def _probe_fs_type(device):
 	"""Filesystem type of device from `blkid -p` ('' when unknown). A failed probe leaves nothing in ERRORS."""
 	error_count = len(ERRORS)
 	try:
-		output = run_command_in_multicmd_with_path_check(['blkid', '-p', '-s', 'TYPE', '-o', 'value', device], quiet=True)
+		output = run_command_in_multicmd_with_path_check(['blkid', '-p', '-s', 'TYPE', '-o', 'value', device], quiet=True, extra_env=_C_LOCALE)
 	except Exception:
 		output = []
 	finally:
@@ -6976,7 +6985,7 @@ def _probe_identity(device):
 	"""
 	error_count = len(ERRORS)
 	try:
-		output = run_command_in_multicmd_with_path_check(['blkid', '-p', '-o', 'udev', device], quiet=True)
+		output = run_command_in_multicmd_with_path_check(['blkid', '-p', '-o', 'udev', device], quiet=True, extra_env=_C_LOCALE)
 	finally:
 		# blkid exits 2 when it finds nothing (BIOS boot and other raw partitions).
 		del ERRORS[error_count:]
@@ -7003,7 +7012,7 @@ def _probe_raw_label(device):
 	"""
 	error_count = len(ERRORS)
 	try:
-		output = run_command_in_multicmd_with_path_check(['blkid', '-p', '-o', 'value', '-s', 'LABEL', device], quiet=True)
+		output = run_command_in_multicmd_with_path_check(['blkid', '-p', '-o', 'value', '-s', 'LABEL', device], quiet=True, extra_env=_C_LOCALE)
 	finally:
 		del ERRORS[error_count:]
 	if not output:
@@ -7017,7 +7026,7 @@ def _partition_table_type(device):
 	none, which includes an ambivalent probe: see _no_partition_table)."""
 	error_count = len(ERRORS)
 	try:
-		output = run_command_in_multicmd_with_path_check(['blkid', '-p', '-o', 'value', '-s', 'PTTYPE', device], quiet=True)
+		output = run_command_in_multicmd_with_path_check(['blkid', '-p', '-o', 'value', '-s', 'PTTYPE', device], quiet=True, extra_env=_C_LOCALE)
 	finally:
 		# blkid exits 2 when it finds nothing.
 		del ERRORS[error_count:]
@@ -8046,7 +8055,7 @@ def _refuse_if_image_in_use(image):
 	"""
 	error_count = len(ERRORS)
 	try:
-		output = run_command_in_multicmd_with_path_check(['losetup', '-j', image], quiet=True)
+		output = run_command_in_multicmd_with_path_check(['losetup', '-j', image], quiet=True, extra_env=_C_LOCALE)
 	finally:
 		del ERRORS[error_count:]
 	for line in output:
