@@ -1,6 +1,7 @@
 """A <TOOL>_PATH override (DD_PATH, E2FSCK_PATH, ...) is the program hpcp starts, for every tool: through the command
 runner as well as where hpcp starts a tool with multiCMD itself."""
 import os
+import pathlib
 import shutil
 import sys
 
@@ -117,10 +118,18 @@ def test_the_runner_takes_a_tuple_and_leaves_the_callers_list_alone(exec_dir, mo
 	# (a bogus device throughout: without the override the real dumpe2fs would be started, and fail on it)
 	monkeypatch.setenv('DUMPE2FS_PATH', _fake_tool(exec_dir, 'my-dumpe2fs', 'echo "args:$*"\n'))
 	assert hpcp.run_command_in_multicmd_with_path_check(('dumpe2fs', '-h', '/dev/hpcp-none'), quiet=True) == ['args:-h /dev/hpcp-none']
-	command = ['dumpe2fs', '-h', '/dev/hpcp-none']
-	hpcp.run_command_in_multicmd_with_path_check(command, quiet=True)
-	assert command == ['dumpe2fs', '-h', '/dev/hpcp-none']
+	# a path-like tool name, which the runner used to replace in the caller's list
+	command = [pathlib.PurePath('dumpe2fs'), '-h', '/dev/hpcp-none']
+	assert hpcp.run_command_in_multicmd_with_path_check(command, quiet=True) == ['args:-h /dev/hpcp-none']
+	assert command == [pathlib.PurePath('dumpe2fs'), '-h', '/dev/hpcp-none']
 	assert hpcp.run_commands_in_multicmd_with_path_check([['dumpe2fs', '/dev/hpcp-none']], quiet=True) == [['args:/dev/hpcp-none']]
+
+
+def test_an_override_of_a_tool_not_looked_up_at_import_is_the_program_mkfs_runs(exec_dir, monkeypatch):
+	# mkfs.hfs (built from the filesystem type) is not in _binCalled: _bin gave its bare name whatever its override said
+	fake = _fake_tool(exec_dir, 'my-mkfs-hfs', 'exit 0\n')
+	monkeypatch.setenv('MKFS.HFS_PATH', fake)
+	assert hpcp._bin('mkfs.hfs') == fake
 
 
 def test_an_override_in_a_directory_with_an_equals_sign_runs(exec_dir, monkeypatch):

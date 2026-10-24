@@ -547,7 +547,9 @@ def _warn_bad_override(program_name):
 def _bin(program_name):
 	"""The program to run for a tool hpcp starts itself with multiCMD, not through the command runner (which does
 	the same for the tools it starts): the <TOOL>_PATH override if it is one, else the one found on PATH, else
-	the bare name."""
+	the bare name. A tool hpcp did not look up at import (mkfs.hfs) is looked up now, as the runner does."""
+	if program_name not in _binPaths:
+		check_path(program_name)
 	_warn_bad_override(program_name)
 	return _binPaths.get(program_name, program_name)
 
