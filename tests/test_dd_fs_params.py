@@ -184,6 +184,7 @@ def test_mkfs_fallback_uses_mirrored_params_when_they_succeed(monkeypatch):
 		return [_FakeTask(0)]
 
 	monkeypatch.setattr(hpcp, '_binPaths', {})
+	monkeypatch.setattr(hpcp, 'check_path', lambda name: False)  # bare names, whatever check_path's cache holds
 	monkeypatch.setattr(hpcp.multiCMD, 'run_commands', fake_run)
 	ok = hpcp._run_mkfs_with_fallback(['mkfs', '-t', 'ext4'], ['-b', '1024'], '/dev/fake1', 'ext4')
 	assert ok is True
@@ -200,6 +201,7 @@ def test_mkfs_fallback_retries_without_params_on_failure(monkeypatch):
 		return [_FakeTask(1, ['invalid block size'])] if len(calls) == 1 else [_FakeTask(0)]
 
 	monkeypatch.setattr(hpcp, '_binPaths', {})
+	monkeypatch.setattr(hpcp, 'check_path', lambda name: False)  # bare names, whatever check_path's cache holds
 	monkeypatch.setattr(hpcp.multiCMD, 'run_commands', fake_run)
 	ok = hpcp._run_mkfs_with_fallback(['mkfs', '-t', 'ext4'], ['-b', '1024'], '/dev/fake1', 'ext4')
 	assert ok is True
@@ -213,6 +215,7 @@ def test_mkfs_fallback_reports_failure_when_both_attempts_fail(monkeypatch):
 		return [_FakeTask(1, ['no such device'])]
 
 	monkeypatch.setattr(hpcp, '_binPaths', {})
+	monkeypatch.setattr(hpcp, 'check_path', lambda name: False)  # bare names, whatever check_path's cache holds
 	monkeypatch.setattr(hpcp.multiCMD, 'run_commands', fake_run)
 	assert hpcp._run_mkfs_with_fallback(['mkfs', '-t', 'ext4'], ['-b', '1024'], '/dev/fake1', 'ext4') is False
 
@@ -225,6 +228,7 @@ def test_mkfs_fallback_single_attempt_when_no_params(monkeypatch):
 		return [_FakeTask(0)]
 
 	monkeypatch.setattr(hpcp, '_binPaths', {})
+	monkeypatch.setattr(hpcp, 'check_path', lambda name: False)  # bare names, whatever check_path's cache holds
 	monkeypatch.setattr(hpcp.multiCMD, 'run_commands', fake_run)
 	assert hpcp._run_mkfs_with_fallback(['mkfs.xfs'], [], '/dev/fake1', 'xfs') is True
 	assert calls == [['mkfs.xfs', '/dev/fake1']]
@@ -261,6 +265,7 @@ def test_mkfs_fallback_drops_only_dash_o_on_middle_retry(monkeypatch):
 		return [_FakeTask(0)] if len(calls) >= 3 else [_FakeTask(1, [f'attempt {len(calls)} rejected'])]
 
 	monkeypatch.setattr(hpcp, '_binPaths', {})
+	monkeypatch.setattr(hpcp, 'check_path', lambda name: False)  # bare names, whatever check_path's cache holds
 	monkeypatch.setattr(hpcp.multiCMD, 'run_commands', fake_run)
 	param_args = ['-b', '1024', '-O', 'has_journal,^orphan_file', '-m', '0.00']
 	ok = hpcp._run_mkfs_with_fallback(['mkfs', '-t', 'ext4'], param_args, '/dev/fake1', 'ext4')
