@@ -3738,6 +3738,10 @@ def _scan_and_build(hpcp_mod, new, base, tmp_path, monkeypatch, change=lambda: N
 	new_map, base_map = hpcp_mod.build_root_maps(str(new), str(base), max_workers=1)
 	kept = {} if scan else None
 	rows = hpcp_mod.compute_changes(new_map, base_map, max_workers=max_workers, scan=kept)
+	# A change in the clock tick of the file's last change keeps its ctime: before Linux 6.13 (multigrain timestamps)
+	# ctime comes from the coarse clock, a tick of 1-10 ms. hpcp covers that case with the racy window, which the tests
+	# of the stat comparison set to 0, so their change comes a tick later.
+	time.sleep(0.02)
 	change()
 	hashed = []
 	real = hpcp_mod._states_for_paths
