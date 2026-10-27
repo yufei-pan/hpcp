@@ -2891,6 +2891,18 @@ def test_lsblk_disk_rows_refuses_empty_output(hpcp_mod, reset_hpcp_globals, monk
 		hpcp_mod._lsblk_disk_rows('/dev/sdz', 'NAME,SIZE')
 
 
+def test_lsblk_disk_rows_settles_udev_before_listing(hpcp_mod, reset_hpcp_globals, monkeypatch):
+	"""Review: sgdisk --info / a GPT write just before (a read-write open) makes udev remove and re-add the partition
+	nodes a few ms later; an unsettled lsblk missed the partition or its type, and -dd then copied it with dd."""
+	calls = []
+	monkeypatch.setattr(hpcp_mod, '_udev_settle', lambda: calls.append('settle'))
+	monkeypatch.setattr(hpcp_mod, 'run_command_in_multicmd_with_path_check', lambda argv, **kwargs: calls.append(argv[0]) or [
+		'NAME="/dev/sdz" SIZE="100" KNAME="/dev/sdz" PKNAME="" TYPE="disk"',
+		'NAME="/dev/sdz1" SIZE="50" KNAME="/dev/sdz1" PKNAME="/dev/sdz" TYPE="part"'])
+	assert hpcp_mod._lsblk_disk_rows('/dev/sdz', 'NAME,SIZE') == (['/dev/sdz', '100'], [['/dev/sdz1', '50']])
+	assert calls == ['settle', 'lsblk']
+
+
 def test_probe_identity_reads_the_encoded_udev_values(hpcp_mod, reset_hpcp_globals, monkeypatch):
 	output = ['ID_FS_UUID=9134403a-3b3f', 'ID_FS_UUID_ENC=9134403a-3b3f', 'ID_FS_UUID_SUB=sub',
 		'ID_FS_LABEL=röot_=x', 'ID_FS_LABEL_ENC=röot\\x20=x', 'ID_FS_LABEL_FATBOOT=BOOT', 'ID_FS_TYPE=ext4',

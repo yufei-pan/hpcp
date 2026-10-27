@@ -1656,7 +1656,7 @@ def test_dd_copies_a_btrfs_partition_with_the_source_uuid_and_label(tmp_path):
 	dest = str(tmp_path / 'dest.img')
 	try:
 		result = _run_hpcp_dd([], src, dest)
-		assert 'usig dd for copying' not in result.stderr + result.stdout
+		assert 'using dd for copying' not in result.stderr + result.stdout
 		assert ('no temp_fsid support' in result.stderr) is not temp_fsid
 		loop = _run('losetup', '--partscan', '--find', '--show', '--read-only', dest).strip()
 		try:

@@ -950,6 +950,9 @@ def _lsblk_disk_rows(disk, columns):
 	shift the columns.
 	"""
 	names = columns.split(',')
+	# A partition table just read or written by sgdisk (a read-write open) makes udev re-read it and remove and re-add
+	# the partition nodes a few ms later: unsettled, lsblk can list a partition as missing, or without its type.
+	_udev_settle()
 	lines = run_command_in_multicmd_with_path_check(['lsblk', '-p', '-nb', '-P', '-o', columns + ',KNAME,PKNAME,TYPE', disk], strict=True, extra_env=_C_LOCALE)
 	rows = [_lsblk_pairs(line) for line in lines if line.strip()]
 	if not rows:
@@ -10266,7 +10269,7 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = multipr
 						# try to bind mount
 						run_command_in_multicmd_with_path_check(['mount','--bind',src_partition_mount_path,src_mount_point],strict=False)
 				if not any(os.scandir(src_mount_point)) and not os.path.ismount(src_mount_point):
-					eprint(f"Error mounting {src_partition_path}, usig dd for copying.")
+					eprint(f"Error mounting {src_partition_path}, using dd for copying.")
 					dd_partition(src_partition_path,dest_partition_path,partition,dd_src,dd_dest)
 					continue
 				print(f"Mounting {dest_partition_path} at {dest_mount_point}")
@@ -10280,7 +10283,7 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = multipr
 						# try to bind mount
 						run_command_in_multicmd_with_path_check(['mount','--bind',dest_partition_mount_path,dest_mount_point],strict=False)
 				if not any(os.scandir(dest_mount_point)) and not os.path.ismount(dest_mount_point):
-					eprint(f"Error mounting {dest_partition_path}, usig dd for copying.")
+					eprint(f"Error mounting {dest_partition_path}, using dd for copying.")
 					dd_partition(src_partition_path,dest_partition_path,partition,dd_src,dd_dest)
 					continue
 				# copy the partition files
