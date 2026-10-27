@@ -297,8 +297,9 @@ def test_fs_params_text_ignores_ext_runtime_features(hpcp_mod):
 
 
 def test_read_disk_layout_settles_once_and_probes_each_partition_once(hpcp_mod, monkeypatch):
-	"""A node udev is still re-adding would be probed as empty: settle once, then wait for the nodes without settling
-	again; the GPT read runs no blkid of its own, and each partition gets one probe on its settled device."""
+	"""A node udev is still re-adding would be probed as empty: settle once, after the GPT read (each sgdisk run makes
+	udev re-read the partition table), with the node wait; the GPT read runs no blkid of its own, and each partition
+	gets one probe on its settled device."""
 	calls = []
 	monkeypatch.setattr(hpcp_mod, '_partition_table_type', lambda device: calls.append('pttype') or 'gpt')
 	monkeypatch.setattr(hpcp_mod, '_udev_settle', lambda: calls.append('settle'))
@@ -315,11 +316,11 @@ def test_read_disk_layout_settles_once_and_probes_each_partition_once(hpcp_mod, 
 	monkeypatch.setattr(hpcp_mod, 'probe_fs_params', lambda device, fs_type: calls.append(('params', device)) or {})
 	monkeypatch.setattr(hpcp_mod, 'MIRROR_FS_PARAMS', True)
 	layout = hpcp_mod.read_disk_layout('/dev/x')
-	assert calls == ['pttype', 'settle', ('infos', False), ('nodes', False), ('probe', '/dev/x1'), ('params', '/dev/x1')]
+	assert calls == ['pttype', ('infos', False), ('nodes', True), ('probe', '/dev/x1'), ('params', '/dev/x1')]
 	assert layout['parts'][1]['fs_label'] == 'l' and layout['parts'][1]['device'] == '/dev/x1'
 	del calls[:]
 	hpcp_mod.read_disk_layout('/dev/x', pttype='gpt', fs_params=False)
-	assert calls == ['settle', ('infos', False), ('nodes', False), ('probe', '/dev/x1')]
+	assert calls == [('infos', False), ('nodes', True), ('probe', '/dev/x1')]
 
 
 def test_get_partition_details_without_identity_runs_only_sgdisk(hpcp_mod, reset_hpcp_globals, monkeypatch):

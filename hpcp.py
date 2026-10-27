@@ -6751,9 +6751,9 @@ def read_disk_layout(device, name=None, pttype=None, fs_params=True):
 	'unique_guid', 'name', 'attrs', 'size', 'fs_type', 'fs_uuid', 'fs_label', 'fs_params',
 	'device'}}}. The partition caches are cleared first: loop device names are reused.
 	pttype: the partition-table type the caller already probed (_partition_table_type), so it is not probed twice.
-	udev is settled once, the GPT is read with sgdisk alone, then each partition is probed once on its settled
-	device (_probe_identity); fs_params False skips the mkfs-parameter probes ('fs_params' is then '': a verify read
-	compares identity values only).
+	The GPT is read with sgdisk alone, udev is then settled once (sgdisk's runs make it re-read the partition table),
+	and each partition is probed once on its settled device (_probe_identity); fs_params False skips the mkfs-parameter
+	probes ('fs_params' is then '': a verify read compares identity values only).
 	Raises RuntimeError('Disk layout mismatch: ...') unless the disk has a GPT partition table:
 	sgdisk reads an MBR disk as if it were GPT, and an identity change would convert it.
 	"""
@@ -6766,12 +6766,11 @@ def read_disk_layout(device, name=None, pttype=None, fs_params=True):
 		raise RuntimeError(f'Disk layout mismatch: {name} has no GPT partition table (found {pttype}); disk patches support GPT disks only')
 	get_partition_infos.cache_clear()
 	get_partition_details.cache_clear()
-	# A node udev is still re-adding would be probed as empty: settle once, then wait for every node.
-	# sgdisk --print only reads the disk, so it triggers no udev re-read: this one settle before it, plus the node wait
-	# after it, is enough.
-	_udev_settle()
+	# A node udev is still re-adding would be probed as empty, so udev is settled after the GPT is read, then every
+	# node waited for: every sgdisk run, --print included, makes udev re-read the partition table (its watch sees a
+	# close after a write-open), removing and re-adding the nodes a few ms after sgdisk exits.
 	infos = get_partition_infos(device, identity=False)
-	devices = _settle_partitions(device, [int(key) for key, info in infos.items() if 'disk_identifier' not in info], settle=False)
+	devices = _settle_partitions(device, [int(key) for key, info in infos.items() if 'disk_identifier' not in info])
 	disk, parts = {}, {}
 	for key, info in infos.items():
 		if 'disk_identifier' in info:
