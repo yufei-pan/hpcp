@@ -1262,92 +1262,31 @@ _EXT_RUNTIME_FEATURES = {'needs_recovery', 'orphan_present', 'has_snapshot', 'jo
 # this e2fsprogs has never heard of) make mke2fs reject the entire option set.
 _EXT_MKFS_FEATURE_KNOWN = {}
 
-def _ext_mkfs_task_text(task):
-	"""Join a multiCMD Task's stdout and stderr into one searchable string."""
-	chunks = []
-	for attr in ('stderr', 'stdout'):
-		val = getattr(task, attr, None) or []
-		if isinstance(val, str):
-			chunks.append(val)
-		else:
-			chunks.extend(str(line) for line in val)
-	return '\n'.join(chunks)
-
-def _ext_mkfs_accepts(task, option_set):
-	"""False if mke2fs said it rejects exactly this -O argument, else True (fail open: any other outcome says nothing
-	against the name). The probe runs with MKE2FS_CONFIG=/dev/null, so no stanza of a mke2fs.conf can make
-	mke2fs reject an -O argument that is not ours."""
-	text = _ext_mkfs_task_text(task)
-	return not any(line.strip() == f"Invalid filesystem option set: {option_set}" for line in text.splitlines())
-
-def _ext_mkfs_probe_run(option_sets):
-	"""Run `mke2fs -n` on /dev/null once per -O argument; one verdict per argument, True if mke2fs accepts it
-	(also when the run did not happen), see _ext_mkfs_accepts. MKE2FS_CONFIG is /dev/null so that no usage-type
-	stanza of the host's mke2fs.conf (a 256-block device is a `floppy`) can put its own features in the way."""
-	commands = [
-		[_bin('mkfs'), '-t', 'ext4', '-n', '-F', '-O', option_set, os.devnull, '256']
-		for option_set in option_sets
-	]
-	tasks = multiCMD.run_commands(
-		commands, timeout=COMMAND_TIMEOUT, max_threads=min(8, len(commands)),
-		return_object=True, quiet=True, extra_env=dict(_C_LOCALE, MKE2FS_CONFIG=os.devnull)) or []
-	verdicts = [_ext_mkfs_accepts(task, option_set) for task, option_set in zip(tasks, option_sets)]
-	return verdicts + [True] * (len(option_sets) - len(verdicts))
+def _ext_mkfs_accepts(option_sets):
+	"""Run `mke2fs -n` on /dev/null once per -O argument (8 at a time): True unless mke2fs rejects exactly that argument
+	('Invalid filesystem option set: <it>', in the C locale; mke2fs.conf has the same words for a bad feature of its
+	own, and any other outcome says nothing against the names). MKE2FS_CONFIG=/dev/null, so no stanza of the host's
+	mke2fs.conf (a 256-block device is a `floppy`) can put its own features in the way. Never a path to make:
+	e2fsprogs 1.45.x-1.46.2 create the regular file they are given before they parse -O."""
+	commands = [[_bin('mkfs'), '-t', 'ext4', '-n', '-F', '-O', option_set, os.devnull, '256'] for option_set in option_sets]
+	tasks = multiCMD.run_commands(commands, timeout=COMMAND_TIMEOUT, max_threads=8, return_object=True, quiet=True,
+		extra_env=dict(_C_LOCALE, MKE2FS_CONFIG=os.devnull))
+	return [f"Invalid filesystem option set: {option_set}" not in [line.strip() for line in task.stdout + task.stderr]
+		for task, option_set in zip(tasks, option_sets)]
 
 def _ext_mkfs_probe_features(names):
-	"""Ask local mke2fs whether each -O feature name parses. Cache the answers.
-
-	Uses `mke2fs -n` against /dev/null, in the C locale, where an unknown
-	name fails with 'Invalid filesystem option set: <the -O argument>'
-	(translated elsewhere, where every name would count as known) and a
-	known name gets past option parsing. Only that exact message counts:
-	mke2fs reads mke2fs.conf first and has the same words for a bad
-	feature of its own, which says nothing about ours. Never a path to
-	make: e2fsprogs 1.45 and 1.46 create the regular file they are given
-	before they parse -O, and where they cannot create it, stop there
-	without parsing -O. Probe failures fail open (known) so a missing
-	mkfs does not strip a usable -O list.
-
-	mke2fs stops at the first bad name and prints the whole list, never the
-	bad name, so the names are asked about as lists: all of them in one run,
-	and each rejected list split in halves (the halves of one level run
-	together) until a list of one name is rejected. The verdicts equal one run
-	per name; with k unknown names of n it is about k*log2(n) runs, and 1 when
-	mke2fs knows them all.
-	"""
+	"""Ask local mke2fs whether each -O feature name parses, and cache the answers. One unknown name (a negation of a
+	feature this e2fsprogs has never heard of too: ^orphan_file on 1.45) makes mke2fs reject the whole list, and it
+	never says which, so all names go in one run, and only when that is rejected, one run per name. A probe that
+	cannot run fails open (known), so a missing mkfs does not strip a usable -O list."""
 	todo = [n for n in dict.fromkeys(names) if n and n not in _EXT_MKFS_FEATURE_KNOWN]
 	if not todo:
 		return
 	try:
-		verdicts = {}
-		groups = [todo]
-		while groups:
-			accepted = _ext_mkfs_probe_run([','.join(group) for group in groups])
-			rejected = []
-			for group, ok in zip(groups, accepted):
-				if ok:
-					verdicts.update((name, True) for name in group)
-				elif len(group) == 1:
-					verdicts[group[0]] = False
-				else:
-					half = len(group) // 2
-					rejected.extend((group[:half], group[half:]))
-			groups = rejected
-		_EXT_MKFS_FEATURE_KNOWN.update(verdicts)
+		verdicts = [True] * len(todo) if _ext_mkfs_accepts([','.join(todo)])[0] else _ext_mkfs_accepts(todo)
 	except Exception:
-		for name in todo:
-			_EXT_MKFS_FEATURE_KNOWN.setdefault(name, True)
-
-def _ext_mkfs_knows_feature(name):
-	"""True if local mke2fs parses this -O feature name.
-
-	One unknown name, including a negation of a feature this e2fsprogs has
-	never heard of, makes mke2fs reject the entire -O list (e2fsprogs 1.45:
-	^orphan_file, ^fast_commit). Callers drop those names and keep the rest.
-	"""
-	if name not in _EXT_MKFS_FEATURE_KNOWN:
-		_ext_mkfs_probe_features([name])
-	return _EXT_MKFS_FEATURE_KNOWN.get(name, True)
+		verdicts = [True] * len(todo)
+	_EXT_MKFS_FEATURE_KNOWN.update(zip(todo, verdicts))
 
 def _probe_ext(device):
 	"""Read ext2/3/4 geometry and features from dumpe2fs."""
@@ -1387,7 +1326,7 @@ def _build_ext(params):
 		kept, dropped = [], []
 		for opt in feature_opts:
 			name = opt[1:] if opt.startswith('^') else opt
-			if _ext_mkfs_knows_feature(name):
+			if _EXT_MKFS_FEATURE_KNOWN.get(name, True):
 				kept.append(opt)
 			else:
 				dropped.append(opt)

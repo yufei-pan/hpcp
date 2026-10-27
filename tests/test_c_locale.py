@@ -125,7 +125,7 @@ def test_the_mke2fs_probe_sets_its_variables_through_extra_env_without_env(monke
 
 	monkeypatch.setitem(hpcp._binPaths, 'mkfs', '/usr/sbin/mkfs')
 	monkeypatch.setattr(hpcp.multiCMD, 'run_commands', fake_run)
-	assert hpcp._ext_mkfs_probe_run(['has_journal', 'extent']) == [True, True]
+	assert hpcp._ext_mkfs_accepts(['has_journal', 'extent']) == [True, True]
 	commands, extra_env = seen[0]
 	assert [command[0] for command in commands] == ['/usr/sbin/mkfs'] * 2
 	assert all('env' not in command and not any('=' in word and word.startswith(('LC_ALL', 'MKE2FS')) for word in command) for command in commands)

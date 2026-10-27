@@ -651,7 +651,6 @@ def test_build_ext_mirrors_geometry():
 
 
 def test_build_ext_negates_absent_curated_features(monkeypatch):
-	monkeypatch.setattr(hpcp, '_ext_mkfs_knows_feature', lambda name: True)
 	monkeypatch.setattr(hpcp, '_ext_mkfs_probe_features', lambda names: None)
 	args = hpcp._build_ext({'features': ['has_journal', 'extent']})
 	features = args[args.index('-O') + 1].split(',')
@@ -666,7 +665,6 @@ def test_build_ext_negates_absent_curated_features(monkeypatch):
 
 
 def test_build_ext_filters_runtime_state_features(monkeypatch):
-	monkeypatch.setattr(hpcp, '_ext_mkfs_knows_feature', lambda name: True)
 	monkeypatch.setattr(hpcp, '_ext_mkfs_probe_features', lambda names: None)
 	args = hpcp._build_ext({'features': ['has_journal', 'needs_recovery', 'journal_dev']})
 	features = args[args.index('-O') + 1].split(',')
@@ -681,9 +679,7 @@ def test_build_ext_drops_feature_names_unknown_to_mke2fs(monkeypatch):
 	# feature the source never had (^orphan_file / ^fast_commit). Those
 	# names must be dropped so geometry and the remaining features still
 	# make it onto the destination.
-	monkeypatch.setattr(
-		hpcp, '_ext_mkfs_knows_feature',
-		lambda name: name not in ('orphan_file', 'fast_commit'))
+	monkeypatch.setattr(hpcp, '_EXT_MKFS_FEATURE_KNOWN', {'orphan_file': False, 'fast_commit': False})
 	monkeypatch.setattr(hpcp, '_ext_mkfs_probe_features', lambda names: None)
 	args = hpcp._build_ext({'features': ['has_journal', 'extent', 'orphan_file']})
 	features = args[args.index('-O') + 1].split(',')
@@ -696,8 +692,7 @@ def test_build_ext_drops_feature_names_unknown_to_mke2fs(monkeypatch):
 
 
 def test_build_ext_omits_dash_o_when_all_features_unknown(monkeypatch):
-	monkeypatch.setattr(hpcp, '_ext_mkfs_knows_feature', lambda name: False)
-	monkeypatch.setattr(hpcp, '_ext_mkfs_probe_features', lambda names: None)
+	monkeypatch.setattr(hpcp, '_ext_mkfs_probe_features', lambda names: hpcp._EXT_MKFS_FEATURE_KNOWN.update((n, False) for n in names))
 	args = hpcp._build_ext({'features': ['has_journal'], 'block_size': 4096})
 	assert '-O' not in args
 	assert args[:2] == ['-b', '4096']
@@ -709,48 +704,12 @@ def _own_mke2fs_verdicts(monkeypatch):
 	monkeypatch.setattr(hpcp, '_EXT_MKFS_FEATURE_KNOWN', {})
 
 
-def test_ext_mkfs_knows_feature_false_on_invalid_option_set(monkeypatch):
-	# mke2fs prints this and exits 1 before touching the device. That is the
-	# only signal that the *name* is unknown; any other outcome means the name
-	# parsed (on /dev/null mke2fs -n then exits 0).
-	def fake_run(commands, **kwargs):
-		return [_FakeTask(1, [
-			'mke2fs 1.45.6 (20-Mar-2020)',
-			'Invalid filesystem option set: orphan_file',
-		])]
-	monkeypatch.setattr(hpcp, '_binPaths', {'mkfs': '/usr/sbin/mkfs'})
-	monkeypatch.setattr(hpcp.multiCMD, 'run_commands', fake_run)
-	assert hpcp._ext_mkfs_knows_feature('orphan_file') is False
-
-
-def test_ext_mkfs_knows_feature_true_when_name_parses(monkeypatch):
-	def fake_run(commands, **kwargs):
-		return [_FakeTask(0, [
-			'mke2fs 1.47.2 (1-Jan-2025)',
-			'warning: Unable to get device geometry for /dev/null',
-			'',
-			'Filesystem too small for a journal',
-			'Creating filesystem with 256 1k blocks and 32 inodes',
-		])]
-	monkeypatch.setattr(hpcp, '_binPaths', {'mkfs': '/usr/sbin/mkfs'})
-	monkeypatch.setattr(hpcp.multiCMD, 'run_commands', fake_run)
-	assert hpcp._ext_mkfs_knows_feature('has_journal') is True
-
-
-def test_ext_mkfs_knows_feature_true_when_a_later_step_fails(monkeypatch):
-	# A non-zero exit after -O parsed still means the name is known: only the message tells.
-	def fake_run(commands, **kwargs):
-		return [_FakeTask(1, ['mke2fs 1.46.5 (30-Dec-2021)', 'mkfs.ext4: Device size reported to be zero.'])]
-	monkeypatch.setattr(hpcp, '_binPaths', {'mkfs': '/usr/sbin/mkfs'})
-	monkeypatch.setattr(hpcp.multiCMD, 'run_commands', fake_run)
-	assert hpcp._ext_mkfs_knows_feature('has_journal') is True
-
-
-def test_ext_mkfs_knows_feature_fail_open_when_probe_cannot_run(monkeypatch):
+def test_ext_mkfs_probe_fails_open_when_it_cannot_run(monkeypatch):
 	def fake_run(commands, **kwargs):
 		raise RuntimeError('mkfs missing')
 	monkeypatch.setattr(hpcp.multiCMD, 'run_commands', fake_run)
-	assert hpcp._ext_mkfs_knows_feature('orphan_file') is True
+	hpcp._ext_mkfs_probe_features(['orphan_file', 'has_journal'])
+	assert hpcp._EXT_MKFS_FEATURE_KNOWN == {'orphan_file': True, 'has_journal': True}
 
 
 def _fake_tool(directory, name, body):
@@ -774,8 +733,8 @@ def _translated_mkfs(directory):
 
 @pytest.mark.skipif(os.name != 'posix', reason='runs a shell script as mkfs')
 def test_ext_mkfs_probe_makes_no_file_and_reads_the_c_locale(tmp_path, exec_dir, monkeypatch):
-	# e2fsprogs 1.45 and 1.46 create the regular file they are given before they parse -O: the probe ran
-	# them on /hpcp-ext-feature-probe and left that file in / (EL8, Ubuntu 20.04 and 22.04, Debian 11, EL9).
+	# e2fsprogs 1.45.x-1.46.2 (EL8, Debian 11, Ubuntu 20.04) create the regular file they are given before they
+	# parse -O: the probe ran them on /hpcp-ext-feature-probe and left that file in /. 1.46.5 and 1.47 do not.
 	# The verdict reads mke2fs's message, which a translated locale changes.
 	devices = tmp_path / 'devices'
 	monkeypatch.setenv('HPCP_TEST_DEVICES', str(devices))
@@ -783,8 +742,8 @@ def test_ext_mkfs_probe_makes_no_file_and_reads_the_c_locale(tmp_path, exec_dir,
 	monkeypatch.setitem(hpcp._binPaths, 'mkfs', _translated_mkfs(exec_dir))
 	hpcp._ext_mkfs_probe_features(['nosuch_a', 'has_journal', 'nosuch_b'])
 	assert hpcp._EXT_MKFS_FEATURE_KNOWN == {'nosuch_a': False, 'has_journal': True, 'nosuch_b': False}
-	# the whole list (rejected), then its halves [nosuch_a] and [has_journal, nosuch_b], then those two names
-	assert devices.read_text().splitlines() == [os.devnull] * 5
+	# the whole list (rejected), then one run per name
+	assert devices.read_text().splitlines() == [os.devnull] * 4
 
 
 @pytest.mark.skipif(os.name != 'posix', reason='runs a shell script as mkfs')
@@ -802,35 +761,17 @@ def test_ext_mkfs_probe_is_one_run_when_every_name_parses(tmp_path, exec_dir, mo
 
 
 @pytest.mark.skipif(os.name != 'posix', reason='runs a shell script as mkfs')
-def test_ext_mkfs_verdict_ignores_a_rejection_of_somebody_elses_feature(tmp_path, exec_dir, monkeypatch):
+def test_ext_mkfs_verdict_is_only_the_exact_rejection_of_our_list(tmp_path, exec_dir, monkeypatch):
 	# mke2fs reads mke2fs.conf before -O, and a feature the floppy stanza lists that this e2fsprogs does not
 	# know ends the run with the same words: 'Invalid filesystem option set: nosuch_x'. Every name asked
-	# about would have been judged unknown (and dropped from the -O list) by the bare substring.
+	# about would have been judged unknown (and dropped from the -O list) by the bare substring. A run that
+	# fails after -O parsed (on /dev/null with MKE2FS_CONFIG=/dev/null, a later step) still knows the name.
 	monkeypatch.setitem(hpcp._binPaths, 'mkfs', _fake_tool(exec_dir, 'mkfs', (
-		'case "$MKE2FS_CONFIG" in /dev/null) case "$6" in *nosuch*) echo "Invalid filesystem option set: $6" >&2; exit 1;; esac; exit 0;; esac\n'
-		'echo "Invalid filesystem option set: nosuch_x" >&2\nexit 1\n')))
+		'[ "$MKE2FS_CONFIG" = /dev/null ] || { echo "Invalid filesystem option set: nosuch_x" >&2; exit 1; }\n'
+		'case "$6" in *nosuch*) echo "Invalid filesystem option set: $6" >&2; exit 1;; esac\n'
+		'echo "mkfs.ext4: Device size reported to be zero." >&2\nexit 1\n')))
 	hpcp._ext_mkfs_probe_features(['has_journal', 'nosuch', 'extent'])
 	assert hpcp._EXT_MKFS_FEATURE_KNOWN == {'has_journal': True, 'nosuch': False, 'extent': True}
-	task = _FakeTask(1, ['Invalid filesystem option set: nosuch_x'])
-	assert hpcp._ext_mkfs_accepts(task, 'has_journal') is True
-	assert hpcp._ext_mkfs_accepts(_FakeTask(0, []), 'has_journal') is True
-	assert hpcp._ext_mkfs_accepts(_FakeTask(1, ['Invalid filesystem option set: a,b']), 'a,b') is False
-
-
-@pytest.mark.skipif(os.name != 'posix', reason='runs a shell script as mkfs')
-@pytest.mark.parametrize('unknown, runs', [(0, 1), (1, 9), (3, 23)])
-def test_ext_mkfs_probe_splits_a_rejected_list_in_halves(tmp_path, exec_dir, monkeypatch, unknown, runs):
-	# 31 names, the way a pre-1.47 mke2fs rejects orphan_file: not one run per name
-	names = ['feat%d' % i for i in range(31)]
-	bad = names[::13][:unknown] if unknown else []
-	devices = tmp_path / 'devices'
-	monkeypatch.setenv('HPCP_TEST_DEVICES', str(devices))
-	monkeypatch.setitem(hpcp._binPaths, 'mkfs', _fake_tool(exec_dir, 'mkfs', (
-		'printf "%s\\n" "$6" >> "$HPCP_TEST_DEVICES"\n'
-		'case ",$6," in ' + ('|'.join('*,%s,*' % b for b in bad) or 'NEVER') + ') echo "Invalid filesystem option set: $6" >&2; exit 1;; esac\nexit 0\n')))
-	hpcp._ext_mkfs_probe_features(names)
-	assert hpcp._EXT_MKFS_FEATURE_KNOWN == {n: n not in bad for n in names}
-	assert len(devices.read_text().splitlines()) == runs
 
 
 @pytest.mark.skipif(
@@ -852,15 +793,16 @@ def test_ext_mkfs_probe_starts_no_env_whatever_env_path_says(tmp_path, exec_dir,
 	monkeypatch.setenv('HPCP_TEST_DEVICES', str(tmp_path / 'devices'))
 	monkeypatch.setenv('ENV_PATH', str(tmp_path / '.env'))
 	monkeypatch.setitem(hpcp._binPaths, 'mkfs', _translated_mkfs(exec_dir))
-	assert hpcp._ext_mkfs_knows_feature('nosuch_hpcp_feature') is False
+	hpcp._ext_mkfs_probe_features(['nosuch_hpcp_feature'])
+	assert hpcp._EXT_MKFS_FEATURE_KNOWN == {'nosuch_hpcp_feature': False}
 
 
 @pytest.mark.skipif(
 	shutil.which('mkfs') is None or shutil.which('mkfs.ext4') is None,
 	reason='mkfs or mkfs.ext4 not available (mkfs -t ext4 runs mkfs.ext4)')
-def test_ext_mkfs_knows_feature_matches_real_mke2fs():
-	assert hpcp._ext_mkfs_knows_feature('has_journal') is True
-	assert hpcp._ext_mkfs_knows_feature('nosuch_hpcp_feature_xyz') is False
+def test_ext_mkfs_probe_matches_real_mke2fs():
+	hpcp._ext_mkfs_probe_features(['has_journal', 'nosuch_hpcp_feature_xyz'])
+	assert hpcp._EXT_MKFS_FEATURE_KNOWN == {'has_journal': True, 'nosuch_hpcp_feature_xyz': False}
 
 
 @pytest.mark.skipif(
