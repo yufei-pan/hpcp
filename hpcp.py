@@ -6628,16 +6628,14 @@ def _udev_settle():
 		finally:
 			del ERRORS[error_count:]
 
-def _settle_partitions(disk, numbers, timeout=10, settle=True):
+def _settle_partitions(disk, numbers, timeout=10):
 	"""{number: device} once udev is idle and every partition in numbers has its device node.
 
 	udev re-reads a whole disk's partition table after the disk is closed from writing (a new
-	loop device, an MBR or GPT write), removing and re-adding the partition nodes meanwhile.
-	settle False skips the udev settle (the caller has just settled).
+	loop device, an MBR or GPT write, an sgdisk read), removing and re-adding the partition nodes meanwhile.
 	Raises RuntimeError('Disk layout mismatch: ...') when a node is still missing after timeout seconds.
 	"""
-	if settle:
-		_udev_settle()
+	_udev_settle()
 	deadline = time.time() + timeout
 	while True:
 		devices = _partition_devices(disk)
