@@ -626,3 +626,25 @@ def test_remove_extra_dirs_does_not_lstat_each_directory(tmp_path, hpcp_mod, res
 	hpcp_mod.remove_extra_dirs([str(src) + os.sep], [str(dst) + os.sep])
 	assert [path for path in calls if isinstance(path, str) and path.startswith(str(dst) + os.sep)] == []
 	assert (dst / 'link').is_symlink() and len(list(dst.iterdir())) == 21
+
+
+@pytest.mark.parametrize('scan_mode', ['path'], indirect=True)
+def test_a_directory_swapped_after_it_is_opened_is_not_read_by_its_path(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch, scan_mode):
+	"""Re-review: without scandir on a descriptor or /proc (Python 3.6 off Linux) the held directory was read by its
+	path: one swapped for a symlink after the open had the link's target listed as if below the destination."""
+	dst, outside = tmp_path / 'dst', tmp_path / 'outside'
+	(dst / 'sub').mkdir(parents=True)
+	outside.mkdir()
+	(outside / 'secret.txt').write_text('x')
+	boundary = hpcp_mod._filesystem_boundary(str(dst), str(dst), visible=frozenset())
+	real = hpcp_mod._enter_directory
+	def enter(path, device):
+		fd = real(path, device)
+		if os.path.basename(path) == 'sub':
+			os.rename(path, path + '.away')
+			os.symlink(str(outside), path)
+		return fd
+	monkeypatch.setattr(hpcp_mod, '_enter_directory', enter)
+	files, _, _, _ = hpcp_mod.get_file_list_serial(str(dst), boundary=boundary)
+	assert not any('secret.txt' in path for path in files)
+	assert any(error.startswith('Listing error: ' + str(dst / 'sub') + ':') for error in hpcp_mod.ERRORS)
