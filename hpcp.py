@@ -8756,9 +8756,15 @@ _BELOW_FLAGS = _DIRECTORY_FLAGS | getattr(os, 'O_NOFOLLOW', 0)
 # A parent only looked up in (its entry removed, or opened below it): O_PATH where there is one, so search permission
 # is enough, as for shutil.rmtree (a drop box, mode 0333).
 _PARENT_FLAGS = (getattr(os, 'O_PATH', 0) or os.O_RDONLY) | getattr(os, 'O_DIRECTORY', 0) | getattr(os, 'O_CLOEXEC', 0)
-# The directory descriptors one walk or cursor holds at most (a tree deeper than the open-files limit): beyond, the
-# shallowest are let go and opened again when needed.
-_WALK_FD_BUDGET = 32
+# A descriptor walk or cursor holds one directory descriptor a level: a tree deeper than the soft open-files limit
+# (often 1024) needs more, so the soft limit is raised to the hard one (often 524288), where the platform allows.
+try:
+	import resource
+	_soft_nofile, _hard_nofile = resource.getrlimit(resource.RLIMIT_NOFILE)
+	if _soft_nofile < _hard_nofile:
+		resource.setrlimit(resource.RLIMIT_NOFILE, (_hard_nofile, _hard_nofile))
+except (ImportError, ValueError, OSError):
+	pass
 
 def _path_identity(path):
 	"""(st_dev, st_ino) of path itself (a symlink is not followed), or None when it cannot be read."""
@@ -8894,19 +8900,12 @@ def _unlink_failed(name, dir_fd, path, exc):
 	if not _is_directory_now(name, dir_fd, exc):
 		_report_unremoved(path, exc)
 
-_UP_FLAGS = os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0) | getattr(os, 'O_CLOEXEC', 0)
-
 class _HeldDirs:
-	"""The directories on the path a removal walk or cursor is at, by descriptor, from a pinned root (always held). At
-	most _WALK_FD_BUDGET are held below it (a tree deeper than the open-files limit): entering a deeper one lets the
-	shallowest held go, its identity kept. Going back to one let go opens it again through '..' of its child (one open
-	a level), or, the child gone, by name from the deepest one held above; it must still be the directory entered
-	(OSError ESTALE when moved or mounted on meanwhile; '..' stays in the filesystem the child is on)."""
-	__slots__ = ('names', 'fds', 'ids', 'first_held')
+	"""The directories on the path a removal walk or cursor is at, by descriptor, from a pinned root: one a level."""
+	__slots__ = ('names', 'fds')
 
 	def __init__(self, root_fd):
-		# Every index >= first_held holds a descriptor (and index 0, the root).
-		self.names, self.fds, self.ids, self.first_held = [None], [root_fd], [None], 1
+		self.names, self.fds = [None], [root_fd]
 
 	def __len__(self):
 		return len(self.fds)
@@ -8917,81 +8916,21 @@ class _HeldDirs:
 	def push(self, name, fd):
 		self.names.append(name)
 		self.fds.append(fd)
-		self.ids.append(None)
-		if len(self.fds) - self.first_held > _WALK_FD_BUDGET:
-			index = self.first_held
-			try:
-				st = os.fstat(self.fds[index])
-			except OSError:
-				# Its identity cannot be kept: held on (over the budget for now).
-				return
-			self.ids[index] = (st.st_dev, st.st_ino)
-			os.close(self.fds[index])
-			self.fds[index] = None
-			self.first_held = index + 1
 
 	def pop(self):
-		"""Leave the deepest directory (closed). Its parent, let go, is opened again first; OSError if that fails (the
-		parent then stays let go: FileNotFoundError when it is gone)."""
-		index = len(self.fds) - 1
-		fd = self.fds[index]
-		try:
-			if index - 1 >= 1 and self.fds[index - 1] is None:
-				self._reopen(index - 1, fd)
-		finally:
-			if fd is not None:
-				os.close(fd)
-			del self.names[index], self.fds[index], self.ids[index]
-			self.first_held = min(self.first_held, len(self.fds))
+		"""Leave the deepest directory (closed)."""
+		os.close(self.fds.pop())
+		self.names.pop()
 
 	def truncate(self, depth):
-		"""Leave the directories below the one at depth (0: the root), one pop each."""
+		"""Leave the directories below the one at depth (0: the root)."""
 		while len(self.fds) > depth + 1:
 			self.pop()
 
 	def close_all(self):
 		for fd in self.fds:
-			if fd is not None:
-				os.close(fd)
-		self.names, self.fds, self.ids, self.first_held = [], [], [], 0
-
-	def _check(self, index, fd):
-		st = os.fstat(fd)
-		if self.ids[index] is not None and (st.st_dev, st.st_ino) != self.ids[index]:
-			raise OSError(errno.ESTALE, 'no longer the directory entered', self.names[index])
-
-	def _reopen(self, index, child_fd):
-		fd = None
-		if child_fd is not None:
-			try:
-				fd = os.open(os.pardir, _UP_FLAGS, dir_fd=child_fd)
-			except OSError:
-				# '..' of a directory removed meanwhile is ENOENT: by name below.
-				fd = None
-		if fd is None:
-			start = index - 1
-			while self.fds[start] is None:
-				start -= 1
-			current = self.fds[start]
-			try:
-				for k in range(start + 1, index + 1):
-					next_fd = os.open(self.names[k], _BELOW_FLAGS, dir_fd=current)
-					if fd is not None:
-						os.close(fd)
-					fd = current = next_fd
-					if k < index:
-						self._check(k, fd)
-			except BaseException:
-				if fd is not None:
-					os.close(fd)
-				raise
-		try:
-			self._check(index, fd)
-		except BaseException:
 			os.close(fd)
-			raise
-		self.fds[index] = fd
-		self.first_held = min(self.first_held, index)
+		self.names, self.fds = [], []
 
 def _remove_listed_files(items, rmdir=False, rate_limiter=None, one_filesystem=False):
 	"""Worker body for remove_moved_sources and remove_extra_files: unlink these (root, its identity, path below it)
@@ -9108,18 +9047,7 @@ def _remove_listed_files(items, rmdir=False, rate_limiter=None, one_filesystem=F
 			depth = 0
 			while depth < len(parent) and depth + 1 < len(held) and held.names[depth + 1] == parent[depth]:
 				depth += 1
-			try:
-				# Back up to the shared directory: a directory let go is opened again through '..' (_HeldDirs).
-				held.truncate(depth)
-			except OSError as exc:
-				# No longer the directory entered (moved, mounted on), or gone: nothing below it is removed, and the
-				# next entry starts again from the root.
-				refused = (root, parent[:depth])
-				if not isinstance(exc, FileNotFoundError):
-					_report_unremoved(os.path.join(root, *parent[:depth]), exc)
-				held.close_all()
-				held, current_root = None, None
-				continue
+			held.truncate(depth)
 			other_filesystem = False
 			try:
 				for part in parent[depth:]:
@@ -9287,9 +9215,7 @@ def _remove_tree_fd(root, root_id, exclude=None, remove_files=False, rate_limite
 	unlinked, entries left in place, excluded ones aside; errors as (path, OSError)): a directory swapped for a symlink,
 	or a root replaced, is an error and nothing below it is touched. A directory that still holds something stays.
 	rate_limiter (a _file_list_rate_limit state, -F) paces the unlinks. spelled: root as the caller wrote it, the base of
-	the paths excludes are matched against (and errors name). At most _WALK_FD_BUDGET descriptors are held: deeper, the
-	shallowest are let go (their identity kept) and each is opened again through '..' of its child, checked against that
-	identity (a directory moved meanwhile stops the walk, an error)."""
+	the paths excludes are matched against (and errors name)."""
 	removed, left, errors = 0, [], []
 	if not _DIR_FD_WALK:
 		base = spelled if spelled is not None else root
@@ -9401,17 +9327,7 @@ def _remove_tree_fd(root, root_id, exclude=None, remove_files=False, rate_limite
 				if e is not None and e.errno not in busy:
 					errors.append((root, e))
 				break
-			try:
-				# This directory is closed; its parent, let go on the way down, is opened again (checked) first.
-				held.pop()
-			except FileNotFoundError:
-				# The parent is gone too (removed meanwhile): nothing more to do in it.
-				frames[-1][2] = len(frames[-1][1])
-				continue
-			except OSError as e:
-				# Not the directory entered (moved, mounted on): the walk cannot go on safely.
-				errors.append((frames[-1][0], e))
-				break
+			held.pop()
 			try:
 				os.rmdir(frame[3], dir_fd=held.top())
 			except FileNotFoundError:

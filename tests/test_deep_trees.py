@@ -141,44 +141,46 @@ def _umask():
 
 # ---- 9.76: review of main..HEAD ----
 
-import contextlib
 import shutil
 import subprocess
 
 
-@contextlib.contextmanager
-def _open_files_limit(soft):
-	"""The soft RLIMIT_NOFILE at soft (a common default is 1024; macOS's is 256), restored after."""
+_LOW_LIMIT_REMOVALS = """if 1:
+	import builtins, os, resource, sys
+	sys.path.insert(0, sys.argv[1])
+	import hpcp
+	assert resource.getrlimit(resource.RLIMIT_NOFILE)[0] > 256, 'the soft limit was not raised'
+	t = sys.argv[2]
+	sys.stdin.isatty, builtins.input = (lambda: True), (lambda: 'y')
+	hpcp._rmtree(os.path.join(t, 'rmtree'))
+	hpcp.process_remove([os.path.join(t, 'plain')], single_thread=True, remove_force=True)
+	files, links, _, _ = hpcp.get_file_list(os.path.join(t, 'move-src'), parallel_file_listing=False)
+	hpcp.remove_moved_sources([os.path.join(t, 'move-src')], files, {}, single_thread=True, remove_force=True,
+		root_ids=hpcp._source_identities([os.path.join(t, 'move-src')]))
+	hpcp.remove_extra_files([], [os.path.join(t, 'dst') + os.sep], 1, False, 1, single_thread=True, src_paths=[os.path.join(t, 'src') + os.sep])
+	hpcp.remove_extra_dirs([os.path.join(t, 'src') + os.sep], [os.path.join(t, 'dst') + os.sep])
+	print([error for error in hpcp.ERRORS if hpcp._is_failure(error)])
+"""
+
+
+def test_a_deep_tree_is_removed_under_a_low_open_files_limit(tmp_path, hpcp_mod, require_linux):
+	"""Review: the descriptor walks hold one descriptor per level, so a tree deeper than the soft open-files limit (a
+	common default is 1024; macOS's is 256) failed with EMFILE. hpcp raises its soft limit to the hard one at import."""
 	resource = pytest.importorskip('resource')
-	old_soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
-	resource.setrlimit(resource.RLIMIT_NOFILE, (soft, hard))
-	try:
-		yield
-	finally:
-		resource.setrlimit(resource.RLIMIT_NOFILE, (old_soft, hard))
-
-
-def test_a_deep_tree_is_removed_under_a_low_open_files_limit(tmp_path, hpcp_mod, reset_hpcp_globals, require_linux, monkeypatch):
-	"""Review: the descriptor walks held one descriptor per level: a tree deeper than the open-files limit could not be
-	removed (EMFILE). They hold a bounded number now."""
+	if resource.getrlimit(resource.RLIMIT_NOFILE)[1] < 4 * DEPTH:
+		pytest.skip('the hard open-files limit is below what a %d-level removal holds' % DEPTH)
 	for name in ('rmtree', 'plain', 'move-src'):
 		_deep(tmp_path / name)
 	(tmp_path / 'src').mkdir()
 	_deep(tmp_path / 'dst')
-	monkeypatch.setattr(sys.stdin, 'isatty', lambda: True)
-	monkeypatch.setattr('builtins.input', lambda: 'y')
-	with _open_files_limit(256):
-		hpcp_mod._rmtree(str(tmp_path / 'rmtree'))
-		hpcp_mod.process_remove([str(tmp_path / 'plain')], single_thread=True, remove_force=True)
-		files, links, _, _ = hpcp_mod.get_file_list(str(tmp_path / 'move-src'), parallel_file_listing=False)
-		hpcp_mod.remove_moved_sources([str(tmp_path / 'move-src')], files, {}, single_thread=True, remove_force=True,
-			root_ids=hpcp_mod._source_identities([str(tmp_path / 'move-src')]))
-		hpcp_mod.remove_extra_files([], [str(tmp_path / 'dst') + os.sep], 1, False, 1, single_thread=True, src_paths=[str(tmp_path / 'src') + os.sep])
-		hpcp_mod.remove_extra_dirs([str(tmp_path / 'src') + os.sep], [str(tmp_path / 'dst') + os.sep])
+	result = subprocess.run(['sh', '-c', 'ulimit -Sn 256 && exec "$0" -c "$1" "$2" "$3"', sys.executable, _LOW_LIMIT_REMOVALS,
+		os.path.dirname(os.path.abspath(hpcp_mod.__file__)), str(tmp_path)], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+		universal_newlines=True)
+	assert result.returncode == 0, result.stderr[-2000:]
+	assert result.stdout.splitlines()[-1] == '[]'
 	for name in ('rmtree', 'plain', 'move-src'):
 		assert not (tmp_path / name).exists(), name
 	assert os.listdir(str(tmp_path / 'dst')) == []
-	assert _failures(hpcp_mod) == []
 
 
 def test_delete_file_bulk_matches_excludes_as_the_paths_were_given(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
@@ -284,7 +286,7 @@ def _count_opens(monkeypatch, hpcp_mod):
 
 def test_remove_extra_dirs_of_a_deep_tree_opens_each_level_about_once(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
 	"""Re-review: the cursor opened every released directory again from the root: 540257 opens for a 1500-level -rme
-	directory pass (9.75: about 1500). Going back up is one '..' a level now."""
+	directory pass (9.75: about 1500). Every level stays held now."""
 	(tmp_path / 'src').mkdir()
 	(tmp_path / 'dst').mkdir()
 	_deep(tmp_path / 'dst' / 'x', name='d')
@@ -316,8 +318,9 @@ def test_a_move_of_a_deep_chain_with_a_file_per_level_opens_each_level_about_onc
 	assert len(opens) <= 4 * 800
 
 
-def test_a_released_directory_mounted_on_meanwhile_is_not_entered(tmp_path, hpcp_mod, reset_hpcp_globals):
-	"""Re-review: a directory the cursor let go and opened again by name crossed into a filesystem mounted on it since."""
+def test_a_held_directory_mounted_on_meanwhile_is_not_entered(tmp_path, hpcp_mod, reset_hpcp_globals):
+	"""Re-review: a directory the cursor let go and opened again by name crossed into a filesystem mounted on it since.
+	Every level stays held now: the removal goes on in the directory held, below the mount, never in it."""
 	if os.geteuid() != 0:
 		pytest.skip('needs root to mount')
 	root = tmp_path / 'dst'
@@ -338,35 +341,14 @@ def test_a_released_directory_mounted_on_meanwhile_is_not_entered(tmp_path, hpcp
 		assert subprocess.run(['mount', '-t', 'tmpfs', 'hpcp-test', chain[3]], capture_output=True).returncode == 0
 		try:
 			open(os.path.join(chain[3], 'mounted'), 'w').close()
-			try:
-				held.truncate(4)
-				os.unlink('x', dir_fd=held.top())
-			except OSError as e:
-				assert e.errno == 116
+			held.truncate(4)
+			os.unlink('x', dir_fd=held.top())
 			assert os.path.exists(os.path.join(chain[3], 'mounted'))
 		finally:
 			subprocess.run(['umount', '-l', chain[3]], capture_output=True)
+		assert not os.path.exists(os.path.join(chain[3], 'x'))
 	finally:
 		held.close_all()
-
-
-def test_walk_goes_on_when_a_released_parent_s_child_is_removed_meanwhile(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
-	"""Re-review: '..' of a directory removed by another process is ENOENT; the walk stopped and left every sibling."""
-	root = tmp_path / 'tree'
-	_deep(root, depth=80)
-	for index in range(5):
-		(root / ('sibling%d' % index)).mkdir()
-		(root / ('sibling%d' % index) / 'f').write_text('x')
-	real_open = os.open
-	failed = []
-	def flaky_open(path, *args, **kwargs):
-		if path == os.pardir and not failed:
-			failed.append(True)
-			raise FileNotFoundError(2, 'No such file or directory', path)
-		return real_open(path, *args, **kwargs)
-	monkeypatch.setattr(hpcp_mod.os, 'open', flaky_open)
-	hpcp_mod._rmtree(str(root))
-	assert failed and not root.exists()
 
 
 def test_rmtree_of_an_empty_path_removes_nothing(tmp_path, hpcp_mod, monkeypatch):
