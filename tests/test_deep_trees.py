@@ -119,6 +119,9 @@ def test_iterative_makedirs_makes_every_missing_level(tmp_path, hpcp_mod, monkey
 	for typed in ('x//y', 'z/.', os.path.join('w', '.', 'v')):
 		hpcp_mod._makedirs(typed, exist_ok=True)
 		assert os.path.isdir(typed)
+	# 'dangling/./' (a dangling symlink) returns as in 9.79: the copy then fails file by file, not all at once.
+	os.symlink('nowhere', 'dangling')
+	hpcp_mod._makedirs(os.path.join('dangling', '.', ''), exist_ok=True)
 	# A parent made meanwhile (another worker) is fine.
 	real_mkdir = os.mkdir
 	def racing_mkdir(directory, *args):

@@ -2613,7 +2613,8 @@ def _file_list_rate_limit(limiter_state, increment=1):
 def _makedirs(name, mode=0o777, exist_ok=False):
 	"""os.makedirs(name, mode, exist_ok) without its recursion (one frame per missing level: a tree deeper than about 1000
 	levels raised RecursionError): the missing parents are made from the top (default mode; one made meanwhile is
-	fine), then name with mode; an existing name is fine only with exist_ok when it is a directory."""
+	fine), then name with mode, unless it ends in '.' (made with them, as in os.makedirs); an existing name is fine only
+	with exist_ok when it is a directory."""
 	missing = []
 	head = os.path.dirname(name.rstrip(os.sep))
 	while head and not os.path.exists(head):
@@ -2627,6 +2628,9 @@ def _makedirs(name, mode=0o777, exist_ok=False):
 			os.mkdir(directory)
 		except FileExistsError:
 			pass
+	if missing and os.path.basename(name.rstrip(os.sep)) == os.curdir:
+		# xxx/newdir/. exists once xxx/newdir does
+		return
 	try:
 		os.mkdir(name, mode)
 	except OSError:
