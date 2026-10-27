@@ -514,25 +514,6 @@ def test_runner_names_a_real_timeout_of_a_tool_that_answers_sigint(monkeypatch):
 		hpcp.ERRORS.extend(saved_errors)
 
 
-def test_runner_dry_run_is_not_a_failure(monkeypatch):
-	# a dry run has no exit status (returncode None); None != 0 recorded a failure for every command
-	assert _runner_errors(monkeypatch, _RunnerTask(['true'], None), dry_run=True) == []
-	# a command that did not run outside a dry run is still one
-	assert len(_runner_errors(monkeypatch, _RunnerTask(['true'], None))) == 1
-
-
-def test_runner_dry_run_through_the_real_multicmd(monkeypatch):
-	monkeypatch.setattr(hpcp, '_binPaths', {'true': '/bin/true'})
-	saved_errors = list(hpcp.ERRORS)
-	hpcp.ERRORS.clear()
-	try:
-		assert hpcp.run_command_in_multicmd_with_path_check(['true'], quiet=True, dry_run=True, strict=True) == []
-		assert hpcp.ERRORS == []
-	finally:
-		hpcp.ERRORS.clear()
-		hpcp.ERRORS.extend(saved_errors)
-
-
 @pytest.fixture
 def _fresh_check_path(monkeypatch):
 	monkeypatch.setattr(hpcp, '_binPaths', {})
