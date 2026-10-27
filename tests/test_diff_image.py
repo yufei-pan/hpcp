@@ -3255,6 +3255,29 @@ def test_remove_tree_around_mounts_refuses_a_directory_swapped_for_a_symlink(tmp
 	assert not (top / 'other').exists()
 
 
+def test_remove_tree_around_mounts_does_not_enter_a_directory_replaced_after_its_stat(tmp_path, hpcp_mod, monkeypatch):
+	"""sub is replaced by another directory (a mount made on it, say) between its stat and its open: not entered."""
+	top = tmp_path / 'app'
+	_write(top / 'sub' / 'f', 'x')
+	_write(tmp_path / 'other' / 'precious', 'keep me')
+	real_stat = os.stat
+	swapped = []
+
+	def racing_stat(path, *args, **kwargs):
+		info = real_stat(path, *args, **kwargs)
+		if os.fspath(path) == 'sub' and not swapped:
+			swapped.append(True)
+			os.rename(str(top / 'sub'), str(tmp_path / 'moved'))
+			os.rename(str(tmp_path / 'other'), str(top / 'sub'))
+		return info
+
+	monkeypatch.setattr(os, 'stat', racing_stat)
+	kept, errors = hpcp_mod._remove_tree_around_mounts(str(top), set())
+	monkeypatch.undo()
+	assert swapped and kept == [] and errors == ['sub: changed while being removed; not entered']
+	assert (top / 'sub' / 'precious').read_text() == 'keep me'
+
+
 def test_remove_tree_around_mounts_collects_errors_and_keeps_going(tmp_path, hpcp_mod, monkeypatch):
 	top = tmp_path / 'app'
 	_write(top / 'a' / 'stuck', 'x')

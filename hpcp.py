@@ -5743,11 +5743,11 @@ def _remove_tree_around_mounts(path, mount_points=None, target_root=None):
 	directory) removes nothing and returns an error. The walk is iterative and keeps going after an error. Returns (the entries left in place as mount
 	points, relative to path; the errors met, as text).
 
-	The walk goes by directory descriptors, as shutil.rmtree does: every directory is opened with O_NOFOLLOW
-	relative to its parent (path itself included) and checked against the lstat taken before descending, and entries are read and removed
-	relative to the descriptor, so a directory swapped for a symlink during the walk is refused, never followed
-	(this runs as root on trees other users may write to). The apply runs only on Linux, which has every descriptor
-	function this needs.
+	The walk is _remove_tree_fd's, by directory descriptors as shutil.rmtree does: every directory is opened with
+	O_NOFOLLOW relative to its parent (path itself included) and checked against the lstat taken before descending, and
+	entries are read and removed relative to the descriptor, so a directory swapped for a symlink during the walk is
+	refused, never followed (this runs as root on trees other users may write to). The apply runs only on Linux, which
+	has every descriptor function this needs.
 
 	target_root: the tree the removal must stay in (the apply's target; '/' when None). The top's parent is resolved once and must lie inside it; it is then reached from a descriptor of target_root one component at a time with O_NOFOLLOW, and the top is examined, entered and removed relative to its parent's descriptor. A directory above the top swapped for a symlink after the apply checked the path therefore refuses the removal instead of acting outside the target (this runs as root on trees other users may write to).
 	"""
@@ -5763,10 +5763,8 @@ def _remove_tree_around_mounts(path, mount_points=None, target_root=None):
 	top = os.path.join(parent_real, name)
 	if parent_real != root_real and not parent_real.startswith(root_real.rstrip(os.sep) + os.sep):
 		return [], [f'..: resolves outside {root_real}; not removed']
-	kept, errors = [], []
-	flags = os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0) | os.O_NOFOLLOW | getattr(os, 'O_CLOEXEC', 0)
 	try:
-		parent_fd = _open_below(root_real, os.path.relpath(parent_real, root_real), flags)
+		parent_fd = _open_below(root_real, os.path.relpath(parent_real, root_real), _BELOW_FLAGS)
 	except FileNotFoundError:
 		return [], []
 	except OSError as e:
@@ -5786,86 +5784,9 @@ def _remove_tree_around_mounts(path, mount_points=None, target_root=None):
 		# A mount made on path itself after mountinfo was read (or a btrfs subvolume) is on another device than its parent.
 		if os.fstat(parent_fd).st_dev != top_dev:
 			return ['.'], []
-		def open_dir(name, parent_fd, rel, expected):
-			"""A descriptor for the directory, or None (an error recorded unless it vanished)."""
-			try:
-				fd = os.open(name, flags, dir_fd=parent_fd)
-			except FileNotFoundError:
-				return None
-			except OSError as e:
-				errors.append(f'{rel}: {e.strerror}')
-				return None
-			try:
-				info = os.fstat(fd)
-				if (info.st_dev, info.st_ino) == (expected.st_dev, expected.st_ino):
-					return fd
-				errors.append(f'{rel}: changed while being removed; not entered')
-			except OSError as e:
-				errors.append(f'{rel}: {e.strerror}')
-			os.close(fd)
-			return None
-
-		# One frame per open directory: [fd, name in its parent, real path, subdirectories still to enter].
-		stack = []
-
-		def enter(name, parent_fd, real, expected):
-			fd = open_dir(name, parent_fd, os.path.relpath(real, top), expected)
-			if fd is None:
-				return
-			frame = [fd, name, real, []]
-			stack.append(frame)
-			try:
-				names = os.listdir(fd)
-			except OSError as e:
-				errors.append(f'{os.path.relpath(real, top)}: {e.strerror}')
-				return
-			for child_name in names:
-				child = os.path.join(real, child_name)
-				rel = os.path.relpath(child, top)
-				try:
-					info = os.stat(child_name, dir_fd=fd, follow_symlinks=False)
-				except FileNotFoundError:
-					continue
-				except OSError as e:
-					errors.append(f'{rel}: {e.strerror}')
-					continue
-				if child in mount_points or (stat.S_ISDIR(info.st_mode) and info.st_dev != top_dev):
-					kept.append(rel)
-				elif stat.S_ISDIR(info.st_mode):
-					frame[3].append((child_name, child, info))
-				else:
-					try:
-						os.unlink(child_name, dir_fd=fd)
-					except FileNotFoundError:
-						pass
-					except OSError as e:
-						errors.append(f'{rel}: {e.strerror}')
-
-		try:
-			enter(name, parent_fd, top, top_info)
-			while stack:
-				frame = stack[-1]
-				if frame[3]:
-					child_name, child, info = frame[3].pop()
-					enter(child_name, frame[0], child, info)
-					continue
-				stack.pop()
-				os.close(frame[0])
-				try:
-					if stack:
-						os.rmdir(frame[1], dir_fd=stack[-1][0])
-					else:
-						os.rmdir(name, dir_fd=parent_fd)
-				except FileNotFoundError:
-					pass
-				except OSError as e:
-					# Not empty: a kept mount below it, or an entry whose removal already failed (recorded).
-					if e.errno not in (errno.ENOTEMPTY, errno.EEXIST):
-						errors.append(f'{os.path.relpath(frame[2], top)}: {e.strerror}')
-		finally:
-			for frame in stack:
-				os.close(frame[0])
-		return sorted(kept), errors
+		_, left, failures = _remove_tree_fd(top, top_info, remove_files=True, parent_fd=parent_fd, mounts=(mount_points, top_dev))
+		return (sorted(os.path.relpath(path, top) for path in left),
+			[f'{os.path.relpath(path, top)}: {e.strerror}' for path, e in failures])
 	finally:
 		os.close(parent_fd)
 
@@ -9207,7 +9128,19 @@ def _is_directory_now(name, dir_fd, exc):
 			return False
 	return False
 
-def _remove_tree_fd(root, root_id, exclude=None, remove_files=False, rate_limiter=None, spelled=None):
+def _changed(fd, expected):
+	"""fd, when it is the directory expected (an lstat) was taken of; else closed, and OSError ESTALE."""
+	try:
+		st = os.fstat(fd)
+		if (st.st_dev, st.st_ino) == (expected.st_dev, expected.st_ino):
+			return fd
+		raise OSError(errno.ESTALE, 'changed while being removed; not entered')
+	except BaseException:
+		os.close(fd)
+		raise
+
+def _remove_tree_fd(root, root_id, exclude=None, remove_files=False, rate_limiter=None, spelled=None, parent_fd=None,
+		mounts=None):
 	"""Walk the directory tree at root by descriptors from the pinned root (_open_source_root), each directory opened
 	relative to its parent with O_NOFOLLOW, deepest first, as shutil.rmtree does (one open and one listing per directory):
 	rmdir each directory once its entries are handled. With remove_files (plain -rm) its other entries are unlinked
@@ -9215,7 +9148,14 @@ def _remove_tree_fd(root, root_id, exclude=None, remove_files=False, rate_limite
 	unlinked, entries left in place, excluded ones aside; errors as (path, OSError)): a directory swapped for a symlink,
 	or a root replaced, is an error and nothing below it is touched. A directory that still holds something stays.
 	rate_limiter (a _file_list_rate_limit state, -F) paces the unlinks. spelled: root as the caller wrote it, the base of
-	the paths excludes are matched against (and errors name)."""
+	the paths excludes are matched against (and errors name).
+
+	For the apply's forced removal (_remove_tree_around_mounts): parent_fd, a descriptor of root's parent, starts the
+	walk there instead of at the pinned root: root is its entry basename(root), opened with O_NOFOLLOW, checked against
+	root_id (a stat_result), and removed relative to it. mounts: (mount points, device): an entry that is a mount point
+	(of any type) or a directory on another device is left in place, in left, with the directories above it. Each entry
+	is then stat'ed, each directory checked against that stat once opened, and a directory whose listing fails is still
+	tried with rmdir."""
 	removed, left, errors = 0, [], []
 	if not _DIR_FD_WALK:
 		base = spelled if spelled is not None else root
@@ -9241,7 +9181,10 @@ def _remove_tree_fd(root, root_id, exclude=None, remove_files=False, rate_limite
 				errors.append((directory, e))
 		return removed, left, errors
 	try:
-		root_fd = _open_source_root(root, root_id)
+		if parent_fd is None:
+			root_fd = _open_source_root(root, root_id)
+		else:
+			root_fd = _changed(os.open(os.path.basename(root), _BELOW_FLAGS, dir_fd=parent_fd), root_id)
 	except FileNotFoundError:
 		return removed, left, errors
 	except OSError as e:
@@ -9253,22 +9196,45 @@ def _remove_tree_fd(root, root_id, exclude=None, remove_files=False, rate_limite
 		"""Handle the entries of directory fd (just opened, or the root's), then hold it (frames, held)."""
 		nonlocal removed
 		try:
-			entries = _dir_entries(fd)
+			entries = _dir_entries(fd) if mounts is None else [(entry, None) for entry in os.listdir(fd)]
 		except OSError as e:
-			if name is not None:
-				os.close(fd)
 			errors.append((path, e))
-			return False
+			if mounts is None:
+				if name is not None:
+					os.close(fd)
+				return False
+			entries = []
 		subdirectories = []
 		for entry, is_dir in entries:
 			child = os.path.join(path, entry)
 			if exclude and is_excluded(child, exclude):
 				continue
+			if mounts is not None:
+				try:
+					info = os.stat(entry, dir_fd=fd, follow_symlinks=False)
+				except FileNotFoundError:
+					continue
+				except OSError as e:
+					errors.append((child, e))
+					continue
+				if child in mounts[0] or (stat.S_ISDIR(info.st_mode) and info.st_dev != mounts[1]):
+					left.append(child)
+				elif stat.S_ISDIR(info.st_mode):
+					subdirectories.append((entry, False, info))
+				else:
+					try:
+						os.unlink(entry, dir_fd=fd)
+						removed += 1
+					except FileNotFoundError:
+						pass
+					except OSError as e:
+						errors.append((child, e))
+				continue
 			if is_dir is None:
 				# Unknown: tried as a directory first (its open says ENOTDIR / ELOOP if it is none).
-				subdirectories.append((entry, True))
+				subdirectories.append((entry, True, None))
 			elif is_dir:
-				subdirectories.append((entry, False))
+				subdirectories.append((entry, False, None))
 			elif not remove_files:
 				left.append(child)
 			else:
@@ -9282,7 +9248,7 @@ def _remove_tree_fd(root, root_id, exclude=None, remove_files=False, rate_limite
 				except OSError as e:
 					if _is_directory_now(entry, fd, e):
 						# A directory now (it changed since it was read): removed as one.
-						subdirectories.append((entry, False))
+						subdirectories.append((entry, False, None))
 					else:
 						errors.append((child, e))
 		if name is not None:
@@ -9296,10 +9262,12 @@ def _remove_tree_fd(root, root_id, exclude=None, remove_files=False, rate_limite
 		while frames:
 			frame = frames[-1]
 			if frame[2] < len(frame[1]):
-				entry, unknown = frame[1][frame[2]]
+				entry, unknown, expected = frame[1][frame[2]]
 				frame[2] += 1
 				try:
 					fd = os.open(entry, _BELOW_FLAGS, dir_fd=held.top())
+					if expected is not None:
+						fd = _changed(fd, expected)
 				except FileNotFoundError:
 					continue
 				except OSError as e:
@@ -9323,7 +9291,16 @@ def _remove_tree_fd(root, root_id, exclude=None, remove_files=False, rate_limite
 				continue
 			frames.pop()
 			if not frames:
-				e = _rmdir_below(root, root_id, '.')
+				if parent_fd is None:
+					e = _rmdir_below(root, root_id, '.')
+				else:
+					try:
+						os.rmdir(os.path.basename(root), dir_fd=parent_fd)
+						e = None
+					except FileNotFoundError:
+						e = None
+					except OSError as rmdir_error:
+						e = rmdir_error
 				if e is not None and e.errno not in busy:
 					errors.append((root, e))
 				break
