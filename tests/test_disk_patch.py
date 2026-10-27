@@ -3127,6 +3127,7 @@ def test_partition_paths_come_from_lsblk_full_names(hpcp_mod, reset_hpcp_globals
 		argvs.append(argv)
 		return list(lsblk)
 	monkeypatch.setattr(hpcp_mod, 'run_command_in_multicmd_with_path_check', fake_lsblk)
+	monkeypatch.setattr(hpcp_mod, '_udev_settle', lambda: None)  # where udevadm exists (test_lsblk_disk_rows_settles_...)
 	assert hpcp_mod.get_partitions(disk) == partitions
 	assert hpcp_mod.get_largest_partition(disk) == largest
 	assert all('-p' in argv and '-P' in argv and argv[argv.index('-o') + 1] == 'NAME,SIZE,KNAME,PKNAME,TYPE' for argv in argvs)
@@ -3143,6 +3144,7 @@ def test_target_partition_uses_lsblk_full_names(hpcp_mod, reset_hpcp_globals, mo
 			'NAME="/dev/cciss/c0d0p2" KNAME="/dev/cciss!c0d0p2" PKNAME="/dev/cciss!c0d0" TYPE="part"']
 	monkeypatch.setattr(hpcp_mod, 'create_loop_device', lambda image: '/dev/cciss/c0d0')
 	monkeypatch.setattr(hpcp_mod, 'run_command_in_multicmd_with_path_check', fake_lsblk)
+	monkeypatch.setattr(hpcp_mod, '_udev_settle', lambda: None)
 	assert hpcp_mod.get_target_partition('/tmp/not-a-device.img', '2') == ('/dev/cciss/c0d0p2', '/dev/cciss/c0d0')
 	assert '-P' in argvs[0] and argvs[0][argvs[0].index('-o') + 1] == 'NAME,KNAME,PKNAME,TYPE'
 
