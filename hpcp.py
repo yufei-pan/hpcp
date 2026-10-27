@@ -10639,8 +10639,9 @@ def _escape_unencodable_stdout():
 def main():
 	global RANDOM_DESTINATION_SELECTION
 	_escape_unencodable_stdout()
-	_warn_bad_overrides()
 	args = get_args()
+	# after get_args: -h and -V print only what they are asked for
+	_warn_bad_overrides()
 	# we run gui if the current platform is windows and src_path is not specified
 	if os.name == 'nt' and len(args.src_path) == 0:
 		hpcp_gui()

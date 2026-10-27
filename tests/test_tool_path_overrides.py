@@ -79,11 +79,18 @@ def test_every_bad_override_is_named_once_at_the_start_of_a_run_and_is_not_run(t
 	not_executable.write_text('#!/bin/sh\necho "Block size:               9999"\n')
 	not_executable.chmod(0o644)
 	bad = {'DUMPE2FS_PATH': str(not_executable), 'CP_PATH': str(tmp_path), 'MOUNT_PATH': str(tmp_path / 'nope')}
-	result = subprocess.run([sys.executable, hpcp.__file__, '-V'], env=dict(os.environ, **bad), stdout=subprocess.PIPE,
-		stderr=subprocess.PIPE, universal_newlines=True)
-	assert result.returncode == 0 and 'High Performance CoPy' in result.stdout
+	def run(*args):
+		return subprocess.run([sys.executable, hpcp.__file__] + list(args), env=dict(os.environ, **bad), stdout=subprocess.PIPE,
+			stderr=subprocess.PIPE, universal_newlines=True)
+	(tmp_path / 'empty').mkdir()
+	result = run(str(tmp_path / 'empty'), '-d', str(tmp_path / 'out'))
+	assert result.returncode == 0, result.stderr
 	for variable, value in bad.items():
 		assert result.stderr.count('Warning: %s=%s is not an executable file' % (variable, value)) == 1
+	# -V and -h print only what they are asked for
+	for option in ('-V', '-h'):
+		result = run(option)
+		assert result.returncode == 0 and result.stdout and result.stderr == ''
 	# the tool on PATH is the one that runs, and nothing more is printed when it does
 	bin_dir = exec_dir / 'bin'
 	bin_dir.mkdir()
