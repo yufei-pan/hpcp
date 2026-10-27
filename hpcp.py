@@ -510,25 +510,19 @@ class Adaptive_Progress_Bar:
 
 _binPaths = {}
 _badOverrides = {}  # tool name -> the <TOOL>_PATH value check_path ignored
-_warnedOverrides = set()
-
-def _warn_bad_override(program_name):
-	"""Say once per process, from the main process only, that <TOOL>_PATH is not an executable and is ignored."""
-	override = _badOverrides.get(program_name)
-	if override is None or program_name in _warnedOverrides:
-		return
-	_warnedOverrides.add(program_name)
-	if multiprocessing.current_process().name == 'MainProcess':
-		print(f"Warning: {program_name.upper()}_PATH={override} is not an executable file; using {program_name} from PATH.", file=sys.stderr)
-
 def _bin(program_name):
 	"""The program hpcp starts for a tool, through the command runner too: its <TOOL>_PATH override if that is an
 	executable, else the one found on PATH, else the bare name (which then fails as a missing command does). A tool
-	hpcp did not look up at import (mkfs.hfs) is looked up now."""
+	hpcp did not look up at import is looked up now."""
 	if program_name not in _binPaths:
 		check_path(program_name)
-	_warn_bad_override(program_name)
 	return _binPaths.get(program_name, program_name)
+
+def _warn_bad_overrides():
+	"""Name, once at the start of a run, every <TOOL>_PATH that is no executable and is ignored: also cp's, which runs
+	in the workers, and a tool's that is missing everywhere."""
+	for program_name, override in sorted(_badOverrides.items()):
+		print(f"Warning: {program_name.upper()}_PATH={override} is not an executable file; using {program_name} from PATH.", file=sys.stderr)
 
 @functools.lru_cache(maxsize=None)
 def check_path(program_name):
@@ -536,8 +530,8 @@ def check_path(program_name):
 	path, or a bare command name as which() takes it), else the one on PATH."""
 	override = os.environ.get(program_name.upper() + '_PATH')
 	if override:
-		# Silent here: this runs at import for every tool, and names like MOUNT_PATH or CP_PATH are common
-		# variables that mean something else. _warn_bad_override says so when hpcp needs that tool.
+		# Recorded, not printed: importing hpcp prints nothing. main() names it at the start of a run
+		# (_warn_bad_overrides).
 		# Every start of the tool uses it, so a stray variable that names an executable file,
 		# MOUNT_PATH=/usr/bin/true, makes hpcp run that file as mount.
 		resolved = shutil.which(override)
@@ -551,7 +545,7 @@ def check_path(program_name):
 	return False
 
 _binCalled = {'lsblk', 'losetup', 'sgdisk', 'blkid', 'umount', 'mount','dd','cp', 'xcopy',
-			  'truncate',
+			  'truncate', 'df', 'partx', 'fsutil', 'mkfs.ext4', 'mkfs.hfs',
 			  'mkfs', 'mkfs.btrfs', 'mkfs.xfs', 'mkfs.f2fs', 'mkfs.ntfs', 'mkfs.vfat', 'mkfs.exfat', 'mkfs.hfsplus',
 			  'mkudffs', 'mkfs.jfs', 'mkfs.reiserfs', 'newfs', 'mkfs.bfs', 'mkfs.minix', 'mkswap',
 			  'e2fsck', 'btrfs', 'xfs_repair', 'xfs_info', 'fsck.f2fs', 'dump.f2fs', 'ntfsfix', 'ntfsinfo',
@@ -10729,6 +10723,7 @@ def _escape_unencodable_stdout():
 def main():
 	global RANDOM_DESTINATION_SELECTION
 	_escape_unencodable_stdout()
+	_warn_bad_overrides()
 	args = get_args()
 	# we run gui if the current platform is windows and src_path is not specified
 	if os.name == 'nt' and len(args.src_path) == 0:

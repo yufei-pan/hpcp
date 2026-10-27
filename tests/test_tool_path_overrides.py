@@ -3,6 +3,7 @@ runner as well as where hpcp starts a tool with multiCMD itself."""
 import os
 import pathlib
 import shutil
+import subprocess
 import sys
 
 import pytest
@@ -26,7 +27,6 @@ def _fresh_tool_lookup(monkeypatch):
 	"""Each test finds its tools anew, from the environment it sets, and leaves nothing of that behind."""
 	monkeypatch.setattr(hpcp, '_binPaths', {})
 	monkeypatch.setattr(hpcp, '_badOverrides', {})
-	monkeypatch.setattr(hpcp, '_warnedOverrides', set())
 	hpcp.check_path.cache_clear()
 	yield
 	hpcp.check_path.cache_clear()
@@ -72,38 +72,31 @@ def test_an_override_with_another_name_is_judged_as_the_tool(exec_dir, monkeypat
 		del hpcp.ERRORS[errors:]
 
 
-def test_a_bad_override_is_reported_when_the_tool_is_needed_and_is_not_run(tmp_path, exec_dir, monkeypatch, capsys):
+def test_every_bad_override_is_named_once_at_the_start_of_a_run_and_is_not_run(tmp_path, exec_dir, monkeypatch, capsys):
+	# CP_PATH too, though cp runs in the workers; MOUNT_PATH and CP_PATH are variables other software sets to
+	# directories and the like. Importing hpcp stays silent (test_importing_hpcp_prints_nothing_...).
+	not_executable = tmp_path / 'dumpe2fs-data'
+	not_executable.write_text('#!/bin/sh\necho "Block size:               9999"\n')
+	not_executable.chmod(0o644)
+	bad = {'DUMPE2FS_PATH': str(not_executable), 'CP_PATH': str(tmp_path), 'MOUNT_PATH': str(tmp_path / 'nope')}
+	result = subprocess.run([sys.executable, hpcp.__file__, '-V'], env=dict(os.environ, **bad), stdout=subprocess.PIPE,
+		stderr=subprocess.PIPE, universal_newlines=True)
+	assert result.returncode == 0 and 'High Performance CoPy' in result.stdout
+	for variable, value in bad.items():
+		assert result.stderr.count('Warning: %s=%s is not an executable file' % (variable, value)) == 1
+	# the tool on PATH is the one that runs, and nothing more is printed when it does
 	bin_dir = exec_dir / 'bin'
 	bin_dir.mkdir()
 	_fake_tool(bin_dir, 'dumpe2fs', 'echo "Block size:               2048"\n')
 	monkeypatch.setenv('PATH', str(bin_dir) + os.pathsep + os.environ.get('PATH', ''))
-	not_executable = tmp_path / 'dumpe2fs-data'
-	not_executable.write_text('#!/bin/sh\necho "Block size:               9999"\n')
-	not_executable.chmod(0o644)
-	for bad in (str(not_executable), str(tmp_path / 'nope'), str(tmp_path)):
-		hpcp._warnedOverrides.clear()
-		monkeypatch.setenv('DUMPE2FS_PATH', bad)
-		assert capsys.readouterr().err == ''
-		assert hpcp._probe_ext('/dev/x')['block_size'] == 2048
-		err = capsys.readouterr().err
-		assert err.count('DUMPE2FS_PATH=' + bad) == 1 and 'is not an executable file' in err
-		hpcp.check_path.cache_clear()
-		hpcp._binPaths.clear()
-
-
-def test_a_stray_mount_path_or_cp_path_is_silent_until_used(tmp_path, exec_dir, monkeypatch, capsys):
-	# MOUNT_PATH and CP_PATH are variables other software sets to directories and the like
-	monkeypatch.setenv('MOUNT_PATH', str(tmp_path))
-	monkeypatch.setenv('CP_PATH', str(tmp_path / 'data-dir-of-something-else'))
-	hpcp.check_path('mount')
-	assert hpcp.check_path('cp') is True
-	assert capsys.readouterr().err == ''
-	# used: reported, and the cp on PATH is the one that runs
+	monkeypatch.setenv('DUMPE2FS_PATH', str(not_executable))
+	assert hpcp._probe_ext('/dev/x')['block_size'] == 2048
+	monkeypatch.setenv('CP_PATH', str(tmp_path))
 	src = tmp_path / 'src'
 	src.write_text('data')
 	hpcp.run_command_in_multicmd_with_path_check(['cp', str(src), str(tmp_path / 'dst')], quiet=True, strict=True)
 	assert (tmp_path / 'dst').read_text() == 'data'
-	assert 'CP_PATH=' in capsys.readouterr().err
+	assert capsys.readouterr().err == ''
 
 
 def test_a_stray_override_that_is_an_executable_file_now_runs_as_the_tool(exec_dir, monkeypatch):
@@ -126,7 +119,8 @@ def test_the_runner_takes_a_tuple_and_leaves_the_callers_list_alone(exec_dir, mo
 
 
 def test_an_override_of_a_tool_not_looked_up_at_import_is_the_program_mkfs_runs(exec_dir, monkeypatch):
-	# mkfs.hfs (built from the filesystem type) is not in _binCalled: _bin gave its bare name whatever its override said
+	# mkfs.hfs (built from the filesystem type) was not in _binCalled: _bin gave its bare name whatever its override said;
+	# a tool not looked up yet (as here, the lookup cleared) is looked up by _bin
 	fake = _fake_tool(exec_dir, 'my-mkfs-hfs', 'exit 0\n')
 	monkeypatch.setenv('MKFS.HFS_PATH', fake)
 	assert hpcp._bin('mkfs.hfs') == fake

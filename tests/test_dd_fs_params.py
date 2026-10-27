@@ -518,7 +518,6 @@ def test_runner_names_a_real_timeout_of_a_tool_that_answers_sigint(monkeypatch):
 def _fresh_check_path(monkeypatch):
 	monkeypatch.setattr(hpcp, '_binPaths', {})
 	monkeypatch.setattr(hpcp, '_badOverrides', {})
-	monkeypatch.setattr(hpcp, '_warnedOverrides', set())
 	hpcp.check_path.cache_clear()
 	yield
 	hpcp.check_path.cache_clear()
@@ -560,26 +559,6 @@ def test_check_path_falls_back_to_path_when_the_override_is_bad(tmp_path, monkey
 	monkeypatch.setenv('TRUE_PATH', str(tmp_path / 'nope'))
 	assert hpcp.check_path('true') is True
 	assert hpcp._binPaths['true'] == shutil.which('true')
-
-
-def test_bad_override_warns_once_and_only_when_the_tool_is_needed(tmp_path, monkeypatch, capsys, _fresh_check_path):
-	monkeypatch.setenv('HPCPTESTTOOL_PATH', str(tmp_path))
-	hpcp.check_path('hpcptesttool')
-	assert capsys.readouterr().err == ''
-	hpcp._bin('losetup')
-	assert capsys.readouterr().err == ''
-	hpcp._bin('hpcptesttool')
-	hpcp._bin('hpcptesttool')
-	err = capsys.readouterr().err
-	assert err.count('HPCPTESTTOOL_PATH=') == 1 and 'is not an executable file' in err
-
-
-def test_bad_override_does_not_warn_in_a_worker(tmp_path, monkeypatch, capsys, _fresh_check_path):
-	monkeypatch.setenv('HPCPTESTTOOL_PATH', str(tmp_path))
-	hpcp.check_path('hpcptesttool')
-	monkeypatch.setattr(hpcp.multiprocessing.current_process(), 'name', 'SpawnPoolWorker-1')
-	hpcp._bin('hpcptesttool')
-	assert capsys.readouterr().err == ''
 
 
 def test_importing_hpcp_prints_nothing_for_a_directory_in_mount_path(tmp_path):
