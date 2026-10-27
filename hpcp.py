@@ -6620,11 +6620,13 @@ def _partition_devices(disk, sys_block_path='/sys/class/block'):
 	return result
 
 def _udev_settle():
-	"""Wait until udev has handled its queued events (quietly; nothing when udevadm is missing)."""
+	"""Wait until udev has handled its queued events, up to 10 s (quietly; nothing when udevadm is missing).
+	A partition re-read settles in milliseconds; the cap keeps one stuck udev event ( a hung multipath path ) from
+	holding every partition listing for udevadm's default 120 s."""
 	if check_path('udevadm'):
 		error_count = len(ERRORS)
 		try:
-			run_command_in_multicmd_with_path_check(['udevadm', 'settle'], quiet=True)
+			run_command_in_multicmd_with_path_check(['udevadm', 'settle', '--timeout=10'], quiet=True)
 		finally:
 			del ERRORS[error_count:]
 
