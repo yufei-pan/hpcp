@@ -575,9 +575,10 @@ def run_commands_in_multicmd_with_path_check(commands, timeout=...,max_threads=1
 	"""
 	Run commands (lists, or strings split on whitespace) with multiCMD, each tool as _bin finds it.
 
-	A missing tool is printed. A timeout (COMMAND_TIMEOUT unless timeout is given) and a non-zero exit are printed,
-	or recorded in ERRORS when quiet. strict raises on each of them. extra_env: variables set for these commands
-	only, on top of the inherited ones (a None value removes one); pass _C_LOCALE for a tool whose output is parsed.
+	A missing tool, a timeout (COMMAND_TIMEOUT unless timeout is given) and a non-zero exit are recorded in ERRORS
+	(the exit code) and printed unless quiet (a missing tool always is); e2fsck's exit 1-3 is a success. strict raises
+	on each of them. extra_env: variables set for these commands only, on top of the inherited ones (a None value
+	removes one); pass _C_LOCALE for a tool whose output is parsed.
 
 	Returns:
 		list: The stdout lines of each command.
