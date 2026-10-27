@@ -2610,33 +2610,21 @@ def _file_list_rate_limit(limiter_state, increment=1):
 
 def _makedirs(name, mode=0o777, exist_ok=False):
 	"""os.makedirs(name, mode, exist_ok) without its recursion (one frame per missing level: a tree deeper than about 1000
-	levels raised RecursionError), step for step: the missing heads are made from the top (default mode, one made
-	meanwhile is fine, an 'xxx/.' head is skipped), then name with mode, unless it ends in '.'; an existing name is
-	fine only with exist_ok when it is a directory."""
-	name = os.fspath(name)
-	head, tail = os.path.split(name)
-	if not tail:
-		head, tail = os.path.split(head)
+	levels raised RecursionError): the missing parents are made from the top (default mode; one made meanwhile is
+	fine), then name with mode; an existing name is fine only with exist_ok when it is a directory."""
 	missing = []
-	part_head, part_tail = head, tail
-	while part_head and part_tail and not os.path.exists(part_head):
-		missing.append(part_head)
-		part_head, part_tail = os.path.split(part_head)
-		if not part_tail:
-			part_head, part_tail = os.path.split(part_head)
+	head = os.path.dirname(name.rstrip(os.sep))
+	while head and not os.path.exists(head):
+		missing.append(head)
+		parent = os.path.dirname(head.rstrip(os.sep))
+		if parent == head:
+			break
+		head = parent
 	for directory in reversed(missing):
-		directory_head, directory_tail = os.path.split(directory)
-		if not directory_tail:
-			directory_head, directory_tail = os.path.split(directory_head)
-		if directory_tail == os.curdir:
-			continue
 		try:
 			os.mkdir(directory)
 		except FileExistsError:
 			pass
-	if missing and tail == os.curdir:
-		# xxx/newdir/. exists once xxx/newdir does
-		return
 	try:
 		os.mkdir(name, mode)
 	except OSError:

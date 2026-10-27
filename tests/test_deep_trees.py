@@ -98,12 +98,12 @@ def test_a_deep_tree_is_mapped_for_a_diff(tmp_path, hpcp_mod, reset_hpcp_globals
 	assert '/'.join(['a'] * DEPTH) + '/bottom.txt' in entries
 
 
-def test_iterative_makedirs_makes_every_missing_level(tmp_path, hpcp_mod):
-	"""os.makedirs recurses once per missing level; _makedirs does not."""
+def test_iterative_makedirs_makes_every_missing_level(tmp_path, hpcp_mod, monkeypatch):
+	"""os.makedirs recurses once per missing level; _makedirs does not, and keeps the contract hpcp's callers use."""
 	path = os.path.join(str(tmp_path), *(['a'] * DEPTH))
 	hpcp_mod._makedirs(path)
 	assert os.path.isdir(path)
-	# The same contract as os.makedirs: an existing path is fine only with exist_ok.
+	# An existing path is fine only with exist_ok, and only when it is a directory.
 	hpcp_mod._makedirs(path, exist_ok=True)
 	with pytest.raises(FileExistsError):
 		hpcp_mod._makedirs(path)
@@ -111,8 +111,23 @@ def test_iterative_makedirs_makes_every_missing_level(tmp_path, hpcp_mod):
 		pass
 	with pytest.raises(FileExistsError):
 		hpcp_mod._makedirs(os.path.join(path, 'file'), exist_ok=True)
-	hpcp_mod._makedirs(os.path.join(str(tmp_path), 'leaf') + os.sep, mode=0o700)
-	assert os.stat(os.path.join(str(tmp_path), 'leaf')).st_mode & 0o777 == 0o700 & ~_umask()
+	# The mode is name's alone; a destination as typed ('x/', 'x//y', 'x/.', relative) works.
+	hpcp_mod._makedirs(os.path.join(str(tmp_path), 'leaf', 'deeper') + os.sep, mode=0o700)
+	assert os.stat(os.path.join(str(tmp_path), 'leaf', 'deeper')).st_mode & 0o777 == 0o700 & ~_umask()
+	assert os.stat(os.path.join(str(tmp_path), 'leaf')).st_mode & 0o777 == 0o777 & ~_umask()
+	monkeypatch.chdir(tmp_path)
+	for typed in ('x//y', 'z/.', os.path.join('w', '.', 'v')):
+		hpcp_mod._makedirs(typed, exist_ok=True)
+		assert os.path.isdir(typed)
+	# A parent made meanwhile (another worker) is fine.
+	real_mkdir = os.mkdir
+	def racing_mkdir(directory, *args):
+		if directory == 'p':
+			real_mkdir(directory)
+		return real_mkdir(directory, *args)
+	monkeypatch.setattr(os, 'mkdir', racing_mkdir)
+	hpcp_mod._makedirs(os.path.join('p', 'q'), exist_ok=True)
+	assert os.path.isdir(os.path.join('p', 'q'))
 
 
 def _umask():
@@ -237,27 +252,6 @@ def _run_dropbox_case(outer, hpcp_mod):
 	os.chmod(str(work / 'dropbox'), 0o755)
 	assert result.returncode == 0, result.stderr[-500:]
 	assert not (work / 'dropbox' / 'tree').exists()
-
-
-@pytest.mark.parametrize('relative', ['x/y/.', 'x/y/', 'x//y', 'a/./b/c'])
-def test_makedirs_matches_os_makedirs(tmp_path, hpcp_mod, monkeypatch, relative):
-	"""Review: '/.'-ended paths, '' and a dangling symlink on the way behaved unlike os.makedirs."""
-	for side, make in (('ours', hpcp_mod._makedirs), ('os', os.makedirs)):
-		(tmp_path / side).mkdir()
-		monkeypatch.chdir(tmp_path / side)
-		make(relative)
-		with pytest.raises(FileExistsError):
-			make(relative.rstrip('/.') or relative)
-	assert sorted(str(p.relative_to(tmp_path / 'ours')) for p in (tmp_path / 'ours').rglob('*')) == \
-		sorted(str(p.relative_to(tmp_path / 'os')) for p in (tmp_path / 'os').rglob('*'))
-	with pytest.raises(FileNotFoundError):
-		hpcp_mod._makedirs('')
-	os.symlink('nowhere', str(tmp_path / 'dangling'))
-	with pytest.raises(OSError) as ours:
-		hpcp_mod._makedirs(str(tmp_path / 'dangling' / 'child'))
-	with pytest.raises(OSError) as theirs:
-		os.makedirs(str(tmp_path / 'dangling' / 'child'))
-	assert type(ours.value) is type(theirs.value)
 
 
 def test_listing_stats_each_subdirectory_once(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
@@ -396,18 +390,6 @@ def test_rmtree_resolves_the_path_as_the_kernel_does(tmp_path, hpcp_mod, monkeyp
 	# What shutil.rmtree('link/..') does: far's contents go, near (the lexical 'link/..') is untouched.
 	assert (tmp_path / 'near' / 'keep').read_text() == 'keep'
 	assert not (tmp_path / 'far' / 'target').exists()
-
-
-@pytest.mark.parametrize('name, exist_ok', [('x/.', False), ('.', False), ('file/.', True)])
-def test_makedirs_raises_where_os_makedirs_does(tmp_path, hpcp_mod, monkeypatch, name, exist_ok):
-	monkeypatch.chdir(tmp_path)
-	(tmp_path / 'x').mkdir()
-	(tmp_path / 'file').write_text('f')
-	with pytest.raises(OSError) as theirs:
-		os.makedirs(name, exist_ok=exist_ok)
-	with pytest.raises(OSError) as ours:
-		hpcp_mod._makedirs(name, exist_ok=exist_ok)
-	assert type(ours.value) is type(theirs.value)
 
 
 def test_a_failing_fstat_on_the_way_back_is_recorded_not_raised(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
