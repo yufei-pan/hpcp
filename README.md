@@ -17,6 +17,13 @@ Block-image functionality is in **beta**. Only available on Linux. Possible use 
 
 hpcp.bat available on github: simple old tk based GUI intended for basic windows functionality.
 
+## Upgrading to 9.80 from 9.79
+
+- **`<TOOL>_PATH` warnings:** every `<TOOL>_PATH` variable (`CP_PATH`, `MOUNT_PATH`, `DD_PATH`, ...) that does not name an executable is now named once at the start of every run (`Warning: CP_PATH=... is not an executable file; using cp from PATH.`). 9.79 named one only when it started that tool itself, so a bad `CP_PATH` (cp runs in the worker processes) was never named. A variable that other software sets for its own use prints that line too; it is harmless, and hpcp uses the tool found on PATH.
+- **Removals:** a removal (plain `-rm`, a move, `-rme`) now holds one directory descriptor per level of the tree, and hpcp raises its soft open-files limit to the hard one at start; the tools it runs inherit the higher limit. A tree deeper than the hard limit (`ulimit -Hn`: 524288 on systemd hosts, 4096 on EL7) stops with "Too many open files" errors and leaves its deep part. On macOS the soft limit (256) stays, so trees deeper than about 250 levels stop there. See [docs/limitations.md](docs/limitations.md).
+- **multiCMD 1.56** is required (`pip` installs it). Without it, or with an older one, hpcp uses its built-in copy, which is the full multiCMD 1.56.
+- **Correction to the 9.77 and 9.78 notes:** they wrongly named Ubuntu 22.04. Only e2fsprogs 1.45.x-1.46.2 (EL8, Debian 11, Ubuntu 20.04) left the empty root-owned file `/hpcp-ext-feature-probe`; 1.46.5 (Ubuntu 22.04) and 1.47 don't, and EL9 is untested. The file is safe to remove by hand.
+
 ## Important Implementation Detail
 
 By default, **hpcp** only checks:
