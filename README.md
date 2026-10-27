@@ -51,7 +51,7 @@ It is recommended to install via **pip**, but **hpcp** can also function as a si
 
 **Note**:  
 - Using `pip` will optionally install the hashing library [xxhash](https://github.com/Cyan4973/xxHash), which can reduce CPU usage for partial hashing and increase performance when using `-fh --full_hash`.  
-- `pip` also installs [multiCMD](https://github.com/yufei-pan/multiCMD), used to issue commands and provide helper functions. If it is not available, `hpcp.py` will use its built-in multiCMD interface, which is more limited, has lower performance, and may have issues with files containing spaces. Please install **multiCMD** if possible.
+- `pip` also installs [multiCMD](https://github.com/yufei-pan/multiCMD), used to issue commands and provide helper functions. If it is not available, or older than the version hpcp requires, `hpcp.py` uses its built-in copy, which is the full multiCMD.
 
 ## Disk Imaging Feature Note
 
