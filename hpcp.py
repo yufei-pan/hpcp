@@ -2673,10 +2673,7 @@ def _walk(top, device=None, foreign=None):
 						if foreign is not None:
 							foreign(dirpath)
 						continue
-			target = _scan_target(fd, dirpath) if fd is not None else dirpath
-			if target is None:
-				continue
-			with os.scandir(target) as entries:
+			with os.scandir(_scan_target(fd, dirpath) if fd is not None else dirpath) as entries:
 				for entry in entries:
 					try:
 						is_dir = entry.is_dir(follow_symlinks=not enter)
@@ -2864,9 +2861,6 @@ def get_file_list_serial(root,exclude=None,append_hash=False,full_hash=False,rec
 				continue
 		try:
 			target = _scan_target(scan_fd, current) if scan_fd is not None else current
-			if target is None:
-				eprint(f'Listing error: {current}: it was replaced since it was opened')
-				continue
 			for entry in _scan_dir(target, current):
 				path = os.path.join(current, entry.name) if scan_fd is not None else entry.path
 				# update the progress bar every 0.5 seconds
@@ -9171,17 +9165,13 @@ _PROC_FD = not _SCANDIR_FD and os.path.isdir('/proc/self/fd')
 
 def _scan_target(fd, path):
 	"""What os.scandir reads directory descriptor fd (open on directory path) through: fd itself; else /proc/self/fd/N
-	(Python 3.6 on Linux); else path while it still names the directory held (one stat; the descriptor, still held,
-	keeps an automount there mounted), None when it no longer does (swapped since the open, for a symlink say)."""
+	(Python 3.6 on Linux); else path (Python 3.6 elsewhere; the descriptor, still held, keeps an automount there
+	mounted, and the removal still goes by descriptors, so a directory swapped for a symlink is refused there)."""
 	if _SCANDIR_FD:
 		return fd
 	if _PROC_FD:
 		return '/proc/self/fd/%d' % fd
-	try:
-		held, named = os.fstat(fd), os.stat(path)
-	except OSError:
-		return None
-	return path if (held.st_dev, held.st_ino) == (named.st_dev, named.st_ino) else None
+	return path
 
 def _destination_roots(dests):
 	"""{abspath(dest): (its real path, that path's _path_identity, dest's own identity)} for -rme: what lies below a
