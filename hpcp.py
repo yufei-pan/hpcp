@@ -9585,13 +9585,10 @@ def remove_moved_sources(src_paths, file_list, sym_links, single_thread=False, m
 			continue
 		roots.append(path)
 	root_ids = {root: (root_ids or {}).get(root, _directory_identity(root) if root_ids is None else None) for root in roots}
-	# Each listed entry with the outermost source root it lies below, so its removal is checked from there down: a scan
-	# of the roots when they are few, else a lookup of the entry's ancestors (-sfl gives one root per file).
-	by_length = [(root, root.rstrip(os.sep) + os.sep) for root in sorted(roots, key=len)]
+	# Each listed entry with the outermost source root it lies below, so its removal is checked from there down: a
+	# lookup of the entry's ancestors (-sfl gives one root per file).
 	root_set = set(roots)
 	def outermost_root(path):
-		if len(by_length) <= 16:
-			return next((root for root, prefix in by_length if path == root or path.startswith(prefix)), None)
 		found, candidate = None, path
 		while True:
 			if candidate in root_set:
