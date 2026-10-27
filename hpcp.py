@@ -1489,6 +1489,7 @@ def _build_ntfs(params):
 def _probe_exfat(device):
 	"""Read exfat sector and cluster size from dump.exfat."""
 	params = {}
+	# Geometry only: under LC_ALL=C it prints a non-ASCII label as '?', so labels come from blkid.
 	for line in run_command_in_multicmd_with_path_check(['dump.exfat', device], quiet=True, extra_env=_C_LOCALE):
 		key, sep, value = line.partition(':')
 		if not sep:
@@ -1576,6 +1577,7 @@ _FS_MKFS_BUILDERS.update({'ntfs': _build_ntfs, 'exfat': _build_exfat, 'f2fs': _b
 def _probe_udf(device):
 	"""Read udf block size and revision from udfinfo."""
 	params = {}
+	# Geometry only: under LC_ALL=C it prints a non-ASCII label as '?', so labels come from blkid.
 	for line in run_command_in_multicmd_with_path_check(['udfinfo', device], quiet=True, extra_env=_C_LOCALE):
 		key, sep, value = line.partition('=')
 		if not sep:
