@@ -5725,52 +5725,6 @@ def _mounts_below(path, mount_points):
 _DIR_FD_WALK = (os.open in os.supports_dir_fd and os.listdir in os.supports_fd and os.stat in os.supports_dir_fd
 	and os.stat in os.supports_follow_symlinks and os.unlink in os.supports_dir_fd and os.rmdir in os.supports_dir_fd and hasattr(os, 'O_NOFOLLOW'))
 
-def _remove_tree_by_path(top, top_dev, mount_points):
-	"""The path-based walk of _remove_tree_around_mounts, for platforms without directory descriptors (open to a
-	swap of a directory for a symlink between the check and the use). top is a real path; returns (kept, errors)."""
-	kept, errors = [], []
-	# (directory, its entries already handled): a directory is pushed again after its children, then removed.
-	stack = [(top, False)]
-	while stack:
-		directory, done = stack.pop()
-		if done:
-			try:
-				os.rmdir(directory)
-			except FileNotFoundError:
-				pass
-			except OSError as e:
-				# Not empty: a kept mount below it, or an entry whose removal already failed (recorded).
-				if e.errno not in (errno.ENOTEMPTY, errno.EEXIST):
-					errors.append(f'{os.path.relpath(directory, top)}: {e.strerror}')
-			continue
-		stack.append((directory, True))
-		try:
-			names = os.listdir(directory)
-		except OSError as e:
-			errors.append(f'{os.path.relpath(directory, top)}: {e.strerror}')
-			continue
-		for name in names:
-			child = os.path.join(directory, name)
-			try:
-				info = os.lstat(child)
-			except FileNotFoundError:
-				continue
-			except OSError as e:
-				errors.append(f'{os.path.relpath(child, top)}: {e.strerror}')
-				continue
-			if child in mount_points or (stat.S_ISDIR(info.st_mode) and info.st_dev != top_dev):
-				kept.append(os.path.relpath(child, top))
-			elif stat.S_ISDIR(info.st_mode):
-				stack.append((child, False))
-			else:
-				try:
-					os.unlink(child)
-				except FileNotFoundError:
-					pass
-				except OSError as e:
-					errors.append(f'{os.path.relpath(child, top)}: {e.strerror}')
-	return sorted(kept), errors
-
 def _descend(fd, parts, flags):
 	"""Open each of parts in turn, the first below descriptor fd, each with flags (O_NOFOLLOW | O_DIRECTORY): a component
 	that is a symlink or no directory raises OSError (ELOOP, ENOTDIR). Takes fd over (closed); returns the last one."""
@@ -5803,10 +5757,10 @@ def _remove_tree_around_mounts(path, mount_points=None, target_root=None):
 	The walk goes by directory descriptors, as shutil.rmtree does: every directory is opened with O_NOFOLLOW
 	relative to its parent (path itself included) and checked against the lstat taken before descending, and entries are read and removed
 	relative to the descriptor, so a directory swapped for a symlink during the walk is refused, never followed
-	(this runs as root on trees other users may write to). Where the platform lacks the descriptor functions it
-	falls back to a walk by path, which does not close that race.
+	(this runs as root on trees other users may write to). The apply runs only on Linux, which has every descriptor
+	function this needs.
 
-	target_root: the tree the removal must stay in (the apply's target; '/' when None). The top's parent is resolved once and must lie inside it; with the descriptor functions it is then reached from a descriptor of target_root one component at a time with O_NOFOLLOW, and the top is examined, entered and removed relative to its parent's descriptor. A directory above the top swapped for a symlink after the apply checked the path therefore refuses the removal instead of acting outside the target (this runs as root on trees other users may write to).
+	target_root: the tree the removal must stay in (the apply's target; '/' when None). The top's parent is resolved once and must lie inside it; it is then reached from a descriptor of target_root one component at a time with O_NOFOLLOW, and the top is examined, entered and removed relative to its parent's descriptor. A directory above the top swapped for a symlink after the apply checked the path therefore refuses the removal instead of acting outside the target (this runs as root on trees other users may write to).
 	"""
 	if mount_points is None:
 		mount_points = {entry['mount_point'] for entry in _mountinfo_entries()}
@@ -5820,24 +5774,6 @@ def _remove_tree_around_mounts(path, mount_points=None, target_root=None):
 	top = os.path.join(parent_real, name)
 	if parent_real != root_real and not parent_real.startswith(root_real.rstrip(os.sep) + os.sep):
 		return [], [f'..: resolves outside {root_real}; not removed']
-	if not _DIR_FD_WALK:
-		try:
-			top_info = os.lstat(top)
-		except FileNotFoundError:
-			return [], []
-		except OSError as e:
-			return [], [f'.: {e.strerror}']
-		if not stat.S_ISDIR(top_info.st_mode):
-			return [], ['.: not a directory (a symlink?)']
-		if top in mount_points:
-			return ['.'], []
-		try:
-			parent_dev = os.lstat(parent_real).st_dev
-		except OSError as e:
-			return [], [f'..: {e.strerror}']
-		if parent_dev != top_info.st_dev:
-			return ['.'], []
-		return _remove_tree_by_path(top, top_info.st_dev, mount_points)
 	kept, errors = [], []
 	flags = os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0) | os.O_NOFOLLOW | getattr(os, 'O_CLOEXEC', 0)
 	try:
