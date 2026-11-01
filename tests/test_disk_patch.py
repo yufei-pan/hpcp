@@ -1,5 +1,6 @@
 import contextlib
 import errno
+import multiprocessing.util
 import os
 import re
 import shutil
@@ -530,7 +531,7 @@ def _mounted(device, fstype=None, options=None):
 	try:
 		yield mount_point
 	finally:
-		subprocess.run(['umount', mount_point], capture_output=True)
+		_run('umount', mount_point)
 		os.rmdir(mount_point)
 
 
@@ -1131,6 +1132,9 @@ def test_live_partition_with_temp_dirs_on_the_live_filesystem(tmp_path, hpcp_mod
 	_make_golden(old)
 	_make_newer(old, new, label=None, raw=False, mbr=False, gpt_name=None)
 	live_image = new if live_side == 'new' else old
+	# Fix multiprocessing's own temp dir (the forkserver socket, Python 3.14's default start method) under the real
+	# /tmp now: made later it would land in the patched tempdir below, and the forkserver outliving the pool would hold that mount.
+	multiprocessing.util.get_temp_dir()
 	with _attached(live_image, read_only=False) as loop:
 		with _mounted(loop + 'p3') as live_root:
 			temp_dir = os.path.join(live_root, 'tmpdir')
