@@ -1808,7 +1808,8 @@ def test_process_get_diff_image_claims_every_volume_name(trees, hpcp_mod, tmp_pa
 
 	monkeypatch.setattr(hpcp_mod, 'create_image', fail)
 	with pytest.raises(RuntimeError, match=r'p_1\.img already exists'):
-		hpcp_mod.process_get_diff_image([str(new)], None, [str(base)], None, str(out), [], [], max_workers=1)
+		with _mount_session(hpcp_mod) as (mount_points, loop_devices):
+			hpcp_mod.process_get_diff_image([str(new)], None, [str(base)], None, str(out), mount_points, loop_devices, max_workers=1)
 	assert second.read_text() == 'keep me'
 	assert not out.exists()
 
@@ -1827,8 +1828,8 @@ def test_process_get_diff_image_sizes_volumes_by_allocation(trees, hpcp_mod, tmp
 		raise Sentinel()
 
 	monkeypatch.setattr(hpcp_mod, 'create_image', capture)
-	with pytest.raises(Sentinel):
-		hpcp_mod.process_get_diff_image([str(new)], None, [str(base)], None, str(tmp_path / 'p.img'), [], [], max_workers=1)
+	with pytest.raises(Sentinel), _mount_session(hpcp_mod) as (mount_points, loop_devices):
+		hpcp_mod.process_get_diff_image([str(new)], None, [str(base)], None, str(tmp_path / 'p.img'), mount_points, loop_devices, max_workers=1)
 	assert captured['init_size'] >= 200 * 4096
 	# F9: every A/M row also reserves 512 bytes of inode overhead (xfs).
 	rows = _changes(hpcp_mod, new, base)
@@ -2632,7 +2633,8 @@ def test_process_get_diff_image_compares_content_only_when_a_side_is_fat(trees, 
 	monkeypatch.setattr(hpcp_mod, 'create_image', stop)
 	monkeypatch.setattr(hpcp_mod, '_plan_dest_images', lambda init_size, dest_image_size=0: (1, 1 << 20))
 	try:
-		result = hpcp_mod.process_get_diff_image([str(new)], None, [str(base)], None, str(tmp_path / 'p.img'), [], [], max_workers=1)
+		with _mount_session(hpcp_mod) as (mount_points, loop_devices):
+			result = hpcp_mod.process_get_diff_image([str(new)], None, [str(base)], None, str(tmp_path / 'p.img'), mount_points, loop_devices, max_workers=1)
 		assert result is None
 	except Stop:
 		pass
