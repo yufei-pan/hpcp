@@ -232,9 +232,9 @@ except ImportError:
 	hasher = hashlib.blake2b()
 	xxhash_available = False
 
-version = '9.80'
+version = '9.81'
 __version__ = version
-COMMIT_DATE = '2026-10-27'
+COMMIT_DATE = '2026-11-05'
 
 MAGIC_NUMBER = 1.61803398875
 RANDOM_DESTINATION_SELECTION = False
@@ -302,6 +302,8 @@ ERROR_TO_RETURNCODE_TABLE = {
 	'Remove file failed': 210,
 	'Remove directory failed': 211,
 	'Remove skipped': 212,
+	# Two sources of one run land on one destination file: the first stays, the others are not copied (cp fails the same way).
+	'Destination clash': 213,
 	'Dest path DataType error': 220,
 	'Destination image broken': 221,
 	'Cannot fix destination image': 222,
@@ -772,6 +774,8 @@ def _init_worker():
 	global _worker_initialized
 	if not _worker_initialized:
 		_on_worker_start()
+		# A worker that did not fork from the parent (forkserver, the default from Python 3.14) has a new stdout.
+		_escape_unencodable_stdout()
 		_worker_initialized = True
 
 # The run settings hpcp() keeps in module globals. A pool worker that did not fork from the parent
@@ -2580,14 +2584,18 @@ def get_file_list(path, exclude=None, append_hash=False, full_hash=False, max_wo
 	if cache_key in _get_file_list_cache:
 		return _get_file_list_cache[cache_key]
 	start_time = time.monotonic()
-	print(f"Getting file list for {path}")
+	# Said for a directory only: a list (-sfl) gives one source per file, two lines each say nothing.
+	announce = os.path.isdir(path)
+	if announce:
+		print(f"Getting file list for {path}")
 	if parallel_file_listing:
 		file_list, links, size, folders = get_file_list_parallel(path, max_workers=max_workers, exclude=exclude, append_hash=append_hash, full_hash=full_hash, boundary=boundary)
 	else:
 		file_list, links, size, folders = get_file_list_serial(path, exclude=exclude, append_hash=append_hash, full_hash=full_hash, boundary=boundary)
 	result = (file_list, links, size, folders)
 	_get_file_list_cache[cache_key] = result
-	print(f"Time taken to get file list: {time.monotonic() - start_time:0.4f} seconds")
+	if announce:
+		print(f"Time taken to get file list: {time.monotonic() - start_time:0.4f} seconds")
 	return result
 
 def _file_list_rate_limit(limiter_state, increment=1):
@@ -3575,7 +3583,7 @@ def copy_files_parallel(src_path, dest_paths, max_workers, full_hash=False, verb
 	return copy_file_list_parallel(file_list=file_list,links=links,src_path=src_path, dest_paths=dest_paths, max_workers=max_workers, full_hash=full_hash, verbose=verbose,files_per_job=files_per_job,estimated_size = init_size)
 
 def copy_files_parallel_batch(jobs, max_workers, full_hash=False, verbose=False,files_per_job=1,parallel_file_listing=False,exclude=None,
-							  exit_not_enough_space=False):
+							  exit_not_enough_space=False,claimed=None):
 	newJobs = []
 	total_symLinks = {}
 	total_files = []
@@ -3597,6 +3605,8 @@ def copy_files_parallel_batch(jobs, max_workers, full_hash=False, verbose=False,
 				eprint(f'Not enough space: free space on {dest_paths} too small, skipping copy {src_path}')
 				print(f'Free space: {format_bytes(dest_free_space)}B, Required: {format_bytes(init_size)}B')
 				continue
+		file_list = _first_claims(claimed, file_list, src_path, dest_paths)
+		links = _first_claims(claimed, links, src_path, dest_paths)
 		newJobs.append((src_path, dest_paths, file_list))
 		total_item_count += len(file_list)
 		total_size_count += init_size
@@ -3643,11 +3653,29 @@ def copy_files_serial(src_path, dest_paths, full_hash=False, verbose=False,exclu
 	_print_operation_summary(apb, endTime - start_time, show_bandwidth=True)
 	return apb.item_counter, apb.size_counter , symLinks , frozenset(file_list)
 
+def _first_claims(claimed, paths, src_path, dest_paths):
+	"""paths (src_path itself or below it) without those whose destination an earlier source of this run holds: the first
+	source in order keeps it, as cp refuses to overwrite a file it just created, and each clash is reported. A file lives
+	in one of dest_paths, so the first names its place. claimed: this run's {destination: source path}, None when there is
+	one source (no clash is possible)."""
+	if claimed is None:
+		return paths
+	src_root, dest_root = src_path.rstrip(os.sep), dest_paths[0].rstrip(os.sep)
+	kept = []
+	for path in paths:
+		dest = dest_root + path[len(src_root):]
+		first = claimed.setdefault(dest, path)
+		if first == path:
+			kept.append(path)
+		else:
+			eprint(f'Destination clash: {dest} is already copied from {first}, not copying {path} over it')
+	return kept
+
 def _link_dests(links, src_path, dest_paths):
 	"""{link: [where it goes in each dest]} for the symlinks a listing of src_path found."""
 	return {link: [os.path.join(dest_path, os.path.relpath(link, src_path)) for dest_path in dest_paths] for link in links}
 
-def copy_files_serial_batch(jobs, full_hash=False, verbose=False,exclude=None,exit_not_enough_space=False):
+def copy_files_serial_batch(jobs, full_hash=False, verbose=False,exclude=None,exit_not_enough_space=False,claimed=None):
 	# skip if src path or dest path is longer than 4096 characters
 	global FILES_RATE_LIMIT
 	global BYTES_RATE_LIMIT
@@ -3664,7 +3692,9 @@ def copy_files_serial_batch(jobs, full_hash=False, verbose=False,exclude=None,ex
 			continue
 		if exclude and is_excluded(src_path,exclude):
 			continue
-		if not os.path.isdir(src_path):
+		if not os.path.isdir(src_path) or os.path.islink(src_path):
+			if not _first_claims(claimed, [src_path], src_path, dest_paths):
+				continue
 			src_size, _ , symLinks = copy_file(src_path, dest_paths,full_hash=full_hash, verbose=verbose)
 			#return 1, src_size , symLinks , frozenset([src_path])
 			copied_count += 1
@@ -3682,6 +3712,8 @@ def copy_files_serial_batch(jobs, full_hash=False, verbose=False,exclude=None,ex
 				eprint(f'Not enough space: free space on {dest_paths} too small, skipping copy {src_path}')
 				print(f'Free space: {format_bytes(dest_free_space)}B, Required: {format_bytes(init_size)}B')
 				continue
+		file_list = _first_claims(claimed, file_list, src_path, dest_paths)
+		links = _first_claims(claimed, links, src_path, dest_paths)
 		newJobs.append((src_path, dest_paths, file_list, set(links), init_size))
 		total_item_count += len(file_list)
 		total_size_count += init_size
@@ -3713,7 +3745,7 @@ def copy_files_serial_batch(jobs, full_hash=False, verbose=False,exclude=None,ex
 
 class copy_scheduler:
 	def __init__(self, max_workers = multiprocessing.cpu_count(), full_hash=False, verbose=False,files_per_job=1,
-			  parallel_file_listing=False,exclude=None, exit_not_enough_space=False):
+			  parallel_file_listing=False,exclude=None, exit_not_enough_space=False, claimed=None):
 		self.max_workers = max_workers
 		self.full_hash = full_hash
 		self.verbose = verbose	
@@ -3728,6 +3760,8 @@ class copy_scheduler:
 		self.total_sym_links = {}
 		self.total_file_list = []
 		self.exit_not_enough_space = exit_not_enough_space
+		# See _first_claims: kept across clear(), so sources processed one by one (-nb) are judged against each other too.
+		self.claimed = claimed
 	def add_dir_sync(self, src, dests):
 		self.dir_sync_job.append((src, dests))
 	def add_copy(self, src, dests):
@@ -3751,11 +3785,11 @@ class copy_scheduler:
 			else:
 				print("Using blake2b for skipping")
 			if self.max_workers == 1:
-				copy_counter, copy_size_counter , rtnSymLinks , file_list = copy_files_serial_batch(self.copy_job, full_hash = self.full_hash,verbose=self.verbose,exclude=self.exclude,exit_not_enough_space=self.exit_not_enough_space)
+				copy_counter, copy_size_counter , rtnSymLinks , file_list = copy_files_serial_batch(self.copy_job, full_hash = self.full_hash,verbose=self.verbose,exclude=self.exclude,exit_not_enough_space=self.exit_not_enough_space,claimed=self.claimed)
 				#total_file_list.update(trim_paths(file_list,src))
 				#self.total_file_list.update(trim_paths(rtnSymLinks.keys(),src))
 			else:
-				copy_counter, copy_size_counter , rtnSymLinks , file_list = copy_files_parallel_batch(self.copy_job, max_workers=self.max_workers,full_hash = self.full_hash,verbose=self.verbose,files_per_job=self.files_per_job,parallel_file_listing=self.parallel_file_listing,exclude=self.exclude,exit_not_enough_space=self.exit_not_enough_space)
+				copy_counter, copy_size_counter , rtnSymLinks , file_list = copy_files_parallel_batch(self.copy_job, max_workers=self.max_workers,full_hash = self.full_hash,verbose=self.verbose,files_per_job=self.files_per_job,parallel_file_listing=self.parallel_file_listing,exclude=self.exclude,exit_not_enough_space=self.exit_not_enough_space,claimed=self.claimed)
 				#total_file_list.update(trim_paths(file_list,src))
 				#self.total_file_list.update(trim_paths(rtnSymLinks.keys(),src))
 			print(f'Total files copied:     {copy_counter}')
@@ -4627,6 +4661,22 @@ def build_entry_map(root, prefix='', parents=None, exclude=None, logical_root=No
 			if post_filter and _logically_excluded(rel, logical_root, exclude):
 				continue
 			entries[prefix + rel.replace(os.sep, '/') + ('/' if is_dir else '')] = path
+	return entries
+
+def _source_entry_map(src, exclude=None, max_workers=multiprocessing.cpu_count(), parallel_file_listing=False):
+	"""build_entry_map for one source of a compare, keyed where the copy lands it. A source from a list is keyed by its
+	landing, with the directories that path implies; a file or a link in a list is an entry of its own."""
+	if not isinstance(src, _ListedSource):
+		return build_entry_map(src, _trim_prefix(src), exclude=exclude, max_workers=max_workers, parallel_file_listing=parallel_file_listing)
+	landing = src.landing.replace(os.sep, '/')
+	entries = {}
+	for source, parent in _implied_parents(src):
+		if os.path.isdir(source) and not os.path.islink(source):
+			entries[parent.replace(os.sep, '/') + '/'] = os.path.abspath(source)
+	if os.path.isdir(src) and not os.path.islink(src):
+		entries.update(build_entry_map(src, landing + '/' if landing else '', exclude=exclude, max_workers=max_workers, parallel_file_listing=parallel_file_listing))
+	elif not (exclude and is_excluded(src, exclude)):
+		entries[landing] = os.path.abspath(src)
 	return entries
 
 def _store_layout_parents(new_dir, store_root):
@@ -8167,6 +8217,14 @@ def remove_extra_dirs(src_paths, dests,exclude=None,dest_image=False,keep=(),des
 			eprint(f'All destination paths are too long: Skipping {src_paths}')
 		return 0, 0, set(), frozenset()
 	mapping = _src_to_dest_map(src_paths, dests, dest_image)
+	# With a list, only what its directories cover is judged (see remove_extra_files).
+	listed_scope = None
+	if _has_listed(src_paths):
+		mapping = _directory_sources(mapping)
+		listed_scope = {}
+		for src_abs, actual_dests in mapping:
+			for actual_dest in actual_dests:
+				listed_scope.setdefault(actual_dest, []).append(src_abs)
 	kept = _kept_paths(keep, mapping)
 	copied_roots = {actual_dest for _, actual_dests in mapping for actual_dest in actual_dests}
 	excluded_roots = _excluded_roots(mapping, exclude)
@@ -8223,7 +8281,9 @@ def remove_extra_dirs(src_paths, dests,exclude=None,dest_image=False,keep=(),des
 				walk_into.append(dirname)
 				relative_path = os.path.relpath(dest_dir_path, dest)
 				# Check if the directory exists in the source paths
-				if dest_image:
+				if listed_scope is not None:
+					in_source = _in_listed_source(os.path.abspath(dest_dir_path), listed_scope)
+				elif dest_image:
 					# The image mirrors this run's sources at their absolute paths: a directory is theirs when it lies on
 					# the way to one (a parent process_copy created) or below one and still exists there.
 					live_path = os.path.join(os.path.sep, relative_path)
@@ -8243,6 +8303,34 @@ def remove_extra_dirs(src_paths, dests,exclude=None,dest_image=False,keep=(),des
 	_remove_listed_files(_items_below(((directory, extraDirs[directory][0]) for directory in ordered), dest_roots, sort=False), rmdir=True,
 		one_filesystem=True)
 
+def _directory_sources(mapping):
+	"""The directory sources of _src_to_dest_map's mapping: what -rme cleans below when a source came from a list."""
+	return [(src_abs, actual_dests) for src_abs, actual_dests in mapping if os.path.isdir(src_abs) and not os.path.islink(src_abs)]
+
+def _in_listed_source(path, scope):
+	"""-rme with a list: False only when destination directory path lies below a listed directory's copy (scope:
+	{its destination: [its source]}) and no such source holds its counterpart. Anything else is not the list's to judge."""
+	judged = False
+	for part in _path_and_parents(path):
+		for src_abs in scope.get(part, ()):
+			judged = True
+			if os.path.lexists(os.path.normpath(os.path.join(src_abs, os.path.relpath(path, part)))):
+				return True
+	return not judged
+
+def _source_dest(src, dest, dest_image=False):
+	"""Where source src lands for destination dest, as an absolute path: the one rule the copy and -rme share.
+	See _src_to_dest_map for the layouts; a source from a list lands at dest/<its landing> (_ListedSource)."""
+	if dest_image:
+		return os.path.abspath(dest + os.path.abspath(src))
+	if isinstance(src, _ListedSource):
+		return os.path.abspath(os.path.join(dest, src.landing))
+	# basename respects trailing separators: 'src/' -> '', 'src' -> 'src'
+	sourceFolderName = os.path.basename(src)
+	if os.path.basename(dest) == '' and sourceFolderName:
+		return os.path.abspath(os.path.join(dest, sourceFolderName))
+	return os.path.abspath(dest)
+
 def _src_to_dest_map(src_paths, dests, dest_image=False):
 	"""Build ``[(src_abs, [actual_dest_abs, ...]), ...]`` mirroring process_copy.
 
@@ -8254,6 +8342,7 @@ def _src_to_dest_map(src_paths, dests, dest_image=False):
 	                            both, so it behaves like ``hpcp src/ dest/``
 	  * with ``dest_image`` (``-di``) -> files land in ``dest/<absolute src>/...``
 	                            for every dest, trailing separator or not
+	  * a source from a list -> files land in ``dest/<its path>`` (``_ListedSource``)
 
 	The list is sorted by ``src_abs`` length (longest first) so that nested
 	srcs are attributed to the most specific entry.
@@ -8262,18 +8351,7 @@ def _src_to_dest_map(src_paths, dests, dest_image=False):
 	for src in src_paths or []:
 		if not src:
 			continue
-		src_abs = os.path.abspath(src)
-		# basename respects trailing separators: 'src/' -> '', 'src' -> 'src'
-		sourceFolderName = os.path.basename(src)
-		actual_dests = []
-		for dest in dests:
-			if dest_image:
-				actual_dests.append(os.path.abspath(dest + src_abs))
-			elif os.path.basename(dest) == '' and sourceFolderName:
-				actual_dests.append(os.path.abspath(os.path.join(dest, sourceFolderName)))
-			else:
-				actual_dests.append(os.path.abspath(dest))
-		mapping.append((src_abs, actual_dests))
+		mapping.append((os.path.abspath(src), [_source_dest(src, dest, dest_image) for dest in dests]))
 	mapping.sort(key=lambda item: len(item[0]), reverse=True)
 	return mapping
 
@@ -8345,19 +8423,24 @@ def _expected_dest_paths(src_entries, src_paths, dests, dest_image=False, mappin
 		return expected
 	if mapping is None:
 		mapping = _src_to_dest_map(src_paths, dests, dest_image)
+	# By the entry's ancestors, not each entry against each source: a list gives one source per file. Every source above
+	# an entry counts: each copied it to its own place.
+	by_source = {}
+	for src_abs, actual_dests in mapping:
+		by_source.setdefault(src_abs, []).extend(actual_dests)
 	for entry in src_entries:
 		if not entry or not os.path.isabs(entry):
 			continue
 		entry_abs = os.path.abspath(entry)
-		for src_abs, actual_dests in mapping:
-			if entry_abs == src_abs:
+		for src_abs in _path_and_parents(entry_abs):
+			actual_dests = by_source.get(src_abs)
+			if actual_dests is None:
+				continue
+			if src_abs == entry_abs:
 				expected.update(actual_dests)
-				break
-			if entry_abs.startswith(src_abs + os.path.sep):
+			else:
 				rel = os.path.relpath(entry_abs, src_abs)
-				for actual_dest in actual_dests:
-					expected.add(os.path.join(actual_dest, rel))
-				break
+				expected.update(os.path.join(actual_dest, rel) for actual_dest in actual_dests)
 	return expected
 
 def remove_extra_files(total_file_list, dests,max_workers,verbose,files_per_job,single_thread=False,exclude=None,parallel_file_listing=False,src_paths=None,sym_links=None,dest_image=False,keep=(),dest_roots=None):
@@ -8395,6 +8478,13 @@ def remove_extra_files(total_file_list, dests,max_workers,verbose,files_per_job,
 		if src_paths:
 			mapping = _src_to_dest_map(src_paths, dests, dest_image)
 			expected = _expected_dest_paths(src_entries, src_paths, dests, dest_image, mapping)
+			# With a list, only what its directories cover is judged: a list says what to copy, not that the rest of the
+			# destination is extra (9.81 moved list sources; a whole-destination reading would delete earlier copies).
+			listed_scope = None
+			if _has_listed(src_paths):
+				mapping = _directory_sources(mapping)
+				listed_scope = {actual_dest for _, actual_dests in mapping for actual_dest in actual_dests}
+				print("Sources from a list: only the directories it names are cleaned of extra files")
 			kept = _kept_paths(keep, mapping)
 			copied_roots = {actual_dest for _, actual_dests in mapping for actual_dest in actual_dests}
 			excluded_roots = _excluded_roots(mapping, exclude)
@@ -8409,6 +8499,8 @@ def remove_extra_files(total_file_list, dests,max_workers,verbose,files_per_job,
 				# never accidentally point os.remove outside of the destination.
 				for path in actual - expected:
 					if path == dest_abs_root or path.startswith(dest_abs_root + os.path.sep):
+						if listed_scope is not None and not any(part in listed_scope for part in _path_and_parents(path)):
+							continue
 						# The copy of an excluded source path is not extra: it was left out, not deleted.
 						if (not _excluded_at_source(path, mapping, exclude, excluded_roots=excluded_roots) and not _is_kept(path, kept, dest_abs_root, copied_roots)
 								and not _in_root_lost_and_found(path, dest_abs_root)):
@@ -8508,26 +8600,118 @@ def mount_src_image(src_images: list,src_paths: list,mount_points: list,loop_dev
 	return src_str.strip('-')
 
 def verify_src_path(src_paths: list):
-	for src in list(src_paths):
-		if not os.path.exists(src):
+	# lexists: a dangling symlink is a source like any other, copied as a link (find lists them).
+	found = []
+	for src in src_paths:
+		if os.path.lexists(src):
+			found.append(src)
+		else:
 			eprint(f"Source path not found: {src} does not exist")
-			src_paths.remove(src)
-		# if ':' in src:
-		#     print(f"Remote syncing is not supported in this version, removing source path {src}.")
-		#     src_paths.remove(src)
+	src_paths[:] = found
 	if len(src_paths) == 0:
 		raise RuntimeError("No source paths: No source paths specified, exiting")
 
-def load_file_list(file_list):
+def _read_list_entries(file_list):
+	"""A list's non-empty entries as (names in order, exact). Bytes through os.fsdecode, so any file name works under any
+	locale. Data holding a NUL byte is NUL-separated (find -print0, fd -0: a path cannot hold one) and exact; otherwise
+	lines split on \\n alone, without a trailing \\r. A missing list file is reported and gives no entries."""
 	file_list_value = '' if file_list is None else str(file_list)
 	if file_list_value in ('-', '/dev/stdin'):
-		return frozenset([entry.strip() for entry in sys.stdin.read().splitlines() if entry.strip()])
-	if not os.path.exists(file_list_value):
+		# A stand-in stream without a binary side (a library caller's StringIO) gives text.
+		binary = getattr(sys.stdin, 'buffer', None)
+		data = binary.read() if binary is not None else os.fsencode(sys.stdin.read())
+	elif not os.path.exists(file_list_value):
 		eprint(f"File list not found: {file_list_value} does not exist")
-		return frozenset()
-	with open(file_list_value, 'r') as f:
-		fileList = frozenset([entry.strip() for entry in f.read().splitlines() if entry.strip()])
-	return fileList
+		return [], False
+	else:
+		with open(file_list_value, 'rb') as f:
+			data = f.read()
+	exact = b'\0' in data
+	names = data.split(b'\0') if exact else [line[:-1] if line.endswith(b'\r') else line for line in data.split(b'\n')]
+	return [os.fsdecode(name) for name in names if name], exact
+
+def load_file_list(file_list):
+	"""A stored list (-fl) as a set, for comparing: entries stripped of surrounding whitespace."""
+	return frozenset(entry.strip() for entry in _read_list_entries(file_list)[0] if entry.strip())
+
+class _ListedSource(str):
+	"""A source path that came from a list (-sfl, stdin): the path as given, plus landing, where it goes below each
+	destination. Travels through src_paths as any other path; _source_dest reads it. See _list_landing."""
+	__slots__ = ('landing',)
+
+def _list_landing(path):
+	"""The path a list entry keeps below the destination, as rsync --files-from and cp --parents: normalised, without a
+	drive, a leading '/' or './', and without any '..', so it never leaves the destination. '' lands at the destination."""
+	path = os.path.splitdrive(os.path.normpath(path))[1]
+	return os.sep.join(part for part in path.split(os.sep) if part not in ('', os.curdir, os.pardir))
+
+def _implied_parents(src):
+	"""(source directory, its landing) for the directories above a _ListedSource's landing, deepest first."""
+	landing, source = src.landing, os.path.normpath(src)
+	while True:
+		landing, source = os.path.dirname(landing), os.path.dirname(source)
+		if not landing:
+			return
+		yield source, landing
+
+def _has_listed(src_paths):
+	return any(isinstance(src, _ListedSource) for src in src_paths)
+
+def load_source_list(file_list):
+	"""A list of sources as _ListedSources, in list order. Hand-written lines stay forgiving: a line with surrounding
+	whitespace is the exact name when that exists, else the stripped one (a NUL-separated list is exact). Entries are
+	not expanded."""
+	names, exact = _read_list_entries(file_list)
+	sources = []
+	for name in names:
+		if not exact and name != name.strip() and not os.path.lexists(name):
+			name = name.strip()
+			if not name:
+				continue
+		source = _ListedSource(name)
+		source.landing = _list_landing(name)
+		sources.append(source)
+	return sources
+
+def _without_covered_sources(src_paths):
+	"""src_paths without a list's repeats and the entries a directory listed above them already covers (plain find lists
+	both), in order. Only by their spelling, so a covered entry would land where its directory's copy puts it anyway. A
+	symlink to a directory covers nothing: it is copied as a link."""
+	listed = {os.path.normpath(src) for src in src_paths if isinstance(src, _ListedSource)}
+	directories = {path for path in listed if os.path.isdir(path) and not os.path.islink(path)}
+	def covered(path):
+		if path == os.curdir:
+			return False
+		while True:
+			parent = os.path.dirname(path)
+			if parent == path:
+				return False
+			if not parent:
+				# Relative: '.' holds it unless it climbs out of '.' ('../x').
+				return os.curdir in directories and path != os.pardir
+			if parent in directories:
+				return True
+			path = parent
+	kept, seen = [], set()
+	for src in src_paths:
+		if isinstance(src, _ListedSource):
+			path = os.path.normpath(src)
+			if path in seen or covered(path):
+				continue
+			seen.add(path)
+		kept.append(src)
+	return kept
+
+def _trim_source_paths(paths, src):
+	"""trim_paths for one source of a stored list (-fl): entries are named where the copy lands them, so a source from a
+	list keeps its tree. Paths may carry a ':<digest>' tail, so relative to the directory above src."""
+	if not isinstance(src, _ListedSource):
+		return trim_paths(paths, src)
+	base = os.path.normpath(src)
+	if not src.landing:
+		return {os.path.relpath(path, base) for path in paths}
+	parent = os.path.dirname(src.landing)
+	return {os.path.join(parent, os.path.relpath(path, os.path.dirname(base))) for path in paths}
 
 def store_file_list(file_list, src_paths: list, single_thread=False, max_workers=multiprocessing.cpu_count(), verbose=False,
 					files_per_job=1, compare_file_list=False, remove_extra=False, parallel_file_listing=False, exclude=None,
@@ -8556,14 +8740,18 @@ def store_file_list(file_list, src_paths: list, single_thread=False, max_workers
 		file_list += '_file_list.txt'
 	if remove_extra:
 		print('-' * 80)
-		file_list_file = load_file_list(file_list)
-		if len(src_paths) == 1:
+		# Both spellings of a line: a stored name with surrounding whitespace is not extra (a stripped one alone made it so,
+		# and it was deleted), nor is the file a hand-edited line names.
+		file_list_file = load_file_list(file_list) | frozenset(_read_list_entries(file_list)[0])
+		# Not with a source from a list: the stored names keep the list's tree, and this comparison would take them all for
+		# extra.
+		if len(src_paths) == 1 and not _has_listed(src_paths):
 			# file_list_file already holds trimmed (relative) paths, so we don't
 			# pass src_paths -- entries are used as-is for the comparison.
 			remove_extra_files(file_list_file, [src_paths[0]], max_workers, verbose, files_per_job, single_thread, exclude=exclude, parallel_file_listing=parallel_file_listing)
 			print('-' * 80)
 		else:
-			print("Currently only supports removing extra files for a single src_path when using file_list")
+			print("Currently only supports removing extra files for a single src_path, given as an argument, when using file_list")
 		raise RuntimeError("Completed removing extra files, exiting")
 	if compare_file_list or diff_file_list:
 		# This means we have a file_list and a src_path so we compare them
@@ -8575,7 +8763,7 @@ def store_file_list(file_list, src_paths: list, single_thread=False, max_workers
 		workers = 1 if single_thread else max_workers
 		new_map = {}
 		for src in src_paths:
-			new_map.update(build_entry_map(src, _trim_prefix(src), exclude=exclude, max_workers=workers, parallel_file_listing=parallel_file_listing))
+			new_map.update(_source_entry_map(src, exclude=exclude, max_workers=workers, parallel_file_listing=parallel_file_listing))
 		states = _states_for_paths(set(new_map.values()), full_hash=full_hash, max_workers=workers)
 		new_states = {key: states[path] for key, path in new_map.items()}
 		new_entries = {key: _value_from_state(state) for key, state in new_states.items()}
@@ -8587,16 +8775,19 @@ def store_file_list(file_list, src_paths: list, single_thread=False, max_workers
 		fileList = set()
 		for src in src_paths:
 			files, links, _,folders  = get_file_list(src, max_workers=max_workers, exclude=exclude,append_hash=append_hash,full_hash=full_hash,parallel_file_listing=parallel_file_listing)
-			fileList.update(trim_paths(files, src))
-			fileList.update(trim_paths(links, src))
-			fileList.update([folder_path + os.path.sep for folder_path in trim_paths(folders, src)])
+			fileList.update(_trim_source_paths(files, src))
+			fileList.update(_trim_source_paths(links, src))
+			fileList.update([folder_path + os.path.sep for folder_path in _trim_source_paths(folders, src)])
+			if isinstance(src, _ListedSource):
+				fileList.update(landing + os.path.sep for _, landing in _implied_parents(src))
 		print(f"Number of files: {len(fileList)}")
-		print(f"Writing file list to {fileList}")
+		print(f"Writing file list to {file_list}")
 		# sort the file list
 		fileList = natural_sort(fileList)
-		with open(file_list, 'w') as f:
+		# Bytes, as _read_list_entries reads them: a name that is not UTF-8 goes back as it came.
+		with open(file_list, 'wb') as f:
 			for file in fileList:
-				f.write(file + '\n')
+				f.write(os.fsencode(file + '\n'))
 
 def _is_filesystem_root(path):
 	"""True when path is / itself, by device and inode (a bind mount of / too), as rm's --preserve-root checks; a
@@ -8618,7 +8809,7 @@ def process_remove(src_paths: list,single_thread = False, max_workers = multipro
 	(FILES_RATE_LIMIT) paces the unlinks."""
 	processedPaths = []
 	for src in src_paths:
-		if not os.path.exists(src):
+		if not os.path.lexists(src):
 			continue
 		# 'src/' is src itself ('ln/' the link ln, as the copy names it).
 		path = os.path.abspath(src)
@@ -9638,6 +9829,9 @@ def get_dest_from_path(dest_path,src_paths: list,src_path,can_be_none = False):
 	except Exception:
 		eprint(f"Dest path DataType error: Error converting dest_path {dest} to string, ignoring it")
 		return None
+	# A list always means the destination is a directory, even with one entry.
+	if _has_listed(src_paths):
+		return dest if dest.endswith(os.path.sep) else dest + os.path.sep
 	if len(src_paths) == 1 and os.path.isdir(src_paths[0]) and not src_paths[0].endswith(os.path.sep) and not dest.endswith(os.path.sep):
 		src_paths[0] += os.path.sep
 		dest += os.path.sep
@@ -9701,7 +9895,7 @@ def process_compare_file_list(src_paths: list, dests, max_workers = multiprocess
 		rooted = bool(src_image_roots)
 		for src in src_paths:
 			src_exclude = _rooted_excludes(exclude or (), src) if src in src_image_roots else exclude
-			new_map.update(build_entry_map(src, _trim_prefix(src), exclude=src_exclude, max_workers=max_workers, parallel_file_listing=parallel_file_listing))
+			new_map.update(_source_entry_map(src, exclude=src_exclude, max_workers=max_workers, parallel_file_listing=parallel_file_listing))
 		for dest in dests:
 			dest_exclude = _rooted_excludes(exclude or (), dest) if rooted else exclude
 			base_map.update(build_entry_map(dest, _trim_prefix(dest), exclude=dest_exclude, max_workers=max_workers, parallel_file_listing=parallel_file_listing))
@@ -9771,6 +9965,18 @@ def create_image(dest_image,target_mount_point,loop_devices: list,src_paths: lis
 	else:
 		raise RuntimeError("No destination image path: Destination path not specified, exiting.")
 
+def _sync_implied_parents(src, dests, synced):
+	"""Make the directories above a _ListedSource's landing in each of dests, top first, with their sources' metadata.
+	synced: the landings done so far in this run (the first source of a landing gives its metadata)."""
+	parents = []
+	for source, landing in _implied_parents(src):
+		if landing in synced:
+			break
+		synced.add(landing)
+		parents.append((source, landing))
+	for source, landing in reversed(parents):
+		sync_directory_metadata(source, [os.path.join(dest, landing) for dest in dests])
+
 def process_copy(src_paths: list, dests:list = [], single_thread = False, max_workers = multiprocessing.cpu_count(),verbose = False, 
 				directory_only = False,no_directory_sync = False, full_hash = False, files_per_job = 1, parallel_file_listing = False,
 				exclude=None,dest_image = None,batch = False, exit_not_enough_space = False):
@@ -9779,12 +9985,15 @@ def process_copy(src_paths: list, dests:list = [], single_thread = False, max_wo
 	taskCtr = 0
 	argDest = dests.copy()
 	if batch:
-		print(f"Copying from {src_paths} to {dests}")
+		print(f"Copying from {f'{len(src_paths)} sources' if _has_listed(src_paths) else src_paths} to {dests}")
 	max_workers = max_workers if not single_thread else 1
-	cs = copy_scheduler(max_workers=max_workers,full_hash=full_hash,verbose=verbose,files_per_job=files_per_job,parallel_file_listing=parallel_file_listing,exclude=exclude,exit_not_enough_space=exit_not_enough_space)
-	for src in src_paths:
+	cs = copy_scheduler(max_workers=max_workers,full_hash=full_hash,verbose=verbose,files_per_job=files_per_job,parallel_file_listing=parallel_file_listing,exclude=exclude,exit_not_enough_space=exit_not_enough_space,
+		claimed={} if len(src_paths) > 1 else None)
+	synced_parents = set()
+	for source in src_paths:
 		taskCtr += 1
 		dests = argDest.copy()
+		src = source
 		if dest_image:
 			# if the destination is a mounted image, then we use the full path for src and add that to dest.
 			src = os.path.abspath(src + os.path.sep)
@@ -9800,45 +10009,43 @@ def process_copy(src_paths: list, dests:list = [], single_thread = False, max_wo
 			#destParentDirs = [ os.path.abspath(dest + srcParentDir + os.path.sep) for srcParentDir in srcParentDirs]
 			sync_directory_metadata_bulk(srcParentDirs,dests,src_path='/')
 			#dest = os.path.abspath(dest + src + os.path.sep)
-			dests = [os.path.abspath(dest + src + os.path.sep) for dest in dests]
+			dests = [_source_dest(source, dest, True) for dest in dests]
 		else:
-			sourceFolderName = os.path.basename(src)
-			if sourceFolderName:
-				src += os.path.sep
 			src = os.path.abspath(src)
-			newDests = []
+			dests = [_source_dest(source, dest) for dest in dests]
+		if isinstance(source, _ListedSource):
+			# As cp --parents and rsync --relative: the directories its path implies are its source's, a private one stays
+			# private. (With dest_image, above.) Its parents may not exist yet, so nothing to check for being writable.
+			if not (dest_image or no_directory_sync or NO_CREATE_DIR or (exclude and is_excluded(src, exclude))):
+				_sync_implied_parents(source, argDest, synced_parents)
+		else:
+			# verify dest is writable
 			for dest in dests:
-				if os.path.basename(dest) == '' and sourceFolderName:
-					dest = os.path.join(dest,sourceFolderName)
-					dest += os.path.sep
-				newDests.append(os.path.abspath(dest))
-			dests = newDests
+				if not os.access(os.path.dirname(os.path.abspath(dest)), os.W_OK):
+					print(f"Destination {dest} is not writable, continue with caution.")
 		if not batch:
 			print('-'*80)
 			print(f"Task {taskCtr} of {len(src_paths)}, copying from {src} to {dests}")
-		# verify dest is writable
-		for dest in dests:
-			if not os.access(os.path.dirname(os.path.abspath(dest)), os.W_OK):
-				print(f"Destination {dest} is not writable, continue with caution.")
 		if os.path.islink(src):
-			total_sym_links[src] = dests
+			# A copy job of its own, so that it takes its turn against the other sources (_first_claims).
 			print(f"{src} is a symlink, creating symlink in dests")
-			continue
-		# if os.path.isfile(src):
-		# 	print("Copying single file")
-		# 	copy_file(src, dests,full_hash=full_hash,verbose=verbose)
-		# 	continue
-		if os.path.isdir(src):
-			src += os.path.sep
-			if no_directory_sync:
-				print("Skipping directory sync")
-				if not NO_CREATE_DIR:
-					for dest in dests:
-						_makedirs(dest, exist_ok=True)
-			else:
-				cs.add_dir_sync(src, dests)
-		if not directory_only:
 			cs.add_copy(src, dests)
+		else:
+			# if os.path.isfile(src):
+			# 	print("Copying single file")
+			# 	copy_file(src, dests,full_hash=full_hash,verbose=verbose)
+			# 	continue
+			if os.path.isdir(src):
+				src += os.path.sep
+				if no_directory_sync:
+					print("Skipping directory sync")
+					if not NO_CREATE_DIR:
+						for dest in dests:
+							_makedirs(dest, exist_ok=True)
+				else:
+					cs.add_dir_sync(src, dests)
+			if not directory_only:
+				cs.add_copy(src, dests)
 		if not batch:
 			fl, sl = cs.process()
 			total_file_list.update(fl)
@@ -10044,7 +10251,7 @@ def get_args(args = None):
 	parser.add_argument('-fh', '--full_hash', action='store_true', help='Checks the full hash of files')
 	parser.add_argument('-hs', '--hash_size', type=int, default=1<<16, help='Hash size in bytes, default is 65536. This means hpcp will only check the last 64 KiB (about 1 page in a SSD) of the file.')
 	parser.add_argument('-fpj', '--files_per_job', type=int, default=1, help='Base number of files per job, will be adjusted dynamically. Default is 1')
-	parser.add_argument('-sfl','-lfl', '--source_file_list', type=str, help='Load source file list from file, or use "-" to read from stdin. Will treat it raw meaning do not expand files / folders. files are seperated using newline.  If --compare_file_list is specified, it will be used as source for compare')
+	parser.add_argument('-sfl','-lfl', '--source_file_list', type=str, help='Load source paths from a file, or use "-" to read them from stdin (read by default when no source is given and stdin is not a terminal: find src -type f | hpcp -d out). Each path lands in the destination as given, minus a leading / and any .. (cd src && find . | hpcp -d out to leave src out); a listed folder copies recursively. Paths are not expanded and are separated by newlines, or by NUL bytes when the data holds one (find -print0, fd -0). If --compare_file_list is specified, it will be used as source for compare')
 	parser.add_argument('-fl','-tfl', '--target_file_list', type=str,help='Specify the file_list file to store list of files in src_path to. If --compare_file_list is specified, it will be used as targets for compare')
 	parser.add_argument('-cfl', '--compare_file_list',action='store_true', help='Only compare file list. Use --file_list to specify a existing file list or specify the dest_path to compare src_path with. When not using with file_list, will compare hash.')
 	parser.add_argument('-dfl', '--diff_file_list', type=str, nargs='?', const="auto",default=None, help="Implies --compare_file_list, specify a file name to store the diff file list to or omit the value to auto-determine.")
@@ -10330,14 +10537,16 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = multipr
 			src_image_roots = list(src_paths)
 
 		if source_file_list:
-			src_paths.extend(load_file_list(source_file_list))
+			src_paths.extend(load_source_list(source_file_list))
 		elif not src_path and not sys.stdin.isatty():
 			print("Reading source file list from stdin...")
-			src_paths.extend(load_file_list('-'))
+			src_paths.extend(load_source_list('-'))
 		src_paths.extend(expand_paths(src_path))
 		verify_src_path(src_paths)
-		if not src_str:
-			src_str = "-".join([os.path.basename(src) for src in src_paths])
+		src_paths[:] = _without_covered_sources(src_paths)
+		# Names the -dfl file, so only then (a list would make a name of every entry).
+		if not src_str and diff_file_list == 'auto':
+			src_str = 'source_list' if _has_listed(src_paths) else "-".join([os.path.basename(src) for src in src_paths])
 
 		if target_file_list:
 			store_file_list(target_file_list,src_paths,single_thread=single_thread, max_workers=max_workers,verbose=verbose, 
@@ -10592,7 +10801,9 @@ _STRICT_STDOUT = None
 
 def _escape_unencodable_stdout():
 	"""Paths with bytes that are not UTF-8 arrive surrogate-escaped; under a UTF-8 locale stdout is strict, and one
-	print of such a name would end the run partway. Show them escaped instead (stderr already does)."""
+	print of such a name would end the run partway. Show them escaped instead (stderr already does). The same for
+	anything else the encoding cannot show: Python 3.6's stdout in the C locale is ASCII with surrogateescape, and the
+	progress bar's first block character ended the copy."""
 	global _STRICT_STDOUT
 	try:
 		sys.stdout.reconfigure(errors='backslashreplace')
@@ -10605,7 +10816,7 @@ def _escape_unencodable_stdout():
 	# Only a genuine TextIOWrapper (a tee or logging proxy in its place is left alone: it would be bypassed).
 	import io
 	stdout = sys.stdout
-	if type(stdout) is not io.TextIOWrapper or stdout.errors != 'strict':
+	if type(stdout) is not io.TextIOWrapper or stdout.errors == 'backslashreplace':
 		return
 	try:
 		stdout.flush()

@@ -17,6 +17,32 @@ Block-image functionality is in **beta**. Only available on Linux. Possible use 
 
 hpcp.bat available on github: simple old tk based GUI intended for basic windows functionality.
 
+## Upgrading to 9.81 from 9.80
+
+- **Lists keep their tree (layout change):** a path from a list (`-sfl FILE`, `-sfl -`, or stdin when no source is given) now lands at `<dest>/<path as given>`, normalised, without a leading `/`, `./` or any `..`, as `rsync --files-from` and `cp --parents` do. 9.80 put every entry flat in the destination, so `src/a/x.txt` and `src/b/x.txt` overwrote each other. Scripts that rely on the flat layout have to change: `cd` into the directory that holds the files, or pass the paths as arguments, which keep their layout. See [Copying from a list](#copying-from-a-list).
+- **Same-name clashes are errors (exit 213):** two sources of one run that land on one destination file, from the arguments (`hpcp a/x b/x -d out`), a list, or same-named directories that merge (`hpcp a/conf b/conf -d out`), no longer overwrite each other silently. The first in order stays, the rest of the run is copied, the clash is named, and hpcp exits 213, as `cp` refuses such a copy. It counts even when the contents are the same. **`hpcp base/ overlay/ -d out` used to let the later source win; it now keeps the earlier one and exits 213.** A move (`-rm`) or `-rme` that meets a clash removes nothing.
+- **`-rme` with a list:** only what the list's directories cover is cleaned. A list of files cleans nothing, and everything else in the destination stays. 9.80 took everything in the destination that was not on the list for extra. Arguments alone work as before.
+- **List parsing:** lists are read as bytes, so any file name works under any locale. Data with a NUL byte is NUL-separated and exact (`find -print0`, `fd -0`), with no flag. Otherwise lines split on newline only, a trailing CR is dropped, and a line with surrounding whitespace is the exact name when that exists, else the stripped one.
+- **Dangling symlinks** given as sources are copied as links (`-rm` removes them); 9.80 reported them as not found.
+- **`-fl` from a list** stores names with the list's tree. `-fl STORED -rme` with a source from a list deletes nothing: give the source as an argument.
+
+## Copying from a list
+
+`hpcp` reads source paths from `-sfl FILE`, from `-sfl -`, or from stdin when no source is given and stdin is not a terminal, so it takes the output of `find` or `fd`:
+
+```bash
+find src -type f -name '*.log' | hpcp -d out   # out/src/.../x.log
+cd src && find . -type f | hpcp -d ../out      # out/.../x.log: cd to leave src out of the destination
+find src -type f -print0 | hpcp -d out         # NUL-separated: any file name is safe, no flag needed
+fd -0 -e log . src | hpcp -d out
+```
+
+- Each path lands at `<dest>/<path as given>`, normalised, without a leading `/`, and `..` never leaves the destination: `../x/a` lands at `<dest>/x/a`. Directories the path implies take their sources' mode, owner and times (`-nds` skips that).
+- A list always means the destination is a directory, even for one entry.
+- A directory in a list copies recursively. An entry below a listed directory is already covered, so plain `find src | hpcp -d out` gives one complete tree, with nothing copied twice.
+- Arguments keep their own layout (`hpcp src -d out` copies the contents of `src` to `out`). Given both, each source follows its own rule.
+- `-rme` with a list cleans only below the directories on the list: `printf 'src/a\n' | hpcp -d out -rme` mirrors `src/a` to `out/src/a` and leaves the rest of `out` alone. It asks first, so it needs a list file (`-sfl FILE`) at a terminal: stdin that holds the list cannot answer.
+
 ## Upgrading to 9.80 from 9.79
 
 - **`<TOOL>_PATH` warnings:** every `<TOOL>_PATH` variable (`CP_PATH`, `MOUNT_PATH`, `DD_PATH`, ...) that does not name an executable is now named once at the start of every run (`Warning: CP_PATH=... is not an executable file; using cp from PATH.`). 9.79 named one only when it started that tool itself, so a bad `CP_PATH` (cp runs in the worker processes) was never named. A variable that other software sets for its own use prints that line too; it is harmless, and hpcp uses the tool found on PATH.
@@ -203,11 +229,16 @@ options:
                         Base number of files per job, will be adjusted
                         dynamically. Default is 1
   -sfl, -lfl, --source_file_list SOURCE_FILE_LIST
-                        Load source file list from file, or use "-" to read
-                        from stdin. Will treat it raw meaning do not expand
-                        files / folders. files are seperated using newline. If
-                        --compare_file_list is specified, it will be used as
-                        source for compare
+                        Load source paths from a file, or use "-" to read them
+                        from stdin (read by default when no source is given
+                        and stdin is not a terminal: find src -type f | hpcp
+                        -d out). Each path lands in the destination as given,
+                        minus a leading / and any .. (cd src && find . | hpcp
+                        -d out to leave src out); a listed folder copies
+                        recursively. Paths are not expanded and are separated
+                        by newlines, or by NUL bytes when the data holds one
+                        (find -print0, fd -0). If --compare_file_list is
+                        specified, it will be used as source for compare
   -fl, -tfl, --target_file_list TARGET_FILE_LIST
                         Specify the file_list file to store list of files in
                         src_path to. If --compare_file_list is specified, it
