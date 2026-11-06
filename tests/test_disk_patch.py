@@ -1249,6 +1249,40 @@ def test_an_apply_with_temp_dirs_on_a_live_filesystem_leaves_nothing_in_another_
 		assert _namespace_mounts(pid, live_root) == []
 
 
+@requires_root_and_disk_tools
+@pytest.mark.root
+@pytest.mark.loop
+def test_an_apply_onto_a_live_filesystem_writes_that_filesystem_before_it_lets_go(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	"""A target someone else mounted is only bound by the apply, and taking the bind off writes nothing: the apply asks the
+	kernel (syncfs) for the filesystem it patched, while its bind is still there."""
+	base, golden, target = tmp_path / 'base.img', tmp_path / 'golden.img', tmp_path / 'target.img'
+	with open(str(base), 'wb') as f:
+		f.truncate(64 << 20)
+	_run('sgdisk', '-n1:2048:+40M', base)
+	with _attached(base) as loop:
+		_run('mkfs.ext4', '-q', '-F', loop + 'p1')
+	shutil.copyfile(str(base), str(golden))
+	shutil.copyfile(str(base), str(target))
+	with _attached(golden) as loop:
+		with _mounted(loop + 'p1') as root:
+			with open(os.path.join(root, 'new-file'), 'w') as f:
+				f.write('new')
+	patch = str(tmp_path / 'patch.img')
+	with _session(hpcp_mod) as (mount_points, loop_devices):
+		assert hpcp_mod.process_get_disk_diff_image([str(golden)], [str(base)], patch, mount_points, loop_devices, max_workers=1) == patch
+	flushed = []
+	real_syncfs = hpcp_mod._syncfs
+	with _attached(target) as loop:
+		with _mounted(loop + 'p1') as live_root:
+			def spy(path):
+				flushed.append((os.path.ismount(path), os.stat(path).st_dev == os.stat(live_root).st_dev))
+				real_syncfs(path)
+			monkeypatch.setattr(hpcp_mod, '_syncfs', spy)
+			assert _apply(hpcp_mod, patch, loop)['failed'] == 0
+			assert os.path.exists(os.path.join(live_root, 'new-file'))
+	assert flushed == [(True, True)]
+
+
 def test_clean_up_takes_the_last_mount_off_first(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
 	calls = []
 	monkeypatch.setattr(hpcp_mod, 'run_command_in_multicmd_with_path_check', lambda argv, **kwargs: calls.append(argv) or [])

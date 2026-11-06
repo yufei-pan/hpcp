@@ -825,11 +825,15 @@ realtime =none                   extsz=4096   blocks=0, rtextents=0
 
 def _fake_xfs_tools(monkeypatch, namespace=True):
 	"""xfs_info as xfsprogs 4.5 (EL7) has it: nothing for a device, the geometry from the probe in a mount namespace
-	(unshare) when that works. Returns the argvs run."""
-	calls = []
+	(unshare) when that works. Returns the argvs run, and in .envs the extra_env of each."""
+	class Calls(list):
+		envs = None
+	calls = Calls()
+	calls.envs = []
 
 	def fake(argv, **kwargs):
 		calls.append(argv)
+		calls.envs.append(kwargs.get('extra_env'))
 		if argv[0] == 'unshare' and namespace:
 			return list(_XFS_INFO_OUTPUT)
 		return []
@@ -851,6 +855,8 @@ def test_probe_xfs_reads_a_filesystem_xfs_info_will_only_read_mounted_in_a_mount
 	assert '/dev/fake3' not in hpcp._XFS_NAMESPACE_PROBE and mount_point not in hpcp._XFS_NAMESPACE_PROBE
 	assert 'ro,nouuid,norecovery' in hpcp._XFS_NAMESPACE_PROBE and '--make-rprivate' in hpcp._XFS_NAMESPACE_PROBE
 	assert not os.path.exists(mount_point)
+	# xfs_info translates its section names: both runs, the namespace one too, are in the C locale
+	assert calls.envs == [hpcp._C_LOCALE, hpcp._C_LOCALE]
 
 
 def test_probe_xfs_runs_the_tools_hpcp_finds(monkeypatch):

@@ -3489,6 +3489,214 @@ def test_a_regular_file_onto_a_device_node_writes_through_as_before(tmp_path, fl
 		assert (after.st_mode, after.st_mtime_ns) == (before.st_mode, before.st_mtime_ns)
 
 
+def _cannot_make_a_node(tmp_path):
+	"""True when this user may not make a device node (not root): the case cp -a unlinks the old file for."""
+	probe = str(tmp_path / 'probe-node')
+	try:
+		os.mknod(probe, 0o600 | stat.S_IFCHR, os.makedev(1, 3))
+	except OSError:
+		return True
+	os.unlink(probe)
+	return False
+
+
+@pytest.mark.skipif(not os.path.exists('/dev/null'), reason='needs /dev/null as a device source')
+@pytest.mark.parametrize('flags', [[], ['-co'], ['-nb']], ids=['plain', 'co', 'nb'])
+@pytest.mark.parametrize('how', ['arg', 'list'])
+def test_a_device_source_a_user_cannot_make_keeps_the_old_file(tmp_path, flags, how):
+	# cp -a unlinks the old file, then its mknod fails (not root): the old file was gone and nothing took its place.
+	if not _cannot_make_a_node(tmp_path):
+		pytest.skip('this user can make a device node: the failure needs a user who cannot')
+	landing = b'null' if how == 'arg' else b'dev/null'
+	write(os.path.join(os.fsencode(str(tmp_path)), b'out', landing), 'old')
+	rc, output = _run_bounded(['/dev/null', '-d', 'out/'] + flags, tmp_path, seconds=30) if how == 'arg' else \
+		_run_bounded(['-sfl', '-', '-d', 'out/'] + flags, tmp_path, stdin=b'/dev/null\n', seconds=30)
+	assert files(tmp_path / 'out') == {landing: b'old'} and rc != 0, (rc, output[-2000:])
+
+
+@pytest.mark.skipif(not os.path.exists('/dev/null'), reason='needs /dev/null as a device source')
+def test_a_device_source_a_user_cannot_make_keeps_the_old_file_of_every_destination(tmp_path):
+	if not _cannot_make_a_node(tmp_path):
+		pytest.skip('this user can make a device node: the failure needs a user who cannot')
+	write(tmp_path / 'out/null', 'old')
+	rc, output = _run_bounded(['/dev/null', '-d', 'out/', '-d', 'o2/'], tmp_path, seconds=30)
+	assert (tmp_path / 'out/null').read_text() == 'old' and not os.path.lexists(tmp_path / 'o2/null'), (rc, output[-2000:])
+
+
+@pytest.mark.skipif(not os.path.exists('/dev/null'), reason='needs /dev/null as a device source')
+def test_a_node_the_user_cannot_make_is_asked_by_making_one_beside_the_old_file(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	# Also as root: mknod is made to answer PermissionError, and no cp may run.
+	write(tmp_path / 'out/null', 'old')
+	asked = []
+	def refuse(path, *args, **kwargs):
+		asked.append(path)
+		raise PermissionError(1, 'Operation not permitted')
+	monkeypatch.setattr(hpcp_mod.os, 'mknod', refuse)
+	ran = []
+	monkeypatch.setattr(hpcp_mod, 'run_command_in_multicmd_with_path_check', lambda *args, **kwargs: ran.append(args))
+	assert hpcp_mod._can_make_node('/dev/null', [str(tmp_path / 'out/null')]) is False
+	assert len(asked) == 1 and os.path.dirname(asked[0]) == str(tmp_path / 'out') and not os.path.exists(asked[0])
+	hpcp_mod.copy_file('/dev/null', [str(tmp_path / 'out/null')])
+	assert not ran and (tmp_path / 'out/null').read_text() == 'old' and os.listdir(str(tmp_path / 'out')) == ['null']
+	assert any('cannot make a device node' in error for error in hpcp_mod.ERRORS)
+
+
+@pytest.mark.skipif(not os.path.exists('/dev/null'), reason='needs /dev/null as a device source')
+def test_the_probe_node_is_removed_and_nothing_is_made_when_nothing_is_at_risk(tmp_path, hpcp_mod, monkeypatch):
+	write(tmp_path / 'out/null', 'old')
+	write(tmp_path / 'f', 'regular')
+	made = []
+	def make(path, mode, device):
+		made.append((path, stat.S_IFMT(mode), device))
+		open(path, 'w').close()
+	monkeypatch.setattr(hpcp_mod.os, 'mknod', make)
+	assert hpcp_mod._can_make_node('/dev/null', [str(tmp_path / 'out/null')]) is True
+	assert hpcp_mod._can_make_node('/dev/null', [str(tmp_path / 'out/null')]) is True
+	assert [m[1:] for m in made] == [(stat.S_IFCHR, os.stat('/dev/null').st_rdev)] * 2 and made[0][0] != made[1][0]
+	assert os.listdir(str(tmp_path / 'out')) == ['null']
+	del made[:]
+	# nothing at the destination to lose, a source that is no device, a source that is gone, and an mknod that fails otherwise
+	assert hpcp_mod._can_make_node('/dev/null', [str(tmp_path / 'out/none')]) is True
+	assert hpcp_mod._can_make_node(str(tmp_path / 'f'), [str(tmp_path / 'out/null')]) is True
+	assert hpcp_mod._can_make_node(str(tmp_path / 'gone'), [str(tmp_path / 'out/null')]) is True
+	assert not made
+	monkeypatch.setattr(hpcp_mod.os, 'mknod', lambda *args: (_ for _ in ()).throw(OSError(30, 'Read-only file system')))
+	assert hpcp_mod._can_make_node('/dev/null', [str(tmp_path / 'out/null')]) is True
+	# the old file of a second destination is as much at risk when the first one is not there yet
+	monkeypatch.setattr(hpcp_mod.os, 'mknod', make)
+	assert hpcp_mod._can_make_node('/dev/null', [str(tmp_path / 'new/null'), str(tmp_path / 'out/null')]) is True
+	assert os.path.dirname(made[0][0]) == str(tmp_path / 'out')
+
+
+def _bare_and_source(tmp_path, source_minor=5):
+	"""a/n a character device (1, source_minor); bare one at (1, 3), a name of its own; both with the same times."""
+	write(tmp_path / 'a/keep', 'k')
+	_device_node(str(tmp_path / 'a/n'), source_minor, str(tmp_path))
+	_device_node(str(tmp_path / 'bare'), 3, str(tmp_path / 'a/n'))
+	return os.lstat(tmp_path / 'bare')
+
+
+def _same_node(path, before):
+	after = os.lstat(path)
+	return (after.st_ino, after.st_mode, after.st_rdev) == (before.st_ino, before.st_mode, before.st_rdev)
+
+
+@needs_root
+@pytest.mark.parametrize('flags', [[], ['-co']], ids=['plain', 'co'])
+def test_a_link_to_a_device_is_the_device_and_is_not_replaced(tmp_path, flags):
+	# /dev/disk/by-id/*, /dev/mapper/* and /dev/vg/lv are links: replacing one with the source's node sends a later write to the source.
+	before = _bare_and_source(tmp_path)
+	os.symlink('bare', tmp_path / 'lnk')
+	rc, output = _run_bounded(['a/n', '-d', 'lnk'] + flags, tmp_path, seconds=30)
+	assert rc == 213 and b'Destination clash: ' + str(tmp_path / 'lnk').encode() + b' is a device' in output, (rc, output[-2000:])
+	assert os.path.islink(tmp_path / 'lnk') and os.readlink(tmp_path / 'lnk') == 'bare' and _same_node(tmp_path / 'bare', before)
+
+
+@needs_root
+@pytest.mark.parametrize('flags', [[], ['-co']], ids=['plain', 'co'])
+def test_a_regular_file_onto_a_link_to_a_device_writes_through_as_before(tmp_path, flags):
+	write(tmp_path / 'a/f', 'F')
+	_device_node(str(tmp_path / 'bare'), 3, str(tmp_path / 'a/f'))
+	os.symlink('bare', tmp_path / 'lnk')
+	rc, output = _run_bounded(['a/f', '-d', 'lnk'] + flags, tmp_path, seconds=30)
+	assert rc == 0 and os.path.islink(tmp_path / 'lnk') and stat.S_ISCHR(os.lstat(tmp_path / 'bare').st_mode), (rc, output[-2000:])
+
+
+@needs_root
+@pytest.mark.parametrize('order', ['dir-first', 'device-first'])
+@pytest.mark.parametrize('flags', [[], ['-co'], ['-nb'], ['-co', '-s']], ids=' '.join)
+def test_a_device_among_several_destinations_leaves_the_others_their_files(tmp_path, order, flags):
+	# Several -d are spill-over: each file lands on one. The device is refused, the file goes where it can.
+	before = _bare_and_source(tmp_path)
+	dests = ['-d', 'out/', '-d', 'bare'] if order == 'dir-first' else ['-d', 'bare', '-d', 'out/']
+	rc, output = _run_bounded(['a/n'] + dests + flags, tmp_path, seconds=30)
+	assert _same_node(tmp_path / 'bare', before), output[-2000:]
+	assert stat.S_ISCHR(os.lstat(tmp_path / 'out/n').st_mode) and os.lstat(tmp_path / 'out/n').st_rdev == os.makedev(1, 5), (rc, output[-2000:])
+	assert rc == 213 and b'Destination clash' in output, (rc, output[-2000:])
+
+
+@needs_root
+@pytest.mark.parametrize('order', ['dir-first', 'device-first'])
+def test_a_regular_file_among_destinations_one_of_which_is_a_device_with_other_names(tmp_path, order):
+	write(tmp_path / 'a/f', 'F')
+	_device_node(str(tmp_path / 'bare'), 3, str(tmp_path / 'a/f'))
+	os.link(tmp_path / 'bare', tmp_path / 'other')
+	before = os.lstat(tmp_path / 'bare')
+	dests = ['-d', 'out/', '-d', 'bare'] if order == 'dir-first' else ['-d', 'bare', '-d', 'out/']
+	rc, output = _run_bounded(['a/f'] + dests, tmp_path, seconds=30)
+	assert (tmp_path / 'out/f').read_text() == 'F' and _same_node(tmp_path / 'bare', before) and rc == 213, (rc, output[-2000:])
+
+
+@needs_root
+@pytest.mark.parametrize('flags', [[], ['-co']], ids=['plain', 'co'])
+def test_a_move_with_no_destination_left_keeps_the_source(tmp_path, flags):
+	before = _bare_and_source(tmp_path)
+	rc, output = _run_bounded(['a/n', '-d', 'bare', '-rf'] + flags, tmp_path, seconds=30)
+	assert rc == 213 and os.path.lexists(tmp_path / 'a/n') and _same_node(tmp_path / 'bare', before), (rc, output[-2000:])
+
+
+@needs_root
+def test_a_move_to_a_device_and_a_directory_lands_in_the_directory_and_keeps_the_source_on_the_error(tmp_path):
+	before = _bare_and_source(tmp_path)
+	rc, output = _run_bounded(['a/n', '-d', 'bare', '-d', 'out/', '-rf'], tmp_path, seconds=30)
+	assert _same_node(tmp_path / 'bare', before) and stat.S_ISCHR(os.lstat(tmp_path / 'out/n').st_mode), (rc, output[-2000:])
+	assert rc == 213 and os.path.lexists(tmp_path / 'a/n'), (rc, output[-2000:])
+
+
+@needs_root
+def test_the_refusal_says_what_fixes_it(tmp_path):
+	_bare_and_source(tmp_path)
+	rc, output = _run_bounded(['a/n', '-d', 'bare'], tmp_path, seconds=30)
+	assert (b'Destination clash: ' + str(tmp_path / 'bare').encode() + b' is a device, and copying ' + str(tmp_path / 'a/n').encode()
+		+ b' would replace it: not copying it. -dd clones a disk; remove the node to replace it') in output, output[-2000:]
+
+
+@needs_root
+@pytest.mark.parametrize('flags', [[], ['-co']], ids=['plain', 'co'])
+def test_a_matching_node_pair_is_no_clash(tmp_path, flags):
+	# The same device under another name, and the pair a first run left: replacing the node would only make it again.
+	write(tmp_path / 'a/keep', 'k')
+	_device_node(str(tmp_path / 'a/n'), 5, str(tmp_path))
+	for attempt in range(2):
+		rc, output = _run_bounded(['a/n', '-d', 'b/n'] + flags, tmp_path, seconds=30)
+		assert rc == 200 and b'Destination clash' not in output, (attempt, rc, output[-2000:])
+		assert os.lstat(tmp_path / 'b/n').st_rdev == os.makedev(1, 5)
+	_device_node(str(tmp_path / 'again'), 5, str(tmp_path / 'a/n'))
+	rc, output = _run_bounded(['a/n', '-d', 'again'] + flags, tmp_path, seconds=30)
+	assert rc == 200 and b'Destination clash' not in output, (rc, output[-2000:])
+	rc, output = _run_bounded(['again', '-d', 'again'] + flags, tmp_path, seconds=30)
+	assert b'Destination clash' not in output and os.lstat(tmp_path / 'again').st_rdev == os.makedev(1, 5), (rc, output[-2000:])
+
+
+@needs_root
+def test_two_kinds_of_node_with_one_number_are_a_clash(tmp_path):
+	# A block and a character device may share a number: only the pair of the same kind is the same node.
+	write(tmp_path / 'a/keep', 'k')
+	os.mknod(tmp_path / 'a/n', 0o600 | stat.S_IFBLK, os.makedev(1, 3))
+	_device_node(str(tmp_path / 'bare'), 3, str(tmp_path / 'a/n'))
+	before = os.lstat(tmp_path / 'bare')
+	rc, output = _run_bounded(['a/n', '-d', 'bare'], tmp_path, seconds=30)
+	assert rc == 213 and _same_node(tmp_path / 'bare', before), (rc, output[-2000:])
+
+
+@needs_root
+@pytest.mark.parametrize('flags', [[], ['-co']], ids=['plain', 'co'])
+def test_a_symlink_source_onto_a_named_device_exits_as_it_did_and_never_touches_the_node(tmp_path, flags):
+	# A link source runs no cp: create_sym_links finds the name taken. Not a replacement, so not claimed to be one.
+	before = _bare_and_source(tmp_path)
+	os.symlink('keep', tmp_path / 'a/l')
+	rc, output = _run_bounded(['a/l', '-d', 'bare'] + flags, tmp_path, seconds=30)
+	assert rc == 162 and b'would replace' not in output and _same_node(tmp_path / 'bare', before), (rc, output[-2000:])
+
+
+@needs_root
+def test_a_directory_source_onto_a_named_device_keeps_its_own_refusal(tmp_path):
+	before = _bare_and_source(tmp_path)
+	rc, output = _run_bounded(['a/', '-d', 'bare'], tmp_path, seconds=30)
+	# its own message: a directory replaces nothing, and "would replace it" would be false
+	assert rc == 213 and _same_node(tmp_path / 'bare', before) and b'is not a directory' in output and b'would replace' not in output, (rc, output[-2000:])
+
+
 @pytest.fixture
 def two_loops(tmp_path):
 	"""(the loop device of an image of A's, the one of an image of B's, the image of B's), read-write."""

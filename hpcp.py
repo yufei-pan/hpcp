@@ -3219,6 +3219,32 @@ def _can_open(path):
 		pass
 	return True
 
+def _can_make_node(src_path, dest_paths):
+	"""False when src_path is a device node that this user cannot make, and a destination holds something. cp -a unlinks
+	what is there before its mknod, so a user who may not make nodes (not root) would lose the old file and get nothing.
+	Asked by doing it: a node of src_path's kind and number is made under a name of its own beside the first destination
+	that exists, and removed again; PermissionError is the answer. Any other error is cp's to answer. Nothing is made for a
+	source that is no device, or when no destination exists (cp then has nothing to lose)."""
+	try:
+		st = os.lstat(src_path)
+	except OSError:
+		return True
+	existing = [dest for dest in dest_paths if os.path.lexists(dest)]
+	if not existing or not (stat.S_ISBLK(st.st_mode) or stat.S_ISCHR(st.st_mode)):
+		return True
+	probe = os.path.join(os.path.dirname(existing[0]), '.hpcp-node-probe-%d-%s' % (os.getpid(), uuid.uuid4().hex))
+	try:
+		os.mknod(probe, 0o600 | stat.S_IFMT(st.st_mode), st.st_rdev)
+	except PermissionError:
+		return False
+	except OSError:
+		return True
+	try:
+		os.unlink(probe)
+	except OSError:
+		pass
+	return True
+
 def _copy_state(path):
 	"""What a copy to path would change at path itself: a link stays whatever cp did through it, so a retry writes through it
 	again and its target ends whole or the file fails. None when nothing is there."""
@@ -3289,6 +3315,9 @@ def copy_file(src_path, dest_paths, full_hash=False, verbose=False, concurrent_p
 			if not _can_open(src_path):
 				# No cp at all: cp -a takes away a destination with other names before it finds it cannot read.
 				eprint(f'Copy failed: cannot open {src_path}, leaving {dest_paths} as they are')
+				return 0, time.monotonic() - start_time, symLinks
+			if not _can_make_node(src_path, dest_paths):
+				eprint(f'Copy failed: cannot make a device node like {src_path} here, leaving {dest_paths} as they are')
 				return 0, time.monotonic() - start_time, symLinks
 			copied = False
 			copy_error_start = len(ERRORS)
@@ -8249,6 +8278,9 @@ def apply_disk_patch(volume_roots, target, mount_points, loop_devices, force=Fal
 			stopped = next((plan.name for plan, summary, _ in ran if summary['failed']), None)
 		# Last mount first (see clean_up): order is the order they were applied in, plans the order they were mounted in.
 		for plan in reversed(plans):
+			# A target that is live (mounted by someone else) is only bound here, and taking the bind off writes nothing; one hpcp
+			# mounted itself is written by its unmount.
+			_syncfs(plan.target_root)
 			_release_mount(plan.target_root, mount_points)
 	failed = sum(summary['failed'] for summary in summaries.values())
 	pending = [entry for entry in raw_plan if entry['action'] != 'skip'] if stopped is None else []
@@ -10355,11 +10387,23 @@ def _sync_implied_parents(src, dests, synced):
 			sync_directory_metadata(os.path.realpath(source) if os.path.islink(source) and os.path.isdir(source) else source, missing)
 
 def _copy_job(source, dests, dest_image=None):
-	"""(src, its destinations) as a copy job names them: 'path/' for a directory, as is for a file or a symlink."""
+	"""(src, its destinations, the destinations it must not take) as a copy job names them: 'path/' for a directory, as is
+	for a file or a symlink. A destination the operator named that is a device node the copy would replace
+	(_would_unlink_device) is not among its destinations, so each file lands on the others, and the job has none left only
+	when every one is such a node."""
 	src = os.path.abspath(source)
-	if os.path.isdir(src) and not os.path.islink(src):
+	directory = os.path.isdir(src) and not os.path.islink(src)
+	if directory:
 		src += os.path.sep
-	return src, [_source_dest(source, dest, bool(dest_image)) for dest in dests]
+	kept, refused = [], []
+	for dest in dests:
+		actual = _source_dest(source, dest, bool(dest_image))
+		# A directory onto a node is refused by its directory sync, which says so (it replaces nothing).
+		if not directory and actual == os.path.abspath(dest) and _would_unlink_device(src, actual):
+			refused.append(actual)
+		else:
+			kept.append(actual)
+	return src, kept, refused
 
 def _same_or_below(path, root):
 	"""True when path is root or lies below it, by their spelling."""
@@ -10392,13 +10436,21 @@ def _roots_overlap(roots):
 	return any(below.startswith(root) for root, below in zip(ordered, ordered[1:]))
 
 def _would_unlink_device(src, dest):
-	"""True when a copy of src to dest would take the name of the device node at dest. cp -a (_cp_flags) unlinks what is there
-	for anything but a regular file; a regular file writes through, unless dest has other names, which goes first either way."""
+	"""True when a copy of src to dest would take the name of the device node that dest is, or leads to (a link to a disk
+	is the disk to whoever writes through it). cp -a (_cp_flags) unlinks what is there for anything but a regular file; a
+	regular file writes through, unless dest has other names, which goes first either way. Not when src is a link, which
+	runs no cp (create_sym_links leaves a name alone), nor when src is a node of the same kind and number, which would only
+	make the node again."""
 	try:
-		src_mode, dest_st = os.lstat(src).st_mode, os.lstat(dest)
+		src_st, dest_st = os.lstat(src), os.stat(dest)
 	except OSError:
 		return False
-	return (stat.S_ISBLK(dest_st.st_mode) or stat.S_ISCHR(dest_st.st_mode)) and (not stat.S_ISREG(src_mode) or dest_st.st_nlink > 1)
+	src_mode, dest_mode = src_st.st_mode, dest_st.st_mode
+	if not (stat.S_ISBLK(dest_mode) or stat.S_ISCHR(dest_mode)) or stat.S_ISLNK(src_mode):
+		return False
+	if stat.S_IFMT(src_mode) == stat.S_IFMT(dest_mode) and src_st.st_rdev == dest_st.st_rdev:
+		return False
+	return not stat.S_ISREG(src_mode) or dest_st.st_nlink > 1
 
 def _settle_destinations(src_paths, dests, dest_image=None, directory_only=False, exclude=None, max_workers=1, parallel_file_listing=False,
 		remove=False, places=None):
@@ -10418,8 +10470,9 @@ def _settle_destinations(src_paths, dests, dest_image=None, directory_only=False
 	    overwrite a file it just created, and it is reported;
 	  * a file where another source makes a directory (itself, or the directory a listed path implies): the directory
 	    stays, whichever came first, and the file is reported as a clash (cp would nest it, or fail);
-	  * a file that would take the name of a device node the destination names itself (-d /dev/sdb): the node stays, and the
-	    file is reported as a clash. Below a destination a node is a file of the tree, and a source replaces it.
+	  * a file that would take the name of a device node the destination names itself (-d /dev/sdb): the node stays, the
+	    file is reported as a clash, and it lands on the other destinations (_copy_job); with none left, nothing is copied.
+	    Below a destination a node is a file of the tree, and a source replaces it.
 	A source met again at its own place is no clash.
 
 	Cost: files are compared only when two real roots meet, which a copy with disjoint source and destination never
@@ -10435,9 +10488,13 @@ def _settle_destinations(src_paths, dests, dest_image=None, directory_only=False
 		return get_file_list(src, max_workers=max_workers, exclude=exclude, parallel_file_listing=parallel_file_listing and max_workers != 1)
 	# (src, its destinations, is it a directory, its real place, its real landing in each destination)
 	jobs = []
+	taken = []
 	for source in src_paths:
-		src, actual_dests = _copy_job(source, dests, dest_image)
-		if not actual_dests or (exclude and is_excluded(src, exclude)):
+		src, actual_dests, refused = _copy_job(source, dests, dest_image)
+		if exclude and is_excluded(src, exclude):
+			continue
+		taken.extend((src, dest) for dest in refused)
+		if not actual_dests:
 			continue
 		directory = src.endswith(os.path.sep)
 		root = src.rstrip(os.path.sep) or os.path.sep
@@ -10457,12 +10514,9 @@ def _settle_destinations(src_paths, dests, dest_image=None, directory_only=False
 	if directory_only:
 		# Nothing is copied.
 		return dropped, 0, set()
-	named = {os.path.abspath(dest) for dest in dests}
-	for src, actual_dests, directory, _, _ in jobs:
-		for dest in actual_dests:
-			if not directory and dest in named and _would_unlink_device(src, dest):
-				eprint(f'Destination clash: {dest} is a device, and copying {src} would replace it: not copying it')
-				dropped.setdefault((src, tuple(actual_dests)), set()).add(src)
+	for src, dest in taken:
+		eprint(f'Destination clash: {dest} is a device, and copying {src} would replace it: not copying it. '
+			'-dd clones a disk; remove the node to replace it')
 	roots = [land for job in jobs for land in job[4]]
 	# An image is a tree of its own. A source that holds its mount point (hpcp / -di) reads what an earlier run put there.
 	if not dest_image:
@@ -10570,7 +10624,10 @@ def process_copy(src_paths: list, dests:list = [], single_thread = False, max_wo
 	synced_parents = set()
 	for source in src_paths:
 		taskCtr += 1
-		src, dests = _copy_job(source, argDest, dest_image)
+		src, dests, _ = _copy_job(source, argDest, dest_image)
+		if not dests:
+			# Every destination is a device it would replace (_settle_destinations said so).
+			continue
 		if (src, tuple(dests)) in in_place:
 			# It lands on itself. Another source may be writing these very files: not read, but -rme has to know them.
 			print(f"{src} lands on itself: nothing to copy")
@@ -10740,6 +10797,21 @@ def dd_partition(src_partition_path,dest_partition_path,partition,dd_src,dd_dest
 		raise RuntimeError(f"Source partition larger than destination partition: {src_part_info[partition]['size']} > {dest_part_info[partition]['size']}, cannot use DD, exiting.")
 	run_command_in_multicmd_with_path_check(['dd','if='+src_partition_path,'of='+dest_partition_path,'bs=1024M'],timeout=0,strict=True)
 
+def _syncfs(path):
+	"""Write the filesystem path is on, and no other: syncfs(2), through ctypes (Python has no os.syncfs). os.sync and the sync
+	command write every filesystem on the host. No libc, no syncfs in it, or an error is a flush that was not made, which a
+	run does without (as a copy with cp does)."""
+	try:
+		import ctypes
+		libc = ctypes.CDLL(None, use_errno=True)
+		fd = os.open(path, os.O_RDONLY | getattr(os, 'O_CLOEXEC', 0))
+		try:
+			libc.syncfs(fd)
+		finally:
+			os.close(fd)
+	except (OSError, AttributeError, ImportError):
+		pass
+
 def _flush_loop_device(loop_device, sysfs='/sys/block'):
 	"""
 	Flush what a loop device holds: the device, then the file behind it (from /sys, read while the device is attached),
@@ -10748,8 +10820,9 @@ def _flush_loop_device(loop_device, sysfs='/sys/block'):
 	"""
 	paths = [loop_device]
 	try:
-		with open(os.path.join(sysfs, os.path.basename(loop_device), 'loop', 'backing_file')) as f:
-			paths.append(f.read().rstrip('\n'))
+		# As bytes: a name that is not valid in the locale is still the name (text mode raises UnicodeDecodeError).
+		with open(os.path.join(sysfs, os.path.basename(loop_device), 'loop', 'backing_file'), 'rb') as f:
+			paths.append(f.read().rstrip(b'\n'))
 	except OSError:
 		pass
 	for path in paths:
@@ -10767,8 +10840,7 @@ def detach_loop_device(loop_device, retries=5, delay=0.5):
 	if not loop_device:
 		return True
 	losetup = _bin('losetup')
-	if os.path.exists(loop_device):
-		_flush_loop_device(loop_device)
+	_flush_loop_device(loop_device)
 	for attempt in range(1, retries + 1):
 		if not os.path.exists(loop_device):
 			print(f"Loop device {loop_device} already gone.")

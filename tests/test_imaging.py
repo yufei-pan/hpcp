@@ -96,6 +96,70 @@ def test_flush_loop_device_ignores_what_it_cannot_flush(tmp_path, hpcp_mod):
 	hpcp_mod._flush_loop_device(str(tmp_path / 'loop8'), sysfs=str(tmp_path))
 
 
+@pytest.mark.skipif(os.name != 'posix', reason='a name that is not text is a POSIX matter')
+def test_flush_loop_device_reads_a_backing_file_name_that_is_not_text(tmp_path, hpcp_mod, monkeypatch):
+	# backing_file holds the name's bytes. Read as text it raised UnicodeDecodeError (not an OSError) under LC_ALL=C or for a
+	# latin-1 name, and -dd ended in a traceback from clean_up with loop devices still attached.
+	image = os.path.join(os.fsencode(str(tmp_path)), b'latin\xff.img')
+	try:
+		with open(image, 'wb') as f:
+			f.write(b'x')
+	except OSError:
+		pytest.skip('this filesystem refuses a name that is not UTF-8')
+	(tmp_path / 'loop8' / 'loop').mkdir(parents=True)
+	with open(str(tmp_path / 'loop8' / 'loop' / 'backing_file'), 'wb') as f:
+		f.write(image + b'\n')
+	opened = []
+	real_open = os.open
+	def spy(path, *args, **kwargs):
+		opened.append(path)
+		return real_open(path, *args, **kwargs)
+	monkeypatch.setattr(os, 'open', spy)
+	hpcp_mod._flush_loop_device(str(tmp_path / 'loop8'), sysfs=str(tmp_path))
+	assert opened == [str(tmp_path / 'loop8'), image]
+
+
+def test_syncfs_writes_the_filesystem_of_the_path_it_is_given(tmp_path, hpcp_mod, monkeypatch):
+	import ctypes
+	seen = []
+	fds = []
+	class Libc:
+		def syncfs(self, fd):
+			seen.append(os.fstat(fd).st_ino)
+			fds.append(fd)
+			return 0
+	monkeypatch.setattr(ctypes, 'CDLL', lambda *args, **kwargs: Libc())
+	hpcp_mod._syncfs(str(tmp_path))
+	assert seen == [os.stat(str(tmp_path)).st_ino]
+	with pytest.raises(OSError):
+		os.fstat(fds[0])  # closed again
+
+
+def test_a_syncfs_that_cannot_be_made_does_not_stop_the_run(tmp_path, hpcp_mod, monkeypatch):
+	import ctypes
+	hpcp_mod._syncfs(str(tmp_path / 'nosuch'))
+	monkeypatch.setattr(ctypes, 'CDLL', lambda *args, **kwargs: object())  # a libc without syncfs
+	hpcp_mod._syncfs(str(tmp_path))
+	def no_libc(*args, **kwargs):
+		raise OSError('no libc')
+	monkeypatch.setattr(ctypes, 'CDLL', no_libc)
+	hpcp_mod._syncfs(str(tmp_path))
+
+
+@pytest.mark.skipif(not sys.platform.startswith('linux'), reason='syncfs(2) is Linux')
+def test_the_real_syncfs_runs_on_this_libc(tmp_path, hpcp_mod, monkeypatch):
+	import ctypes
+	calls = []
+	real_cdll = ctypes.CDLL
+	def spy(*args, **kwargs):
+		libc = real_cdll(*args, **kwargs)
+		calls.append(libc.syncfs)
+		return libc
+	monkeypatch.setattr(ctypes, 'CDLL', spy)
+	hpcp_mod._syncfs(str(tmp_path))
+	assert len(calls) == 1
+
+
 def test_detach_loop_device_flushes_before_it_detaches(hpcp_mod, monkeypatch, tmp_path):
 	events = []
 	device = tmp_path / 'loop9'
@@ -127,7 +191,8 @@ def test_detaching_a_loop_device_fsyncs_it_and_its_image(loop_image, hpcp_mod, r
 
 
 def test_hpcp_never_calls_global_sync():
-	"""os.sync, os.syncfs and the sync command write every filesystem on the host; hpcp flushes what it wrote."""
+	"""os.sync and the sync command write every filesystem on the host; hpcp flushes what it wrote. Python has no os.syncfs: a
+	patched filesystem is flushed by syncfs(2) through ctypes (_syncfs), which writes that one filesystem only."""
 	import ast
 	with open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'hpcp.py'), encoding='utf-8') as f:
 		tree = ast.parse(f.read())

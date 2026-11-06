@@ -37,7 +37,7 @@ _REAL_SCANDIR_FD = hpcp._SCANDIR_FD
 @pytest.fixture(autouse=hasattr(os, 'sync'))  # Windows has no os.sync
 def _no_global_sync():
 	"""sync(2) writes every filesystem on the host (from a container too), backup disks included. hpcp flushes what it
-	wrote instead (_flush_loop_device); a test that reaches os.sync fails. A run in a subprocess is covered by
+	wrote instead (_flush_loop_device, and _syncfs for a patched filesystem); a test that reaches os.sync fails. A run in a subprocess is covered by
 	test_hpcp_never_calls_global_sync. Not monkeypatch: a fixture using it would outlive the autouse teardowns that
 	run with a test's own patches still in place."""
 	def refuse():
