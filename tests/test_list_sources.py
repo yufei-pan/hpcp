@@ -144,7 +144,7 @@ def test_plain_find_gives_a_complete_tree_copying_nothing_twice(work):
 	assert files(work / 'out') == {b'src/link': b'-> a/x.txt', b'src/a/x.txt': b'one', b'src/b/x.txt': b'two', b'src/a/deep/y.log': b'three'}
 	assert (work / 'out/src/empty').is_dir()
 	# 'src' covers every other entry: one source.
-	assert b'Copying from 1 sources' in output
+	assert b"Copying from ['src'] to" in output
 
 
 def test_find_dot_with_directories(work):
@@ -487,6 +487,12 @@ def test_rme_with_a_positional_too_stays_scoped(work, hpcp_mod, reset_hpcp_globa
 	assert files(work / 'out') == {b'b/x.txt': b'two', b'src/a/x.txt': b'one', b'keep': b'stays'}
 
 
+def test_rme_with_the_list_on_stdin_cannot_ask_and_deletes_nothing(work):
+	write(work / 'out/src/a/stale', 'stays')
+	rc, output = run(['-d', 'out', '-rme'], work, b'src/a\n')
+	assert rc == 147 and (work / 'out/src/a/stale').exists() and b'stale' in output
+
+
 def test_rme_positional_alone_still_judges_the_whole_destination(work, hpcp_mod, reset_hpcp_globals, at_a_tty, monkeypatch):
 	monkeypatch.chdir(work)
 	write(work / 'out/stale', 'gone')
@@ -692,7 +698,8 @@ def test_list_output_stays_quiet(tmp_path):
 		write(tmp_path / ('s/f%d' % index))
 	listing = subprocess.run(['find', 's', '-type', 'f'], cwd=str(tmp_path), stdout=subprocess.PIPE).stdout
 	rc, output = run(['-d', 'out'], tmp_path, listing)
-	assert rc == 0 and b'Getting file list' not in output and b'not writable' not in output and b's/f7, ' not in output
+	assert rc == 0 and b'Getting file list' not in output and b'not writable' not in output and b's/f7' not in output
+	assert b'Copying from 50 sources' in output
 
 
 def test_help_and_readme_tell_the_layout():

@@ -37,7 +37,7 @@ find src -type f -print0 | hpcp -d out         # NUL-separated: any file name is
 fd -0 -e log . src | hpcp -d out
 ```
 
-- Each path lands at `<dest>/<path as given>`, normalised, without a leading `/`, and `..` never leaves the destination: `../x/a` lands at `<dest>/x/a`. Directories the path implies take their sources' mode, owner and times (`-nds` skips that).
+- Each path lands at `<dest>/<path as given>`, normalised, without a leading `/`, and `..` never leaves the destination: `../x/a` lands at `<dest>/x/a`. Directories the path implies take their sources' mode and owner, so a private one stays private (`-nds` skips that).
 - A list always means the destination is a directory, even for one entry.
 - A directory in a list copies recursively. An entry below a listed directory is already covered, so plain `find src | hpcp -d out` gives one complete tree, with nothing copied twice.
 - Arguments keep their own layout (`hpcp src -d out` copies the contents of `src` to `out`). Given both, each source follows its own rule.

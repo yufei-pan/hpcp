@@ -8654,6 +8654,10 @@ def _implied_parents(src):
 			return
 		yield source, landing
 
+def _sources_text(src_paths):
+	"""Sources as a log line names them: a list can hold hundreds of thousands."""
+	return f'{len(src_paths)} sources' if len(src_paths) > 20 else pformat(list(src_paths))
+
 def _has_listed(src_paths):
 	return any(isinstance(src, _ListedSource) for src in src_paths)
 
@@ -8755,7 +8759,7 @@ def store_file_list(file_list, src_paths: list, single_thread=False, max_workers
 		raise RuntimeError("Completed removing extra files, exiting")
 	if compare_file_list or diff_file_list:
 		# This means we have a file_list and a src_path so we compare them
-		print(f"Comparing file list from {src_paths} with {file_list}")
+		print(f"Comparing file list from {_sources_text(src_paths)} with {file_list}")
 		if diff_file_list == 'auto':
 			if not src_str:
 				src_str = '-'.join([os.path.basename(os.path.realpath(src)) for src in src_paths])
@@ -8820,7 +8824,7 @@ def process_remove(src_paths: list,single_thread = False, max_workers = multipro
 		else:
 			processedPaths.append(path)
 	source_ids = _source_identities(processedPaths)
-	print(f"Removing files from {pformat(processedPaths)} with {max_workers if not single_thread else '1'} workers")
+	print(f"Removing files from {_sources_text(processedPaths)} with {max_workers if not single_thread else '1'} workers")
 	error_start = len(ERRORS)
 	if not remove_force:
 		if not sys.stdin.isatty():
@@ -9690,7 +9694,7 @@ def remove_moved_sources(src_paths, file_list, sym_links, single_thread=False, m
 		if root is not None:
 			pairs.append((path, root))
 	listed = _items_below(pairs, {root: (root, root_ids[root], root_ids[root]) for root in roots})
-	print(f"Removing the {len(listed)} files and links copied from {pformat(roots)} with {max_workers if not single_thread else '1'} workers")
+	print(f"Removing the {len(listed)} files and links copied from {_sources_text(roots)} with {max_workers if not single_thread else '1'} workers")
 	if not remove_force:
 		if not sys.stdin.isatty():
 			raise RuntimeError("User requested stop: Not removing files as stdin is not a tty")
@@ -9879,7 +9883,7 @@ def process_compare_file_list(src_paths: list, dests, max_workers = multiprocess
 	dests = [dest for dest in dests if dest and os.path.exists(dest) and os.path.isdir(dest)]
 	if not dests:
 		raise RuntimeError(f"No destination paths in cpl: Destination image {dest_image} does not exist or dests {dests} is empty when comparing file lists, exiting")
-	print(f"Comparing file list from {src_paths} with {dests}")
+	print(f"Comparing file list from {_sources_text(src_paths)} with {dests}")
 	new_map, base_map = {}, {}
 	if dest_image:
 		for src in src_paths:
@@ -9985,7 +9989,7 @@ def process_copy(src_paths: list, dests:list = [], single_thread = False, max_wo
 	taskCtr = 0
 	argDest = dests.copy()
 	if batch:
-		print(f"Copying from {f'{len(src_paths)} sources' if _has_listed(src_paths) else src_paths} to {dests}")
+		print(f"Copying from {_sources_text(src_paths)} to {dests}")
 	max_workers = max_workers if not single_thread else 1
 	cs = copy_scheduler(max_workers=max_workers,full_hash=full_hash,verbose=verbose,files_per_job=files_per_job,parallel_file_listing=parallel_file_listing,exclude=exclude,exit_not_enough_space=exit_not_enough_space,
 		claimed={} if len(src_paths) > 1 else None)
@@ -10658,7 +10662,7 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = multipr
 				print(f"Number of links: {len(total_sym_links)}")
 				print(f"Total time taken: {time.monotonic()-programStartTime:0.4f} seconds")
 		if remove and copy_failures:
-			eprint(f'Remove skipped: not removing {src_paths}: the copy reported {len(copy_failures)} error(s); '
+			eprint(f'Remove skipped: not removing {_sources_text(src_paths)}: the copy reported {len(copy_failures)} error(s); '
 				'fix them (or exclude those paths with -e) and re-run')
 		elif remove and dests != ...:
 			# A move: only what the copy listed goes (see remove_moved_sources).
