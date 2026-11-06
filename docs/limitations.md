@@ -29,7 +29,7 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 
 ### Destination symlink at a directory's path
 - **Kind:** deferred.
-- **What the operator sees:** with `out/d -> ../elsewhere`, `hpcp src/ -d out/` writes src/d's files into elsewhere and changes elsewhere's mode, and as root its owner, exit 0, as in 9.80. A user who can write the destination can plant `d -> /etc` before root restores into it. `hpcp src/ -d out/ -rme` with `out/d -> ../src/d` removes the link as an extra, and `d` is not mirrored.
+- **What the operator sees:** with `out/d -> ../elsewhere`, `hpcp src/ -d out/` writes src/d's files into elsewhere and changes elsewhere's mode, and as root its owner, exit 0, as in 9.80. A user who can write the destination can plant `d -> /etc` before root restores into it. `hpcp src/ -d out/ -rme` with `out/d -> ../src/d` removes the link as an extra, and `d` is not mirrored. The same at a file's path, identical or not: with `out/x -> ../t/f`, `t/f` takes the mode, and as root the owner, of `a/x`.
 - **Why:** not a regression (a link there that leads onto a source file is refused, exit 213), and it needs its own decision: refuse as `cp -a` does, or write through without touching the target's mode and owner, since someone with a symlinked data directory may rely on writing through.
 - **Revisit when:** the next hpcp release (9.82).
 - **Approved:** 2026-11-05, the user chose "Deferred to 9.82 (Recommended)".
@@ -118,6 +118,6 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 
 ### `-co` reads a device source and writes through the device node at the destination
 - **Kind:** deferred.
-- **What the operator sees:** as root, with a block or character device node in the tree and `-co`, when the mtime of the node at the destination differs, `cp -f` reads the source device to its end and writes it through the node at the destination: the same device, or a disk behind it, which on a mounted disk writes old blocks over live ones (reasoned, not run). The same on 9.80 (the reviewer ran it). A matching pair of nodes (same kind, same device number, same mtime) is left alone since 9.81.
-- **Why:** old, root only, and it needs a device node in the tree and `-co`. Leaving a destination that is not a regular file alone belongs with the temporary name and rename above.
+- **What the operator sees:** as root, with a block or character device node named or in a list (a directory source skips it) and `-co`, when the node at the destination differs in mtime or device number, `cp -f` reads the source device to its end and writes it through the node at the destination: the same device, another disk, or a disk behind it, which on a mounted disk writes old blocks over live ones (reasoned, not run). The same on 9.80 when the mtime differs (the reviewer ran it); a different device number with the same mtime was skipped on 9.80. A matching pair of nodes (same kind, same device number, same mtime) is left alone since 9.81.
+- **Why:** old, root only, and it needs a named or listed device node and `-co`. Leaving a destination that is not a regular file alone belongs with the temporary name and rename above.
 - **Revisit when:** the next hpcp release (9.82).
