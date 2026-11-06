@@ -3813,6 +3813,10 @@ class copy_scheduler:
 
 
 #%% ---- Copy Directories ----
+def _below(dest, relative):
+	"""dest/relative; the directory itself (relative '.') is dest, not 'dest/.', which does not exist when dest is a file."""
+	return dest if relative == os.curdir else os.path.join(dest, relative)
+
 def sync_directory_metadata(src_path, dest_paths):
 	global CONTENT_ONLY
 	dest_paths = _validate_paths(src_path, dest_paths)
@@ -3837,6 +3841,10 @@ def sync_directory_metadata(src_path, dest_paths):
 	for dest_path in dest_paths:
 		# One directory that cannot be created or synced is recorded; the others (and the other dests) go on.
 		try:
+			if os.path.lexists(dest_path) and not os.path.isdir(dest_path):
+				# A file (or a link to one) is no directory's to take: its mode and owner stay, and nothing can be made below it.
+				eprint(f'Destination clash: {dest_path} is not a directory, not syncing the directory {src_path} onto it')
+				continue
 			try:
 				if not (os.path.exists(dest_path) or os.path.ismount(dest_path)):
 					_makedirs(dest_path, exist_ok=True)
@@ -3863,7 +3871,7 @@ def sync_directory_metadata_bulk(src_paths, dest_paths,src_path):
 	symLinks = {}
 	for src in src_paths:
 		source_relative_path = os.path.relpath(src, src_path)
-		dests = [os.path.join(dest_path, source_relative_path) for dest_path in dest_paths]
+		dests = [_below(dest_path, source_relative_path) for dest_path in dest_paths]
 		count , cpTime , rtnSymLinks = sync_directory_metadata(src, dests)
 		total_count += count
 		total_time += cpTime
@@ -3876,7 +3884,7 @@ def sync_directory_metadata_bulk_batch(jobs):
 	symLinks = {}
 	for (src_path,folder,dest_paths) in jobs:
 		source_relative_path = os.path.relpath(folder, src_path)
-		dests = [os.path.join(dest_path, source_relative_path) for dest_path in dest_paths]
+		dests = [_below(dest_path, source_relative_path) for dest_path in dest_paths]
 		count , cpTime , rtnSymLinks = sync_directory_metadata(folder, dests)
 		total_count += count
 		total_time += cpTime
@@ -4096,7 +4104,7 @@ def sync_directories_serial(src, dests,exclude=None):
 	apb = Adaptive_Progress_Bar(total_count=len(folders),total_size=len(folders),process_word='Synced',bytes_rate_limit=BYTES_RATE_LIMIT,files_rate_limit=FILES_RATE_LIMIT)
 	for folder in folders:
 		source_relative_path = os.path.relpath(folder, src)
-		count , cpTime , _ = sync_directory_metadata(folder, [os.path.join(dest, source_relative_path) for dest in dests])
+		count , cpTime , _ = sync_directory_metadata(folder, [_below(dest, source_relative_path) for dest in dests])
 		apb.update(num_files=1, cpSize=count, cpTime=cpTime , files_per_job=1)
 		apb.rate_limit()
 	apb.stop()
@@ -4131,7 +4139,7 @@ def sync_directories_serial_batch(jobs,exclude=None):
 	for (src, dests), folders in zip(newJobs, srcFolders):
 		for folder in folders:
 			source_relative_path = os.path.relpath(folder, src)
-			count , cpTime , _ = sync_directory_metadata(folder, [os.path.join(dest, source_relative_path) for dest in dests])
+			count , cpTime , _ = sync_directory_metadata(folder, [_below(dest, source_relative_path) for dest in dests])
 			apb.update(num_files=1, cpSize=count, cpTime=cpTime , files_per_job=1)
 			apb.rate_limit()
 	apb.stop()
@@ -8186,7 +8194,7 @@ def _in_root_lost_and_found(path, dest_root):
 		path = os.path.dirname(path)
 	return False
 
-def remove_extra_dirs(src_paths, dests,exclude=None,dest_image=False,keep=(),dest_roots=None):
+def remove_extra_dirs(src_paths, dests,exclude=None,dest_image=False,keep=(),dest_roots=None,listed=None):
 	"""
 	Removes extra directories in destination that are not present in the source paths.
 
@@ -8220,7 +8228,7 @@ def remove_extra_dirs(src_paths, dests,exclude=None,dest_image=False,keep=(),des
 	mapping = _src_to_dest_map(src_paths, dests, dest_image)
 	# With a list, only what its directories cover is judged (see remove_extra_files).
 	listed_scope = None
-	if _has_listed(src_paths):
+	if _has_listed(src_paths) if listed is None else listed:
 		mapping = _directory_sources(mapping)
 		listed_scope = {}
 		for src_abs, actual_dests in mapping:
@@ -8444,7 +8452,7 @@ def _expected_dest_paths(src_entries, src_paths, dests, dest_image=False, mappin
 				expected.update(os.path.join(actual_dest, rel) for actual_dest in actual_dests)
 	return expected
 
-def remove_extra_files(total_file_list, dests,max_workers,verbose,files_per_job,single_thread=False,exclude=None,parallel_file_listing=False,src_paths=None,sym_links=None,dest_image=False,keep=(),dest_roots=None):
+def remove_extra_files(total_file_list, dests,max_workers,verbose,files_per_job,single_thread=False,exclude=None,parallel_file_listing=False,src_paths=None,sym_links=None,dest_image=False,keep=(),dest_roots=None,listed=None):
 		"""Remove files in ``dests`` that have no counterpart in ``total_file_list``.
 
 		``total_file_list`` may contain absolute src-side paths (as returned by
@@ -8476,13 +8484,14 @@ def remove_extra_files(total_file_list, dests,max_workers,verbose,files_per_job,
 		if sym_links:
 			src_entries.update(sym_links.keys() if hasattr(sym_links, 'keys') else sym_links)
 		inDestNotInSrc = set()
+		unknown_lists = 0
 		if src_paths:
 			mapping = _src_to_dest_map(src_paths, dests, dest_image)
 			expected = _expected_dest_paths(src_entries, src_paths, dests, dest_image, mapping)
 			# With a list, only what its directories cover is judged: a list says what to copy, not that the rest of the
 			# destination is extra (9.81 moved list sources; a whole-destination reading would delete earlier copies).
 			listed_scope = None
-			if _has_listed(src_paths):
+			if _has_listed(src_paths) if listed is None else listed:
 				mapping = _directory_sources(mapping)
 				listed_scope = {actual_dest for _, actual_dests in mapping for actual_dest in actual_dests}
 				print("Sources from a list: only the directories it names are cleaned of extra files")
@@ -8520,6 +8529,11 @@ def remove_extra_files(total_file_list, dests,max_workers,verbose,files_per_job,
 				# A bare name ('data', '.') has no directory part: its extras are relative to the CWD (not to /).
 				dest_base = os.path.dirname(dest) or os.curdir
 				not_comparable = 0
+				if dest_trimmed and not (dest_trimmed & src_entries):
+					# As a missing list: nothing is known of what belongs here.
+					print(f"The stored list matches nothing in {dest}: not removing extra files from it")
+					unknown_lists += 1
+					continue
 				for file in dest_trimmed - src_entries:
 					if '\n' in file:
 						# A line break in a stored list separates entries: the list cannot say whether this name is in it.
@@ -8536,7 +8550,8 @@ def remove_extra_files(total_file_list, dests,max_workers,verbose,files_per_job,
 			print(file)
 		print('-'*80)
 		if len(inDestNotInSrc) == 0:
-			print(f"No extra files found in {dests}")
+			if not unknown_lists:
+				print(f"No extra files found in {dests}")
 		else:
 			print(f"Files in dest but not in src count: {len(inDestNotInSrc)}")
 			_confirm("Do you want to delete them? (y/n)", "Not deleting extra files")
@@ -8744,22 +8759,40 @@ def _without_covered_sources(src_paths):
 
 def _inside_destinations(src_paths, dests):
 	"""(src_paths without the list entries that lie inside a destination, how many that were, the paths of the
-	destinations that a kept listed directory holds, as its walk spells them). An entry inside a destination (or the destination itself) stays where it is: copying
-	it onto its own place is nothing, and moving it would destroy it. A listed directory that holds the destination
+	destinations that a kept listed directory holds, as its walk spells them). An entry inside a destination (or the
+	destination itself) stays where it is: copying it onto its own place is nothing, and moving it would destroy it. Not
+	one that is relative while the working directory lies strictly inside the destination and that lands elsewhere
+	(cd overlay; find etc | hpcp -d ..): its landing is another place. A listed directory that holds the destination
 	(find . | hpcp -d out) is kept: the walk below it must leave the destination out (_exclude_roots)."""
 	roots = set()
 	for dest in dests:
 		roots.update((os.path.abspath(dest), os.path.realpath(dest)))
 	prefixes = tuple(root.rstrip(os.path.sep) + os.path.sep for root in roots)
 	kept, skipped, holding = [], 0, set()
+	real_parents = {}
+	try:
+		cwd = os.getcwd()
+	except OSError:
+		cwd = None
+	cwd_inside = cwd is not None and cwd not in roots and cwd.startswith(prefixes)
 	for src in src_paths:
 		if isinstance(src, _ListedSource):
 			path = os.path.abspath(src)
 			directory = os.path.isdir(path) and not os.path.islink(path)
-			spellings = (path, os.path.realpath(path)) if directory else (path,)
+			if directory:
+				spellings = (path, os.path.realpath(path))
+			else:
+				# Judged by its real parent directory and its own name: a link entry is its own place, a file reached
+				# through a linked directory is where that directory is.
+				parent = os.path.dirname(path)
+				if parent not in real_parents:
+					real_parents[parent] = os.path.realpath(parent)
+				spellings = (path, os.path.join(real_parents[parent], os.path.basename(path)))
 			if any(spelling in roots or spelling.startswith(prefixes) for spelling in spellings):
-				skipped += 1
-				continue
+				landings = {os.path.normpath(os.path.join(root, src.landing)) for root in roots}
+				if os.path.isabs(src) or not cwd_inside or any(spelling in landings for spelling in spellings):
+					skipped += 1
+					continue
 			if directory:
 				# Named as this entry's walk will spell it, whichever spelling of the entry holds the destination.
 				for spelling in spellings:
@@ -9004,9 +9037,11 @@ def _same_or_inside(path, src):
 	"""True when path is src, by real path or inode (a bind mount), or lies below it. A symlink src is the link itself."""
 	if os.path.islink(src):
 		src_real = os.path.join(os.path.realpath(os.path.dirname(os.path.abspath(src))), os.path.basename(os.path.abspath(src)))
+		# Its own place, like the link's: following path's last part would lead to the link's target.
+		path_real = os.path.join(os.path.realpath(os.path.dirname(os.path.abspath(path))), os.path.basename(os.path.abspath(path)))
 	else:
 		src_real = os.path.realpath(src)
-	path_real = os.path.realpath(path)
+		path_real = os.path.realpath(path)
 	if path_real == src_real or path_real.startswith(src_real.rstrip(os.sep) + os.sep):
 		return True
 	try:
@@ -9916,7 +9951,8 @@ def get_dest_from_path(dest_path,src_paths: list,src_path,can_be_none = False):
 	if len(src_paths) == 1 and os.path.isdir(src_paths[0]) and not src_paths[0].endswith(os.path.sep) and not dest.endswith(os.path.sep):
 		src_paths[0] += os.path.sep
 		dest += os.path.sep
-	if (len(src_paths) > 1 or src_paths[0].endswith(os.path.sep)) and not dest.endswith(os.path.sep):
+	# A file named alone goes into a directory that exists (cp's rule), so the destination is that directory.
+	if (len(src_paths) > 1 or src_paths[0].endswith(os.path.sep) or os.path.isdir(dest)) and not dest.endswith(os.path.sep):
 		dest += os.path.sep
 	return dest
 
@@ -10048,8 +10084,8 @@ def create_image(dest_image,target_mount_point,loop_devices: list,src_paths: lis
 
 def _sync_implied_parents(src, dests, synced):
 	"""Make the directories above a _ListedSource's landing in each of dests that are missing, top first, with their
-	sources' metadata. One that exists (a directory, a link, a file) is left as it is: it is not this run's to change,
-	as for cp --parents and rsync -R. synced: the landings looked at so far in this run (one look each)."""
+	sources' metadata. One that exists (a directory, a link, a file) is left as it is: it is not this run's to change.
+	synced: the landings looked at so far in this run (one look each)."""
 	parents = []
 	for source, landing in _implied_parents(src):
 		if landing in synced:
@@ -10191,7 +10227,7 @@ def process_copy(src_paths: list, dests:list = [], single_thread = False, max_wo
 			#destParentDirs = [ os.path.abspath(dest + srcParentDir + os.path.sep) for srcParentDir in srcParentDirs]
 			sync_directory_metadata_bulk(srcParentDirs,argDest,src_path='/')
 		if isinstance(source, _ListedSource):
-			# As cp --parents and rsync --relative: the directories its path implies are its source's, a private one stays
+			# The directories its path implies that are missing take its sources' mode and owner, so a private one stays
 			# private. (With dest_image, above.) Its parents may not exist yet, so nothing to check for being writable.
 			if not (dest_image or no_directory_sync or NO_CREATE_DIR or (exclude and is_excluded(src, exclude))):
 				_sync_implied_parents(source, argDest, synced_parents)
@@ -10789,7 +10825,9 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = multipr
 		copy_failures = []
 		if dests != ...:
 			copy_exclude = exclude
-			if _has_listed(src_paths):
+			# Decided before the entries inside a destination go: what is left of the sources is still a list's.
+			listed = _has_listed(src_paths)
+			if listed:
 				src_paths[:], skipped, holding = _inside_destinations(src_paths, dests)
 				if skipped:
 					print(f"Skipped {skipped} list entries inside the destination {', '.join(dests)}: they stay where they are, not copied or moved")
@@ -10836,17 +10874,17 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = multipr
 			if remove_extra and copy_failures:
 				eprint(f'Remove skipped: not removing extra files from {dests}: the copy reported {len(copy_failures)} error(s); '
 					'fix them (or exclude those paths with -e) and re-run')
-			elif remove_extra and _has_listed(src_paths) and not _directory_sources(_src_to_dest_map(src_paths, dests, bool(dest_image))):
+			elif remove_extra and listed and not _directory_sources(_src_to_dest_map(src_paths, dests, bool(dest_image))):
 				print('-rme checked nothing: the list names no directories, and only below those can a list judge extras. '
 					'To mirror a directory, list the directory itself: printf "src\\n" | hpcp -d out -rme')
 			elif remove_extra:
 				print('-'*80)
 				dest_roots = _checked_destination_roots(dests, pinned_dest_roots)
 				remove_extra_files(total_file_list, dests,max_workers,verbose,files_per_job,single_thread,exclude=exclude,parallel_file_listing=parallel_file_listing,src_paths=src_paths,sym_links=total_sym_links,
-					dest_image=bool(dest_image),keep=link_targets,dest_roots=dest_roots)
+					dest_image=bool(dest_image),keep=link_targets,dest_roots=dest_roots,listed=listed)
 				print('-'*80)
 				print("Removing extra directories...")
-				remove_extra_dirs(src_paths, dests,exclude=exclude,dest_image=bool(dest_image),keep=link_targets,dest_roots=dest_roots)
+				remove_extra_dirs(src_paths, dests,exclude=exclude,dest_image=bool(dest_image),keep=link_targets,dest_roots=dest_roots,listed=listed)
 			print('-'*80)
 			if len(src_paths) > 1:
 				print("Overall Summary:")

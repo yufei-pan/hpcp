@@ -244,14 +244,22 @@ def test_remove_extra_into_a_symlinked_destination_removes_the_extras(tmp_path, 
 	assert [error for error in hpcp_mod.ERRORS if hpcp_mod._is_failure(error)] == []
 
 
+def _stored_names(hpcp_mod, dest):
+	"""The names a stored list made of dest as it is now would hold (what -fl STORED compares with)."""
+	files, links, _, _ = hpcp_mod.get_file_list(dest, max_workers=1, parallel_file_listing=False)
+	return hpcp_mod.trim_paths(files, dest) | hpcp_mod.trim_paths(links, dest)
+
+
 def test_legacy_remove_extra_with_a_relative_destination_removes_the_extras(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
 	"""-fl list -rme data/ (no src_paths): the extras are built relative to the CWD; they were dropped silently."""
 	(tmp_path / 'data').mkdir()
-	(tmp_path / 'data' / 'extra').write_text('extra')
+	(tmp_path / 'data' / 'keep').write_text('keep')
 	monkeypatch.chdir(tmp_path)
+	known = _stored_names(hpcp_mod, 'data/')
+	(tmp_path / 'data' / 'extra').write_text('extra')
 	_answer_yes(monkeypatch)
-	hpcp_mod.remove_extra_files(set(), ['data/'], 2, False, 1, single_thread=True)
-	assert not (tmp_path / 'data' / 'extra').exists()
+	hpcp_mod.remove_extra_files(known, ['data/'], 2, False, 1, single_thread=True)
+	assert not (tmp_path / 'data' / 'extra').exists() and (tmp_path / 'data' / 'keep').exists()
 
 
 def test_parallel_remove_of_a_tree_deeper_than_path_max_records_no_error(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
@@ -349,7 +357,8 @@ def test_remove_extra_leaves_no_cached_listing_of_the_destination(tmp_path, hpcp
 def test_remove_extra_never_unlinks_the_target_of_a_destination_that_is_a_symlink(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch, legacy):
 	"""Security review: `-rme src dst` where dst was replaced by a symlink to /etc/shadow (here: victim.txt). Listed
 	plainly, dst is the link, and an extra; resolving the destination would unlink its target. The link goes, as in
-	9.73 (os.remove(dest)), never what it points to."""
+	9.73 (os.remove(dest)), never what it points to. A stored list that names nothing of the tree (legacy, here an empty
+	one) is nothing known, so there the link stays: the target is untouched either way."""
 	src = tmp_path / 'src'
 	src.mkdir()
 	(tmp_path / 'victim.txt').write_text('not yours')
@@ -361,7 +370,7 @@ def test_remove_extra_never_unlinks_the_target_of_a_destination_that_is_a_symlin
 	else:
 		hpcp_mod.remove_extra_files([], [str(dst)], 2, False, 1, single_thread=True, src_paths=[str(src) + os.sep])
 	assert (tmp_path / 'victim.txt').read_text() == 'not yours'
-	assert not os.path.lexists(dst)
+	assert os.path.lexists(dst) == legacy
 
 
 # ---- 9.74: re-review of 418ca7e..HEAD ----
@@ -372,11 +381,13 @@ def test_legacy_remove_extra_with_a_bare_relative_destination_removes_the_extras
 	'/data/extra'; 9.74 refused them all). The fallback is the CWD."""
 	work = tmp_path / 'work'
 	(work / 'data').mkdir(parents=True)
-	(work / 'data' / 'extra').write_text('extra')
+	(work / 'data' / 'keep').write_text('keep')
 	monkeypatch.chdir(work if dest == 'data' else work / 'data')
+	known = _stored_names(hpcp_mod, dest)
+	(work / 'data' / 'extra').write_text('extra')
 	_answer_yes(monkeypatch)
-	hpcp_mod.remove_extra_files(set(), [dest], 2, False, 1, single_thread=True)
-	assert not (work / 'data' / 'extra').exists()
+	hpcp_mod.remove_extra_files(known, [dest], 2, False, 1, single_thread=True)
+	assert not (work / 'data' / 'extra').exists() and (work / 'data' / 'keep').exists()
 	assert [error for error in hpcp_mod.ERRORS if hpcp_mod._is_failure(error)] == []
 
 

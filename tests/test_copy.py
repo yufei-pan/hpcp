@@ -400,7 +400,8 @@ def test_serial_dir_sync_records_a_failed_directory_and_goes_on(tmp_tree, hpcp_m
 	_tree_with_one_blocked_dir(tmp_tree, count=3)
 	hpcp_mod.sync_directories_serial_batch([(str(tmp_tree.src) + os.sep, [str(tmp_tree.dst) + os.sep])])
 	assert all((tmp_tree.dst / f'd{index}' / 'sub').is_dir() for index in range(3))
-	assert hpcp_mod.get_rc_from_error() == 193
+	# A directory meeting a file at its destination path is a clash (213), not a metadata error (193): the file keeps its mode.
+	assert hpcp_mod.get_rc_from_error() == 213
 
 
 def test_dir_sync_ignores_chown_permission_error_without_privileges(tmp_tree, hpcp_mod, reset_hpcp_globals, require_linux, monkeypatch):

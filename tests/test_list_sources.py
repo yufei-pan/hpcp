@@ -1403,6 +1403,341 @@ def test_a_link_copied_to_another_place_still_works(tmp_path):
 	assert rc == 0 and os.readlink(str(tmp_path / 'out/l')) == 'f'
 
 
+# ---- the second review of 9.81 ----
+
+# R1: a named file into an existing directory lands inside it (9.80 did), in every mode.
+
+def _dir_and_file(tmp_path):
+	write(tmp_path / 'a/x', 'X')
+	os.makedirs(str(tmp_path / 'd'))
+	return tmp_path
+
+
+@pytest.mark.parametrize('flags', MODES, ids=MODE_IDS)
+@pytest.mark.parametrize('how', ['positional', 'dash-d', 'dot', 'dotdot', 'link'])
+def test_a_named_file_lands_inside_an_existing_directory(tmp_path, flags, how):
+	_dir_and_file(tmp_path)
+	cwd, args = tmp_path, None
+	if how == 'positional':
+		args = ['a/x', 'd']
+	elif how == 'dash-d':
+		args = ['a/x', '-d', 'd']
+	elif how == 'dot':
+		cwd, args = tmp_path / 'd', ['../a/x', '-d', '.']
+	elif how == 'dotdot':
+		os.makedirs(str(tmp_path / 'd/sub'))
+		cwd, args = tmp_path / 'd/sub', ['../../a/x', '-d', '..']
+	else:
+		os.symlink('d', str(tmp_path / 'lnk'))
+		args = ['a/x', '-d', 'lnk']
+	rc, output = run(args + flags, cwd)
+	assert rc == 0, output[-2000:]
+	assert files(tmp_path / 'd').get(b'x') == b'X'
+	assert files(tmp_path / 'a') == {b'x': b'X'}
+	if how == 'link':
+		assert os.path.islink(str(tmp_path / 'lnk')) and not os.path.exists(str(tmp_path / 'lnk/lnk'))
+
+
+def test_a_named_file_lands_inside_an_existing_directory_from_the_library(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	_dir_and_file(tmp_path)
+	monkeypatch.chdir(tmp_path)
+	assert hpcp_mod.hpcp(['a/x'], ['d'], single_thread=True) == 0
+	assert files(tmp_path / 'd') == {b'x': b'X'}
+
+
+@pytest.mark.parametrize('flags', MODES, ids=MODE_IDS)
+def test_a_named_file_moves_into_an_existing_directory(tmp_path, flags):
+	_dir_and_file(tmp_path)
+	rc, output = run(['a/x', '-d', 'd', '-rm', '-rf'] + flags, tmp_path)
+	assert rc == 0, output[-2000:]
+	assert files(tmp_path) == {b'd/x': b'X'}
+
+
+def test_rme_keeps_the_file_it_just_copied_into_an_existing_directory(tmp_path):
+	_dir_and_file(tmp_path)
+	write(tmp_path / 'd/stale', 'S')
+	rc, shown = in_a_terminal(hpcp_command(['a/x', '-d', 'd', '-rme']), tmp_path, b'y')
+	assert rc == 0 and files(tmp_path / 'd') == {b'x': b'X'}
+
+
+@pytest.mark.parametrize('flags', MODES, ids=MODE_IDS)
+def test_a_named_file_still_renames_and_overwrites_a_file(tmp_path, flags):
+	_dir_and_file(tmp_path)
+	write(tmp_path / 'f', 'old')
+	assert run(['a/x', '-d', 'new'] + flags, tmp_path)[0] == 0
+	assert run(['a/x', '-d', 'f'] + flags, tmp_path)[0] == 0
+	assert files(tmp_path) == {b'a/x': b'X', b'new': b'X', b'f': b'X'}
+
+
+@pytest.mark.parametrize('flags', MODES, ids=MODE_IDS)
+def test_a_named_file_onto_a_directory_of_its_name_is_still_a_clash(tmp_path, flags):
+	_dir_and_file(tmp_path)
+	write(tmp_path / 'd/x/inner', 'I')
+	rc, output = run(['a/x', '-d', 'd'] + flags, tmp_path)
+	assert rc == 213 and files(tmp_path / 'd') == {b'x/inner': b'I'}
+
+
+def test_a_symlink_source_lands_inside_an_existing_directory(tmp_path):
+	_dir_and_file(tmp_path)
+	os.symlink('x', str(tmp_path / 'a/l'))
+	rc, output = run(['a/l', '-d', 'd'], tmp_path)
+	assert rc == 0 and files(tmp_path / 'd') == {b'l': b'-> x'}
+
+
+# R3: a link spelling of a file entry is judged by its real parent directory.
+
+@pytest.mark.parametrize('flags', MODES, ids=MODE_IDS)
+def test_a_symlink_spelling_of_an_entry_inside_the_destination_stays(tmp_path, flags):
+	os.makedirs(str(tmp_path / 'archive/a'))
+	write(tmp_path / 'a/x', 'NEW')
+	write(tmp_path / 'archive/a/x', 'OLD')
+	os.symlink('archive', str(tmp_path / 'cur'))
+	rc, output = run(['-d', 'archive', '-rf'] + flags, tmp_path, b'cur/a/x\na/x\n')
+	assert rc == 0, output[-2000:]
+	assert files(tmp_path / 'archive') == {b'a/x': b'NEW'}
+
+
+def test_find_dash_l_run_twice_does_not_nest(tmp_path):
+	write(tmp_path / 'logs/one.log', '1')
+	write(tmp_path / 'logs/sub/two.log', '2')
+	os.makedirs(str(tmp_path / 'archive'))
+	os.symlink('../archive', str(tmp_path / 'logs/arch'))
+	for _ in range(2):
+		listing = subprocess.run(['find', '-L', '.', '-name', '*.log'], cwd=str(tmp_path / 'logs'), stdout=subprocess.PIPE).stdout
+		rc, output = run(['-d', '../archive/', '-rf'], tmp_path / 'logs', listing)
+		assert rc == 0, output[-2000:]
+	assert files(tmp_path / 'archive') == {b'one.log': b'1', b'sub/two.log': b'2'}
+
+
+# R4: the scope of -rme is decided before entries inside the destination are dropped.
+
+def test_rme_with_a_positional_and_an_entry_inside_the_destination_stays_scoped(tmp_path):
+	write(tmp_path / 'p/f', 'P')
+	write(tmp_path / 'out/keep', 'K')
+	write(tmp_path / 'out/stale', 'S')
+	write(tmp_path / 'out/d/z', 'Z')
+	(tmp_path / 'L').write_bytes(b'out/keep\n')
+	rc, shown = in_a_terminal(hpcp_command(['p', '-sfl', 'L', '-d', 'out/', '-rme']), tmp_path, b'y')
+	assert rc == 0 and files(tmp_path / 'out') == {b'keep': b'K', b'stale': b'S', b'd/z': b'Z', b'p/f': b'P'}
+
+
+# R5: a symlink source is not removed by a move onto its own place.
+
+def _link_in_a_directory(tmp_path, kind='file'):
+	write(tmp_path / 'src/t', 'T')
+	os.makedirs(str(tmp_path / 'src/sub/dir'))
+	target = {'file': '../t', 'dangling': '/nonexist', 'dir': 'dir'}[kind]
+	os.symlink(target, str(tmp_path / 'src/sub/l'))
+	return tmp_path
+
+
+@pytest.mark.parametrize('flags', MODES, ids=MODE_IDS)
+@pytest.mark.parametrize('kind', ['file', 'dangling', 'dir'])
+def test_a_move_of_a_link_onto_its_own_place_keeps_it(tmp_path, flags, kind):
+	_link_in_a_directory(tmp_path, kind)
+	before = files(tmp_path)
+	rc, output = run(['src/sub/l', '-d', 'src/sub/', '-rf'] + flags, tmp_path)
+	assert rc == 241, output[-2000:]
+	assert os.path.islink(str(tmp_path / 'src/sub/l')) and files(tmp_path) == before
+
+
+def test_a_move_of_a_link_onto_its_own_place_by_a_linked_directory_keeps_it(tmp_path):
+	_link_in_a_directory(tmp_path)
+	os.symlink('src/sub', str(tmp_path / 'viadir'))
+	rc, output = run(['src/sub/l', '-d', 'viadir/', '-rf'], tmp_path)
+	assert rc == 241 and os.path.islink(str(tmp_path / 'src/sub/l'))
+
+
+def test_a_move_of_a_link_onto_its_own_place_asks_nothing_and_keeps_it(tmp_path):
+	_link_in_a_directory(tmp_path)
+	rc, shown = in_a_terminal(hpcp_command(['src/sub/l', '-d', 'src/sub/', '-rm']), tmp_path, b'y')
+	assert rc == 241 and os.path.islink(str(tmp_path / 'src/sub/l'))
+
+
+def test_a_move_of_a_link_elsewhere_still_moves_it(tmp_path):
+	_link_in_a_directory(tmp_path)
+	rc, output = run(['src/sub/l', '-d', 'out/', '-rf', '-rm'], tmp_path)
+	assert rc == 0, output[-2000:]
+	assert files(tmp_path / 'out') == {b'l': b'-> ../t'} and not os.path.lexists(str(tmp_path / 'src/sub/l'))
+
+
+def test_a_move_of_a_hard_linked_link_still_moves_it(tmp_path):
+	_link_in_a_directory(tmp_path)
+	os.makedirs(str(tmp_path / 'out'))
+	os.link(str(tmp_path / 'src/sub/l'), str(tmp_path / 'out/l'), follow_symlinks=False)
+	rc, output = run(['src/sub/l', '-d', 'out/', '-rf', '-rm'], tmp_path)
+	assert rc == 0, output[-2000:]
+	assert os.path.islink(str(tmp_path / 'out/l')) and not os.path.lexists(str(tmp_path / 'src/sub/l'))
+
+
+# Call 1: a directory source meeting a file at the destination changes nothing about that file.
+
+@pytest.mark.parametrize('flags', MODES, ids=MODE_IDS)
+def test_a_directory_onto_a_file_is_a_clash_and_leaves_its_mode(tmp_path, flags):
+	write(tmp_path / 'a/x/in', 'in')
+	write(tmp_path / 'out/x', 'KEEP')
+	os.chmod(str(tmp_path / 'out/x'), 0o600)
+	rc, output = run(['a/x', '-d', 'out/'] + flags, tmp_path)
+	assert rc == 213, output[-2000:]
+	assert files(tmp_path / 'out') == {b'x': b'KEEP'} and stat.S_IMODE(os.stat(str(tmp_path / 'out/x')).st_mode) == 0o600
+
+
+def test_a_directory_onto_a_link_to_a_private_file_leaves_the_file(tmp_path):
+	write(tmp_path / 'a/x/in', 'in')
+	write(tmp_path / 'private', 'KEEP')
+	os.chmod(str(tmp_path / 'private'), 0o600)
+	os.makedirs(str(tmp_path / 'out'))
+	os.symlink('../private', str(tmp_path / 'out/x'))
+	rc, output = run(['a/x', '-d', 'out/'], tmp_path)
+	assert rc == 213, output[-2000:]
+	assert stat.S_IMODE(os.stat(str(tmp_path / 'private')).st_mode) == 0o600 and files(tmp_path / 'out') == {b'x': b'-> ../private'}
+
+
+# -rf with every entry inside the destination.
+
+@pytest.mark.parametrize('flags', MODES, ids=MODE_IDS)
+def test_a_move_of_entries_all_inside_the_destination_keeps_them_and_says_so(tmp_path, flags):
+	write(tmp_path / 'out/one', '1')
+	rc, output = run(['-d', 'out', '-rf'] + flags, tmp_path, b'out/one\n')
+	assert rc == 0 and files(tmp_path) == {b'out/one': b'1'} and b'inside the destination' in output
+
+
+# R2: a relative entry is copied when the working directory lies strictly inside the destination.
+
+def _overlay_dir(tmp_path):
+	write(tmp_path / 't/overlay/etc/conf', 'C')
+	write(tmp_path / 't/overlay/etc/sub/more', 'M')
+	return tmp_path / 't/overlay'
+
+
+@pytest.mark.parametrize('flags', MODES, ids=MODE_IDS)
+def test_entries_below_a_working_directory_inside_the_destination_are_copied(tmp_path, flags):
+	overlay = _overlay_dir(tmp_path)
+	listing = subprocess.run(['find', 'etc', '-type', 'f'], cwd=str(overlay), stdout=subprocess.PIPE).stdout
+	rc, output = run(['-d', '..'] + flags, overlay, listing)
+	assert rc == 0, output[-2000:]
+	assert files(tmp_path / 't') == {b'overlay/etc/conf': b'C', b'overlay/etc/sub/more': b'M', b'etc/conf': b'C', b'etc/sub/more': b'M'}
+
+
+def test_entries_are_copied_to_an_absolute_parent_of_the_working_directory(tmp_path):
+	overlay = _overlay_dir(tmp_path)
+	rc, output = run(['-d', str(tmp_path / 't')], overlay, b'etc/conf\n')
+	assert rc == 0 and files(tmp_path / 't').get(b'etc/conf') == b'C'
+
+
+def test_entries_are_copied_to_a_destination_reached_through_a_link(tmp_path):
+	overlay = _overlay_dir(tmp_path)
+	os.symlink('t', str(tmp_path / 'viat'))
+	rc, output = run(['-d', str(tmp_path / 'viat')], overlay, b'etc/conf\n')
+	assert rc == 0 and files(tmp_path / 't').get(b'etc/conf') == b'C'
+
+
+def test_entries_are_moved_to_a_parent_of_the_working_directory(tmp_path):
+	overlay = _overlay_dir(tmp_path)
+	rc, output = run(['-d', '..', '-rf'], overlay, b'etc/conf\n')
+	assert rc == 0, output[-2000:]
+	assert files(tmp_path / 't') == {b'etc/conf': b'C', b'overlay/etc/sub/more': b'M'}
+
+
+def test_a_listed_directory_is_copied_to_a_parent_of_the_working_directory(tmp_path):
+	overlay = _overlay_dir(tmp_path)
+	rc, output = run(['-d', '..'], overlay, b'etc\n')
+	assert rc == 0, output[-2000:]
+	assert files(tmp_path / 't').get(b'etc/sub/more') == b'M' and files(tmp_path / 't').get(b'etc/conf') == b'C'
+
+
+def test_entries_that_land_on_themselves_still_stay(tmp_path):
+	overlay = _overlay_dir(tmp_path)
+	before = files(tmp_path)
+	for args, stdin in ((['-d', '.'], b'etc/conf\n'), ([], b'etc/conf\n'), (['-d', '.', '-rf'], b'etc\n')):
+		rc, output = run(args, overlay, stdin)
+		assert rc == 0 and files(tmp_path) == before, (args, output[-2000:])
+
+
+def test_find_dot_into_a_directory_below_still_leaves_that_directory_out(tmp_path):
+	write(tmp_path / 'src/a', '1')
+	write(tmp_path / 'src/out/old', 'o')
+	listing = subprocess.run(['find', '.', '-type', 'f'], cwd=str(tmp_path / 'src'), stdout=subprocess.PIPE).stdout
+	rc, output = run(['-d', 'out'], tmp_path / 'src', listing)
+	assert rc == 0 and files(tmp_path / 'src/out') == {b'a': b'1', b'old': b'o'}
+
+
+def test_absolute_entries_inside_the_destination_stay(tmp_path):
+	overlay = _overlay_dir(tmp_path)
+	before = files(tmp_path)
+	rc, output = run(['-d', str(tmp_path / 't')], overlay, (str(overlay / 'etc/conf') + '\n').encode())
+	assert rc == 0 and files(tmp_path) == before
+
+
+@pytest.mark.root
+@pytest.mark.skipif(not hasattr(os, 'geteuid') or os.geteuid() != 0, reason='needs root: it writes below /')
+def test_a_relative_entry_is_copied_to_the_root_directory_and_an_absolute_one_stays(tmp_path):
+	write(tmp_path / 'hpcp_r2_probe/f', 'F')
+	try:
+		rc, output = run(['-d', '/'], tmp_path, b'hpcp_r2_probe/f\n')
+		assert rc == 0, output[-2000:]
+		assert files('/hpcp_r2_probe') == {b'f': b'F'}
+		shutil.rmtree('/hpcp_r2_probe')
+		rc, output = run(['-d', '/'], tmp_path, (str(tmp_path / 'hpcp_r2_probe/f') + '\n').encode())
+		assert rc == 0 and not os.path.exists('/hpcp_r2_probe') and b'inside the destination' in output
+	finally:
+		shutil.rmtree('/hpcp_r2_probe', ignore_errors=True)
+
+
+# Stored list: a list that shares no name with the tree is nothing known, as a missing list.
+
+def _nothing_known(directory, said=True):
+	"""The run's output (in_a_terminal writes it to log) asked nothing, and said the list matches nothing (or did not)."""
+	log = (directory / 'log').read_bytes()
+	return b'(y/n)' not in log and (b'matches nothing' in log) == said
+
+
+def _tree_and_list(tmp_path, content):
+	write(tmp_path / 'src/one', '1')
+	write(tmp_path / 'src/sub/two', '2')
+	(tmp_path / 'S').write_bytes(content)
+	return files(tmp_path / 'src')
+
+
+@pytest.mark.parametrize('content', [b'', b'\0', b'\n', b'unrelated:abc\nother\n'], ids=['empty', 'nul', 'newline', 'other-names'])
+def test_a_stored_list_that_matches_nothing_deletes_nothing(tmp_path, content):
+	before = _tree_and_list(tmp_path, content)
+	rc, shown = stored_rme(tmp_path)
+	assert rc == 0 and files(tmp_path / 'src') == before and _nothing_known(tmp_path)
+
+
+def test_dev_null_as_a_stored_list_deletes_nothing(tmp_path):
+	before = _tree_and_list(tmp_path, b'')
+	rc, shown = in_a_terminal(hpcp_command(['src', '-fl', '/dev/null', '-rme']), tmp_path, b'y')
+	assert rc == 0 and files(tmp_path / 'src') == before and _nothing_known(tmp_path)
+
+
+@pytest.mark.parametrize('made, used', [('src/', 'src'), ('src', 'src/')], ids=['slash-then-bare', 'bare-then-slash'])
+def test_a_list_stored_under_the_other_spelling_matches_nothing_and_deletes_nothing(tmp_path, made, used):
+	write(tmp_path / 'src/a', '1')
+	write(tmp_path / 'src/b', '2')
+	assert run([made, '-fl', 'S'], tmp_path)[0] == 0
+	write(tmp_path / 'src/stale', 'x')
+	rc, shown = in_a_terminal(hpcp_command([used, '-fl', 'S', '-rme']), tmp_path, b'y')
+	assert rc == 0 and files(tmp_path / 'src') == {b'a': b'1', b'b': b'2', b'stale': b'x'}
+	assert _nothing_known(tmp_path)
+
+
+def test_a_stored_list_with_one_matching_name_still_deletes_the_extras(tmp_path):
+	write(tmp_path / 'src/one', '1')
+	write(tmp_path / 'src/stale', 'x')
+	(tmp_path / 'S').write_bytes(b'src/one\n')
+	rc, shown = stored_rme(tmp_path)
+	assert rc == 0 and files(tmp_path / 'src') == {b'one': b'1'}
+
+
+def test_a_stored_list_and_an_empty_tree_report_no_such_note(tmp_path):
+	os.makedirs(str(tmp_path / 'src'))
+	(tmp_path / 'S').write_bytes(b'')
+	rc, shown = stored_rme(tmp_path)
+	assert rc == 0 and _nothing_known(tmp_path, False)
+
+
 # ---- modes: -di (needs root and loop devices: VM 901) ----
 
 @pytest.mark.root
