@@ -3152,9 +3152,9 @@ def _chown_like_cp(path, st):
 
 def _leave_hard_links(path):
 	"""A file with other names goes before a content-only copy: cp -f rewrites the inode, so all its names change, a source
-	perhaps (cp -a replaces such a file by itself, and a symlink to one). Here and not a cp flag: any cp, and a retry finds
-	the file removed. No file there, or a link that leads nowhere, is cp's to answer; a file that cannot be left fails, as
-	under cp -a."""
+	perhaps (cp -a replaces such a file by itself, and a symlink to one). Here and not a cp flag: any cp, and every cp of an
+	attempt runs after this. No file there, or a link that leads nowhere, is cp's to answer. A file that cannot be left
+	raises, and that fails the attempt before any cp, as under cp -a."""
 	try:
 		if os.stat(path).st_nlink <= 1:
 			return
@@ -3270,12 +3270,13 @@ def copy_file(src_path, dest_paths, full_hash=False, verbose=False, concurrent_p
 					print(f'\nTrying to copy from {src_path} to {dest_path}')
 				before = _copy_state(dest_path)
 				try:
+					# Outside the inner try: its retry is a cp too, and it must not run when this failed.
+					if CONTENT_ONLY:
+						_leave_hard_links(dest_path)
 					try:
 						# if the parent path for the file does not exist, create it
 						if not NO_CREATE_DIR:
 							_makedirs(os.path.dirname(dest_path), exist_ok=True)
-						if CONTENT_ONLY:
-							_leave_hard_links(dest_path)
 						if os.name == 'posix':
 							cp_command = ["cp", "-f" if CONTENT_ONLY else "-af"]
 							if cp_supports_sparse():

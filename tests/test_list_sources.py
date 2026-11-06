@@ -3085,3 +3085,23 @@ def test_content_only_takes_a_link_loop_at_a_landing_without_a_crash(tmp_path):
 	os.symlink('x', tmp_path / 'out/x')
 	rc, output = run(['a/', '-d', 'out/', '-co'], tmp_path)
 	assert b'Traceback' not in output, output[-2000:]
+
+
+@no_permissions_as_root
+@pytest.mark.parametrize('flags', [[], ['-rf']], ids=['copy', 'move'])
+@pytest.mark.parametrize('through_a_link', [False, True], ids=['hard-link', 'link-to-a-hard-link'])
+def test_content_only_never_writes_through_a_hard_link_it_could_not_leave(tmp_path, out_back, through_a_link, flags):
+	# A read-only destination directory: the name cannot go, so that file fails; no retry may open the inode behind it.
+	write(tmp_path / 'a/x', 'X' * 5000)
+	write(tmp_path / 'a/y', 'Y' * 3000)
+	os.makedirs(tmp_path / 'out')
+	if through_a_link:
+		os.makedirs(tmp_path / 't')
+		os.link(tmp_path / 'a/y', tmp_path / 't/h')
+		os.symlink('../t/h', tmp_path / 'out/x')
+	else:
+		os.link(tmp_path / 'a/y', tmp_path / 'out/x')
+	os.chmod(tmp_path / 'out', 0o555)
+	rc, output = run(['a/', '-d', 'out/', '-co'] + flags, tmp_path)
+	os.chmod(tmp_path / 'out', 0o700)
+	assert rc != 0 and (tmp_path / 'a/y').read_text() == 'Y' * 3000 and (tmp_path / 'a/x').read_text() == 'X' * 5000, output[-2000:]
