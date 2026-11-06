@@ -10285,7 +10285,7 @@ def _settle_destinations(src_paths, dests, dest_image=None, directory_only=False
 			for path, place, landings in files_of(job):
 				if remove and place in landings:
 					raise RuntimeError(f'Destination clash: {path} would land on itself at {place}; nothing is copied or removed')
-				if not (job[2] and place in landings):
+				if not (job[2] and job[3] in job[4]):
 					reads[place] = path
 		for job in jobs:
 			for path, place, landings in files_of(job):
