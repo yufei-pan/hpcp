@@ -2681,11 +2681,11 @@ def test_content_only_writes_no_source_through_a_symlink_and_a_hard_link(tmp_pat
 	assert (tmp_path / 'b/y').read_text() == 'B' * 3000 and (tmp_path / 'out/x').read_text() == 'A' * 5000
 
 
-@pytest.mark.parametrize('sources, link, landing, source', [
-	(['a/'], 'a/y', 'out/x', 'out/y'),
-	(['a/', 'b/'], 'b/x', 'out/y', 'out/x'),
+@pytest.mark.parametrize('sources, link, landing', [
+	(['a/'], 'a/y', 'out/x'),
+	(['a/', 'b/'], 'b/x', 'out/y'),
 ], ids=['own-file', 'another-source'])
-def test_a_content_only_move_keeps_every_file_through_a_hard_link(tmp_path, sources, link, landing, source):
+def test_a_content_only_move_keeps_every_file_through_a_hard_link(tmp_path, sources, link, landing):
 	for attempt in range(4):
 		root = tmp_path / str(attempt)
 		write(root / 'a/x', 'X' * 200000)
@@ -3146,11 +3146,12 @@ def test_a_service_with_read_capability_copies_what_it_cannot_read_by_mode(tmp_p
 @pytest.mark.parametrize('mode', [0o000, 0o644], ids=oct)
 def test_a_fifo_is_no_read_so_its_mode_stops_nothing(tmp_path, mode):
 	# cp -a makes a new one, reading nothing. And asking must not hang on it: no writer is coming.
+	# The exit is 200 ("Source path type error") for both modes, as on 9.80: the node is made all the same.
 	os.makedirs(tmp_path / 'a')
 	os.mkfifo(tmp_path / 'a/p', mode)
 	task = subprocess.run([sys.executable, HPCP, 'a/p', '-d', 'out/'], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
 		cwd=str(tmp_path), timeout=60, start_new_session=True)
-	assert stat.S_ISFIFO(os.lstat(tmp_path / 'out/p').st_mode), task.stdout[-2000:]
+	assert stat.S_ISFIFO(os.lstat(tmp_path / 'out/p').st_mode) and task.returncode == 200, task.stdout[-2000:]
 
 
 def _cp_through_a_link(hpcp_mod, monkeypatch, parts):
@@ -3175,7 +3176,7 @@ def _link_at_the_landing(tmp_path):
 
 
 def test_a_part_through_a_link_keeps_the_link_for_the_retry(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
-	# The link goes, and the retry leaves a whole file beside a target cut short, reported as success.
+	# It used to take the link away, and the retry then left a whole file beside a target cut short, reported as success.
 	source, landing = _link_at_the_landing(tmp_path)
 	_cp_through_a_link(hpcp_mod, monkeypatch, 1)
 	hpcp_mod.copy_file(source, [landing])
