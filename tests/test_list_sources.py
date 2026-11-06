@@ -3146,7 +3146,8 @@ def test_a_service_with_read_capability_copies_what_it_cannot_read_by_mode(tmp_p
 @pytest.mark.parametrize('mode', [0o000, 0o644], ids=oct)
 def test_a_fifo_is_no_read_so_its_mode_stops_nothing(tmp_path, mode):
 	# cp -a makes a new one, reading nothing. And asking must not hang on it: no writer is coming.
-	# The exit is 200 ("Source path type error") for both modes, as on 9.80: the node is made all the same.
+	# The exit is 200 ("Source path type error") for both modes, as on 9.80: the node is made all the same. That exit is wrong and
+	# deferred (docs/limitations.md, "A named FIFO or socket is copied and still exits 200"): this holds both modes to one route.
 	os.makedirs(tmp_path / 'a')
 	os.mkfifo(tmp_path / 'a/p', mode)
 	task = subprocess.run([sys.executable, HPCP, 'a/p', '-d', 'out/'], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,

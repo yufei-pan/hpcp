@@ -110,8 +110,14 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - **Why:** old and safe. The fix is to move the readability check ahead of the identical loop, or to catch `PermissionError` around the hash.
 - **Revisit when:** the next hpcp release (9.82).
 
-### `-co` on a FIFO with other names at the destination
+### A FIFO that blocks the copy
 - **Kind:** deferred.
-- **What the operator sees:** `-co` onto a 644 FIFO hangs, because `cp -f` reads it, as on 9.80. New in 9.81: a FIFO that has other names is unlinked at that name first, and the copy lands there as a regular file; the FIFO keeps its other names.
-- **Why:** rare, and the hang is old. Leaving a destination that is not a regular file alone belongs with the temporary name and rename above.
+- **What the operator sees:** a 644 FIFO named as a source under `-co` hangs, because `cp -f` reads it and no writer comes. A lone 644 FIFO at the destination hangs with or without `-co`, because `cp` writes to it and waits for a reader. Both as on 9.80. New in 9.81, under `-co`: a FIFO source over a hard-linked destination has already taken that name when it hangs, and the content stays at the other names. A regular file onto a FIFO with other names no longer hangs: it lands as a regular file at that name, as `-a` always did, and the other names keep the FIFO.
+- **Why:** rare, and the hang is old. The temporary name and rename above keeps the name until the copy is whole.
+- **Revisit when:** the next hpcp release (9.82).
+
+### A named FIFO or socket is copied and still exits 200
+- **Kind:** deferred.
+- **What the operator sees:** `hpcp a/p -d out/` makes the node, prints `Source path type error` and ends exit 200. With `-rf` it is 212 and every named source stays, files included; nothing is lost. The same FIFO in a directory source is skipped silently with exit 0. Same on 9.80.
+- **Why:** old and safe. A named special should either copy cleanly or be skipped as in a tree, and that is its own decision.
 - **Revisit when:** the next hpcp release (9.82).
