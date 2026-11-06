@@ -3163,13 +3163,15 @@ def _leave_hard_links(path):
 	os.unlink(path)
 
 def _can_open(path):
-	"""False when cp could not read the source path. Asked by opening, with the ids cp runs with: access() answers for the
-	real uid, and a service with a read capability or a setuid wrapper can open more. Not blocking, for a FIFO. Only a
-	regular file has to open: cp -a makes a new node for the rest. No search permission on the way answers as a file does."""
+	"""False when cp could not read the regular file path. Asked by opening, with the ids cp runs with: access() answers for
+	the real uid, and a service with a read capability or a setuid wrapper can open more. Only a regular file: cp -a makes a
+	new node for the rest, and opening one is an act of its own (a FIFO's writer wakes, a watchdog arms). No search
+	permission on the way answers as a file does."""
 	try:
-		os.close(os.open(path, os.O_RDONLY | getattr(os, 'O_NONBLOCK', 0)))
+		if stat.S_ISREG(os.stat(path).st_mode):
+			os.close(os.open(path, os.O_RDONLY))
 	except PermissionError:
-		return os.path.exists(path) and not os.path.isfile(path)
+		return False
 	except OSError:
 		pass
 	return True

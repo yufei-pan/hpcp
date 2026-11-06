@@ -3154,6 +3154,41 @@ def test_a_fifo_is_no_read_so_its_mode_stops_nothing(tmp_path, mode):
 	assert stat.S_ISFIFO(os.lstat(tmp_path / 'out/p').st_mode) and task.returncode == 200, task.stdout[-2000:]
 
 
+_FIFO_WRITER = 'import os, sys; print("ready", flush=True); os.write(os.open(sys.argv[1], os.O_WRONLY), b"x")'
+
+
+def test_a_fifo_with_a_waiting_writer_is_not_disturbed_by_being_named(tmp_path):
+	# Opening it to ask wakes the writer, and its write then fails with a broken pipe where it waited before.
+	os.makedirs(tmp_path / 'a')
+	os.mkfifo(tmp_path / 'a/p')
+	writer = subprocess.Popen([sys.executable, '-c', _FIFO_WRITER, str(tmp_path / 'a/p')], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True)
+	try:
+		assert writer.stdout.readline() == b'ready\n'
+		time.sleep(0.3)
+		subprocess.run([sys.executable, HPCP, 'a/p', '-d', 'out/'], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+			cwd=str(tmp_path), timeout=60, start_new_session=True)
+		with pytest.raises(subprocess.TimeoutExpired):
+			writer.wait(timeout=1)
+	finally:
+		writer.kill()
+		writer.wait()
+		writer.stdout.close()
+
+
+@no_permissions_as_root
+def test_a_source_behind_a_directory_without_search_permission_does_not_open(tmp_path, hpcp_mod):
+	write(tmp_path / 'd/x', 'X')
+	os.chmod(tmp_path / 'd', 0o600)
+	try:
+		assert hpcp_mod._can_open(str(tmp_path / 'd/x')) is False
+	finally:
+		os.chmod(tmp_path / 'd', 0o700)
+
+
+def test_a_source_that_is_not_there_is_left_to_cp(tmp_path, hpcp_mod):
+	assert hpcp_mod._can_open(str(tmp_path / 'nosuch')) is True
+
+
 def _cp_through_a_link(hpcp_mod, monkeypatch, parts):
 	"""A cp that dies part way through its first parts writes, and works after that."""
 	real, failures = hpcp_mod.run_command_in_multicmd_with_path_check, [parts]
