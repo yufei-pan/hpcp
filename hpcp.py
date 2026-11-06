@@ -1294,6 +1294,25 @@ _FS_MKFS_BUILDERS.update({'ext2': _build_ext, 'ext3': _build_ext, 'ext4': _build
 
 _XFS_RO_MOUNT_OPTIONS = 'ro,nouuid,norecovery'
 
+def _release_probe_mount(mount_point):
+	"""
+	Unmount a probe's temporary mount and remove its directory, whatever ended the probe (Ctrl-C included).
+
+	One something still holds (a shell with its cwd in it) is unmounted lazily. The probe's ERRORS are cut
+	afterwards, so a mount that stays says so on stderr.
+	"""
+	for command in (['umount', mount_point], ['umount', '-l', mount_point]):
+		if not _is_mount_point(mount_point):
+			break
+		run_command_in_multicmd_with_path_check(command, quiet=True)
+	if _is_mount_point(mount_point):
+		print(f"FS param probe warning: could not unmount {mount_point}; unmount it by hand (umount -l {mount_point}).", file=sys.stderr)
+		return
+	try:
+		os.rmdir(mount_point)
+	except OSError:
+		pass
+
 def _probe_xfs(device):
 	"""
 	Read xfs geometry and features from xfs_info.
@@ -1310,14 +1329,12 @@ def _probe_xfs(device):
 	lines = run_command_in_multicmd_with_path_check(['xfs_info', device], quiet=True, extra_env=_C_LOCALE)
 	if not lines and check_path('xfs_info'):
 		mount_point = tempfile.mkdtemp()
-		run_command_in_multicmd_with_path_check(['mount', '-o', _XFS_RO_MOUNT_OPTIONS, device, mount_point], quiet=True)
-		if _is_mount_point(mount_point):
-			lines = run_command_in_multicmd_with_path_check(['xfs_info', mount_point], quiet=True, extra_env=_C_LOCALE)
-			run_command_in_multicmd_with_path_check(['umount', mount_point], quiet=True)
 		try:
-			os.rmdir(mount_point)
-		except OSError:
-			pass
+			run_command_in_multicmd_with_path_check(['mount', '-o', _XFS_RO_MOUNT_OPTIONS, device, mount_point], quiet=True)
+			if _is_mount_point(mount_point):
+				lines = run_command_in_multicmd_with_path_check(['xfs_info', mount_point], quiet=True, extra_env=_C_LOCALE)
+		finally:
+			_release_probe_mount(mount_point)
 	for line in lines:
 		if not line.strip():
 			continue

@@ -861,6 +861,76 @@ def test_probe_xfs_mounts_nothing_without_xfs_info(monkeypatch):
 	assert calls == [['xfs_info', '/dev/fake3']]
 
 
+def test_probe_xfs_mounts_nothing_when_xfs_info_prints(monkeypatch):
+	"""xfs_info of a newer xfsprogs reads the device itself: no mount, no temp directory."""
+	calls = []
+
+	def fake(argv, **kwargs):
+		calls.append(argv)
+		return list(_XFS_INFO_OUTPUT)
+
+	monkeypatch.setattr(hpcp, 'run_command_in_multicmd_with_path_check', fake)
+	monkeypatch.setattr(hpcp, 'check_path', lambda tool: True)
+	assert hpcp._probe_xfs('/dev/fake3')['data']['bsize'] == '4096'
+	assert calls == [['xfs_info', '/dev/fake3']]
+
+
+def test_probe_xfs_unmounts_when_interrupted_during_xfs_info(monkeypatch):
+	"""Ctrl-C during the second xfs_info leaves no mount and no directory."""
+	calls = _fake_xfs_tools(monkeypatch)
+	inner = hpcp.run_command_in_multicmd_with_path_check
+
+	def interrupt(argv, **kwargs):
+		if argv[0] == 'xfs_info' and argv[-1] != '/dev/fake3':
+			raise KeyboardInterrupt
+		return inner(argv, **kwargs)
+
+	monkeypatch.setattr(hpcp, 'run_command_in_multicmd_with_path_check', interrupt)
+	with pytest.raises(KeyboardInterrupt):
+		hpcp._probe_xfs('/dev/fake3')
+	mount_point = calls[1][-1]
+	assert calls[-1] == ['umount', mount_point]
+	assert not hpcp._is_mount_point(mount_point)
+	assert not os.path.exists(mount_point)
+
+
+def _busy_umount(monkeypatch, lazy_works):
+	"""_fake_xfs_tools whose plain umount fails (something holds the mount); umount -l works when lazy_works."""
+	calls = _fake_xfs_tools(monkeypatch)
+	inner = hpcp.run_command_in_multicmd_with_path_check
+
+	def fake(argv, **kwargs):
+		if argv[0] == 'umount':
+			calls.append(argv)
+			if argv[1] != '-l' or not lazy_works:
+				return []
+			return inner(['umount', argv[-1]], **kwargs)
+		return inner(argv, **kwargs)
+
+	monkeypatch.setattr(hpcp, 'run_command_in_multicmd_with_path_check', fake)
+	return calls
+
+
+def test_probe_xfs_unmounts_a_busy_mount_lazily(monkeypatch, capsys):
+	calls = _busy_umount(monkeypatch, lazy_works=True)
+	assert hpcp._probe_xfs('/dev/fake3')['data']['bsize'] == '4096'
+	mount_point = [call for call in calls if call[0] == 'mount'][0][-1]
+	assert ['umount', mount_point] in calls and ['umount', '-l', mount_point] in calls
+	assert not os.path.exists(mount_point)
+	assert capsys.readouterr().err == ''
+
+
+def test_probe_xfs_says_so_when_even_a_lazy_unmount_fails(monkeypatch, capsys):
+	calls = _busy_umount(monkeypatch, lazy_works=False)
+	try:
+		assert hpcp._probe_xfs('/dev/fake3')['data']['bsize'] == '4096'
+		mount_point = [call for call in calls if call[0] == 'mount'][0][-1]
+		err = capsys.readouterr().err
+		assert 'could not unmount ' + mount_point in err and 'umount -l' in err
+	finally:
+		shutil.rmtree(mount_point, ignore_errors=True)
+
+
 def test_probe_xfs_gives_nothing_when_the_filesystem_cannot_be_mounted(monkeypatch):
 	calls = _fake_xfs_tools(monkeypatch, mounts=False)
 	assert hpcp._probe_xfs('/dev/fake3') == {}
