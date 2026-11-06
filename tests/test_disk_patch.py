@@ -1210,14 +1210,17 @@ def test_a_diff_with_temp_dirs_on_a_live_filesystem_leaves_nothing_in_another_na
 @pytest.mark.root
 @pytest.mark.loop
 @pytest.mark.skipif(shutil.which('unshare') is None, reason='needs unshare')
-def test_an_apply_with_temp_dirs_on_a_live_filesystem_leaves_nothing_in_another_namespace(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+@pytest.mark.parametrize('esp', [False, True], ids=['plain', 'esp-first'])
+def test_an_apply_with_temp_dirs_on_a_live_filesystem_leaves_nothing_in_another_namespace(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch, esp):
 	"""As for a diff, with the sections: partition 1 is live, so it is a bind, and partition 2 is mounted after it. The
-	apply takes the sections off itself, in the opposite order to their mounts. Partition 1 is an ESP, which is applied
-	last: the order of the mounts (1, 2) is not the order of the applies (2, 1), so releasing in apply order leaves the bind."""
+	apply takes the sections off itself, in the opposite order to their mounts (1, 2), whatever order it applied them in.
+	With partition 1 plain, the apply order is the mount order, so releasing in apply order (or in mount order) leaves the
+	bind; with partition 1 an ESP, which is applied last, the apply order is (2, 1), the reverse of the mounts, and releasing
+	in reverse apply order leaves it. Each wrong form fails one of the two."""
 	base, golden, target = tmp_path / 'base.img', tmp_path / 'golden.img', tmp_path / 'target.img'
 	with open(str(base), 'wb') as f:
 		f.truncate(96 << 20)
-	_run('sgdisk', '-n1:2048:+40M', '-t1:EF00', '-n2:0:+40M', base)
+	_run('sgdisk', '-n1:2048:+40M', *(['-t1:EF00'] if esp else []), '-n2:0:+40M', base)
 	with _attached(base) as loop:
 		_run('mkfs.ext4', '-q', '-F', loop + 'p1')
 		_run('mkfs.ext4', '-q', '-F', loop + 'p2')
