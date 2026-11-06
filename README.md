@@ -24,6 +24,7 @@ hpcp.bat available on github: simple old tk based GUI intended for basic windows
 - **`unshare` is now needed for xfs geometry on EL7:** `xfs_info` there takes only a mounted filesystem, so hpcp mounts the source in a mount namespace of its own. Without `unshare` a `-dd` copy of xfs gives up mirroring the geometry and uses the defaults, and says so.
 - **`-co` never reads a FIFO, socket or device node:** a source that is not a regular file is made as `cp -a` makes it, with its mode, owner and times, and never opened. 9.81 read a device to its end and wrote it through what was at the destination, another disk if a device node was there, and a FIFO source hung on the first run. As in a plain run, a user who may not make device nodes gets an error for a device source (9.81 under `-co` got an ordinary file with its contents).
 - **A device named by `-d` is never replaced (exit 213):** a source that would take the name of a device node that `-d` names itself (`hpcp /dev/sda -d /dev/sdb`, `hpcp a/fifo -d /dev/sdb`, with or without `-co`; a regular file too when the node has other names) is a clash: the node and the source stay. A plain run replaced the node; `-dd` is what clones a disk. A device node inside a destination directory is a file of the tree, and a node source replaces it. A regular file still writes through a device node, as in 9.81 (see [docs/limitations.md](docs/limitations.md)).
+- **xxhash is no longer installed on Python 3.6:** `pip3 install hpcp` on stock EL7 and EL8 failed without a compiler, because pip 9 takes no xxhash wheel and hpcp required it. It now installs there and hashes with blake2b; an xxhash already installed is still used, and `pip3 install xxhash` adds it.
 - **multiCMD:** the embedded multiCMD is 1.57. It runs whenever the installed one is older, so nothing needs upgrading. On EL7 and EL8 stock pip 9.0.3 cannot upgrade multiCMD, so `pip3 install -U hpcp` fails there: use `pip3 install hpcp==9.82` or upgrade pip first.
 
 ## Upgrading to 9.81 from 9.80
@@ -106,7 +107,7 @@ hpcp -V
 It is recommended to install via **pip**, but **hpcp** can also function as a single script using Python’s default libraries.
 
 **Note**:  
-- Using `pip` will optionally install the hashing library [xxhash](https://github.com/Cyan4973/xxHash), which can reduce CPU usage for partial hashing and increase performance when using `-fh --full_hash`.  
+- On Python 3.7 and later `pip` also installs the hashing library [xxhash](https://github.com/Cyan4973/xxHash), which can reduce CPU usage for partial hashing and increase performance when using `-fh --full_hash`. On Python 3.6 (EL7 and EL8) it does not, because building it there needs a compiler: hpcp uses blake2b instead, or `pip3 install xxhash` adds it.  
 - `pip` also installs [multiCMD](https://github.com/yufei-pan/multiCMD), used to issue commands and provide helper functions. If it is not available, or older than the version hpcp requires, `hpcp.py` uses its built-in copy, which is the full multiCMD.
 
 ## Disk Imaging Feature Note

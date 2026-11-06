@@ -48,3 +48,10 @@ def test_the_import_gate_tracks_the_embedded_copy_and_the_floor_is_one_number():
 	with open(os.path.join(_ROOT, 'setup.py'), encoding='utf-8') as f:
 		assert "'multiCMD>=1.56'" in f.read()
 	assert '"multiCMD>=1.56"' in source
+
+
+def test_xxhash_is_not_required_where_stock_pip_cannot_install_it():
+	# pip 9.0.3 on EL7 and EL8 (Python 3.6) takes no xxhash wheel and building one needs a compiler, so a plain requirement
+	# fails the whole install; hpcp hashes with blake2b without it
+	with open(os.path.join(_ROOT, 'setup.py'), encoding='utf-8') as f:
+		assert "\"xxhash; python_version >= '3.7'\"" in f.read()

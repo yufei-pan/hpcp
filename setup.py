@@ -17,7 +17,8 @@ setup(
         ],
     },
     install_requires=[
-		'xxhash',
+		# not on 3.6: stock pip on EL7 and EL8 takes no xxhash wheel, and building one needs a compiler; hpcp runs without it
+		"xxhash; python_version >= '3.7'",
 		'multiCMD>=1.56',
     ],
     classifiers=[

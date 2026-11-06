@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.6"
 # dependencies = [
-#     "xxhash",
+#     "xxhash; python_version >= '3.7'",
 #     "multiCMD>=1.56",
 # ]
 # ///
