@@ -2863,9 +2863,9 @@ def test_fat_serial_reads_back_through_blkid_and_passes_fsck(tmp_path, hpcp_mod,
 	report, the backup boot sector of FAT32 included."""
 	image = tmp_path / 'fat.img'
 	with open(str(image), 'wb') as f:
-		f.truncate((64 if fat_bits == '32' else 8) << 20)
+		f.truncate({'12': 8, '16': 32, '32': 64}[fat_bits] << 20)
 	_run('mkfs.vfat', '-F', fat_bits, '-n', 'OLD', image)
-	# Against the fresh filesystem: fsck.fat 3.0.20 has something to say about what its own mkfs.vfat made at FAT16.
+	# Against the fresh filesystem: fsck.fat 3.0.20 can have something to say about what its own mkfs.vfat made.
 	check = lambda: subprocess.run(['fsck.fat', '-n', str(image)], capture_output=True, text=True)
 	before = check()
 	hpcp_mod._write_fat_serial(str(image), 'ABCD-1234')
