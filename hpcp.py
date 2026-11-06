@@ -6788,6 +6788,8 @@ _BACKSLASHREPLACE_RE = re.compile(rb'\\x([89a-f][0-9a-f])')
 # Counted in UTF-8 bytes, as the buffer is: blkid keeps UTF-8 as it is, so a multibyte label is cut in fewer characters.
 _UDEV_ENC_CUT_BYTES = 261
 _UDEV_PARTIAL_ESCAPE_RE = re.compile(r'\\(x[0-9a-fA-F]?)?$')
+# The filesystems whose label can pass 127 bytes and whose own tool reads it (see _probe_identity).
+_LABEL_READERS = {'btrfs': ['btrfs', 'filesystem', 'label'], 'ntfs': ['ntfslabel']}
 
 def _udev_decode(value):
 	"""A blkid `-o udev` *_ENC value as text, with the original bytes: blkid writes unsafe bytes (a space, a
@@ -6808,8 +6810,8 @@ def _probe_identity(device):
 	An ID_FS_LABEL_ENC value of 261 bytes or more, or one ending in a partial escape, may have been cut (blkid keeps
 	it in a 265-byte buffer; a long btrfs, NTFS, f2fs or udf label full of spaces needs more): the label is then
 	read raw (_probe_raw_label).
-	A btrfs label comes from btrfs itself (_probe_btrfs_label): blkid 2.23.2 (EL7) cuts every label at 127 bytes and
-	trims what is left, so no length shows the cut.
+	A btrfs or NTFS label comes from that filesystem's own tool (_LABEL_READERS): blkid 2.23.2 (EL7) cuts every label
+	at 127 bytes and trims what is left, so no length shows the cut.
 	"""
 	error_count = len(ERRORS)
 	try:
@@ -6825,7 +6827,7 @@ def _probe_identity(device):
 	uuid = values.get('ID_FS_UUID_ENC', values.get('ID_FS_UUID', ''))
 	label = values.get('ID_FS_LABEL_ENC', '')
 	fs_type = values.get('ID_FS_TYPE', '')
-	exact_label = _probe_btrfs_label(device) if fs_type == 'btrfs' and label else None
+	exact_label = _probe_tool_label(fs_type, device) if label else None
 	if not exact_label and (len(label.encode('utf-8', 'surrogateescape')) >= _UDEV_ENC_CUT_BYTES or _UDEV_PARTIAL_ESCAPE_RE.search(label)):
 		exact_label = _probe_raw_label(device)
 	return fs_type, _udev_decode(uuid), exact_label if exact_label else _udev_decode(label)
@@ -6852,9 +6854,11 @@ def _probe_raw_label(device):
 	"""device's label from `blkid -p -o value -s LABEL` (see _label_printed_raw)."""
 	return _label_printed_raw(['blkid', '-p', '-o', 'value', '-s', 'LABEL', device])
 
-def _probe_btrfs_label(device):
-	"""The label of the btrfs on device from `btrfs filesystem label` (see _label_printed_raw); None without the tool."""
-	return _label_printed_raw(['btrfs', 'filesystem', 'label', device]) if check_path('btrfs') else None
+def _probe_tool_label(fs_type, device):
+	"""device's label from its filesystem's own tool (see _label_printed_raw); None for a filesystem with none in
+	_LABEL_READERS, or without the tool."""
+	reader = _LABEL_READERS.get(fs_type)
+	return _label_printed_raw(reader + [device]) if reader and check_path(reader[0]) else None
 
 def _partition_table_type(device):
 	"""Partition table type of device from a low-level `blkid -p` probe ('gpt', 'dos', ...; '' when it finds

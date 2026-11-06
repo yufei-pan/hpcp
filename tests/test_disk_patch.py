@@ -3196,7 +3196,7 @@ def test_probe_identity_reads_a_btrfs_label_with_the_btrfs_tool(hpcp_mod, reset_
 	assert calls == [['blkid', '-p', '-o', 'udev', '/dev/x1'], ['btrfs', 'filesystem', 'label', '/dev/x1']]
 
 
-def test_probe_identity_runs_no_btrfs_tool_for_no_label(hpcp_mod, reset_hpcp_globals, monkeypatch):
+def test_probe_identity_runs_no_label_tool_for_no_label(hpcp_mod, reset_hpcp_globals, monkeypatch):
 	calls = _fake_btrfs_probe(monkeypatch, hpcp_mod, '', ['never'])
 	assert hpcp_mod._probe_identity('/dev/x1') == ('btrfs', 'u1', '')
 	assert len(calls) == 1
@@ -3236,6 +3236,25 @@ def test_probe_identity_reads_a_btrfs_label_past_127_bytes(tmp_path, hpcp_mod, r
 		f.truncate(128 << 20)
 	_run('mkfs.btrfs', '-q', '-f', '-L', label, image)
 	assert hpcp_mod._probe_identity(str(image))[2] == label
+
+
+@pytest.mark.skipif(shutil.which('mkfs.ntfs') is None or shutil.which('ntfslabel') is None or shutil.which('blkid') is None, reason='needs ntfsprogs and blkid')
+@pytest.mark.parametrize('label', ['n' * 128, 'ü' * 100], ids=['longest', 'multibyte'])
+def test_probe_identity_reads_an_ntfs_label_past_127_bytes(tmp_path, hpcp_mod, reset_hpcp_globals, label):
+	image = tmp_path / 'ntfs.img'
+	with open(str(image), 'wb') as f:
+		f.truncate(32 << 20)
+	_run('mkfs.ntfs', '-Q', '-F', '-L', label, image)
+	assert hpcp_mod._probe_identity(str(image))[2] == label
+
+
+def test_probe_identity_asks_ntfslabel_for_an_ntfs_label(hpcp_mod, reset_hpcp_globals, monkeypatch):
+	calls = []
+	monkeypatch.setattr(hpcp_mod, 'run_command_in_multicmd_with_path_check', lambda argv, **kwargs: calls.append(argv)
+		or (['n' * 128] if argv[0] == 'ntfslabel' else ['ID_FS_LABEL_ENC=' + 'n' * 127, 'ID_FS_TYPE=ntfs']))
+	monkeypatch.setattr(hpcp_mod, 'check_path', lambda tool: True)
+	assert hpcp_mod._probe_identity('/dev/x1')[2] == 'n' * 128
+	assert calls[1] == ['ntfslabel', '/dev/x1']
 
 
 @pytest.mark.parametrize('line, name', [
