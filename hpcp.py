@@ -2543,9 +2543,11 @@ def is_file_identical(src_path, dest_path,src_size,full_hash=False,compare_metad
 			return False
 	except Exception:
 		pass
-	# Only regular files have contents to compare, and opening anything else is an act of its own (a FIFO waits for a writer).
-	if not (os.path.isfile(src_path) and os.path.isfile(dest_path)):
-		return False
+	# A node has no contents to compare, and opening one is an act of its own (a FIFO waits for a writer): nodes of one kind for
+	# the same device are the same, and a changed device number is not.
+	src_st, dst_st = os.stat(src_path), os.stat(dest_path)
+	if not (stat.S_ISREG(src_st.st_mode) and stat.S_ISREG(dst_st.st_mode)):
+		return stat.S_IFMT(src_st.st_mode) == stat.S_IFMT(dst_st.st_mode) and src_st.st_rdev == dst_st.st_rdev
 	if hash_file(src_path,src_size,full_hash) != hash_file(dest_path,dst_size,full_hash):
 		return False
 	if compare_metadata:
