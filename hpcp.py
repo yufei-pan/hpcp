@@ -236,7 +236,7 @@ except ImportError:
 
 version = '9.81'
 __version__ = version
-COMMIT_DATE = '2026-11-05'
+COMMIT_DATE = '2026-11-06'
 
 MAGIC_NUMBER = 1.61803398875
 RANDOM_DESTINATION_SELECTION = False
