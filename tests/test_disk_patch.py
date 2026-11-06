@@ -5,6 +5,7 @@ import os
 import re
 import shutil
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
@@ -782,7 +783,7 @@ def test_fs_identity_commands_labels_and_unsupported(hpcp_mod):
 	cmd = hpcp_mod._fs_identity_commands
 	assert cmd('ext4', dev, label='root2') == [['e2label', dev, 'root2']]
 	assert cmd('xfs', dev, label='') == [['xfs_admin', '-L', '--', dev]]
-	assert cmd('vfat', dev, uuid='ab12-cd34', label='ESP') == [['fatlabel', '-i', dev, 'AB12CD34'], ['fatlabel', dev, 'ESP']]
+	assert cmd('vfat', dev, uuid='ab12-cd34', label='ESP') == [[hpcp_mod._FAT_SERIAL_WRITER, dev, 'ab12-cd34'], ['fatlabel', dev, 'ESP']]
 	assert cmd('swap', dev, label='swap2') == [['swaplabel', '-L', 'swap2', dev]]
 	assert cmd('ntfs', dev, label='DATA') == [['ntfslabel', dev, 'DATA']]
 	assert cmd('ntfs', dev, uuid='X') is None
@@ -2663,6 +2664,112 @@ def test_disk_write_hold_releases_on_an_error_inside(tmp_path, hpcp_mod, reset_h
 		assert _lock_comes_free(loop)
 		for device in (loop + 'p2', loop + 'p3'):
 			os.close(os.open(device, os.O_RDONLY | os.O_EXCL))
+
+
+def _fat_boot_sector(fat32, sector_size=512, reserved=32, backup=6, signature=0x29, serial=0x11223344):
+	"""A boot sector as far as the volume ID needs it, with a 0xEE filler that shows any stray write."""
+	sector = bytearray(b'\xee' * sector_size)
+	struct.pack_into('<H', sector, 11, sector_size)
+	struct.pack_into('<H', sector, 14, reserved)
+	struct.pack_into('<H', sector, 22, 0 if fat32 else 200)
+	if fat32:
+		struct.pack_into('<H', sector, 50, backup)
+	sector[66 if fat32 else 38] = signature
+	struct.pack_into('<I', sector, 67 if fat32 else 39, serial)
+	return sector
+
+
+def _fat_image(path, sector, backup_at=None):
+	image = bytearray(1 << 16)
+	image[:len(sector)] = sector
+	if backup_at is not None:
+		image[backup_at:backup_at + len(sector)] = sector
+	path.write_bytes(bytes(image))
+	return image
+
+
+@pytest.mark.parametrize('uuid', ['ABCD-1234', 'abcd-1234', 'ABCD1234'])
+def test_fat_serial_writes_the_fat16_boot_sector(tmp_path, hpcp_mod, reset_hpcp_globals, uuid):
+	"""blkid shows the four bytes highest first, so ABCD-1234 is 34 12 CD AB; nothing else in the image moves."""
+	image = tmp_path / 'fat.img'
+	expected = _fat_image(image, _fat_boot_sector(False))
+	hpcp_mod._write_fat_serial(str(image), uuid)
+	expected[39:43] = bytes.fromhex('3412CDAB')
+	assert image.read_bytes() == bytes(expected)
+	assert hpcp_mod.ERRORS == []
+
+
+@pytest.mark.parametrize('sector_size', [512, 4096])
+def test_fat_serial_writes_fat32_and_its_backup_boot_sector(tmp_path, hpcp_mod, reset_hpcp_globals, sector_size):
+	"""fsck.fat reports a backup boot sector that differs from the first."""
+	image = tmp_path / 'fat.img'
+	backup_at = 6 * sector_size
+	expected = _fat_image(image, _fat_boot_sector(True, sector_size=sector_size), backup_at=backup_at)
+	hpcp_mod._write_fat_serial(str(image), 'ABCD-1234')
+	expected[67:71] = bytes.fromhex('3412CDAB')
+	expected[backup_at + 67:backup_at + 71] = bytes.fromhex('3412CDAB')
+	assert image.read_bytes() == bytes(expected)
+	assert hpcp_mod.ERRORS == []
+
+
+@pytest.mark.parametrize('backup', [0, 32, 0xffff], ids=['none', 'past-the-reserved-sectors', 'unset'])
+def test_fat_serial_leaves_what_is_no_backup_boot_sector_alone(tmp_path, hpcp_mod, reset_hpcp_globals, backup):
+	image = tmp_path / 'fat.img'
+	expected = _fat_image(image, _fat_boot_sector(True, backup=backup))
+	hpcp_mod._write_fat_serial(str(image), 'ABCD-1234')
+	expected[67:71] = bytes.fromhex('3412CDAB')
+	assert image.read_bytes() == bytes(expected)
+	assert hpcp_mod.ERRORS == []
+
+
+@pytest.mark.parametrize('kwargs, uuid, words', [
+	# DOS 3.x boot code starts where a later boot sector keeps the volume ID.
+	({'signature': 0}, 'ABCD-1234', 'no volume ID field'),
+	({}, 'ABCD-123', 'not a FAT volume ID'),
+	({}, 'ABCD-123G', 'not a FAT volume ID'),
+	({}, '11111111-2222-3333-4444-555555555555', 'not a FAT volume ID'),
+], ids=['no-signature', 'short', 'not-hex', 'a-long-uuid'])
+def test_fat_serial_that_cannot_be_written_writes_nothing_and_says_why(tmp_path, hpcp_mod, reset_hpcp_globals, capsys, kwargs, uuid, words):
+	image = tmp_path / 'fat.img'
+	before = bytes(_fat_image(image, _fat_boot_sector(False, **kwargs)))
+	hpcp_mod._write_fat_serial(str(image), uuid)
+	assert image.read_bytes() == before
+	assert words in capsys.readouterr().err
+	assert len(hpcp_mod.ERRORS) == 1
+
+
+def test_fat_serial_on_a_device_it_cannot_open_says_why(tmp_path, hpcp_mod, reset_hpcp_globals, capsys):
+	hpcp_mod._write_fat_serial(str(tmp_path / 'nosuch'), 'ABCD-1234')
+	assert 'nosuch' in capsys.readouterr().err
+	assert len(hpcp_mod.ERRORS) == 1
+
+
+def test_identity_commands_run_the_fat_serial_writer_in_process(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	"""A hold stays in place: the writer is hpcp itself, whose own O_EXCL descriptor does not keep it out."""
+	calls, ran = [], []
+	monkeypatch.setattr(hpcp_mod, '_write_fat_serial', lambda device, uuid: calls.append((device, uuid)))
+	monkeypatch.setattr(hpcp_mod, 'run_command_in_multicmd_with_path_check', lambda argv, **kwargs: ran.append(argv))
+	commands = hpcp_mod._fs_identity_commands('vfat', '/dev/x1', uuid='ABCD-1234', label='ESP')
+	hpcp_mod._run_identity_commands(commands, {'/dev/x1': 99})
+	assert calls == [('/dev/x1', 'ABCD-1234')]
+	assert ran == [['fatlabel', '/dev/x1', 'ESP']]
+
+
+@pytest.mark.parametrize('fat_bits', ['12', '16', '32'])
+@pytest.mark.skipif(shutil.which('mkfs.vfat') is None or shutil.which('blkid') is None or shutil.which('fsck.fat') is None,
+	reason='needs mkfs.vfat, fsck.fat and blkid')
+def test_fat_serial_reads_back_through_blkid_and_passes_fsck(tmp_path, hpcp_mod, reset_hpcp_globals, fat_bits):
+	"""On a filesystem real tools made, for each FAT width: blkid sees the new ID and fsck.fat finds nothing to report,
+	the backup boot sector of FAT32 included."""
+	image = tmp_path / 'fat.img'
+	with open(str(image), 'wb') as f:
+		f.truncate((64 if fat_bits == '32' else 8) << 20)
+	_run('mkfs.vfat', '-F', fat_bits, '-n', 'OLD', image)
+	hpcp_mod._write_fat_serial(str(image), 'ABCD-1234')
+	assert hpcp_mod._probe_identity(str(image))[:2] == ('vfat', 'ABCD-1234')
+	check = subprocess.run(['fsck.fat', '-n', str(image)], capture_output=True, text=True)
+	assert check.returncode == 0 and 'differences' not in check.stdout, check.stdout
+	assert hpcp_mod.ERRORS == []
 
 
 _FULL_UUID = '11111111-2222-3333-4444-555555555555'

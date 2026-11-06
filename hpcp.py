@@ -7389,13 +7389,53 @@ def _has_case_insensitive_names(fs_type, device=''):
 
 _IDENTITY_FIELDS = ('unique_guid', 'name', 'attrs', 'fs_uuid', 'fs_label')
 IdentityChange = namedtuple('IdentityChange', 'number field current new')
+# In a command's tool place, not a program: _run_identity_commands calls _write_fat_serial for it.
+_FAT_SERIAL_WRITER = 'hpcp-write-fat-serial'
+
+def _write_fat_serial(device, uuid):
+	"""Set the volume ID of the FAT filesystem on device to uuid (blkid's XXXX-XXXX), as `fatlabel -i` does: dosfstools
+	3.0.20 (EL7) and 4.1 (EL8) have no -i, so hpcp writes it on every system. Failures are reported (eprint), and
+	the identity check after the write phase counts them.
+
+	The ID is four little-endian bytes after the extended boot signature (0x28 or 0x29): at 39 on FAT12 and FAT16, at
+	67 on FAT32, which is the layout with no 16-bit FAT size at 22. FAT32 repeats its boot sector in the reserved
+	sectors, at the sector number at 50 (sector size at 11, reserved sectors at 14), and fsck.fat reports a copy that
+	differs. Without the signature, those bytes are not a volume ID (DOS 3.x boot code starts there).
+	"""
+	if not re.fullmatch(r'[0-9A-Fa-f]{4}-?[0-9A-Fa-f]{4}', uuid):
+		eprint(f'Identity change error: {uuid!r} is not a FAT volume ID (XXXX-XXXX); {device} is left as it is')
+		return
+	serial = struct.pack('<I', int(uuid.replace('-', ''), 16))
+	try:
+		fd = os.open(device, os.O_RDWR | getattr(os, 'O_CLOEXEC', 0))
+		try:
+			boot = os.pread(fd, 512, 0)
+			fat32 = struct.unpack_from('<H', boot, 22)[0] == 0
+			offset = 67 if fat32 else 39
+			if boot[offset - 1] not in (0x28, 0x29):
+				eprint(f'Identity change error: the FAT boot sector of {device} has no volume ID field (no extended boot signature); it is left as it is')
+				return
+			offsets = [offset]
+			if fat32:
+				sector_size, reserved = struct.unpack_from('<H', boot, 11)[0], struct.unpack_from('<H', boot, 14)[0]
+				backup = struct.unpack_from('<H', boot, 50)[0]
+				if 0 < backup < reserved:
+					offsets.append(backup * sector_size + offset)
+			for place in offsets:
+				os.pwrite(fd, serial, place)
+			os.fsync(fd)
+		finally:
+			os.close(fd)
+	except OSError as e:
+		eprint(f'Identity change error: cannot write the FAT volume ID of {device}: {e.strerror}')
 
 def _fs_identity_commands(fs_type, device, uuid=None, label=None):
 	"""argv lists that set a filesystem's UUID and / or label on an unmounted device.
 
 	uuid / label None leave the value alone; label '' clears it. Returns None when fs_type
 	cannot have a requested value set without recreating it. dd mode's delayed UUID
-	commands (write_partition_info) come from this table too.
+	commands (write_partition_info) come from this table too; a FAT volume ID is never one of them
+	(mkfs.vfat -i sets it there), and only _run_identity_commands knows _FAT_SERIAL_WRITER.
 	"""
 	commands = []
 	if uuid:
@@ -7407,7 +7447,7 @@ def _fs_identity_commands(fs_type, device, uuid=None, label=None):
 		elif fs_type == 'btrfs':
 			commands.append(['btrfstune', '-f', '-U', uuid, device])
 		elif fs_type in _FAT_TYPES:
-			commands.append(['fatlabel', '-i', device, uuid.replace('-', '').upper()])
+			commands.append([_FAT_SERIAL_WRITER, device, uuid])
 		elif fs_type == 'exfat':
 			# exfatlabel -i takes the serial as 0xXXXXXXXX; blkid shows it as XXXX-XXXX ("invalid serial number").
 			commands.append(['exfatlabel', '-i', device, '0x' + uuid.replace('-', '')])
@@ -8008,7 +8048,10 @@ def _run_identity_commands(commands, holds):
 					os.close(fd)
 					holds[device] = None
 					dropped.append(device)
-		run_command_in_multicmd_with_path_check(command, strict=False)
+		if command[0] == _FAT_SERIAL_WRITER:
+			_write_fat_serial(*command[1:])
+		else:
+			run_command_in_multicmd_with_path_check(command, strict=False)
 		for device in dropped:
 			try:
 				holds[device] = _exclusive_open(device)
