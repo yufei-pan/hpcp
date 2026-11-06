@@ -640,7 +640,7 @@ def test_rme_says_nothing_of_the_kind_after_a_failed_copy(work, hpcp_mod, reset_
 
 def test_rme_says_nothing_of_the_kind_without_a_list(work, hpcp_mod, reset_hpcp_globals, at_a_tty, monkeypatch, capsys):
 	monkeypatch.chdir(work)
-	assert hpcp_mod.hpcp(['src/a/x.txt'], dest_paths=[str(work / 'out') + os.sep], single_thread=True, remove_extra=True) == 0
+	assert hpcp_mod.hpcp(['src/a/'], dest_paths=[str(work / 'out') + os.sep], single_thread=True, remove_extra=True) == 0
 	assert '-rme checked nothing' not in capsys.readouterr().out
 
 
@@ -1457,7 +1457,8 @@ def test_rme_keeps_the_file_it_just_copied_into_an_existing_directory(tmp_path):
 	_dir_and_file(tmp_path)
 	write(tmp_path / 'd/stale', 'S')
 	rc, shown = in_a_terminal(hpcp_command(['a/x', '-d', 'd', '-rme']), tmp_path, b'y')
-	assert rc == 0 and files(tmp_path / 'd') == {b'x': b'X'}
+	# 9.81 deleted the other files of d; a named file says nothing of them (see the third review, below).
+	assert rc == 0 and files(tmp_path / 'd') == {b'x': b'X', b'stale': b'S'}
 
 
 @pytest.mark.parametrize('flags', MODES, ids=MODE_IDS)
@@ -1703,13 +1704,13 @@ def _tree_and_list(tmp_path, content):
 def test_a_stored_list_that_matches_nothing_deletes_nothing(tmp_path, content):
 	before = _tree_and_list(tmp_path, content)
 	rc, shown = stored_rme(tmp_path)
-	assert rc == 0 and files(tmp_path / 'src') == before and _nothing_known(tmp_path)
+	assert rc == 212 and files(tmp_path / 'src') == before and _nothing_known(tmp_path) and b'Remove skipped' in (tmp_path / 'log').read_bytes()
 
 
 def test_dev_null_as_a_stored_list_deletes_nothing(tmp_path):
 	before = _tree_and_list(tmp_path, b'')
 	rc, shown = in_a_terminal(hpcp_command(['src', '-fl', '/dev/null', '-rme']), tmp_path, b'y')
-	assert rc == 0 and files(tmp_path / 'src') == before and _nothing_known(tmp_path)
+	assert rc == 212 and files(tmp_path / 'src') == before and _nothing_known(tmp_path)
 
 
 @pytest.mark.parametrize('made, used', [('src/', 'src'), ('src', 'src/')], ids=['slash-then-bare', 'bare-then-slash'])
@@ -1719,7 +1720,7 @@ def test_a_list_stored_under_the_other_spelling_matches_nothing_and_deletes_noth
 	assert run([made, '-fl', 'S'], tmp_path)[0] == 0
 	write(tmp_path / 'src/stale', 'x')
 	rc, shown = in_a_terminal(hpcp_command([used, '-fl', 'S', '-rme']), tmp_path, b'y')
-	assert rc == 0 and files(tmp_path / 'src') == {b'a': b'1', b'b': b'2', b'stale': b'x'}
+	assert rc == 212 and files(tmp_path / 'src') == {b'a': b'1', b'b': b'2', b'stale': b'x'}
 	assert _nothing_known(tmp_path)
 
 
@@ -1736,6 +1737,160 @@ def test_a_stored_list_and_an_empty_tree_report_no_such_note(tmp_path):
 	(tmp_path / 'S').write_bytes(b'')
 	rc, shown = stored_rme(tmp_path)
 	assert rc == 0 and _nothing_known(tmp_path, False)
+
+
+# ---- the third review of 9.81 ----
+
+# -rme with only named files or links checks nothing, as a list of files does.
+
+def _rme_in_a_terminal(tmp_path, args):
+	"""hpcp ARGS -rme, answering yes: (rc, the whole output). A prompt would be answered, so a kept file proves none ran."""
+	rc, _ = in_a_terminal(hpcp_command(args + ['-rme']), tmp_path, b'y')
+	return rc, (tmp_path / 'log').read_bytes()
+
+
+def _but_log(tree):
+	return {name: content for name, content in tree.items() if os.path.basename(name) != b'log'}
+
+
+def test_rme_with_a_named_file_into_its_own_directory_checks_nothing(tmp_path):
+	write(tmp_path / 'a/x', 'X')
+	write(tmp_path / 'a/other', 'O')
+	rc, output = _rme_in_a_terminal(tmp_path, ['a/x', '-d', 'a'])
+	assert rc == 0, output[-2000:]
+	assert _but_log(files(tmp_path)) == {b'a/x': b'X', b'a/other': b'O'} and b'-rme checked nothing' in output and b'(y/n)' not in output
+
+
+def test_rme_with_a_link_into_the_working_directory_deletes_nothing(tmp_path):
+	write(tmp_path / 'w/target', 'T')
+	write(tmp_path / 'w/precious', 'P')
+	write(tmp_path / 'w/sub/q', 'Q')
+	os.symlink('target', str(tmp_path / 'w/lf'))
+	before = files(tmp_path)
+	rc, output = _rme_in_a_terminal(tmp_path / 'w', ['lf', '-d', '.'])
+	assert rc == 0, output[-2000:]
+	assert _but_log(files(tmp_path)) == before and b'-rme checked nothing' in output
+
+
+@pytest.mark.parametrize('dest', ['d', 'd/'])
+def test_rme_with_a_named_file_copies_it_and_leaves_the_rest_of_the_destination(tmp_path, dest):
+	write(tmp_path / 'a/x', 'X')
+	write(tmp_path / 'd/keep', 'K')
+	write(tmp_path / 'd/sub/s', 'S')
+	rc, output = _rme_in_a_terminal(tmp_path, ['a/x', '-d', dest])
+	assert rc == 0, output[-2000:]
+	assert files(tmp_path / 'd') == {b'keep': b'K', b'sub/s': b'S', b'x': b'X'} and b'-rme checked nothing' in output
+
+
+def test_rme_with_two_named_files_and_a_dangling_link_deletes_nothing(tmp_path):
+	write(tmp_path / 'a/x', 'X')
+	write(tmp_path / 'a/y', 'Y')
+	os.symlink('nowhere', str(tmp_path / 'a/dg'))
+	write(tmp_path / 'd/keep', 'K')
+	rc, output = _rme_in_a_terminal(tmp_path, ['a/x', 'a/y', 'a/dg', '-d', 'd'])
+	assert rc == 0, output[-2000:]
+	assert files(tmp_path / 'd') == {b'keep': b'K', b'x': b'X', b'y': b'Y', b'dg': b'-> nowhere'} and b'-rme checked nothing' in output
+
+
+def test_rme_with_a_link_to_a_directory_deletes_nothing(tmp_path):
+	write(tmp_path / 'a/x', 'X')
+	os.symlink('a', str(tmp_path / 'ld'))
+	write(tmp_path / 'd/keep', 'K')
+	rc, output = _rme_in_a_terminal(tmp_path, ['ld', '-d', 'd'])
+	assert files(tmp_path / 'd').get(b'keep') == b'K' and b'(y/n)' not in output
+	assert files(tmp_path / 'a') == {b'x': b'X'}
+
+
+def test_rme_with_a_file_and_a_directory_still_cleans(tmp_path):
+	write(tmp_path / 'a/x', 'X')
+	write(tmp_path / 'e/z', 'Z')
+	write(tmp_path / 'd/keep', 'K')
+	rc, output = _rme_in_a_terminal(tmp_path, ['a/x', 'e/', '-d', 'd'])
+	assert rc == 0, output[-2000:]
+	assert files(tmp_path / 'd') == {b'x': b'X', b'z': b'Z'} and b'-rme checked nothing' not in output
+
+
+def test_rme_with_a_directory_alone_still_cleans(tmp_path):
+	write(tmp_path / 'e/z', 'Z')
+	write(tmp_path / 'd/keep', 'K')
+	rc, output = _rme_in_a_terminal(tmp_path, ['e/', '-d', 'd'])
+	assert rc == 0 and files(tmp_path / 'd') == {b'z': b'Z'} and b'-rme checked nothing' not in output
+
+
+# R2, the tighter rule: a relative entry is copied only when it and the working directory part strictly inside
+# every destination that holds it, and its landing is neither the entry nor below it.
+
+def _nest(tmp_path):
+	write(tmp_path / 't/a/f', '1')
+	write(tmp_path / 't/a/b/g', '2')
+	write(tmp_path / 't/a/c/h', '3')
+	os.symlink('..', str(tmp_path / 't/a/b/up'))
+	os.symlink('a', str(tmp_path / 't/viaa'))
+	return tmp_path
+
+
+@pytest.mark.parametrize('entry', ['../../a', '../../a/', './../../a/.', '../../../t/a', '../../a/c', '../c', '../f', 'up/f'],
+	ids=['name', 'slash', 'dot', 'through-t', 'sibling-dir', 'sibling', 'file-above', 'link-up'])
+@pytest.mark.parametrize('dest', ['..', 'abs', 'link'])
+def test_an_entry_that_is_or_is_below_the_destination_stays_and_a_rerun_agrees(tmp_path, entry, dest):
+	_nest(tmp_path)
+	cwd = tmp_path / 't/a/b'
+	target = {'..': '..', 'abs': str(tmp_path / 't/a'), 'link': str(tmp_path / 't/viaa')}[dest]
+	before = files(tmp_path)
+	for _ in range(2):
+		rc, output = run(['-d', target], cwd, (entry + '\n').encode())
+		assert rc == 0, output[-2000:]
+		assert files(tmp_path) == before, (entry, dest, output[-2000:])
+
+
+def test_find_of_the_destination_run_twice_adds_nothing(tmp_path):
+	_nest(tmp_path)
+	cwd = tmp_path / 't/a/b'
+	before = files(tmp_path)
+	after = []
+	for _ in range(2):
+		listing = subprocess.run(['find', '../../a', '-type', 'f'], cwd=str(cwd), stdout=subprocess.PIPE).stdout
+		rc, output = run(['-d', '..'], cwd, listing)
+		assert rc == 0, output[-2000:]
+		after.append(files(tmp_path))
+	# The file below the working directory (a/b/g) is copied once, as an entry that parts from the destination at b; the
+	# files directly in the destination stay, and the second run finds nothing new.
+	assert after[0] == after[1] and set(after[0]) - set(before) == {b't/a/a/b/g'}
+
+
+def test_a_repeated_name_run_twice_does_not_nest(tmp_path):
+	write(tmp_path / 't/b/b/f', '1')
+	before = files(tmp_path)
+	for _ in range(2):
+		rc, output = run(['-d', '..'], tmp_path / 't/b/b', b'../../b/b\n')
+		assert rc == 0 and files(tmp_path) == before, output[-2000:]
+
+
+def test_two_destinations_one_holding_the_entry_keeps_it_and_copies_the_other(tmp_path):
+	write(tmp_path / 't/a/o/log', 'L')
+	write(tmp_path / 't/a/new', 'N')
+	rc, output = run(['-d', 'o', '-d', '..', '-rf'], tmp_path / 't/a', b'o/log\nnew\n')
+	assert rc == 0, output[-2000:]
+	assert files(tmp_path / 't') == {b'a/o/log': b'L', b'a/o/new': b'N'}
+
+
+def test_entries_below_the_working_directory_still_copy_to_its_parent(tmp_path):
+	overlay = _overlay_dir(tmp_path)
+	listing = subprocess.run(['find', 'etc', '-type', 'f'], cwd=str(overlay), stdout=subprocess.PIPE).stdout
+	for _ in range(2):
+		rc, output = run(['-d', '..'], overlay, listing)
+		assert rc == 0, output[-2000:]
+	assert files(tmp_path / 't') == {b'overlay/etc/conf': b'C', b'overlay/etc/sub/more': b'M', b'etc/conf': b'C', b'etc/sub/more': b'M'}
+
+
+def test_the_landing_rule_survives_a_missing_working_directory_and_mixed_drives(hpcp_mod, monkeypatch):
+	spellings = ('/t/a/b/g', '/t/a/b/g')
+	assert hpcp_mod._lands_elsewhere(spellings, 'a/b/g', {'/t/a'}, ['/t/a'], '/t/a/b')
+	assert not hpcp_mod._lands_elsewhere(spellings, 'a/b/g', {'/t/a'}, ['/t/a'], None)
+	def other_drive(paths):
+		raise ValueError("Paths don't have the same drive")
+	monkeypatch.setattr(os.path, 'commonpath', other_drive)
+	assert not hpcp_mod._lands_elsewhere(spellings, 'a/b/g', {'/t/a'}, ['/t/a'], '/t/a/b')
 
 
 # ---- modes: -di (needs root and loop devices: VM 901) ----

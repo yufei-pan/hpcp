@@ -8531,7 +8531,7 @@ def remove_extra_files(total_file_list, dests,max_workers,verbose,files_per_job,
 				not_comparable = 0
 				if dest_trimmed and not (dest_trimmed & src_entries):
 					# As a missing list: nothing is known of what belongs here.
-					print(f"The stored list matches nothing in {dest}: not removing extra files from it")
+					eprint(f"Remove skipped: the stored list matches nothing in {dest}: not removing extra files from it")
 					unknown_lists += 1
 					continue
 				for file in dest_trimmed - src_entries:
@@ -8760,21 +8760,24 @@ def _without_covered_sources(src_paths):
 def _inside_destinations(src_paths, dests):
 	"""(src_paths without the list entries that lie inside a destination, how many that were, the paths of the
 	destinations that a kept listed directory holds, as its walk spells them). An entry inside a destination (or the
-	destination itself) stays where it is: copying it onto its own place is nothing, and moving it would destroy it. Not
-	one that is relative while the working directory lies strictly inside the destination and that lands elsewhere
-	(cd overlay; find etc | hpcp -d ..): its landing is another place. A listed directory that holds the destination
-	(find . | hpcp -d out) is kept: the walk below it must leave the destination out (_exclude_roots)."""
+	destination itself) stays where it is: copying it onto its own place is nothing, and moving it would destroy it.
+	Absolute entries always stay. A relative entry is copied (cd overlay; find etc | hpcp -d ..) only when it and the
+	working directory share a directory strictly inside every destination that holds the entry, on real paths, and its
+	landing is neither the entry nor below it: then it lands in another place, however it is spelled, and a second run
+	finds the same. A listed directory that holds the destination (find . | hpcp -d out) is kept: the walk below it must
+	leave the destination out (_exclude_roots)."""
 	roots = set()
+	real_roots = []
 	for dest in dests:
 		roots.update((os.path.abspath(dest), os.path.realpath(dest)))
+		real_roots.append(os.path.realpath(dest))
 	prefixes = tuple(root.rstrip(os.path.sep) + os.path.sep for root in roots)
 	kept, skipped, holding = [], 0, set()
 	real_parents = {}
 	try:
-		cwd = os.getcwd()
+		real_cwd = os.path.realpath(os.getcwd())
 	except OSError:
-		cwd = None
-	cwd_inside = cwd is not None and cwd not in roots and cwd.startswith(prefixes)
+		real_cwd = None
 	for src in src_paths:
 		if isinstance(src, _ListedSource):
 			path = os.path.abspath(src)
@@ -8789,8 +8792,7 @@ def _inside_destinations(src_paths, dests):
 					real_parents[parent] = os.path.realpath(parent)
 				spellings = (path, os.path.join(real_parents[parent], os.path.basename(path)))
 			if any(spelling in roots or spelling.startswith(prefixes) for spelling in spellings):
-				landings = {os.path.normpath(os.path.join(root, src.landing)) for root in roots}
-				if os.path.isabs(src) or not cwd_inside or any(spelling in landings for spelling in spellings):
+				if os.path.isabs(src) or not _lands_elsewhere(spellings, src.landing, roots, real_roots, real_cwd):
 					skipped += 1
 					continue
 			if directory:
@@ -8800,6 +8802,25 @@ def _inside_destinations(src_paths, dests):
 					holding.update(path.rstrip(os.path.sep) + os.path.sep + root[len(above):] for root in roots if root.startswith(above))
 		kept.append(src)
 	return kept, skipped, holding
+
+def _lands_elsewhere(spellings, landing, roots, real_roots, real_cwd):
+	"""True when a relative list entry that lies inside a destination is still copied (see _inside_destinations)."""
+	real = spellings[1].rstrip(os.path.sep) + os.path.sep
+	for root in real_roots:
+		prefix = root.rstrip(os.path.sep) + os.path.sep
+		if real.startswith(prefix):
+			try:
+				shared = os.path.commonpath((spellings[1], real_cwd)).rstrip(os.path.sep) + os.path.sep
+			except (TypeError, ValueError):
+				# No working directory, or none on the entry's drive: nothing to part from.
+				return False
+			if not shared.startswith(prefix) or shared == prefix:
+				return False
+	for root in roots:
+		lands = os.path.normpath(os.path.join(root, landing)).rstrip(os.path.sep) + os.path.sep
+		if any(lands.startswith(spelling.rstrip(os.path.sep) + os.path.sep) for spelling in spellings):
+			return False
+	return True
 
 def _exclude_roots(exclude, roots):
 	"""exclude, and the paths roots (see _inside_destinations) as patterns: a listing leaves them, and all below, out."""
@@ -10874,9 +10895,14 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = multipr
 			if remove_extra and copy_failures:
 				eprint(f'Remove skipped: not removing extra files from {dests}: the copy reported {len(copy_failures)} error(s); '
 					'fix them (or exclude those paths with -e) and re-run')
-			elif remove_extra and listed and not _directory_sources(_src_to_dest_map(src_paths, dests, bool(dest_image))):
-				print('-rme checked nothing: the list names no directories, and only below those can a list judge extras. '
-					'To mirror a directory, list the directory itself: printf "src\\n" | hpcp -d out -rme')
+			elif remove_extra and not _directory_sources(_src_to_dest_map(src_paths, dests, bool(dest_image))):
+				# Only a directory can say what is extra below it: a named file, a link or a list of files says nothing of the rest.
+				if listed:
+					print('-rme checked nothing: the list names no directories, and only below those can a list judge extras. '
+						'To mirror a directory, list the directory itself: printf "src\\n" | hpcp -d out -rme')
+				else:
+					print('-rme checked nothing: no source is a directory, and only below a directory can extras be judged. '
+						'To mirror a directory, name it: hpcp src/ -d out -rme')
 			elif remove_extra:
 				print('-'*80)
 				dest_roots = _checked_destination_roots(dests, pinned_dest_roots)

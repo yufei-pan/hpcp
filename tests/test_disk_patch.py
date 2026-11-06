@@ -509,11 +509,12 @@ def _attached(image, read_only=False):
 	argv = ['losetup', '--partscan', '--find', '--show'] + (['--read-only'] if read_only else []) + [str(image)]
 	loop = subprocess.run(argv, check=True, capture_output=True, text=True).stdout.strip()
 	try:
-		# The kernel (--partscan) and udev (re-read after a close-write) can both rescan the table, briefly
-		# removing and re-adding the partition nodes: let udev go quiet, then wait for every GPT partition.
+		# The kernel (--partscan) and udev (re-read after a close-write) can both rescan the table, briefly removing and
+		# re-adding the partition nodes. Every sgdisk run, even a read, makes udev do it once more: read the table first,
+		# then let udev go quiet, then wait for every GPT partition.
+		listing = subprocess.run(['sgdisk', '-p', loop], capture_output=True, text=True).stdout.splitlines()
 		if shutil.which('udevadm'):
 			subprocess.run(['udevadm', 'settle'], capture_output=True)
-		listing = subprocess.run(['sgdisk', '-p', loop], capture_output=True, text=True).stdout.splitlines()
 		wanted = [line.split()[0] for line in listing if len(line.split()) > 3 and line.split()[0].isdigit()] or ['1']
 		for _ in range(100):
 			if all(os.path.exists(f'{loop}p{number}') for number in wanted):

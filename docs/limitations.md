@@ -27,12 +27,12 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - **Revisit when:** someone hits it.
 - **Approved:** 2026-11-05, the user chose "Known limitation (Recommended)".
 
-### Positional source inside the destination, another source landing on it
+### A move where one source's landing is another source's path
 - **Kind:** deferred.
-- **What the operator sees:** `hpcp d1 d2/d1/ -d d2/ -rf` (d1/x=A, d2/d1/x=B) leaves only d2/x=B and exits 0, so A is gone. `hpcp a out/a/x -d out/ -rf` leaves only out/x. 9.80 loses content here too. A list with no positional source is not affected.
-- **Why:** not a regression. The proposed fix (widening the overlap check to source roots and real paths) is untested and adds another rule to this round.
+- **What the operator sees:** `hpcp d1 d2/d1/ -d d2/ -rf` (d1/x=A, d2/d1/x=B) is a race in the default copy: in 30 runs on 9.81, A survived 10 times, B 13, and d2/x was 0 bytes 7 times, both contents gone, the sources removed, exit 0 (9.80: 13, 12, 5). With `-s` or `-nb`, A survived all 12 runs on both versions. The list form loses one content too: `cd w/D/c; printf '../../c/r\nr\n' | hpcp -d .. -rf` (w/c/r=OUT, w/D/c/r=IN) leaves only `w/D/r`, holding OUT or IN from run to run, exit 0 (also after the 9.81 landing rule): both entries land in the destination, one at the path of the other, and both sources are removed. `hpcp a out/a/x -d out/ -rf` leaves only out/x. 9.80 loses content here too.
+- **Why:** not a regression. It happens in a move where one source's landing is another source's path; the proposed fix (widening the overlap check to source roots and real paths) is untested and adds another rule to this round.
 - **Revisit when:** the next hpcp release (9.82).
-- **Approved:** 2026-11-05, the user chose "Deferred to 9.82 (Recommended)".
+- **Approved:** 2026-11-05, the user chose "Keep deferred, correct the text (Recommended)" (replacing the text approved as "Deferred to 9.82 (Recommended)").
 
 ### Destination symlink at a directory's path
 - **Kind:** deferred.
@@ -47,3 +47,17 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - **Why:** catching it means resolving the real parent of every landing on the destination side before copying, and it needs a symlink already in the destination plus a list naming both spellings.
 - **Revisit when:** someone hits it, or the 9.82 destination-symlink work makes the check cheap.
 - **Approved:** 2026-11-05, the user chose "Known limitation (Recommended)".
+
+### A stored list used under another spelling can match by chance
+- **Kind:** known limitation.
+- **What the operator sees:** after `hpcp s -fl S`, `hpcp s/ -fl S -rme` with s/a and s/s/a present shares one name with the list (`s/a` against `a`), so the matches-nothing rule does not fire, and the prompt offers the other files for deletion.
+- **Why:** telling a chance match from a real one needs the list to record how it was made, a format change.
+- **Revisit when:** someone hits it.
+- **Approved:** 2026-11-05, the user chose "Known limitation (Recommended)".
+
+### `-nds` with a directory source meeting a file in the destination
+- **Kind:** deferred.
+- **What the operator sees:** with `-nds`, `hpcp a/x -d out/` where a/x is a directory and out/x a file exits 70 with a `File exists` traceback instead of a clean clash, exit 213. The file is untouched, as in 9.80.
+- **Why:** ugly but safe, and old.
+- **Revisit when:** the next hpcp release (9.82).
+- **Approved:** 2026-11-05, the user chose "Deferred to 9.82 (Recommended)".
