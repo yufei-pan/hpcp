@@ -35,3 +35,9 @@ entries go last, in the same commit as the change:
 - Why we had to change: `cd w/sub; hpcp .. -d out/` wrote into `w/sub/` and left `out/` empty, and `cd w/c/s; hpcp ../../x .. -d ../ -rf` swapped two files through it and lost both, in 60 of 60 runs.
 - Original design was wrong because: the basename of a source was taken for a name. '.' came out right by accident (joining it changes nothing), and '..' joined as a name climbs out of the destination. `hpcp .. -d out`, without the slash, already gave the contents.
 - Lesson: a path part is a name only if it names something. When a layout rule joins user input onto a destination, say what it does with the parts that are not names.
+
+## 2026-11-06 A write goes to an inode, not a path
+- Changed: `-co` replaces a destination file that has other hard links instead of writing through it; such a file then has the source's mode, not its old one.
+- Why we had to change: `hpcp a/ -d out/ -co -rf` with `ln a/y out/x` wrote a/x into a/y's inode: out/y came out holding X, empty or partial in about half of 20 runs, and the source was then removed. `hpcp a/ b/ -d out/ -co -rf` with `ln b/x out/y` lost B in 10 of 20.
+- Original design was wrong because: `-co` swapped `cp -af` for `cp -f` to keep metadata and lost what `-a` also does: `cp -a` unlinks a destination with several names, `cp -f` opens it. The landing rule works by path, and a hard link has no path to compare.
+- Lesson: when an option changes how a file is written, list what the old way did besides the thing the option is about. A check by path protects paths; what shares an inode has to be left by the writer.

@@ -3150,6 +3150,16 @@ def _chown_like_cp(path, st):
 	now = os.stat(path)
 	return now.st_uid == st.st_uid, now.st_gid == st.st_gid
 
+def _leave_hard_links(path):
+	"""A file with other names goes before a content-only copy: cp -f rewrites the inode, so all its names change, a source
+	perhaps (cp -a replaces such a file by itself, and a symlink to one). Here and not a cp flag: any cp, and a retry finds
+	the file removed."""
+	try:
+		if os.stat(path).st_nlink > 1:
+			os.unlink(path)
+	except FileNotFoundError:
+		pass
+
 def copy_file(src_path, dest_paths, full_hash=False, verbose=False, concurrent_processes=0):
 	"""
 	Copy a file from the source path to the destination path.
@@ -3243,6 +3253,8 @@ def copy_file(src_path, dest_paths, full_hash=False, verbose=False, concurrent_p
 						# if the parent path for the file does not exist, create it
 						if not NO_CREATE_DIR:
 							_makedirs(os.path.dirname(dest_path), exist_ok=True)
+						if CONTENT_ONLY:
+							_leave_hard_links(dest_path)
 						if os.name == 'posix':
 							cp_command = ["cp", "-f" if CONTENT_ONLY else "-af"]
 							if cp_supports_sparse():
@@ -10654,7 +10666,7 @@ def get_args(args = None):
 	parser.add_argument('-F','-frl','--file_rate_limit', type=str, default=None, help='Approximate a rate limit the copy speed in files/second. Example: 10K for 10000 files/s, 1Ki for 1024 files/s. Default is 0: no rate limit.')
 	parser.add_argument('-tfs','--target_file_system', type=str, default=None, help='Specify the target file system type. Will abort if the target file system type does not match. Example: ext4, xfs, f2fs, ntfs, fat32, exfat. Default is None: do not check target file system type.')
 	parser.add_argument('-ncd','--no_create_dir', action='store_true', help='Ignore any destination folder that does not already exist. ( Will still copy if dest is a file )')
-	parser.add_argument('-co','--content_only', action='store_true', help='Content-only copy: do not sync mode, owner, or timestamps on files or directories. Still create missing destination directories using filesystem-default permissions (so parent ACL/setgid/setuid inherit).')
+	parser.add_argument('-co','--content_only', action='store_true', help='Content-only copy: do not sync mode, owner, or timestamps on files or directories. A destination file with other hard links is replaced, not written through. Still create missing destination directories using filesystem-default permissions (so parent ACL/setgid/setuid inherit).')
 	parser.add_argument('-ctl','--command_timeout_limit', type=int, default=0, help='Set the command timeout limit in seconds for external commands ( ex. cp / dd ). Default is 0: no timeout.')
 	parser.add_argument('-enes','--exit_not_enough_space', action='store_true', help='Exit if there is not enough space on the destination instead of continuing (Note: Default is continue as in compressed fs copy can be down even if source is bigger than free space).')
 	try:

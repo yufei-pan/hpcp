@@ -357,7 +357,9 @@ options:
                         Ignore any destination folder that does not already
                         exist. ( Will still copy if dest is a file )
   -co, --content_only   Content-only copy: do not sync mode, owner, or
-                        timestamps on files or directories. Still create
+                        timestamps on files or directories. A destination
+                        file with other hard links is replaced, not written
+                        through. Still create
                         missing destination directories using filesystem-
                         default permissions (so parent ACL/setgid/setuid
                         inherit).
