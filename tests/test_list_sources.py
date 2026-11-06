@@ -2725,13 +2725,14 @@ def test_rme_takes_nothing_from_a_source_left_out_as_the_destination(tmp_path):
 
 
 @pytest.mark.parametrize('dests', [['a/'], ['a/', 'out/']], ids=['one', 'two'])
-def test_safe_a_source_that_lands_on_itself_is_not_left_out(tmp_path, dests):
+@pytest.mark.parametrize('sources', [['a/', 'b/'], ['a/', 'a', 'b/']], ids=['alone', 'beside-its-named-twin'])
+def test_safe_a_source_that_lands_on_itself_is_not_left_out(tmp_path, dests, sources):
 	# 'a/' has no name to land under: it is the landing, not something to move into it, and b/x would land on a/x.
 	write(tmp_path / 'a/x', 'A')
 	write(tmp_path / 'b/x', 'B')
 	os.makedirs(tmp_path / 'out')
 	tree = files(tmp_path)
-	rc, output = run(['a/', 'b/'] + [arg for dest in dests for arg in ('-d', dest)] + ['-rf'], tmp_path)
+	rc, output = run(sources + [arg for dest in dests for arg in ('-d', dest)] + ['-rf'], tmp_path)
 	assert rc == 241 and files(tmp_path) == tree, output[-2000:]
 
 
