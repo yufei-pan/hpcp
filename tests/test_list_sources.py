@@ -2896,3 +2896,84 @@ def test_two_paths_of_one_directory_are_one_place(hpcp_mod, tmp_path, monkeypatc
 	places = hpcp_mod._RealPlaces()
 	assert places.directory(str(tmp_path / 'one')) == places.directory(str(tmp_path / 'two'))
 	assert places.place(str(tmp_path / 'two/x')) == str(tmp_path / 'one/x')
+
+
+# ---- a failed copy takes only what it changed ----
+
+
+@no_permissions_as_root
+@pytest.mark.parametrize('flags', [[], ['-co']], ids=['plain', 'content-only'])
+@pytest.mark.parametrize('source', ['a/', 'a/x'], ids=['directory', 'file'])
+def test_a_source_that_cannot_be_read_leaves_the_destination_alone(tmp_path, source, flags):
+	write(tmp_path / 'a/x', 'new and longer')
+	write(tmp_path / 'out/x', 'good')
+	os.chmod(tmp_path / 'a/x', 0o000)
+	try:
+		rc, output = run([source, '-d', 'out/'] + flags, tmp_path)
+	finally:
+		os.chmod(tmp_path / 'a/x', 0o600)
+	assert rc != 0 and (tmp_path / 'out/x').read_text() == 'good', output[-2000:]
+
+
+@no_permissions_as_root
+@pytest.mark.parametrize('flags', [[], ['-co']], ids=['plain', 'content-only'])
+def test_a_source_that_cannot_be_read_leaves_a_hard_linked_destination_alone(tmp_path, flags):
+	write(tmp_path / 'a/x', 'new and longer')
+	write(tmp_path / 'out/x', 'good')
+	os.link(tmp_path / 'out/x', tmp_path / 'other')
+	os.chmod(tmp_path / 'a/x', 0o000)
+	try:
+		rc, output = run(['a/', '-d', 'out/'] + flags, tmp_path)
+	finally:
+		os.chmod(tmp_path / 'a/x', 0o600)
+	assert rc != 0 and (tmp_path / 'out/x').read_text() == 'good', output[-2000:]
+
+
+def _cp_writing_a_part(hpcp_mod, monkeypatch, fails):
+	"""A cp that dies part way through its write to each path in fails, and works elsewhere."""
+	real = hpcp_mod.run_command_in_multicmd_with_path_check
+	def cp(command, *args, **kwargs):
+		if command[-1] in fails:
+			with open(command[-1], 'w') as target:
+				target.write('par')
+			raise RuntimeError('cp: write error: No space left on device')
+		return real(command, *args, **kwargs)
+	monkeypatch.setattr(hpcp_mod, 'run_command_in_multicmd_with_path_check', cp)
+
+
+def test_a_cp_that_wrote_nothing_leaves_the_destination_alone(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	write(tmp_path / 'a/x', 'new and longer')
+	write(tmp_path / 'out/x', 'good')
+	def cp(*args, **kwargs):
+		raise RuntimeError('cp: Too many open files')
+	monkeypatch.setattr(hpcp_mod, 'run_command_in_multicmd_with_path_check', cp)
+	hpcp_mod.copy_file(str(tmp_path / 'a/x'), [str(tmp_path / 'out/x')])
+	assert (tmp_path / 'out/x').read_text() == 'good'
+
+
+@pytest.mark.parametrize('there', [None, 'old content'], ids=['new', 'over-a-file'])
+def test_a_part_of_a_copy_goes_before_the_next_destination(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch, there):
+	write(tmp_path / 'a/x', 'the whole file')
+	first, second = str(tmp_path / 'one/x'), str(tmp_path / 'two/x')
+	os.makedirs(tmp_path / 'two')
+	if there:
+		write(tmp_path / 'one/x', there)
+	_cp_writing_a_part(hpcp_mod, monkeypatch, [first])
+	hpcp_mod.copy_file(str(tmp_path / 'a/x'), [first, second])
+	assert not os.path.exists(first) and (tmp_path / 'two/x').read_text() == 'the whole file'
+
+
+def test_a_part_of_a_copy_goes_when_no_destination_takes_it(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	write(tmp_path / 'a/x', 'the whole file')
+	first, second = str(tmp_path / 'one/x'), str(tmp_path / 'two/x')
+	_cp_writing_a_part(hpcp_mod, monkeypatch, [first, second])
+	hpcp_mod.copy_file(str(tmp_path / 'a/x'), [first, second])
+	assert not os.path.exists(first) and not os.path.exists(second)
+
+
+def test_content_only_takes_a_link_loop_at_a_landing_without_a_crash(tmp_path):
+	write(tmp_path / 'a/x', 'A')
+	os.makedirs(tmp_path / 'out')
+	os.symlink('x', tmp_path / 'out/x')
+	rc, output = run(['a/', '-d', 'out/', '-co'], tmp_path)
+	assert b'Traceback' not in output, output[-2000:]

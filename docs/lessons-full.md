@@ -52,4 +52,10 @@ entries go last, in the same commit as the change:
 - Changed: a landing directory without search permission is refused, exit 213, naming it and `chmod u+rx`. `chmod 600 out; hpcp a/ -d out/ -rf` ran in 9.80 and 7617241. A directory that cannot be listed (0300), or has more entries than the run has names to ask about (past max(10000, files)), is asked by name instead; that also stops one file into a 2M-entry directory from reading all of it (1.04 s, back to 0.06 s).
 - Why we had to change: the scan answered "no links" when it failed, so `out/y -> ../b/x` in a 0300 `out` was not seen and the run's own directory sync opened the way: b/x lost in 20 of 20 runs.
 - Original design was wrong because: one set meant both "I looked and found none" and "I could not look". And `os.path.islink` turns EACCES into False, the same mistake one level down: only a lstat tells them apart. The scan also read a whole directory for one name, since nothing said how much reading a question is worth.
-- Lesson: a look that can fail returns three answers. Bound the look by what the answer is worth, and treat "stopped" the same as "failed": ask a narrower way, open the gate, or refuse with the fix.
+- Lesson: a look that can fail returns three answers. Bound the look by what the answer is worth, and treat "stopped" the same as "failed": ask a narrower way, open the gate, or refuse with the fix. Refuse only at the question that needs the answer: a look that raises by itself refuses for places nothing lands in.
+
+## 2026-11-06 Clean up what you made
+- Changed: a failed copy removes the destination file only when the attempt changed it (inode, size or mtime against before), and a source that cannot be read gets no `cp` at all. Exit codes stay.
+- Why we had to change: `os.remove(dest_path)` ran after any failure, so an unreadable source deleted the good copy a backup held. And the last retry returned before it removed its part.
+- Original design was wrong because: the cleanup assumed the failure was its own doing. It was written for a part of a file, and a destination that was there before looks the same as a part.
+- Lesson: before cleaning up after a failure, prove the failed step made what you are about to remove. And `cp -a` acts on the destination before it opens the source, so only not starting it keeps a hard-linked one.

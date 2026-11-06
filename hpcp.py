@@ -3153,12 +3153,28 @@ def _chown_like_cp(path, st):
 def _leave_hard_links(path):
 	"""A file with other names goes before a content-only copy: cp -f rewrites the inode, so all its names change, a source
 	perhaps (cp -a replaces such a file by itself, and a symlink to one). Here and not a cp flag: any cp, and a retry finds
-	the file removed."""
+	the file removed. No file there, or a link that leads nowhere, is cp's to answer; a file that cannot be left fails, as
+	under cp -a."""
 	try:
-		if os.stat(path).st_nlink > 1:
-			os.unlink(path)
-	except FileNotFoundError:
-		pass
+		if os.stat(path).st_nlink <= 1:
+			return
+	except OSError:
+		return
+	os.unlink(path)
+
+def _copy_state(path):
+	"""What a copy to path would change: of the file itself, as cp writes through a link. None when nothing is there."""
+	try:
+		st = os.stat(path)
+	except OSError:
+		return None
+	return st.st_ino, st.st_size, st.st_mtime_ns
+
+def _remove_what_failed(path, before):
+	"""After a failed copy to path, whose _copy_state was before: its part goes. What it never touched is the destination's
+	old copy, maybe the only good one, so that stays."""
+	if _copy_state(path) not in (None, before):
+		os.remove(path)
 
 def copy_file(src_path, dest_paths, full_hash=False, verbose=False, concurrent_processes=0):
 	"""
@@ -3212,6 +3228,10 @@ def copy_file(src_path, dest_paths, full_hash=False, verbose=False, concurrent_p
 		if os.path.islink(src_path):
 			symLinks[src_path] = dest_paths
 		else:
+			if not os.access(src_path, os.R_OK):
+				# No cp at all: cp -a takes away a destination with other names before it finds it cannot read.
+				eprint(f'Copy failed: cannot read {src_path}, leaving {dest_paths} as they are')
+				return 0, time.monotonic() - start_time, symLinks
 			copied = False
 			copy_error_start = len(ERRORS)
 			while (not copied) and dest_paths:
@@ -3248,6 +3268,7 @@ def copy_file(src_path, dest_paths, full_hash=False, verbose=False, concurrent_p
 						continue
 				if verbose:
 					print(f'\nTrying to copy from {src_path} to {dest_path}')
+				before = _copy_state(dest_path)
 				try:
 					try:
 						# if the parent path for the file does not exist, create it
@@ -3270,8 +3291,7 @@ def copy_file(src_path, dest_paths, full_hash=False, verbose=False, concurrent_p
 						copied = True
 						break
 					except Exception as e:
-						if os.path.exists(dest_path):
-							os.remove(dest_path)
+						_remove_what_failed(dest_path, before)
 						if using_bak_paths:
 							if not dest_paths and not verbose:
 								import traceback
@@ -3291,6 +3311,7 @@ def copy_file(src_path, dest_paths, full_hash=False, verbose=False, concurrent_p
 						elif verbose:
 							eprint(f'Retrying with a different destination path in {dest_paths}')
 				except Exception as e:
+					_remove_what_failed(dest_path, before)
 					if using_bak_paths and not dest_paths:
 						import traceback
 						eprint(f'Copy failed: ERROR copying {src_path} to {dest_path}, No more destination paths to try: {e}')
@@ -3298,8 +3319,6 @@ def copy_file(src_path, dest_paths, full_hash=False, verbose=False, concurrent_p
 						return 0, time.monotonic() - start_time, symLinks #, task_to_run
 					elif verbose:
 						print(f'Re-Retrying with a different destination path in {dest_paths}')
-					if os.path.exists(dest_path):
-						os.remove(dest_path)
 				if not copied and not using_bak_paths and not dest_paths:
 					if verbose:
 						print(f'Gracious copy pass failed. Force trying all destination paths for {src_path}')
