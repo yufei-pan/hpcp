@@ -61,12 +61,6 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - **Why:** the removal of `lb/x` and of the link `lb` run side by side, and the check before removing sees the link already gone. 7617241 does the same (67 runs in 200, against 66).
 - **Revisit when:** the next hpcp release (9.82).
 
-### `-nds` onto a file ends in a traceback
-- **Kind:** deferred.
-- **What the operator sees:** `hpcp a/ -d file -nds`, with `file` an existing file: exit 70 and a Python traceback (`File exists`), where the same run without `-nds` says "Destination clash: file is not a directory" and exits 213. Nothing is copied or lost.
-- **Why:** `-nds` makes the directory itself, and that one call does not look first. 9.80 and 7617241 do the same.
-- **Revisit when:** the next hpcp release (9.82).
-
 ### `-rme` can take a source inside the destination for extra
 - **Kind:** deferred.
 - **What the operator sees:** `hpcp out/sub/ b/ -d out/ -rme`, answered y at a terminal, deletes `out/sub/x`, the only copy when `b/x` replaced it at `out/x`: the file lies in the destination and no source lands on it, so it looks extra. With `-rf` the run then exits 212, and its message says -rme may have removed it. Same in 9.80.
