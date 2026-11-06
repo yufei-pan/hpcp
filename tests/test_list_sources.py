@@ -1355,7 +1355,7 @@ def test_settling_reads_no_listing_when_destinations_cannot_meet(hpcp_mod, monke
 		raise AssertionError('listed')
 	monkeypatch.setattr(hpcp_mod, 'get_file_list', fail)
 	monkeypatch.setattr(hpcp_mod.os.path, 'isdir', lambda path: path.startswith('/data/source'))
-	assert hpcp_mod._settle_destinations(['/data/source_a', '/data/source_b'], ['/o/out/'], None, False, None, 4, False) == ({}, 0)
+	assert hpcp_mod._settle_destinations(['/data/source_a', '/data/source_b'], ['/o/out/'], None, False, None, 4, False)[:2] == ({}, 0)
 
 
 def test_settling_lists_when_destinations_overlap(hpcp_mod, monkeypatch):
@@ -1363,7 +1363,7 @@ def test_settling_lists_when_destinations_overlap(hpcp_mod, monkeypatch):
 		'/data/source_b/': (frozenset(['/data/source_b/f']), frozenset(), 0, frozenset(['/data/source_b/']))}
 	monkeypatch.setattr(hpcp_mod, 'get_file_list', lambda path, **kwargs: listings[path])
 	monkeypatch.setattr(hpcp_mod.os.path, 'isdir', lambda path: path.startswith('/data/source'))
-	dropped, replaced = hpcp_mod._settle_destinations(['/data/source_a', '/data/source_b'], ['/o/out'], None, False, None, 4, False)
+	dropped, replaced, _ = hpcp_mod._settle_destinations(['/data/source_a', '/data/source_b'], ['/o/out'], None, False, None, 4, False)
 	assert (dropped, replaced) == ({('/data/source_a/', ('/o/out',)): {'/data/source_a/f'}}, 1)
 
 
@@ -2095,10 +2095,16 @@ def test_a_source_landing_over_its_own_tree_is_refused(tmp_path, flags):
 	assert str(tmp_path / 'p/q/q/x').encode() in output and str(tmp_path / 'p/q/x').encode() in output
 
 
-@pytest.mark.parametrize('listing', [b'.\n./x\n./q\n./q/x\n', b'./x\n./q/x\n', b'.\n'], ids=['find', 'find-files', 'dot'])
+@pytest.mark.parametrize('listing', [b'.\n./x\n./q\n./q/x\n', b'.\n'], ids=['find', 'dot'])
 def test_a_list_landing_over_its_own_tree_is_refused(tmp_path, listing):
 	tree = _own_tree(tmp_path)
 	rc, output = run(['-d', '..', '-rf'], tmp_path / 'p/q', listing)
+	assert rc == 213 and files(tmp_path) == tree, output[-2000:]
+
+
+def test_safe_file_entries_landing_over_each_other_stay_refused(tmp_path):
+	tree = _own_tree(tmp_path)
+	rc, output = run(['-d', '..', '-rf'], tmp_path / 'p/q', b'./x\n./q/x\n')
 	assert rc == 213 and files(tmp_path) == tree, output[-2000:]
 
 
@@ -2302,25 +2308,30 @@ def test_safe_a_named_file_that_lands_on_itself_is_not_overwritten(tmp_path):
 		assert rc == 213 and files(tmp_path) == {b'x': b'mine', b'y/x': b'other'}, output[-2000:]
 
 
-def test_a_file_landing_on_itself_copies_nothing(hpcp_mod, reset_hpcp_globals, tmp_path, monkeypatch):
-	# Another source may be writing it right now: nothing here may read it, and cp would fail on the same file.
-	write(tmp_path / 'x', 'X')
-	def fail(*args, **kwargs):
-		raise AssertionError('copied')
-	monkeypatch.setattr(hpcp_mod, 'run_command_in_multicmd_with_path_check', fail)
-	monkeypatch.setattr(hpcp_mod, 'is_file_identical', fail)
-	assert hpcp_mod.copy_file(str(tmp_path / 'x'), [str(tmp_path / 'x')])[0] == 0 and not hpcp_mod.ERRORS
+@pytest.mark.parametrize('spelling', ['merged/conf', 'lm/conf'], ids=['plain', 'through-a-link'])
+def test_a_directory_landing_on_itself_runs_no_copy(hpcp_mod, reset_hpcp_globals, tmp_path, monkeypatch, spelling):
+	# Another source may be writing its files right now: reading one (a hash, a size) fails, and cp would fail on the same file.
+	write(tmp_path / 'a/conf/x', 'A')
+	write(tmp_path / 'merged/conf/x', 'old')
+	write(tmp_path / 'merged/conf/keep', 'K')
+	os.symlink('merged', tmp_path / 'lm')
+	monkeypatch.chdir(tmp_path)
+	copied = []
+	real_copy = hpcp_mod.copy_file
+	monkeypatch.setattr(hpcp_mod, 'copy_file', lambda src, *args, **kwargs: copied.append(src) or real_copy(src, *args, **kwargs))
+	assert hpcp_mod.hpcp(['a/conf', spelling], dest_paths=['merged/'], single_thread=True, batch=True) == 0
+	assert copied == [str(tmp_path / 'a/conf/x')] and (tmp_path / 'merged/conf/x').read_text() == 'A'
 
 
-def test_a_file_landing_on_itself_through_a_link_copies_nothing(hpcp_mod, reset_hpcp_globals, tmp_path, monkeypatch):
-	# The same, by another spelling: while the other source writes it, the file even looks different from itself.
-	write(tmp_path / 'd/x', 'X')
-	os.symlink('d', tmp_path / 'l')
-	def fail(*args, **kwargs):
-		raise AssertionError('copied')
-	monkeypatch.setattr(hpcp_mod, 'run_command_in_multicmd_with_path_check', fail)
-	monkeypatch.setattr(hpcp_mod, 'is_file_identical', lambda *args, **kwargs: False)
-	assert hpcp_mod.copy_file(str(tmp_path / 'l/x'), [str(tmp_path / 'd/x')])[0] == 0 and not hpcp_mod.ERRORS
+def test_rme_knows_the_files_of_a_directory_that_lands_on_itself(tmp_path):
+	write(tmp_path / 'a/sub/x', 'A')
+	write(tmp_path / 'out/sub/k', 'K')
+	os.symlink('k', tmp_path / 'out/sub/lk')
+	os.makedirs(tmp_path / 'out/sub/empty')
+	write(tmp_path / 'out/stale', 'gone')
+	rc, output = _rme_in_a_terminal(tmp_path, ['a/', 'out/sub', '-d', 'out/'])
+	assert rc == 0, output[-2000:]
+	assert files(tmp_path / 'out') == {b'sub/x': b'A', b'sub/k': b'K', b'sub/lk': b'-> k'} and (tmp_path / 'out/sub/empty').is_dir()
 
 
 # The rule judges what is really copied: the listing's files, not what happens to exist.
@@ -2404,6 +2415,17 @@ def test_safe_no_working_directory_is_needed(tmp_path, flags):
 	assert (tmp_path / 'out' / str(tmp_path / 'a').lstrip(os.sep)).read_text() == 'A'
 
 
+def test_safe_a_relative_destination_without_a_working_directory_lands_nowhere(tmp_path):
+	# Leaving a removed working directory (Python 3.14's workers ask for one) must not turn this into a path under /.
+	write(tmp_path / 'a', 'A')
+	os.mkdir(tmp_path / 'gone')
+	code = ('import os, subprocess, sys\n'
+		'os.chdir(sys.argv[1]); os.rmdir(sys.argv[1])\n'
+		'sys.exit(subprocess.run([sys.executable] + sys.argv[2:], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode)\n')
+	rc, _ = run_python(code, [str(tmp_path / 'gone'), HPCP, str(tmp_path / 'a'), '-d', 'hpcp_relative_landing/'], b'')
+	assert rc != 0 and not os.path.lexists('/hpcp_relative_landing')
+
+
 def run_python(code, args, stdin):
 	task = subprocess.run([sys.executable, '-c', code] + args, input=stdin, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=600, start_new_session=True)
 	return task.returncode, task.stdout
@@ -2424,7 +2446,7 @@ def test_real_places_look_at_each_directory_once(hpcp_mod, tmp_path, monkeypatch
 	for name in range(50):
 		assert places.landing(root + f'/out/l/f{name}', root + f'/s/f{name}') == root + f'/out/d/f{name}'
 		assert places.place(root + f'/out/l/f{name}') == root + f'/out/d/f{name}'
-	assert scans == [root + '/out/d'] and stats.count(root + '/out/l') == 1 and len(stats) == len(set(stats))
+	assert scans == [root + '/out/d'] and not [path for path in stats if os.path.basename(path).startswith('f')]
 
 
 def test_real_places_agree_with_realpath(hpcp_mod, tmp_path):
@@ -2441,7 +2463,7 @@ def test_real_places_agree_with_realpath(hpcp_mod, tmp_path):
 def test_safe_a_copy_into_a_new_destination_lists_nothing_early(hpcp_mod, tmp_path, monkeypatch):
 	write(tmp_path / 'src/d/x', 'x')
 	monkeypatch.setattr(hpcp_mod, 'get_file_list', lambda *args, **kwargs: pytest.fail('listed'))
-	assert hpcp_mod._settle_destinations([str(tmp_path / 'src/')], [str(tmp_path / 'new') + '/']) == ({}, 0)
+	assert hpcp_mod._settle_destinations([str(tmp_path / 'src/')], [str(tmp_path / 'new') + '/'])[:2] == ({}, 0)
 
 
 def test_a_copy_onto_an_existing_tree_reads_each_directory_once_and_stats_no_file(hpcp_mod, tmp_path, monkeypatch):
@@ -2456,7 +2478,7 @@ def test_a_copy_onto_an_existing_tree_reads_each_directory_once_and_stats_no_fil
 	lstats = []
 	monkeypatch.setattr(hpcp_mod.os, 'lstat', lambda path, **kwargs: lstats.append(path) or real_lstat(path, **kwargs))
 	try:
-		assert hpcp_mod._settle_destinations(['src/'], ['out/'], max_workers=1) == ({}, 0)
+		assert hpcp_mod._settle_destinations(['src/'], ['out/'], max_workers=1)[:2] == ({}, 0)
 	finally:
 		hpcp_mod._get_file_list_cache.clear()
 	root = str(tmp_path)

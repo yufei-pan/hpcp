@@ -3175,9 +3175,6 @@ def copy_file(src_path, dest_paths, full_hash=False, verbose=False, concurrent_p
 		return 0, 0, symLinks
 	start_time = time.monotonic()
 	if not os.path.islink(src_path):
-		# A directory that lands on itself copies nothing: another source may be writing this very file (_settle_destinations).
-		if src_path in dest_paths:
-			return 0, 0, symLinks
 		# cp would put the file inside a directory at its place (dest/x/x), and a move would then lose the source.
 		usable = [dest for dest in dest_paths if not os.path.isdir(dest)]
 		if not usable:
@@ -3188,9 +3185,7 @@ def copy_file(src_path, dest_paths, full_hash=False, verbose=False, concurrent_p
 		src_size = get_file_size(src_path)
 		copiedSize = 0
 		for dest in dest_paths:
-			if not os.path.exists(dest) or os.path.islink(src_path):
-				continue
-			if is_file_identical(src_path, dest,os.path.getsize(src_path),full_hash):
+			if os.path.exists(dest) and (not os.path.islink(src_path)) and is_file_identical(src_path, dest,os.path.getsize(src_path),full_hash):
 				if not CONTENT_ONLY:
 					st = os.stat(src_path,follow_symlinks=False)
 					_remove_stale_xattrs(src_path, dest)
@@ -3202,10 +3197,6 @@ def copy_file(src_path, dest_paths, full_hash=False, verbose=False, concurrent_p
 					os.utime(dest, (st.st_atime, st.st_mtime),follow_symlinks=False)
 				endTime = time.monotonic()
 				return 0, endTime - start_time , symLinks #, task_to_run
-			# Itself by another spelling (a directory landing on itself through a link), differing only because another source
-			# is writing it: nothing to copy, and cp would fail.
-			if os.path.samefile(src_path, dest):
-				return 0, time.monotonic() - start_time, symLinks
 		bak_dest_paths = dest_paths.copy()
 		using_bak_paths = False
 		if os.path.islink(src_path):
@@ -10226,9 +10217,11 @@ def _settle_destinations(src_paths, dests, dest_image=None, directory_only=False
 	Cost: files are compared only when two real roots meet, which a copy with disjoint source and destination never
 	does. Up to there a file source costs what its parent directory costs (_RealPlaces). A directory source that lands
 	where nothing exists is not even listed; one that lands in an existing directory is listed, as the copy would, and
-	each directory it lands in is read once, so a link there cannot hide a landing. Returns ({(job's src, tuple(its
-	dests)): paths it must not copy}, files a later source replaced). Listings are cached, so the copy reads the same ones."""
+	each directory it lands in is read once, so a link there cannot hide a landing. Listings are cached, so the copy reads
+	the same ones. Returns ({job: paths it must not copy}, files a later source replaced, the jobs of directories that land
+	on themselves, which run no copy), a job being (its src, tuple(its dests))."""
 	dropped = {}
+	in_place = set()
 	places = places or _RealPlaces()
 	def listing(src):
 		return get_file_list(src, max_workers=max_workers, exclude=exclude, parallel_file_listing=parallel_file_listing and max_workers != 1)
@@ -10256,9 +10249,11 @@ def _settle_destinations(src_paths, dests, dest_image=None, directory_only=False
 					raise RuntimeError(f'Invalid arguments: -rm would move {root} onto itself ({land} is it or lies inside it); '
 						'nothing is copied or removed')
 		jobs.append((src, actual_dests, directory, real, lands))
+		if directory and real in lands:
+			in_place.add((src, tuple(actual_dests)))
 	if directory_only:
 		# Nothing is copied.
-		return dropped, 0
+		return dropped, 0, set()
 	roots = [land for job in jobs for land in job[4]]
 	if not dest_image:
 		roots.extend(job[3] for job in jobs)
@@ -10268,7 +10263,7 @@ def _settle_destinations(src_paths, dests, dest_image=None, directory_only=False
 					if os.path.isdir(land):
 						roots.extend(_link_targets(src, dest, listing(src), places))
 	if not _roots_overlap(roots):
-		return dropped, 0
+		return dropped, 0, in_place
 	def files_of(job):
 		"""(path, its place, where it lands in each destination) for each file of job that the copy really takes: the
 		listing's, within the length copy_file accepts (_validate_paths)."""
@@ -10350,12 +10345,12 @@ def _settle_destinations(src_paths, dests, dest_image=None, directory_only=False
 				holders[dest] = (path, job, directory)
 			else:
 				clash(path, job, f'{dest} is already copied from {held[0]}')
-	return dropped, replaced
+	return dropped, replaced, in_place
 
 def process_copy(src_paths: list, dests:list = [], single_thread = False, max_workers = multiprocessing.cpu_count(),verbose = False, 
 				directory_only = False,no_directory_sync = False, full_hash = False, files_per_job = 1, parallel_file_listing = False,
-				exclude=None,dest_image = None,batch = False, exit_not_enough_space = False, dropped = None):
-	"""dropped: what _settle_destinations decided, when several sources share destinations (hpcp() settles them first)."""
+				exclude=None,dest_image = None,batch = False, exit_not_enough_space = False, dropped = None, in_place = ()):
+	"""dropped, in_place: what _settle_destinations decided (hpcp() settles them first)."""
 	total_file_list = set()
 	total_sym_links = {}
 	taskCtr = 0
@@ -10369,6 +10364,13 @@ def process_copy(src_paths: list, dests:list = [], single_thread = False, max_wo
 	for source in src_paths:
 		taskCtr += 1
 		src, dests = _copy_job(source, argDest, dest_image)
+		if (src, tuple(dests)) in in_place:
+			# It lands on itself. Another source may be writing these very files: not read, but -rme has to know them.
+			print(f"{src} lands on itself: nothing to copy")
+			files, links = get_file_list(src, max_workers=max_workers, exclude=exclude, parallel_file_listing=parallel_file_listing and max_workers != 1)[:2]
+			total_file_list.update(files)
+			total_sym_links.update(_link_dests(links, src, dests))
+			continue
 		if dest_image:
 			# if the destination is a mounted image, then we use the full path for src and add that to dest.
 			# the dest path have the src full src path, we will also recersively copy the dir meta data
@@ -10942,7 +10944,14 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = multipr
 			process_compare_file_list(src_paths, dests, max_workers=max_workers,parallel_file_listing=parallel_file_listing,
 							exclude=exclude,dest_image=dest_image,diff_file_list=diff_file_list,tar_diff_file_list=tar_diff_file_list,append_hash=append_hash_to_file_list,full_hash=full_hash,src_image_roots=src_image_roots)
 			raise RuntimeError("Exiting after comparing file list.")
-		
+
+		# Nothing below names a path through the working directory: sources and destinations are resolved, and one that needed
+		# it has already failed. Python 3.14 starts its workers through os.getcwd(), so a removed one would stop the first pool.
+		try:
+			os.getcwd()
+		except FileNotFoundError:
+			os.chdir(os.sep)
+
 		dests_to_remove = []
 		for dest in dests:
 			try:
@@ -11003,14 +11012,14 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = multipr
 			pinned_dest_roots = _destination_roots(dests) if remove_extra else None
 			copy_error_start = len(ERRORS)
 			# Refuses a clash before anything is copied or removed.
-			dropped, replaced = _settle_destinations(src_paths, dests, dest_image, directory_only, copy_exclude, 1 if single_thread else max_workers,
+			dropped, replaced, in_place = _settle_destinations(src_paths, dests, dest_image, directory_only, copy_exclude, 1 if single_thread else max_workers,
 				parallel_file_listing, remove=remove, places=places)
 			if replaced:
 				print(f"Merged directories: {replaced} file(s) replaced by a later source")
 			total_file_list, total_sym_links = process_copy(src_paths, dests, single_thread=single_thread, max_workers=max_workers,
 																			verbose=verbose, directory_only=directory_only,no_directory_sync=no_directory_sync,
 																			full_hash=full_hash, files_per_job=files_per_job, parallel_file_listing=parallel_file_listing,
-																			exclude=copy_exclude,dest_image=dest_image,batch = batch,exit_not_enough_space = exit_not_enough_space,dropped = dropped)
+																			exclude=copy_exclude,dest_image=dest_image,batch = batch,exit_not_enough_space = exit_not_enough_space,dropped = dropped,in_place = in_place)
 			if verbose:
 				# sort file list and sym links
 				for file in natural_sort(total_file_list):
