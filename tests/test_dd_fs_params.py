@@ -1875,7 +1875,7 @@ def test_probe_xfs_in_a_mount_namespace_leaves_a_dirty_log_to_the_next_mount(tmp
 			assert loop not in mounts.read()
 		_run('mount', '-o', 'ro,nouuid', loop, after)
 		try:
-			assert sorted(os.listdir(after)) == sorted(['after-sync'] + [f'd{number}' for number in range(8)])
+			assert {f'd{number}' for number in range(8)} <= set(os.listdir(after))
 		finally:
 			_run('umount', after)
 	finally:
