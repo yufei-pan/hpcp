@@ -3166,14 +3166,68 @@ def test_a_fifo_with_a_waiting_writer_is_not_disturbed_by_being_named(tmp_path):
 	try:
 		assert writer.stdout.readline() == b'ready\n'
 		time.sleep(0.3)
-		subprocess.run([sys.executable, HPCP, 'a/p', '-d', 'out/'], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+		task = subprocess.run([sys.executable, HPCP, 'a/p', '-d', 'out/'], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
 			cwd=str(tmp_path), timeout=60, start_new_session=True)
+		assert stat.S_ISFIFO(os.lstat(tmp_path / 'out/p').st_mode) and task.returncode == 200, task.stdout[-2000:]
 		with pytest.raises(subprocess.TimeoutExpired):
 			writer.wait(timeout=1)
 	finally:
 		writer.kill()
 		writer.wait()
 		writer.stdout.close()
+
+
+def _run_bounded(args, cwd, stdin=b'', seconds=30):
+	"""The CLI with a limit: a run that hangs fails the test, its whole process group killed, instead of stalling the suite."""
+	task = subprocess.Popen([sys.executable, HPCP] + args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+		cwd=str(cwd), start_new_session=True)
+	try:
+		output = task.communicate(stdin, timeout=seconds)[0]
+	except subprocess.TimeoutExpired:
+		os.killpg(task.pid, signal.SIGKILL)
+		task.communicate()
+		pytest.fail('hung on a rerun: ' + ' '.join(args))
+	return task.returncode, output
+
+
+def test_a_named_fifo_run_twice_ends_both_times(tmp_path):
+	# The identical-file check hashed it: both sizes 0, mtimes alike, and opening a FIFO waits for a writer.
+	os.makedirs(tmp_path / 'a')
+	os.mkfifo(tmp_path / 'a/p')
+	for attempt in range(2):
+		rc, output = _run_bounded(['a/p', '-d', 'out/'], tmp_path, seconds=30)
+		assert rc == 200 and stat.S_ISFIFO(os.lstat(tmp_path / 'out/p').st_mode), (attempt, rc, output[-2000:])
+
+
+def test_a_list_holding_a_fifo_run_twice_ends_both_times(tmp_path):
+	os.makedirs(tmp_path / 'a')
+	os.mkfifo(tmp_path / 'a/p')
+	write(tmp_path / 'a/f', 'F')
+	for attempt in range(2):
+		rc, output = _run_bounded(['-d', 'out/'], tmp_path, stdin=b'a/p\na/f\n')
+		assert rc == 200 and stat.S_ISFIFO(os.lstat(tmp_path / 'out/a/p').st_mode) and (tmp_path / 'out/a/f').read_text() == 'F', (attempt, rc, output[-2000:])
+
+
+def test_a_move_of_a_list_holding_a_fifo_keeps_the_sources_on_a_rerun(tmp_path):
+	os.makedirs(tmp_path / 'a')
+	os.mkfifo(tmp_path / 'a/p')
+	write(tmp_path / 'a/f', 'F')
+	_run_bounded(['-d', 'out/'], tmp_path, stdin=b'a/p\na/f\n')
+	rc, output = _run_bounded(['-d', 'out/', '-rf'], tmp_path, stdin=b'a/p\na/f\n')
+	assert rc == 212 and stat.S_ISFIFO(os.lstat(tmp_path / 'a/p').st_mode) and (tmp_path / 'a/f').read_text() == 'F', (rc, output[-2000:])
+
+
+@pytest.mark.parametrize('fifo_is', ['source', 'destination'])
+def test_a_fifo_is_never_hashed_to_find_it_identical(tmp_path, hpcp_mod, monkeypatch, fifo_is):
+	os.makedirs(tmp_path / 'a')
+	os.mkfifo(tmp_path / 'a/p')
+	write(tmp_path / 'a/f', '')
+	os.utime(tmp_path / 'a/f', ns=(os.lstat(tmp_path / 'a/p').st_atime_ns, os.lstat(tmp_path / 'a/p').st_mtime_ns))
+	def no_hash(*args, **kwargs):
+		raise AssertionError('opened to hash: %r' % (args,))
+	monkeypatch.setattr(hpcp_mod, 'hash_file', no_hash)
+	pair = (str(tmp_path / 'a/p'), str(tmp_path / 'a/f'))
+	assert hpcp_mod.is_file_identical(*(pair if fifo_is == 'source' else pair[::-1]), 0) is False
 
 
 @no_permissions_as_root
