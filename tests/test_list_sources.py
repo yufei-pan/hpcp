@@ -3166,14 +3166,132 @@ def test_a_fifo_with_a_waiting_writer_is_not_disturbed_by_being_named(tmp_path):
 	try:
 		assert writer.stdout.readline() == b'ready\n'
 		time.sleep(0.3)
-		subprocess.run([sys.executable, HPCP, 'a/p', '-d', 'out/'], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+		task = subprocess.run([sys.executable, HPCP, 'a/p', '-d', 'out/'], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
 			cwd=str(tmp_path), timeout=60, start_new_session=True)
+		assert stat.S_ISFIFO(os.lstat(tmp_path / 'out/p').st_mode) and task.returncode == 200, task.stdout[-2000:]
 		with pytest.raises(subprocess.TimeoutExpired):
 			writer.wait(timeout=1)
 	finally:
 		writer.kill()
 		writer.wait()
 		writer.stdout.close()
+
+
+def _run_bounded(args, cwd, stdin=b'', seconds=30):
+	"""The CLI with a limit: a run that hangs fails the test, its whole process group killed, instead of stalling the suite."""
+	task = subprocess.Popen([sys.executable, HPCP] + args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+		cwd=str(cwd), start_new_session=True)
+	try:
+		output = task.communicate(stdin, timeout=seconds)[0]
+	except subprocess.TimeoutExpired:
+		os.killpg(task.pid, signal.SIGKILL)
+		task.communicate()
+		pytest.fail('hung on a rerun: ' + ' '.join(args))
+	return task.returncode, output
+
+
+def test_a_named_fifo_run_twice_ends_both_times(tmp_path):
+	# The identical-file check hashed it: both sizes 0, mtimes alike, and opening a FIFO waits for a writer.
+	os.makedirs(tmp_path / 'a')
+	os.mkfifo(tmp_path / 'a/p')
+	for attempt in range(2):
+		rc, output = _run_bounded(['a/p', '-d', 'out/'], tmp_path, seconds=30)
+		assert rc == 200 and stat.S_ISFIFO(os.lstat(tmp_path / 'out/p').st_mode), (attempt, rc, output[-2000:])
+
+
+def test_a_list_holding_a_fifo_run_twice_ends_both_times(tmp_path):
+	os.makedirs(tmp_path / 'a')
+	os.mkfifo(tmp_path / 'a/p')
+	write(tmp_path / 'a/f', 'F')
+	for attempt in range(2):
+		rc, output = _run_bounded(['-d', 'out/'], tmp_path, stdin=b'a/p\na/f\n')
+		assert rc == 200 and stat.S_ISFIFO(os.lstat(tmp_path / 'out/a/p').st_mode) and (tmp_path / 'out/a/f').read_text() == 'F', (attempt, rc, output[-2000:])
+
+
+def test_a_move_of_a_list_holding_a_fifo_keeps_the_sources_on_a_rerun(tmp_path):
+	os.makedirs(tmp_path / 'a')
+	os.mkfifo(tmp_path / 'a/p')
+	write(tmp_path / 'a/f', 'F')
+	_run_bounded(['-d', 'out/'], tmp_path, stdin=b'a/p\na/f\n')
+	rc, output = _run_bounded(['-d', 'out/', '-rf'], tmp_path, stdin=b'a/p\na/f\n')
+	assert rc == 212 and stat.S_ISFIFO(os.lstat(tmp_path / 'a/p').st_mode) and (tmp_path / 'a/f').read_text() == 'F', (rc, output[-2000:])
+
+
+@pytest.mark.parametrize('fifo_is', ['source', 'destination'])
+def test_a_fifo_is_never_hashed_to_find_it_identical(tmp_path, hpcp_mod, monkeypatch, fifo_is):
+	os.makedirs(tmp_path / 'a')
+	os.mkfifo(tmp_path / 'a/p')
+	write(tmp_path / 'a/f', '')
+	os.utime(tmp_path / 'a/f', ns=(os.lstat(tmp_path / 'a/p').st_atime_ns, os.lstat(tmp_path / 'a/p').st_mtime_ns))
+	def no_hash(*args, **kwargs):
+		raise AssertionError('opened to hash: %r' % (args,))
+	monkeypatch.setattr(hpcp_mod, 'hash_file', no_hash)
+	pair = (str(tmp_path / 'a/p'), str(tmp_path / 'a/f'))
+	assert hpcp_mod.is_file_identical(*(pair if fifo_is == 'source' else pair[::-1]), 0) is False
+
+
+def test_two_fifos_are_identical_without_a_hash(tmp_path, hpcp_mod, monkeypatch):
+	os.makedirs(tmp_path / 'a')
+	os.mkfifo(tmp_path / 'a/p')
+	os.mkfifo(tmp_path / 'a/q')
+	os.utime(tmp_path / 'a/q', ns=(os.lstat(tmp_path / 'a/p').st_atime_ns, os.lstat(tmp_path / 'a/p').st_mtime_ns))
+	def no_hash(*args, **kwargs):
+		raise AssertionError('opened to hash: %r' % (args,))
+	monkeypatch.setattr(hpcp_mod, 'hash_file', no_hash)
+	assert hpcp_mod.is_file_identical(str(tmp_path / 'a/p'), str(tmp_path / 'a/q'), 0) is True
+
+
+needs_root = pytest.mark.skipif(not hasattr(os, 'geteuid') or os.geteuid() != 0, reason='needs root to make a device node')
+
+
+def _device_node(path, minor, like):
+	"""A character device (1, minor) at path with the times of like."""
+	os.mknod(path, 0o600 | stat.S_IFCHR, os.makedev(1, minor))
+	st = os.lstat(like)
+	os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns))
+
+
+@needs_root
+def test_two_nodes_for_one_device_are_identical_and_for_another_are_not(tmp_path, hpcp_mod, monkeypatch):
+	def no_hash(*args, **kwargs):
+		raise AssertionError('opened to hash: %r' % (args,))
+	monkeypatch.setattr(hpcp_mod, 'hash_file', no_hash)
+	_device_node(str(tmp_path / 'null'), 3, str(tmp_path))
+	_device_node(str(tmp_path / 'null2'), 3, str(tmp_path / 'null'))
+	_device_node(str(tmp_path / 'zero'), 5, str(tmp_path / 'null'))
+	assert hpcp_mod.is_file_identical(str(tmp_path / 'null'), str(tmp_path / 'null2'), 0) is True
+	assert hpcp_mod.is_file_identical(str(tmp_path / 'null'), str(tmp_path / 'zero'), 0) is False
+
+
+@pytest.mark.parametrize('kind', ['fifo', pytest.param('device', marks=needs_root)])
+def test_content_only_leaves_a_matching_pair_of_nodes_to_no_cp(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch, kind):
+	# cp -f reads a node to its end and writes it through the one at the destination: a device, the disk behind it.
+	os.makedirs(tmp_path / 'a')
+	os.makedirs(tmp_path / 'out')
+	if kind == 'fifo':
+		os.mkfifo(tmp_path / 'a/n')
+		os.mkfifo(tmp_path / 'out/n')
+		os.utime(tmp_path / 'out/n', ns=(os.lstat(tmp_path / 'a/n').st_atime_ns, os.lstat(tmp_path / 'a/n').st_mtime_ns))
+	else:
+		_device_node(str(tmp_path / 'a/n'), 3, str(tmp_path))
+		_device_node(str(tmp_path / 'out/n'), 3, str(tmp_path / 'a/n'))
+	before = os.lstat(tmp_path / 'out/n')
+	ran = []
+	monkeypatch.setattr(hpcp_mod, 'run_command_in_multicmd_with_path_check', lambda *args, **kwargs: ran.append(args))
+	hpcp_mod.CONTENT_ONLY = True
+	hpcp_mod.copy_file(str(tmp_path / 'a/n'), [str(tmp_path / 'out/n')])
+	after = os.lstat(tmp_path / 'out/n')
+	assert not ran and (after.st_ino, after.st_mode, after.st_mtime_ns) == (before.st_ino, before.st_mode, before.st_mtime_ns)
+
+
+def test_a_content_only_rerun_over_the_fifo_a_plain_run_made_ends(tmp_path):
+	# cp -f onto the FIFO it made reads it, and waits for a writer. (A first run under -co has no node there, and cp -f reads
+	# the source FIFO: that one waits too, on 9.80 as well, and is not this.)
+	os.makedirs(tmp_path / 'a')
+	os.mkfifo(tmp_path / 'a/p')
+	for flags in ([], ['-co']):
+		rc, output = _run_bounded(['a/p', '-d', 'out/'] + flags, tmp_path)
+		assert rc == 200 and stat.S_ISFIFO(os.lstat(tmp_path / 'out/p').st_mode), (flags, rc, output[-2000:])
 
 
 @no_permissions_as_root

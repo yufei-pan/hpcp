@@ -106,7 +106,7 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 
 ### A rerun with a source that became unreadable ends in a traceback
 - **Kind:** deferred.
-- **What the operator sees:** the destination matches the source by size and mtime, then the source becomes unreadable (mode 000, not root): the identical-file check hashes first, `hash_file`'s open raises, and the run ends with a Python traceback and exit 191 instead of the clean 190. Nothing is lost, and a move stays blocked at 212. Same on 9.80.
+- **What the operator sees:** the destination matches the source by size and mtime, then the source becomes unreadable (mode 000, not root): the identical-file check hashes first, `hash_file`'s open raises, and a copy ends with a Python traceback and exit 191 instead of the clean 190. A move ends 212 as usual (the exit is the highest of the errors), with its sources kept. Nothing is lost. Same on 9.80.
 - **Why:** old and safe. The fix is to move the readability check ahead of the identical loop, or to catch `PermissionError` around the hash.
 - **Revisit when:** the next hpcp release (9.82).
 
@@ -120,4 +120,10 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - **Kind:** deferred.
 - **What the operator sees:** `hpcp a/p -d out/` makes the node, prints `Source path type error` and ends exit 200. With `-rf` it is 212 and every named source stays, files included; nothing is lost. The same FIFO in a directory source is skipped silently with exit 0. Same on 9.80.
 - **Why:** old and safe. A named special should either copy cleanly or be skipped as in a tree, and that is its own decision.
+- **Revisit when:** the next hpcp release (9.82).
+
+### `-co` reads a device source and writes through the device node at the destination
+- **Kind:** deferred.
+- **What the operator sees:** as root, with a block or character device node in the tree and `-co`, when the mtime of the node at the destination differs, `cp -f` reads the source device to its end and writes it through the node at the destination: the same device, or a disk behind it, which on a mounted disk writes old blocks over live ones (reasoned, not run). The same on 9.80 (the reviewer ran it). A matching pair of nodes (same kind, same device number, same mtime) is left alone since 9.81.
+- **Why:** old, root only, and it needs a device node in the tree and `-co`. Leaving a destination that is not a regular file alone belongs with the temporary name and rename above.
 - **Revisit when:** the next hpcp release (9.82).
