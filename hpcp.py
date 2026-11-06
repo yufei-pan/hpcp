@@ -1302,11 +1302,13 @@ def _probe_xfs(device):
 	realtime) and reuses key names across them - `bsize` is the block size under
 	`data` but the directory block size under `naming` - so values are bucketed
 	by section rather than flattened.
+	xfs_info of xfsprogs 4.5 (EL7) reads a mounted filesystem only: one it prints nothing for is mounted read-only
+	for the moment it takes (nothing is written: no log recovery).
 	"""
 	params = {}
 	section = ''
 	lines = run_command_in_multicmd_with_path_check(['xfs_info', device], quiet=True, extra_env=_C_LOCALE)
-	if not lines:
+	if not lines and check_path('xfs_info'):
 		mount_point = tempfile.mkdtemp()
 		run_command_in_multicmd_with_path_check(['mount', '-o', _XFS_RO_MOUNT_OPTIONS, device, mount_point], quiet=True)
 		if _is_mount_point(mount_point):

@@ -839,6 +839,7 @@ def _fake_xfs_tools(monkeypatch, mounts=True):
 
 	monkeypatch.setattr(hpcp, 'run_command_in_multicmd_with_path_check', fake)
 	monkeypatch.setattr(hpcp, '_is_mount_point', lambda path: path.rstrip(os.sep) in mounted)
+	monkeypatch.setattr(hpcp, 'check_path', lambda tool: True)
 	return calls
 
 
@@ -851,6 +852,13 @@ def test_probe_xfs_mounts_a_filesystem_xfs_info_will_only_read_mounted(monkeypat
 	assert calls[1] == ['mount', '-o', 'ro,nouuid,norecovery', '/dev/fake3', mount_point]
 	assert calls[2:] == [['xfs_info', mount_point], ['umount', mount_point]]
 	assert not os.path.exists(mount_point)
+
+
+def test_probe_xfs_mounts_nothing_without_xfs_info(monkeypatch):
+	calls = _fake_xfs_tools(monkeypatch)
+	monkeypatch.setattr(hpcp, 'check_path', lambda tool: False)
+	assert hpcp._probe_xfs('/dev/fake3') == {}
+	assert calls == [['xfs_info', '/dev/fake3']]
 
 
 def test_probe_xfs_gives_nothing_when_the_filesystem_cannot_be_mounted(monkeypatch):
