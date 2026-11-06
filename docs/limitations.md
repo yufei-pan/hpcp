@@ -30,16 +30,9 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 ### Destination symlink at a directory's path
 - **Kind:** deferred.
 - **What the operator sees:** with `out/d -> ../elsewhere`, `hpcp src/ -d out/` writes src/d's files into elsewhere and changes elsewhere's mode, and as root its owner, exit 0, as in 9.80. A user who can write the destination can plant `d -> /etc` before root restores into it.
-- **Why:** not a regression, and it needs its own decision: refuse as `cp -a` does, or write through without touching the target's mode and owner, since someone with a symlinked data directory may rely on writing through.
+- **Why:** not a regression (a link there that leads onto a source file is refused, exit 213), and it needs its own decision: refuse as `cp -a` does, or write through without touching the target's mode and owner, since someone with a symlinked data directory may rely on writing through.
 - **Revisit when:** the next hpcp release (9.82).
 - **Approved:** 2026-11-05, the user chose "Deferred to 9.82 (Recommended)".
-
-### Symlink in the destination makes two list entries one file
-- **Kind:** known limitation.
-- **What the operator sees:** with `out/l -> real`, `printf 'l/x\nreal/x\n' | hpcp -d out -rf` writes both to out/real/x, so one content is lost and both sources are removed, exit 0. 9.80 loses one too, through its flat layout.
-- **Why:** catching it means resolving the real parent of every landing on the destination side before copying, and it needs a symlink already in the destination plus a list naming both spellings.
-- **Revisit when:** someone hits it, or the 9.82 destination-symlink work makes the check cheap.
-- **Approved:** 2026-11-05, the user chose "Known limitation (Recommended)".
 
 ### A stored list used under another spelling can match by chance
 - **Kind:** known limitation.
@@ -61,3 +54,9 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - **Why:** limiting it changes old behaviour and needs its own look; a source ending in a slash mirrors into the destination, where judging all of it is right.
 - **Revisit when:** the next hpcp release (9.82), limiting it to where the source lands.
 - **Approved:** 2026-11-05, the user chose "Deferred to 9.82 (Recommended)".
+
+### `-rme` can take a source inside the destination for extra
+- **Kind:** deferred.
+- **What the operator sees:** `hpcp out/sub/ b/ -d out/ -rme`, answered y at a terminal, deletes `out/sub/x`, the only copy when `b/x` replaced it at `out/x`: the file lies in the destination and no source lands on it, so it looks extra. With `-rf` the run then exits 212, and its message says -rme may have removed it. Same in 9.80.
+- **Why:** it needs `-rme` to know what the run reads, and that belongs with limiting positional `-rme` to where a source lands.
+- **Revisit when:** the next hpcp release (9.82), with "Positional `-rme` judges the whole destination".

@@ -247,6 +247,17 @@ def test_fallback_removal_stops_at_another_device(tmp_path, hpcp_mod, reset_hpcp
 	assert _failures(hpcp_mod) == []
 
 
+def test_a_move_onto_a_bind_mount_of_itself_is_refused(tmp_path, hpcp_mod, reset_hpcp_globals):
+	"""One directory by two paths: every file is identical to itself, so the removal would delete the only copy."""
+	src = tmp_path / 'src'
+	src.mkdir()
+	(src / 'f').write_text('keep')
+	(tmp_path / 'bind').mkdir()
+	with _mounted(tmp_path / 'bind', bind_source=src):
+		assert hpcp_mod.hpcp([str(src) + '/'], dest_paths=[str(tmp_path / 'bind') + '/'], remove_force=True, batch=True) == 241
+		assert (src / 'f').read_text() == 'keep'
+
+
 # ---- 9.75: re-review of 127f141..HEAD ----
 
 @pytest.mark.parametrize('dest', ['dst/', './dst/', 'x/../dst/'])
