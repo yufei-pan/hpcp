@@ -1214,9 +1214,9 @@ def test_a_diff_with_temp_dirs_on_a_live_filesystem_leaves_nothing_in_another_na
 def test_an_apply_with_temp_dirs_on_a_live_filesystem_leaves_nothing_in_another_namespace(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch, esp):
 	"""As for a diff, with the sections: partition 1 is live, so it is a bind, and partition 2 is mounted after it. The
 	apply takes the sections off itself, in the opposite order to their mounts (1, 2), whatever order it applied them in.
-	With partition 1 plain, the apply order is the mount order, so releasing in apply order (or in mount order) leaves the
-	bind; with partition 1 an ESP, which is applied last, the apply order is (2, 1), the reverse of the mounts, and releasing
-	in reverse apply order leaves it. Each wrong form fails one of the two."""
+	Plain, the apply order is the mount order (1, 2), so releasing in apply order leaves the bind. With partition 1 an ESP,
+	which is applied last, the apply order is (2, 1), so releasing in reverse apply order leaves it. Releasing in mount order
+	fails both. Run on EL7, every wrong form fails at least one of the two."""
 	base, golden, target = tmp_path / 'base.img', tmp_path / 'golden.img', tmp_path / 'target.img'
 	with open(str(base), 'wb') as f:
 		f.truncate(96 << 20)
