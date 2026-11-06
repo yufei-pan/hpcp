@@ -8762,15 +8762,13 @@ def _inside_destinations(src_paths, dests):
 	destinations that a kept listed directory holds, as its walk spells them). An entry inside a destination (or the
 	destination itself) stays where it is: copying it onto its own place is nothing, and moving it would destroy it.
 	Absolute entries always stay. A relative entry is copied (cd overlay; find etc | hpcp -d ..) only when it and the
-	working directory share a directory strictly inside every destination that holds the entry, on real paths, and its
-	landing is neither the entry nor below it: then it lands in another place, however it is spelled, and a second run
+	working directory share a directory strictly inside every destination that holds the entry (by each spelling of the
+	entry: as given and by its real parent), and its landing is neither the entry nor below it: then it lands in another place, however it is spelled, and a second run
 	finds the same. A listed directory that holds the destination (find . | hpcp -d out) is kept: the walk below it must
 	leave the destination out (_exclude_roots)."""
 	roots = set()
-	real_roots = []
 	for dest in dests:
 		roots.update((os.path.abspath(dest), os.path.realpath(dest)))
-		real_roots.append(os.path.realpath(dest))
 	prefixes = tuple(root.rstrip(os.path.sep) + os.path.sep for root in roots)
 	kept, skipped, holding = [], 0, set()
 	real_parents = {}
@@ -8792,7 +8790,7 @@ def _inside_destinations(src_paths, dests):
 					real_parents[parent] = os.path.realpath(parent)
 				spellings = (path, os.path.join(real_parents[parent], os.path.basename(path)))
 			if any(spelling in roots or spelling.startswith(prefixes) for spelling in spellings):
-				if os.path.isabs(src) or not _lands_elsewhere(spellings, src.landing, roots, real_roots, real_cwd):
+				if os.path.isabs(src) or not _lands_elsewhere(spellings, src.landing, roots, real_cwd):
 					skipped += 1
 					continue
 			if directory:
@@ -8803,19 +8801,22 @@ def _inside_destinations(src_paths, dests):
 		kept.append(src)
 	return kept, skipped, holding
 
-def _lands_elsewhere(spellings, landing, roots, real_roots, real_cwd):
+def _lands_elsewhere(spellings, landing, roots, real_cwd):
 	"""True when a relative list entry that lies inside a destination is still copied (see _inside_destinations)."""
-	real = spellings[1].rstrip(os.path.sep) + os.path.sep
-	for root in real_roots:
-		prefix = root.rstrip(os.path.sep) + os.path.sep
-		if real.startswith(prefix):
-			try:
-				shared = os.path.commonpath((spellings[1], real_cwd)).rstrip(os.path.sep) + os.path.sep
-			except (TypeError, ValueError):
-				# No working directory, or none on the entry's drive: nothing to part from.
-				return False
-			if not shared.startswith(prefix) or shared == prefix:
-				return False
+	prefixes = [root.rstrip(os.path.sep) + os.path.sep for root in roots]
+	for spelling in spellings:
+		# Each spelling is judged against the destinations that hold it: a path that is inside by its given spelling and
+		# outside by its real one (through a link) still has to part from the destination.
+		inside = spelling.rstrip(os.path.sep) + os.path.sep
+		for prefix in prefixes:
+			if inside.startswith(prefix):
+				try:
+					shared = os.path.commonpath((spelling, real_cwd)).rstrip(os.path.sep) + os.path.sep
+				except (TypeError, ValueError):
+					# No working directory, or none on the entry's drive: nothing to part from.
+					return False
+				if not shared.startswith(prefix) or shared == prefix:
+					return False
 	for root in roots:
 		lands = os.path.normpath(os.path.join(root, landing)).rstrip(os.path.sep) + os.path.sep
 		if any(lands.startswith(spelling.rstrip(os.path.sep) + os.path.sep) for spelling in spellings):
@@ -10901,7 +10902,7 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = multipr
 					print('-rme checked nothing: the list names no directories, and only below those can a list judge extras. '
 						'To mirror a directory, list the directory itself: printf "src\\n" | hpcp -d out -rme')
 				else:
-					print('-rme checked nothing: no source is a directory, and only below a directory can extras be judged. '
+					print('-rme checked nothing: every source is a named file or a link, which says nothing of what else belongs in the destination. '
 						'To mirror a directory, name it: hpcp src/ -d out -rme')
 			elif remove_extra:
 				print('-'*80)

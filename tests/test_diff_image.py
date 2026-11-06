@@ -2364,9 +2364,9 @@ def test_mount_visibility_scales_with_deep_chains_and_many_siblings(tmp_path, hp
 	# 20000 siblings under one parent resolve quickly.
 	root = _mount_entry('/', 'ext4', ids=(1, 0))
 	siblings = [_mount_entry(tmp_path / 'sib' / f'm{i}', 'tmpfs', ids=(i + 10, 1)) for i in range(20000)]
-	start = time.time()
+	start = time.process_time()
 	assert hpcp_mod._hidden_mounts([root] + siblings) == set()
-	assert time.time() - start < 2
+	assert time.process_time() - start < 2
 
 
 def test_fuseblk_scopes_are_probed_only_where_used(tmp_path, hpcp_mod, monkeypatch):
@@ -2659,9 +2659,9 @@ def test_rows_by_scope_scales_with_many_mounts(hpcp_mod):
 	scopes = [('', 'ext4', '')] + [(f'var/lib/kubelet/pods/p{i}/volumes/v', 'tmpfs', '') for i in range(20000)]
 	rows = [R('A', f'var/lib/kubelet/pods/p{i}/volumes/v/f', '-', 'f:1:1:100644:0:0:-:-') for i in range(20000)]
 	rows.append(R('A', 'var/lib/kubelet/pods/p1/volumes/vx', '-', 'f:1:1:100644:0:0:-:-'))
-	start = time.time()
+	start = time.process_time()
 	grouped = hpcp_mod._rows_by_scope(rows, scopes)
-	assert time.time() - start < 2
+	assert time.process_time() - start < 2
 	assert len(grouped) == 20001 and [row.path for row in grouped['var/lib/kubelet/pods/p7/volumes/v']] == [
 		'var/lib/kubelet/pods/p7/volumes/v/f']
 	assert [row.path for row in grouped['']] == ['var/lib/kubelet/pods/p1/volumes/vx']

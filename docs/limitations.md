@@ -29,10 +29,10 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 
 ### A move where one source's landing is another source's path
 - **Kind:** deferred.
-- **What the operator sees:** `hpcp d1 d2/d1/ -d d2/ -rf` (d1/x=A, d2/d1/x=B) is a race in the default copy: in 30 runs on 9.81, A survived 10 times, B 13, and d2/x was 0 bytes 7 times, both contents gone, the sources removed, exit 0 (9.80: 13, 12, 5). With `-s` or `-nb`, A survived all 12 runs on both versions. The list form loses one content too: `cd w/D/c; printf '../../c/r\nr\n' | hpcp -d .. -rf` (w/c/r=OUT, w/D/c/r=IN) leaves only `w/D/r`, holding OUT or IN from run to run, exit 0 (also after the 9.81 landing rule): both entries land in the destination, one at the path of the other, and both sources are removed. `hpcp a out/a/x -d out/ -rf` leaves only out/x. 9.80 loses content here too.
+- **What the operator sees:** `hpcp d1 d2/d1/ -d d2/ -rf` (d1/x=A, d2/d1/x=B) is a race in the default copy: in 30 runs on 9.81, A survived 10 times, B 13, and d2/x was 0 bytes 7 times, both contents gone, the sources removed, exit 0 (9.80: 13, 12, 5). With `-s` or `-nb`, A survived all 12 runs on both versions. The list form loses content too: `cd w/D/c; printf '../../c/r\nr\n' | hpcp -d .. -rf` (w/c/r=OUT, w/D/c/r=IN) leaves only `w/D/r`, with the sources removed and exit 0 (also after the 9.81 landing rule). Over 40 runs, 7 left a 0-byte `w/D/r` (both contents gone) in one measurement; in another 12 of 40 did, with OUT in 19 and IN in 9. Both entries land in the destination, one at the path of the other; the cause of the 0 bytes is not verified. `hpcp a out/a/x -d out/ -rf` leaves only out/x. 9.80 loses content here too.
 - **Why:** not a regression. It happens in a move where one source's landing is another source's path; the proposed fix (widening the overlap check to source roots and real paths) is untested and adds another rule to this round.
 - **Revisit when:** the next hpcp release (9.82).
-- **Approved:** 2026-11-05, the user chose "Keep deferred, correct the text (Recommended)" (replacing the text approved as "Deferred to 9.82 (Recommended)").
+- **Approved:** 2026-11-05, the user chose "Deferred to 9.82 (Recommended)"; text corrected the same day, the user chose "Keep deferred, correct the text (Recommended)", and again for the list form, the user chose "Keep deferred, fix text (Recommended)".
 
 ### Destination symlink at a directory's path
 - **Kind:** deferred.
@@ -60,4 +60,11 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - **What the operator sees:** with `-nds`, `hpcp a/x -d out/` where a/x is a directory and out/x a file exits 70 with a `File exists` traceback instead of a clean clash, exit 213. The file is untouched, as in 9.80.
 - **Why:** ugly but safe, and old.
 - **Revisit when:** the next hpcp release (9.82).
+- **Approved:** 2026-11-05, the user chose "Deferred to 9.82 (Recommended)".
+
+### Positional `-rme` judges the whole destination
+- **Kind:** deferred.
+- **What the operator sees:** `hpcp b -d out/ -rme` lands in `out/b`, but at the prompt's y it also deletes what lies outside that, such as `out/keep`; `hpcp a/x b -d out/ -rme` does the same. Same as 9.80. A source from a list is already limited to what it covers.
+- **Why:** limiting it changes old behaviour and needs its own look; a source ending in a slash mirrors into the destination, where judging all of it is right.
+- **Revisit when:** the next hpcp release (9.82), limiting it to where the source lands.
 - **Approved:** 2026-11-05, the user chose "Deferred to 9.82 (Recommended)".

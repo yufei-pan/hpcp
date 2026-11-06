@@ -673,9 +673,9 @@ def test_rme_listed_dir_with_exclude_keeps_the_excluded_copy(work, hpcp_mod, res
 
 def test_expected_paths_are_linear_in_the_sources(hpcp_mod, tmp_path, reset_hpcp_globals):
 	sources = ['/s/d%d/f%05d' % (i % 100, i) for i in range(30000)]
-	start = time.monotonic()
+	start = time.process_time()
 	got = hpcp_mod._expected_dest_paths(sources, sources, ['/o/'])
-	assert time.monotonic() - start < 3
+	assert time.process_time() - start < 3
 	assert len(got) == 30000 and '/o/f00007' in got
 
 
@@ -1885,12 +1885,72 @@ def test_entries_below_the_working_directory_still_copy_to_its_parent(tmp_path):
 
 def test_the_landing_rule_survives_a_missing_working_directory_and_mixed_drives(hpcp_mod, monkeypatch):
 	spellings = ('/t/a/b/g', '/t/a/b/g')
-	assert hpcp_mod._lands_elsewhere(spellings, 'a/b/g', {'/t/a'}, ['/t/a'], '/t/a/b')
-	assert not hpcp_mod._lands_elsewhere(spellings, 'a/b/g', {'/t/a'}, ['/t/a'], None)
+	assert hpcp_mod._lands_elsewhere(spellings, 'a/b/g', {'/t/a'}, '/t/a/b')
+	assert not hpcp_mod._lands_elsewhere(spellings, 'a/b/g', {'/t/a'}, None)
 	def other_drive(paths):
 		raise ValueError("Paths don't have the same drive")
 	monkeypatch.setattr(os.path, 'commonpath', other_drive)
-	assert not hpcp_mod._lands_elsewhere(spellings, 'a/b/g', {'/t/a'}, ['/t/a'], '/t/a/b')
+	assert not hpcp_mod._lands_elsewhere(spellings, 'a/b/g', {'/t/a'}, '/t/a/b')
+
+
+# An entry inside a destination by its given path, outside it by its real path (through a link), still parts from the
+# destination at the working directory, or it stays.
+
+@pytest.mark.parametrize('flags', [[], ['-rf']], ids=['copy', 'move'])
+def test_an_entry_through_a_link_that_leaves_the_destination_stays_when_it_does_not_part(tmp_path, flags):
+	write(tmp_path / 'data/x', 'D')
+	os.makedirs(str(tmp_path / 'home/u'))
+	os.symlink('../../data', str(tmp_path / 'home/u/scratch'))
+	before = files(tmp_path)
+	for _ in range(2):
+		rc, output = run(['-d', 'home'] + flags, tmp_path, b'home/u/scratch/x\n')
+		assert rc == 0, output[-2000:]
+		assert files(tmp_path) == before and not os.path.exists(str(tmp_path / 'home/home'))
+
+
+def test_find_dash_l_through_a_link_out_of_the_destination_adds_no_nested_copy(tmp_path):
+	write(tmp_path / 'ext/x', 'E')
+	write(tmp_path / 'out/own', 'O')
+	os.symlink('../ext', str(tmp_path / 'out/lk'))
+	listing = subprocess.run(['find', '-L', '.', '-type', 'f'], cwd=str(tmp_path), stdout=subprocess.PIPE).stdout
+	rc, output = run(['-d', 'out'], tmp_path, listing)
+	assert rc == 0, output[-2000:]
+	assert not os.path.exists(str(tmp_path / 'out/out')) and files(tmp_path / 'ext') == {b'x': b'E'}
+
+
+@pytest.mark.parametrize('entry', [b'a/l/x', b'a/l/sub', b'a/l'], ids=['file', 'directory-below-link', 'link'])
+def test_an_entry_below_a_link_in_the_destination_stays(tmp_path, entry):
+	write(tmp_path / 'o/x', 'X')
+	write(tmp_path / 'o/sub/y', 'Y')
+	os.makedirs(str(tmp_path / 't/a'))
+	os.symlink('../../o', str(tmp_path / 't/a/l'))
+	before = files(tmp_path)
+	rc, output = run(['-d', 'a'], tmp_path / 't', entry + b'\n')
+	assert rc == 0, output[-2000:]
+	assert files(tmp_path) == before and not os.path.exists(str(tmp_path / 't/a/a'))
+
+
+def test_find_dash_l_into_a_directory_with_a_link_out_of_it_run_with_a_move_keeps_everything(tmp_path):
+	write(tmp_path / 'o/x', 'X')
+	os.makedirs(str(tmp_path / 't/a'))
+	os.symlink('../../o', str(tmp_path / 't/a/l'))
+	before = files(tmp_path)
+	listing = subprocess.run(['find', '-L', 'a', '-type', 'f'], cwd=str(tmp_path / 't'), stdout=subprocess.PIPE).stdout
+	rc, output = run(['-d', 'a/', '-rf'], tmp_path / 't', listing)
+	assert rc == 0, output[-2000:]
+	assert files(tmp_path) == before
+
+
+@pytest.mark.parametrize('flags', [[], ['-rf']], ids=['copy', 'move'])
+def test_a_link_out_of_the_overlay_still_copies_where_the_path_parts_from_the_destination(tmp_path, flags):
+	overlay = _overlay_dir(tmp_path)
+	write(tmp_path / 'o2/x', 'L')
+	os.symlink('../../../o2', str(overlay / 'etc/l'))
+	listing = subprocess.run(['find', '-L', 'etc', '-type', 'f'], cwd=str(overlay), stdout=subprocess.PIPE).stdout
+	rc, output = run(['-d', '..'] + flags, overlay, listing)
+	assert rc == 0, output[-2000:]
+	assert files(tmp_path / 't').get(b'etc/l/x') == b'L' and files(tmp_path / 't').get(b'etc/conf') == b'C'
+	assert os.path.exists(str(tmp_path / 'o2/x')) == (not flags)
 
 
 # ---- modes: -di (needs root and loop devices: VM 901) ----

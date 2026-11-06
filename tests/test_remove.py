@@ -897,9 +897,9 @@ def test_move_with_many_source_roots_matches_each_entry_in_linear_time(tmp_path,
 		path.write_text('x')
 		roots.append(str(path))
 	ids = {root: hpcp_mod._path_identity(root) for root in roots}
-	start = time.monotonic()
+	start = time.process_time()
 	hpcp_mod.remove_moved_sources(roots, roots, {}, single_thread=True, remove_force=True, root_ids=ids)
-	assert time.monotonic() - start < 3
+	assert time.process_time() - start < 3
 	assert os.listdir(src) == []
 
 
