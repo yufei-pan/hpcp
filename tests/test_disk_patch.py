@@ -2859,16 +2859,19 @@ def test_identity_commands_run_the_fat_serial_writer_in_process(tmp_path, hpcp_m
 @pytest.mark.skipif(shutil.which('mkfs.vfat') is None or shutil.which('blkid') is None or shutil.which('fsck.fat') is None,
 	reason='needs mkfs.vfat, fsck.fat and blkid')
 def test_fat_serial_reads_back_through_blkid_and_passes_fsck(tmp_path, hpcp_mod, reset_hpcp_globals, fat_bits):
-	"""On a filesystem real tools made, for each FAT width: blkid sees the new ID and fsck.fat finds nothing to report,
-	the backup boot sector of FAT32 included."""
+	"""On a filesystem real tools made, for each FAT width: blkid sees the new ID and fsck.fat finds nothing new to
+	report, the backup boot sector of FAT32 included."""
 	image = tmp_path / 'fat.img'
 	with open(str(image), 'wb') as f:
 		f.truncate((64 if fat_bits == '32' else 8) << 20)
 	_run('mkfs.vfat', '-F', fat_bits, '-n', 'OLD', image)
+	# Against the fresh filesystem: fsck.fat 3.0.20 has something to say about what its own mkfs.vfat made at FAT16.
+	check = lambda: subprocess.run(['fsck.fat', '-n', str(image)], capture_output=True, text=True)
+	before = check()
 	hpcp_mod._write_fat_serial(str(image), 'ABCD-1234')
 	assert hpcp_mod._probe_identity(str(image))[:2] == ('vfat', 'ABCD-1234')
-	check = subprocess.run(['fsck.fat', '-n', str(image)], capture_output=True, text=True)
-	assert check.returncode == 0 and 'differences' not in check.stdout, check.stdout
+	after = check()
+	assert (after.returncode, after.stdout) == (before.returncode, before.stdout)
 	assert hpcp_mod.ERRORS == []
 
 

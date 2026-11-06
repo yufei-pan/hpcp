@@ -1411,9 +1411,9 @@ def _build_three_partition_source(tmp_path):
 		# an xfs with non-default inode and directory geometry.
 		_run('mkfs.vfat', '-F', '32', '-n', 'ESP', f'{loop}p1')
 		_run('mkfs.ext4', '-q', '-F', '-b', '1024', '-I', '128',
-			 '-O', '^metadata_csum,^64bit,^dir_index', '-m', '0', '-L', 'BOOTFS', f'{loop}p2')
+			 *_ext4_without('metadata_csum', '64bit', 'dir_index'), '-m', '0', '-L', 'BOOTFS', f'{loop}p2')
 		_run('mkfs.xfs', '-q', '-f', '-i', 'size=1024', '-n', 'size=8192',
-			 '-m', 'reflink=0', '-L', 'ROOTFS', f'{loop}p3')
+			 *_xfs_no_reflink(), '-L', 'ROOTFS', f'{loop}p3')
 		for index in (1, 2, 3):
 			mount_point = str(tmp_path / f'mnt{index}')
 			os.makedirs(mount_point, exist_ok=True)
@@ -1427,6 +1427,25 @@ def _build_three_partition_source(tmp_path):
 	finally:
 		subprocess.run(['losetup', '-d', loop], check=False, capture_output=True)
 	return src
+
+
+def _mkfs_takes(*argv):
+	"""True when argv, a mkfs command, runs on a scratch image: e2fsprogs 1.42 and xfsprogs 4.5 (EL7) stop at an
+	option they do not know."""
+	with tempfile.NamedTemporaryFile() as image:
+		image.truncate(512 << 20)
+		return subprocess.run(list(argv) + [image.name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+
+
+def _ext4_without(*features):
+	"""mkfs.ext4 arguments that turn features off, leaving out those this mke2fs does not know."""
+	known = ['^' + feature for feature in features if _mkfs_takes('mkfs.ext4', '-n', '-q', '-F', '-O', '^' + feature)]
+	return ['-O', ','.join(known)] if known else []
+
+
+def _xfs_no_reflink():
+	"""mkfs.xfs arguments that turn reflink off, none when this mkfs.xfs has no reflink."""
+	return ['-m', 'reflink=0'] if _mkfs_takes('mkfs.xfs', '-N', '-f', '-m', 'reflink=0') else []
 
 
 @requires_root_and_tools
@@ -1458,7 +1477,8 @@ def test_dd_roundtrip_preserves_source_fs_params(tmp_path):
 
 		assert dest_xfs['meta-data']['isize'] == src_xfs['meta-data']['isize'] == '1024'
 		assert dest_xfs['naming']['bsize'] == src_xfs['naming']['bsize'] == '8192'
-		assert dest_xfs['meta-data']['reflink'] == src_xfs['meta-data']['reflink'] == '0'
+		# xfs_info of xfsprogs 4.5 (EL7) knows no reflink: none there means off.
+		assert dest_xfs['meta-data'].get('reflink', '0') == src_xfs['meta-data'].get('reflink', '0') == '0'
 	finally:
 		# hpcp -dd leaves its own read-only source loop attached; see
 		# _detach_loops_for_image's docstring.
@@ -1558,7 +1578,7 @@ def _build_single_partition_source(tmp_path):
 		# metadata_csum without metadata_csum_seed is the layout that makes
 		# delayed tune2fs -U refuse unless e2fsck -f ran after the copy.
 		_run('mkfs.ext4', '-q', '-F', '-b', '1024', '-I', '128',
-			 '-O', '^metadata_csum_seed', '-L', 'ROOTFS', f'{loop}p1')
+			 *_ext4_without('metadata_csum_seed'), '-L', 'ROOTFS', f'{loop}p1')
 		mount_point = str(tmp_path / 'mnt1')
 		os.makedirs(mount_point, exist_ok=True)
 		_run('mount', f'{loop}p1', mount_point)
