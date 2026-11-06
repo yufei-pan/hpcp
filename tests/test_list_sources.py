@@ -3649,6 +3649,7 @@ def test_the_refusal_says_what_fixes_it(tmp_path):
 	rc, output = _run_bounded(['a/n', '-d', 'bare'], tmp_path, seconds=30)
 	assert (b'Destination clash: ' + str(tmp_path / 'bare').encode() + b' is a device, and copying ' + str(tmp_path / 'a/n').encode()
 		+ b' would replace it: not copying it. -dd clones a disk; remove the node to replace it') in output, output[-2000:]
+	assert b'too long' not in output, output[-2000:]  # a job with no destination left is skipped, not run with none
 
 
 @needs_root
@@ -3680,11 +3681,12 @@ def test_two_kinds_of_node_with_one_number_are_a_clash(tmp_path):
 
 
 @needs_root
+@pytest.mark.parametrize('target', ['keep', 'n'], ids=['to-a-file', 'to-a-device'])
 @pytest.mark.parametrize('flags', [[], ['-co']], ids=['plain', 'co'])
-def test_a_symlink_source_onto_a_named_device_exits_as_it_did_and_never_touches_the_node(tmp_path, flags):
-	# A link source runs no cp: create_sym_links finds the name taken. Not a replacement, so not claimed to be one.
+def test_a_symlink_source_onto_a_named_device_exits_as_it_did_and_never_touches_the_node(tmp_path, flags, target):
+	# A link source runs no cp: create_sym_links finds the name taken. Not a replacement, so not claimed to be one, whatever it leads to.
 	before = _bare_and_source(tmp_path)
-	os.symlink('keep', tmp_path / 'a/l')
+	os.symlink(target, tmp_path / 'a/l')
 	rc, output = _run_bounded(['a/l', '-d', 'bare'] + flags, tmp_path, seconds=30)
 	assert rc == 162 and b'would replace' not in output and _same_node(tmp_path / 'bare', before), (rc, output[-2000:])
 
