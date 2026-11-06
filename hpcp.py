@@ -14,6 +14,7 @@ import fnmatch
 import functools
 import glob
 import hashlib
+import itertools
 import locale
 import multiprocessing
 import os
@@ -2297,6 +2298,14 @@ def create_sym_links(symLinks,exclude=None,link_tracking=False):
 			if exclude and is_excluded(src,exclude):
 				print(f"\n{pformat(src)} is excluded, skipping...")
 				continue
+			# Read before anything is removed: a link whose destination is the link itself (a list, a move onto its own
+			# place) would be gone, and unreadable.
+			linkedTargetFile = os.readlink(src)
+			source_stat = os.lstat(src)
+			# The link is already there: it is its own copy.
+			dests = [d for d in dests if not (os.path.islink(d) and os.path.samestat(source_stat, os.lstat(d)))]
+			if not dests:
+				continue
 			for d in dests:
 				if os.path.islink(d):
 					os.remove(d)
@@ -2308,7 +2317,6 @@ def create_sym_links(symLinks,exclude=None,link_tracking=False):
 					f"in the destination, skipping the link {pformat(src)}")
 				continue
 			# Determine if the link is a absolute link or relative link
-			linkedTargetFile = os.readlink(src)
 			dest = ''
 			# The link's target at the source (relative links); keep_target: its destination copy belongs to the copy (the
 			# target exists at the source, with tracking) or is the copy of an excluded path, and -rme keeps it (_kept_paths).
@@ -3162,6 +3170,13 @@ def copy_file(src_path, dest_paths, full_hash=False, verbose=False, concurrent_p
 	if dest_paths is None:
 		return 0, 0, symLinks
 	start_time = time.monotonic()
+	if not os.path.islink(src_path):
+		# cp would put the file inside a directory at its place (dest/x/x), and a move would then lose the source.
+		usable = [dest for dest in dest_paths if not os.path.isdir(dest)]
+		if not usable:
+			eprint(f'Destination clash: {dest_paths[0]} is a directory, not copying {src_path} over it')
+			return 0, 0, symLinks
+		dest_paths = usable
 	try:
 		src_size = get_file_size(src_path)
 		copiedSize = 0
@@ -8504,10 +8519,17 @@ def remove_extra_files(total_file_list, dests,max_workers,verbose,files_per_job,
 				# dest basename when ``dest`` lacks a trailing separator.
 				# A bare name ('data', '.') has no directory part: its extras are relative to the CWD (not to /).
 				dest_base = os.path.dirname(dest) or os.curdir
+				not_comparable = 0
 				for file in dest_trimmed - src_entries:
+					if '\n' in file:
+						# A line break in a stored list separates entries: the list cannot say whether this name is in it.
+						not_comparable += 1
+						continue
 					path = os.path.join(dest_base, file)
 					inDestNotInSrc.add(path)
 					extra_roots[path] = dest
+				if not_comparable:
+					print(f"{not_comparable} name(s) with a line break cannot be told from the stored list's lines: not treated as extra")
 		print('-'*80)
 		print("Files in dest but not in src:")
 		for file in inDestNotInSrc:
@@ -8616,10 +8638,11 @@ def _confirm(question, stop):
 	if not answer.lower().startswith('y'):
 		raise RuntimeError(f"User requested stop: {stop}")
 
-def _read_list_entries(file_list):
+def _read_list_entries(file_list, stored=False):
 	"""A list's non-empty entries as (names in order, exact). Bytes through os.fsdecode, so any file name works under any
 	locale. Data holding a NUL byte is NUL-separated (find -print0, fd -0: a path cannot hold one) and exact; otherwise
-	lines split on \\n alone, without a trailing \\r. A missing list file is reported and gives no entries."""
+	lines split on \\n alone, without a trailing \\r. A missing list file is reported and gives no entries. stored: a list
+	hpcp wrote (-fl): always lines, and a \\r stays (a name may end in one; the callers strip)."""
 	file_list_value = '' if file_list is None else str(file_list)
 	if file_list_value in ('-', '/dev/stdin'):
 		global _STDIN_HELD_LIST
@@ -8633,8 +8656,8 @@ def _read_list_entries(file_list):
 	else:
 		with open(file_list_value, 'rb') as f:
 			data = f.read()
-	exact = b'\0' in data
-	names = data.split(b'\0') if exact else [line[:-1] if line.endswith(b'\r') else line for line in data.split(b'\n')]
+	exact = b'\0' in data and not stored
+	names = data.split(b'\0') if exact else [line[:-1] if line.endswith(b'\r') and not stored else line for line in data.split(b'\n')]
 	def decode(name):
 		try:
 			return os.fsdecode(name)
@@ -8645,7 +8668,7 @@ def _read_list_entries(file_list):
 
 def load_file_list(file_list):
 	"""A stored list (-fl) as a set, for comparing: entries stripped of surrounding whitespace."""
-	return frozenset(entry.strip() for entry in _read_list_entries(file_list)[0] if entry.strip())
+	return frozenset(entry.strip() for entry in _read_list_entries(file_list, stored=True)[0] if entry.strip())
 
 class _ListedSource(str):
 	"""A source path that came from a list (-sfl, stdin): the path as given, plus landing, where it goes below each
@@ -8719,6 +8742,36 @@ def _without_covered_sources(src_paths):
 		kept.append(src)
 	return kept
 
+def _inside_destinations(src_paths, dests):
+	"""(src_paths without the list entries that lie inside a destination, how many that were, the paths of the
+	destinations that a kept listed directory holds, as its walk spells them). An entry inside a destination (or the destination itself) stays where it is: copying
+	it onto its own place is nothing, and moving it would destroy it. A listed directory that holds the destination
+	(find . | hpcp -d out) is kept: the walk below it must leave the destination out (_exclude_roots)."""
+	roots = set()
+	for dest in dests:
+		roots.update((os.path.abspath(dest), os.path.realpath(dest)))
+	prefixes = tuple(root.rstrip(os.path.sep) + os.path.sep for root in roots)
+	kept, skipped, holding = [], 0, set()
+	for src in src_paths:
+		if isinstance(src, _ListedSource):
+			path = os.path.abspath(src)
+			directory = os.path.isdir(path) and not os.path.islink(path)
+			spellings = (path, os.path.realpath(path)) if directory else (path,)
+			if any(spelling in roots or spelling.startswith(prefixes) for spelling in spellings):
+				skipped += 1
+				continue
+			if directory:
+				# Named as this entry's walk will spell it, whichever spelling of the entry holds the destination.
+				for spelling in spellings:
+					above = spelling.rstrip(os.path.sep) + os.path.sep
+					holding.update(path.rstrip(os.path.sep) + os.path.sep + root[len(above):] for root in roots if root.startswith(above))
+		kept.append(src)
+	return kept, skipped, holding
+
+def _exclude_roots(exclude, roots):
+	"""exclude, and the paths roots (see _inside_destinations) as patterns: a listing leaves them, and all below, out."""
+	return frozenset(exclude or ()) | {glob.escape(root) for root in roots}
+
 def _trim_source_paths(paths, src):
 	"""trim_paths for one source of a stored list (-fl): entries are named where the copy lands them, so a source from a
 	list keeps its tree. Paths may carry a ':<digest>' tail, so relative to the directory above src."""
@@ -8729,6 +8782,23 @@ def _trim_source_paths(paths, src):
 		return {os.path.relpath(path, base) for path in paths}
 	parent = os.path.dirname(src.landing)
 	return {os.path.join(parent, os.path.relpath(path, os.path.dirname(base))) for path in paths}
+
+def _stored_names(lines):
+	"""Every name a line of a stored list (-fl) may mean, so that none of them is taken for extra: the line, stripped of
+	surrounding whitespace as well (a name may have some, a hand-edited line may add it), and each part of either before a
+	':' (a stored line is 'name:digest', or 'link:target'; a name may hold a ':' itself). Wrongly keeping a file is the
+	safe mistake."""
+	names = set()
+	for line in lines:
+		for text in (line, line.strip()):
+			if not text:
+				continue
+			names.add(text)
+			colon = text.find(':')
+			while colon != -1:
+				names.add(text[:colon])
+				colon = text.find(':', colon + 1)
+	return frozenset(names)
 
 def store_file_list(file_list, src_paths: list, single_thread=False, max_workers=multiprocessing.cpu_count(), verbose=False,
 					files_per_job=1, compare_file_list=False, remove_extra=False, parallel_file_listing=False, exclude=None,
@@ -8757,10 +8827,11 @@ def store_file_list(file_list, src_paths: list, single_thread=False, max_workers
 		file_list += '_file_list.txt'
 	if remove_extra:
 		print('-' * 80)
-		# Both spellings of a line: a stored name with surrounding whitespace is not extra (a stripped one alone made it so,
-		# and it was deleted), nor is the file a hand-edited line names.
-		stored = _read_list_entries(file_list)[0]
-		file_list_file = frozenset(stored) | frozenset(entry.strip() for entry in stored if entry.strip())
+		if file_list not in ('-', '/dev/stdin') and not os.path.exists(file_list):
+			# Nothing is known of what belongs: every file would be extra.
+			eprint(f"File list not found: {file_list} does not exist, not removing extra files")
+			raise RuntimeError("Not removing extra files, exiting")
+		file_list_file = _stored_names(_read_list_entries(file_list, stored=True)[0])
 		# Not with a source from a list: the stored names keep the list's tree, and this comparison would take them all for
 		# extra.
 		if len(src_paths) == 1 and not _has_listed(src_paths):
@@ -9976,8 +10047,9 @@ def create_image(dest_image,target_mount_point,loop_devices: list,src_paths: lis
 		raise RuntimeError("No destination image path: Destination path not specified, exiting.")
 
 def _sync_implied_parents(src, dests, synced):
-	"""Make the directories above a _ListedSource's landing in each of dests, top first, with their sources' metadata.
-	synced: the landings done so far in this run (the first source of a landing gives its metadata)."""
+	"""Make the directories above a _ListedSource's landing in each of dests that are missing, top first, with their
+	sources' metadata. One that exists (a directory, a link, a file) is left as it is: it is not this run's to change,
+	as for cp --parents and rsync -R. synced: the landings looked at so far in this run (one look each)."""
 	parents = []
 	for source, landing in _implied_parents(src):
 		if landing in synced:
@@ -9985,7 +10057,9 @@ def _sync_implied_parents(src, dests, synced):
 		synced.add(landing)
 		parents.append((source, landing))
 	for source, landing in reversed(parents):
-		sync_directory_metadata(source, [os.path.join(dest, landing) for dest in dests])
+		missing = [path for path in (os.path.join(dest, landing) for dest in dests) if not os.path.lexists(path)]
+		if missing:
+			sync_directory_metadata(source, missing)
 
 def _copy_job(source, dests, dest_image=None):
 	"""(src, its destinations) as a copy job names them: 'path/' for a directory, as is for a file or a symlink."""
@@ -9994,49 +10068,102 @@ def _copy_job(source, dests, dest_image=None):
 		src += os.path.sep
 	return src, [_source_dest(source, dest, bool(dest_image)) for dest in dests]
 
-def _settle_destinations(src_paths, dests, dest_image=None, directory_only=False, exclude=None, max_workers=1, parallel_file_listing=False):
+def _roots_overlap(roots):
+	"""True when two of roots (paths) are the same or one lies below the other. Ended with a separator and sorted, the
+	paths below a root follow it directly, so each one is compared with its neighbour only."""
+	ordered = sorted(root.rstrip(os.path.sep) + os.path.sep for root in roots)
+	return any(below.startswith(root) for root, below in zip(ordered, ordered[1:]))
+
+def _settle_destinations(src_paths, dests, dest_image=None, directory_only=False, exclude=None, max_workers=1, parallel_file_listing=False, move=False):
 	"""Who writes each destination file when sources share one, decided before anything is copied, so the answer is the
 	same in every copy mode. In source order, with symlinks counted as files:
 	  * two files that land together because directory sources merge: the later source wins (an overlay, as a sequential
-	    copy always gave), counted;
+	    copy always gave), counted for each file that ends up replaced;
 	  * a file named directly (an argument, a list entry) on either side: a clash. The first stays, as cp refuses to
-	    overwrite a file it just created, and it is reported.
-	A source met again at its own place is no clash. Returns ({(job's src, tuple(its dests)): paths it must not copy},
-	files a later source replaced). Listings are cached, so the copy reads the same ones."""
+	    overwrite a file it just created, and it is reported;
+	  * a file where another source makes a directory (itself, or the directory a listed path implies): the directory
+	    stays, whichever came first, and the file is reported as a clash (cp would nest it, or fail);
+	  * a file that would be written over a source named directly: a clash, and with move an error, as -rm would then
+	    remove the file it wrote.
+	A source met again at its own place is no clash. Nothing is settled (and no listing read) when no two destinations
+	can meet. Returns ({(job's src, tuple(its dests)): paths it must not copy}, files a later source replaced). Listings
+	are cached, so the copy reads the same ones."""
 	dropped = {}
+	if directory_only:
+		# Nothing is copied.
+		return dropped, 0
+	def jobs():
+		for source in src_paths:
+			src, actual_dests = _copy_job(source, dests, dest_image)
+			if actual_dests and not (exclude and is_excluded(src, exclude)):
+				yield src, actual_dests
+	if not _roots_overlap(actual_dests[0] for _, actual_dests in jobs()):
+		return dropped, 0
 	replaced = 0
 	holders = {}
-	for source in src_paths:
-		src, actual_dests = _copy_job(source, dests, dest_image)
+	dirs = set()
+	named = []
+	def clash(path, job, why):
+		eprint(f'Destination clash: {why}, not copying {path} over it')
+		dropped.setdefault(job, set()).add(path)
+	def add_directory(path):
+		"""path and the directories above it are directories at the destination: a file held there gives way."""
+		while path not in dirs:
+			dirs.add(path)
+			held = holders.get(path)
+			if held is not None and not os.path.islink(held[0]):
+				del holders[path]
+				clash(held[0], held[1], f'{path} is a directory of another source')
+			parent = os.path.dirname(path)
+			if parent == path:
+				return
+			path = parent
+	for src, actual_dests in jobs():
 		directory = src.endswith(os.path.sep)
-		if not actual_dests or (exclude and is_excluded(src, exclude)) or (directory and directory_only):
-			continue
 		job = (src, tuple(actual_dests))
-		paths = (src,)
-		if directory:
-			files, links, _, _ = get_file_list(src, max_workers=max_workers, exclude=exclude, parallel_file_listing=parallel_file_listing and max_workers != 1)
-			paths = list(files) + list(links)
 		src_root, dest_root = src.rstrip(os.path.sep), actual_dests[0].rstrip(os.path.sep)
+		if directory:
+			files, links, _, folders = get_file_list(src, max_workers=max_workers, exclude=exclude, parallel_file_listing=parallel_file_listing and max_workers != 1)
+			paths = itertools.chain(files, links)
+			add_directory(dest_root)
+			for folder in folders:
+				add_directory((dest_root + folder[len(src_root):]).rstrip(os.path.sep))
+		else:
+			paths = (src,)
+			named.append((src, job))
+			add_directory(os.path.dirname(dest_root))
 		for path in paths:
 			dest = dest_root + path[len(src_root):]
 			held = holders.get(dest)
-			if held is None:
+			if dest in dirs and not os.path.islink(path):
+				clash(path, job, f'{dest} is a directory of another source')
+			elif held is None:
 				holders[dest] = (path, job, directory)
 			elif held[0] == path:
 				continue
 			elif directory and held[2]:
 				dropped.setdefault(held[1], set()).add(held[0])
-				holders[dest] = (path, job, directory)
 				replaced += 1
+				# The same source met again (a/ b/ a/) wins back what it lost on the way: counted once, by its end.
+				lost = dropped.get(job)
+				if lost and path in lost:
+					lost.discard(path)
+					replaced -= 1
+				holders[dest] = (path, job, directory)
 			else:
-				eprint(f'Destination clash: {dest} is already copied from {held[0]}, not copying {path} over it')
-				dropped.setdefault(job, set()).add(path)
+				clash(path, job, f'{dest} is already copied from {held[0]}')
+	for src, job in named:
+		held = holders.get(src)
+		if held is not None and held[0] != src:
+			if move:
+				raise RuntimeError(f'Invalid arguments: -rm would overwrite the source {src} with {held[0]} before moving it; nothing is copied or removed')
+			clash(held[0], held[1], f'{src} is a source')
 	return dropped, replaced
 
 def process_copy(src_paths: list, dests:list = [], single_thread = False, max_workers = multiprocessing.cpu_count(),verbose = False, 
 				directory_only = False,no_directory_sync = False, full_hash = False, files_per_job = 1, parallel_file_listing = False,
-				exclude=None,dest_image = None,batch = False, exit_not_enough_space = False, report = None):
-	"""report: a dict that gets 'replaced', the files a later merged directory replaced (see _settle_destinations)."""
+				exclude=None,dest_image = None,batch = False, exit_not_enough_space = False, dropped = None):
+	"""dropped: what _settle_destinations decided, when several sources share destinations (hpcp() settles them first)."""
 	total_file_list = set()
 	total_sym_links = {}
 	taskCtr = 0
@@ -10044,10 +10171,6 @@ def process_copy(src_paths: list, dests:list = [], single_thread = False, max_wo
 	if batch:
 		print(f"Copying from {_sources_text(src_paths)} to {dests}")
 	max_workers = max_workers if not single_thread else 1
-	dropped, replaced = {}, 0
-	# One source has nothing to share a destination with.
-	if len(src_paths) > 1:
-		dropped, replaced = _settle_destinations(src_paths, argDest, dest_image, directory_only, exclude, max_workers, parallel_file_listing)
 	cs = copy_scheduler(max_workers=max_workers,full_hash=full_hash,verbose=verbose,files_per_job=files_per_job,parallel_file_listing=parallel_file_listing,exclude=exclude,exit_not_enough_space=exit_not_enough_space,
 		dropped=dropped)
 	synced_parents = set()
@@ -10112,10 +10235,6 @@ def process_copy(src_paths: list, dests:list = [], single_thread = False, max_wo
 		cs.clear()
 		print(f"Processed {len(total_file_list)} files and {len(total_sym_links)} symlinks in total")
 		print('-'*80)
-	if replaced:
-		print(f"Merged directories: {replaced} file(s) replaced by a later source")
-	if report is not None:
-		report['replaced'] = replaced
 	return total_file_list, total_sym_links
 
 def validate_dd_source_path(src_path,loop_devices = None):
@@ -10308,7 +10427,7 @@ def get_args(args = None):
 	parser.add_argument('-fh', '--full_hash', action='store_true', help='Checks the full hash of files')
 	parser.add_argument('-hs', '--hash_size', type=int, default=1<<16, help='Hash size in bytes, default is 65536. This means hpcp will only check the last 64 KiB (about 1 page in a SSD) of the file.')
 	parser.add_argument('-fpj', '--files_per_job', type=int, default=1, help='Base number of files per job, will be adjusted dynamically. Default is 1')
-	parser.add_argument('-sfl','-lfl', '--source_file_list', type=str, help='Load source paths from a file, or use "-" to read them from stdin (read by default when no source is given and stdin is not a terminal: find src -type f | hpcp -d out). Each path lands in the destination as given, minus a leading / and any .. (cd src && find . | hpcp -d out to leave src out); a listed folder copies recursively. Paths are not expanded and are separated by newlines, or by NUL bytes when the data holds one (find -print0, fd -0). If --compare_file_list is specified, it will be used as source for compare')
+	parser.add_argument('-sfl','-lfl', '--source_file_list', type=str, help='Load source paths from a file, or use "-" to read them from stdin (read by default when no source is given and stdin is not a terminal: find src -type f | hpcp -d out). Each path lands in the destination as given, minus a leading / and any .. (cd src && find . | hpcp -d ../out to leave src out); a listed folder copies recursively. Paths are not expanded and are separated by newlines, or by NUL bytes when the data holds one (find -print0, fd -0). If --compare_file_list is specified, it will be used as source for compare')
 	parser.add_argument('-fl','-tfl', '--target_file_list', type=str,help='Specify the file_list file to store list of files in src_path to. If --compare_file_list is specified, it will be used as targets for compare')
 	parser.add_argument('-cfl', '--compare_file_list',action='store_true', help='Only compare file list. Use --file_list to specify a existing file list or specify the dest_path to compare src_path with. When not using with file_list, will compare hash.')
 	parser.add_argument('-dfl', '--diff_file_list', type=str, nargs='?', const="auto",default=None, help="Implies --compare_file_list, specify a file name to store the diff file list to or omit the value to auto-determine.")
@@ -10669,6 +10788,17 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = multipr
 
 		copy_failures = []
 		if dests != ...:
+			copy_exclude = exclude
+			if _has_listed(src_paths):
+				src_paths[:], skipped, holding = _inside_destinations(src_paths, dests)
+				if skipped:
+					print(f"Skipped {skipped} list entries inside the destination {', '.join(dests)}: they stay where they are, not copied or moved")
+				if holding:
+					copy_exclude = _exclude_roots(exclude, holding)
+					print(f"A listed directory holds the destination ({', '.join(sorted(holding))}): the destination is left out of its copy")
+				if not src_paths:
+					print('Nothing to copy: every source lies inside the destination')
+					return get_rc_from_error()
 			# The remove gate below judges the errors recorded from here on. A listing cached earlier (create_image's size
 			# scan, or a library caller's) would not record its errors again: list afresh.
 			if remove and not dest_image:
@@ -10685,11 +10815,14 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = multipr
 			# -rme cleans the destinations the copy writes: pinned now, checked before -rme (_checked_destination_roots).
 			pinned_dest_roots = _destination_roots(dests) if remove_extra else None
 			copy_error_start = len(ERRORS)
-			copy_report = {}
+			dropped, replaced = _settle_destinations(src_paths, dests, dest_image, directory_only, copy_exclude, 1 if single_thread else max_workers,
+				parallel_file_listing, move=remove)
+			if replaced:
+				print(f"Merged directories: {replaced} file(s) replaced by a later source")
 			total_file_list, total_sym_links = process_copy(src_paths, dests, single_thread=single_thread, max_workers=max_workers,
 																			verbose=verbose, directory_only=directory_only,no_directory_sync=no_directory_sync,
 																			full_hash=full_hash, files_per_job=files_per_job, parallel_file_listing=parallel_file_listing,
-																			exclude=exclude,dest_image=dest_image,batch = batch,exit_not_enough_space = exit_not_enough_space,report = copy_report)
+																			exclude=copy_exclude,dest_image=dest_image,batch = batch,exit_not_enough_space = exit_not_enough_space,dropped = dropped)
 			if verbose:
 				# sort file list and sym links
 				for file in natural_sort(total_file_list):
@@ -10705,7 +10838,7 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = multipr
 					'fix them (or exclude those paths with -e) and re-run')
 			elif remove_extra and _has_listed(src_paths) and not _directory_sources(_src_to_dest_map(src_paths, dests, bool(dest_image))):
 				print('-rme checked nothing: the list names no directories, and only below those can a list judge extras. '
-					'To mirror a directory, list its entries: find src -mindepth 1 -maxdepth 1 | hpcp -d out -rme')
+					'To mirror a directory, list the directory itself: printf "src\\n" | hpcp -d out -rme')
 			elif remove_extra:
 				print('-'*80)
 				dest_roots = _checked_destination_roots(dests, pinned_dest_roots)
@@ -10723,9 +10856,9 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = multipr
 		if remove and copy_failures:
 			eprint(f'Remove skipped: not removing {_sources_text(src_paths)}: the copy reported {len(copy_failures)} error(s); '
 				'fix them (or exclude those paths with -e) and re-run')
-		elif remove and dests != ... and copy_report.get('replaced'):
+		elif remove and dests != ... and replaced:
 			# Removing the earlier directory would destroy the only copy of each file the later one replaced.
-			eprint(f"Remove skipped: not removing {_sources_text(src_paths)}: {copy_report['replaced']} file(s) in merged directories "
+			eprint(f"Remove skipped: not removing {_sources_text(src_paths)}: {replaced} file(s) in merged directories "
 				'were replaced by a later source, so the earlier source holds their only copy; every source stays')
 		elif remove and dests != ...:
 			# A move: only what the copy listed goes (see remove_moved_sources).
