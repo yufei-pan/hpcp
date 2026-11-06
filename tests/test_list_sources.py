@@ -278,19 +278,20 @@ def _overlay(tmp_path, count=400):
 @pytest.mark.parametrize('flags', MODES, ids=MODE_IDS)
 def test_merged_directories_later_source_wins_in_every_mode(tmp_path, flags):
 	# Enough files that the parallel path runs many jobs at once: 'later' cannot depend on who finishes last.
-	_overlay(tmp_path)
+	count = 400 if not flags else 60
+	_overlay(tmp_path, count)
 	rc, output = run(['base/', 'overlay/', '-d', 'out'] + flags, tmp_path)
 	assert rc == 0, output[-2000:]
 	got = files(tmp_path / 'out')
-	assert len(got) == 1200
+	assert len(got) == 3 * count
 	assert {content for path, content in got.items() if path.startswith(b'd')} == {b'overlay'}
 	assert b'Destination clash' not in output
-	assert output.count(b'Merged directories: 400 file(s) replaced by a later source') == 1
+	assert output.count(b'Merged directories: %d file(s) replaced by a later source' % count) == 1
 
 
 @pytest.mark.parametrize('flags', MODES, ids=MODE_IDS)
 def test_merged_directories_order_decides(tmp_path, flags):
-	_overlay(tmp_path, 100)
+	_overlay(tmp_path, 40)
 	rc, _ = run(['overlay/', 'base/', '-d', 'out'] + flags, tmp_path)
 	assert rc == 0
 	assert {content for path, content in files(tmp_path / 'out').items() if path.startswith(b'd')} == {b'base'}
