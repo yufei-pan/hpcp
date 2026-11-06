@@ -1294,24 +1294,9 @@ _FS_MKFS_BUILDERS.update({'ext2': _build_ext, 'ext3': _build_ext, 'ext4': _build
 
 _XFS_RO_MOUNT_OPTIONS = 'ro,nouuid,norecovery'
 
-def _release_probe_mount(mount_point):
-	"""
-	Unmount a probe's temporary mount and remove its directory, whatever ended the probe (Ctrl-C included).
-
-	One something still holds (a shell with its cwd in it) is unmounted lazily. The probe's ERRORS are cut
-	afterwards, so a mount that stays says so on stderr.
-	"""
-	for command in (['umount', mount_point], ['umount', '-l', mount_point]):
-		if not _is_mount_point(mount_point):
-			break
-		run_command_in_multicmd_with_path_check(command, quiet=True)
-	if _is_mount_point(mount_point):
-		print(f"FS param probe warning: could not unmount {mount_point}; unmount it by hand (umount -l {mount_point}).", file=sys.stderr)
-		return
-	try:
-		os.rmdir(mount_point)
-	except OSError:
-		pass
+# $1 mount, $2 xfs_info, $3 device, $4 mount point (see _probe_xfs). rprivate first: the namespace starts out sharing
+# the host's mounts, and this one must not reach it.
+_XFS_NAMESPACE_PROBE = '"$1" --make-rprivate / && "$1" -o ' + _XFS_RO_MOUNT_OPTIONS + ' "$3" "$4" && exec "$2" "$4"'
 
 def _probe_xfs(device):
 	"""
@@ -1322,7 +1307,11 @@ def _probe_xfs(device):
 	`data` but the directory block size under `naming` - so values are bucketed
 	by section rather than flattened.
 	xfs_info of xfsprogs 4.5 (EL7) reads a mounted filesystem only: one it prints nothing for is mounted read-only
-	for the moment it takes (nothing is written: no log recovery).
+	without log recovery (nothing is written), for the moment it takes, in a mount namespace of its own. The mount
+	is then the kernel's to clean up (whatever ends the probe, Ctrl-C and SIGKILL included), nothing else on the
+	system sees it, and nothing holds the superblock after the probe: a host mount that a process kept busy and that
+	was taken off with umount -l left the superblock alive, and the next mount of the device shared it, with no log
+	recovery.
 	"""
 	params = {}
 	section = ''
@@ -1330,11 +1319,14 @@ def _probe_xfs(device):
 	if not lines and check_path('xfs_info'):
 		mount_point = tempfile.mkdtemp()
 		try:
-			run_command_in_multicmd_with_path_check(['mount', '-o', _XFS_RO_MOUNT_OPTIONS, device, mount_point], quiet=True)
-			if _is_mount_point(mount_point):
-				lines = run_command_in_multicmd_with_path_check(['xfs_info', mount_point], quiet=True, extra_env=_C_LOCALE)
+			# device and mount_point are arguments of the script, never part of it; mount and xfs_info are the ones hpcp finds
+			lines = run_command_in_multicmd_with_path_check(['unshare', '-m', 'sh', '-c', _XFS_NAMESPACE_PROBE, 'sh',
+				_bin('mount'), _bin('xfs_info'), device, mount_point], quiet=True, extra_env=_C_LOCALE)
 		finally:
-			_release_probe_mount(mount_point)
+			try:
+				os.rmdir(mount_point)
+			except OSError:
+				pass
 	for line in lines:
 		if not line.strip():
 			continue
