@@ -8853,18 +8853,11 @@ class _RealPlaces:
 	def links(self, directory, names=0):
 		"""The names of the symlinks in directory, a real path; none when there is no such directory; None when that is not
 		known, because it cannot be listed or has more entries than the names asked about (names, or the run's) are worth
-		reading. is_link then asks by name, which needs search permission only. Without that nothing can be known about
-		it: refused, or a link there could send a file onto a source."""
+		reading. A listing needs read permission only, so a directory no file lands in costs a run nothing, whatever its mode."""
 		if directory not in self.link_names:
 			self.link_names[directory] = self._read_links(directory, max(self.limit, names))
 		return self.link_names[directory]
 	def _read_links(self, directory, limit):
-		try:
-			os.lstat(os.path.join(directory, os.curdir))
-		except PermissionError as e:
-			raise _cannot_search(directory, e)
-		except OSError:
-			pass
 		found = set()
 		try:
 			with os.scandir(directory) as entries:
@@ -8879,8 +8872,18 @@ class _RealPlaces:
 			return None
 		return found
 	def is_link(self, directory, name):
+		"""Is name in directory a link? Without a listing it is asked by name, which needs search permission. A directory that
+		answers neither way is refused: a file lands there, and a link could send it onto a source. (os.path.islink
+		answers no.)"""
 		names = self.links(directory)
-		return os.path.islink(os.path.join(directory, name)) if names is None else name in names
+		if names is not None:
+			return name in names
+		try:
+			return stat.S_ISLNK(os.lstat(os.path.join(directory, name)).st_mode)
+		except PermissionError as e:
+			raise _cannot_search(directory, e)
+		except OSError:
+			return False
 	def landing(self, path, source):
 		"""Where source ends up when copied to path: path's place, or what a link there leads to (cp writes through it; a
 		link source replaces it)."""

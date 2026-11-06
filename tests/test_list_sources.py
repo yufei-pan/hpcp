@@ -2750,6 +2750,14 @@ def test_safe_a_source_that_lands_on_itself_is_not_left_out(tmp_path, dests, sou
 # ---- what a landing directory can and cannot answer ----
 
 
+def test_a_source_that_is_the_destination_through_a_link_is_left_out(tmp_path):
+	write(tmp_path / 'a/x', 'A')
+	write(tmp_path / 'b/x', 'B')
+	os.symlink('a', tmp_path / 'la')
+	rc, output = run(['a', 'b/', '-d', 'la/', '-rf'], tmp_path)
+	assert rc == 0 and files(tmp_path) == {b'a/x': b'B', b'la': b'-> a'}, output[-2000:]
+
+
 no_permissions_as_root = pytest.mark.skipif(not hasattr(os, 'geteuid') or os.geteuid() == 0, reason='root reads every directory')
 
 
@@ -2802,13 +2810,91 @@ def test_a_directory_that_cannot_be_searched_is_refused_by_name(tmp_path, out_ba
 
 
 @no_permissions_as_root
-def test_a_run_into_a_directory_that_cannot_be_searched_is_refused_without_a_link(tmp_path, out_back):
+def test_a_landing_in_a_directory_that_answers_nothing_is_refused_without_a_link(tmp_path, out_back):
+	write(tmp_path / 'a/x', 'A')
+	os.makedirs(tmp_path / 'out')
+	os.chmod(tmp_path / 'out', 0o000)
+	rc, output = run(['a/', '-d', 'out/', '-rf'], tmp_path)
+	os.chmod(tmp_path / 'out', 0o700)
+	assert rc == 213 and files(tmp_path) == {b'a/x': b'A'}, output[-2000:]
+	assert b'chmod u+rx' in output
+
+
+@no_permissions_as_root
+def test_safe_a_directory_that_can_be_listed_needs_no_search_to_answer(tmp_path, out_back):
+	# chmod 600 out: the listing says no link is there, and the run's own directory sync lets the copy in.
 	write(tmp_path / 'a/x', 'A')
 	os.makedirs(tmp_path / 'out')
 	os.chmod(tmp_path / 'out', 0o600)
 	rc, output = run(['a/', '-d', 'out/', '-rf'], tmp_path)
 	os.chmod(tmp_path / 'out', 0o700)
-	assert rc == 213 and files(tmp_path) == {b'a/x': b'A'}, output[-2000:]
+	assert rc == 0 and files(tmp_path) == {b'out/x': b'A'}, output[-2000:]
+
+
+def _unlock(root):
+	for path, directories, _ in os.walk(str(root)):
+		for name in directories:
+			if not os.path.islink(os.path.join(path, name)):
+				os.chmod(os.path.join(path, name), 0o700)
+
+
+@no_permissions_as_root
+@pytest.mark.parametrize('made, modes', [
+	(['a/locked/'], [('a/locked', 0o600)]),
+	(['a/locked/'], [('a/locked', 0o000)]),
+	(['a/locked/f'], [('a/locked', 0o600)]),
+	(['a/locked/f'], [('a/locked', 0o000)]),
+	(['a/s/f', 'a/s/t/g'], [('a/s/t', 0o644), ('a/s', 0o644)]),
+], ids=['empty-600', 'empty-000', 'full-600', 'full-000', 'chmod-R-644'])
+def test_safe_a_directory_no_file_lands_in_does_not_stop_a_rerun(tmp_path, made, modes):
+	# Nothing lands there, so what is in it cannot matter: every run goes as the first did, and the rest stays updated.
+	for path in made:
+		if path.endswith('/'):
+			os.makedirs(tmp_path / path)
+		else:
+			write(tmp_path / path, 'F')
+	for path, mode in modes:
+		os.chmod(tmp_path / path, mode)
+	codes = []
+	try:
+		for number in range(1, 4):
+			write(tmp_path / 'a/ok', 'K' * number)
+			rc, output = run(['a/', '-d', 'out/'], tmp_path)
+			codes.append(rc)
+			assert rc != 213 and (tmp_path / 'out/ok').read_text() == 'K' * number, output[-2000:]
+		assert len(set(codes)) == 1
+	finally:
+		_unlock(tmp_path)
+
+
+@no_permissions_as_root
+@pytest.mark.parametrize('mode', [0o000, 0o100, 0o200, 0o300, 0o400, 0o500, 0o600], ids=oct)
+@pytest.mark.parametrize('link, name', [('../b/x', 'a/y'), ('../b', 'a/y/x')], ids=['link', 'middle-link'])
+def test_a_link_at_a_landing_is_refused_at_every_mode(tmp_path, out_back, mode, link, name):
+	write(tmp_path / 'a/k', 'K')
+	write(tmp_path / name, 'C')
+	write(tmp_path / 'b/x', 'B')
+	os.makedirs(tmp_path / 'out')
+	os.symlink(link, tmp_path / 'out/y')
+	tree = files(tmp_path)
+	os.chmod(tmp_path / 'out', mode)
+	rc, output = run(['a/', 'b/', '-d', 'out/', '-rf'], tmp_path)
+	os.chmod(tmp_path / 'out', 0o700)
+	assert rc == 213 and files(tmp_path) == tree, output[-2000:]
+
+
+@no_permissions_as_root
+def test_one_source_through_a_link_in_a_directory_that_cannot_be_listed(tmp_path, out_back):
+	# One source: no two landings meet, so only the unknown listing opens the gate.
+	write(tmp_path / 'a/x', 'A')
+	write(tmp_path / 'a/y', 'C')
+	os.makedirs(tmp_path / 'out')
+	os.symlink('../a/x', tmp_path / 'out/y')
+	tree = files(tmp_path)
+	os.chmod(tmp_path / 'out', 0o300)
+	rc, output = run(['a/', '-d', 'out/', '-rf'], tmp_path)
+	os.chmod(tmp_path / 'out', 0o700)
+	assert rc == 213 and files(tmp_path) == tree, output[-2000:]
 
 
 def _a_big_directory(root, entries):
@@ -2824,6 +2910,15 @@ def test_safe_a_link_past_the_listing_limit_is_still_found(tmp_path):
 	os.symlink('../b/x', tmp_path / 'out/y')
 	rc, output = run(['a/', 'b/', '-d', 'out/', '-rf'], tmp_path)
 	assert rc == 213 and (tmp_path / 'a/y').read_text() == 'A' and (tmp_path / 'b/x').read_text() == 'B', output[-2000:]
+
+
+def test_one_source_through_a_link_past_the_listing_limit(tmp_path):
+	_a_big_directory(tmp_path / 'out', 10100)
+	write(tmp_path / 'a/x', 'A')
+	write(tmp_path / 'a/y', 'C')
+	os.symlink('../a/x', tmp_path / 'out/y')
+	rc, output = run(['a/', '-d', 'out/', '-rf'], tmp_path)
+	assert rc == 213 and (tmp_path / 'a/x').read_text() == 'A' and (tmp_path / 'a/y').read_text() == 'C', output[-2000:]
 
 
 def test_safe_a_run_past_the_listing_limit_copies(tmp_path):
