@@ -121,3 +121,9 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - **What the operator sees:** `hpcp a/p -d out/` makes the node, prints `Source path type error` and ends exit 200. With `-rf` it is 212 and every named source stays, files included; nothing is lost. The same FIFO in a directory source is skipped silently with exit 0. Same on 9.80.
 - **Why:** old and safe. A named special should either copy cleanly or be skipped as in a tree, and that is its own decision.
 - **Revisit when:** the next hpcp release (9.82).
+
+### `-co` reads a device source and writes through the device node at the destination
+- **Kind:** deferred.
+- **What the operator sees:** as root, with a block or character device node in the tree and `-co`, when the mtime of the node at the destination differs, `cp -f` reads the source device to its end and writes it through the node at the destination: the same device, or a disk behind it, which on a mounted disk writes old blocks over live ones (reasoned, not run). The same on 9.80 (the reviewer ran it). A matching pair of nodes (same kind, same device number, same mtime) is left alone since 9.81.
+- **Why:** old, root only, and it needs a device node in the tree and `-co`. Leaving a destination that is not a regular file alone belongs with the temporary name and rename above.
+- **Revisit when:** the next hpcp release (9.82).
