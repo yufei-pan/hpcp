@@ -57,13 +57,13 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 
 ### A move of a link's directory and a path through the link can end in exit 192
 - **Kind:** deferred.
-- **What the operator sees:** `printf 'lb/\n' | hpcp -sfl - lb/x -d out/ -rf`, with `lb` a link to `b`: `out/x` and the link `out/lb -> b` land, `lb` goes and `b/x`, `b/y`, `b/s/z` stay, in every run. About one run in three then ends with "not removing lb: it, or a directory on its path, is no longer what the copy listed" and exit 192, the others exit 0. Nothing is lost: the tree comes out the same either way.
+- **What the operator sees:** `printf 'lb/\n' | hpcp -sfl - lb/x -d out/ -rf`, with `lb` a link to `b`: `out/x` and the link `out/lb -> b` land, `lb` goes and `b/x`, `b/y`, `b/s/z` stay, in every run. Some runs then end with "not removing lb: it, or a directory on its path, is no longer what the copy listed" and exit 192, the others exit 0. Nothing is lost: the tree comes out the same either way.
 - **Why:** the removal of `lb/x` and of the link `lb` run side by side, and the check before removing sees the link already gone. 7617241 does the same (67 runs in 200, against 66).
 - **Revisit when:** the next hpcp release (9.82).
 
 ### A million-entry list holds its jobs in memory
 - **Kind:** deferred.
-- **What the operator sees:** the check before the copy keeps every entry's paths at once: about 741 bytes more per entry than 7617241, so 740 MB more for a million.
+- **What the operator sees:** the check before the copy keeps every entry's paths at once: a peak of about 741 bytes more per entry than 7617241 with the copy stubbed out (740 MB for a million), and +143 bytes per file measured in a real copy of 300,000. The extra CPU is nearly all garbage collection over the kept jobs: a stubbed million took 19.08, 20.56 and 22.22 s with it on, 19.26, 19.15 and 19.56 s with it off.
 - **Why:** it reads the jobs twice, and generators need `_settle_destinations` reshaped; the copy works either way.
 - **Revisit when:** the next hpcp release (9.82).
 
@@ -75,7 +75,7 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 
 ### `-ncd` can end in a traceback
 - **Kind:** deferred.
-- **What the operator sees:** `-sfl` with `-ncd`, when a listed file's directory is missing under the destination: `cp` fails and each retry prints a Python traceback before the run ends with an error code (37 to 54 of 4000 fuzz runs). Nothing is lost.
+- **What the operator sees:** `-sfl` with `-ncd`, when a listed file's directory is missing under the destination: `cp` fails and each retry prints a Python traceback before the run ends with an error code (32 to 54 of 4000 fuzz runs). Nothing is lost.
 - **Why:** old, ugly but safe.
 - **Revisit when:** the next hpcp release (9.82).
 
@@ -84,3 +84,15 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - **What the operator sees:** `hpcp out/sub/ b/ -d out/ -rme`, answered y at a terminal, deletes `out/sub/x`, the only copy when `b/x` replaced it at `out/x`: the file lies in the destination and no source lands on it, so it looks extra. With `-rf` the run then exits 212, and its message says -rme may have removed it. Same in 9.80.
 - **Why:** it needs `-rme` to know what the run reads, and that belongs with limiting positional `-rme` to where a source lands.
 - **Revisit when:** the next hpcp release (9.82), with "Positional `-rme` judges the whole destination".
+
+### A landing through a link into an unreachable place blames the wrong directory
+- **Kind:** deferred.
+- **What the operator sees:** with `out/l -> /root/secret/f`, the 213 says `/root` cannot be searched and offers a `chmod` a non-root user cannot run. The refusal is right; it should name the link.
+- **Why:** `_RealPlaces.directory` raises where the walk stopped and no longer knows which landing led there.
+- **Revisit when:** the next hpcp release (9.82).
+
+### A named source that matches nothing beside a good one is dropped silently
+- **Kind:** deferred.
+- **What the operator sees:** `hpcp nosuch ok/g -d out/`, also with `-rf`, copies `ok/g` and exits 0 without a word about `nosuch`, as 9.80 does. Alone it is exit 240, and the list route gives 207.
+- **Why:** the glob expansion (near line 756) drops it. It should say so and exit 207 after copying the rest.
+- **Revisit when:** the next hpcp release (9.82).
