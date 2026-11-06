@@ -3162,6 +3162,18 @@ def _leave_hard_links(path):
 		return
 	os.unlink(path)
 
+def _can_open(path):
+	"""False when cp could not read the source path. Asked by opening, with the ids cp runs with: access() answers for the
+	real uid, and a service with a read capability or a setuid wrapper can open more. Not blocking, for a FIFO. Only a
+	regular file has to open: cp -a makes a new node for the rest. No search permission on the way answers as a file does."""
+	try:
+		os.close(os.open(path, os.O_RDONLY | getattr(os, 'O_NONBLOCK', 0)))
+	except PermissionError:
+		return os.path.exists(path) and not os.path.isfile(path)
+	except OSError:
+		pass
+	return True
+
 def _copy_state(path):
 	"""What a copy to path would change: of the file itself, as cp writes through a link. None when nothing is there."""
 	try:
@@ -3228,9 +3240,9 @@ def copy_file(src_path, dest_paths, full_hash=False, verbose=False, concurrent_p
 		if os.path.islink(src_path):
 			symLinks[src_path] = dest_paths
 		else:
-			if not os.access(src_path, os.R_OK):
+			if not _can_open(src_path):
 				# No cp at all: cp -a takes away a destination with other names before it finds it cannot read.
-				eprint(f'Copy failed: cannot read {src_path}, leaving {dest_paths} as they are')
+				eprint(f'Copy failed: cannot open {src_path}, leaving {dest_paths} as they are')
 				return 0, time.monotonic() - start_time, symLinks
 			copied = False
 			copy_error_start = len(ERRORS)

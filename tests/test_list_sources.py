@@ -3105,3 +3105,48 @@ def test_content_only_never_writes_through_a_hard_link_it_could_not_leave(tmp_pa
 	rc, output = run(['a/', '-d', 'out/', '-co'] + flags, tmp_path)
 	os.chmod(tmp_path / 'out', 0o700)
 	assert rc != 0 and (tmp_path / 'a/y').read_text() == 'Y' * 3000 and (tmp_path / 'a/x').read_text() == 'X' * 5000, output[-2000:]
+
+
+def test_a_source_the_real_uid_cannot_read_is_still_copied_when_it_opens(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	# A backup service with CAP_DAC_READ_SEARCH, a setuid wrapper: access() answers for the real uid, cp runs with more.
+	write(tmp_path / 'a/x', 'new')
+	monkeypatch.setattr(os, 'access', lambda *args, **kwargs: False)
+	hpcp_mod.copy_file(str(tmp_path / 'a/x'), [str(tmp_path / 'out/x')])
+	assert (tmp_path / 'out/x').read_text() == 'new'
+
+
+def test_a_source_that_does_not_open_gets_no_cp(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	write(tmp_path / 'a/x', 'new and longer')
+	write(tmp_path / 'out/x', 'good')
+	real_open, source = os.open, str(tmp_path / 'a/x')
+	def refusing(path, *args, **kwargs):
+		if path == source:
+			raise PermissionError(13, 'Permission denied', path)
+		return real_open(path, *args, **kwargs)
+	ran = []
+	monkeypatch.setattr(os, 'open', refusing)
+	monkeypatch.setattr(hpcp_mod, 'run_command_in_multicmd_with_path_check', lambda *args, **kwargs: ran.append(args))
+	hpcp_mod.copy_file(source, [str(tmp_path / 'out/x')])
+	assert not ran and (tmp_path / 'out/x').read_text() == 'good'
+
+
+@pytest.mark.skipif(not hasattr(os, 'geteuid') or os.geteuid() != 0 or not shutil.which('setpriv'), reason='needs root to hand out a capability')
+def test_a_service_with_read_capability_copies_what_it_cannot_read_by_mode(tmp_path):
+	write(tmp_path / 'a/x', 'X')
+	os.chmod(tmp_path / 'a/x', 0o000)
+	os.makedirs(tmp_path / 'out')
+	os.chown(tmp_path / 'out', 65534, 65534)
+	task = subprocess.run(['setpriv', '--reuid=65534', '--regid=65534', '--clear-groups', '--inh-caps=+dac_read_search', '--ambient-caps=+dac_read_search',
+		sys.executable, HPCP, 'a/', '-d', 'out/'], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, cwd=str(tmp_path), env=dict(os.environ, HOME='/tmp'),
+		stdin=subprocess.DEVNULL, timeout=120)
+	assert task.returncode == 0 and (tmp_path / 'out/x').exists(), task.stdout[-2000:]
+
+
+@no_permissions_as_root
+def test_a_fifo_is_no_read_so_its_mode_stops_nothing(tmp_path):
+	# cp -a makes a new one, reading nothing. And asking must not hang on it: no writer is coming.
+	os.makedirs(tmp_path / 'a')
+	os.mkfifo(tmp_path / 'a/p', 0o000)
+	task = subprocess.run([sys.executable, HPCP, 'a/p', '-d', 'out/'], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+		cwd=str(tmp_path), timeout=60, start_new_session=True)
+	assert stat.S_ISFIFO(os.lstat(tmp_path / 'out/p').st_mode), task.stdout[-2000:]
