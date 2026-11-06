@@ -6808,6 +6808,8 @@ def _probe_identity(device):
 	An ID_FS_LABEL_ENC value of 261 bytes or more, or one ending in a partial escape, may have been cut (blkid keeps
 	it in a 265-byte buffer; a long btrfs, NTFS, f2fs or udf label full of spaces needs more): the label is then
 	read raw (_probe_raw_label).
+	A btrfs label comes from btrfs itself (_probe_btrfs_label): blkid 2.23.2 (EL7) cuts every label at 127 bytes and
+	trims what is left, so no length shows the cut.
 	"""
 	error_count = len(ERRORS)
 	try:
@@ -6822,15 +6824,14 @@ def _probe_identity(device):
 			values[key] = value
 	uuid = values.get('ID_FS_UUID_ENC', values.get('ID_FS_UUID', ''))
 	label = values.get('ID_FS_LABEL_ENC', '')
-	if len(label.encode('utf-8', 'surrogateescape')) >= _UDEV_ENC_CUT_BYTES or _UDEV_PARTIAL_ESCAPE_RE.search(label):
-		raw_label = _probe_raw_label(device)
-		label = _udev_decode(label) if raw_label is None else raw_label
-	else:
-		label = _udev_decode(label)
-	return values.get('ID_FS_TYPE', ''), _udev_decode(uuid), label
+	fs_type = values.get('ID_FS_TYPE', '')
+	exact_label = _probe_btrfs_label(device) if fs_type == 'btrfs' and label else None
+	if not exact_label and (len(label.encode('utf-8', 'surrogateescape')) >= _UDEV_ENC_CUT_BYTES or _UDEV_PARTIAL_ESCAPE_RE.search(label)):
+		exact_label = _probe_raw_label(device)
+	return fs_type, _udev_decode(uuid), exact_label if exact_label else _udev_decode(label)
 
-def _probe_raw_label(device):
-	"""device's label from `blkid -p -o value -s LABEL`, which prints it raw (None when it prints nothing).
+def _label_printed_raw(command):
+	"""The label command prints raw on its first line (None when it prints nothing; a failure leaves nothing in ERRORS).
 
 	multiCMD writes each output byte that is not UTF-8 as \\xNN (0x80 and above); those become the bytes again, kept
 	with surrogateescape. A backslash in the label itself is printed as it is and stays: _udev_decode would read a
@@ -6838,7 +6839,7 @@ def _probe_raw_label(device):
 	"""
 	error_count = len(ERRORS)
 	try:
-		output = run_command_in_multicmd_with_path_check(['blkid', '-p', '-o', 'value', '-s', 'LABEL', device], quiet=True, extra_env=_C_LOCALE)
+		output = run_command_in_multicmd_with_path_check(command, quiet=True, extra_env=_C_LOCALE)
 	finally:
 		del ERRORS[error_count:]
 	if not output:
@@ -6846,6 +6847,14 @@ def _probe_raw_label(device):
 	data = output[0].rstrip('\r\n').encode('utf-8', 'surrogateescape')
 	data = _BACKSLASHREPLACE_RE.sub(lambda match: bytes([int(match.group(1), 16)]), data)
 	return data.decode('utf-8', 'surrogateescape')
+
+def _probe_raw_label(device):
+	"""device's label from `blkid -p -o value -s LABEL` (see _label_printed_raw)."""
+	return _label_printed_raw(['blkid', '-p', '-o', 'value', '-s', 'LABEL', device])
+
+def _probe_btrfs_label(device):
+	"""The label of the btrfs on device from `btrfs filesystem label` (see _label_printed_raw); None without the tool."""
+	return _label_printed_raw(['btrfs', 'filesystem', 'label', device]) if check_path('btrfs') else None
 
 def _partition_table_type(device):
 	"""Partition table type of device from a low-level `blkid -p` probe ('gpt', 'dos', ...; '' when it finds

@@ -3051,10 +3051,10 @@ def test_probe_identity_reads_a_cut_label_raw(hpcp_mod, reset_hpcp_globals, monk
 		calls.append(argv)
 		if '-o' in argv and argv[argv.index('-o') + 1] == 'value':
 			return [raw]
-		return ['ID_FS_UUID_ENC=u1', 'ID_FS_LABEL_ENC=' + enc, 'ID_FS_TYPE=btrfs']
+		return ['ID_FS_UUID_ENC=u1', 'ID_FS_LABEL_ENC=' + enc, 'ID_FS_TYPE=f2fs']
 
 	monkeypatch.setattr(hpcp_mod, 'run_command_in_multicmd_with_path_check', fake)
-	assert hpcp_mod._probe_identity('/dev/x1') == ('btrfs', 'u1', label)
+	assert hpcp_mod._probe_identity('/dev/x1') == ('f2fs', 'u1', label)
 	assert calls == [['blkid', '-p', '-o', 'udev', '/dev/x1'], ['blkid', '-p', '-o', 'value', '-s', 'LABEL', '/dev/x1']]
 
 
@@ -3064,9 +3064,54 @@ def test_probe_identity_reads_a_whole_label_from_udev_alone(hpcp_mod, reset_hpcp
 	enc = 'a' * 250 + 'b\\x5cx\\x20'
 	assert len(enc) == 260
 	monkeypatch.setattr(hpcp_mod, 'run_command_in_multicmd_with_path_check',
-		lambda argv, **kwargs: calls.append(argv) or ['ID_FS_LABEL_ENC=' + enc, 'ID_FS_TYPE=btrfs'])
-	assert hpcp_mod._probe_identity('/dev/x1') == ('btrfs', '', 'a' * 250 + 'b\\x ')
+		lambda argv, **kwargs: calls.append(argv) or ['ID_FS_LABEL_ENC=' + enc, 'ID_FS_TYPE=f2fs'])
+	assert hpcp_mod._probe_identity('/dev/x1') == ('f2fs', '', 'a' * 250 + 'b\\x ')
 	assert len(calls) == 1
+
+
+def _fake_btrfs_probe(monkeypatch, hpcp_mod, enc, tool_output, have_tool=True):
+	"""blkid finds btrfs with label enc; `btrfs filesystem label` prints tool_output. Returns the list of argvs run."""
+	calls = []
+
+	def fake(argv, **kwargs):
+		calls.append(argv)
+		if argv[0] == 'btrfs':
+			return tool_output
+		if '-o' in argv and argv[argv.index('-o') + 1] == 'value':
+			return ['from blkid raw']
+		return ['ID_FS_UUID_ENC=u1', 'ID_FS_LABEL_ENC=' + enc, 'ID_FS_TYPE=btrfs']
+
+	monkeypatch.setattr(hpcp_mod, 'run_command_in_multicmd_with_path_check', fake)
+	monkeypatch.setattr(hpcp_mod, 'check_path', lambda tool: have_tool)
+	return calls
+
+
+def test_probe_identity_reads_a_btrfs_label_with_the_btrfs_tool(hpcp_mod, reset_hpcp_globals, monkeypatch):
+	"""blkid 2.23.2 (EL7) cuts a label at 127 bytes, and then trims what is left, so its length does not show the cut."""
+	label = 'a' * 120 + ' \\x41 ' + 'b' * 100 + '\\xff'
+	calls = _fake_btrfs_probe(monkeypatch, hpcp_mod, 'a' * 120, [label])
+	assert hpcp_mod._probe_identity('/dev/x1') == ('btrfs', 'u1', 'a' * 120 + ' \\x41 ' + 'b' * 100 + '\udcff')
+	assert calls == [['blkid', '-p', '-o', 'udev', '/dev/x1'], ['btrfs', 'filesystem', 'label', '/dev/x1']]
+
+
+def test_probe_identity_runs_no_btrfs_tool_for_no_label(hpcp_mod, reset_hpcp_globals, monkeypatch):
+	calls = _fake_btrfs_probe(monkeypatch, hpcp_mod, '', ['never'])
+	assert hpcp_mod._probe_identity('/dev/x1') == ('btrfs', 'u1', '')
+	assert len(calls) == 1
+
+
+@pytest.mark.parametrize('have_tool, output', [(True, []), (True, ['']), (False, ['never'])], ids=['failed', 'printed-nothing', 'no-tool'])
+def test_probe_identity_keeps_blkids_btrfs_label_when_the_tool_gives_none(hpcp_mod, reset_hpcp_globals, monkeypatch, capsys, have_tool, output):
+	"""A disk can be read on a system without btrfs-progs, or with a device the tool cannot open: blkid still answers."""
+	_fake_btrfs_probe(monkeypatch, hpcp_mod, 'short\\x20label', output, have_tool=have_tool)
+	assert hpcp_mod._probe_identity('/dev/x1') == ('btrfs', 'u1', 'short label')
+	assert capsys.readouterr().err == ''
+	assert hpcp_mod.ERRORS == []
+
+
+def test_probe_identity_falls_back_to_the_raw_probe_for_a_cut_btrfs_label(hpcp_mod, reset_hpcp_globals, monkeypatch):
+	_fake_btrfs_probe(monkeypatch, hpcp_mod, 'a' * 258 + '\\x2', [], have_tool=False)
+	assert hpcp_mod._probe_identity('/dev/x1')[2] == 'from blkid raw'
 
 
 @pytest.mark.skipif(shutil.which('mkfs.btrfs') is None or shutil.which('blkid') is None, reason='needs mkfs.btrfs and blkid')
@@ -3074,6 +3119,16 @@ def test_probe_identity_reads_a_long_btrfs_label_exactly(tmp_path, hpcp_mod, res
 	"""A 249-byte btrfs label of spaces and backslashes needs more than blkid's 265-byte ENC buffer (libblkid trims
 	a label's trailing whitespace on every path, so it ends in a letter)."""
 	label = ('a b\\x41 ' * 40)[:249]
+	image = tmp_path / 'btrfs.img'
+	with open(str(image), 'wb') as f:
+		f.truncate(128 << 20)
+	_run('mkfs.btrfs', '-q', '-f', '-L', label, image)
+	assert hpcp_mod._probe_identity(str(image))[2] == label
+
+
+@pytest.mark.skipif(shutil.which('mkfs.btrfs') is None or shutil.which('btrfs') is None or shutil.which('blkid') is None, reason='needs btrfs-progs and blkid')
+@pytest.mark.parametrize('label', ['b' * 200, 'a' * 124 + '  ' + 'c' * 40, 'ü' * 100], ids=['long', 'space-where-blkid-cuts', 'multibyte'])
+def test_probe_identity_reads_a_btrfs_label_past_127_bytes(tmp_path, hpcp_mod, reset_hpcp_globals, label):
 	image = tmp_path / 'btrfs.img'
 	with open(str(image), 'wb') as f:
 		f.truncate(128 << 20)
