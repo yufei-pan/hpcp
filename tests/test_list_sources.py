@@ -3284,13 +3284,14 @@ def test_content_only_leaves_a_matching_pair_of_nodes_to_no_cp(tmp_path, hpcp_mo
 	assert not ran and (after.st_ino, after.st_mode, after.st_mtime_ns) == (before.st_ino, before.st_mode, before.st_mtime_ns)
 
 
-def test_a_named_fifo_run_twice_under_content_only_ends_both_times(tmp_path):
-	# cp -f onto the FIFO it made reads it, and waits for a writer.
+def test_a_content_only_rerun_over_the_fifo_a_plain_run_made_ends(tmp_path):
+	# cp -f onto the FIFO it made reads it, and waits for a writer. (A first run under -co has no node there, and cp -f reads
+	# the source FIFO: that one waits too, on 9.80 as well, and is not this.)
 	os.makedirs(tmp_path / 'a')
 	os.mkfifo(tmp_path / 'a/p')
-	for attempt in range(2):
-		rc, output = _run_bounded(['a/p', '-d', 'out/', '-co'], tmp_path)
-		assert rc == 200 and stat.S_ISFIFO(os.lstat(tmp_path / 'out/p').st_mode), (attempt, rc, output[-2000:])
+	for flags in ([], ['-co']):
+		rc, output = _run_bounded(['a/p', '-d', 'out/'] + flags, tmp_path)
+		assert rc == 200 and stat.S_ISFIFO(os.lstat(tmp_path / 'out/p').st_mode), (flags, rc, output[-2000:])
 
 
 @no_permissions_as_root
