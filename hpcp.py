@@ -10993,6 +10993,7 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = multipr
 			places = _RealPlaces()
 			# Decided before the entries inside a destination go: what is left of the sources is still a list's.
 			listed = _has_listed(src_paths)
+			holding = None
 			if listed or not dest_image:
 				src_paths[:], skipped, holding = _inside_destinations(src_paths, dests, places)
 				if skipped:
@@ -11033,6 +11034,10 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = multipr
 			if remove_extra and copy_failures:
 				eprint(f'Remove skipped: not removing extra files from {dests}: the copy reported {len(copy_failures)} error(s); '
 					'fix them (or exclude those paths with -e) and re-run')
+			elif remove_extra and holding:
+				# What it left out of its copy lies in the destination, and looks extra there.
+				print('-rme checked nothing: a source holds the destination, so all that is in it belongs to that source. '
+					'To mirror a directory, name a destination outside it')
 			elif remove_extra and not _directory_sources(_src_to_dest_map(src_paths, dests, bool(dest_image))):
 				# Only a directory can say what is extra below it: a named file, a link or a list of files says nothing of the rest.
 				if listed:

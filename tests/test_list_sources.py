@@ -2302,6 +2302,17 @@ def test_a_source_holding_the_destination_leaves_it_out(tmp_path):
 		assert files(tmp_path / 'out') == {b'x': b'X', b's/a': b'A'}
 
 
+@pytest.mark.parametrize('source', [['.'], ['-sfl', 'names']], ids=['argument', 'list'])
+def test_rme_takes_nothing_from_a_destination_a_source_holds(tmp_path, source):
+	# d/keep was left out of the copy of '.', so it looks extra there, and it is a source file.
+	write(tmp_path / 'x', 'X')
+	write(tmp_path / 'd/keep', 'K')
+	write(tmp_path / 'names', '.\n')
+	rc, output = _rme_in_a_terminal(tmp_path, source + ['-d', 'd/'])
+	assert rc == 0 and b'-rme checked nothing: a source holds the destination' in output and b'(y/n)' not in output, output[-2000:]
+	assert (tmp_path / 'd/keep').read_text() == 'K' and (tmp_path / 'd/x').read_text() == 'X'
+
+
 def test_dot_dot_holding_the_destination_runs_twice_the_same(tmp_path):
 	write(tmp_path / 'w/t', 'T')
 	write(tmp_path / 'w/sub/s', 'S')
