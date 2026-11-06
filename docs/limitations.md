@@ -75,7 +75,7 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 
 ### `-ncd` can end in a traceback
 - **Kind:** deferred.
-- **What the operator sees:** `-sfl` with `-ncd`, when a listed file's directory is missing under the destination: `cp` fails and each retry prints a Python traceback before the run ends with an error code (30 to 54 of 4000 fuzz runs). Nothing is lost.
+- **What the operator sees:** `-sfl` with `-ncd`, when a listed file's directory is missing under the destination: `cp` fails and each retry prints a Python traceback before the run ends with an error code (30 to 56 of 4000 fuzz runs). Nothing is lost.
 - **Why:** old, ugly but safe.
 - **Revisit when:** the next hpcp release (9.82).
 
@@ -95,4 +95,10 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - **Kind:** deferred.
 - **What the operator sees:** `hpcp nosuch ok/g -d out/`, also with `-rf`, copies `ok/g` and exits 0 without a word about `nosuch`, as 9.80 does. Alone it is exit 240, and the list route gives 207.
 - **Why:** the glob expansion (near line 756) drops it. It should say so and exit 207 after copying the rest.
+- **Revisit when:** the next hpcp release (9.82).
+
+### A source that opens and then fails on read costs the old copy
+- **Kind:** deferred.
+- **What the operator sees:** `cp` truncates the destination before its first read, so a source that opens and then fails (`/proc/self/mem` with an old `out/mem`) ends in exit 190 and the old copy is gone. 9.80 left it empty.
+- **Why:** keeping it takes a temporary name and a rename, which is its own design.
 - **Revisit when:** the next hpcp release (9.82).
