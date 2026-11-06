@@ -55,7 +55,7 @@ entries go last, in the same commit as the change:
 - Lesson: a look that can fail returns three answers. Bound the look by what the answer is worth, and treat "stopped" the same as "failed": ask a narrower way, open the gate, or refuse with the fix. Refuse only at the question that needs the answer: a look that raises by itself refuses for places nothing lands in.
 
 ## 2026-11-06 Clean up what you made
-- Changed: a failed copy removes the destination file only when the attempt changed it (inode, size or mtime against before), and a source that cannot be read gets no `cp` at all. Exit codes stay.
+- Changed: a failed copy removes the destination file only when the attempt changed it (inode, size or mtime against before), and a source that cannot be opened gets no `cp` at all. Exit codes stay. The state is the path's own (lstat): a link stays through a failed write, so a retry finishes its target.
 - Why we had to change: `os.remove(dest_path)` ran after any failure, so an unreadable source deleted the good copy a backup held. And the last retry returned before it removed its part.
 - Original design was wrong because: the cleanup assumed the failure was its own doing. It was written for a part of a file, and a destination that was there before looks the same as a part.
 - Lesson: before cleaning up after a failure, prove the failed step made what you are about to remove. And `cp -a` acts on the destination before it opens the source, so only not starting it keeps a hard-linked one.

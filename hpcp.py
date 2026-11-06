@@ -3175,9 +3175,10 @@ def _can_open(path):
 	return True
 
 def _copy_state(path):
-	"""What a copy to path would change: of the file itself, as cp writes through a link. None when nothing is there."""
+	"""What a copy to path would change at path itself: a link stays whatever cp did through it, so a retry writes through it
+	again and its target ends whole or the file fails. None when nothing is there."""
 	try:
-		st = os.stat(path)
+		st = os.lstat(path)
 	except OSError:
 		return None
 	return st.st_ino, st.st_size, st.st_mtime_ns

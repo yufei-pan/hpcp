@@ -3150,3 +3150,39 @@ def test_a_fifo_is_no_read_so_its_mode_stops_nothing(tmp_path):
 	task = subprocess.run([sys.executable, HPCP, 'a/p', '-d', 'out/'], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
 		cwd=str(tmp_path), timeout=60, start_new_session=True)
 	assert stat.S_ISFIFO(os.lstat(tmp_path / 'out/p').st_mode), task.stdout[-2000:]
+
+
+def _cp_through_a_link(hpcp_mod, monkeypatch, parts):
+	"""A cp that dies part way through its first parts writes, and works after that."""
+	real, failures = hpcp_mod.run_command_in_multicmd_with_path_check, [parts]
+	def cp(command, *args, **kwargs):
+		if failures[0]:
+			failures[0] -= 1
+			with open(command[-1], 'w') as target:
+				target.write('par')
+			raise RuntimeError('cp: write error: No space left on device')
+		return real(command, *args, **kwargs)
+	monkeypatch.setattr(hpcp_mod, 'run_command_in_multicmd_with_path_check', cp)
+
+
+def _link_at_the_landing(tmp_path):
+	write(tmp_path / 'a/x', 'the whole file')
+	write(tmp_path / 't/f', 'old')
+	os.makedirs(tmp_path / 'out')
+	os.symlink('../t/f', tmp_path / 'out/x')
+	return str(tmp_path / 'a/x'), str(tmp_path / 'out/x')
+
+
+def test_a_part_through_a_link_keeps_the_link_for_the_retry(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	# The link goes, and the retry leaves a whole file beside a target cut short, reported as success.
+	source, landing = _link_at_the_landing(tmp_path)
+	_cp_through_a_link(hpcp_mod, monkeypatch, 1)
+	hpcp_mod.copy_file(source, [landing])
+	assert os.path.islink(landing) and (tmp_path / 't/f').read_text() == 'the whole file'
+
+
+def test_a_write_that_keeps_failing_through_a_link_keeps_the_link(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	source, landing = _link_at_the_landing(tmp_path)
+	_cp_through_a_link(hpcp_mod, monkeypatch, 100)
+	assert hpcp_mod.copy_file(source, [landing])[0] == 0
+	assert os.path.islink(landing)
