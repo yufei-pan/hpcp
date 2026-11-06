@@ -106,7 +106,7 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 
 ### A rerun with a source that became unreadable ends in a traceback
 - **Kind:** deferred.
-- **What the operator sees:** the destination matches the source by size and mtime, then the source becomes unreadable (mode 000, not root): the identical-file check hashes first, `hash_file`'s open raises, and the run ends with a Python traceback and exit 191 instead of the clean 190. Nothing is lost, and a move stays blocked at 212. Same on 9.80.
+- **What the operator sees:** the destination matches the source by size and mtime, then the source becomes unreadable (mode 000, not root): the identical-file check hashes first, `hash_file`'s open raises, and a copy ends with a Python traceback and exit 191 instead of the clean 190. A move ends 212 as usual (the exit is the highest of the errors), with its sources kept. Nothing is lost. Same on 9.80.
 - **Why:** old and safe. The fix is to move the readability check ahead of the identical loop, or to catch `PermissionError` around the hash.
 - **Revisit when:** the next hpcp release (9.82).
 
