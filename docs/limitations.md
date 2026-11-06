@@ -104,6 +104,12 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - **Why:** old and safe. The fix is to move the readability check ahead of the identical loop, or to catch `PermissionError` around the hash.
 - **Revisit when:** the next hpcp release (9.82).
 
+### `Copy failed` does not carry cp's stderr
+- **Kind:** deferred.
+- **What the operator sees:** when `cp` fails, hpcp says `Copy failed: ... failed with return code 1`; why (a full disk, a loop in a destination link, a permission) is in cp's stderr, which is not shown. A full disk says only "return code 1".
+- **Why:** old behaviour: the traceback 9.81 printed did not carry it either. The runner has the stderr (the task keeps it); the error text does not carry it.
+- **Revisit when:** the next hpcp release.
+
 ### A FIFO that blocks the copy
 - **Kind:** deferred.
 - **What the operator sees:** a 644 FIFO named as a source under `-co` hangs, because `cp -f` reads it and no writer comes. A lone 644 FIFO at the destination hangs with or without `-co`, because `cp` writes to it and waits for a reader. Both as on 9.80. New in 9.81, under `-co`: a FIFO source over a hard-linked destination has already taken that name when it hangs, and the content stays at the other names. A regular file onto a FIFO with other names no longer hangs: it lands as a regular file at that name, as `-a` always did, and the other names keep the FIFO.

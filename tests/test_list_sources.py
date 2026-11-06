@@ -3097,21 +3097,24 @@ def test_a_cp_that_fails_says_so_in_lines_and_shows_no_traceback(tmp_path, hpcp_
 	monkeypatch.setattr(hpcp_mod, 'run_command_in_multicmd_with_path_check', cp)
 	assert hpcp_mod.copy_file(str(tmp_path / 'a/x'), [str(tmp_path / 'out/x')])[0] == 0
 	captured = capsys.readouterr()
-	assert 'Copy failed' in captured.err and 'Too many levels' in captured.out + captured.err
+	# the retry says what failed and what it tries next, on stdout; the end of the road is the eprint
+	assert 'Error copying' in captured.out and 'Too many levels' in captured.out and 'without sparse' in captured.out
+	assert 'Copy failed' in captured.err
 	assert 'Traceback' not in captured.out + captured.err
 
 
-@pytest.mark.parametrize('error, traceback_shown', [
-	(PermissionError(13, 'Permission denied', 'a/x'), False),
-	(TypeError('a bug'), True),
-], ids=['an OSError is one line', 'anything else keeps its traceback'])
-def test_a_copy_that_crashes_shows_a_traceback_only_for_what_is_not_an_oserror(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch, capsys, error, traceback_shown):
+@pytest.mark.parametrize('error, verbose, traceback_shown', [
+	(PermissionError(13, 'Permission denied', 'a/x'), False, False),
+	(PermissionError(13, 'Permission denied', 'a/x'), True, True),
+	(TypeError('a bug'), False, True),
+], ids=['an OSError is one line', 'an OSError under -v has its traceback', 'anything else keeps its traceback'])
+def test_a_copy_that_crashes_shows_a_traceback_only_for_what_is_not_an_oserror_or_under_verbose(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch, capsys, error, verbose, traceback_shown):
 	write(tmp_path / 'a/x', 'A')
 	write(tmp_path / 'out/x', 'A')
 	def identical(*args, **kwargs):
 		raise error
 	monkeypatch.setattr(hpcp_mod, 'is_file_identical', identical)
-	assert hpcp_mod.copy_file(str(tmp_path / 'a/x'), [str(tmp_path / 'out/x')])[0] == 0
+	assert hpcp_mod.copy_file(str(tmp_path / 'a/x'), [str(tmp_path / 'out/x')], verbose=verbose)[0] == 0
 	captured = capsys.readouterr()
 	assert 'Copy process crashed' in captured.err
 	assert ('Traceback' in captured.out) == traceback_shown
