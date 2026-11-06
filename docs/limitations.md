@@ -75,7 +75,7 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 
 ### `-ncd` can end in a traceback
 - **Kind:** deferred.
-- **What the operator sees:** `-ncd` with a destination directory that is missing can stop with a Python traceback instead of a clean error (44 of 4000 fuzz runs). Nothing is lost.
+- **What the operator sees:** `-sfl` with `-ncd`, when a listed file's directory is missing under the destination: `cp` fails and each retry prints a Python traceback before the run ends with an error code (37 to 54 of 4000 fuzz runs). Nothing is lost.
 - **Why:** old, ugly but safe.
 - **Revisit when:** the next hpcp release (9.82).
 
