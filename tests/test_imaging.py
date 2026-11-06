@@ -1,5 +1,7 @@
 import os
 import shutil
+import stat
+import sys
 import subprocess
 import warnings
 import pytest
@@ -69,6 +71,71 @@ def test_create_and_detach_loop_device(loop_image, hpcp_mod, reset_hpcp_globals)
 		)
 	# Re-detach should not crash
 	hpcp_mod.detach_loop_device(loop)
+
+
+def test_flush_loop_device_flushes_the_device_and_the_file_behind_it(tmp_path, hpcp_mod, monkeypatch):
+	device, image = tmp_path / 'dev' / 'loop7', tmp_path / 'img'
+	(tmp_path / 'dev').mkdir()
+	device.write_bytes(b'')
+	image.write_bytes(b'x')
+	sysfs = tmp_path / 'sys' / 'loop7' / 'loop'
+	sysfs.mkdir(parents=True)
+	(sysfs / 'backing_file').write_text(str(image) + '\n')
+	flushed = []
+	real_fsync = os.fsync
+	monkeypatch.setattr(os, 'fsync', lambda fd: flushed.append(os.fstat(fd).st_ino) or real_fsync(fd))
+	hpcp_mod._flush_loop_device(str(device), sysfs=str(tmp_path / 'sys'))
+	assert flushed == [os.stat(str(device)).st_ino, os.stat(str(image)).st_ino]
+
+
+def test_flush_loop_device_ignores_what_it_cannot_flush(tmp_path, hpcp_mod):
+	# no such device, no sysfs entry, a backing file that is gone
+	hpcp_mod._flush_loop_device(str(tmp_path / 'nosuch'), sysfs=str(tmp_path))
+	(tmp_path / 'loop8' / 'loop').mkdir(parents=True)
+	(tmp_path / 'loop8' / 'loop' / 'backing_file').write_text(str(tmp_path / 'gone\n'))
+	hpcp_mod._flush_loop_device(str(tmp_path / 'loop8'), sysfs=str(tmp_path))
+
+
+def test_detach_loop_device_flushes_before_it_detaches(hpcp_mod, monkeypatch, tmp_path):
+	events = []
+	device = tmp_path / 'loop9'
+	device.write_bytes(b'')
+	monkeypatch.setattr(hpcp_mod, '_flush_loop_device', lambda loop: events.append('flush'))
+
+	class Task:
+		returncode = 0
+		stderr = []
+
+	monkeypatch.setattr(hpcp_mod.multiCMD, 'run_commands', lambda commands, **kwargs: events.append('losetup') or [Task()])
+	assert hpcp_mod.detach_loop_device(str(device)) is True
+	assert events == ['flush', 'losetup']
+
+
+def test_detaching_a_loop_device_fsyncs_it_and_its_image(loop_image, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	flushed = []
+	real_fsync = os.fsync
+	rdev, inode = os.stat(loop_image['loop']).st_rdev, os.stat(loop_image['image']).st_ino
+
+	def spy(fd):
+		status = os.fstat(fd)
+		flushed.append(('device', status.st_rdev) if stat.S_ISBLK(status.st_mode) else ('file', status.st_ino))
+		return real_fsync(fd)
+
+	monkeypatch.setattr(os, 'fsync', spy)
+	assert hpcp_mod.detach_loop_device(loop_image['loop']) is True
+	assert flushed == [('device', rdev), ('file', inode)]
+
+
+def test_hpcp_never_calls_global_sync():
+	"""os.sync, os.syncfs and the sync command write every filesystem on the host; hpcp flushes what it wrote."""
+	import ast
+	with open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'hpcp.py'), encoding='utf-8') as f:
+		tree = ast.parse(f.read())
+	for node in ast.walk(tree):
+		if isinstance(node, ast.Attribute) and node.attr in ('sync', 'syncfs') and isinstance(node.value, ast.Name) and node.value.id == 'os':
+			pytest.fail(f'os.{node.attr} at line {node.lineno}')
+		if isinstance(node, ast.Constant if sys.version_info >= (3, 8) else ast.Str) and (node.value if sys.version_info >= (3, 8) else node.s) == 'sync':
+			pytest.fail(f'the sync command at line {node.lineno}')
 
 
 def test_get_partitions_on_loop_without_table(loop_image, hpcp_mod, reset_hpcp_globals):

@@ -34,6 +34,22 @@ if sys.version_info < (3, 7):
 _REAL_SCANDIR_FD = hpcp._SCANDIR_FD
 
 
+@pytest.fixture(autouse=True)
+def _no_global_sync():
+	"""sync(2) writes every filesystem on the host (from a container too), backup disks included. hpcp flushes what it
+	wrote instead (_flush_loop_device); a test that reaches os.sync fails. A run in a subprocess is covered by
+	test_hpcp_never_calls_global_sync. Not monkeypatch: a fixture using it would outlive the autouse teardowns that
+	run with a test's own patches still in place."""
+	def refuse():
+		raise AssertionError('os.sync() flushes every filesystem on the host: flush the file or device itself')
+	real = os.sync
+	os.sync = refuse
+	try:
+		yield
+	finally:
+		os.sync = real
+
+
 @pytest.fixture(params=['fd', 'proc', 'path'])
 def scan_mode(request, monkeypatch):
 	"""How hpcp reads a directory it holds open: scandir on the descriptor (Python 3.7+), /proc/self/fd/N (3.6 on

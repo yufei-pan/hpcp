@@ -10712,16 +10712,36 @@ def dd_partition(src_partition_path,dest_partition_path,partition,dd_src,dd_dest
 		raise RuntimeError(f"Source partition larger than destination partition: {src_part_info[partition]['size']} > {dest_part_info[partition]['size']}, cannot use DD, exiting.")
 	run_command_in_multicmd_with_path_check(['dd','if='+src_partition_path,'of='+dest_partition_path,'bs=1024M'],timeout=0,strict=True)
 
+def _flush_loop_device(loop_device, sysfs='/sys/block'):
+	"""
+	Flush what a loop device holds: the device, then the file behind it (from /sys, read while the device is attached),
+	so an image's clone is on disk when the run ends. A global sync(2) would also write every other filesystem on the
+	host. An OSError is ignored: a flush that cannot be made is what the detach would have gone without.
+	"""
+	paths = [loop_device]
+	try:
+		with open(os.path.join(sysfs, os.path.basename(loop_device), 'loop', 'backing_file')) as f:
+			paths.append(f.read().rstrip('\n'))
+	except OSError:
+		pass
+	for path in paths:
+		try:
+			fd = os.open(path, os.O_RDONLY | getattr(os, 'O_CLOEXEC', 0))
+			try:
+				os.fsync(fd)
+			finally:
+				os.close(fd)
+		except OSError:
+			pass
+
 def detach_loop_device(loop_device, retries=5, delay=0.5):
-	"""Detach a loop device with sync and retries for intermittent EBUSY."""
+	"""Flush a loop device and its backing file, then detach it, with retries for intermittent EBUSY."""
 	if not loop_device:
 		return True
 	losetup = _bin('losetup')
+	if os.path.exists(loop_device):
+		_flush_loop_device(loop_device)
 	for attempt in range(1, retries + 1):
-		try:
-			os.sync()
-		except Exception:
-			pass
 		if not os.path.exists(loop_device):
 			print(f"Loop device {loop_device} already gone.")
 			return True
@@ -10751,11 +10771,7 @@ def clean_up(mount_points: list,loop_devices: list, delayed_commands: list = Non
 		print(f"Unmounting {mount_point}")
 		run_command_in_multicmd_with_path_check(["umount",mount_point],strict=False)
 		if _is_mount_point(mount_point):
-			# Still busy; sync and retry once before leaving it for loop detach retries.
-			try:
-				os.sync()
-			except Exception:
-				pass
+			# Still busy; retry once before leaving it for loop detach retries.
 			time.sleep(0.5)
 			run_command_in_multicmd_with_path_check(["umount",mount_point],strict=False)
 		print(f"Removing mount point {mount_point}")
@@ -10764,7 +10780,7 @@ def clean_up(mount_points: list,loop_devices: list, delayed_commands: list = Non
 		except OSError as e:
 			eprint(f"Failed to remove mount point {mount_point}: {e}")
 	mount_points.clear()
-	# Fold any delayed losetup --detach into loop_devices so they get sync/retry handling.
+	# Fold any delayed losetup --detach into loop_devices so they get flush/retry handling.
 	remaining_commands = []
 	for cmd in delayed_commands:
 		if cmd and len(cmd) >= 3 and cmd[0] == 'losetup' and cmd[1] in ('-d', '--detach'):
@@ -10778,10 +10794,6 @@ def clean_up(mount_points: list,loop_devices: list, delayed_commands: list = Non
 		# Serial on purpose: write_partition_info queues e2fsck then tune2fs -U
 		# as ordered pairs, and a parallel run would let tune2fs race the fsck.
 		run_commands_in_multicmd_with_path_check(remaining_commands,strict=False,max_threads=1)
-	try:
-		os.sync()
-	except Exception:
-		pass
 	for loop_device_dest in list(loop_devices):
 		print(f"Removing loop device {loop_device_dest}")
 		detach_loop_device(loop_device_dest)
