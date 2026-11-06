@@ -34,7 +34,7 @@ if sys.version_info < (3, 7):
 _REAL_SCANDIR_FD = hpcp._SCANDIR_FD
 
 
-@pytest.fixture(autouse=True)
+@pytest.fixture(autouse=hasattr(os, 'sync'))  # Windows has no os.sync
 def _no_global_sync():
 	"""sync(2) writes every filesystem on the host (from a container too), backup disks included. hpcp flushes what it
 	wrote instead (_flush_loop_device); a test that reaches os.sync fails. A run in a subprocess is covered by
