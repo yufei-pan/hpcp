@@ -100,5 +100,18 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 ### A source that opens and then fails on read costs the old copy
 - **Kind:** deferred.
 - **What the operator sees:** `cp` truncates the destination before its first read, so a source that opens and then fails (`/proc/self/mem` with an old `out/mem`) ends in exit 190 and the old copy is gone. 9.80 left it empty.
-- **Why:** keeping it takes a temporary name and a rename, which is its own design.
+  - With several destinations, a part written through a link at the first destination and the file then taken by the second ends exit 0 with the link's target half written (`hpcp a/ -d out/ -d two/` with `out/x -> ../t/f`).
+- **Why:** keeping it takes a temporary name and a rename, which is its own design; that covers the link case too.
+- **Revisit when:** the next hpcp release (9.82).
+
+### A rerun with a source that became unreadable ends in a traceback
+- **Kind:** deferred.
+- **What the operator sees:** the destination matches the source by size and mtime, then the source becomes unreadable (mode 000, not root): the identical-file check hashes first, `hash_file`'s open raises, and the run ends with a Python traceback and exit 191 instead of the clean 190. Nothing is lost, and a move stays blocked at 212. Same on 9.80.
+- **Why:** old and safe. The fix is to move the readability check ahead of the identical loop, or to catch `PermissionError` around the hash.
+- **Revisit when:** the next hpcp release (9.82).
+
+### `-co` on a FIFO with other names at the destination
+- **Kind:** deferred.
+- **What the operator sees:** `-co` onto a 644 FIFO hangs, because `cp -f` reads it, as on 9.80. New in 9.81: a FIFO that has other names is unlinked at that name first, and the copy lands there as a regular file; the FIFO keeps its other names.
+- **Why:** rare, and the hang is old. Leaving a destination that is not a regular file alone belongs with the temporary name and rename above.
 - **Revisit when:** the next hpcp release (9.82).
