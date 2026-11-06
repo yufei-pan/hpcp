@@ -1155,6 +1155,106 @@ def test_live_partition_with_temp_dirs_on_the_live_filesystem(tmp_path, hpcp_mod
 	assert [row.path for row in part3 if row.path.startswith('tmpdir') and row.path != 'tmpdir/'] == []
 
 
+@contextlib.contextmanager
+def _another_namespace():
+	"""The pid of a process in a mount namespace that follows this one's mounts and unmounts, as a PrivateTmp service's
+	does (chronyd on EL7). Newer unshare makes the new namespace private unless told otherwise; older has no such option."""
+	known = '--propagation' in subprocess.run(['unshare', '--help'], capture_output=True, text=True).stdout
+	holder = subprocess.Popen(['unshare', '-m'] + (['--propagation', 'unchanged'] if known else [])
+		+ ['sh', '-c', 'mount --make-rslave / && echo ready && exec sleep 600'], stdout=subprocess.PIPE, universal_newlines=True)
+	try:
+		assert holder.stdout.readline().strip() == 'ready'
+		yield holder.pid
+	finally:
+		holder.kill()
+		holder.wait()
+		holder.stdout.close()
+
+
+def _namespace_mounts(pid, prefix):
+	with open(f'/proc/{pid}/mountinfo') as f:
+		return [line.split()[4] for line in f if line.split()[4].startswith(prefix)]
+
+
+@requires_root_and_disk_tools
+@pytest.mark.root
+@pytest.mark.loop
+@pytest.mark.skipif(shutil.which('unshare') is None, reason='needs unshare')
+def test_a_diff_with_temp_dirs_on_a_live_filesystem_leaves_nothing_in_another_namespace(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch, capsys):
+	"""A mount made after a bind of the live filesystem also lands inside the bind's copy in another namespace. Taken
+	off bind first, that copy still has a child, so the unmount does not reach it: on 3.10 (EL7) the copy stays for good,
+	rmdir of its directory fails with EBUSY, and the filesystem and its loop device stay held."""
+	old, new, out = tmp_path / 'old.img', tmp_path / 'new.img', str(tmp_path / 'patch.img')
+	_make_golden(old)
+	_make_newer(old, new, label=None, raw=False, mbr=False, gpt_name=None)
+	multiprocessing.util.get_temp_dir()
+	with _another_namespace() as pid:
+		with _attached(new, read_only=False) as loop:
+			with _mounted(loop + 'p3') as live_root:
+				temp_dir = os.path.join(live_root, 'tmpdir')
+				os.makedirs(temp_dir)
+				monkeypatch.setattr(tempfile, 'tempdir', temp_dir)
+				with _session(hpcp_mod) as (mount_points, loop_devices):
+					assert hpcp_mod.process_get_disk_diff_image([loop], [str(old)], out, mount_points, loop_devices, max_workers=1) == out
+				assert 'Failed to remove mount point' not in capsys.readouterr().err
+				assert _namespace_mounts(pid, temp_dir) == []
+				assert os.listdir(temp_dir) == []
+				monkeypatch.setattr(tempfile, 'tempdir', None)
+		assert _namespace_mounts(pid, live_root) == []
+
+
+@requires_root_and_disk_tools
+@pytest.mark.root
+@pytest.mark.loop
+@pytest.mark.skipif(shutil.which('unshare') is None, reason='needs unshare')
+def test_an_apply_with_temp_dirs_on_a_live_filesystem_leaves_nothing_in_another_namespace(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	"""As for a diff, with the sections: partition 1 is live, so it is a bind, and partition 2 is mounted after it. The
+	apply takes the sections off itself, in the opposite order to their mounts."""
+	base, golden, target = tmp_path / 'base.img', tmp_path / 'golden.img', tmp_path / 'target.img'
+	with open(str(base), 'wb') as f:
+		f.truncate(96 << 20)
+	_run('sgdisk', '-n1:2048:+40M', '-n2:0:+40M', base)
+	with _attached(base) as loop:
+		_run('mkfs.ext4', '-q', '-F', loop + 'p1')
+		_run('mkfs.ext4', '-q', '-F', loop + 'p2')
+	shutil.copyfile(str(base), str(golden))
+	shutil.copyfile(str(base), str(target))
+	with _attached(golden) as loop:
+		for number in (1, 2):
+			with _mounted(f'{loop}p{number}') as root:
+				with open(os.path.join(root, 'new-file'), 'w') as f:
+					f.write('new')
+	patch = str(tmp_path / 'patch.img')
+	with _session(hpcp_mod) as (mount_points, loop_devices):
+		assert hpcp_mod.process_get_disk_diff_image([str(golden)], [str(base)], patch, mount_points, loop_devices, max_workers=1) == patch
+	multiprocessing.util.get_temp_dir()
+	with _another_namespace() as pid:
+		with _attached(target) as loop:
+			with _mounted(loop + 'p1') as live_root:
+				temp_dir = os.path.join(live_root, 'tmpdir')
+				os.makedirs(temp_dir)
+				monkeypatch.setattr(tempfile, 'tempdir', temp_dir)
+				assert _apply(hpcp_mod, patch, loop)['failed'] == 0
+				assert _namespace_mounts(pid, temp_dir) == []
+				assert os.listdir(temp_dir) == []
+				monkeypatch.setattr(tempfile, 'tempdir', None)
+				assert os.path.exists(os.path.join(live_root, 'new-file'))
+		assert _namespace_mounts(pid, live_root) == []
+
+
+def test_clean_up_takes_the_last_mount_off_first(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	calls = []
+	monkeypatch.setattr(hpcp_mod, 'run_command_in_multicmd_with_path_check', lambda argv, **kwargs: calls.append(argv) or [])
+	monkeypatch.setattr(hpcp_mod, '_is_mount_point', lambda path: False)
+	mounts = [str(tmp_path / name) for name in ('first', 'second', 'third')]
+	for mount in mounts:
+		os.mkdir(mount)
+	remaining = list(mounts)
+	hpcp_mod.clean_up(remaining, [])
+	assert [argv[1] for argv in calls if argv[0] == 'umount'] == mounts[::-1]
+	assert remaining == [] and os.listdir(str(tmp_path)) == []
+
+
 @requires_root_and_disk_tools
 @pytest.mark.root
 @pytest.mark.loop

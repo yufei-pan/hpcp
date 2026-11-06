@@ -8204,7 +8204,8 @@ def apply_disk_patch(volume_roots, target, mount_points, loop_devices, force=Fal
 		_verify_across_sections(ran, max_workers, full_hash, compare_hash)
 		if stopped is None:
 			stopped = next((plan.name for plan, summary, _ in ran if summary['failed']), None)
-		for plan in order:
+		# Last mount first (see clean_up): order is the order they were applied in, plans the order they were mounted in.
+		for plan in reversed(plans):
 			_release_mount(plan.target_root, mount_points)
 	failed = sum(summary['failed'] for summary in summaries.values())
 	pending = [entry for entry in raw_plan if entry['action'] != 'skip'] if stopped is None else []
@@ -10711,7 +10712,10 @@ def clean_up(mount_points: list,loop_devices: list, delayed_commands: list = Non
 	# clean up loop devices and mount points if we are using a image
 	if delayed_commands is None:
 		delayed_commands = []
-	for mount_point in list(mount_points):
+	# Last mount first. A mount made after a bind of a live filesystem, with its directory on that filesystem, also lands
+	# inside the bind's copy in another mount namespace (a PrivateTmp service's). Unmounted first, that bind's copy
+	# keeps its child and stays: on Linux 3.10 (EL7) for good, with rmdir failing EBUSY and its device held.
+	for mount_point in reversed(list(mount_points)):
 		print(f"Unmounting {mount_point}")
 		run_command_in_multicmd_with_path_check(["umount",mount_point],strict=False)
 		if _is_mount_point(mount_point):
