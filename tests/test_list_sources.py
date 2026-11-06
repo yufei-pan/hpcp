@@ -2,6 +2,10 @@
 import builtins
 import io
 import os
+import pty
+import select
+import shlex
+import signal
 import stat
 import subprocess
 import sys
@@ -15,8 +19,9 @@ HPCP = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
 def run(args, cwd, stdin=b'', env=None):
 	"""The CLI, stdin given as bytes (never a tty): (return code, stdout + stderr as bytes)."""
 	full_env = dict(os.environ, **(env or {}))
+	# Its own session: no controlling terminal, wherever the tests run, so a prompt cannot reach a person's.
 	task = subprocess.run([sys.executable, HPCP] + args, input=stdin, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-		cwd=str(cwd), env=full_env, timeout=120)
+		cwd=str(cwd), env=full_env, timeout=120, start_new_session=True)
 	return task.returncode, task.stdout
 
 
@@ -258,15 +263,123 @@ def test_list_entries_landing_on_one_path_clash_first_wins(tmp_path, flags):
 	assert rc == 213 and (tmp_path / 'out/x/a').read_text() == 'inside'
 
 
-@pytest.mark.parametrize('flags', [[], ['-s'], ['-nb']], ids=['parallel', 'serial', 'sequential'])
-def test_merged_directories_clash_file_by_file(tmp_path, flags):
+MODES = [[], ['-s'], ['-nb'], ['-s', '-nb']]
+MODE_IDS = ['parallel', 'serial', 'sequential', 'serial-sequential']
+
+
+def _overlay(tmp_path, count=400):
+	for index in range(count):
+		write(tmp_path / ('base/d%d/f%d' % (index % 7, index)), 'base')
+		write(tmp_path / ('overlay/d%d/f%d' % (index % 7, index)), 'overlay')
+		write(tmp_path / ('base/only_base/f%d' % index), 'base')
+		write(tmp_path / ('overlay/only_overlay/f%d' % index), 'overlay')
+
+
+@pytest.mark.parametrize('flags', MODES, ids=MODE_IDS)
+def test_merged_directories_later_source_wins_in_every_mode(tmp_path, flags):
+	# Enough files that the parallel path runs many jobs at once: 'later' cannot depend on who finishes last.
+	_overlay(tmp_path)
+	rc, output = run(['base/', 'overlay/', '-d', 'out'] + flags, tmp_path)
+	assert rc == 0, output[-2000:]
+	got = files(tmp_path / 'out')
+	assert len(got) == 1200
+	assert {content for path, content in got.items() if path.startswith(b'd')} == {b'overlay'}
+	assert b'Destination clash' not in output
+	assert output.count(b'Merged directories: 400 file(s) replaced by a later source') == 1
+
+
+@pytest.mark.parametrize('flags', MODES, ids=MODE_IDS)
+def test_merged_directories_order_decides(tmp_path, flags):
+	_overlay(tmp_path, 100)
+	rc, _ = run(['overlay/', 'base/', '-d', 'out'] + flags, tmp_path)
+	assert rc == 0
+	assert {content for path, content in files(tmp_path / 'out').items() if path.startswith(b'd')} == {b'base'}
+
+
+@pytest.mark.parametrize('flags', MODES, ids=MODE_IDS)
+def test_same_named_directories_merge_with_the_later_winning(tmp_path, flags):
 	write(tmp_path / 'a/conf/same', 'from a')
 	write(tmp_path / 'a/conf/only_a', 'A')
 	write(tmp_path / 'b/conf/same', 'from b')
 	write(tmp_path / 'b/conf/only_b', 'B')
 	rc, output = run(['a/conf', 'b/conf', '-d', 'out'] + flags, tmp_path)
+	assert rc == 0 and b'Destination clash' not in output
+	assert files(tmp_path / 'out') == {b'conf/same': b'from b', b'conf/only_a': b'A', b'conf/only_b': b'B'}
+	assert b'1 file(s) replaced' in output
+
+
+@pytest.mark.parametrize('flags', MODES, ids=MODE_IDS)
+def test_three_directories_the_last_wins_and_all_count(tmp_path, flags):
+	for name in 'abc':
+		write(tmp_path / name / 'x', name)
+	rc, output = run(['a/', 'b/', 'c/', '-d', 'out'] + flags, tmp_path)
+	assert rc == 0 and files(tmp_path / 'out') == {b'x': b'c'} and b'2 file(s) replaced' in output
+
+
+@pytest.mark.parametrize('flags', MODES, ids=MODE_IDS)
+def test_symlinks_in_merged_directories_follow_the_same_rule(tmp_path, flags):
+	write(tmp_path / 'a/ln1', 'file')
+	(tmp_path / 'b').mkdir()
+	os.symlink('target', str(tmp_path / 'b/ln1'))
+	os.symlink('target', str(tmp_path / 'a/ln2'))
+	write(tmp_path / 'b/ln2', 'file')
+	os.symlink('first', str(tmp_path / 'a/ln3'))
+	os.symlink('second', str(tmp_path / 'b/ln3'))
+	rc, output = run(['a/', 'b/', '-d', 'out'] + flags, tmp_path)
+	assert rc == 0, output[-2000:]
+	assert files(tmp_path / 'out') == {b'ln1': b'-> target', b'ln2': b'file', b'ln3': b'-> second'}
+
+
+@pytest.mark.parametrize('flags', MODES, ids=MODE_IDS)
+def test_listed_directories_merge_with_the_later_winning(tmp_path, flags):
+	cwd = tmp_path / 'top/cwd'
+	write(cwd / 'x/same', 'inside')
+	write(tmp_path / 'top/x/same', 'outside')
+	rc, output = run(['-d', str(tmp_path / 'out')] + flags, cwd, b'../x\nx\n')
+	assert rc == 0 and files(tmp_path / 'out') == {b'x/same': b'inside'} and b'1 file(s) replaced' in output
+
+
+@pytest.mark.parametrize('flags', MODES, ids=MODE_IDS)
+def test_a_directly_named_file_and_a_directorys_file_clash_either_way(tmp_path, flags):
+	write(tmp_path / 'd/x', 'from dir')
+	write(tmp_path / 'd/other', 'other')
+	write(tmp_path / 'f/x', 'named')
+	rc, output = run(['d/', 'f/x', '-d', 'o1'] + flags, tmp_path)
 	assert rc == 213 and b'Destination clash' in output
-	assert files(tmp_path / 'out') == {b'conf/same': b'from a', b'conf/only_a': b'A', b'conf/only_b': b'B'}
+	assert files(tmp_path / 'o1') == {b'x': b'from dir', b'other': b'other'}
+	rc, output = run(['f/x', 'd/', '-d', 'o2'] + flags, tmp_path)
+	assert rc == 213 and b'Destination clash' in output
+	assert files(tmp_path / 'o2') == {b'x': b'named', b'other': b'other'}
+
+
+@pytest.mark.parametrize('flags', MODES, ids=MODE_IDS)
+def test_a_move_of_merged_directories_lands_the_later_file_and_removes_nothing(tmp_path, flags):
+	write(tmp_path / 'a/x', 'early')
+	write(tmp_path / 'a/only_a', 'A')
+	write(tmp_path / 'b/x', 'late')
+	rc, output = run(['a/', 'b/', '-d', 'out', '-rf', '-rm'] + flags, tmp_path)
+	assert rc == 212 and b'Remove skipped' in output and b'only copy' in output
+	assert files(tmp_path / 'out') == {b'x': b'late', b'only_a': b'A'}
+	assert (tmp_path / 'a/x').read_text() == 'early' and (tmp_path / 'b/x').read_text() == 'late'
+
+
+def test_a_move_of_directories_that_share_no_file_removes_them(tmp_path):
+	write(tmp_path / 'a/x', 'A')
+	write(tmp_path / 'b/y', 'B')
+	rc, output = run(['a/', 'b/', '-d', 'out', '-rf', '-rm'], tmp_path)
+	assert rc == 0, output[-2000:]
+	assert files(tmp_path / 'out') == {b'x': b'A', b'y': b'B'}
+	assert not (tmp_path / 'a/x').exists() and not (tmp_path / 'b/y').exists()
+
+
+@pytest.mark.parametrize('sequential', [False, True], ids=['batch', 'sequential'])
+def test_rme_goes_on_after_a_merge_win(tmp_path, hpcp_mod, reset_hpcp_globals, at_a_tty, monkeypatch, sequential):
+	monkeypatch.chdir(tmp_path)
+	write(tmp_path / 'a/x', 'early')
+	write(tmp_path / 'b/x', 'late')
+	write(tmp_path / 'out/stale', 'gone')
+	assert hpcp_mod.hpcp(['a/', 'b/'], dest_paths=[str(tmp_path / 'out')], single_thread=True, batch=not sequential, remove_extra=True) == 0
+	assert files(tmp_path / 'out') == {b'x': b'late'}
 
 
 def test_a_file_loses_to_a_directory_before_it(tmp_path):
@@ -309,10 +422,6 @@ def test_identical_content_still_clashes_as_cp_does(tmp_path):
 	write(tmp_path / 'b/x', 'same')
 	rc, _ = run(['a/x', 'b/x', '-d', 'out'], tmp_path)
 	assert rc == 213
-
-
-def test_one_source_tree_costs_no_claims(work, hpcp_mod):
-	assert hpcp_mod._first_claims(None, ['a'], 'a', ['b']) == ['a']
 
 
 def test_a_move_with_a_clash_removes_no_source(work):
@@ -371,6 +480,17 @@ def test_stored_lists_are_still_sets_of_stripped_lines(hpcp_mod, tmp_path):
 	path = tmp_path / 'stored'
 	path.write_bytes(b'./\n a.txt:abc \n\nlatin\xe9\n')
 	assert hpcp_mod.load_file_list(str(path)) == frozenset(['./', 'a.txt:abc', os.fsdecode(b'latin\xe9')])
+
+
+def test_list_bytes_the_filesystem_encoding_refuses_use_the_locale(hpcp_mod, tmp_path, monkeypatch):
+	# Windows: os.fsdecode is strict UTF-8 there, and a list from other tools is in the locale's encoding. Windows itself
+	# is not run: the decoder is stood in for.
+	real = os.fsdecode
+	def strict(name):
+		return name.decode('utf-8') if isinstance(name, bytes) else real(name)
+	monkeypatch.setattr(hpcp_mod.os, 'fsdecode', strict)
+	monkeypatch.setattr(hpcp_mod.locale, 'getpreferredencoding', lambda do_setlocale=True: 'cp1252')
+	assert parsed(hpcp_mod, tmp_path, b'caf\xe9\nplain\n') == ['caf\xe9', 'plain']
 
 
 def test_missing_list_file_reports(work):
@@ -487,10 +607,39 @@ def test_rme_with_a_positional_too_stays_scoped(work, hpcp_mod, reset_hpcp_globa
 	assert files(work / 'out') == {b'b/x.txt': b'two', b'src/a/x.txt': b'one', b'keep': b'stays'}
 
 
-def test_rme_with_the_list_on_stdin_cannot_ask_and_deletes_nothing(work):
+def test_rme_with_the_list_on_stdin_and_no_terminal_refuses_saying_why(work):
 	write(work / 'out/src/a/stale', 'stays')
 	rc, output = run(['-d', 'out', '-rme'], work, b'src/a\n')
-	assert rc == 147 and (work / 'out/src/a/stale').exists() and b'stale' in output
+	assert rc == 147 and (work / 'out/src/a/stale').exists() and b'no terminal can be opened' in output
+
+
+def test_rme_with_a_list_of_files_says_it_checked_nothing(work, hpcp_mod, reset_hpcp_globals, at_a_tty, monkeypatch, capsys):
+	monkeypatch.chdir(work)
+	write(work / 'out/keep', 'stays')
+	assert hpcp_list(hpcp_mod, work, b'src/a/x.txt\n', remove_extra=True) == 0
+	output = capsys.readouterr().out
+	assert output.count('-rme checked nothing') == 1 and 'find src -mindepth 1 -maxdepth 1 | hpcp -d out -rme' in output
+	assert (work / 'out/keep').exists()
+
+
+def test_rme_says_nothing_of_the_kind_when_a_directory_is_named(work, hpcp_mod, reset_hpcp_globals, at_a_tty, monkeypatch, capsys):
+	monkeypatch.chdir(work)
+	assert hpcp_list(hpcp_mod, work, b'src/a\nsrc/b/x.txt\n', remove_extra=True) == 0
+	assert '-rme checked nothing' not in capsys.readouterr().out
+
+
+def test_rme_says_nothing_of_the_kind_after_a_failed_copy(work, hpcp_mod, reset_hpcp_globals, at_a_tty, monkeypatch, capsys):
+	monkeypatch.chdir(work)
+	write(work / 'other/a/x.txt', 'zzz')
+	(work / 'the-list').write_bytes(b'src/a/x.txt\n')
+	rc = hpcp_mod.hpcp(['src/b/x.txt', 'other/a/x.txt'], dest_paths=[str(work / 'out')], source_file_list='the-list', single_thread=True, remove_extra=True)
+	assert rc != 0 and '-rme checked nothing' not in capsys.readouterr().out
+
+
+def test_rme_says_nothing_of_the_kind_without_a_list(work, hpcp_mod, reset_hpcp_globals, at_a_tty, monkeypatch, capsys):
+	monkeypatch.chdir(work)
+	assert hpcp_mod.hpcp(['src/a/x.txt'], dest_paths=[str(work / 'out') + os.sep], single_thread=True, remove_extra=True) == 0
+	assert '-rme checked nothing' not in capsys.readouterr().out
 
 
 def test_rme_positional_alone_still_judges_the_whole_destination(work, hpcp_mod, reset_hpcp_globals, at_a_tty, monkeypatch):
@@ -576,6 +725,97 @@ def test_move_with_a_list_lands_the_tree_and_removes_the_sources(work):
 def test_move_onto_itself_with_a_list_is_refused(work):
 	rc, output = run(['-rf', '-rm', '-d', '.'], work, b'src/a/x.txt\n')
 	assert rc == 241 and (work / 'src/a/x.txt').read_text() == 'one'
+
+
+# ---- prompts when stdin held the list (a real terminal) ----
+
+def in_a_terminal(command, cwd, answer):
+	"""Run a shell pipeline with a pty as its controlling terminal, its output to a file so that only the prompt reaches
+	the terminal or the log. Answer the first '(y/n)'. (exit status, what the terminal showed.)"""
+	log = os.path.join(str(cwd), 'log')
+	pid, fd = pty.fork()
+	if pid == 0:
+		os.chdir(str(cwd))
+		os.execvp('sh', ['sh', '-c', command + ' >log 2>&1'])
+	shown = b''
+	answered = False
+	deadline = time.monotonic() + 90
+	try:
+		while time.monotonic() < deadline:
+			ready, _, _ = select.select([fd], [], [], 0.2)
+			if not ready:
+				# A prompt on stdin at the terminal goes to stdout, which is the log here.
+				if not answered and os.path.exists(log) and b'(y/n)' in open(log, 'rb').read():
+					os.write(fd, answer + b'\n')
+					answered = True
+				continue
+			try:
+				chunk = os.read(fd, 4096)
+			except OSError:
+				break
+			if not chunk:
+				break
+			shown += chunk
+			if not answered and b'(y/n)' in shown:
+				os.write(fd, answer + b'\n')
+				answered = True
+		else:
+			os.kill(pid, signal.SIGKILL)
+			pytest.fail('no end in 90 s; the terminal showed %r' % shown)
+	finally:
+		os.close(fd)
+	return os.WEXITSTATUS(os.waitpid(pid, 0)[1]), shown
+
+
+def hpcp_command(args):
+	return ' '.join(shlex.quote(part) for part in [sys.executable, HPCP] + args)
+
+
+@pytest.mark.parametrize('answer, kept', [(b'y', False), (b'n', True)], ids=['yes', 'no'])
+def test_rme_with_the_list_on_stdin_asks_the_terminal(work, answer, kept):
+	write(work / 'out/src/a/stale', 'x')
+	rc, shown = in_a_terminal("printf 'src/a\\n' | " + hpcp_command(['-d', 'out', '-rme']), work, answer)
+	assert b'delete them? (y/n)' in shown
+	assert rc == (147 if kept else 0)
+	assert (work / 'out/src/a/stale').exists() == kept
+	assert (work / 'out/src/a/x.txt').exists()
+
+
+@pytest.mark.parametrize('answer, kept', [(b'y', False), (b'n', True)], ids=['yes', 'no'])
+def test_rm_with_the_list_on_stdin_asks_the_terminal(work, answer, kept):
+	rc, shown = in_a_terminal("printf 'src/a\\n' | " + hpcp_command(['-rm']), work, answer)
+	assert b'continue? (y/n)' in shown and rc == (147 if kept else 0)
+	assert (work / 'src/a/x.txt').exists() == kept
+
+
+@pytest.mark.parametrize('answer, kept', [(b'y', False), (b'n', True)], ids=['yes', 'no'])
+def test_move_with_the_list_on_stdin_asks_the_terminal(work, answer, kept):
+	rc, shown = in_a_terminal("printf 'src/a/x.txt\\n' | " + hpcp_command(['-rm', '-d', 'out']), work, answer)
+	assert b'continue? (y/n)' in shown and rc == (147 if kept else 0)
+	assert (work / 'src/a/x.txt').exists() == kept
+	assert (work / 'out/src/a/x.txt').read_text() == 'one'
+
+
+def test_explicit_dash_on_stdin_asks_the_terminal_too(work):
+	write(work / 'out/src/a/stale', 'x')
+	rc, shown = in_a_terminal("printf 'src/a\\n' | " + hpcp_command(['-sfl', '-', '-d', 'out', '-rme']), work, b'y')
+	assert b'(y/n)' in shown and rc == 0 and not (work / 'out/src/a/stale').exists()
+
+
+def test_a_list_file_with_stdin_at_the_terminal_asks_as_ever(work):
+	(work / 'the-list').write_bytes(b'src/a\n')
+	write(work / 'out/src/a/stale', 'x')
+	rc, shown = in_a_terminal(hpcp_command(['-sfl', 'the-list', '-d', 'out', '-rme']) + ' </dev/tty', work, b'y')
+	assert rc == 0 and not (work / 'out/src/a/stale').exists()
+
+
+def test_stdin_not_the_list_and_not_a_terminal_refuses_as_ever(work):
+	# A terminal exists, but stdin was not the list: no asking it.
+	(work / 'the-list').write_bytes(b'src/a\n')
+	write(work / 'out/src/a/stale', 'x')
+	rc, shown = in_a_terminal(hpcp_command(['-sfl', 'the-list', '-d', 'out', '-rme']) + ' </dev/null', work, b'y')
+	assert rc == 147 and b'(y/n)' not in shown and (work / 'out/src/a/stale').exists()
+	assert b'stdin is not a tty' in (work / 'log').read_bytes()
 
 
 # ---- modes: excludes, -do, several destinations, -fl, -cfl, -dfl, hash modes ----
@@ -674,6 +914,14 @@ def test_stored_list_rme_with_a_listed_source_deletes_nothing(work, hpcp_mod, re
 	hpcp_mod.hpcp([], source_file_list='the-list', target_file_list=str(stored), append_hash_to_file_list=False, single_thread=True)
 	hpcp_mod.hpcp([], source_file_list='the-list', target_file_list=str(stored), remove_extra=True, single_thread=True)
 	assert (work / 'src/a/x.txt').exists() and (work / 'src/a/deep/y.log').exists()
+
+
+def test_stored_list_on_stdin_rme_keeps_a_name_with_surrounding_whitespace(tmp_path):
+	# stdin can be read once: both spellings have to come from that one read. Here no terminal: refused, nothing deleted.
+	write(tmp_path / 'r/trail ', 'x')
+	write(tmp_path / 'r/plain', 'x')
+	rc, output = run(['r', '-fl', '-', '-rme'], tmp_path, b'r/\nr/plain\nr/trail \n')
+	assert b'No extra files found' in output and sorted(os.listdir(str(tmp_path / 'r'))) == ['plain', 'trail ']
 
 
 def test_stored_list_rme_keeps_a_name_with_surrounding_whitespace(tmp_path, hpcp_mod, reset_hpcp_globals, at_a_tty, monkeypatch):
