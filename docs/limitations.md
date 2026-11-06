@@ -73,12 +73,6 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - **Why:** correct and bounded as it is; a parallel scan is its own change.
 - **Revisit when:** the next hpcp release (9.82).
 
-### `-ncd` can end in a traceback
-- **Kind:** deferred.
-- **What the operator sees:** `-sfl` with `-ncd`, when a listed file's directory is missing under the destination: `cp` fails and each retry prints a Python traceback before the run ends with an error code (about 30 to 60 of 4000 fuzz runs). Nothing is lost.
-- **Why:** old, ugly but safe.
-- **Revisit when:** the next hpcp release (9.82).
-
 ### `-rme` can take a source inside the destination for extra
 - **Kind:** deferred.
 - **What the operator sees:** `hpcp out/sub/ b/ -d out/ -rme`, answered y at a terminal, deletes `out/sub/x`, the only copy when `b/x` replaced it at `out/x`: the file lies in the destination and no source lands on it, so it looks extra. With `-rf` the run then exits 212, and its message says -rme may have removed it. Same in 9.80.
@@ -104,9 +98,9 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - **Why:** keeping it takes a temporary name and a rename, which is its own design; that covers the link case too.
 - **Revisit when:** the next hpcp release (9.82).
 
-### A rerun with a source that became unreadable ends in a traceback
+### A rerun with a source that became unreadable ends in exit 191
 - **Kind:** deferred.
-- **What the operator sees:** the destination matches the source by size and mtime, then the source becomes unreadable (mode 000, not root): the identical-file check hashes first, `hash_file`'s open raises, and a copy ends with a Python traceback and exit 191 instead of the clean 190. A move ends 212 as usual (the exit is the highest of the errors), with its sources kept. Nothing is lost. Same on 9.80.
+- **What the operator sees:** the destination matches the source by size and mtime, then the source becomes unreadable (mode 000, not root): the identical-file check hashes first, `hash_file`'s open raises, and a copy says `Copy process crashed: Fatal Error copying ...: Permission denied` and ends with exit 191 instead of the clean 190 (no traceback since 9.82; 9.81 printed one). A move ends 212 as usual (the exit is the highest of the errors), with its sources kept. Nothing is lost. Same on 9.80.
 - **Why:** old and safe. The fix is to move the readability check ahead of the identical loop, or to catch `PermissionError` around the hash.
 - **Revisit when:** the next hpcp release (9.82).
 

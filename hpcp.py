@@ -3350,9 +3350,7 @@ def copy_file(src_path, dest_paths, full_hash=False, verbose=False, concurrent_p
 						_remove_what_failed(dest_path, before)
 						if using_bak_paths:
 							if not dest_paths and not verbose:
-								import traceback
 								print(f'Error copying {src_path} to {dest_path}, {e}')
-								print(traceback.format_exc())
 								print(f'Trying to copy from {src_path} to {dest_path} without sparse')
 							if os.name == 'posix':
 								cp_flags = "-f" if CONTENT_ONLY else "-af"
@@ -3369,9 +3367,7 @@ def copy_file(src_path, dest_paths, full_hash=False, verbose=False, concurrent_p
 				except Exception as e:
 					_remove_what_failed(dest_path, before)
 					if using_bak_paths and not dest_paths:
-						import traceback
 						eprint(f'Copy failed: ERROR copying {src_path} to {dest_path}, No more destination paths to try: {e}')
-						print(traceback.format_exc())
 						return 0, time.monotonic() - start_time, symLinks #, task_to_run
 					elif verbose:
 						print(f'Re-Retrying with a different destination path in {dest_paths}')
@@ -3391,8 +3387,10 @@ def copy_file(src_path, dest_paths, full_hash=False, verbose=False, concurrent_p
 				print(f'Estimated remaining size: {format_bytes(dest_free_space - copiedSize)}B')
 	except Exception as e:
 		eprint(f'Copy process crashed: Fatal Error copying {src_path} to {inDests}: {e}')
-		import traceback
-		print(traceback.format_exc())
+		if verbose or not isinstance(e, OSError):
+			# a file that cannot be read or reached says so in one line; anything else is a bug and keeps its traceback
+			import traceback
+			print(traceback.format_exc())
 		return 0, time.monotonic() - start_time, symLinks #, task_to_run
 	if not copiedSize:
 		copiedSize = src_size
@@ -8147,7 +8145,8 @@ def apply_disk_patch(volume_roots, target, mount_points, loop_devices, force=Fal
 	pttype = _partition_table_type(disk)
 	if not pttype:
 		raise RuntimeError(f'Invalid arguments: {_no_partition_table(target)}; a disk patch needs a whole GPT disk (block device or disk image)')
-	layout = read_disk_layout(disk, name=target, pttype=pttype)
+	# fs_params False: nothing in apply reads them, and on EL7 their xfs probe mounts the partition
+	layout = read_disk_layout(disk, name=target, pttype=pttype, fs_params=False)
 	problems = match_target_layout(disk_rows, layout)
 	if problems:
 		raise RuntimeError('Disk layout mismatch: ' + '; '.join(problems) + '; nothing applied')

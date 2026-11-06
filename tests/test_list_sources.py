@@ -3079,12 +3079,42 @@ def test_a_part_of_a_copy_goes_when_no_destination_takes_it(tmp_path, hpcp_mod, 
 	assert not os.path.exists(first) and not os.path.exists(second)
 
 
-def test_content_only_takes_a_link_loop_at_a_landing_without_a_crash(tmp_path):
+@pytest.mark.parametrize('flags', [[], ['-co']], ids=['plain', 'content-only'])
+def test_a_link_loop_at_a_landing_ends_without_a_traceback(tmp_path, flags):
+	# cp 8.22 (EL7) fails with ELOOP where a newer one replaces the link; either way nothing is lost and no traceback shows.
 	write(tmp_path / 'a/x', 'A')
 	os.makedirs(tmp_path / 'out')
 	os.symlink('x', tmp_path / 'out/x')
-	rc, output = run(['a/', '-d', 'out/', '-co'], tmp_path)
+	rc, output = run(['a/', '-d', 'out/'] + flags, tmp_path)
 	assert b'Traceback' not in output, output[-2000:]
+	assert (tmp_path / 'a/x').read_text() == 'A'
+
+
+def test_a_cp_that_fails_says_so_in_lines_and_shows_no_traceback(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch, capsys):
+	write(tmp_path / 'a/x', 'A')
+	def cp(*args, **kwargs):
+		raise RuntimeError('cp: cannot create regular file: Too many levels of symbolic links')
+	monkeypatch.setattr(hpcp_mod, 'run_command_in_multicmd_with_path_check', cp)
+	assert hpcp_mod.copy_file(str(tmp_path / 'a/x'), [str(tmp_path / 'out/x')])[0] == 0
+	captured = capsys.readouterr()
+	assert 'Copy failed' in captured.err and 'Too many levels' in captured.out + captured.err
+	assert 'Traceback' not in captured.out + captured.err
+
+
+@pytest.mark.parametrize('error, traceback_shown', [
+	(PermissionError(13, 'Permission denied', 'a/x'), False),
+	(TypeError('a bug'), True),
+], ids=['an OSError is one line', 'anything else keeps its traceback'])
+def test_a_copy_that_crashes_shows_a_traceback_only_for_what_is_not_an_oserror(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch, capsys, error, traceback_shown):
+	write(tmp_path / 'a/x', 'A')
+	write(tmp_path / 'out/x', 'A')
+	def identical(*args, **kwargs):
+		raise error
+	monkeypatch.setattr(hpcp_mod, 'is_file_identical', identical)
+	assert hpcp_mod.copy_file(str(tmp_path / 'a/x'), [str(tmp_path / 'out/x')])[0] == 0
+	captured = capsys.readouterr()
+	assert 'Copy process crashed' in captured.err
+	assert ('Traceback' in captured.out) == traceback_shown
 
 
 @no_permissions_as_root
@@ -3130,7 +3160,16 @@ def test_a_source_that_does_not_open_gets_no_cp(tmp_path, hpcp_mod, reset_hpcp_g
 	assert not ran and (tmp_path / 'out/x').read_text() == 'good'
 
 
-@pytest.mark.skipif(not hasattr(os, 'geteuid') or os.geteuid() != 0 or not shutil.which('setpriv'), reason='needs root to hand out a capability')
+def _setpriv_has_ambient_caps():
+	# util-linux 2.23 (EL7) has no --ambient-caps
+	try:
+		return b'--ambient-caps' in subprocess.run(['setpriv', '--help'], stdout=subprocess.PIPE, stderr=subprocess.STDOUT).stdout
+	except OSError:
+		return False
+
+
+@pytest.mark.skipif(not hasattr(os, 'geteuid') or os.geteuid() != 0 or not shutil.which('setpriv') or not _setpriv_has_ambient_caps(),
+	reason='needs root to hand out a capability, and a setpriv that has --ambient-caps')
 def test_a_service_with_read_capability_copies_what_it_cannot_read_by_mode(tmp_path):
 	write(tmp_path / 'a/x', 'X')
 	os.chmod(tmp_path / 'a/x', 0o000)
