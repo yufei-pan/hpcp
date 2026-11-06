@@ -3194,6 +3194,16 @@ def _leave_hard_links(path):
 		return
 	os.unlink(path)
 
+def _cp_flags(src_path):
+	"""How cp copies src_path. Under -co cp -f reads what it is given and writes through what is there, so only a regular file
+	goes that way: cp -a makes a new node for anything else and never opens it, so a device is not read to its end and a FIFO
+	does not wait for a writer. A source that is gone is cp's to answer."""
+	try:
+		regular = stat.S_ISREG(os.lstat(src_path).st_mode)
+	except OSError:
+		regular = True
+	return "-f" if CONTENT_ONLY and regular else "-af"
+
 def _can_open(path):
 	"""False when cp could not read the regular file path. Asked by opening, with the ids cp runs with: access() answers for
 	the real uid, and a service with a read capability or a setuid wrapper can open more. Only a regular file: cp -a makes a
@@ -3281,6 +3291,7 @@ def copy_file(src_path, dest_paths, full_hash=False, verbose=False, concurrent_p
 				return 0, time.monotonic() - start_time, symLinks
 			copied = False
 			copy_error_start = len(ERRORS)
+			cp_flags = _cp_flags(src_path)
 			while (not copied) and dest_paths:
 				if RANDOM_DESTINATION_SELECTION:
 					idx = random.randrange(len(dest_paths))
@@ -3325,7 +3336,7 @@ def copy_file(src_path, dest_paths, full_hash=False, verbose=False, concurrent_p
 						if not NO_CREATE_DIR:
 							_makedirs(os.path.dirname(dest_path), exist_ok=True)
 						if os.name == 'posix':
-							cp_command = ["cp", "-f" if CONTENT_ONLY else "-af"]
+							cp_command = ["cp", cp_flags]
 							if cp_supports_sparse():
 								cp_command.append("--sparse=always")
 							run_command_in_multicmd_with_path_check(cp_command + [src_path, dest_path],quiet=True,strict=True)
@@ -3345,7 +3356,6 @@ def copy_file(src_path, dest_paths, full_hash=False, verbose=False, concurrent_p
 								print(f'Error copying {src_path} to {dest_path}, {e}')
 								print(f'Trying to copy from {src_path} to {dest_path} without sparse')
 							if os.name == 'posix':
-								cp_flags = "-f" if CONTENT_ONLY else "-af"
 								run_command_in_multicmd_with_path_check(["cp", cp_flags, src_path, dest_path],quiet=True,strict=True)
 								copiedSize = get_file_size(dest_path)
 								#task_to_run = ["cp", "-af", src_path, dest_path]
@@ -10380,6 +10390,15 @@ def _roots_overlap(roots):
 	ordered = sorted(root.rstrip(os.path.sep) + os.path.sep for root in roots)
 	return any(below.startswith(root) for root, below in zip(ordered, ordered[1:]))
 
+def _would_unlink_device(src, dest):
+	"""True when a copy of src to dest would take the name of the device node at dest. cp -a (_cp_flags) unlinks what is there
+	for anything but a regular file; a regular file writes through, unless dest has other names, which goes first either way."""
+	try:
+		src_mode, dest_st = os.lstat(src).st_mode, os.lstat(dest)
+	except OSError:
+		return False
+	return (stat.S_ISBLK(dest_st.st_mode) or stat.S_ISCHR(dest_st.st_mode)) and (not stat.S_ISREG(src_mode) or dest_st.st_nlink > 1)
+
 def _settle_destinations(src_paths, dests, dest_image=None, directory_only=False, exclude=None, max_workers=1, parallel_file_listing=False,
 		remove=False, places=None):
 	"""Everything decided before a copy starts, so the answer is the same in every copy mode, for arguments and lists.
@@ -10397,7 +10416,9 @@ def _settle_destinations(src_paths, dests, dest_image=None, directory_only=False
 	  * a file named directly (an argument, a list entry) on either side: a clash. The first stays, as cp refuses to
 	    overwrite a file it just created, and it is reported;
 	  * a file where another source makes a directory (itself, or the directory a listed path implies): the directory
-	    stays, whichever came first, and the file is reported as a clash (cp would nest it, or fail).
+	    stays, whichever came first, and the file is reported as a clash (cp would nest it, or fail);
+	  * a file that would take the name of a device node the destination names itself (-d /dev/sdb): the node stays, and the
+	    file is reported as a clash. Below a destination a node is a file of the tree, and a source replaces it.
 	A source met again at its own place is no clash.
 
 	Cost: files are compared only when two real roots meet, which a copy with disjoint source and destination never
@@ -10435,6 +10456,12 @@ def _settle_destinations(src_paths, dests, dest_image=None, directory_only=False
 	if directory_only:
 		# Nothing is copied.
 		return dropped, 0, set()
+	named = {os.path.abspath(dest) for dest in dests}
+	for src, actual_dests, directory, _, _ in jobs:
+		for dest in actual_dests:
+			if not directory and dest in named and _would_unlink_device(src, dest):
+				eprint(f'Destination clash: {dest} is a device, and copying {src} would replace it: not copying it')
+				dropped.setdefault((src, tuple(actual_dests)), set()).add(src)
 	roots = [land for job in jobs for land in job[4]]
 	# An image is a tree of its own. A source that holds its mount point (hpcp / -di) reads what an earlier run put there.
 	if not dest_image:
@@ -10848,7 +10875,7 @@ def get_args(args = None):
 	parser.add_argument('-F','-frl','--file_rate_limit', type=str, default=None, help='Approximate a rate limit the copy speed in files/second. Example: 10K for 10000 files/s, 1Ki for 1024 files/s. Default is 0: no rate limit.')
 	parser.add_argument('-tfs','--target_file_system', type=str, default=None, help='Specify the target file system type. Will abort if the target file system type does not match. Example: ext4, xfs, f2fs, ntfs, fat32, exfat. Default is None: do not check target file system type.')
 	parser.add_argument('-ncd','--no_create_dir', action='store_true', help='Ignore any destination folder that does not already exist. ( Will still copy if dest is a file )')
-	parser.add_argument('-co','--content_only', action='store_true', help='Content-only copy: do not sync mode, owner, or timestamps on files or directories. A destination file with other hard links is replaced, not written through. Still create missing destination directories using filesystem-default permissions (so parent ACL/setgid/setuid inherit).')
+	parser.add_argument('-co','--content_only', action='store_true', help='Content-only copy: do not sync mode, owner, or timestamps on files or directories. A destination file with other hard links is replaced, not written through. A FIFO, socket or device node is made as cp -a makes it, never read. Still create missing destination directories using filesystem-default permissions (so parent ACL/setgid/setuid inherit).')
 	parser.add_argument('-ctl','--command_timeout_limit', type=int, default=0, help='Set the command timeout limit in seconds for external commands ( ex. cp / dd ). Default is 0: no timeout.')
 	parser.add_argument('-enes','--exit_not_enough_space', action='store_true', help='Exit if there is not enough space on the destination instead of continuing (Note: Default is continue as in compressed fs copy can be down even if source is bigger than free space).')
 	try:

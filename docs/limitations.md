@@ -94,6 +94,7 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 ### A source that opens and then fails on read costs the old copy
 - **Kind:** deferred.
 - **What the operator sees:** `cp` truncates the destination before its first read, so a source that opens and then fails (`/proc/self/mem` with an old `out/mem`) ends in exit 190 and the old copy is gone. 9.80 left it empty.
+  - A source that needs a node the user cannot make costs the old copy too: not root, `hpcp /dev/null -d out/` with a regular file at `out/null` ends in exit 200 and the file is gone, because `cp -a` unlinks before its `mknod` fails. Same on 9.80. Under `-co` 9.81 emptied the file instead (reasoned from `cp -f`, not run).
   - With several destinations, a part written through a link at the first destination and the file then taken by the second ends exit 0 with the link's target half written (`hpcp a/ -d out/ -d two/` with `out/x -> ../t/f`).
 - **Why:** keeping it takes a temporary name and a rename, which is its own design; that covers the link case too.
 - **Revisit when:** the next hpcp release (9.82).
@@ -112,9 +113,9 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 
 ### A FIFO that blocks the copy
 - **Kind:** deferred.
-- **What the operator sees:** a 644 FIFO named as a source under `-co` hangs, because `cp -f` reads it and no writer comes. A lone 644 FIFO at the destination hangs with or without `-co`, because `cp` writes to it and waits for a reader. Both as on 9.80. New in 9.81, under `-co`: a FIFO source over a hard-linked destination has already taken that name when it hangs, and the content stays at the other names. A regular file onto a FIFO with other names no longer hangs: it lands as a regular file at that name, as `-a` always did, and the other names keep the FIFO.
-- **Why:** rare, and the hang is old. The temporary name and rename above keeps the name until the copy is whole.
-- **Revisit when:** the next hpcp release (9.82).
+- **What the operator sees:** a regular file onto a lone FIFO at the destination hangs with or without `-co`, because `cp` writes to it and waits for a reader. As on 9.80. A regular file onto a FIFO with other names does not hang: it lands as a regular file at that name, as `-a` always did, and the other names keep the FIFO.
+- **Why:** rare, and the hang is old. The temporary name and rename above keeps the name until the copy is whole, and never opens the FIFO.
+- **Revisit when:** the next hpcp release.
 
 ### A named FIFO or socket is copied and still exits 200
 - **Kind:** deferred.
@@ -122,11 +123,11 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - **Why:** old and safe. A named special should either copy cleanly or be skipped as in a tree, and that is its own decision.
 - **Revisit when:** the next hpcp release (9.82).
 
-### `-co` reads a device source and writes through the device node at the destination
+### A regular file writes through a device node at the destination
 - **Kind:** deferred.
-- **What the operator sees:** as root, with a block or character device node named or in a list (a directory source skips it) and `-co`, when the node at the destination differs in mtime or device number, `cp -f` reads the source device to its end and writes it through the node at the destination: the same device, another disk, or a disk behind it, which on a mounted disk writes old blocks over live ones (reasoned, not run). The same on 9.80 when the mtime differs (the reviewer ran it); a different device number with the same mtime was skipped on 9.80. A matching pair of nodes (same kind, same device number, same mtime) is left alone since 9.81.
-- **Why:** old, root only, and it needs a named or listed device node and `-co`. Leaving a destination that is not a regular file alone belongs with the temporary name and rename above.
-- **Revisit when:** the next hpcp release (9.82).
+- **What the operator sees:** a regular source that lands on a device node, in a tree or named by `-d`, is written through it, with or without `-co`: into the device, or the disk behind it, which on a mounted disk writes over live blocks (reasoned, not run). Without `-co` the node also takes the source's mode and times. The same on 9.80. A device or FIFO source no longer does this: since 9.82 it is never read, with or without `-co`.
+- **Why:** old, and it needs a node where a file belongs. Leaving a destination that is not a regular file alone belongs with the temporary name and rename above. A device named by `-d` may be what the operator meant to write.
+- **Revisit when:** the next hpcp release.
 
 ### Rerunning an overlapping form is refused
 - **Kind:** known limitation.

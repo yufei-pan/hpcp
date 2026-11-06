@@ -3327,13 +3327,222 @@ def test_content_only_leaves_a_matching_pair_of_nodes_to_no_cp(tmp_path, hpcp_mo
 
 
 def test_a_content_only_rerun_over_the_fifo_a_plain_run_made_ends(tmp_path):
-	# cp -f onto the FIFO it made reads it, and waits for a writer. (A first run under -co has no node there, and cp -f reads
-	# the source FIFO: that one waits too, on 9.80 as well, and is not this.)
+	# cp -f onto the FIFO it made reads it, and waits for a writer.
 	os.makedirs(tmp_path / 'a')
 	os.mkfifo(tmp_path / 'a/p')
 	for flags in ([], ['-co']):
 		rc, output = _run_bounded(['a/p', '-d', 'out/'] + flags, tmp_path)
 		assert rc == 200 and stat.S_ISFIFO(os.lstat(tmp_path / 'out/p').st_mode), (flags, rc, output[-2000:])
+
+
+def test_a_content_only_first_run_makes_the_fifo_without_opening_it(tmp_path):
+	# cp -f read the source FIFO and waited for a writer that never comes, on 9.80 as well. Exit 200: see the first FIFO test.
+	os.makedirs(tmp_path / 'a')
+	os.mkfifo(tmp_path / 'a/p')
+	rc, output = _run_bounded(['a/p', '-d', 'out/', '-co'], tmp_path, seconds=15)
+	assert rc == 200 and stat.S_ISFIFO(os.lstat(tmp_path / 'out/p').st_mode), (rc, output[-2000:])
+
+
+def test_a_content_only_fifo_over_a_hard_linked_file_takes_the_name_and_ends(tmp_path):
+	os.makedirs(tmp_path / 'a')
+	os.mkfifo(tmp_path / 'a/p')
+	write(tmp_path / 'out/p', 'old')
+	os.link(tmp_path / 'out/p', tmp_path / 'other')
+	rc, output = _run_bounded(['a/p', '-d', 'out/', '-co'], tmp_path, seconds=15)
+	assert rc == 200 and stat.S_ISFIFO(os.lstat(tmp_path / 'out/p').st_mode), (rc, output[-2000:])
+	assert (tmp_path / 'other').read_text() == 'old'
+
+
+def test_a_content_only_fifo_with_a_waiting_writer_is_not_disturbed(tmp_path):
+	os.makedirs(tmp_path / 'a')
+	os.mkfifo(tmp_path / 'a/p')
+	writer = subprocess.Popen([sys.executable, '-c', _FIFO_WRITER, str(tmp_path / 'a/p')], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True)
+	try:
+		assert writer.stdout.readline() == b'ready\n'
+		time.sleep(0.3)
+		rc, output = _run_bounded(['a/p', '-d', 'out/', '-co'], tmp_path, seconds=15)
+		assert rc == 200 and stat.S_ISFIFO(os.lstat(tmp_path / 'out/p').st_mode), (rc, output[-2000:])
+		with pytest.raises(subprocess.TimeoutExpired):
+			writer.wait(timeout=1)
+	finally:
+		writer.kill()
+		writer.wait()
+		writer.stdout.close()
+
+
+@pytest.mark.parametrize('content_only, kind, flags', [(True, 'file', '-f'), (True, 'fifo', '-af'), (False, 'file', '-af'), (False, 'fifo', '-af')],
+	ids=['co-file', 'co-fifo', 'plain-file', 'plain-fifo'])
+def test_only_a_regular_file_goes_through_cp_f_on_every_attempt(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch, content_only, kind, flags):
+	os.makedirs(tmp_path / 'a')
+	if kind == 'fifo':
+		os.mkfifo(tmp_path / 'a/n')
+	else:
+		write(tmp_path / 'a/n', 'N')
+	ran = []
+	def cp_fails(command, *args, **kwargs):
+		ran.append(command)
+		raise RuntimeError('no')
+	monkeypatch.setattr(hpcp_mod, 'run_command_in_multicmd_with_path_check', cp_fails)
+	hpcp_mod.CONTENT_ONLY = content_only
+	hpcp_mod.copy_file(str(tmp_path / 'a/n'), [str(tmp_path / 'out/n')])
+	assert len(ran) >= 2 and {command[1] for command in ran} == {flags}, ran
+
+
+def test_a_source_that_is_gone_is_left_to_cp_under_content_only(tmp_path, hpcp_mod, reset_hpcp_globals):
+	hpcp_mod.CONTENT_ONLY = True
+	assert hpcp_mod._cp_flags(str(tmp_path / 'nosuch')) == '-f'
+
+
+@needs_root
+@pytest.mark.parametrize('matching_mtime', [True, False], ids=['same-mtime', 'other-mtime'])
+def test_content_only_makes_the_device_node_and_never_reads_the_source(tmp_path, matching_mtime):
+	# cp -f read /dev/zero's number to no end and wrote it through out/n. A read of a real disk ends, but writes the other disk.
+	os.makedirs(tmp_path / 'a')
+	os.makedirs(tmp_path / 'out')
+	_device_node(str(tmp_path / 'a/n'), 5, str(tmp_path))
+	_device_node(str(tmp_path / 'out/n'), 3, str(tmp_path / 'a/n'))
+	if not matching_mtime:
+		os.utime(tmp_path / 'out/n', (1, 1))
+	rc, output = _run_bounded(['a/n', '-d', 'out/', '-co'], tmp_path, seconds=15)
+	st = os.lstat(tmp_path / 'out/n')
+	assert rc == 200 and stat.S_ISCHR(st.st_mode) and st.st_rdev == os.makedev(1, 5), (rc, output[-2000:])
+
+
+@needs_root
+def test_content_only_first_run_makes_the_device_node_and_a_rerun_leaves_it(tmp_path):
+	os.makedirs(tmp_path / 'a')
+	_device_node(str(tmp_path / 'a/n'), 5, str(tmp_path))
+	inodes = set()
+	for attempt in range(2):
+		rc, output = _run_bounded(['a/n', '-d', 'out/', '-co'], tmp_path, seconds=15)
+		st = os.lstat(tmp_path / 'out/n')
+		assert rc == 200 and stat.S_ISCHR(st.st_mode) and st.st_rdev == os.makedev(1, 5), (attempt, rc, output[-2000:])
+		inodes.add(st.st_ino)
+	assert len(inodes) == 1
+
+
+_DEVICE_FLAGS = [[], ['-co'], ['-rf'], ['-co', '-rf'], ['-nb'], ['-co', '-s']]
+
+
+@needs_root
+@pytest.mark.parametrize('flags', _DEVICE_FLAGS, ids=' '.join)
+@pytest.mark.parametrize('kind', ['device', 'fifo'])
+def test_a_device_the_destination_names_is_never_unlinked(tmp_path, flags, kind):
+	# cp -a unlinks what is there for a node, so `hpcp /dev/sda -d /dev/sdb` took /dev/sdb's name.
+	os.makedirs(tmp_path / 'a')
+	if kind == 'fifo':
+		os.mkfifo(tmp_path / 'a/n')
+	else:
+		_device_node(str(tmp_path / 'a/n'), 5, str(tmp_path))
+	_device_node(str(tmp_path / 'bare'), 3, str(tmp_path / 'a/n'))
+	before = os.lstat(tmp_path / 'bare')
+	rc, output = _run_bounded(['a/n', '-d', 'bare'] + flags, tmp_path, seconds=15)
+	after = os.lstat(tmp_path / 'bare')
+	assert (after.st_ino, after.st_mode, after.st_rdev) == (before.st_ino, before.st_mode, before.st_rdev), output[-2000:]
+	assert rc == 213 and b'Destination clash' in output, (rc, output[-2000:])
+	assert os.path.lexists(tmp_path / 'a/n')
+
+
+@needs_root
+@pytest.mark.parametrize('flags', [[], ['-co']], ids=['plain', 'co'])
+def test_a_device_with_another_name_keeps_this_name_when_the_destination_names_it(tmp_path, flags):
+	# Under -co _leave_hard_links, under -a cp itself, would take a name with others away first.
+	write(tmp_path / 'a/f', 'F')
+	_device_node(str(tmp_path / 'bare'), 3, str(tmp_path))
+	os.link(tmp_path / 'bare', tmp_path / 'other')
+	before = os.lstat(tmp_path / 'bare')
+	rc, output = _run_bounded(['a/f', '-d', 'bare'] + flags, tmp_path, seconds=15)
+	after = os.lstat(tmp_path / 'bare')
+	assert rc == 213 and (after.st_ino, after.st_mode) == (before.st_ino, before.st_mode), (rc, output[-2000:])
+
+
+@needs_root
+@pytest.mark.parametrize('flags', [[], ['-co']], ids=['plain', 'co'])
+def test_a_failed_write_through_a_device_the_destination_names_leaves_the_node(tmp_path, flags):
+	# /dev/full: cp fails with ENOSPC, and the cleanup of a failed copy must see that the node is what was there.
+	write(tmp_path / 'a/f', 'F')
+	os.mknod(tmp_path / 'bare', 0o600 | stat.S_IFCHR, os.makedev(1, 7))
+	before = os.lstat(tmp_path / 'bare')
+	rc, output = _run_bounded(['a/f', '-d', 'bare'] + flags, tmp_path, seconds=30)
+	after = os.lstat(tmp_path / 'bare')
+	assert rc != 0 and (after.st_ino, after.st_rdev) == (before.st_ino, before.st_rdev), (rc, output[-2000:])
+	assert (tmp_path / 'a/f').read_text() == 'F'
+
+
+@needs_root
+@pytest.mark.parametrize('where', ['named', 'tree'])
+@pytest.mark.parametrize('flags', [[], ['-co']], ids=['plain', 'co'])
+def test_a_regular_file_onto_a_device_node_writes_through_as_before(tmp_path, flags, where):
+	# No -co rule for this: a regular source is cp -f, which keeps the node as it was (cp -a gives it the source's mode). The
+	# proper fix is a temporary name (docs/limitations.md).
+	write(tmp_path / 'a/f', 'F')
+	os.chmod(tmp_path / 'a/f', 0o640)
+	os.makedirs(tmp_path / 'out')
+	node = tmp_path / ('bare' if where == 'named' else 'out/f')
+	_device_node(str(node), 3, str(tmp_path))
+	os.utime(node, (1, 1))
+	before = os.lstat(node)
+	rc, output = _run_bounded(['a/f', '-d', str(node) if where == 'named' else 'out/'] + flags, tmp_path, seconds=30)
+	after = os.lstat(node)
+	assert rc == 0 and (after.st_ino, after.st_rdev) == (before.st_ino, before.st_rdev) and stat.S_ISCHR(after.st_mode), (rc, output[-2000:])
+	if flags:
+		assert (after.st_mode, after.st_mtime_ns) == (before.st_mode, before.st_mtime_ns)
+
+
+@pytest.fixture
+def two_loops(tmp_path):
+	"""(the loop device of an image of A's, the one of an image of B's, the image of B's), read-write."""
+	if not hasattr(os, 'geteuid') or os.geteuid() != 0 or not shutil.which('losetup'):
+		pytest.skip('needs root and losetup')
+	loops = []
+	try:
+		for name, byte in (('a.img', b'A'), ('b.img', b'B')):
+			with open(tmp_path / name, 'wb') as image:
+				image.write(byte * (1 << 20))
+			task = subprocess.run(['losetup', '--find', '--show', str(tmp_path / name)], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, universal_newlines=True)
+			if task.returncode:
+				pytest.skip('no loop devices here')
+			loops.append(task.stdout.strip())
+		yield loops[0], loops[1], tmp_path / 'b.img'
+	finally:
+		for loop in loops:
+			subprocess.run(['losetup', '-d', loop], check=False)
+
+
+def _node_of(device, path):
+	st = os.stat(device)
+	os.mknod(path, 0o600 | stat.S_IFBLK, st.st_rdev)
+
+
+def _disk_of_b_is_whole(image):
+	with open(image, 'rb') as f:
+		return f.read() == b'B' * (1 << 20)
+
+
+@pytest.mark.parametrize('matching_mtime', [True, False], ids=['same-mtime', 'other-mtime'])
+def test_content_only_never_copies_one_disk_over_another(tmp_path, two_loops, matching_mtime):
+	loop_a, loop_b, image_b = two_loops
+	os.makedirs(tmp_path / 'a')
+	os.makedirs(tmp_path / 'out')
+	_node_of(loop_a, tmp_path / 'a/n')
+	_node_of(loop_b, tmp_path / 'out/n')
+	st = os.lstat(tmp_path / 'a/n')
+	os.utime(tmp_path / 'out/n', ns=(st.st_atime_ns, st.st_mtime_ns) if matching_mtime else (1, 1))
+	rc, output = _run_bounded(['a/n', '-d', 'out/', '-co'], tmp_path, seconds=30)
+	subprocess.run(['blockdev', '--flushbufs', loop_b], check=False)
+	assert _disk_of_b_is_whole(image_b), (rc, output[-2000:])
+	assert rc == 200 and os.lstat(tmp_path / 'out/n').st_rdev == os.stat(loop_a).st_rdev, (rc, output[-2000:])
+
+
+@pytest.mark.parametrize('flags', [[], ['-co']], ids=['plain', 'co'])
+def test_a_disk_the_destination_names_is_left_when_another_disk_is_the_source(tmp_path, two_loops, flags):
+	loop_a, loop_b, image_b = two_loops
+	before = os.lstat(loop_b)
+	rc, output = _run_bounded([loop_a, '-d', loop_b] + flags, tmp_path, seconds=30)
+	after = os.lstat(loop_b)
+	subprocess.run(['blockdev', '--flushbufs', loop_b], check=False)
+	assert rc == 213 and (after.st_ino, after.st_rdev) == (before.st_ino, before.st_rdev), (rc, output[-2000:])
+	assert _disk_of_b_is_whole(image_b)
 
 
 @no_permissions_as_root

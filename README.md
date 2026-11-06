@@ -368,7 +368,8 @@ options:
   -co, --content_only   Content-only copy: do not sync mode, owner, or
                         timestamps on files or directories. A destination
                         file with other hard links is replaced, not written
-                        through. Still create
+                        through. A FIFO, socket or device node is made as cp
+                        -a makes it, never read. Still create
                         missing destination directories using filesystem-
                         default permissions (so parent ACL/setgid/setuid
                         inherit).
