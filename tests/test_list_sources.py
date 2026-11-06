@@ -3143,10 +3143,11 @@ def test_a_service_with_read_capability_copies_what_it_cannot_read_by_mode(tmp_p
 
 
 @no_permissions_as_root
-def test_a_fifo_is_no_read_so_its_mode_stops_nothing(tmp_path):
+@pytest.mark.parametrize('mode', [0o000, 0o644], ids=oct)
+def test_a_fifo_is_no_read_so_its_mode_stops_nothing(tmp_path, mode):
 	# cp -a makes a new one, reading nothing. And asking must not hang on it: no writer is coming.
 	os.makedirs(tmp_path / 'a')
-	os.mkfifo(tmp_path / 'a/p', 0o000)
+	os.mkfifo(tmp_path / 'a/p', mode)
 	task = subprocess.run([sys.executable, HPCP, 'a/p', '-d', 'out/'], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
 		cwd=str(tmp_path), timeout=60, start_new_session=True)
 	assert stat.S_ISFIFO(os.lstat(tmp_path / 'out/p').st_mode), task.stdout[-2000:]
