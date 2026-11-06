@@ -41,3 +41,9 @@ entries go last, in the same commit as the change:
 - Why we had to change: `hpcp a/ -d out/ -co -rf` with `ln a/y out/x` wrote a/x into a/y's inode: out/y came out holding X, empty or partial in about half of 20 runs, and the source was then removed. `hpcp a/ b/ -d out/ -co -rf` with `ln b/x out/y` lost B in 10 of 20.
 - Original design was wrong because: `-co` swapped `cp -af` for `cp -f` to keep metadata and lost what `-a` also does: `cp -a` unlinks a destination with several names, `cp -f` opens it. The landing rule works by path, and a hard link has no path to compare.
 - Lesson: when an option changes how a file is written, list what the old way did besides the thing the option is about. A check by path protects paths; what shares an inode has to be left by the writer.
+
+## 2026-11-06 Ask the rule that decided, not the spelling
+- Changed: a directory named as an argument that is a destination and lands below itself is left out of the run, as a list entry is: `hpcp a b -d b/ -rf` was 241 and is now exit 0, `a` moved, `b` left. `hpcp a -d a/ -rf` was 241 and now moves nothing, exit 0. `-rme` then checks nothing.
+- Why we had to change: `hpcp * -d backup/` with `backup` in the working directory gave 0, 213, 213: the first run nests `backup/backup`, and the next run's files land on it. 7617241 gave 0, 0, 0, one level deeper each run.
+- Original design was wrong because: leaving out a source that holds the destination covers what it holds, and a source that is the destination holds nothing to copy but itself. It stayed a source that read the files others land on. A prototype that tested the trailing slash away made `a/` look named: `hpcp a/ b/ -d a/ -d out/ -rf` then destroyed a/x. `a/` lands on itself, and 241 stays right.
+- Lesson: when a case turns on where something lands, ask `_source_dest` and compare its answer with the destination; never re-derive the rule from the spelling. `a`, `a/`, `.` and `..` differ only in that answer.

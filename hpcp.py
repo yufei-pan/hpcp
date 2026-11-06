@@ -8846,7 +8846,9 @@ def _inside_destinations(src_paths, dests, places):
 	working directory share a directory strictly inside every destination that holds the entry (by each spelling of the
 	entry: as given and by its real parent), and its landing is neither the entry nor below it: then it lands in another place, however it is spelled, and a second run
 	finds the same. A directory that holds the destination (find . | hpcp -d out, hpcp . -d out/) is kept: the walk below it
-	must leave the destination out (_exclude_roots), or it would read files other sources are writing."""
+	must leave the destination out (_exclude_roots), or it would read files other sources are writing. A directory named as
+	an argument that is a destination (hpcp * -d backup/) goes, as a list entry does: it would land below itself. 'a/' has
+	no name to land under, so it lands on itself, a thing _settle_destinations judges. Both count as holding."""
 	roots = set()
 	for dest in dests:
 		roots.update((os.path.abspath(dest), places.directory(os.path.abspath(dest))))
@@ -8864,6 +8866,10 @@ def _inside_destinations(src_paths, dests, places):
 			if os.path.isabs(src) or not _lands_elsewhere(spellings, src.landing, roots, real_cwd):
 				skipped += 1
 				continue
+		if directory and not isinstance(src, _ListedSource) and any(places.directory(os.path.abspath(dest)) == spellings[1] and
+				_source_dest(src, dest) != os.path.abspath(dest) for dest in dests):
+			holding.add(path + os.path.sep)
+			continue
 		if directory:
 			# Named as this entry's walk will spell it, whichever spelling of the entry holds the destination.
 			for spelling in spellings:
@@ -11012,7 +11018,7 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = multipr
 					print(f"Skipped {skipped} list entries inside the destination {', '.join(dests)}: not copied or moved")
 				if holding:
 					copy_exclude = _exclude_roots(exclude, holding)
-					print(f"A source holds the destination ({', '.join(sorted(holding))}): the destination is left out of its copy")
+					print(f"A source is or holds the destination ({', '.join(sorted(holding))}): the destination is left out of the copy")
 				if not src_paths:
 					print('Nothing to copy: every source lies inside the destination')
 					return get_rc_from_error()
@@ -11048,7 +11054,7 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = multipr
 					'fix them (or exclude those paths with -e) and re-run')
 			elif remove_extra and holding:
 				# What it left out of its copy lies in the destination, and looks extra there.
-				print('-rme checked nothing: a source holds the destination, so all that is in it belongs to that source. '
+				print('-rme checked nothing: a source is or holds the destination, so all that is in it belongs to that source. '
 					'To mirror a directory, name a destination outside it')
 			elif remove_extra and not _directory_sources(_src_to_dest_map(src_paths, dests, bool(dest_image))):
 				# Only a directory can say what is extra below it: a named file, a link or a list of files says nothing of the rest.
