@@ -448,7 +448,8 @@ def test_in_use_raw_partition_is_refused_before_it_is_hashed(tmp_path, hpcp_mod,
 	monkeypatch.setattr(hpcp_mod, '_refuse_if_image_in_use', lambda image: None)
 	monkeypatch.setattr(hpcp_mod, '_attach_disk', lambda path, ro, loops: '/dev/fake')
 	monkeypatch.setattr(hpcp_mod, '_partition_table_type', lambda device: 'gpt')
-	monkeypatch.setattr(hpcp_mod, 'read_disk_layout', lambda disk, name=None, **kwargs: layout)
+	read_with = []
+	monkeypatch.setattr(hpcp_mod, 'read_disk_layout', lambda disk, name=None, **kwargs: read_with.append(kwargs) or layout)
 	monkeypatch.setattr(hpcp_mod, '_mountinfo_entries', lambda: [])
 	monkeypatch.setattr(hpcp_mod, '_swap_devices', lambda: set())
 	monkeypatch.setattr(hpcp_mod, '_device_number', lambda device: (7, 0))
@@ -462,6 +463,8 @@ def test_in_use_raw_partition_is_refused_before_it_is_hashed(tmp_path, hpcp_mod,
 			'which cannot be checked or written while it is in use; apply the patch offline (an offline apply skips it if it is already done)') + '$'):
 		hpcp_mod.apply_disk_patch([volume], str(tmp_path / 'node.img'), [], [])
 	assert hashed == []
+	# nothing in an apply reads the mkfs parameters, and on EL7 probing them mounts each xfs partition
+	assert read_with and all(kwargs.get('fs_params') is False for kwargs in read_with)
 
 
 def test_several_in_use_raw_partitions_and_other_refusals_share_one_message(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
@@ -1209,11 +1212,12 @@ def test_a_diff_with_temp_dirs_on_a_live_filesystem_leaves_nothing_in_another_na
 @pytest.mark.skipif(shutil.which('unshare') is None, reason='needs unshare')
 def test_an_apply_with_temp_dirs_on_a_live_filesystem_leaves_nothing_in_another_namespace(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
 	"""As for a diff, with the sections: partition 1 is live, so it is a bind, and partition 2 is mounted after it. The
-	apply takes the sections off itself, in the opposite order to their mounts."""
+	apply takes the sections off itself, in the opposite order to their mounts. Partition 1 is an ESP, which is applied
+	last: the order of the mounts (1, 2) is not the order of the applies (2, 1), so releasing in apply order leaves the bind."""
 	base, golden, target = tmp_path / 'base.img', tmp_path / 'golden.img', tmp_path / 'target.img'
 	with open(str(base), 'wb') as f:
 		f.truncate(96 << 20)
-	_run('sgdisk', '-n1:2048:+40M', '-n2:0:+40M', base)
+	_run('sgdisk', '-n1:2048:+40M', '-t1:EF00', '-n2:0:+40M', base)
 	with _attached(base) as loop:
 		_run('mkfs.ext4', '-q', '-F', loop + 'p1')
 		_run('mkfs.ext4', '-q', '-F', loop + 'p2')
@@ -2799,6 +2803,20 @@ def test_fat_serial_writes_the_fat16_boot_sector(tmp_path, hpcp_mod, reset_hpcp_
 	assert hpcp_mod.ERRORS == []
 
 
+@pytest.mark.parametrize('fat32', [False, True], ids=['fat16', 'fat32'])
+def test_fat_serial_writes_after_either_extended_boot_signature(tmp_path, hpcp_mod, reset_hpcp_globals, fat32):
+	"""0x28 (OS/2, DOS 4.0) marks the volume ID field as well as 0x29."""
+	image = tmp_path / 'fat.img'
+	expected = _fat_image(image, _fat_boot_sector(fat32, signature=0x28), backup_at=6 * 512 if fat32 else None)
+	hpcp_mod._write_fat_serial(str(image), 'ABCD-1234')
+	offset = 67 if fat32 else 39
+	expected[offset:offset + 4] = bytes.fromhex('3412CDAB')
+	if fat32:
+		expected[6 * 512 + offset:6 * 512 + offset + 4] = bytes.fromhex('3412CDAB')
+	assert image.read_bytes() == bytes(expected)
+	assert hpcp_mod.ERRORS == []
+
+
 @pytest.mark.parametrize('sector_size', [512, 4096])
 def test_fat_serial_writes_fat32_and_its_backup_boot_sector(tmp_path, hpcp_mod, reset_hpcp_globals, sector_size):
 	"""fsck.fat reports a backup boot sector that differs from the first."""
@@ -3181,6 +3199,9 @@ def _fake_btrfs_probe(monkeypatch, hpcp_mod, enc, tool_output, have_tool=True):
 	def fake(argv, **kwargs):
 		calls.append(argv)
 		if argv[0] == 'btrfs':
+			if not tool_output:
+				# what run_command_in_multicmd_with_path_check does for a tool that exits non-zero
+				hpcp_mod.ERRORS.append("Task return code error: Command '['btrfs', 'filesystem', 'label']' failed with return code 1.")
 			return tool_output
 		if '-o' in argv and argv[argv.index('-o') + 1] == 'value':
 			return ['from blkid raw']
@@ -3212,6 +3233,13 @@ def test_probe_identity_keeps_blkids_btrfs_label_when_the_tool_gives_none(hpcp_m
 	assert hpcp_mod._probe_identity('/dev/x1') == ('btrfs', 'u1', 'short label')
 	assert capsys.readouterr().err == ''
 	assert hpcp_mod.ERRORS == []
+
+
+def test_probe_identity_reads_a_cut_btrfs_label_from_the_tool_alone(hpcp_mod, reset_hpcp_globals, monkeypatch):
+	"""The raw blkid probe is for a cut label no tool answered for: a tool's label is whole."""
+	calls = _fake_btrfs_probe(monkeypatch, hpcp_mod, 'a' * 258 + '\\x2', ['the tool label'])
+	assert hpcp_mod._probe_identity('/dev/x1')[2] == 'the tool label'
+	assert calls == [['blkid', '-p', '-o', 'udev', '/dev/x1'], ['btrfs', 'filesystem', 'label', '/dev/x1']]
 
 
 def test_probe_identity_falls_back_to_the_raw_probe_for_a_cut_btrfs_label(hpcp_mod, reset_hpcp_globals, monkeypatch):
