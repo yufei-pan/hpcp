@@ -823,6 +823,42 @@ realtime =none                   extsz=4096   blocks=0, rtextents=0
 """.splitlines()
 
 
+def _fake_xfs_tools(monkeypatch, mounts=True):
+	"""xfs_info as xfsprogs 4.5 (EL7) has it: nothing for a device that is not mounted. Returns the argvs run."""
+	calls, mounted = [], []
+
+	def fake(argv, **kwargs):
+		calls.append(argv)
+		if argv[0] == 'mount' and mounts:
+			mounted.append(argv[-1])
+		elif argv[0] == 'umount':
+			mounted.remove(argv[-1])
+		elif argv[0] == 'xfs_info' and argv[-1] in mounted:
+			return list(_XFS_INFO_OUTPUT)
+		return []
+
+	monkeypatch.setattr(hpcp, 'run_command_in_multicmd_with_path_check', fake)
+	monkeypatch.setattr(hpcp, '_is_mount_point', lambda path: path.rstrip(os.sep) in mounted)
+	return calls
+
+
+def test_probe_xfs_mounts_a_filesystem_xfs_info_will_only_read_mounted(monkeypatch):
+	calls = _fake_xfs_tools(monkeypatch)
+	params = hpcp._probe_xfs('/dev/fake3')
+	assert params['meta-data']['isize'] == '1024'
+	assert calls[0] == ['xfs_info', '/dev/fake3']
+	mount_point = calls[1][-1]
+	assert calls[1] == ['mount', '-o', 'ro,nouuid,norecovery', '/dev/fake3', mount_point]
+	assert calls[2:] == [['xfs_info', mount_point], ['umount', mount_point]]
+	assert not os.path.exists(mount_point)
+
+
+def test_probe_xfs_gives_nothing_when_the_filesystem_cannot_be_mounted(monkeypatch):
+	calls = _fake_xfs_tools(monkeypatch, mounts=False)
+	assert hpcp._probe_xfs('/dev/fake3') == {}
+	assert not os.path.exists(calls[1][-1])
+
+
 def test_probe_xfs_parses_sections(monkeypatch):
 	monkeypatch.setattr(hpcp, 'run_command_in_multicmd_with_path_check',
 						lambda command, **kwargs: _XFS_INFO_OUTPUT)

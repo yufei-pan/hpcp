@@ -1292,6 +1292,8 @@ def _build_ext(params):
 _FS_PARAM_PROBES.update({'ext2': _probe_ext, 'ext3': _probe_ext, 'ext4': _probe_ext})
 _FS_MKFS_BUILDERS.update({'ext2': _build_ext, 'ext3': _build_ext, 'ext4': _build_ext})
 
+_XFS_RO_MOUNT_OPTIONS = 'ro,nouuid,norecovery'
+
 def _probe_xfs(device):
 	"""
 	Read xfs geometry and features from xfs_info.
@@ -1303,7 +1305,18 @@ def _probe_xfs(device):
 	"""
 	params = {}
 	section = ''
-	for line in run_command_in_multicmd_with_path_check(['xfs_info', device], quiet=True, extra_env=_C_LOCALE):
+	lines = run_command_in_multicmd_with_path_check(['xfs_info', device], quiet=True, extra_env=_C_LOCALE)
+	if not lines:
+		mount_point = tempfile.mkdtemp()
+		run_command_in_multicmd_with_path_check(['mount', '-o', _XFS_RO_MOUNT_OPTIONS, device, mount_point], quiet=True)
+		if _is_mount_point(mount_point):
+			lines = run_command_in_multicmd_with_path_check(['xfs_info', mount_point], quiet=True, extra_env=_C_LOCALE)
+			run_command_in_multicmd_with_path_check(['umount', mount_point], quiet=True)
+		try:
+			os.rmdir(mount_point)
+		except OSError:
+			pass
+	for line in lines:
 		if not line.strip():
 			continue
 		if not line[0].isspace():
@@ -6419,7 +6432,7 @@ def _probe_fs_type(device):
 
 def _ro_mount_options(device):
 	"""Read-only mount options that also work for cloned (duplicate-UUID) xfs and dirty ext3/4 journals."""
-	return {'xfs': 'ro,nouuid,norecovery', 'ext3': 'ro,noload', 'ext4': 'ro,noload'}.get(_probe_fs_type(device), 'ro')
+	return {'xfs': _XFS_RO_MOUNT_OPTIONS, 'ext3': 'ro,noload', 'ext4': 'ro,noload'}.get(_probe_fs_type(device), 'ro')
 
 def _rw_mount_command(device, mount_point):
 	"""The read-write mount command for device: a clone of a mounted xfs (a golden image, an image of a live node's
