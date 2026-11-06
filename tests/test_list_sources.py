@@ -1757,6 +1757,24 @@ def _but_log(tree):
 	return {name: content for name, content in tree.items() if os.path.basename(name) != b'log'}
 
 
+def _a_merge_out_of_the_destination(tmp_path):
+	write(tmp_path / 'out/sub/x', 'S')
+	write(tmp_path / 'b/x', 'B')
+	return ['out/sub/', 'b/', '-d', 'out/', '-rf']
+
+
+def test_safe_remove_skipped_says_every_source_stays(tmp_path):
+	rc, output = run(_a_merge_out_of_the_destination(tmp_path), tmp_path)
+	assert rc == 212 and b'every source stays' in output, output[-2000:]
+	assert files(tmp_path) == {b'out/sub/x': b'S', b'b/x': b'B', b'out/x': b'B'}
+
+
+def test_remove_skipped_does_not_claim_what_rme_took(tmp_path):
+	# -rme runs first and takes a source inside the destination for extra (docs/limitations.md).
+	rc, output = _rme_in_a_terminal(tmp_path, _a_merge_out_of_the_destination(tmp_path))
+	assert rc == 212 and b'unless -rme removed it above' in output and b'every source stays' not in output, output[-2000:]
+
+
 def test_rme_with_a_named_file_into_its_own_directory_checks_nothing(tmp_path):
 	write(tmp_path / 'a/x', 'X')
 	write(tmp_path / 'a/other', 'O')
