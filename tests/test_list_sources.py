@@ -10,6 +10,7 @@ import signal
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 
 import pytest
@@ -2309,7 +2310,7 @@ def test_rme_takes_nothing_from_a_destination_a_source_holds(tmp_path, source):
 	write(tmp_path / 'd/keep', 'K')
 	write(tmp_path / 'names', '.\n')
 	rc, output = _rme_in_a_terminal(tmp_path, source + ['-d', 'd/'])
-	assert rc == 0 and b'-rme checked nothing: a source holds the destination' in output and b'(y/n)' not in output, output[-2000:]
+	assert rc == 0 and b'-rme checked nothing: a source is or holds the destination' in output and b'(y/n)' not in output, output[-2000:]
 	assert (tmp_path / 'd/keep').read_text() == 'K' and (tmp_path / 'd/x').read_text() == 'X'
 
 
@@ -2400,31 +2401,6 @@ def test_a_special_file_lands_nowhere(tmp_path, monkeypatch, kind):
 	rc, output = run(['a/', 'out/b/', '-d', 'out/'], tmp_path)
 	assert rc == 0 and b'would land on' not in output, output[-2000:]
 	assert files(tmp_path / 'out') == {b'y': b'Y', b'x': b'B', b'b/x': b'B'}
-
-
-def test_a_path_too_long_to_copy_lands_nowhere(tmp_path, monkeypatch):
-	# deep/a/n/f is over 4096 characters, so copy_file skips it: its landing out/n/f, a short path and a file of the
-	# source out/n/, gets nothing. The skip itself is reported.
-	write(tmp_path / 'out/b/f', 'B')
-	monkeypatch.chdir(tmp_path)
-	while len(os.getcwd()) < 3900:
-		os.mkdir('d' * 100)
-		os.chdir('d' * 100)
-	deep = os.getcwd()
-	name = 'n' * (4090 - len(deep) - len('/a/'))
-	os.makedirs('a/' + name)
-	os.chdir('a/' + name)
-	with open('f' * 20, 'w') as f:
-		f.write('A')
-	os.chdir(deep)
-	write(tmp_path / 'out' / name / ('f' * 20), 'B')
-	try:
-		rc, output = run(['a/', str(tmp_path / 'out' / name) + '/', '-d', str(tmp_path / 'out') + '/'], deep)
-		assert b'would land on' not in output and b'is too long' in output, output[-2000:]
-		assert (tmp_path / 'out' / ('f' * 20)).read_text() == 'B'
-	finally:
-		monkeypatch.chdir(tmp_path)
-		subprocess.run(['rm', '-rf', 'd' * 100])
 
 
 @pytest.mark.parametrize('flags', [[], ['-rf']], ids=['copy', 'move'])
@@ -2614,3 +2590,297 @@ def test_dest_image_keeps_absolute_paths_and_a_list_only_cleans_its_directories(
 		assert os.path.exists(mount + '/elsewhere/keep') and not os.path.exists(inside + '/src/a/stale')
 	finally:
 		subprocess.run(['umount', mount], stderr=subprocess.DEVNULL)
+
+
+@pytest.mark.skipif(not hasattr(os, 'geteuid') or os.geteuid() != 0, reason='needs root and loop devices')
+def test_an_image_mounted_inside_its_source_takes_a_rerun(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	# hpcp / -di in small: the source reads what the last run put in the image, and that is no clash.
+	write(tmp_path / 'src/x', 'X')
+	os.mkdir(tmp_path / 'src/tmp')
+	monkeypatch.chdir(tmp_path)
+	monkeypatch.setattr(tempfile, 'tempdir', str(tmp_path / 'src/tmp'))
+	for _ in range(2):
+		assert hpcp_mod.hpcp(['src/'], dest_image=str(tmp_path / 'dest.img'), dest_image_size=80 * 1024 * 1024, batch=True) == 0
+
+
+# ---- a directory job judged as a whole; a hard link at the landing; a source that is the destination ----
+
+
+def test_a_link_in_the_destination_onto_a_source_directory_protects_its_files(tmp_path):
+	# src/d/x lands on itself through out/d, yet src/ as a whole does not land on itself, so it still reads src/d/x.
+	write(tmp_path / 'src/d/x', 'S')
+	write(tmp_path / 'b/d/x', 'B')
+	os.makedirs(tmp_path / 'out')
+	os.symlink('../src/d', tmp_path / 'out/d')
+	tree = files(tmp_path)
+	rc, output = run(['src/', 'b/', '-d', 'out/'], tmp_path)
+	assert rc == 213 and files(tmp_path) == tree, output[-2000:]
+
+
+def test_a_link_in_the_destination_onto_a_source_file_protects_it(tmp_path):
+	write(tmp_path / 'a/x', 'A')
+	write(tmp_path / 'b/x', 'B')
+	os.makedirs(tmp_path / 'out')
+	os.symlink('../a/x', tmp_path / 'out/x')
+	tree = files(tmp_path)
+	rc, output = run(['a/', 'b/', '-d', 'out/'], tmp_path)
+	assert rc == 213 and files(tmp_path) == tree, output[-2000:]
+
+
+def test_safe_one_source_over_a_link_to_itself_copies_nothing_and_runs(tmp_path):
+	write(tmp_path / 'src/d/x', 'S')
+	os.makedirs(tmp_path / 'out')
+	os.symlink('../src/d', tmp_path / 'out/d')
+	rc, output = run(['src/', '-d', 'out/'], tmp_path)
+	assert rc == 0 and (tmp_path / 'src/d/x').read_text() == 'S', output[-2000:]
+
+
+def test_content_only_writes_no_source_through_a_hard_link(tmp_path):
+	# cp -f rewrites the inode, and b/y is that inode too.
+	write(tmp_path / 'a/x', 'A' * 5000)
+	write(tmp_path / 'b/y', 'B' * 3000)
+	os.makedirs(tmp_path / 'out')
+	os.link(tmp_path / 'b/y', tmp_path / 'out/x')
+	rc, output = run(['a/x', '-d', 'out/', '-co'], tmp_path)
+	assert rc == 0, output[-2000:]
+	assert (tmp_path / 'b/y').read_text() == 'B' * 3000 and (tmp_path / 'out/x').read_text() == 'A' * 5000
+
+
+def test_content_only_writes_no_source_through_a_symlink_and_a_hard_link(tmp_path):
+	write(tmp_path / 'a/x', 'A' * 5000)
+	write(tmp_path / 'b/y', 'B' * 3000)
+	os.makedirs(tmp_path / 'out')
+	os.link(tmp_path / 'b/y', tmp_path / 't')
+	os.symlink('../t', tmp_path / 'out/x')
+	rc, output = run(['a/x', '-d', 'out/', '-co'], tmp_path)
+	assert rc == 0, output[-2000:]
+	assert (tmp_path / 'b/y').read_text() == 'B' * 3000 and (tmp_path / 'out/x').read_text() == 'A' * 5000
+
+
+@pytest.mark.parametrize('sources, link, landing, source', [
+	(['a/'], 'a/y', 'out/x', 'out/y'),
+	(['a/', 'b/'], 'b/x', 'out/y', 'out/x'),
+], ids=['own-file', 'another-source'])
+def test_a_content_only_move_keeps_every_file_through_a_hard_link(tmp_path, sources, link, landing, source):
+	for attempt in range(4):
+		root = tmp_path / str(attempt)
+		write(root / 'a/x', 'X' * 200000)
+		write(root / 'a/y', 'Y' * 200000)
+		write(root / 'b/x', 'B' * 200000)
+		os.makedirs(root / 'out')
+		os.link(root / link, root / landing)
+		rc, output = run(sources + ['-d', 'out/', '-co', '-rf'] + (['-s'] if attempt else []), root)
+		wanted = {b'X' * 200000, b'Y' * 200000} | ({b'B' * 200000} if len(sources) > 1 else set())
+		assert wanted <= set(files(root).values()), (rc, output[-2000:])
+
+
+def test_safe_content_only_keeps_a_plain_destination_and_makes_a_new_one(tmp_path):
+	write(tmp_path / 'a/x', 'new')
+	write(tmp_path / 'a/y', 'made')
+	write(tmp_path / 'out/x', 'old')
+	os.chmod(tmp_path / 'out/x', 0o640)
+	inode = os.stat(tmp_path / 'out/x').st_ino
+	rc, output = run(['a/', '-d', 'out/', '-co'], tmp_path)
+	assert rc == 0, output[-2000:]
+	assert (tmp_path / 'out/x').read_text() == 'new' and (tmp_path / 'out/y').read_text() == 'made'
+	assert os.stat(tmp_path / 'out/x').st_ino == inode and stat.S_IMODE(os.stat(tmp_path / 'out/x').st_mode) == 0o640
+
+
+@pytest.mark.parametrize('sources, dest, nested', [
+	(['a', 'b', 'backup'], 'backup/', 'backup/backup'),
+	(['a'], 'a/', 'a/a'),
+	(['a', 'b'], 'b/', 'b/b'),
+], ids=['glob', 'alone', 'last'])
+def test_a_source_that_is_the_destination_is_left_out_on_every_run(tmp_path, sources, dest, nested):
+	write(tmp_path / 'a/x', 'A')
+	write(tmp_path / 'b/y', 'B')
+	os.makedirs(tmp_path / 'backup')
+	for _ in range(3):
+		rc, output = run(sources + ['-d', dest], tmp_path)
+		assert rc == 0 and b'list entries' not in output, output[-2000:]
+		assert not os.path.lexists(tmp_path / nested)
+
+
+def test_a_move_leaves_out_the_source_that_is_the_destination(tmp_path):
+	write(tmp_path / 'a/x', 'A')
+	write(tmp_path / 'b/y', 'B')
+	rc, output = run(['a', 'b', '-d', 'b/', '-rf'], tmp_path)
+	assert rc == 0, output[-2000:]
+	assert files(tmp_path) == {b'b/a/x': b'A', b'b/y': b'B'}
+
+
+def test_a_move_of_the_destination_alone_moves_nothing(tmp_path):
+	write(tmp_path / 'a/x', 'A')
+	rc, output = run(['a', '-d', 'a/', '-rf'], tmp_path)
+	assert rc == 0 and b'Nothing to copy' in output, output[-2000:]
+	assert files(tmp_path) == {b'a/x': b'A'}
+
+
+def test_rme_takes_nothing_from_a_source_left_out_as_the_destination(tmp_path):
+	write(tmp_path / 'a/x', 'A')
+	write(tmp_path / 'b/y', 'B')
+	rc, output = _rme_in_a_terminal(tmp_path, ['a', 'b', '-d', 'b/'])
+	assert rc == 0 and b'-rme checked nothing' in output and b'(y/n)' not in output, output[-2000:]
+	assert (tmp_path / 'b/y').read_text() == 'B' and (tmp_path / 'b/a/x').read_text() == 'A'
+
+
+@pytest.mark.parametrize('dests', [['a/'], ['a/', 'out/']], ids=['one', 'two'])
+def test_safe_a_source_that_lands_on_itself_is_not_left_out(tmp_path, dests):
+	# 'a/' has no name to land under: it is the landing, not something to move into it, and b/x would land on a/x.
+	write(tmp_path / 'a/x', 'A')
+	write(tmp_path / 'b/x', 'B')
+	os.makedirs(tmp_path / 'out')
+	tree = files(tmp_path)
+	rc, output = run(['a/', 'b/'] + [arg for dest in dests for arg in ('-d', dest)] + ['-rf'], tmp_path)
+	assert rc == 241 and files(tmp_path) == tree, output[-2000:]
+
+
+# ---- what a landing directory can and cannot answer ----
+
+
+no_permissions_as_root = pytest.mark.skipif(not hasattr(os, 'geteuid') or os.geteuid() == 0, reason='root reads every directory')
+
+
+def _link_at_a_landing(tmp_path, mode):
+	"""a/y would write through out/y onto b/x, in an out of that mode. (out's mode comes back when the test ends.)"""
+	write(tmp_path / 'a/x', 'A')
+	write(tmp_path / 'a/y', 'C')
+	write(tmp_path / 'b/x', 'B')
+	os.makedirs(tmp_path / 'out')
+	os.symlink('../b/x', tmp_path / 'out/y')
+	tree = files(tmp_path)
+	os.chmod(tmp_path / 'out', mode)
+	return tree
+
+
+@pytest.fixture
+def out_back(tmp_path):
+	yield
+	if os.path.isdir(tmp_path / 'out'):
+		os.chmod(tmp_path / 'out', 0o700)
+
+
+@no_permissions_as_root
+def test_a_directory_that_cannot_be_listed_is_asked_by_name(tmp_path, out_back):
+	tree = _link_at_a_landing(tmp_path, 0o300)
+	rc, output = run(['a/', 'b/', '-d', 'out/', '-rf'], tmp_path)
+	os.chmod(tmp_path / 'out', 0o700)
+	assert rc == 213 and files(tmp_path) == tree, output[-2000:]
+
+
+@no_permissions_as_root
+def test_safe_a_directory_that_cannot_be_listed_still_takes_a_safe_copy(tmp_path, out_back):
+	write(tmp_path / 'a/x', 'A')
+	os.makedirs(tmp_path / 'out')
+	os.chmod(tmp_path / 'out', 0o300)
+	rc, output = run(['a/', '-d', 'out/', '-rf'], tmp_path)
+	os.chmod(tmp_path / 'out', 0o700)
+	assert rc == 0, output[-2000:]
+	assert files(tmp_path) == {b'out/x': b'A'}
+
+
+@no_permissions_as_root
+@pytest.mark.parametrize('mode', [0o000, 0o600], ids=['nothing', 'read-only'])
+def test_a_directory_that_cannot_be_searched_is_refused_by_name(tmp_path, out_back, mode):
+	tree = _link_at_a_landing(tmp_path, mode)
+	rc, output = run(['a/', 'b/', '-d', 'out/', '-rf'], tmp_path)
+	os.chmod(tmp_path / 'out', 0o700)
+	assert rc == 213 and files(tmp_path) == tree, output[-2000:]
+	assert b'chmod u+rx' in output and str(tmp_path / 'out').encode() in output
+
+
+@no_permissions_as_root
+def test_a_run_into_a_directory_that_cannot_be_searched_is_refused_without_a_link(tmp_path, out_back):
+	write(tmp_path / 'a/x', 'A')
+	os.makedirs(tmp_path / 'out')
+	os.chmod(tmp_path / 'out', 0o600)
+	rc, output = run(['a/', '-d', 'out/', '-rf'], tmp_path)
+	os.chmod(tmp_path / 'out', 0o700)
+	assert rc == 213 and files(tmp_path) == {b'a/x': b'A'}, output[-2000:]
+
+
+def _a_big_directory(root, entries):
+	os.makedirs(root)
+	for number in range(entries):
+		os.close(os.open(os.path.join(str(root), f'e{number}'), os.O_CREAT | os.O_WRONLY))
+
+
+def test_safe_a_link_past_the_listing_limit_is_still_found(tmp_path):
+	_a_big_directory(tmp_path / 'out', 10100)
+	write(tmp_path / 'a/y', 'A')
+	write(tmp_path / 'b/x', 'B')
+	os.symlink('../b/x', tmp_path / 'out/y')
+	rc, output = run(['a/', 'b/', '-d', 'out/', '-rf'], tmp_path)
+	assert rc == 213 and (tmp_path / 'a/y').read_text() == 'A' and (tmp_path / 'b/x').read_text() == 'B', output[-2000:]
+
+
+def test_safe_a_run_past_the_listing_limit_copies(tmp_path):
+	_a_big_directory(tmp_path / 'out', 10100)
+	write(tmp_path / 'a/y', 'A')
+	write(tmp_path / 'b/x', 'B')
+	rc, output = run(['a/', 'b/', '-d', 'out/', '-rf'], tmp_path)
+	assert rc == 0, output[-2000:]
+	assert (tmp_path / 'out/y').read_text() == 'A' and (tmp_path / 'out/x').read_text() == 'B'
+
+
+def test_one_file_into_a_big_directory_reads_only_the_limit(hpcp_mod, reset_hpcp_globals, tmp_path, monkeypatch):
+	_a_big_directory(tmp_path / 'out', 20000)
+	write(tmp_path / 'f', 'F')
+	read = []
+	real_scandir = os.scandir
+
+	class Counted:
+		def __init__(self, path):
+			self.entries = real_scandir(path)
+		def __enter__(self):
+			return self
+		def __exit__(self, *args):
+			self.entries.close()
+		def __iter__(self):
+			for entry in self.entries:
+				read.append(entry.name)
+				yield entry
+
+	monkeypatch.setattr(os, 'scandir', Counted)
+	monkeypatch.chdir(tmp_path)
+	places = hpcp_mod._RealPlaces()
+	assert places.landing(str(tmp_path / 'out/f'), str(tmp_path / 'f')) == str(tmp_path / 'out/f')
+	assert len(read) <= 10001
+
+
+def test_the_listing_reads_as_far_as_the_names_asked_about(hpcp_mod, tmp_path):
+	_a_big_directory(tmp_path / 'out', 10100)
+	os.symlink('e0', tmp_path / 'out/l')
+	assert hpcp_mod._RealPlaces().links(str(tmp_path / 'out')) is None
+	assert hpcp_mod._RealPlaces().links(str(tmp_path / 'out'), 20000) == {'l'}
+	assert hpcp_mod._RealPlaces(20000).links(str(tmp_path / 'out')) == {'l'}
+
+
+def test_no_directory_answers_no_links_and_a_failed_scan_answers_nothing(hpcp_mod, tmp_path, monkeypatch):
+	os.makedirs(tmp_path / 'out')
+	assert hpcp_mod._RealPlaces().links(str(tmp_path / 'gone')) == set()
+
+	def refused(path):
+		raise PermissionError(13, 'Permission denied', path)
+
+	monkeypatch.setattr(os, 'scandir', refused)
+	assert hpcp_mod._RealPlaces().links(str(tmp_path / 'out')) is None
+
+
+def test_two_paths_of_one_directory_are_one_place(hpcp_mod, tmp_path, monkeypatch):
+	# What a bind mount or a casefolded name shows: the same directory by another name.
+	os.makedirs(tmp_path / 'one')
+	os.makedirs(tmp_path / 'two')
+	real_lstat = os.lstat
+	seen = real_lstat(tmp_path / 'one')
+
+	def lstat(path, **kwargs):
+		found = real_lstat(path, **kwargs)
+		if os.path.basename(str(path)) != 'two':
+			return found
+		return os.stat_result(found[:1] + (seen.st_ino, seen.st_dev) + found[3:])
+
+	monkeypatch.setattr(os, 'lstat', lstat)
+	places = hpcp_mod._RealPlaces()
+	assert places.directory(str(tmp_path / 'one')) == places.directory(str(tmp_path / 'two'))
+	assert places.place(str(tmp_path / 'two/x')) == str(tmp_path / 'one/x')

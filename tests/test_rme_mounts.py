@@ -2,10 +2,13 @@
 import contextlib
 import errno
 import os
+import shutil
 import subprocess
 import sys
 
 import pytest
+
+HPCP = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'hpcp.py')
 
 
 @contextlib.contextmanager
@@ -256,6 +259,50 @@ def test_a_move_onto_a_bind_mount_of_itself_is_refused(tmp_path, hpcp_mod, reset
 	with _mounted(tmp_path / 'bind', bind_source=src):
 		assert hpcp_mod.hpcp([str(src) + '/'], dest_paths=[str(tmp_path / 'bind') + '/'], remove_force=True, batch=True) == 241
 		assert (src / 'f').read_text() == 'keep'
+
+
+def test_a_landing_through_a_bind_mount_is_a_landing(tmp_path):
+	"""m2 is m1 by another path: d1/x and m2/d1/x both land on m1/d1/x, and the second is the first's source."""
+	run = lambda: subprocess.run([sys.executable, HPCP, 'd1', 'm2/d1/', '-d', 'm1/', '-rf', '-s'], cwd=str(tmp_path), stdin=subprocess.DEVNULL,
+		stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+	(tmp_path / 'd1').mkdir()
+	(tmp_path / 'd1/x').write_text('A')
+	(tmp_path / 'm1/d1').mkdir(parents=True)
+	(tmp_path / 'm1/d1/x').write_text('B')
+	(tmp_path / 'm2').mkdir()
+	with _mounted(tmp_path / 'm2', bind_source=tmp_path / 'm1'):
+		task = run()
+		assert task.returncode == 213, task.stdout[-2000:]
+		assert (tmp_path / 'd1/x').read_text() == 'A' and (tmp_path / 'm1/d1/x').read_text() == 'B'
+
+
+def test_a_landing_by_another_case_is_a_landing(tmp_path):
+	"""On a casefolded directory D2 and d2 are one: the second source is what the first would land on."""
+	mkfs, image, mount = shutil.which('mkfs.ext4'), tmp_path / 'fold.img', tmp_path / 'fold'
+	if os.geteuid() != 0 or not mkfs or not shutil.which('chattr'):
+		pytest.skip('needs root, mkfs.ext4 and chattr')
+	image.write_bytes(b'')
+	os.truncate(str(image), 64 << 20)
+	if subprocess.run([mkfs, '-q', '-O', 'casefold', '-E', 'encoding=utf8', str(image)], capture_output=True).returncode:
+		pytest.skip('mkfs.ext4 without casefold')
+	mount.mkdir()
+	if subprocess.run(['mount', '-o', 'loop', str(image), str(mount)], capture_output=True).returncode:
+		pytest.skip('this kernel does not mount a casefold filesystem')
+	try:
+		fold = mount / 'w'
+		fold.mkdir()
+		if subprocess.run(['chattr', '+F', str(fold)], capture_output=True).returncode:
+			pytest.skip('casefold flag refused')
+		(fold / 'd1').mkdir()
+		(fold / 'd1/x').write_text('A')
+		(fold / 'd2/d1').mkdir(parents=True)
+		(fold / 'd2/d1/x').write_text('B')
+		task = subprocess.run([sys.executable, HPCP, 'd1', 'D2/d1/', '-d', 'd2/', '-rf', '-s'], cwd=str(fold), stdin=subprocess.DEVNULL,
+			stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+		assert task.returncode == 213, task.stdout[-2000:]
+		assert (fold / 'd1/x').read_text() == 'A' and (fold / 'd2/d1/x').read_text() == 'B'
+	finally:
+		subprocess.run(['umount', '-l', str(mount)], capture_output=True)
 
 
 # ---- 9.75: re-review of 127f141..HEAD ----

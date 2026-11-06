@@ -8786,15 +8786,23 @@ def _without_covered_sources(src_paths):
 		kept.append(src)
 	return kept
 
+def _cannot_search(directory, error):
+	return RuntimeError(f'Destination clash: {directory} cannot be searched ({error.strerror}), so a link in it could hide a clash; '
+		f'nothing is copied or removed. To let it through: chmod u+rx {directory}')
+
 class _RealPlaces:
 	"""Where paths really are, for one run. The one answer for every check that compares a source with a destination: a
-	directory is looked at once (a lstat), and one that files land in is read once (a scandir, its d_type), so no file
-	costs a stat of its own, however many a list names."""
-	def __init__(self):
+	directory is looked at once (a lstat) and known by what it is, so a bind mount of it or another case of its name is the
+	same place, and one that files land in is read once, as far as that pays (links), so no file costs a stat of its own,
+	however many a list names. names: how many paths the run will ask about."""
+	def __init__(self, names=0):
+		self.limit = max(10000, names)
 		self.directories = {}
+		self.identities = {}
 		self.link_names = {}
 	def directory(self, path):
-		"""os.path.realpath(path) for an absolute path, by each directory on the way once. It need not exist."""
+		"""os.path.realpath(path) for an absolute path, by each directory on the way once, with one name for one directory.
+		It need not exist."""
 		known, below = self.directories, []
 		while path not in known:
 			parent = os.path.dirname(path)
@@ -8805,37 +8813,61 @@ class _RealPlaces:
 			path = parent
 		real = known[path]
 		for path in reversed(below):
-			real = os.path.join(real, os.path.basename(path))
-			if os.path.islink(real):
-				real = os.path.realpath(real)
+			parent, real = real, os.path.join(real, os.path.basename(path))
+			# Set first: a loop of links ends here.
 			known[path] = real
+			try:
+				st = os.lstat(real)
+			except PermissionError as e:
+				raise _cannot_search(parent, e)
+			except OSError:
+				continue
+			if stat.S_ISLNK(st.st_mode):
+				real = known[path] = self.directory(os.path.realpath(real))
+			elif stat.S_ISDIR(st.st_mode):
+				real = known[path] = self.identities.setdefault((st.st_dev, st.st_ino), real)
 		return real
 	def place(self, path):
 		"""Where the file or link path is: its real parent and its own name. A link is its own place."""
 		parent, name = os.path.split(path)
 		return os.path.join(self.directory(parent), name)
-	def links(self, directory):
-		"""The names of the symlinks in directory, a real path; none when there is no such directory."""
-		names = self.link_names.get(directory)
-		if names is None:
-			names = self.link_names[directory] = set()
-			try:
-				with os.scandir(directory) as entries:
-					names.update(entry.name for entry in entries if entry.is_symlink())
-			except (FileNotFoundError, NotADirectoryError):
-				pass
-			except OSError as e:
-				# A note, not an error: the copy may still work, and only a link in there would matter.
-				print(f'Note: {directory} cannot be read ({e.strerror}): a symlink in it is not followed when judging clashes', file=sys.stderr)
-		return names
+	def links(self, directory, names=0):
+		"""The names of the symlinks in directory, a real path; none when there is no such directory; None when that is not
+		known, because it cannot be listed or has more entries than the names asked about (names, or the run's) are worth
+		reading. is_link then asks by name, which needs search permission only. Without that nothing can be known about
+		it: refused, or a link there could send a file onto a source."""
+		if directory not in self.link_names:
+			self.link_names[directory] = self._read_links(directory, max(self.limit, names))
+		return self.link_names[directory]
+	def _read_links(self, directory, limit):
+		try:
+			os.lstat(os.path.join(directory, os.curdir))
+		except PermissionError as e:
+			raise _cannot_search(directory, e)
+		except OSError:
+			pass
+		found = set()
+		try:
+			with os.scandir(directory) as entries:
+				for seen, entry in enumerate(entries):
+					if seen == limit:
+						return None
+					if entry.is_symlink():
+						found.add(entry.name)
+		except (FileNotFoundError, NotADirectoryError):
+			pass
+		except OSError:
+			return None
+		return found
+	def is_link(self, directory, name):
+		names = self.links(directory)
+		return os.path.islink(os.path.join(directory, name)) if names is None else name in names
 	def landing(self, path, source):
 		"""Where source ends up when copied to path: path's place, or what a link there leads to (cp writes through it; a
 		link source replaces it)."""
-		parent, name = os.path.split(path)
-		real = self.directory(parent)
-		place = os.path.join(real, name)
-		if name in self.links(real) and not os.path.islink(source):
-			return os.path.realpath(place)
+		place = self.place(path)
+		if self.is_link(*os.path.split(place)) and not os.path.islink(source):
+			return self.directory(place)
 		return place
 
 def _inside_destinations(src_paths, dests, places):
@@ -10194,16 +10226,22 @@ def _same_or_below(path, root):
 
 def _link_targets(src, dest, listed, places):
 	"""Where the symlinks lead that the copy of directory src (a listing of it: listed) to dest would write through: those
-	at a path where it has a file or a directory. Each directory it lands in that exists is read once."""
+	at a path where it has a file or a directory. Each directory it lands in that exists is read once. Only those: every
+	link in a tree that is copied again would cost a realpath, and open the gate."""
 	files, _, _, folders = listed
 	src_root, dest_root = src.rstrip(os.sep), dest.rstrip(os.sep)
 	targets = []
 	for folder in folders:
 		real = places.directory((dest_root + folder[len(src_root):]).rstrip(os.sep))
-		for name in places.links(real):
+		names = places.links(real, len(files))
+		if names is None:
+			# Each file is asked about by name instead: it could lead anywhere, so the roots have to meet.
+			targets.append(os.sep)
+			continue
+		for name in names:
 			path = os.path.join(folder, name)
 			if path in files or path in folders:
-				targets.append(os.path.realpath(os.path.join(real, name)))
+				targets.append(places.directory(os.path.join(real, name)))
 	return targets
 
 def _roots_overlap(roots):
@@ -10243,8 +10281,6 @@ def _settle_destinations(src_paths, dests, dest_image=None, directory_only=False
 	places = places or _RealPlaces()
 	def listing(src):
 		return get_file_list(src, max_workers=max_workers, exclude=exclude, parallel_file_listing=parallel_file_listing and max_workers != 1)
-	def landing(path, source):
-		return path if dest_image else places.landing(path, source)
 	# (src, its destinations, is it a directory, its real place, its real landing in each destination)
 	jobs = []
 	for source in src_paths:
@@ -10253,17 +10289,14 @@ def _settle_destinations(src_paths, dests, dest_image=None, directory_only=False
 			continue
 		directory = src.endswith(os.path.sep)
 		root = src.rstrip(os.path.sep) or os.path.sep
-		if dest_image:
-			real, lands = root, actual_dests
-		elif directory:
+		if directory:
 			real, lands = places.directory(root), [places.directory(dest) for dest in actual_dests]
 		else:
 			real, lands = places.place(src), [places.landing(dest, src) for dest in actual_dests]
-		if remove and not dest_image:
+		if remove:
 			for land in lands:
-				# Every file is identical to itself, so the copy skips it and the removal would delete the only copy (9.72
-				# did). By identity too: a bind mount of a directory is that directory by another path.
-				if _same_or_below(land, real) or (directory and os.path.isdir(land) and _directory_identity(land) == _directory_identity(real)):
+				# Every file is identical to itself, so the copy skips it and the removal would delete the only copy (9.72 did).
+				if _same_or_below(land, real):
 					raise RuntimeError(f'Invalid arguments: -rm would move {root} onto itself ({land} is it or lies inside it); '
 						'nothing is copied or removed')
 		jobs.append((src, actual_dests, directory, real, lands))
@@ -10272,19 +10305,16 @@ def _settle_destinations(src_paths, dests, dest_image=None, directory_only=False
 	if directory_only:
 		# Nothing is copied.
 		return dropped, 0, set()
-	roots = [land for job in jobs for land in job[4]]
-	if not dest_image:
-		roots.extend(job[3] for job in jobs)
-		for src, actual_dests, directory, _, lands in jobs:
-			if directory:
-				for dest, land in zip(actual_dests, lands):
-					if os.path.isdir(land):
-						roots.extend(_link_targets(src, dest, listing(src), places))
+	roots = [land for job in jobs for land in job[4]] + [job[3] for job in jobs]
+	for src, actual_dests, directory, _, lands in jobs:
+		if directory:
+			for dest, land in zip(actual_dests, lands):
+				if os.path.isdir(land):
+					roots.extend(_link_targets(src, dest, listing(src), places))
 	if not _roots_overlap(roots):
 		return dropped, 0, in_place
 	def files_of(job):
-		"""(path, its place, where it lands in each destination) for each file of job that the copy really takes: the
-		listing's, within the length copy_file accepts (_validate_paths)."""
+		"""(path, its place, where it lands in each destination) for each file of job that the copy really takes: the listing's."""
 		src, actual_dests, directory, real, _ = job
 		if directory:
 			src_root, real_root = src.rstrip(os.path.sep), real.rstrip(os.path.sep)
@@ -10294,9 +10324,8 @@ def _settle_destinations(src_paths, dests, dest_image=None, directory_only=False
 		else:
 			entries = ((src, real, actual_dests),)
 		for path, place, targets in entries:
-			targets = [target for target in targets if len(target) <= 4096]
-			if targets and len(path) <= 4096:
-				yield path, place, [landing(target, path) for target in targets]
+			yield path, place, [places.landing(target, path) for target in targets]
+	# An image is a tree of its own. A source that holds its mount point (hpcp / -di) reads what an earlier run put there.
 	if not dest_image:
 		reads = {}
 		for job in jobs:
@@ -10338,7 +10367,7 @@ def _settle_destinations(src_paths, dests, dest_image=None, directory_only=False
 			add_directory(lands[0])
 			for folder in listing(src)[3]:
 				below = (dest_root + folder[len(src_root):]).rstrip(os.path.sep)
-				add_directory(below if dest_image else places.directory(below))
+				add_directory(places.directory(below))
 		else:
 			add_directory(os.path.dirname(lands[0]))
 		for path, place, landings in files_of(entry):
@@ -10658,8 +10687,8 @@ def get_args(args = None):
 	parser.add_argument('src_path', nargs='*', type=str, help='Source Path')
 	parser.add_argument('-si','--src_image',action='append', type=str, help='Source Image, mount the image and copy the files from it.')
 	parser.add_argument('-siff','--load_diff_image',action='append', type=str, help='Apply a patch image made by -diff to the target (-d / -di or a single path). Repeat for each -dis volume. Every path the patch touches is checked first; conflicts prompt before being overridden. A disk patch (made with -dd -diff) takes the target disk with -d.')
-	parser.add_argument('-d','-C','--dest_path',action='append', type=str, help='Destination Path')
-	parser.add_argument('-rds','--random_dest_selection', action='store_true', help='Randomly select destination path from the list of destination paths instead of filling round robin. Can speed up transfer if dests are on different devices. Warning: can cause unable to fit in big files as dests are filled up by smaller files.')
+	parser.add_argument('-d','-C','--dest_path',action='append', type=str, help='Destination Path. Repeat it to spill over: each file goes to one destination, the first with room, not to all of them.')
+	parser.add_argument('-rds','--random_dest_selection', action='store_true', help='Randomly select destination path from the list of destination paths instead of the first with room. Can speed up transfer if dests are on different devices. Warning: can cause unable to fit in big files as dests are filled up by smaller files.')
 	parser.add_argument('-di','--dest_image', type=str, help='Base name for destination Image, create a image file and copy the files into it.')
 	parser.add_argument('-dis','--dest_image_size', type=str, help='Destination Image Size, specify the size of the destination image to split into. Default is 0 (No split). Example: {10TiB} or {1G}', default='0')
 	parser.add_argument('-diff', '--get_diff_image', type=str, nargs='?', const='auto', default=None, help='Generate a patch image that updates the base (-d / -di) to the source (src_path / -si): added and modified files in full plus a change list under .hpcp_diff/. Optionally name the output; default DIFF_<src>_TO_<base>_<time>.img. Honors -dis, -fh, -hs and -e. With -dd, compares whole GPT disks: the new disk as the path and the old disk with -d.')
@@ -11008,7 +11037,7 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = multipr
 		copy_failures = []
 		if dests != ...:
 			copy_exclude = exclude
-			places = _RealPlaces()
+			places = _RealPlaces(len(src_paths))
 			# Decided before the entries inside a destination go: what is left of the sources is still a list's.
 			listed = _has_listed(src_paths)
 			holding = None

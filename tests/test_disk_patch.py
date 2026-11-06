@@ -3078,9 +3078,10 @@ def test_disk_patch_writes_awkward_labels_names_and_exfat_serials_exactly(tmp_pa
 	shutil.copyfile(str(base), str(target))
 	summary = _apply(hpcp_mod, patch, target)
 	assert summary['failed'] == 0
+	# From the image: sgdisk on the loop device makes udev re-read the table, and the partition nodes vanish for a moment.
+	names = [subprocess.run(['sgdisk', '-i', str(number), str(target)], capture_output=True, text=True).stdout for number in (1, 2)]
+	assert f"Partition name: '{_AWKWARD_NAME_1}'" in names[0] and f"Partition name: '{_AWKWARD_NAME_2}'" in names[1]
 	with _attached(target, read_only=True) as loop:
-		names = [subprocess.run(['sgdisk', '-i', str(number), loop], capture_output=True, text=True).stdout for number in (1, 2)]
-		assert f"Partition name: '{_AWKWARD_NAME_1}'" in names[0] and f"Partition name: '{_AWKWARD_NAME_2}'" in names[1]
 		assert hpcp_mod._probe_identity(loop + 'p2')[2] == _AWKWARD_LABEL
 		if _HAS_EXFAT:
 			assert hpcp_mod._probe_identity(loop + 'p3')[1] == 'ABCD-1234'

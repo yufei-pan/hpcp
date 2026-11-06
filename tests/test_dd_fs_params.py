@@ -1612,11 +1612,12 @@ def test_dd_copies_awkward_labels_and_gpt_names_exactly(tmp_path):
 	dest = str(tmp_path / 'dest.img')
 	try:
 		_run_hpcp_dd([], src, dest)
+		# From the image: sgdisk on the loop device makes udev re-read the table, and the partition nodes vanish for a moment.
+		assert f"Partition name: '{name1}'" in _run('sgdisk', '-i', '1', dest)
+		assert f"Partition name: '{name2}'" in _run('sgdisk', '-i', '2', dest)
 		loop = _run('losetup', '--partscan', '--find', '--show', '--read-only', dest).strip()
 		try:
 			subprocess.run(['udevadm', 'settle'], check=False, capture_output=True)
-			assert f"Partition name: '{name1}'" in _run('sgdisk', '-i', '1', loop)
-			assert f"Partition name: '{name2}'" in _run('sgdisk', '-i', '2', loop)
 			assert _run('e2label', f'{loop}p2').rstrip('\n') == label
 		finally:
 			subprocess.run(['losetup', '-d', loop], check=False, capture_output=True)

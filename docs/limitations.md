@@ -29,7 +29,7 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 
 ### Destination symlink at a directory's path
 - **Kind:** deferred.
-- **What the operator sees:** with `out/d -> ../elsewhere`, `hpcp src/ -d out/` writes src/d's files into elsewhere and changes elsewhere's mode, and as root its owner, exit 0, as in 9.80. A user who can write the destination can plant `d -> /etc` before root restores into it.
+- **What the operator sees:** with `out/d -> ../elsewhere`, `hpcp src/ -d out/` writes src/d's files into elsewhere and changes elsewhere's mode, and as root its owner, exit 0, as in 9.80. A user who can write the destination can plant `d -> /etc` before root restores into it. `hpcp src/ -d out/ -rme` with `out/d -> ../src/d` removes the link as an extra, and `d` is not mirrored.
 - **Why:** not a regression (a link there that leads onto a source file is refused, exit 213), and it needs its own decision: refuse as `cp -a` does, or write through without touching the target's mode and owner, since someone with a symlinked data directory may rely on writing through.
 - **Revisit when:** the next hpcp release (9.82).
 - **Approved:** 2026-11-05, the user chose "Deferred to 9.82 (Recommended)".
@@ -57,8 +57,26 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 
 ### A move of a link's directory and a path through the link can end in exit 192
 - **Kind:** deferred.
-- **What the operator sees:** `printf 'lb/\n' | hpcp -sfl - lb/x -d out/ -rf`, with `lb` a link to a directory: every file is at the destination and the sources are gone as asked, yet about one run in three ends with "not removing lb: it, or a directory on its path, is no longer what the copy listed" and exit 192. Nothing is lost: the tree comes out the same in the runs that exit 0.
+- **What the operator sees:** `printf 'lb/\n' | hpcp -sfl - lb/x -d out/ -rf`, with `lb` a link to `b`: `out/x` and the link `out/lb -> b` land, `lb` goes and `b/x`, `b/y`, `b/s/z` stay, in every run. About one run in three then ends with "not removing lb: it, or a directory on its path, is no longer what the copy listed" and exit 192, the others exit 0. Nothing is lost: the tree comes out the same either way.
 - **Why:** the removal of `lb/x` and of the link `lb` run side by side, and the check before removing sees the link already gone. 7617241 does the same (67 runs in 200, against 66).
+- **Revisit when:** the next hpcp release (9.82).
+
+### A million-entry list holds its jobs in memory
+- **Kind:** deferred.
+- **What the operator sees:** the check before the copy keeps every entry's paths at once: about 741 bytes more per entry than 7617241, so 740 MB more for a million.
+- **Why:** it reads the jobs twice, and generators need `_settle_destinations` reshaped; the copy works either way.
+- **Revisit when:** the next hpcp release (9.82).
+
+### A rerun scans the destination directories one by one
+- **Kind:** deferred.
+- **What the operator sees:** a copy onto an existing tree reads each directory it lands in, on one worker, before the first file is copied: about 1 us per file on a local disk, longer on network storage.
+- **Why:** correct and bounded as it is; a parallel scan is its own change.
+- **Revisit when:** the next hpcp release (9.82).
+
+### `-ncd` can end in a traceback
+- **Kind:** deferred.
+- **What the operator sees:** `-ncd` with a destination directory that is missing can stop with a Python traceback instead of a clean error (44 of 4000 fuzz runs). Nothing is lost.
+- **Why:** old, ugly but safe.
 - **Revisit when:** the next hpcp release (9.82).
 
 ### `-rme` can take a source inside the destination for extra
