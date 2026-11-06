@@ -953,9 +953,11 @@ def _lsblk_disk_rows(disk, columns):
 	lsblk is asked for full paths (-p): it names each node itself (cciss, by-id and kpartx nodes alike), so no path
 	is built here from the kernel names. The first row is the disk itself. lsblk also lists every device stacked on
 	the disk's partitions (LVM, LUKS and dm-linear devices, md arrays) and those devices' own partitions (md127p1 of a
-	partitioned md array built on the disk): a row is a partition of the disk only when its TYPE is part and its
-	parent (PKNAME) is the disk itself (its KNAME). -P prints KEY="value" pairs, so the disk's empty PKNAME cannot
-	shift the columns.
+	partitioned md array built on the disk): a row is a partition of the disk only when its parent (PKNAME) is the
+	disk itself (its KNAME) and it is a partition: the kernel says so in sysfs (_is_kernel_partition), or TYPE is part
+	(a kpartx partition is a dm device, which the kernel knows nothing about; lsblk 2.23.2 and 2.32.1 call a loop
+	device's partitions TYPE loop, so TYPE alone misses those). -P prints KEY="value" pairs, so the disk's empty
+	PKNAME cannot shift the columns.
 	"""
 	names = columns.split(',')
 	# A partition table just read or written by sgdisk (a read-write open) makes udev re-read it and remove and re-add
@@ -966,7 +968,8 @@ def _lsblk_disk_rows(disk, columns):
 	if not rows:
 		raise RuntimeError(f'Disk error: lsblk printed nothing for {disk}')
 	disk_row = rows[0]
-	partitions = [row for row in rows[1:] if row.get('TYPE') == 'part' and row.get('PKNAME') == disk_row.get('KNAME')]
+	partitions = [row for row in rows[1:] if row.get('PKNAME') == disk_row.get('KNAME')
+		and (row.get('TYPE') == 'part' or _is_kernel_partition(row.get('KNAME', '')))]
 	return [disk_row.get(name, '') for name in names], [[row.get(name, '') for name in names] for row in partitions]
 
 def get_largest_partition(disk):
@@ -1759,7 +1762,7 @@ def get_target_partition(image, partition_name):
 	This function handles both regular image files and block devices. If the input is an
 	image file, it creates a loop device first. It then identifies all partitions and
 	returns the path to the partition that matches the given partition name.
-	The partitions are lsblk's TYPE part rows whose parent is the disk, with full paths (see _lsblk_disk_rows): a
+	The partitions are the rows of lsblk whose parent is the disk, with full paths (see _lsblk_disk_rows): a
 	device stacked on a partition, or that device's own partitions, such as a dm-linear device on partition 1 named
 	hpcp-holder-2, is never matched as partition 2.
 	
@@ -6704,6 +6707,10 @@ def _sysfs_block_name(device):
 	if real.startswith('/dev/'):
 		return real[len('/dev/'):].replace('/', '!')
 	return os.path.basename(real)
+
+def _is_kernel_partition(device, sys_block_path='/sys/class/block'):
+	"""True when the kernel keeps device as a partition: its sysfs directory holds a 'partition' file."""
+	return os.path.exists(os.path.join(sys_block_path, _sysfs_block_name(device), 'partition'))
 
 def _partition_devices(disk, sys_block_path='/sys/class/block'):
 	"""{partition number: device path} for disk, using the kernel's partition number, not the name suffix.

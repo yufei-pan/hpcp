@@ -3139,6 +3139,42 @@ def test_partition_paths_come_from_lsblk_full_names(hpcp_mod, reset_hpcp_globals
 	assert all('-p' in argv and '-P' in argv and argv[argv.index('-o') + 1] == 'NAME,SIZE,KNAME,PKNAME,TYPE' for argv in argvs)
 
 
+@pytest.mark.parametrize('disk, lsblk, kernel_partitions, partitions', [
+	# lsblk 2.23.2 (EL7) and 2.32.1 (EL8) call a loop device's partitions TYPE loop.
+	('/dev/loop3', [_lsblk_p('/dev/loop3', 1000, '/dev/loop3', '', 'loop'),
+		_lsblk_p('/dev/loop3p1', 400, '/dev/loop3p1', '/dev/loop3', 'loop'),
+		_lsblk_p('/dev/loop3p2', 600, '/dev/loop3p2', '/dev/loop3', 'loop')],
+		{'/dev/loop3p1', '/dev/loop3p2'}, ['/dev/loop3p1', '/dev/loop3p2']),
+	# TYPE is only ever a hint: a partitioned array's partition under any name it may have there.
+	('/dev/md0', [_lsblk_p('/dev/md0', 1000, '/dev/md0', '', 'raid1'),
+		_lsblk_p('/dev/md0p1', 900, '/dev/md0p1', '/dev/md0', 'md')], {'/dev/md0p1'}, ['/dev/md0p1']),
+	# A loop device stacked on a partition is no partition of the disk, whatever its name: wrong parent, and sysfs says no.
+	('/dev/sdc', [_lsblk_p('/dev/sdc', 1000, '/dev/sdc', '', 'disk'),
+		_lsblk_p('/dev/sdc1', 900, '/dev/sdc1', '/dev/sdc', 'part'),
+		_lsblk_p('/dev/loop4', 800, '/dev/loop4', '/dev/sdc1', 'loop')], {'/dev/sdc1'}, ['/dev/sdc1']),
+	# A partition of an array on the disk: the kernel calls it a partition, but of the array.
+	('/dev/loop5', [_lsblk_p('/dev/loop5', 1000, '/dev/loop5', '', 'loop'),
+		_lsblk_p('/dev/md127', 990, '/dev/md127', '/dev/loop5', 'raid1'),
+		_lsblk_p('/dev/md127p1', 400, '/dev/md127p1', '/dev/md127', 'md')], {'/dev/md127p1'}, []),
+], ids=['loop', 'md', 'loop-on-a-partition', 'partition-of-an-array'])
+def test_a_partition_is_what_the_kernel_says_whatever_lsblk_calls_it(hpcp_mod, reset_hpcp_globals, monkeypatch, disk, lsblk, kernel_partitions, partitions):
+	monkeypatch.setattr(hpcp_mod, 'run_command_in_multicmd_with_path_check', lambda argv, **kwargs: list(lsblk))
+	monkeypatch.setattr(hpcp_mod, '_udev_settle', lambda: None)
+	monkeypatch.setattr(hpcp_mod, '_is_kernel_partition', lambda device: device in kernel_partitions)
+	assert hpcp_mod.get_partitions(disk) == partitions
+
+
+def test_is_kernel_partition_reads_sysfs(tmp_path, hpcp_mod):
+	"""The kernel's own answer: a device with a 'partition' file in its sysfs directory, under its kernel name."""
+	for name in ('loop0', 'loop0p1', 'cciss!c0d0p1', 'dm-1'):
+		(tmp_path / name).mkdir()
+	(tmp_path / 'loop0p1' / 'partition').write_text('1\n')
+	(tmp_path / 'cciss!c0d0p1' / 'partition').write_text('1\n')
+	check = lambda device: hpcp_mod._is_kernel_partition(device, sys_block_path=str(tmp_path))
+	assert check('/dev/loop0p1') and check('/dev/cciss!c0d0p1') and check('/dev/cciss/c0d0p1')
+	assert not check('/dev/loop0') and not check('/dev/dm-1') and not check('/dev/nosuch')
+
+
 def test_target_partition_uses_lsblk_full_names(hpcp_mod, reset_hpcp_globals, monkeypatch):
 	argvs = []
 	def fake_lsblk(argv, **kwargs):
