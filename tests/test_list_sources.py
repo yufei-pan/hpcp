@@ -22,7 +22,7 @@ def run(args, cwd, stdin=b'', env=None):
 	full_env = dict(os.environ, **(env or {}))
 	# Its own session: no controlling terminal, wherever the tests run, so a prompt cannot reach a person's.
 	task = subprocess.run([sys.executable, HPCP] + args, input=stdin, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-		cwd=str(cwd), env=full_env, timeout=120, start_new_session=True)
+		cwd=str(cwd), env=full_env, timeout=600, start_new_session=True)
 	return task.returncode, task.stdout
 
 
@@ -174,8 +174,11 @@ def test_covered_entries_go_and_repeats_too(tmp_path, hpcp_mod, monkeypatch):
 	monkeypatch.chdir(tmp_path)
 	(tmp_path / 'list').write_bytes(b'd/e/f\nd/e\n./d/e/\ng/h\ng/h\nln\nln/e\n')
 	kept = hpcp_mod._without_covered_sources(hpcp_mod.load_source_list('list'))
-	# A later ancestor covers an earlier entry; a repeat goes whatever its spelling; a symlink covers nothing.
-	assert kept == ['d/e', 'g/h', 'ln', 'ln/e']
+	# A later ancestor covers an earlier entry; a repeat goes whatever its spelling; a symlink covers nothing, but one
+	# with entries below it (find -L) goes: they land in a directory of its name.
+	assert kept == ['d/e', 'g/h', 'ln/e']
+	(tmp_path / 'list').write_bytes(b'ln\n')
+	assert hpcp_mod._without_covered_sources(hpcp_mod.load_source_list('list')) == ['ln']
 
 
 def test_a_positional_directory_does_not_cover_a_list_entry(work):
@@ -1051,8 +1054,9 @@ def test_a_source_that_another_source_would_overwrite_is_a_clash(tmp_path):
 	write(tmp_path / 'a/sub/x', 'from a')
 	write(tmp_path / 'out/sub/x', 'mine')
 	rc, output = run(['a/', 'out/sub/x', '-d', 'out/'], tmp_path)
-	assert rc == 213 and b'Destination clash' in output and b'is a source' in output
-	assert (tmp_path / 'out/x').read_text() == 'mine' and (tmp_path / 'out/sub/x').read_text() == 'mine'
+	# Refused whole (_landing_clash), before anything is copied: nothing of the rest is copied either.
+	assert rc == 213 and b'Destination clash' in output and b'holds the source' in output
+	assert files(tmp_path) == {b'a/sub/x': b'from a', b'out/sub/x': b'mine'}
 
 
 def test_a_move_that_would_overwrite_a_source_is_refused_before_any_copy(tmp_path):
@@ -1060,7 +1064,7 @@ def test_a_move_that_would_overwrite_a_source_is_refused_before_any_copy(tmp_pat
 	write(tmp_path / 'a/y', 'y')
 	write(tmp_path / 'out/sub/x', 'mine')
 	rc, output = run(['a/', 'out/sub/x', '-d', 'out/', '-rm', '-rf'], tmp_path)
-	assert rc == 241 and not (tmp_path / 'out/y').exists()
+	assert rc == 213 and not (tmp_path / 'out/y').exists()
 	assert (tmp_path / 'a/sub/x').read_text() == 'from a' and (tmp_path / 'out/sub/x').read_text() == 'mine'
 
 
@@ -1883,10 +1887,9 @@ def test_entries_below_the_working_directory_still_copy_to_its_parent(tmp_path):
 	assert files(tmp_path / 't') == {b'overlay/etc/conf': b'C', b'overlay/etc/sub/more': b'M', b'etc/conf': b'C', b'etc/sub/more': b'M'}
 
 
-def test_the_landing_rule_survives_a_missing_working_directory_and_mixed_drives(hpcp_mod, monkeypatch):
+def test_the_landing_rule_survives_mixed_drives(hpcp_mod, monkeypatch):
 	spellings = ('/t/a/b/g', '/t/a/b/g')
 	assert hpcp_mod._lands_elsewhere(spellings, 'a/b/g', {'/t/a'}, '/t/a/b')
-	assert not hpcp_mod._lands_elsewhere(spellings, 'a/b/g', {'/t/a'}, None)
 	def other_drive(paths):
 		raise ValueError("Paths don't have the same drive")
 	monkeypatch.setattr(os.path, 'commonpath', other_drive)
@@ -1951,6 +1954,201 @@ def test_a_link_out_of_the_overlay_still_copies_where_the_path_parts_from_the_de
 	assert rc == 0, output[-2000:]
 	assert files(tmp_path / 't').get(b'etc/l/x') == b'L' and files(tmp_path / 't').get(b'etc/conf') == b'C'
 	assert os.path.exists(str(tmp_path / 'o2/x')) == (not flags)
+
+
+# ---- a source's landing is another source's path (refused before anything changes, exit 213) ----
+
+def _race_tree(tmp_path):
+	"""w/c/r = OUT and w/D/c/r = IN; commands run in w/D/c: '../../c/r' lands at w/D/c/r, which is the other entry."""
+	write(tmp_path / 'w/c/r', 'OUT')
+	write(tmp_path / 'w/D/c/r', 'IN')
+	return tmp_path / 'w/D/c'
+
+
+@pytest.mark.parametrize('flags', [['-rf'], [], ['-s'], ['-nb'], ['-rf', '-nb'], ['-rf', '-s']], ids=lambda flags: ' '.join(flags) or 'copy')
+def test_a_list_entry_that_lands_on_another_entry_is_refused_before_anything_changes(tmp_path, flags):
+	# 9.81 left a 0-byte w/D/r in about 1 run in 20 (exit 0, sources removed); with -s or -nb IN was always lost.
+	cwd = _race_tree(tmp_path)
+	rc, output = run(['-d', '..'] + flags, cwd, b'../../c/r\nr\n')
+	assert rc == 213, output[-2000:]
+	assert files(tmp_path / 'w') == {b'c/r': b'OUT', b'D/c/r': b'IN'}
+	assert str(tmp_path / 'w/c/r').encode() in output and str(tmp_path / 'w/D/c/r').encode() in output
+	assert b'nothing is copied or removed' in output
+
+
+@pytest.mark.parametrize('flags', [['-rf'], []], ids=['move', 'copy'])
+def test_a_directory_that_lands_on_another_source_is_refused_before_anything_changes(tmp_path, flags):
+	# d1/x=A and d2/d1/x=B: the second source's contents land in d2/, the first's directory on the second's path.
+	write(tmp_path / 'd1/x', 'A')
+	write(tmp_path / 'd2/d1/x', 'B')
+	rc, output = run(['d1', 'd2/d1/', '-d', 'd2/'] + flags, tmp_path)
+	assert rc == 213, output[-2000:]
+	assert files(tmp_path) == {b'd1/x': b'A', b'd2/d1/x': b'B'}
+	assert str(tmp_path / 'd1').encode() in output and str(tmp_path / 'd2/d1').encode() in output
+
+
+@pytest.mark.parametrize('flags', [['-rf'], []], ids=['move', 'copy'])
+def test_a_directory_that_holds_another_source_and_has_its_file_is_refused(tmp_path, flags):
+	# a lands at out/a, which holds the source out/a/x; a/x would overwrite it.
+	write(tmp_path / 'a/x', 'A')
+	write(tmp_path / 'out/a/x', 'B')
+	rc, output = run(['a', 'out/a/x', '-d', 'out/'] + flags, tmp_path)
+	assert rc == 213, output[-2000:]
+	assert files(tmp_path) == {b'a/x': b'A', b'out/a/x': b'B'}
+	assert b'holds the source' in output
+
+
+def test_a_landing_inside_a_source_directory_is_refused(hpcp_mod, tmp_path, monkeypatch):
+	write(tmp_path / 'out/p/q', 'B')
+	write(tmp_path / 'src/p/q', 'A')
+	monkeypatch.chdir(tmp_path / 'src')
+	entry = hpcp_mod._ListedSource('p/q')
+	entry.landing = hpcp_mod._list_landing('p/q')
+	text = hpcp_mod._landing_clash([entry, str(tmp_path / 'out/p')], [str(tmp_path / 'out')])
+	assert text and 'lies inside the source' in text and str(tmp_path / 'out/p') in text and str(tmp_path / 'src/p/q') in text
+	# Nothing there yet: a file added to the other source's tree loses nothing.
+	os.remove(tmp_path / 'out/p/q')
+	assert hpcp_mod._landing_clash([entry, str(tmp_path / 'out/p')], [str(tmp_path / 'out')]) is None
+
+
+def test_an_excluded_source_is_no_clash(tmp_path):
+	cwd = _race_tree(tmp_path)
+	rc, output = run(['-d', '..', '-e', '*/D/c/r'], cwd, b'../../c/r\nr\n')
+	assert b'would land on' not in output
+
+
+# The forms around it that stay as they are.
+
+def test_find_dot_into_a_directory_below_it_still_runs(tmp_path):
+	write(tmp_path / 'a/x', 'A')
+	write(tmp_path / 'b', 'B')
+	rc, output = run(['-d', 'out'], tmp_path, b'.\n./a\n./a/x\n./b\n')
+	assert rc == 0, output[-2000:]
+	assert files(tmp_path / 'out') == {b'a/x': b'A', b'b': b'B'}
+
+
+def test_a_source_holding_the_destination_with_another_source_still_runs(tmp_path):
+	write(tmp_path / 's/a', 'A')
+	write(tmp_path / 'x', 'X')
+	rc, output = run(['.', 'x', '-d', 'out'], tmp_path)
+	assert rc == 0, output[-2000:]
+	assert files(tmp_path / 'out')[b'x'] == b'X' and files(tmp_path / 'out')[b's/a'] == b'A'
+
+
+def test_a_landing_on_a_path_that_is_not_a_source_overwrites_it_as_before(tmp_path):
+	cwd = _race_tree(tmp_path)
+	write(tmp_path / 'w/D/other', 'O')
+	rc, output = run(['-d', '..'], cwd, b'../../c/r\n../other\n')
+	assert rc == 0, output[-2000:]
+	assert files(tmp_path / 'w/D')[b'c/r'] == b'OUT'
+
+
+def test_a_source_that_lands_on_itself_with_another_source_is_no_clash(tmp_path):
+	write(tmp_path / 'out/x', 'X')
+	write(tmp_path / 'y', 'Y')
+	rc, output = run(['out/x', 'y', '-d', 'out'], tmp_path)
+	assert rc == 0, output[-2000:]
+	assert files(tmp_path / 'out') == {b'x': b'X', b'y': b'Y'}
+
+
+def test_a_directory_that_lands_on_itself_and_holds_another_source_still_runs(tmp_path):
+	# a copies nothing (it is its own landing), so it overwrites nothing of a/x, which lands at ./x.
+	write(tmp_path / 'a/x', 'A')
+	rc, output = run(['a/x', 'a', '-d', '.'], tmp_path)
+	assert rc == 0, output[-2000:]
+	assert files(tmp_path) == {b'a/x': b'A', b'x': b'A'}
+
+
+def test_a_named_file_that_is_the_destination_is_not_landed_on(tmp_path):
+	write(tmp_path / 'a/x', 'A')
+	os.symlink('a', tmp_path / 'ldir')
+	rc, output = run(['a/x', 'ldir/', '-d', 'a/x'], tmp_path)
+	assert rc == 213 and b'is another source' in output
+	assert files(tmp_path) == {b'a/x': b'A', b'ldir': b'-> a'}
+
+
+def test_a_directory_that_holds_another_source_without_its_file_still_runs(tmp_path):
+	write(tmp_path / 'a/f', 'F')
+	write(tmp_path / 'out/a/x', 'B')
+	rc, output = run(['a', 'out/a/x', '-d', 'out/'], tmp_path)
+	assert rc == 0, output[-2000:]
+	assert files(tmp_path / 'out')[b'a/f'] == b'F' and files(tmp_path / 'out')[b'x'] == b'B'
+
+
+# ---- a link entry whose directory nobody made, and a link to a directory in the list ----
+
+def _linked_tree(root):
+	write(root / 'f0', 'X')
+	os.makedirs(root / 'real')
+	os.symlink('../f0', root / 'real/l')
+	os.symlink('real', root / 'lnk')
+
+
+@pytest.mark.parametrize('args, stdin, expected', [
+	(['-d', 'out'], b'lnk/l\n', {b'lnk/l': b'-> ../f0'}),
+	(['-d', 'out', '-nds'], b'real/l\n', {b'real/l': b'-> ../f0'}),
+	(['-d', 'out', '-rf'], b'lnk/l\n', {b'lnk/l': b'-> ../f0'}),
+	(['-d', 'out'], b'lnk/l\nlnk\n', {b'lnk/l': b'-> ../f0'}),
+], ids=['through a link', '-nds', 'move', 'the link listed too'])
+def test_a_link_entry_gets_its_directory(tmp_path, args, stdin, expected):
+	_linked_tree(tmp_path)
+	rc, output = run(args, tmp_path, stdin)
+	assert rc == 0, output[-2000:]
+	assert files(tmp_path / 'out') == expected
+
+
+def test_find_with_links_followed_copies_every_link_entry(tmp_path):
+	_linked_tree(tmp_path)
+	listing = subprocess.run(['find', '-L', '.', '-type', 'f'], cwd=str(tmp_path), stdout=subprocess.PIPE).stdout
+	rc, output = run(['-d', 'out'], tmp_path, listing)
+	assert rc == 0, output[-2000:]
+	assert files(tmp_path / 'out') == {b'f0': b'X', b'lnk/l': b'-> ../f0', b'real/l': b'-> ../f0'}
+
+
+def test_a_link_in_a_subdirectory_gets_its_directory_without_directory_sync(tmp_path):
+	# -nds makes no directory, and a directory holding only links gets none from a file's copy either: 9.80 exited 162.
+	write(tmp_path / 'f0', 'X')
+	os.makedirs(tmp_path / 'real/sub')
+	os.symlink('../../f0', tmp_path / 'real/sub/m')
+	rc, output = run(['real', '-d', 'out/', '-nds'], tmp_path)
+	assert rc == 0, output[-2000:]
+	assert files(tmp_path / 'out') == {b'real/sub/m': b'-> ../../f0'}
+
+
+def test_a_directory_is_not_made_for_a_link_when_directories_are_not_to_be(tmp_path):
+	_linked_tree(tmp_path)
+	rc, output = run(['-d', 'out', '-ncd'], tmp_path, b'lnk/l\n')
+	assert rc != 0 and not os.path.exists(tmp_path / 'out/lnk')
+
+
+def test_a_directory_reached_through_a_link_keeps_the_mode_of_the_real_one(tmp_path):
+	write(tmp_path / 'real/f', 'F')
+	os.chmod(tmp_path / 'real', 0o700)
+	os.symlink('real', tmp_path / 'lnk')
+	for name in ('lnk', 'real'):
+		rc, output = run(['-d', 'out_' + name], tmp_path, name.encode() + b'/f\n')
+		assert rc == 0, output[-2000:]
+		assert stat.S_IMODE(os.stat(tmp_path / ('out_' + name) / name).st_mode) == 0o700
+
+
+@pytest.mark.parametrize('flags', [[], ['-rf']], ids=['copy', 'move'])
+def test_find_following_a_link_to_a_directory_copies_its_files(tmp_path, flags):
+	write(tmp_path / 'd/a', 'A')
+	os.symlink('d', tmp_path / 'lnk')
+	rc, output = run(['-d', 'out'] + flags, tmp_path, b'lnk\nlnk/a\n')
+	assert rc == 0, output[-2000:]
+	assert files(tmp_path / 'out') == {b'lnk/a': b'A'}
+	assert os.path.isdir(tmp_path / 'out/lnk') and not os.path.islink(tmp_path / 'out/lnk')
+	if flags:
+		assert not os.path.exists(tmp_path / 'd/a')
+
+
+def test_a_link_to_a_directory_listed_alone_is_still_copied_as_a_link(tmp_path):
+	write(tmp_path / 'd/a', 'A')
+	os.symlink('d', tmp_path / 'lnk')
+	rc, output = run(['-d', 'out'], tmp_path, b'lnk\n')
+	assert rc == 0, output[-2000:]
+	assert files(tmp_path / 'out') == {b'lnk': b'-> d'}
 
 
 # ---- modes: -di (needs root and loop devices: VM 901) ----

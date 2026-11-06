@@ -2368,6 +2368,9 @@ def create_sym_links(symLinks,exclude=None,link_tracking=False):
 				elif dest in dests:
 					dests.remove(dest)
 				try:
+					# The link's directory, made as a file's is (-nds, or a link reached through a linked directory, has none yet).
+					if not NO_CREATE_DIR:
+						_makedirs(os.path.dirname(dest), exist_ok=True)
 					# A relative target is resolved from the link's directory (Windows makes directory and file links apart).
 					os.symlink(linkedTargetFile, dest, target_is_directory=os.path.isdir(os.path.join(os.path.dirname(src), linkedTargetFile)))
 					if keep_target:
@@ -8731,9 +8734,13 @@ def load_source_list(file_list):
 def _without_covered_sources(src_paths):
 	"""src_paths without a list's repeats and the entries a directory listed above them already covers (plain find lists
 	both), in order. Only by their spelling, so a covered entry would land where its directory's copy puts it anyway. A
-	symlink to a directory covers nothing: it is copied as a link."""
+	symlink to a directory covers nothing: it is copied as a link, unless the list also names entries below it
+	(find -L lnk): those land in a directory of its name, which the link would only get in the way of, so the link goes."""
 	listed = {os.path.normpath(src) for src in src_paths if isinstance(src, _ListedSource)}
-	directories = {path for path in listed if os.path.isdir(path) and not os.path.islink(path)}
+	directories, links = set(), set()
+	for path in listed:
+		if os.path.isdir(path):
+			(links if os.path.islink(path) else directories).add(path)
 	def covered(path):
 		if path == os.curdir:
 			return False
@@ -8747,11 +8754,19 @@ def _without_covered_sources(src_paths):
 			if parent in directories:
 				return True
 			path = parent
+	opened = set()
+	if links:
+		for path in listed:
+			parent = os.path.dirname(path)
+			while parent and parent != path:
+				if parent in links:
+					opened.add(parent)
+				path, parent = parent, os.path.dirname(parent)
 	kept, seen = [], set()
 	for src in src_paths:
 		if isinstance(src, _ListedSource):
 			path = os.path.normpath(src)
-			if path in seen or covered(path):
+			if path in seen or path in opened or covered(path):
 				continue
 			seen.add(path)
 		kept.append(src)
@@ -8812,8 +8827,8 @@ def _lands_elsewhere(spellings, landing, roots, real_cwd):
 			if inside.startswith(prefix):
 				try:
 					shared = os.path.commonpath((spelling, real_cwd)).rstrip(os.path.sep) + os.path.sep
-				except (TypeError, ValueError):
-					# No working directory, or none on the entry's drive: nothing to part from.
+				except ValueError:
+					# The working directory is on another drive (Windows): nothing to part from.
 					return False
 				if not shared.startswith(prefix) or shared == prefix:
 					return False
@@ -10117,7 +10132,8 @@ def _sync_implied_parents(src, dests, synced):
 	for source, landing in reversed(parents):
 		missing = [path for path in (os.path.join(dest, landing) for dest in dests) if not os.path.lexists(path)]
 		if missing:
-			sync_directory_metadata(source, missing)
+			# A link to a directory (lnk/f) is made from the directory it leads to: the link itself has no mode to keep.
+			sync_directory_metadata(os.path.realpath(source) if os.path.islink(source) and os.path.isdir(source) else source, missing)
 
 def _copy_job(source, dests, dest_image=None):
 	"""(src, its destinations) as a copy job names them: 'path/' for a directory, as is for a file or a symlink."""
@@ -10132,7 +10148,64 @@ def _roots_overlap(roots):
 	ordered = sorted(root.rstrip(os.path.sep) + os.path.sep for root in roots)
 	return any(below.startswith(root) for root, below in zip(ordered, ordered[1:]))
 
-def _settle_destinations(src_paths, dests, dest_image=None, directory_only=False, exclude=None, max_workers=1, parallel_file_listing=False, move=False):
+def _landing_clash(src_paths, dests, exclude=None):
+	"""The text of the first clash where one source lands on another source's path, or None. Only a source inside a
+	destination can be hit, so a copy with none is not looked at (one path test each). A source A clashes with another
+	source B inside the destination when A's landing is B's path, lies inside B (a directory), or is a directory that
+	holds B and has a file at B's place (A's files would overwrite what B is copying). Copying or moving it would
+	overwrite the source being read, in an order nobody chose (a move then removes both). A source that lands on itself
+	copies nothing and is no clash, and one that holds the destination (find . | hpcp -d out) does not lie inside it.
+	A named file that is the destination itself can be landed on too (the destination is a file, and a source)."""
+	roots = [os.path.abspath(dest).rstrip(os.sep) + os.sep for dest in dests]
+	paths = [(os.path.abspath(src), src) for src in src_paths if src]
+	if not any(path.startswith(root) or path + os.sep == root for path, _ in paths for root in roots):
+		return None
+	def directory(path):
+		return os.path.isdir(path) and not os.path.islink(path)
+	def skipped(path):
+		return bool(exclude) and is_excluded(path + os.sep if directory(path) else path, exclude)
+	def clash(source, landing, other, how):
+		if skipped(source) or skipped(other):
+			return None
+		return f'Destination clash: {source} would land on {landing}, which {how}; nothing is copied or removed'
+	for dest, root in zip(dests, roots):
+		inside = {}
+		for path, _ in paths:
+			if path.startswith(root) or (path + os.sep == root and not directory(path)):
+				inside.setdefault(path, None)
+		if not inside:
+			continue
+		lands = [_source_dest(src, dest) for _, src in paths]
+		# A's landing is B's path or lies inside B.
+		for (path, _), landing in zip(paths, lands):
+			where = landing
+			while landing != path and (where.startswith(root) or where + os.sep == root):
+				if where in inside and where != path and (where == landing or (directory(where) and os.path.lexists(landing))):
+					text = clash(path, landing, where, 'is another source' if where == landing else f'lies inside the source {where}')
+					if text:
+						return text
+				if where == os.path.dirname(where):
+					break
+				where = os.path.dirname(where)
+		# A's landing holds B, and A has a file or directory at B's place.
+		holders = {}
+		for (path, _), landing in zip(paths, lands):
+			if landing != path and directory(path):
+				holders.setdefault(landing, []).append(path)
+		for other in inside:
+			where = os.path.dirname(other)
+			while len(where) + 1 >= len(root):
+				for path in holders.get(where, ()):
+					if path != other and os.path.lexists(os.path.join(path, os.path.relpath(other, where))):
+						text = clash(path, where, other, f'holds the source {other}')
+						if text:
+							return text
+				if where == os.path.dirname(where):
+					break
+				where = os.path.dirname(where)
+	return None
+
+def _settle_destinations(src_paths, dests, dest_image=None, directory_only=False, exclude=None, max_workers=1, parallel_file_listing=False):
 	"""Who writes each destination file when sources share one, decided before anything is copied, so the answer is the
 	same in every copy mode. In source order, with symlinks counted as files:
 	  * two files that land together because directory sources merge: the later source wins (an overlay, as a sequential
@@ -10141,8 +10214,7 @@ def _settle_destinations(src_paths, dests, dest_image=None, directory_only=False
 	    overwrite a file it just created, and it is reported;
 	  * a file where another source makes a directory (itself, or the directory a listed path implies): the directory
 	    stays, whichever came first, and the file is reported as a clash (cp would nest it, or fail);
-	  * a file that would be written over a source named directly: a clash, and with move an error, as -rm would then
-	    remove the file it wrote.
+	(A source that another lands on is refused before this, by _landing_clash.)
 	A source met again at its own place is no clash. Nothing is settled (and no listing read) when no two destinations
 	can meet. Returns ({(job's src, tuple(its dests)): paths it must not copy}, files a later source replaced). Listings
 	are cached, so the copy reads the same ones."""
@@ -10160,7 +10232,6 @@ def _settle_destinations(src_paths, dests, dest_image=None, directory_only=False
 	replaced = 0
 	holders = {}
 	dirs = set()
-	named = []
 	def clash(path, job, why):
 		eprint(f'Destination clash: {why}, not copying {path} over it')
 		dropped.setdefault(job, set()).add(path)
@@ -10188,7 +10259,6 @@ def _settle_destinations(src_paths, dests, dest_image=None, directory_only=False
 				add_directory((dest_root + folder[len(src_root):]).rstrip(os.path.sep))
 		else:
 			paths = (src,)
-			named.append((src, job))
 			add_directory(os.path.dirname(dest_root))
 		for path in paths:
 			dest = dest_root + path[len(src_root):]
@@ -10210,12 +10280,6 @@ def _settle_destinations(src_paths, dests, dest_image=None, directory_only=False
 				holders[dest] = (path, job, directory)
 			else:
 				clash(path, job, f'{dest} is already copied from {held[0]}')
-	for src, job in named:
-		held = holders.get(src)
-		if held is not None and held[0] != src:
-			if move:
-				raise RuntimeError(f'Invalid arguments: -rm would overwrite the source {src} with {held[0]} before moving it; nothing is copied or removed')
-			clash(held[0], held[1], f'{src} is a source')
 	return dropped, replaced
 
 def process_copy(src_paths: list, dests:list = [], single_thread = False, max_workers = multiprocessing.cpu_count(),verbose = False, 
@@ -10869,6 +10933,11 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = multipr
 						if _same_or_inside(actual, src_abs):
 							raise RuntimeError(f'Invalid arguments: -rm would move {src_abs} onto itself ({actual} is it or lies inside it); '
 								'nothing is copied or removed')
+			if not (directory_only or dest_image):
+				# Refused before anything is copied or removed: a source written over while it is read is lost.
+				clash_text = _landing_clash(src_paths, dests, exclude)
+				if clash_text:
+					raise RuntimeError(clash_text)
 			_get_file_list_cache.clear()
 			# What each source is before the copy reads it: a move removes nothing below a source replaced since.
 			source_ids = _source_identities(src_paths)
@@ -10876,7 +10945,7 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = multipr
 			pinned_dest_roots = _destination_roots(dests) if remove_extra else None
 			copy_error_start = len(ERRORS)
 			dropped, replaced = _settle_destinations(src_paths, dests, dest_image, directory_only, copy_exclude, 1 if single_thread else max_workers,
-				parallel_file_listing, move=remove)
+				parallel_file_listing)
 			if replaced:
 				print(f"Merged directories: {replaced} file(s) replaced by a later source")
 			total_file_list, total_sym_links = process_copy(src_paths, dests, single_thread=single_thread, max_workers=max_workers,
