@@ -2614,13 +2614,16 @@ def test_a_source_that_holds_the_image_is_not_listed_before_the_copy(tmp_path, h
 	assert got == ({}, 0, set())
 
 
-def test_sources_that_share_an_image_are_no_clash_with_what_it_holds(tmp_path, hpcp_mod, reset_hpcp_globals):
-	# Two sources meet in the image, so the files are compared; src/x landing on what the last run put there is no clash.
+def test_sources_that_meet_in_an_image_are_no_clash_with_what_it_holds(tmp_path, hpcp_mod, reset_hpcp_globals):
+	# An image keeps full paths, so src and src/sub land in each other and the files are compared; src/x landing on what the
+	# last run put there is no clash.
+	source, mount = str(tmp_path / 'src'), str(tmp_path / 'src/tmp')
 	write(tmp_path / 'src/x', 'X')
-	write(tmp_path / 'src/tmp/x', 'earlier run')
-	write(tmp_path / 'b/y', 'Y')
-	got = hpcp_mod._settle_destinations([str(tmp_path / 'src'), str(tmp_path / 'b')], [str(tmp_path / 'src/tmp')],
-		dest_image=str(tmp_path / 'dest.img'))
+	write(tmp_path / 'src/sub/y', 'Y')
+	os.makedirs(mount + source)
+	with open(mount + source + '/x', 'w') as earlier:
+		earlier.write('earlier run')
+	got = hpcp_mod._settle_destinations([source, source + '/sub'], [mount], dest_image=str(tmp_path / 'dest.img'))
 	assert got[2] == set()
 
 
