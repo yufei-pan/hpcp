@@ -127,3 +127,23 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - **What the operator sees:** as root, with a block or character device node named or in a list (a directory source skips it) and `-co`, when the node at the destination differs in mtime or device number, `cp -f` reads the source device to its end and writes it through the node at the destination: the same device, another disk, or a disk behind it, which on a mounted disk writes old blocks over live ones (reasoned, not run). The same on 9.80 when the mtime differs (the reviewer ran it); a different device number with the same mtime was skipped on 9.80. A matching pair of nodes (same kind, same device number, same mtime) is left alone since 9.81.
 - **Why:** old, root only, and it needs a named or listed device node and `-co`. Leaving a destination that is not a regular file alone belongs with the temporary name and rename above.
 - **Revisit when:** the next hpcp release (9.82).
+
+### Rerunning an overlapping form is refused
+- **Kind:** known limitation.
+- **What the operator sees:** `hpcp p/q/ -d p/` and `hpcp a out/a/s -d out/` copy on the first run and exit 213 on every run after it, because the first run's output has become a source file. Nothing is lost.
+- **Why:** narrowing it needs a content check at refusal time.
+- **Revisit when:** someone hits it.
+- **Approved:** 2026-11-06, the user chose "Known limitation (Recommended)".
+
+### A bind of a deep subdirectory inside a source tree is not caught
+- **Kind:** known limitation.
+- **What the operator sees:** the landing check looks only at directories it walks. With a deep subdirectory of a source tree bind-mounted so that it is reached from inside the destination, a file can land on itself, with possible loss. Binds of the destination itself and other spellings of its name are caught.
+- **Why:** catching it needs an lstat per directory on every run, for a layout that takes root to make.
+- **Revisit when:** someone hits it.
+- **Approved:** 2026-11-06, the user chose "Known limitation (Recommended)".
+
+### Two names that differ only in case on a case-insensitive destination
+- **Kind:** deferred.
+- **What the operator sees:** with `a/X` and `b/x`, `hpcp a/ b/ -d out/ -rf` onto a casefold directory exits 0, one file's content is gone, and either source can win (ext4 casefold: the earlier source in 3 of 9 runs, on every version). SMB, NTFS and exFAT destinations should do the same (reasoned, not run).
+- **Why:** the check compares real paths before the files exist. The fix is to ask whether the destination folds case and refuse the clash, exit 213.
+- **Revisit when:** the next hpcp release (9.82).
