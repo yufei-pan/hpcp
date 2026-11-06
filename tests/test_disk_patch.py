@@ -2926,8 +2926,8 @@ requires_root_loop = pytest.mark.skipif(os.name == 'nt' or os.geteuid() != 0 or 
 
 
 @contextlib.contextmanager
-def _plain_loop(image, sector_size=None):
-	argv = ['losetup', '--find', '--show'] + (['--sector-size', str(sector_size)] if sector_size else []) + [str(image)]
+def _plain_loop(image, sector_size=512):
+	argv = ['losetup', '--find', '--show'] + (['--sector-size', str(sector_size)] if sector_size != 512 else []) + [str(image)]
 	loop = subprocess.run(argv, check=True, capture_output=True, text=True).stdout.strip()
 	try:
 		yield loop
@@ -2964,6 +2964,8 @@ def test_direct_read_back_sees_the_device_not_the_cache(tmp_path, hpcp_mod):
 def test_direct_read_of_the_boot_code_on_any_sector_size(tmp_path, hpcp_mod, sector_size):
 	"""Review Focus 5: the 440-byte boot code is read as its enclosing logical block and cut back to 440 bytes; an
 	area ending short of a whole read chunk is hashed exactly."""
+	if sector_size != 512 and '--sector-size' not in subprocess.run(['losetup', '--help'], capture_output=True, text=True).stdout:
+		pytest.skip('this losetup has no --sector-size (util-linux 2.23.2 on EL7)')
 	image = tmp_path / 'disk.img'
 	data = bytes(range(256)) * (5 << 12)
 	image.write_bytes(data)
