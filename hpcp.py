@@ -10305,12 +10305,15 @@ def _settle_destinations(src_paths, dests, dest_image=None, directory_only=False
 	if directory_only:
 		# Nothing is copied.
 		return dropped, 0, set()
-	roots = [land for job in jobs for land in job[4]] + [job[3] for job in jobs]
-	for src, actual_dests, directory, _, lands in jobs:
-		if directory:
-			for dest, land in zip(actual_dests, lands):
-				if os.path.isdir(land):
-					roots.extend(_link_targets(src, dest, listing(src), places))
+	roots = [land for job in jobs for land in job[4]]
+	# An image is a tree of its own. A source that holds its mount point (hpcp / -di) reads what an earlier run put there.
+	if not dest_image:
+		roots.extend(job[3] for job in jobs)
+		for src, actual_dests, directory, _, lands in jobs:
+			if directory:
+				for dest, land in zip(actual_dests, lands):
+					if os.path.isdir(land):
+						roots.extend(_link_targets(src, dest, listing(src), places))
 	if not _roots_overlap(roots):
 		return dropped, 0, in_place
 	def files_of(job):
@@ -10325,7 +10328,6 @@ def _settle_destinations(src_paths, dests, dest_image=None, directory_only=False
 			entries = ((src, real, actual_dests),)
 		for path, place, targets in entries:
 			yield path, place, [places.landing(target, path) for target in targets]
-	# An image is a tree of its own. A source that holds its mount point (hpcp / -di) reads what an earlier run put there.
 	if not dest_image:
 		reads = {}
 		for job in jobs:

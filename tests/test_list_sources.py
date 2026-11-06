@@ -2603,6 +2603,17 @@ def test_an_image_mounted_inside_its_source_takes_a_rerun(tmp_path, hpcp_mod, re
 		assert hpcp_mod.hpcp(['src/'], dest_image=str(tmp_path / 'dest.img'), dest_image_size=80 * 1024 * 1024, batch=True) == 0
 
 
+def test_a_source_that_holds_the_image_is_not_listed_before_the_copy(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	# hpcp / -di in small: an image is a tree of its own, so the run pays nothing to look for clashes with it.
+	write(tmp_path / 'src/x', 'X')
+	write(tmp_path / 'src/tmp/x', 'earlier run')
+	def listed(*args, **kwargs):
+		raise AssertionError('listed before the copy')
+	monkeypatch.setattr(hpcp_mod, 'get_file_list', listed)
+	got = hpcp_mod._settle_destinations([str(tmp_path / 'src')], [str(tmp_path / 'src/tmp')], dest_image=str(tmp_path / 'dest.img'))
+	assert got == ({}, 0, set())
+
+
 # ---- a directory job judged as a whole; a hard link at the landing; a source that is the destination ----
 
 
