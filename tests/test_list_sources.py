@@ -4521,6 +4521,13 @@ def test_the_net_folds_names_that_python_holds_as_escapes(hpcp_mod):
 	# Not UTF-8 at all: what a filesystem makes of those bytes (latin-1 on vfat, say) is its own, so they meet in the net and
 	# the directory is asked.
 	assert same('\udcff', '\udcfe') and same('/o/caf\udce9', '/o/CAF\udcc9')
+	# A legacy name in which a few bytes happen to make a UTF-8 character ('\u041f\u0451' in cp1251 is the UTF-8 of '\u03f8'),
+	# while its other case is not UTF-8: read byte by byte, both meet. 'replace' read the first as UTF-8 and lost the pair.
+	for encoding, first, second in (('cp1251', '\u041f\u0451\u0442\u0440.txt', '\u043f\u0451\u0442\u0440.txt'),
+			('cp1251', '\u0412\u0456\u043a\u0442\u043e\u0440', '\u0432\u0456\u043a\u0442\u043e\u0440'),
+			('koi8-r', '\u0436\u0451\u043b\u0442\u044b\u0439', '\u0416\u0451\u043b\u0442\u044b\u0439')):
+		one, other = (os.fsdecode(name.encode(encoding)) for name in (first, second))
+		assert same(one, other) and same('/o/' + one, '/O/' + other) and same('/\u00e9/' + one, '/\u00c9/' + other), encoding
 
 
 _C_LOCALE_PAIR = """
@@ -5257,8 +5264,8 @@ def _counting(hpcp_mod, monkeypatch):
 
 
 def test_names_that_fold_alike_are_asked_about_in_one_probe_however_many(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
-	# Names in a legacy encoding (cp1251 surnames) are not UTF-8, and the net folds every such byte alike: a pair at a time,
-	# 3,000 of them made 902,303 probes.
+	# Names in a legacy encoding (cp1251 surnames) are not UTF-8, and the net folds every byte past ASCII alike, so names of one
+	# length meet: a pair at a time, 3,000 of them made 902,303 probes.
 	monkeypatch.chdir(tmp_path)
 	os.makedirs(tmp_path / 'a')
 	for number in range(200):
@@ -5442,3 +5449,63 @@ def test_names_that_cannot_be_asked_about_meet_only_the_names_that_fold_like_the
 	said = [line for line in capsys.readouterr().err.splitlines() if line.endswith('not copying %s over it' % (tmp_path / 'd/y'))]
 	assert len(said) == 1 and '%s and %s may be one name' % (tmp_path / 'out/y', tmp_path / 'out/Y') in said[0], said
 	assert files(tmp_path / 'out') == {b'X': b'a', b'Y': b'c'}
+
+
+def test_a_name_found_among_several_made_costs_no_probe_of_its_own(tmp_path, hpcp_mod, monkeypatch):
+	# The file says which name holds it: asking each made name alone is only for when it cannot.
+	_probes_folding_case(monkeypatch)
+	asked = _counting(hpcp_mod, monkeypatch)
+	assert hpcp_mod._ask_names(str(tmp_path), ['X', 'Y', 'Z', 'y'])[0]['y'] == 'Y'
+	assert asked == [['X', 'Y', 'Z', 'y']]
+
+
+def test_a_name_that_is_there_already_says_why_each_made_name_alone_could_not_say(tmp_path, hpcp_mod, monkeypatch):
+	# Asked alone, a then b: the first question finds no space, the second no permission. Both reasons are the fix.
+	real_open, real_mkdir, probes = os.open, os.mkdir, []
+	def opening(path, flags, *args, **kwargs):
+		directory, name = os.path.split(os.fspath(path))
+		if name == 'z' and flags & os.O_CREAT and len(os.listdir(directory)) > 1:
+			raise FileExistsError(errno.EEXIST, 'File exists', path)
+		if not flags & os.O_CREAT and name == 'z':
+			raise FileNotFoundError(errno.ENOENT, 'No such file or directory', path)
+		return real_open(path, flags, *args, **kwargs)
+	def making(path, *args, **kwargs):
+		probes.append(path)
+		if len(probes) == 2:
+			raise OSError(errno.ENOSPC, 'No space left on device', path)
+		if len(probes) == 3:
+			raise PermissionError(errno.EACCES, 'Permission denied', path)
+		return real_mkdir(path, *args, **kwargs)
+	monkeypatch.setattr(os, 'open', opening)
+	monkeypatch.setattr(os, 'mkdir', making)
+	answers, why = hpcp_mod._ask_names(str(tmp_path), ['a', 'b', 'z'])
+	assert answers == {'a': 'a', 'b': 'b'} and why['z'].startswith(f'{tmp_path} takes z for a name it holds, and cannot say which; ')
+	assert 'free some space there' in why['z'] and 'make it writable' in why['z'], why
+	assert os.listdir(tmp_path) == []
+
+
+@no_permissions_as_root
+def test_a_landing_on_a_source_file_that_cannot_be_asked_about_says_why_and_not_that_it_is_the_source(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch, capsys):
+	monkeypatch.chdir(tmp_path)
+	write(tmp_path / 't/sub/f', 'T')
+	write(tmp_path / 's/sub/F', 'S')
+	os.chmod(tmp_path / 's/sub', 0o555)
+	try:
+		assert _move(hpcp_mod, ['t/', 's/sub/F'], ['s/']) == 213
+	finally:
+		os.chmod(tmp_path / 's/sub', 0o755)
+	error = capsys.readouterr().err
+	assert 'which is the source file' not in error and f'may land on the source file {tmp_path}/s/sub/F' in error, error[-2000:]
+	assert f'nothing can be made in {tmp_path}/s/sub to ask it (Permission denied): make it writable and run again' in error
+	assert (tmp_path / 't/sub/f').read_text() == 'T' and (tmp_path / 's/sub/F').read_text() == 'S'
+
+
+
+def test_a_question_that_cannot_be_asked_gives_the_reasons_of_its_own_two_names(tmp_path, hpcp_mod, monkeypatch):
+	# One group, two names unknown for different reasons: the pair X and x is told about x, not about x. too.
+	monkeypatch.setattr(hpcp_mod, '_ask_names', lambda directory, names: ({'X': 'X'}, {'x.': 'the reason for x.', 'x': 'the reason for x'}))
+	root = os.path.realpath(str(tmp_path))
+	places = hpcp_mod._RealPlaces()
+	places.expect([root + '/X', root + '/x.', root + '/x'])
+	assert places.same_place(root + '/X', root + '/x') is None
+	assert places.cannot_ask(root + '/X', root + '/x') == 'the reason for x'

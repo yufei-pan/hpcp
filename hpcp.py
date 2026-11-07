@@ -10722,9 +10722,9 @@ def _make_names(probe, names, made, answers, why):
 			fd = os.open(os.path.join(probe, name), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
 		except FileExistsError:
 			# Made, not looked up: vfat with iocharset=utf8 finds only the one spelling, and still refuses the other.
-			holder = made[0] if len(made) == 1 else _holder(probe, name, made)
+			holder, reasons = (made[0], ()) if len(made) == 1 else _holder(probe, name, made)
 			if holder is None:
-				why[name] = f'{directory} takes {name} for a name it holds, and cannot say which'
+				why[name] = '; '.join([f'{directory} takes {name} for a name it holds, and cannot say which'] + list(dict.fromkeys(reasons)))
 			else:
 				answers[name] = holder
 			continue
@@ -10744,17 +10744,24 @@ def _make_names(probe, names, made, answers, why):
 	return None
 
 def _holder(probe, name, made):
-	"""Which of made, the names made in probe so far, holds name, that is there already. The file says; where it cannot (a
-	lookup that misses the spelling it refused, a write that found no space), each one is asked on its own."""
+	"""Which of made, the names made in probe so far, holds name, that is there already, and why the questions that could not
+	say could not: (the name or None, reasons). The file says; where it cannot (a lookup that misses the spelling it refused, a
+	write that found no space), each one is asked on its own."""
 	try:
 		fd = os.open(os.path.join(probe, name), os.O_RDONLY)
 		try:
-			return made[int(os.read(fd, 32))]
+			return made[int(os.read(fd, 32))], ()
 		finally:
 			os.close(fd)
 	except (OSError, ValueError, IndexError):
-		directory = os.path.dirname(probe)
-		return next((other for other in made if _ask_names(directory, [other, name])[0].get(name) == other), None)
+		pass
+	directory, reasons = os.path.dirname(probe), []
+	for other in made:
+		answers, why = _ask_names(directory, [other, name])
+		if answers.get(name) == other:
+			return other, ()
+		reasons.extend(why.values())
+	return None, reasons
 
 # Default_Ignorable_Code_Point: ext4 and f2fs passed over these until Linux 6.14.
 _IGNORABLE = re.compile('[\u00ad\u034f\u061c\u115f\u1160\u17b4\u17b5\u180b-\u180f\u200b-\u200f\u202a-\u202e\u2060-\u206f\u3164\ufe00-\ufe0f\ufeff\uffa0'
@@ -10765,12 +10772,26 @@ _TRAILING_DOTS = re.compile(r'\.+(?=%s|$)' % re.escape(os.sep))
 
 def _folded(path):
 	"""What two paths have in common when some filesystem could read them as one: a wide net, as the filesystem itself is asked
-	about what it catches (_one_name). Read as UTF-8 whatever the locale: under C, Python 3.6 holds 'É' as two escapes, which
-	nothing folds."""
-	path = os.fsencode(path).decode('utf-8', 'replace')
+	about what it catches (_ask_names). Read as UTF-8 whatever the locale: under C, Python 3.6 holds 'É' as two escapes, which
+	nothing folds. A name that is not UTF-8 is in a legacy encoding (cp1251, koi8-r, latin-1), which a filesystem mounted with
+	that charset folds by its own table: past ASCII any byte may be another's case there, so each such byte is one mark,
+	even where a few of them happen to make a UTF-8 character ('Пё' in cp1251), which its other case does not."""
+	raw = os.fsencode(path)
+	try:
+		path = raw.decode('utf-8')
+	except UnicodeDecodeError:
+		path = os.sep.join(_legacy_name(name) for name in raw.split(os.fsencode(os.sep)))
 	path = _IGNORABLE.sub('', unicodedata.normalize('NFD', unicodedata.normalize('NFD', path).casefold()))
 	# Most names have a dot, and few end one: the pattern runs for those only.
 	return _TRAILING_DOTS.sub('', path) if path.endswith('.') or '.' + os.sep in path else path
+
+def _legacy_name(name):
+	"""A name of a path that is not UTF-8 as a whole, as _folded reads it: as UTF-8 where it is, else its ASCII as it is and every
+	other byte as the one mark U+FFFD."""
+	try:
+		return name.decode('utf-8')
+	except UnicodeDecodeError:
+		return ''.join(chr(byte) if byte < 0x80 else '\ufffd' for byte in name)
 
 def _names_may_fold(jobs, listing):
 	"""The landings of jobs (of _settle_destinations) that another landing matches in everything but spelling: none when no two
@@ -10942,10 +10963,14 @@ def _settle_destinations(src_paths, dests, dest_image=None, directory_only=False
 			for read in folded_reads[folded]:
 				alike_reads.setdefault(places.bucket(read), []).append(read)
 			for path, place, land in lands:
-				read = next((other for other in alike_reads.get(places.bucket(land), ()) if other != place and places.same_place(land, other) is not False), None)
-				if read is not None:
-					raise RuntimeError(f'Destination clash: {path} would land on {land}, which is the source file {reads[read]}; '
-						'nothing is copied or removed')
+				for read in alike_reads.get(places.bucket(land), ()):
+					answer = read != place and places.same_place(land, read)
+					if answer:
+						raise RuntimeError(f'Destination clash: {path} would land on {land}, which is the source file {reads[read]}; '
+							'nothing is copied or removed')
+					if answer is None:
+						raise RuntimeError(f'Destination clash: {path} may land on the source file {reads[read]}: {land} and {read} may be one '
+							f'name, and the destination cannot be asked: {places.cannot_ask(land, read)}; nothing is copied or removed')
 	replaced = 0
 	holders = {}
 	dirs = set()

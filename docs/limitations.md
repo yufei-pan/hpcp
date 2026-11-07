@@ -120,7 +120,7 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 
 ### A probe left behind by SIGKILL
 - **Kind:** known limitation.
-- **What the operator sees:** hpcp killed with SIGKILL in the moment it asks a directory about a pair leaves a hidden `.hpcp-case-probe-PID-uuid` directory in the destination, empty or holding a small file for each spelling of the name it was asking about. No data is affected. SIGINT, SIGTERM and SIGHUP wait for the probe to go, and left nothing in 30 kills each.
+- **What the operator sees:** hpcp killed with SIGKILL in the moment it asks a directory about a name leaves a hidden `.hpcp-case-probe-PID-uuid` directory in the destination, empty or holding a small file for each spelling of the name it was asking about; where the probe asks each made name alone (a spelling the directory will not look up, as on vfat), a second such directory can be left beside it. No data is affected. SIGINT, SIGTERM and SIGHUP wait for the probe to go, and left nothing in 30 kills each.
 - **Why:** SIGKILL cannot be handled, and the only way to ask a directory about two names is to make them.
 - **Revisit when:** an operator reports finding one.
 - **Approved:** 2026-11-06, the user chose "Known limitation (Recommended)".
@@ -135,7 +135,7 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 ### An 8.3 alias beside its long name on vfat
 - **Kind:** deferred.
 - **What the operator sees:** `hpcp a/ b/ -d out/ -rf` onto vfat with `a/longfilename.txt` and `b/LONGFI~1.TXT` exits 0 and one content is gone, in about half of the runs: vfat made `LONGFI~1.TXT` the short name of the first file, so the second source is written onto it. The sources are removed. 9.82 does the same.
-- **Why:** the alias is not in either name, so no rule on names catches it, and asking the directory about the pair (`_one_name`) cannot see that one file already has the other's name. It is a filesystem's invention, not a spelling.
+- **Why:** the alias is not in either name, so no rule on names catches it, and asking the directory about the pair (`_ask_names`) cannot see that one file already has the other's name. It is a filesystem's invention, not a spelling.
 - **Plan:** before a move removes anything, check that no two sources share a landing identity (device and inode of what the copy wrote), and keep every source when two do.
 - **Revisit when:** the next hpcp release.
 
@@ -145,3 +145,18 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - **Why:** the check that a source holds the destination compares real paths, and FUSE exFAT gives each spelling of one directory a number of its own, so `D` and `d` are two real paths there. Kernel filesystems give both one number, and the check sees one directory.
 - **Plan:** where a source's real path folds like the start of a destination's, ask the directory whether they are one (`_RealPlaces.same_place`), as the move check does, and leave the destination out of the walk as for one spelling.
 - **Revisit when:** the next hpcp release.
+
+### A legacy name that is valid UTF-8 by chance, against its other case
+- **Kind:** deferred.
+- **What the operator sees:** on a vfat or exFAT mounted with a codepage `iocharset` (`iso8859-1`, `cp1251`, `koi8-r`; not `utf8`), two names that the mount takes for one, where the bytes of one happen to be valid UTF-8 and the other's are not, are not asked about: the bytes `C3 A9 74` (Latin-1 `Ã©t`, UTF-8 `ét`) and `E3 A9 74`, which a cp1251 mount reads as `Г©t` and `г©t`. `hpcp a/ b/ -d out/ -rf` with one in `a/` and the other in `b/` exits 0 with one content gone, and `hpcp Ã©t -d ã©t -rf` (a rename in case) exits 0 and the file is gone. Checked on vfat `iocharset=cp1251` and kernel exFAT `iocharset=cp1251` (VM 901). Only for such a pair, and only on such a mount: names that are not UTF-8 as a whole fold byte by byte and meet.
+- **Why:** a name that is valid UTF-8 is read as UTF-8, which it is on every other mount, and its other case read byte by byte is not the same text. Joining every valid name with every non-UTF-8 name of the same length and ASCII would ask about most legacy trees pair by pair again.
+- **Plan:** a second, byte-level key for valid names (ASCII casefolded, every byte at or above 0x80 one mark), joined only with the keys of names that are not UTF-8, at every place names are grouped; or read the mount's `iocharset` and fold by it.
+- **Revisit when:** the next hpcp release.
+
+### A landing within about 57 characters of PATH_MAX
+- **Kind:** deferred.
+- **What the operator sees:** two names that fold alike landing at a path within about 57 characters of the system's path limit (4096 on Linux) are refused with 213, `refuses the name ... (File name too long)`, because the probe directory makes the path longer. Never a loss; 9.83's earlier probe did the same.
+- **Why:** the probe makes its names at the probe directory's full path.
+- **Plan:** make the probe directory and its names relative to a descriptor of the directory (`dir_fd`), so their length is the name's own.
+- **Revisit when:** the next hpcp release.
+
