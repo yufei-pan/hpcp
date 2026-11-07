@@ -10978,6 +10978,9 @@ def _settle_destinations(src_paths, dests, dest_image=None, directory_only=False
 	replaced = 0
 	holders = {}
 	dirs = set()
+	# The directories of the other destinations, for the fold check only: a file can meet a directory of another source in
+	# any destination it may go to (files spill, -rds picks at random), and only a later one may take the two for one name.
+	later = set()
 	def clash(path, job, why):
 		eprint(f'Destination clash: {why}, not copying {path} over it')
 		dropped.setdefault(job, set()).add(path)
@@ -10996,6 +10999,13 @@ def _settle_destinations(src_paths, dests, dest_image=None, directory_only=False
 					f'{ours} and {theirs} may be one name, and the destination cannot be asked: {places.cannot_ask(theirs, ours)}')
 				return True
 		return False
+	def add_later(path):
+		while path not in later:
+			later.add(path)
+			parent = os.path.dirname(path)
+			if parent == path:
+				return
+			path = parent
 	def add_directory(path):
 		"""path and the directories above it are directories at the destination: a file held there gives way."""
 		while path not in dirs:
@@ -11011,14 +11021,20 @@ def _settle_destinations(src_paths, dests, dest_image=None, directory_only=False
 	for entry in jobs:
 		src, actual_dests, directory, _, lands = entry
 		job = (src, tuple(actual_dests))
+		# Only names that fold alike are checked against the other destinations' directories.
+		count_later = folds and len(lands) > 1
 		if directory:
-			src_root, dest_root = src.rstrip(os.path.sep), actual_dests[0].rstrip(os.path.sep)
-			add_directory(lands[0])
-			for folder in listing(src)[3]:
-				below = (dest_root + folder[len(src_root):]).rstrip(os.path.sep)
-				add_directory(places.directory(below))
+			src_root = src.rstrip(os.path.sep)
+			for index, (dest, land) in enumerate(zip(actual_dests, lands) if count_later else [(actual_dests[0], lands[0])]):
+				add = add_directory if index == 0 else add_later
+				add(land)
+				dest_root = dest.rstrip(os.path.sep)
+				for folder in listing(src)[3]:
+					add(places.directory((dest_root + folder[len(src_root):]).rstrip(os.path.sep)))
 		else:
 			add_directory(os.path.dirname(lands[0]))
+			for land in lands[1:] if count_later else ():
+				add_later(os.path.dirname(land))
 		for path, place, landings in sorted(files_of(entry)) if folds else files_of(entry):
 			if directory and place in landings:
 				continue
@@ -11047,29 +11063,34 @@ def _settle_destinations(src_paths, dests, dest_image=None, directory_only=False
 				clash(path, job, f'{dest} is already copied from {held[0]}')
 	if folds:
 		made = {}
-		for path in dirs:
+		for path in itertools.chain(dirs, later):
 			made.setdefault(_folded(path), []).append(path)
 		names = [_folded(dest) for dest in holders]
 		count = Counter(names)
 		# Only names that meet another are compared, and each directory is asked about all its spellings of one at once.
 		shared = [(name, held) for name, held in zip(names, list(holders.items())) if count[name] > 1 or name in made]
-		places.expect(itertools.chain.from_iterable(itertools.chain(held[1][3], made.get(name, ())) for name, held in shared))
+		# The fold of each landing, in each destination: the first is the holder's own.
+		landing_names = [[name] + [_folded(land) for land in held[1][3][1:]] for name, held in shared]
+		places.expect(itertools.chain.from_iterable(itertools.chain(held[1][3], *(made.get(key, ()) for key in keys)) for keys, (_, held) in zip(landing_names, shared)))
 		directories = {}
-		for name in {name for name, _ in shared}:
-			for path in made.get(name, ()):
+		for key in {key for keys in landing_names for key in keys}:
+			for path in made.get(key, ()):
 				directories.setdefault(places.bucket(path), []).append(path)
 		kept = {}
 		for order, (name, (dest, (path, job, _, landings))) in enumerate(shared):
 			buckets = [places.bucket(land) for land in landings]
 			if not os.path.islink(path):
+				# In every destination: the file may go to any of them.
 				verdicts = {}
-				for place in directories.get(buckets[0], ()):
-					verdicts.setdefault(places.same_place(dest, place), place)
+				for land, key in zip(landings, buckets):
+					for place in directories.get(key, ()):
+						verdicts.setdefault(places.same_place(land, place), (land, place))
 				if True in verdicts:
-					clash(path, job, f'{dest} is a directory of another source where the destination folds case')
+					clash(path, job, f'{verdicts[True][0]} is a directory of another source where the destination folds case')
 					continue
 				if None in verdicts:
-					clash(path, job, f'{dest} and {verdicts[None]} may be one name, and the destination cannot be asked: {places.cannot_ask(dest, verdicts[None])}')
+					land, place = verdicts[None]
+					clash(path, job, f'{land} and {place} may be one name, and the destination cannot be asked: {places.cannot_ask(land, place)}')
 					continue
 			# The first, in order, that is one name with it in any destination, or may be.
 			firsts = sorted({first[0]: first for index, key in enumerate(buckets) for first in kept.get((index, key), ())}.values())

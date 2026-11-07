@@ -4884,6 +4884,21 @@ def test_several_destinations_name_the_one_that_folds(tmp_path, hpcp_mod, reset_
 	assert str(tmp_path / 'two/x') + ' and ' + str(tmp_path / 'two/X') + ' are one name' in said and 'one/' not in said
 
 
+@pytest.mark.parametrize('remove', [False, True], ids=['copy', 'move'])
+def test_a_file_and_a_directory_that_only_a_later_destination_takes_for_one_name_are_a_clash(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch, capsys, remove):
+	# With -nds and -rds the file could be written into the directory on two/ as it was made there, onto its file: exit 0
+	# and one content gone in 6 of 20 runs of 100 such pairs (vfat).
+	monkeypatch.chdir(tmp_path)
+	write(tmp_path / 'a/X', 'file')
+	write(tmp_path / 'b/x/X', 'below')
+	_answering(hpcp_mod, monkeypatch, lambda directory, first, second: os.path.basename(directory) == 'two')
+	assert hpcp_mod.hpcp(['a/', 'b/'], ['one/', 'two/'], single_thread=True, max_workers=1, batch=True, remove_force=remove) == 213
+	said = [line for line in capsys.readouterr().err.splitlines() if 'is a directory of another source where the destination folds case' in line]
+	assert said and str(tmp_path / 'two/X') in said[0] and 'a/X' in said[0]
+	assert (tmp_path / 'a/X').read_text() == 'file'
+	assert {**files(tmp_path / 'one'), **files(tmp_path / 'two')} == {b'x/X': b'below'}
+
+
 def test_a_question_that_is_asked_of_two_parts_ends_unknown_if_one_part_cannot_be_asked(tmp_path, hpcp_mod, monkeypatch):
 	# Unknown, then one name: not one name. Where the first cannot be asked there is no directory to ask the second of.
 	asked = _answering(hpcp_mod, monkeypatch, lambda directory, first, second: None if first.lower() == 'a' else True)

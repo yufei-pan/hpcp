@@ -113,7 +113,7 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 
 ### Several destinations and a pair one of them takes for one name
 - **Kind:** known limitation.
-- **What the operator sees:** with several `-d`, two names that one destination takes for one name (`a/X` and `b/x`, the second `-d` folding case) are a clash, exit 213, though both would have fitted on another destination that keeps them apart. It is a false 213 for that pair, never a lost file.
+- **What the operator sees:** with several `-d`, two names that one destination takes for one name (`a/X` and `b/x`, the second `-d` folding case) are a clash, exit 213, though both would have fitted on another destination that keeps them apart. The same holds for a file and a directory of another source (`a/X` and `b/x/`). It is a false 213 for that pair, never a lost file.
 - **Why:** files spill from one destination to the next as space runs out, and `-rds` picks at random, so which destination gets each file is not known before the copy.
 - **Revisit when:** someone hits it.
 - **Approved:** 2026-11-06, the user chose "Known limitation (Recommended)".
@@ -155,13 +155,6 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   `hpcp a/ b/ -d out/ -rf` with one in `a/` and the other in `b/` exits 0 with one content gone, and the rename in case (`hpcp out/ONE -d out/OTHER -rf`) exits 0 and the file is gone. Checked on vfat mounted `iocharset=cp1251`, `koi8-r`, `iso8859-1` and `iso8859-9` (`utf8=0`), and kernel exFAT mounted `iocharset=cp1251` (VM 901). Only for such pairs, and only on such a mount: names that are not UTF-8 as a whole fold byte by byte and meet.
 - **Why:** a name that is valid UTF-8 is read as UTF-8, which it is on every other mount, and the mount's own table, not UTF-8, says what its other case is. Joining every valid name with every name of the same length would ask about most trees pair by pair again.
 - **Plan:** first a backstop that needs no fold rule: before a move removes a source, check that its landing holds that source (the size and modification time `cp -a` gave it, and that the landing is not the source itself, which is asked by doing, in the same directory, where they share it), and where it does not, keep the source and report a clash. Then catch the pairs before the copy: fold every name byte by byte on a mount with a codepage `iocharset` (read from the mount options), or join byte-level keys across all names.
-- **Revisit when:** the next hpcp release.
-
-### A file and a directory that only a later `-d` takes for one name, with `-nds`
-- **Kind:** deferred.
-- **What the operator sees:** with `a/F` a file and `b/f/F` a file in a directory, `hpcp a/ b/ -d one/ -d two/ -rf -rds -nds`, where only `two/` folds case, exits 0 with one content gone in about a third of the runs (6 of 20 runs of 100 such pairs, `-j 16`, vfat on VM 901; 9.82 the same). `-nds` makes `two/f` only as `b/f/F` is copied, so `a/F` can pass the check that its landing is no directory and then be written into `two/f`, onto `two/f/F`. Without `-nds` the directories are made on every destination before any file, and nothing was lost in 1,100 pairs; without `-rds` the file goes to `one/` unless that fills.
-- **Why:** the check for a file meeting a directory of another source (`_settle_destinations`) runs on the first destination only, as files may spill to the others.
-- **Plan:** run that check on every destination's landing, not only `buckets[0]`, so the pair is refused as two files are (see "Several destinations and a pair one of them takes for one name").
 - **Revisit when:** the next hpcp release.
 
 ### A landing within about 57 characters of PATH_MAX
