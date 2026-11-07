@@ -1351,10 +1351,13 @@ def test_directory_only_with_two_file_sources_is_no_clash(tmp_path):
 
 # F10: sources whose destinations cannot meet are not settled.
 
-def test_settling_reads_no_listing_when_destinations_cannot_meet(hpcp_mod, monkeypatch):
+def test_settling_compares_no_file_when_destinations_cannot_meet(hpcp_mod, monkeypatch):
+	listings = {'/data/source_a/': (frozenset(['/data/source_a/f']), frozenset(), 0, frozenset(['/data/source_a/'])),
+		'/data/source_b/': (frozenset(['/data/source_b/g']), frozenset(), 0, frozenset(['/data/source_b/']))}
+	monkeypatch.setattr(hpcp_mod, 'get_file_list', lambda path, **kwargs: listings[path])
 	def fail(*args, **kwargs):
-		raise AssertionError('listed')
-	monkeypatch.setattr(hpcp_mod, 'get_file_list', fail)
+		raise AssertionError('compared')
+	monkeypatch.setattr(hpcp_mod._RealPlaces, 'landing', fail)
 	monkeypatch.setattr(hpcp_mod.os.path, 'isdir', lambda path: path.startswith('/data/source'))
 	assert hpcp_mod._settle_destinations(['/data/source_a', '/data/source_b'], ['/o/out/'], None, False, None, 4, False)[:2] == ({}, 0)
 
@@ -2465,10 +2468,14 @@ def test_real_places_agree_with_realpath(hpcp_mod, tmp_path):
 		assert places.directory(root + '/' + path) == os.path.realpath(root + '/' + path)
 
 
-def test_safe_a_copy_into_a_new_destination_lists_nothing_early(hpcp_mod, tmp_path, monkeypatch):
+def test_safe_a_copy_into_a_new_destination_reads_its_source_once(hpcp_mod, reset_hpcp_globals, tmp_path, monkeypatch):
+	# The check before the copy lists it, to compare the names, and the copy reuses that listing.
 	write(tmp_path / 'src/d/x', 'x')
-	monkeypatch.setattr(hpcp_mod, 'get_file_list', lambda *args, **kwargs: pytest.fail('listed'))
-	assert hpcp_mod._settle_destinations([str(tmp_path / 'src/')], [str(tmp_path / 'new') + '/'])[:2] == ({}, 0)
+	scans = []
+	real = hpcp_mod.get_file_list_serial
+	monkeypatch.setattr(hpcp_mod, 'get_file_list_serial', lambda *args, **kwargs: scans.append(args[0]) or real(*args, **kwargs))
+	assert hpcp_mod.hpcp([str(tmp_path / 'src/')], [str(tmp_path / 'new') + '/'], single_thread=True, max_workers=1, batch=True) == 0
+	assert len(scans) == 1 and (tmp_path / 'new/src/d/x').exists()
 
 
 def test_a_copy_onto_an_existing_tree_reads_each_directory_once_and_stats_no_file(hpcp_mod, tmp_path, monkeypatch):
@@ -2603,13 +2610,13 @@ def test_an_image_mounted_inside_its_source_takes_a_rerun(tmp_path, hpcp_mod, re
 		assert hpcp_mod.hpcp(['src/'], dest_image=str(tmp_path / 'dest.img'), dest_image_size=80 * 1024 * 1024, batch=True) == 0
 
 
-def test_a_source_that_holds_the_image_is_not_listed_before_the_copy(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
-	# hpcp / -di in small: an image is a tree of its own, so the run pays nothing to look for clashes with it.
+def test_a_source_that_holds_the_image_is_compared_with_nothing(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	# hpcp / -di in small: an image is a tree of its own, so nothing it holds counts as a clash.
 	write(tmp_path / 'src/x', 'X')
 	write(tmp_path / 'src/tmp/x', 'earlier run')
-	def listed(*args, **kwargs):
-		raise AssertionError('listed before the copy')
-	monkeypatch.setattr(hpcp_mod, 'get_file_list', listed)
+	def compared(*args, **kwargs):
+		raise AssertionError('compared')
+	monkeypatch.setattr(hpcp_mod._RealPlaces, 'landing', compared)
 	got = hpcp_mod._settle_destinations([str(tmp_path / 'src')], [str(tmp_path / 'src/tmp')], dest_image=str(tmp_path / 'dest.img'))
 	assert got == ({}, 0, set())
 
@@ -3884,12 +3891,23 @@ def test_a_name_with_glob_characters_that_matches_nothing_as_a_pattern_is_that_f
 	assert rc == 0 and files(good / 'out') == {b'a[1]': b'bracket'}, output[-2000:]
 
 
-@pytest.mark.parametrize('stdin,arguments', [(b'', ['nosuch', 'ok/g']), (b'nosuch\nok/g\n', [])], ids=['arguments', 'list'])
-def test_a_move_with_a_missing_source_removes_nothing(good, stdin, arguments):
-	# The usual rule on errors, by either route: a list moved the rest and exited 207, and arguments did the same with no word.
-	rc, output = run(arguments + ['-d', 'out/', '-rf'], good, stdin)
+def test_a_move_with_a_missing_named_source_removes_nothing(good):
+	rc, output = run(['nosuch', 'ok/g', '-d', 'out/', '-rf'], good)
 	assert rc == 212 and b'Source path not found: nosuch' in output and b'Remove skipped' in output, output[-2000:]
 	assert (good / 'ok/g').read_text() == 'g'
+
+
+def test_a_gone_list_entry_is_said_and_the_rest_moves(good):
+	# A list can be older than the tree, and a gone entry has nothing to lose.
+	rc, output = run(['-d', 'out/', '-rf'], good, b'nosuch\nok/g\n')
+	assert rc == 207 and b'Source path not found: nosuch' in output and b'Remove skipped' not in output, output[-2000:]
+	assert not (good / 'ok/g').exists() and (good / 'out/ok/g').read_text() == 'g'
+
+
+def test_a_gone_list_entry_stops_rme(good):
+	write(good / 'out/ok/stale', 's')
+	rc, output = run(['-d', 'out/', '-rme'], good, b'nosuch\nok\n')
+	assert rc == 212 and b'Remove skipped: not removing extra files' in output and (good / 'out/ok/stale').exists(), output[-2000:]
 
 
 def test_rme_takes_nothing_for_extra_when_a_source_is_missing(good):
@@ -3908,6 +3926,61 @@ def test_a_removal_goes_on_past_a_missing_name_as_rm_does(good):
 def test_a_missing_source_alone_is_still_240_and_says_which(good):
 	rc, output = run(['nosuch', '-d', 'out/'], good)
 	assert rc == 240 and b'Source path not found: nosuch does not exist' in output and not (good / 'out').exists()
+	rc, output = run(['nosuch'], good)  # one word is no destination
+	assert rc == 240 and b'Source path not found: nosuch does not exist' in output
+
+
+def test_a_missing_last_word_of_a_removal_or_a_stored_list_is_a_source(good):
+	# Neither has a destination, so the last word cannot be one.
+	rc, output = run(['ok/g', 'nosuch', '-rf'], good)
+	assert rc == 207 and b'Source path not found: nosuch' in output and not (good / 'ok/g').exists(), output[-2000:]
+	write(good / 'ok/g', 'g')
+	rc, output = run(['ok', 'nosuch', '-fl', 'stored'], good)
+	assert rc == 207 and b'Source path not found: nosuch' in output and (good / 'stored').exists(), output[-2000:]
+
+
+def test_a_missing_last_word_beside_an_image_is_a_source(good, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	def stop(*args, **kwargs):
+		raise RuntimeError('Runtime Error: stop here')
+	monkeypatch.setattr(hpcp_mod, 'get_dests', stop)
+	monkeypatch.chdir(good)
+	seen = []
+	monkeypatch.setattr(hpcp_mod, 'get_rc_from_error', lambda: seen.extend(hpcp_mod.ERRORS) or 0)
+	hpcp_mod.hpcp(['ok/g', 'nosuch'], dest_image='x.img')
+	assert 'Source path not found: nosuch does not exist' in seen
+
+
+def test_a_name_under_a_file_does_not_exist_and_a_tilde_is_said_expanded(good):
+	rc, output = run(['ok/g/x', 'ok/g', '-d', 'out/'], good)
+	assert rc == 207 and b'Source path not found: ok/g/x does not exist' in output
+	rc, output = run(['~/nosuch', 'ok/g', '-d', 'out/'], good, env={'HOME': str(good)})
+	assert rc == 207 and b'Source path not found: ' + str(good / 'nosuch').encode() + b' does not exist' in output, output[-2000:]
+
+
+@pytest.mark.parametrize('answer', ['y', 'elsewhere/'], ids=['working-directory', 'own-path'])
+def test_a_last_word_the_prompt_turned_down_is_a_missing_source(good, hpcp_mod, reset_hpcp_globals, monkeypatch, capsys, answer):
+	# It was dropped as the destination-to-be, and the prompt then gave another.
+	os.makedirs(good / 'w')
+	os.rename(good / 'ok', good / 'w/ok')
+	monkeypatch.chdir(good / 'w')
+	monkeypatch.setattr(sys.stdin, 'isatty', lambda: True)
+	monkeypatch.setattr(hpcp_mod.multiCMD, 'input_with_timeout_and_countdown', lambda *args, **kwargs: answer)
+	assert hpcp_mod.hpcp(['ok/g', 'nosuch'], single_thread=True, max_workers=1, batch=True) == 207
+	assert 'Source path not found: nosuch does not exist' in capsys.readouterr().err
+
+
+def test_the_prompt_taking_the_last_word_reports_nothing(good, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	monkeypatch.chdir(good)
+	monkeypatch.setattr(sys.stdin, 'isatty', lambda: True)
+	monkeypatch.setattr(hpcp_mod.multiCMD, 'input_with_timeout_and_countdown', lambda *args, **kwargs: 'l')
+	assert hpcp_mod.hpcp(['ok/g', 'new/'], single_thread=True, max_workers=1, batch=True) == 0
+	assert (good / 'new/g').exists()
+
+
+def test_an_excluded_name_that_is_not_there_counts_for_nothing(good):
+	# The refusal says "or exclude those paths with -e": that has to work.
+	rc, output = run(['nosuch', 'ok/g', '-d', 'out/', '-rf', '-e', 'nosuch'], good)
+	assert rc == 0 and b'nosuch does not exist' not in output and not (good / 'ok/g').exists() and (good / 'out/g').exists(), output[-2000:]
 
 
 def test_the_last_word_as_the_destination_need_not_exist(good):
@@ -3957,6 +4030,11 @@ def test_the_runner_keeps_the_last_lines_of_what_a_tool_said(hpcp_mod, reset_hpc
 def test_a_tool_that_says_nothing_keeps_the_old_sentence(hpcp_mod, reset_hpcp_globals):
 	hpcp_mod.run_commands_in_multicmd_with_path_check([['sh', '-c', 'exit 3']], quiet=True)
 	assert hpcp_mod.ERRORS[-1].endswith('failed with return code 3.')
+
+
+def test_blank_lines_a_tool_prints_are_left_out(hpcp_mod, reset_hpcp_globals):
+	hpcp_mod.run_commands_in_multicmd_with_path_check([['sh', '-c', 'echo reason >&2; echo >&2; exit 3']], quiet=True)
+	assert hpcp_mod.ERRORS[-1].endswith('failed with return code 3: reason')
 
 
 def test_nds_with_a_directory_meeting_a_file_is_a_clash(tmp_path):
@@ -4049,16 +4127,31 @@ def test_a_landing_through_a_link_into_an_unreachable_place_names_the_link(tmp_p
 def test_a_landing_through_a_link_to_a_directory_names_the_link(tmp_path):
 	# The walk passes: the link leads to a directory it can see. The landing in it is what cannot be asked about.
 	write(tmp_path / 'src/d/x', 'x')
+	write(tmp_path / 'src/e', 'e')
 	write(tmp_path / 'locked/x', 'kept')
 	os.makedirs(tmp_path / 'out')
 	os.symlink('../locked', tmp_path / 'out/d')
 	os.chmod(tmp_path / 'locked', 0o000)
 	try:
-		rc, output = run(['src/d/x', 'src/l/x', '-d', 'out/d/'], tmp_path)
+		rc, output = run(['src/d/x', 'src/e', '-d', 'out/d/'], tmp_path)
 	finally:
 		os.chmod(tmp_path / 'locked', 0o755)
 	link = str(tmp_path / 'out/d').encode()
 	assert rc == 213 and b'Destination clash: ' + link + b' leads to ' in output, output[-2000:]
+
+
+@no_permissions_as_root
+def test_a_link_that_only_spells_the_way_is_not_blamed(tmp_path):
+	# alias -> real, real/out mode 000: the link leads to a place that is fine, and rm of it would not help.
+	write(tmp_path / 'src/x', 'x')
+	os.makedirs(tmp_path / 'real/out')
+	os.symlink('real', tmp_path / 'alias')
+	os.chmod(tmp_path / 'real/out', 0o000)
+	try:
+		rc, output = run(['src/', '-d', 'alias/out/'], tmp_path)
+	finally:
+		os.chmod(tmp_path / 'real/out', 0o755)
+	assert rc == 213 and b' leads to ' not in output and b'chmod u+rx ' + str(tmp_path / 'real/out').encode() in output, output[-2000:]
 
 
 @no_permissions_as_root
@@ -4081,6 +4174,7 @@ def test_the_last_link_on_the_way_is_found_and_none_when_there_is_none(tmp_path,
 	assert hpcp_mod._last_link(root + '/d/e') is None
 	assert hpcp_mod._last_link(root + '/one/e/f') == root + '/one'
 	assert hpcp_mod._last_link(root + '/d/two/f') == root + '/d/two'
+	assert hpcp_mod._last_link(root + '/one/two/f') == root + '/one/two'  # the last, not the first
 
 
 def test_a_refused_named_fifo_is_reported_once(tmp_path):
@@ -4098,9 +4192,9 @@ def test_a_refused_named_fifo_is_reported_once(tmp_path):
 
 @pytest.fixture
 def folding(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
-	"""The probe answers yes on this filesystem, which does not fold: so a file that lands at all was not refused. On a real
+	"""The question answers yes on this filesystem, which does not fold: so a file that lands at all was not refused. On a real
 	one, test_rme_mounts.py. Commands run in tmp_path."""
-	monkeypatch.setattr(hpcp_mod, '_folds_case', lambda dest: True)
+	monkeypatch.setattr(hpcp_mod, '_one_name', lambda directory, first, second: True)
 	monkeypatch.chdir(tmp_path)
 	return tmp_path
 
@@ -4189,64 +4283,150 @@ def test_a_destination_that_does_not_fold_keeps_both(tmp_path, hpcp_mod, reset_h
 	assert files(tmp_path / 'out') == {b'X': b'upper', b'x': b'lower'}
 
 
-def _probes(hpcp_mod, monkeypatch):
+def test_a_link_and_a_directory_in_another_case_are_no_clash_as_in_one_case(folding, hpcp_mod, capsys):
+	# As with one spelling: a link goes through create_sym_links, which leaves a name alone.
+	os.makedirs(folding / 'a')
+	os.symlink('nowhere', folding / 'a/X')
+	write(folding / 'b/x/f', 'below')
+	_copy(hpcp_mod, ['a/', 'b/'])
+	assert 'is a directory of another source' not in capsys.readouterr().err
+
+
+def test_a_pair_the_destination_cannot_be_asked_about_is_refused_and_says_so(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch, capsys):
+	monkeypatch.setattr(hpcp_mod, '_one_name', lambda directory, first, second: None)
+	monkeypatch.chdir(tmp_path)
+	write(tmp_path / 'a/X', 'upper')
+	write(tmp_path / 'b/x', 'lower')
+	assert _copy(hpcp_mod, ['a/', 'b/']) == 213
+	assert 'may be one name, and the destination cannot be asked' in capsys.readouterr().err
+	assert files(tmp_path / 'out') == {b'X': b'upper'}
+
+
+def _asked(hpcp_mod, monkeypatch, answer=False):
 	asked = []
-	monkeypatch.setattr(hpcp_mod, '_folds_case', lambda dest: asked.append(dest) or False)
+	monkeypatch.setattr(hpcp_mod, '_one_name', lambda *key: asked.append(key) or answer)
 	return asked
 
 
-def test_one_probe_per_destination_however_many_files(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+def test_nothing_is_asked_when_no_two_names_fold_alike(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
 	monkeypatch.chdir(tmp_path)
 	for name in 'abcdef':
 		write(tmp_path / 'a' / name, name)
-		write(tmp_path / 'b' / name, name)
-	asked = _probes(hpcp_mod, monkeypatch)
-	assert hpcp_mod.hpcp(['a/', 'b/'], ['one/', 'two/'], single_thread=True, max_workers=1, batch=True) == 0
-	assert sorted(os.path.basename(dest.rstrip(os.sep)) for dest in asked) == ['one', 'two']
+		write(tmp_path / 'b' / (name + '2'), name)
+	asked = _asked(hpcp_mod, monkeypatch)
+	assert _copy(hpcp_mod, ['a/', 'b/']) == 0 and asked == []
 
 
-def test_a_single_file_asks_nothing(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+def test_a_pair_is_asked_about_where_it_lands_with_its_own_names(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
 	monkeypatch.chdir(tmp_path)
-	write(tmp_path / 'a/x', 'x')
-	asked = _probes(hpcp_mod, monkeypatch)
-	assert _copy(hpcp_mod, ['a/x']) == 0 and asked == []
+	write(tmp_path / 'a/s/X', '1')
+	write(tmp_path / 'b/s/x', '2')
+	os.makedirs(tmp_path / 'out/s')
+	asked = _asked(hpcp_mod, monkeypatch)
+	assert _copy(hpcp_mod, ['a/', 'b/']) == 0
+	assert asked == [(os.path.realpath(str(tmp_path / 'out/s')), 'X', 'x')]
 
 
-def test_directories_only_and_images_ask_nothing(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
-	write(tmp_path / 'a/x', 'x')
-	asked = _probes(hpcp_mod, monkeypatch)
-	source, out = str(tmp_path / 'a') + os.sep, str(tmp_path / 'out') + os.sep
+def test_a_pair_in_a_directory_not_made_yet_is_asked_of_the_nearest_that_is(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	monkeypatch.chdir(tmp_path)
+	write(tmp_path / 'a/s/X', '1')
+	write(tmp_path / 'b/s/x', '2')
+	asked = _asked(hpcp_mod, monkeypatch)
+	_copy(hpcp_mod, ['a/', 'b/'])
+	assert [key[0] for key in asked] == [os.path.realpath(str(tmp_path / 'out'))]
+
+
+def test_one_pair_of_directories_is_asked_about_once(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	monkeypatch.chdir(tmp_path)
+	for name in 'abc':
+		write(tmp_path / 'a/D' / name, '1')
+		write(tmp_path / 'b/d' / name, '2')
+	asked = _asked(hpcp_mod, monkeypatch)
+	assert _copy(hpcp_mod, ['a/', 'b/']) == 0 and [key[1:] for key in asked] == [('D', 'd')]
+
+
+def test_each_destination_is_asked_and_one_that_says_yes_is_enough(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	monkeypatch.chdir(tmp_path)
+	write(tmp_path / 'a/X', '1')
+	write(tmp_path / 'b/x', '2')
+	monkeypatch.setattr(hpcp_mod, '_one_name', lambda directory, first, second: os.path.basename(directory) == 'two')
+	assert hpcp_mod.hpcp(['a/', 'b/'], ['one/', 'two/'], single_thread=True, max_workers=1, batch=True) == 213
+	assert files(tmp_path / 'one') == {b'X': b'1'}
+
+
+def test_three_names_are_judged_each_against_the_others(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	# vfat: STRASSE and strasse are one, and Stra\u00dfe is another name.
+	monkeypatch.chdir(tmp_path)
+	write(tmp_path / 'a/Stra\u00dfe', '1')
+	write(tmp_path / 'b/STRASSE', '2')
+	write(tmp_path / 'c/strasse', '3')
+	monkeypatch.setattr(hpcp_mod, '_one_name', lambda directory, first, second: 'S' in first.upper() and '\u00df' not in first + second)
+	assert _copy(hpcp_mod, ['a/', 'b/', 'c/']) == 213
+	assert set(files(tmp_path / 'out')) == {'Stra\u00dfe'.encode(), b'STRASSE'}
+
+
+def test_directories_only_asks_nothing_and_an_image_is_asked(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	# hpcp a/ -di x.img on a vfat image lost one of a/X and a/x: an image is a destination like any other.
+	write(tmp_path / 'a/X', '1')
+	write(tmp_path / 'a/x', '2')
+	asked = _asked(hpcp_mod, monkeypatch, True)
+	source, out = str(tmp_path / 'a') + os.sep, str(tmp_path / 'mount') + os.sep
 	hpcp_mod._settle_destinations([source], [out], directory_only=True)
-	hpcp_mod._settle_destinations([source], [out], dest_image=str(tmp_path / 'image.img'))
 	assert asked == []
+	dropped = hpcp_mod._settle_destinations([source], [out], dest_image=str(tmp_path / 'image.img'))[0]
+	assert len(asked) == 1 and len(list(dropped.values())[0]) == 1
 
 
-def test_the_probe_leaves_the_directory_as_it_was(tmp_path, hpcp_mod):
-	# It says no here (these suites do not run on a folding filesystem), and no trace of asking stays.
+def test_the_question_leaves_the_directory_as_it_was(tmp_path, hpcp_mod):
 	os.utime(tmp_path, (1000000000, 1000000000))
-	assert hpcp_mod._folds_case(str(tmp_path) + os.sep) is False
+	assert hpcp_mod._one_name(str(tmp_path), 'X', 'x') is False
 	assert os.listdir(tmp_path) == [] and os.stat(tmp_path).st_mtime == 1000000000
 
 
-def test_the_probe_answers_yes_when_the_other_case_is_there(tmp_path, hpcp_mod, monkeypatch):
+def test_the_question_answers_yes_when_the_other_name_is_there(tmp_path, hpcp_mod, monkeypatch):
 	real = os.path.lexists
 	monkeypatch.setattr(hpcp_mod.os.path, 'lexists', lambda path: real(path.lower()))
-	assert hpcp_mod._folds_case(str(tmp_path)) is True
+	assert hpcp_mod._one_name(str(tmp_path), 'x', 'X') is True
 	assert os.listdir(tmp_path) == []
 
 
-def test_the_probe_asks_the_nearest_directory_that_exists(tmp_path, hpcp_mod, monkeypatch):
-	made = []
-	real = os.open
-	monkeypatch.setattr(hpcp_mod.os, 'open', lambda path, *args, **kwargs: made.append(path) or real(path, *args, **kwargs))
-	hpcp_mod._folds_case(str(tmp_path / 'new/deep') + os.sep)
-	assert [os.path.dirname(path) for path in made] == [str(tmp_path)] and not (tmp_path / 'new').exists()
+def test_a_name_the_directory_cannot_hold_cannot_be_asked_about(tmp_path, hpcp_mod):
+	assert hpcp_mod._one_name(str(tmp_path), 'x' * 300, 'X' * 300) is None
+	assert os.listdir(tmp_path) == []
 
 
 @no_permissions_as_root
-def test_the_probe_says_no_where_nothing_can_land(tmp_path, hpcp_mod):
+def test_a_directory_that_takes_nothing_cannot_be_asked(tmp_path, hpcp_mod):
 	os.chmod(tmp_path, 0o555)
 	try:
-		assert hpcp_mod._folds_case(str(tmp_path)) is False
+		assert hpcp_mod._one_name(str(tmp_path), 'X', 'x') is None
 	finally:
 		os.chmod(tmp_path, 0o755)
+
+
+def test_what_the_net_catches(hpcp_mod):
+	folded = hpcp_mod._folded
+	assert folded('Stra\u00dfe') == folded('STRASSE') and folded('caf\u00e9') == folded('cafe\u0301') and folded('a\u200db') == folded('ab')
+	assert folded('a') != folded('b')
+
+
+def test_a_link_at_the_destination_in_another_case_is_nothing_where_names_differ(tmp_path):
+	# out/X -> ../src/y and src/x: two names here, so x lands beside the link. Where they are one: test_rme_mounts.py.
+	write(tmp_path / 'src/x', 'x')
+	write(tmp_path / 'src/y', 'y')
+	os.makedirs(tmp_path / 'out')
+	os.symlink('../src/y', tmp_path / 'out/X')
+	rc, output = run(['src/', '-d', 'out/'], tmp_path)
+	assert rc == 0 and (tmp_path / 'out/x').read_text() == 'x' and (tmp_path / 'src/y').read_text() == 'y', output[-2000:]
+
+
+def test_rme_leaves_what_the_copy_wrote_under_another_spelling(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	# Only a real folding directory shows this whole (test_rme_mounts.py): here the two spellings are given one identity.
+	write(tmp_path / 'a/x', 'new')
+	write(tmp_path / 'out/X', 'written through')
+	write(tmp_path / 'out/stale', 'old')
+	monkeypatch.setattr(hpcp_mod, '_file_id', lambda path: path.lower())
+	monkeypatch.setattr(sys.stdin, 'isatty', lambda: True)
+	monkeypatch.setattr('builtins.input', lambda: 'y')
+	hpcp_mod.remove_extra_files([str(tmp_path / 'a/x')], [str(tmp_path / 'out') + '/'], 1, False, 1, single_thread=True, src_paths=[str(tmp_path / 'a') + '/'])
+	assert (tmp_path / 'out/X').exists() and not (tmp_path / 'out/stale').exists()

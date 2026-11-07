@@ -110,3 +110,10 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - **Why:** catching it needs an lstat per directory on every run, for a layout that takes root to make.
 - **Revisit when:** someone hits it.
 - **Approved:** 2026-11-06, the user chose "Known limitation (Recommended)".
+
+### Several destinations and a pair one of them takes for one name
+- **Kind:** known limitation.
+- **What the operator sees:** with several `-d`, two names that one destination takes for one name (`a/X` and `b/x`, the second `-d` folding case) are a clash, exit 213, though both would have fitted on another destination that keeps them apart. It is a false 213 for that pair, never a lost file.
+- **Why:** files spill from one destination to the next as space runs out, and `-rds` picks at random, so which destination gets each file is not known before the copy.
+- **Revisit when:** someone hits it.
+- **Approved:** 2026-11-06, the user chose "Known limitation (Recommended)".
