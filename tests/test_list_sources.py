@@ -5377,3 +5377,68 @@ def test_paths_in_different_buckets_are_never_one_place(tmp_path, hpcp_mod, monk
 		for second in paths:
 			if hpcp_mod._folded(first) == hpcp_mod._folded(second) and places.bucket(first) != places.bucket(second):
 				assert places.same_place(first, second) is False, (first, second)
+
+
+def test_a_name_that_is_there_already_but_alone_with_none_is_one_that_cannot_be_asked(tmp_path, hpcp_mod, monkeypatch):
+	# The directory takes z for a name it holds once a and b are made, and for neither of them alone: no answer is a guess.
+	real = os.open
+	def opening(path, flags, *args, **kwargs):
+		directory, name = os.path.split(os.fspath(path))
+		if name == 'z' and flags & os.O_CREAT and len(os.listdir(directory)) > 1:
+			raise FileExistsError(errno.EEXIST, 'File exists', path)
+		return real(path, flags, *args, **kwargs)
+	monkeypatch.setattr(os, 'open', opening)
+	answers, why = hpcp_mod._ask_names(str(tmp_path), ['a', 'b', 'z'])
+	assert answers == {'a': 'a', 'b': 'b'} and why == {'z': f'{tmp_path} takes z for a name it holds, and cannot say which'}
+	assert os.listdir(tmp_path) == []
+
+
+def test_an_overlay_through_a_link_of_names_that_do_not_fold_alike_asks_nothing_of_a_directory_on_the_way(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	# a/D/x and b/d/y land on one file through out/d/y -> ../D/x: D and d fold alike, x and y do not, so it is no pair.
+	monkeypatch.chdir(tmp_path)
+	write(tmp_path / 'a/D/x', 'A')
+	write(tmp_path / 'b/d/y', 'B')
+	os.makedirs(tmp_path / 'out/D')
+	os.makedirs(tmp_path / 'out/d')
+	os.symlink('../D/x', tmp_path / 'out/d/y')
+	asked = _asked(hpcp_mod, monkeypatch)
+	_copy(hpcp_mod, ['a/', 'b/'])
+	assert asked == []
+
+
+def test_both_paths_of_a_question_are_asked_about_together(tmp_path, hpcp_mod):
+	root = os.path.realpath(str(tmp_path))
+	places = hpcp_mod._RealPlaces()
+	places.expect([root + '/X', root + '/x'])
+	real, asked = hpcp_mod._ask_names, []
+	hpcp_mod._ask_names = lambda directory, names: asked.append(list(names)) or real(directory, names)
+	try:
+		assert places.same_place(root + '/x', root + '/x.') is False
+	finally:
+		hpcp_mod._ask_names = real
+	assert asked == [['X', 'x', 'x.']]
+
+
+def test_a_tree_onto_another_spelling_of_itself_that_is_another_directory_compares_no_pair_of_names(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	# Each landing in A folds like every file read in a, as legacy names do: only those that may be one place are compared.
+	monkeypatch.chdir(tmp_path)
+	os.makedirs(tmp_path / 'a')
+	os.makedirs(tmp_path / 'A')
+	for number in range(200):
+		with open(os.fsencode(str(tmp_path / 'a')) + b'/' + bytes([0xc0 + number % 32, 0xe0 + number // 32]) + b'.pdf', 'w'):
+			pass
+	real, compared = hpcp_mod._RealPlaces.same_place, []
+	monkeypatch.setattr(hpcp_mod._RealPlaces, 'same_place', lambda self, first, second: compared.append(first) or real(self, first, second))
+	assert hpcp_mod.hpcp(['a/'], ['A/'], single_thread=True, max_workers=1, batch=True) == 0
+	assert len(os.listdir(tmp_path / 'A')) == 200 and len(compared) < 10, len(compared)
+
+
+def test_names_that_cannot_be_asked_about_meet_only_the_names_that_fold_like_them(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch, capsys):
+	monkeypatch.chdir(tmp_path)
+	for directory, name in (('a', 'X'), ('b', 'x'), ('c', 'Y'), ('d', 'y')):
+		write(tmp_path / directory / name, directory)
+	_answering(hpcp_mod, monkeypatch, lambda directory, first, second: None)
+	assert _copy(hpcp_mod, ['a/', 'b/', 'c/', 'd/']) == 213
+	said = [line for line in capsys.readouterr().err.splitlines() if line.endswith('not copying %s over it' % (tmp_path / 'd/y'))]
+	assert len(said) == 1 and '%s and %s may be one name' % (tmp_path / 'out/y', tmp_path / 'out/Y') in said[0], said
+	assert files(tmp_path / 'out') == {b'X': b'a', b'Y': b'c'}

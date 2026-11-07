@@ -9228,11 +9228,12 @@ class _RealPlaces:
 			key.append(spelling)
 		return tuple(key)
 	def same_place(self, first, second):
-		"""Do landings first and second, spelled differently, lead to one file? True, False, or None when that cannot be asked
-		(cannot_ask says why). Each name where they differ is asked about in the directory it lands in (_names)."""
+		"""Do landings first and second, spelled differently and folding alike (_folded), lead to one file? True, False, or None
+		when that cannot be asked (cannot_ask says why). Each name where they differ is asked about in the directory it lands in
+		(_names)."""
 		self.expect((first, second))
 		for one, other in itertools.zip_longest(self._names(first), self._names(second)):
-			if one is None or other is None or one[1] != other[1]:
+			if one is None or other is None:
 				return False
 			if one[0] != other[0]:
 				if None in (one[2], other[2]):
