@@ -117,3 +117,10 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - **Why:** files spill from one destination to the next as space runs out, and `-rds` picks at random, so which destination gets each file is not known before the copy.
 - **Revisit when:** someone hits it.
 - **Approved:** 2026-11-06, the user chose "Known limitation (Recommended)".
+
+### An 8.3 alias beside its long name on vfat
+- **Kind:** deferred.
+- **What the operator sees:** `hpcp a/ b/ -d out/ -rf` onto vfat with `a/longfilename.txt` and `b/LONGFI~1.TXT` exits 0 and one content is gone, in about half of the runs: vfat made `LONGFI~1.TXT` the short name of the first file, so the second source is written onto it. The sources are removed. 9.82 does the same.
+- **Why:** the alias is not in either name, so no rule on names catches it, and asking the directory about the pair (`_one_name`) cannot see that one file already has the other's name. It is a filesystem's invention, not a spelling.
+- **Plan:** before a move removes anything, check that no two sources share a landing identity (device and inode of what the copy wrote), and keep every source when two do.
+- **Revisit when:** the next hpcp release.
