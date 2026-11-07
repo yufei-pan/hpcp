@@ -10818,17 +10818,21 @@ def _settle_destinations(src_paths, dests, dest_image=None, directory_only=False
 					raise RuntimeError(f'Destination clash: {path} would land on itself at {place}; nothing is copied or removed')
 				if not (job[2] and job[3] in job[4]):
 					reads[place] = path
+		# A source file below a destination can be landed on in another spelling too, where the directory takes the two for one
+		# name, or cannot say. Only those are folded (lower() picks them out, cheaply and widely: a destination's own spelling
+		# may differ too), so two trees onto a third fold nothing here.
+		below = tuple(land.lower().rstrip(os.sep) + os.sep for job in jobs for land in job[4])
 		folded_reads = {}
 		for read in reads:
-			folded_reads.setdefault(_folded(read), []).append(read)
+			if read.lower().startswith(below):
+				folded_reads.setdefault(_folded(read), []).append(read)
 		for job in jobs:
 			for path, place, landings in files_of(job):
 				if place not in landings:
 					for land in landings:
-						# In another spelling too, where the directory takes the two for one name, or cannot say.
-						read = land if land in reads else next((other for other in folded_reads.get(_folded(land), ())
+						read = land if land in reads else folded_reads and next((other for other in folded_reads.get(_folded(land), ())
 							if other != place and places.same_place(land, other) is not False), None)
-						if read is not None:
+						if read:
 							raise RuntimeError(f'Destination clash: {path} would land on {land}, which is the source file {reads[read]}; '
 								'nothing is copied or removed')
 	replaced = 0
