@@ -17,6 +17,10 @@ Block-image functionality is in **beta**. Only available on Linux. Possible use 
 
 hpcp.bat available on github: simple old tk based GUI intended for basic windows functionality.
 
+## Upgrading to 9.83 from 9.82
+
+Nothing needs doing to upgrade. What changed:
+
 ## Upgrading to 9.82 from 9.81
 
 - **Labels with trailing spaces on btrfs and NTFS are kept:** these two labels now come from the filesystem's own tool (`btrfs filesystem label`, `ntfslabel`), which gives them whole; 9.81 took them from libblkid, which drops trailing spaces, so a `-dd` copy lost them. Other filesystems still lose them. A disk patch made by 9.81 or older recorded such a label without its spaces, so regenerate those patches.
