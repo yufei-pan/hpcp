@@ -10774,9 +10774,9 @@ def _folded(path):
 	"""What two paths have in common when some filesystem could read them as one: a wide net, as the filesystem itself is asked
 	about what it catches (_ask_names). Read as UTF-8 whatever the locale: under C, Python 3.6 holds 'É' as two escapes, which
 	nothing folds. A name that is not UTF-8 is in a legacy encoding (cp1251, koi8-r, latin-1), which a filesystem mounted with
-	that charset folds by its own table: there any letter, ASCII too, and any byte past ASCII may be another's case ('i' and
-	iso8859-9 'İ'), so each is one mark, even where a few of them happen to make a UTF-8 character ('Пё' in cp1251), which its
-	other case does not. Dotless 'ı' is 'i': a vfat with codepage 850 or 857 gives 'kız.txt' the short name 'KIZ.TXT'."""
+	that charset folds by its own table: there any letter, ASCII too ('i' and iso8859-9 'İ'), any byte past ASCII, and the
+	punctuation that ends a double-byte character (cp932 'а' is 84 70, 'А' 84 40), may be another's case, so each is one mark,
+	even where a few of them happen to make a UTF-8 character ('Пё' in cp1251), which its other case does not. Dotless 'ı' is 'i': a vfat with codepage 850 or 857 gives 'kız.txt' the short name 'KIZ.TXT'."""
 	raw = os.fsencode(path)
 	try:
 		path = raw.decode('utf-8')
@@ -10786,8 +10786,10 @@ def _folded(path):
 	# Most names have a dot, and few end one: the pattern runs for those only.
 	return _TRAILING_DOTS.sub('', path) if path.endswith('.') or '.' + os.sep in path else path
 
-# In a name that is not UTF-8, the bytes a mount's own table may take for another's case: ASCII letters and every byte past ASCII.
-_LEGACY_MARKS = dict.fromkeys([*range(0x41, 0x5b), *range(0x61, 0x7b), *range(0x80, 0x100)], '\ufffd')
+# In a name that is not UTF-8, the bytes a mount's own table may take for another's case: ASCII letters, every byte past ASCII,
+# and 40-7E, which can end a double-byte character in the kernel's cp932, cp936, cp949 and cp950 ('@[\]^_`{|}~' among them).
+# Digits and the punctuation below 40 never do there; they keep names of one length apart.
+_LEGACY_MARKS = dict.fromkeys([*range(0x40, 0x7f), *range(0x80, 0x100)], '\ufffd')
 
 def _legacy_name(name):
 	"""A name of a path that is not UTF-8 as a whole, as _folded reads it: as UTF-8 where it is, else its digits and punctuation
@@ -10800,14 +10802,21 @@ def _legacy_name(name):
 def _names_may_fold(jobs, listing):
 	"""The landings of jobs (of _settle_destinations) that another landing matches in everything but spelling: none when no two
 	differ only in what _folded leaves out. A directory source is listed for it, which costs nothing: the copy reuses the
-	listing."""
-	seen, shared = {}, set()
+	listing. A file's landing brings the directories above it, which a listed path (l/x/f) makes: l/x meets a file l/X."""
+	seen, shared, above = {}, set(), set()
 	for src, actual_dests, directory, _, _ in jobs:
 		landings = [actual_dests[0]]
 		if directory:
 			files, links, _, folders = listing(src)
 			src_root, dest_root = src.rstrip(os.sep), actual_dests[0].rstrip(os.sep)
 			landings = (dest_root + path[len(src_root):] for path in itertools.chain(files, links, folders))
+		else:
+			# Up to the first one already counted: a list's files share their directories.
+			parent = os.path.dirname(actual_dests[0])
+			while parent not in above and parent != os.path.dirname(parent):
+				above.add(parent)
+				landings.append(parent)
+				parent = os.path.dirname(parent)
 		for landing in landings:
 			first = seen.setdefault(_folded(landing), landing)
 			if first != landing:

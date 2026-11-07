@@ -9,6 +9,7 @@ import shlex
 import shutil
 import signal
 import stat
+import string
 import subprocess
 import sys
 import tempfile
@@ -4537,6 +4538,13 @@ def test_the_net_folds_names_that_python_holds_as_escapes(hpcp_mod):
 	# not UTF-8, an ASCII letter is a mark too. 'i\u015f.txt' and '\u0130\u015f.txt' were two names to the net, one to the mount.
 	assert same(os.fsdecode('i\u015f.txt'.encode('iso8859-9')), os.fsdecode('\u0130\u015f.txt'.encode('iso8859-9')))
 	assert not same(os.fsdecode('i\u015f1.txt'.encode('iso8859-9')), os.fsdecode('i\u015f2.txt'.encode('iso8859-9')))
+	# Every ASCII letter beside a byte past ASCII meets its other case: vfat iso8859-1 takes 'Z\u00e9' and 'z\u00e9' for one name.
+	assert [letter for letter in string.ascii_letters if not same(os.fsdecode(letter.encode() + b'\xe9'), os.fsdecode(letter.swapcase().encode() + b'\xe9'))] == []
+	# A double-byte character can end in ASCII punctuation, which kernel exFAT with cp932 or cp950 takes for another's case:
+	# cp932 '\u0430' is 84 70 and '\u0410' 84 40, Big5 '\u03c9' A3 73 and '\u03a9' A3 5B.
+	for encoding, first, second in (('cp932', 'x\u0430.txt', 'x\u0410.txt'), ('cp932', '\uff41', '\uff21'), ('cp932', '\u044f\u043d\u0432.txt', '\u042f\u041d\u0412.TXT'),
+			('cp950', '\u03b1\u03b2.txt', '\u0391\u0392.TXT'), ('cp950', '\u03c9', '\u03a9')):
+		assert same(os.fsdecode(first.encode(encoding)), os.fsdecode(second.encode(encoding))), (encoding, first)
 	# A vfat with codepage 850 or 857 gives 'k\u0131z.txt' the short name 'KIZ.TXT', and casefold keeps dotless '\u0131'.
 	assert same('k\u0131z.txt', 'KIZ.TXT') and same('/o/K\u0131Z', '/o/kiz')
 
@@ -4910,15 +4918,15 @@ def test_a_later_destination_is_asked_once_about_a_file_and_the_directories_it_m
 	assert [sorted(names) for directory, names in asked if os.path.basename(directory) == 'two'] == [['X', 'x', 'x.']]
 
 
-def test_a_file_and_the_directory_a_listed_path_implies_in_a_later_destination_are_a_clash(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch, capsys):
-	# A listed l/x/f implies the directory l/x, which a later destination takes for a/l/X. (The net looks only where names
-	# fold alike: a/Y and a/y.)
+@pytest.mark.parametrize('listed', ['l/x/f', 'l/x/m/f'])
+def test_a_file_and_the_directory_a_listed_path_implies_in_a_later_destination_are_a_clash(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch, capsys, listed):
+	# A listed l/x/f, or l/x/m/f, implies the directory l/x, which a later destination takes for a/l/X. The net did not see the
+	# directories a listed path implies, so the check never ran: with -nds -rds the file was written into l/x as it was made,
+	# exit 0 and one content gone in 2 to 4 of 10 runs of 100 such pairs (vfat).
 	monkeypatch.chdir(tmp_path)
-	write(tmp_path / 'l/x/f', 'below')
+	write(tmp_path / listed, 'below')
 	write(tmp_path / 'a/l/X', 'file')
-	write(tmp_path / 'a/Y', 'Y')
-	write(tmp_path / 'a/y', 'y')
-	(tmp_path / 'the-list').write_text('l/x/f\n')
+	(tmp_path / 'the-list').write_text(listed + '\n')
 	_answering(hpcp_mod, monkeypatch, lambda directory, first, second: os.path.basename(os.path.dirname(directory)) == 'two' or os.path.basename(directory) == 'two')
 	assert hpcp_mod.hpcp(['a/'], ['one/', 'two/'], source_file_list='the-list', single_thread=True, max_workers=1, batch=True) == 213
 	said = [line for line in capsys.readouterr().err.splitlines() if 'is a directory of another source where the destination folds case' in line]

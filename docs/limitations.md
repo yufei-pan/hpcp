@@ -152,9 +152,17 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   - one name's bytes happen to be valid UTF-8 and the other's are not: `C3 A9 74` (Latin-1 `Ã©t`, UTF-8 `ét`) against `E3 A9 74`, which a cp1251 mount reads as `Г©t` and `г©t`;
   - both names' bytes are valid UTF-8, but not as each other's case: KOI8-R `бё` and `бЁ` (`C2 A3` and `C2 B3`), CP1251 `EF B8 B8` and `EF A8 B8`; CP1251 alone has 880 such two-byte pairs;
   - an ASCII name against a legacy one: `istanbul` against ISO 8859-9 `İstanbul` (`DD` for `İ`, which that table makes the other case of `i`).
+  - two cases of different lengths: EUC-JP `ς` is three bytes (`8F A6 F8`) and `Σ` two (`A6 B2`), and no rule over single bytes can join names of different lengths.
   `hpcp a/ b/ -d out/ -rf` with one in `a/` and the other in `b/` exits 0 with one content gone, and the rename in case (`hpcp out/ONE -d out/OTHER -rf`) exits 0 and the file is gone. Checked on vfat mounted `iocharset=cp1251`, `koi8-r`, `iso8859-1` and `iso8859-9` (`utf8=0`), and kernel exFAT mounted `iocharset=cp1251` (VM 901). Only for such pairs, and only on such a mount: names that are not UTF-8 as a whole fold byte by byte and meet.
 - **Why:** a name that is valid UTF-8 is read as UTF-8, which it is on every other mount, and the mount's own table, not UTF-8, says what its other case is. Joining every valid name with every name of the same length would ask about most trees pair by pair again.
-- **Plan:** first a backstop that needs no fold rule: before a move removes a source, check that its landing holds that source (the size and modification time `cp -a` gave it, and that the landing is not the source itself, which is asked by doing, in the same directory, where they share it), and where it does not, keep the source and report a clash. Then catch the pairs before the copy: fold every name byte by byte on a mount with a codepage `iocharset` (read from the mount options), or join byte-level keys across all names.
+- **Plan:** first a backstop that needs no fold rule, the only one that catches names of different lengths: before a move removes a source, check that its landing holds that source (the size and modification time `cp -a` gave it, and that the landing is not the source itself, which is asked by doing, in the same directory, where they share it), and where it does not, keep the source and report a clash. Then catch the pairs before the copy: fold every name byte by byte on a mount with a codepage `iocharset` (read from the mount options), or join byte-level keys across all names.
+- **Revisit when:** the next hpcp release.
+
+### Directories that differ only in case on vfat mounted `iocharset=utf8`
+- **Kind:** deferred.
+- **What the operator sees:** on a vfat mounted with `iocharset=utf8` given explicitly, `hpcp a/ b/ -d out/` with `a/D/f` and `b/d/g` exits 193 (`Directory sync error: .../b/d to .../out/d: [Errno 2] No such file or directory`, then `Copy failed ... No more destination paths to try`), and `g` is not copied; with `-rf` it exits 212 and keeps both sources. Nothing is lost, and 9.82 does the same. Checked on VM 901; vfat with its default charset or `iocharset=iso8859-1`, kernel exFAT, NTFS (`ignore_case`) and ext4 casefold merge the two, exit 0.
+- **Why:** vfat mounted that way looks a name up in its own case only (`out/d` is not found) but will not make it either, as `out/D` holds the name; the copy names the directory as the source spells it.
+- **Plan:** write a merged directory's files under the spelling the directory holds, which `_RealPlaces` knows from asking it, or report the pair as a clash.
 - **Revisit when:** the next hpcp release.
 
 ### A landing within about 57 characters of PATH_MAX
