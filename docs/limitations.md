@@ -118,7 +118,7 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 
 ### A named FIFO or socket is copied and still exits 200
 - **Kind:** deferred.
-- **What the operator sees:** `hpcp a/p -d out/` makes the node, prints `Source path type error` and ends exit 200. The line also follows a refusal where no destination is left (`Destination clash: ... is a device`), where it reads as a second, different failure. With `-rf` it is 212 and every named source stays, files included; nothing is lost. The same FIFO in a directory source is skipped silently with exit 0. Same on 9.80.
+- **What the operator sees:** `hpcp a/p -d out/` makes the node, prints `Source path type error` and ends exit 200. With `-s` the exit is 0 (9.81 too). The line also follows a refusal where no destination is left (`Destination clash: ... is a device`), where it reads as a second, different failure. With `-rf` it is 212 and every named source stays, files included; nothing is lost. The same FIFO in a directory source is skipped silently with exit 0. Same on 9.80.
 - **Why:** old and safe. A named special should either copy cleanly or be skipped as in a tree, and that is its own decision.
 - **Revisit when:** the next hpcp release.
 

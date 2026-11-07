@@ -3633,7 +3633,8 @@ def test_a_device_among_several_destinations_leaves_the_others_their_files(tmp_p
 	rc, output = _run_bounded(['a/n'] + dests + flags, tmp_path, seconds=30)
 	assert _same_node(tmp_path / 'bare', before), output[-2000:]
 	assert stat.S_ISCHR(os.lstat(tmp_path / 'out/n').st_mode) and os.lstat(tmp_path / 'out/n').st_rdev == os.makedev(1, 5), (rc, output[-2000:])
-	assert rc == 200 and b'Destination clash' not in output and b'leaving it out' in output, (rc, output[-2000:])
+	# 200 as for any named node (a serial run, -s, exits 0 for one: the same on 9.81)
+	assert rc == (0 if '-s' in flags else 200) and b'Destination clash' not in output and b'leaving it out' in output, (rc, output[-2000:])
 
 
 @needs_root
@@ -3680,7 +3681,8 @@ def test_a_landing_on_a_name_another_d_gives_is_named_too(tmp_path, order):
 	dests = ['-d', 'out/', '-d', 'out/n'] if order == 'dir-first' else ['-d', 'out/n', '-d', 'out/']
 	rc, output = _run_bounded(['a/n'] + dests, tmp_path, seconds=30)
 	assert rc == 213 and _same_node(tmp_path / 'out/n', before), (rc, output[-2000:])
-	assert output.count(b'Destination clash: ') == 1, output[-2000:]
+	summary = [line for line in output.splitlines() if line.startswith(b'Error occurred: ')]
+	assert len(summary) == 1 and summary[0].count(b'Destination clash: ') == 1, output[-2000:]
 
 
 def test_an_excluded_source_gets_no_clash(tmp_path, hpcp_mod, monkeypatch, capsys):
