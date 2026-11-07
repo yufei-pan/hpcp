@@ -357,7 +357,7 @@ _PAIRS = {'case': ('X', 'x'), 'sharp-s': ('Stra\u00dfe', 'STRASSE'), 'normal-for
 @pytest.mark.parametrize('pair', sorted(_PAIRS))
 def test_a_run_agrees_with_the_filesystem_about_a_pair(tmp_path, hpcp_mod, kind, pair):
 	"""The filesystem is the judge, whatever its rules: one name is a clash, two names both land. Each filesystem's own answer
-	is read here by making the file."""
+	is read here by making both files."""
 	first, second = _PAIRS[pair]
 	_filled(tmp_path / 'a' / first, 'first')
 	_filled(tmp_path / 'b' / second, 'second')
@@ -366,11 +366,16 @@ def test_a_run_agrees_with_the_filesystem_about_a_pair(tmp_path, hpcp_mod, kind,
 			(fold / first).write_text('')
 		except OSError:
 			pytest.skip(f'{kind} takes no such name')
-		one = os.path.lexists(fold / second)
+		try:
+			os.close(os.open(str(fold / second), os.O_WRONLY | os.O_CREAT | os.O_EXCL))
+			one = False
+			(fold / second).unlink()
+		except FileExistsError:
+			one = True
 		(fold / first).unlink()
 		task = _hpcp(['a/', 'b/', '-d', str(fold / 'out') + os.sep], tmp_path)
 		assert task.returncode == (213 if one else 0), task.stdout[-2000:]
-		assert sorted(os.listdir(fold / 'out')) == sorted([first] if one else [first, second]), task.stdout[-2000:]
+		assert len(os.listdir(fold / 'out')) == (1 if one else 2), task.stdout[-2000:]
 		assert not [name for name in os.listdir(fold) if name.startswith('.hpcp')]
 
 

@@ -4384,8 +4384,8 @@ def test_the_question_leaves_the_directory_as_it_was(tmp_path, hpcp_mod):
 
 
 def test_the_question_answers_yes_when_the_other_name_is_there(tmp_path, hpcp_mod, monkeypatch):
-	real = os.path.lexists
-	monkeypatch.setattr(hpcp_mod.os.path, 'lexists', lambda path: real(path.lower()))
+	real = os.open
+	monkeypatch.setattr(hpcp_mod.os, 'open', lambda path, *args, **kwargs: real(path.lower(), *args, **kwargs))
 	assert hpcp_mod._one_name(str(tmp_path), 'x', 'X') is True
 	assert os.listdir(tmp_path) == []
 

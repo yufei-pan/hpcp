@@ -10585,14 +10585,19 @@ def _one_name(directory, first, second):
 		os.mkdir(probe, 0o700)
 	except OSError:
 		return None
-	made = os.path.join(probe, first)
+	names = [os.path.join(probe, first), os.path.join(probe, second)]
 	try:
-		os.close(os.open(made, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
-		return os.path.lexists(os.path.join(probe, second))
+		for name in names:
+			os.close(os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
+		return False
+	except FileExistsError:
+		# Made, not looked up: vfat with iocharset=utf8 finds only the one spelling, and still refuses the other.
+		return True
 	except OSError:
 		return None
 	finally:
-		for undo in (lambda: os.unlink(made), lambda: os.rmdir(probe), lambda: os.utime(directory, ns=(st.st_atime_ns, st.st_mtime_ns))):
+		undoing = [functools.partial(os.unlink, name) for name in names]
+		for undo in undoing + [functools.partial(os.rmdir, probe), functools.partial(os.utime, directory, ns=(st.st_atime_ns, st.st_mtime_ns))]:
 			try:
 				undo()
 			except OSError:
