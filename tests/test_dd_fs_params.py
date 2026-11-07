@@ -823,6 +823,109 @@ realtime =none                   extsz=4096   blocks=0, rtextents=0
 """.splitlines()
 
 
+def _fake_xfs_tools(monkeypatch, namespace=True):
+	"""xfs_info as xfsprogs 4.5 (EL7) has it: nothing for a device, the geometry from the probe in a mount namespace
+	(unshare) when that works. Returns the argvs run, and in .envs the extra_env of each."""
+	class Calls(list):
+		envs = None
+	calls = Calls()
+	calls.envs = []
+
+	def fake(argv, **kwargs):
+		calls.append(argv)
+		calls.envs.append(kwargs.get('extra_env'))
+		if argv[0] == 'unshare' and namespace:
+			return list(_XFS_INFO_OUTPUT)
+		return []
+
+	monkeypatch.setattr(hpcp, 'run_command_in_multicmd_with_path_check', fake)
+	monkeypatch.setattr(hpcp, 'check_path', lambda tool: True)
+	return calls
+
+
+def test_probe_xfs_reads_a_filesystem_xfs_info_will_only_read_mounted_in_a_mount_namespace(monkeypatch):
+	calls = _fake_xfs_tools(monkeypatch)
+	params = hpcp._probe_xfs('/dev/fake3')
+	assert params['meta-data']['isize'] == '1024'
+	assert len(calls) == 2 and calls[0] == ['xfs_info', '/dev/fake3']
+	mount_point = calls[1][-1]
+	assert calls[1] == ['unshare', '-m', 'sh', '-c', hpcp._XFS_NAMESPACE_PROBE, 'sh',
+		hpcp._bin('mount'), hpcp._bin('xfs_info'), '/dev/fake3', mount_point]
+	# the device and the directory are arguments, never pasted into the script
+	assert '/dev/fake3' not in hpcp._XFS_NAMESPACE_PROBE and mount_point not in hpcp._XFS_NAMESPACE_PROBE
+	assert 'ro,nouuid,norecovery' in hpcp._XFS_NAMESPACE_PROBE and '--make-rprivate' in hpcp._XFS_NAMESPACE_PROBE
+	assert not os.path.exists(mount_point)
+	# xfs_info translates its section names: both runs, the namespace one too, are in the C locale
+	assert calls.envs == [hpcp._C_LOCALE, hpcp._C_LOCALE]
+
+
+def test_probe_xfs_runs_the_tools_hpcp_finds(monkeypatch):
+	calls = _fake_xfs_tools(monkeypatch)
+	monkeypatch.setitem(hpcp._binPaths, 'mount', '/opt/x/mount')
+	monkeypatch.setitem(hpcp._binPaths, 'xfs_info', '/opt/x/xfs_info')
+	hpcp._probe_xfs('/dev/fake3')
+	assert calls[1][6:8] == ['/opt/x/mount', '/opt/x/xfs_info']
+
+
+def test_probe_xfs_mounts_nothing_without_xfs_info(monkeypatch):
+	calls = _fake_xfs_tools(monkeypatch)
+	monkeypatch.setattr(hpcp, 'check_path', lambda tool: False)
+	assert hpcp._probe_xfs('/dev/fake3') == {}
+	assert calls == [['xfs_info', '/dev/fake3']]
+
+
+def test_probe_xfs_mounts_nothing_when_xfs_info_prints(monkeypatch):
+	"""xfs_info of a newer xfsprogs reads the device itself: no namespace, no temp directory."""
+	calls = []
+
+	def fake(argv, **kwargs):
+		calls.append(argv)
+		return list(_XFS_INFO_OUTPUT)
+
+	monkeypatch.setattr(hpcp, 'run_command_in_multicmd_with_path_check', fake)
+	monkeypatch.setattr(hpcp, 'check_path', lambda tool: True)
+	assert hpcp._probe_xfs('/dev/fake3')['data']['bsize'] == '4096'
+	assert calls == [['xfs_info', '/dev/fake3']]
+
+
+def test_probe_xfs_gives_nothing_when_the_namespace_or_the_mount_is_refused(monkeypatch):
+	calls = _fake_xfs_tools(monkeypatch, namespace=False)
+	assert hpcp._probe_xfs('/dev/fake3') == {}
+	assert not os.path.exists(calls[1][-1])
+
+
+def test_probe_xfs_gives_nothing_without_unshare(tmp_path, monkeypatch, capsys):
+	"""The real runner with no unshare to find: the existing degrade, {}."""
+	monkeypatch.setattr(hpcp, 'check_path', lambda tool: tool != 'unshare')
+	monkeypatch.setitem(hpcp._binPaths, 'xfs_info', '/bin/true')
+	monkeypatch.delitem(hpcp._binPaths, 'unshare', raising=False)
+	monkeypatch.setenv('PATH', str(tmp_path))
+	scratch = tmp_path / 'scratch'
+	scratch.mkdir()
+	monkeypatch.setattr(tempfile, 'tempdir', str(scratch))
+	assert hpcp._probe_xfs(str(tmp_path / 'nodevice')) == {}
+	assert 'unshare' in capsys.readouterr().err
+	assert os.listdir(str(scratch)) == []
+	hpcp.ERRORS.clear()
+
+
+def test_probe_xfs_leaves_nothing_when_interrupted(monkeypatch):
+	"""Ctrl-C while the namespace probe runs: the kernel takes the mount, the directory goes."""
+	calls = _fake_xfs_tools(monkeypatch)
+	inner = hpcp.run_command_in_multicmd_with_path_check
+
+	def interrupt(argv, **kwargs):
+		if argv[0] == 'unshare':
+			calls.append(argv)
+			raise KeyboardInterrupt
+		return inner(argv, **kwargs)
+
+	monkeypatch.setattr(hpcp, 'run_command_in_multicmd_with_path_check', interrupt)
+	with pytest.raises(KeyboardInterrupt):
+		hpcp._probe_xfs('/dev/fake3')
+	assert not os.path.exists(calls[-1][-1])
+
+
 def test_probe_xfs_parses_sections(monkeypatch):
 	monkeypatch.setattr(hpcp, 'run_command_in_multicmd_with_path_check',
 						lambda command, **kwargs: _XFS_INFO_OUTPUT)
@@ -1375,9 +1478,9 @@ def _build_three_partition_source(tmp_path):
 		# an xfs with non-default inode and directory geometry.
 		_run('mkfs.vfat', '-F', '32', '-n', 'ESP', f'{loop}p1')
 		_run('mkfs.ext4', '-q', '-F', '-b', '1024', '-I', '128',
-			 '-O', '^metadata_csum,^64bit,^dir_index', '-m', '0', '-L', 'BOOTFS', f'{loop}p2')
+			 *_ext4_without('metadata_csum', '64bit', 'dir_index'), '-m', '0', '-L', 'BOOTFS', f'{loop}p2')
 		_run('mkfs.xfs', '-q', '-f', '-i', 'size=1024', '-n', 'size=8192',
-			 '-m', 'reflink=0', '-L', 'ROOTFS', f'{loop}p3')
+			 *_xfs_no_reflink(), '-L', 'ROOTFS', f'{loop}p3')
 		for index in (1, 2, 3):
 			mount_point = str(tmp_path / f'mnt{index}')
 			os.makedirs(mount_point, exist_ok=True)
@@ -1391,6 +1494,25 @@ def _build_three_partition_source(tmp_path):
 	finally:
 		subprocess.run(['losetup', '-d', loop], check=False, capture_output=True)
 	return src
+
+
+def _mkfs_takes(*argv):
+	"""True when argv, a mkfs command, runs on a scratch image: e2fsprogs 1.42 and xfsprogs 4.5 (EL7) stop at an
+	option they do not know."""
+	with tempfile.NamedTemporaryFile() as image:
+		image.truncate(512 << 20)
+		return subprocess.run(list(argv) + [image.name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+
+
+def _ext4_without(*features):
+	"""mkfs.ext4 arguments that turn features off, leaving out those this mke2fs does not know."""
+	known = ['^' + feature for feature in features if _mkfs_takes('mkfs.ext4', '-n', '-q', '-F', '-O', '^' + feature)]
+	return ['-O', ','.join(known)] if known else []
+
+
+def _xfs_no_reflink():
+	"""mkfs.xfs arguments that turn reflink off, none when this mkfs.xfs has no reflink."""
+	return ['-m', 'reflink=0'] if _mkfs_takes('mkfs.xfs', '-N', '-f', '-m', 'reflink=0') else []
 
 
 @requires_root_and_tools
@@ -1422,7 +1544,8 @@ def test_dd_roundtrip_preserves_source_fs_params(tmp_path):
 
 		assert dest_xfs['meta-data']['isize'] == src_xfs['meta-data']['isize'] == '1024'
 		assert dest_xfs['naming']['bsize'] == src_xfs['naming']['bsize'] == '8192'
-		assert dest_xfs['meta-data']['reflink'] == src_xfs['meta-data']['reflink'] == '0'
+		# xfs_info of xfsprogs 4.5 (EL7) knows no reflink: none there means off.
+		assert dest_xfs['meta-data'].get('reflink', '0') == src_xfs['meta-data'].get('reflink', '0') == '0'
 	finally:
 		# hpcp -dd leaves its own read-only source loop attached; see
 		# _detach_loops_for_image's docstring.
@@ -1453,7 +1576,7 @@ def test_dd_roundtrip_uses_defaults_with_no_fs_param_mirror(tmp_path):
 
 
 def test_version_bumped():
-	assert hpcp.version == '9.81'
+	assert hpcp.version == '9.82'
 	assert hpcp.__version__ == hpcp.version
 	assert hpcp.COMMIT_DATE == '2026-11-06'
 
@@ -1522,7 +1645,7 @@ def _build_single_partition_source(tmp_path):
 		# metadata_csum without metadata_csum_seed is the layout that makes
 		# delayed tune2fs -U refuse unless e2fsck -f ran after the copy.
 		_run('mkfs.ext4', '-q', '-F', '-b', '1024', '-I', '128',
-			 '-O', '^metadata_csum_seed', '-L', 'ROOTFS', f'{loop}p1')
+			 *_ext4_without('metadata_csum_seed'), '-L', 'ROOTFS', f'{loop}p1')
 		mount_point = str(tmp_path / 'mnt1')
 		os.makedirs(mount_point, exist_ok=True)
 		_run('mount', f'{loop}p1', mount_point)
@@ -1721,3 +1844,46 @@ def test_dd_clones_a_disk_whose_partition_is_mounted_read_write(tmp_path, fs_typ
 	finally:
 		subprocess.run(['losetup', '-d', loop], check=False, capture_output=True)
 		_detach_loops_for_image(dest)
+
+
+@requires_root_and_tools
+@pytest.mark.skipif(shutil.which('unshare') is None or shutil.which('xfs_io') is None, reason='needs unshare and xfs_io')
+def test_probe_xfs_in_a_mount_namespace_leaves_a_dirty_log_to_the_next_mount(tmp_path, monkeypatch):
+	"""The probe mounts norecovery. Nothing may keep its superblock after it: the next mount shares a live one, and then
+	no log recovery runs and what only the log holds is missing (xfsprogs 4.5 on EL7 takes this route for every xfs)."""
+	image = tmp_path / 'xfs.img'
+	with open(str(image), 'wb') as f:
+		f.truncate(300 << 20)
+	loop = _run('losetup', '--find', '--show', str(image)).strip()
+	live, after = str(tmp_path / 'live'), str(tmp_path / 'after')
+	os.makedirs(live)
+	os.makedirs(after)
+	try:
+		_run('mkfs.xfs', '-q', '-f', loop)
+		_run('mount', loop, live)
+		for number in range(8):
+			os.makedirs(os.path.join(live, f'd{number}'))
+		_run('sync')
+		open(os.path.join(live, 'after-sync'), 'w').close()
+		_run('xfs_io', '-x', '-c', 'shutdown', live)
+		_run('umount', live)
+		real = hpcp.run_command_in_multicmd_with_path_check
+		monkeypatch.setattr(hpcp, 'run_command_in_multicmd_with_path_check',
+			lambda argv, **kwargs: [] if argv[0] == 'xfs_info' else real(argv, **kwargs))
+		scratch = tmp_path / 'scratch'
+		scratch.mkdir()
+		monkeypatch.setattr(tempfile, 'tempdir', str(scratch))
+		params = hpcp._probe_xfs(loop)
+		monkeypatch.setattr(tempfile, 'tempdir', None)
+		assert params['data']['bsize'] and params['meta-data']['isize']
+		assert os.listdir(str(scratch)) == []
+		with open('/proc/self/mounts') as mounts:
+			assert loop not in mounts.read()
+		_run('mount', '-o', 'ro,nouuid', loop, after)
+		try:
+			assert {f'd{number}' for number in range(8)} <= set(os.listdir(after))
+		finally:
+			_run('umount', after)
+	finally:
+		subprocess.run(['umount', live], capture_output=True)
+		subprocess.run(['losetup', '-d', loop], capture_output=True)

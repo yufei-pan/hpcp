@@ -192,6 +192,7 @@ _PARSED = [
 	(lambda: hpcp._probe_fs_type('/dev/x'), {'blkid'}),
 	(lambda: hpcp._probe_identity('/dev/x'), {'blkid'}),
 	(lambda: hpcp._probe_raw_label('/dev/x'), {'blkid'}),
+	(lambda: hpcp._label_printed_raw(['btrfs', 'filesystem', 'label', '/dev/x']), {'btrfs'}),
 	(lambda: hpcp._partition_table_type('/dev/x'), {'blkid'}),
 	(lambda: hpcp._refuse_if_image_in_use('/tmp/x.img'), {'losetup'}),
 ]

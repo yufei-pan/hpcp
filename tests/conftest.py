@@ -34,6 +34,22 @@ if sys.version_info < (3, 7):
 _REAL_SCANDIR_FD = hpcp._SCANDIR_FD
 
 
+@pytest.fixture(autouse=hasattr(os, 'sync'))  # Windows has no os.sync
+def _no_global_sync():
+	"""sync(2) writes every filesystem on the host (from a container too), backup disks included. hpcp flushes what it
+	wrote instead (_flush_loop_device, and _syncfs for a patched filesystem); a test that reaches os.sync fails. A run in a subprocess is covered by
+	test_hpcp_never_calls_global_sync. Not monkeypatch: a fixture using it would outlive the autouse teardowns that
+	run with a test's own patches still in place."""
+	def refuse():
+		raise AssertionError('os.sync() flushes every filesystem on the host: flush the file or device itself')
+	real = os.sync
+	os.sync = refuse
+	try:
+		yield
+	finally:
+		os.sync = real
+
+
 @pytest.fixture(params=['fd', 'proc', 'path'])
 def scan_mode(request, monkeypatch):
 	"""How hpcp reads a directory it holds open: scandir on the descriptor (Python 3.7+), /proc/self/fd/N (3.6 on
@@ -70,6 +86,8 @@ def _clear_hpcp_transient_state():
 		hpcp.ERRORS.clear()
 	if hasattr(hpcp, '_EXT_MKFS_FEATURE_KNOWN'):
 		hpcp._EXT_MKFS_FEATURE_KNOWN.clear()
+	# Reading a list from stdin sets it and only hpcp() clears it: a test calling further in would ask /dev/tty.
+	hpcp._STDIN_HELD_LIST = False
 	hash_file = getattr(hpcp, 'hash_file', None)
 	if hash_file is not None and hasattr(hash_file, 'cache_clear'):
 		hash_file.cache_clear()
@@ -88,7 +106,6 @@ def reset_hpcp_globals():
 		'REMOVE_FILES_WHILE_LISTING': hpcp.REMOVE_FILES_WHILE_LISTING,
 		'RANDOM_DESTINATION_SELECTION': hpcp.RANDOM_DESTINATION_SELECTION,
 		'MIRROR_FS_PARAMS': hpcp.MIRROR_FS_PARAMS,
-		'_STDIN_HELD_LIST': hpcp._STDIN_HELD_LIST,
 	}
 	_clear_hpcp_transient_state()
 	try:

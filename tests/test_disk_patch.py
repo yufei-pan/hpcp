@@ -5,6 +5,7 @@ import os
 import re
 import shutil
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
@@ -447,7 +448,8 @@ def test_in_use_raw_partition_is_refused_before_it_is_hashed(tmp_path, hpcp_mod,
 	monkeypatch.setattr(hpcp_mod, '_refuse_if_image_in_use', lambda image: None)
 	monkeypatch.setattr(hpcp_mod, '_attach_disk', lambda path, ro, loops: '/dev/fake')
 	monkeypatch.setattr(hpcp_mod, '_partition_table_type', lambda device: 'gpt')
-	monkeypatch.setattr(hpcp_mod, 'read_disk_layout', lambda disk, name=None, **kwargs: layout)
+	read_with = []
+	monkeypatch.setattr(hpcp_mod, 'read_disk_layout', lambda disk, name=None, **kwargs: read_with.append(kwargs) or layout)
 	monkeypatch.setattr(hpcp_mod, '_mountinfo_entries', lambda: [])
 	monkeypatch.setattr(hpcp_mod, '_swap_devices', lambda: set())
 	monkeypatch.setattr(hpcp_mod, '_device_number', lambda device: (7, 0))
@@ -461,6 +463,8 @@ def test_in_use_raw_partition_is_refused_before_it_is_hashed(tmp_path, hpcp_mod,
 			'which cannot be checked or written while it is in use; apply the patch offline (an offline apply skips it if it is already done)') + '$'):
 		hpcp_mod.apply_disk_patch([volume], str(tmp_path / 'node.img'), [], [])
 	assert hashed == []
+	# nothing in an apply reads the mkfs parameters, and on EL7 probing them mounts each xfs partition
+	assert read_with and all(kwargs.get('fs_params') is False for kwargs in read_with)
 
 
 def test_several_in_use_raw_partitions_and_other_refusals_share_one_message(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
@@ -782,7 +786,7 @@ def test_fs_identity_commands_labels_and_unsupported(hpcp_mod):
 	cmd = hpcp_mod._fs_identity_commands
 	assert cmd('ext4', dev, label='root2') == [['e2label', dev, 'root2']]
 	assert cmd('xfs', dev, label='') == [['xfs_admin', '-L', '--', dev]]
-	assert cmd('vfat', dev, uuid='ab12-cd34', label='ESP') == [['fatlabel', '-i', dev, 'AB12CD34'], ['fatlabel', dev, 'ESP']]
+	assert cmd('vfat', dev, uuid='ab12-cd34', label='ESP') == [[hpcp_mod._FAT_SERIAL_WRITER, dev, 'ab12-cd34'], ['fatlabel', dev, 'ESP']]
 	assert cmd('swap', dev, label='swap2') == [['swaplabel', '-L', 'swap2', dev]]
 	assert cmd('ntfs', dev, label='DATA') == [['ntfslabel', dev, 'DATA']]
 	assert cmd('ntfs', dev, uuid='X') is None
@@ -1152,6 +1156,144 @@ def test_live_partition_with_temp_dirs_on_the_live_filesystem(tmp_path, hpcp_mod
 	assert ('M', 'etc/os-release') in {(row.op, row.path) for row in part3}
 	# tmpdir/ itself exists on the live side only; nothing below it (this run's mount-point dirs) may appear.
 	assert [row.path for row in part3 if row.path.startswith('tmpdir') and row.path != 'tmpdir/'] == []
+
+
+@contextlib.contextmanager
+def _another_namespace():
+	"""The pid of a process in a mount namespace that follows this one's mounts and unmounts, as a PrivateTmp service's
+	does (chronyd on EL7). Newer unshare makes the new namespace private unless told otherwise; older has no such option."""
+	known = '--propagation' in subprocess.run(['unshare', '--help'], capture_output=True, text=True).stdout
+	holder = subprocess.Popen(['unshare', '-m'] + (['--propagation', 'unchanged'] if known else [])
+		+ ['sh', '-c', 'mount --make-rslave / && echo ready && exec sleep 600'], stdout=subprocess.PIPE, universal_newlines=True)
+	try:
+		assert holder.stdout.readline().strip() == 'ready'
+		yield holder.pid
+	finally:
+		holder.kill()
+		holder.wait()
+		holder.stdout.close()
+
+
+def _namespace_mounts(pid, prefix):
+	with open(f'/proc/{pid}/mountinfo') as f:
+		return [line.split()[4] for line in f if line.split()[4].startswith(prefix)]
+
+
+@requires_root_and_disk_tools
+@pytest.mark.root
+@pytest.mark.loop
+@pytest.mark.skipif(shutil.which('unshare') is None, reason='needs unshare')
+def test_a_diff_with_temp_dirs_on_a_live_filesystem_leaves_nothing_in_another_namespace(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch, capsys):
+	"""A mount made after a bind of the live filesystem also lands inside the bind's copy in another namespace. Taken
+	off bind first, that copy still has a child, so the unmount does not reach it: on 3.10 (EL7) the copy stays for good,
+	rmdir of its directory fails with EBUSY, and the filesystem and its loop device stay held."""
+	old, new, out = tmp_path / 'old.img', tmp_path / 'new.img', str(tmp_path / 'patch.img')
+	_make_golden(old)
+	_make_newer(old, new, label=None, raw=False, mbr=False, gpt_name=None)
+	multiprocessing.util.get_temp_dir()
+	with _another_namespace() as pid:
+		with _attached(new, read_only=False) as loop:
+			with _mounted(loop + 'p3') as live_root:
+				temp_dir = os.path.join(live_root, 'tmpdir')
+				os.makedirs(temp_dir)
+				monkeypatch.setattr(tempfile, 'tempdir', temp_dir)
+				with _session(hpcp_mod) as (mount_points, loop_devices):
+					assert hpcp_mod.process_get_disk_diff_image([loop], [str(old)], out, mount_points, loop_devices, max_workers=1) == out
+				assert 'Failed to remove mount point' not in capsys.readouterr().err
+				assert _namespace_mounts(pid, temp_dir) == []
+				assert os.listdir(temp_dir) == []
+				monkeypatch.setattr(tempfile, 'tempdir', None)
+		assert _namespace_mounts(pid, live_root) == []
+
+
+@requires_root_and_disk_tools
+@pytest.mark.root
+@pytest.mark.loop
+@pytest.mark.skipif(shutil.which('unshare') is None, reason='needs unshare')
+@pytest.mark.parametrize('esp', [False, True], ids=['plain', 'esp-first'])
+def test_an_apply_with_temp_dirs_on_a_live_filesystem_leaves_nothing_in_another_namespace(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch, esp):
+	"""As for a diff, with the sections: partition 1 is live, so it is a bind, and partition 2 is mounted after it. The
+	apply takes the sections off itself, in the opposite order to their mounts (1, 2), whatever order it applied them in.
+	Plain, the apply order is the mount order (1, 2), so releasing in apply order leaves the bind. With partition 1 an ESP,
+	which is applied last, the apply order is (2, 1), so releasing in reverse apply order leaves it. Releasing in mount order
+	fails both. Run on EL7, every wrong form fails at least one of the two."""
+	base, golden, target = tmp_path / 'base.img', tmp_path / 'golden.img', tmp_path / 'target.img'
+	with open(str(base), 'wb') as f:
+		f.truncate(96 << 20)
+	_run('sgdisk', '-n1:2048:+40M', *(['-t1:EF00'] if esp else []), '-n2:0:+40M', base)
+	with _attached(base) as loop:
+		_run('mkfs.ext4', '-q', '-F', loop + 'p1')
+		_run('mkfs.ext4', '-q', '-F', loop + 'p2')
+	shutil.copyfile(str(base), str(golden))
+	shutil.copyfile(str(base), str(target))
+	with _attached(golden) as loop:
+		for number in (1, 2):
+			with _mounted(f'{loop}p{number}') as root:
+				with open(os.path.join(root, 'new-file'), 'w') as f:
+					f.write('new')
+	patch = str(tmp_path / 'patch.img')
+	with _session(hpcp_mod) as (mount_points, loop_devices):
+		assert hpcp_mod.process_get_disk_diff_image([str(golden)], [str(base)], patch, mount_points, loop_devices, max_workers=1) == patch
+	multiprocessing.util.get_temp_dir()
+	with _another_namespace() as pid:
+		with _attached(target) as loop:
+			with _mounted(loop + 'p1') as live_root:
+				temp_dir = os.path.join(live_root, 'tmpdir')
+				os.makedirs(temp_dir)
+				monkeypatch.setattr(tempfile, 'tempdir', temp_dir)
+				assert _apply(hpcp_mod, patch, loop)['failed'] == 0
+				assert _namespace_mounts(pid, temp_dir) == []
+				assert os.listdir(temp_dir) == []
+				monkeypatch.setattr(tempfile, 'tempdir', None)
+				assert os.path.exists(os.path.join(live_root, 'new-file'))
+		assert _namespace_mounts(pid, live_root) == []
+
+
+@requires_root_and_disk_tools
+@pytest.mark.root
+@pytest.mark.loop
+def test_an_apply_onto_a_live_filesystem_writes_that_filesystem_before_it_lets_go(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	"""A target someone else mounted is only bound by the apply, and taking the bind off writes nothing: the apply asks the
+	kernel (syncfs) for the filesystem it patched, while its bind is still there."""
+	base, golden, target = tmp_path / 'base.img', tmp_path / 'golden.img', tmp_path / 'target.img'
+	with open(str(base), 'wb') as f:
+		f.truncate(64 << 20)
+	_run('sgdisk', '-n1:2048:+40M', base)
+	with _attached(base) as loop:
+		_run('mkfs.ext4', '-q', '-F', loop + 'p1')
+	shutil.copyfile(str(base), str(golden))
+	shutil.copyfile(str(base), str(target))
+	with _attached(golden) as loop:
+		with _mounted(loop + 'p1') as root:
+			with open(os.path.join(root, 'new-file'), 'w') as f:
+				f.write('new')
+	patch = str(tmp_path / 'patch.img')
+	with _session(hpcp_mod) as (mount_points, loop_devices):
+		assert hpcp_mod.process_get_disk_diff_image([str(golden)], [str(base)], patch, mount_points, loop_devices, max_workers=1) == patch
+	flushed = []
+	real_syncfs = hpcp_mod._syncfs
+	with _attached(target) as loop:
+		with _mounted(loop + 'p1') as live_root:
+			def spy(path):
+				flushed.append((os.path.ismount(path), os.stat(path).st_dev == os.stat(live_root).st_dev))
+				real_syncfs(path)
+			monkeypatch.setattr(hpcp_mod, '_syncfs', spy)
+			assert _apply(hpcp_mod, patch, loop)['failed'] == 0
+			assert os.path.exists(os.path.join(live_root, 'new-file'))
+	assert flushed == [(True, True)]
+
+
+def test_clean_up_takes_the_last_mount_off_first(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	calls = []
+	monkeypatch.setattr(hpcp_mod, 'run_command_in_multicmd_with_path_check', lambda argv, **kwargs: calls.append(argv) or [])
+	monkeypatch.setattr(hpcp_mod, '_is_mount_point', lambda path: False)
+	mounts = [str(tmp_path / name) for name in ('first', 'second', 'third')]
+	for mount in mounts:
+		os.mkdir(mount)
+	remaining = list(mounts)
+	hpcp_mod.clean_up(remaining, [])
+	assert [argv[1] for argv in calls if argv[0] == 'umount'] == mounts[::-1]
+	assert remaining == [] and os.listdir(str(tmp_path)) == []
 
 
 @requires_root_and_disk_tools
@@ -2665,6 +2807,129 @@ def test_disk_write_hold_releases_on_an_error_inside(tmp_path, hpcp_mod, reset_h
 			os.close(os.open(device, os.O_RDONLY | os.O_EXCL))
 
 
+def _fat_boot_sector(fat32, sector_size=512, reserved=32, backup=6, signature=0x29, serial=0x11223344):
+	"""A boot sector as far as the volume ID needs it, with a 0xEE filler that shows any stray write."""
+	sector = bytearray(b'\xee' * sector_size)
+	struct.pack_into('<H', sector, 11, sector_size)
+	struct.pack_into('<H', sector, 14, reserved)
+	struct.pack_into('<H', sector, 22, 0 if fat32 else 200)
+	if fat32:
+		struct.pack_into('<H', sector, 50, backup)
+	sector[66 if fat32 else 38] = signature
+	struct.pack_into('<I', sector, 67 if fat32 else 39, serial)
+	return sector
+
+
+def _fat_image(path, sector, backup_at=None):
+	image = bytearray(1 << 16)
+	image[:len(sector)] = sector
+	if backup_at is not None:
+		image[backup_at:backup_at + len(sector)] = sector
+	path.write_bytes(bytes(image))
+	return image
+
+
+@pytest.mark.parametrize('uuid', ['ABCD-1234', 'abcd-1234', 'ABCD1234'])
+def test_fat_serial_writes_the_fat16_boot_sector(tmp_path, hpcp_mod, reset_hpcp_globals, uuid):
+	"""blkid shows the four bytes highest first, so ABCD-1234 is 34 12 CD AB; nothing else in the image moves."""
+	image = tmp_path / 'fat.img'
+	expected = _fat_image(image, _fat_boot_sector(False))
+	hpcp_mod._write_fat_serial(str(image), uuid)
+	expected[39:43] = bytes.fromhex('3412CDAB')
+	assert image.read_bytes() == bytes(expected)
+	assert hpcp_mod.ERRORS == []
+
+
+@pytest.mark.parametrize('fat32', [False, True], ids=['fat16', 'fat32'])
+def test_fat_serial_writes_after_either_extended_boot_signature(tmp_path, hpcp_mod, reset_hpcp_globals, fat32):
+	"""0x28 (OS/2, DOS 4.0) marks the volume ID field as well as 0x29."""
+	image = tmp_path / 'fat.img'
+	expected = _fat_image(image, _fat_boot_sector(fat32, signature=0x28), backup_at=6 * 512 if fat32 else None)
+	hpcp_mod._write_fat_serial(str(image), 'ABCD-1234')
+	offset = 67 if fat32 else 39
+	expected[offset:offset + 4] = bytes.fromhex('3412CDAB')
+	if fat32:
+		expected[6 * 512 + offset:6 * 512 + offset + 4] = bytes.fromhex('3412CDAB')
+	assert image.read_bytes() == bytes(expected)
+	assert hpcp_mod.ERRORS == []
+
+
+@pytest.mark.parametrize('sector_size', [512, 4096])
+def test_fat_serial_writes_fat32_and_its_backup_boot_sector(tmp_path, hpcp_mod, reset_hpcp_globals, sector_size):
+	"""fsck.fat reports a backup boot sector that differs from the first."""
+	image = tmp_path / 'fat.img'
+	backup_at = 6 * sector_size
+	expected = _fat_image(image, _fat_boot_sector(True, sector_size=sector_size), backup_at=backup_at)
+	hpcp_mod._write_fat_serial(str(image), 'ABCD-1234')
+	expected[67:71] = bytes.fromhex('3412CDAB')
+	expected[backup_at + 67:backup_at + 71] = bytes.fromhex('3412CDAB')
+	assert image.read_bytes() == bytes(expected)
+	assert hpcp_mod.ERRORS == []
+
+
+@pytest.mark.parametrize('backup', [0, 32, 0xffff], ids=['none', 'past-the-reserved-sectors', 'unset'])
+def test_fat_serial_leaves_what_is_no_backup_boot_sector_alone(tmp_path, hpcp_mod, reset_hpcp_globals, backup):
+	image = tmp_path / 'fat.img'
+	expected = _fat_image(image, _fat_boot_sector(True, backup=backup))
+	hpcp_mod._write_fat_serial(str(image), 'ABCD-1234')
+	expected[67:71] = bytes.fromhex('3412CDAB')
+	assert image.read_bytes() == bytes(expected)
+	assert hpcp_mod.ERRORS == []
+
+
+@pytest.mark.parametrize('kwargs, uuid, words', [
+	# DOS 3.x boot code starts where a later boot sector keeps the volume ID.
+	({'signature': 0}, 'ABCD-1234', 'no volume ID field'),
+	({}, 'ABCD-123', 'not a FAT volume ID'),
+	({}, 'ABCD-123G', 'not a FAT volume ID'),
+	({}, '11111111-2222-3333-4444-555555555555', 'not a FAT volume ID'),
+], ids=['no-signature', 'short', 'not-hex', 'a-long-uuid'])
+def test_fat_serial_that_cannot_be_written_writes_nothing_and_says_why(tmp_path, hpcp_mod, reset_hpcp_globals, capsys, kwargs, uuid, words):
+	image = tmp_path / 'fat.img'
+	before = bytes(_fat_image(image, _fat_boot_sector(False, **kwargs)))
+	hpcp_mod._write_fat_serial(str(image), uuid)
+	assert image.read_bytes() == before
+	assert words in capsys.readouterr().err
+	assert len(hpcp_mod.ERRORS) == 1
+
+
+def test_fat_serial_on_a_device_it_cannot_open_says_why(tmp_path, hpcp_mod, reset_hpcp_globals, capsys):
+	hpcp_mod._write_fat_serial(str(tmp_path / 'nosuch'), 'ABCD-1234')
+	assert 'nosuch' in capsys.readouterr().err
+	assert len(hpcp_mod.ERRORS) == 1
+
+
+def test_identity_commands_run_the_fat_serial_writer_in_process(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	"""A hold stays in place: the writer is hpcp itself, whose own O_EXCL descriptor does not keep it out."""
+	calls, ran = [], []
+	monkeypatch.setattr(hpcp_mod, '_write_fat_serial', lambda device, uuid: calls.append((device, uuid)))
+	monkeypatch.setattr(hpcp_mod, 'run_command_in_multicmd_with_path_check', lambda argv, **kwargs: ran.append(argv))
+	commands = hpcp_mod._fs_identity_commands('vfat', '/dev/x1', uuid='ABCD-1234', label='ESP')
+	hpcp_mod._run_identity_commands(commands, {'/dev/x1': 99})
+	assert calls == [('/dev/x1', 'ABCD-1234')]
+	assert ran == [['fatlabel', '/dev/x1', 'ESP']]
+
+
+@pytest.mark.parametrize('fat_bits', ['12', '16', '32'])
+@pytest.mark.skipif(shutil.which('mkfs.vfat') is None or shutil.which('blkid') is None or shutil.which('fsck.fat') is None,
+	reason='needs mkfs.vfat, fsck.fat and blkid')
+def test_fat_serial_reads_back_through_blkid_and_passes_fsck(tmp_path, hpcp_mod, reset_hpcp_globals, fat_bits):
+	"""On a filesystem real tools made, for each FAT width: blkid sees the new ID and fsck.fat finds nothing new to
+	report, the backup boot sector of FAT32 included."""
+	image = tmp_path / 'fat.img'
+	with open(str(image), 'wb') as f:
+		f.truncate({'12': 8, '16': 32, '32': 64}[fat_bits] << 20)
+	_run('mkfs.vfat', '-F', fat_bits, '-n', 'OLD', image)
+	# Against the fresh filesystem: fsck.fat 3.0.20 can have something to say about what its own mkfs.vfat made.
+	check = lambda: subprocess.run(['fsck.fat', '-n', str(image)], capture_output=True, text=True)
+	before = check()
+	hpcp_mod._write_fat_serial(str(image), 'ABCD-1234')
+	assert hpcp_mod._probe_identity(str(image))[:2] == ('vfat', 'ABCD-1234')
+	after = check()
+	assert (after.returncode, after.stdout) == (before.returncode, before.stdout)
+	assert hpcp_mod.ERRORS == []
+
+
 _FULL_UUID = '11111111-2222-3333-4444-555555555555'
 # (fs_type, mkfs argv, identity tool, UUID as blkid shows it, label); None is left alone (hpcp sets only the label of
 # f2fs and ntfs).
@@ -2719,8 +2984,8 @@ requires_root_loop = pytest.mark.skipif(os.name == 'nt' or os.geteuid() != 0 or 
 
 
 @contextlib.contextmanager
-def _plain_loop(image, sector_size=None):
-	argv = ['losetup', '--find', '--show'] + (['--sector-size', str(sector_size)] if sector_size else []) + [str(image)]
+def _plain_loop(image, sector_size=512):
+	argv = ['losetup', '--find', '--show'] + (['--sector-size', str(sector_size)] if sector_size != 512 else []) + [str(image)]
 	loop = subprocess.run(argv, check=True, capture_output=True, text=True).stdout.strip()
 	try:
 		yield loop
@@ -2757,6 +3022,8 @@ def test_direct_read_back_sees_the_device_not_the_cache(tmp_path, hpcp_mod):
 def test_direct_read_of_the_boot_code_on_any_sector_size(tmp_path, hpcp_mod, sector_size):
 	"""Review Focus 5: the 440-byte boot code is read as its enclosing logical block and cut back to 440 bytes; an
 	area ending short of a whole read chunk is hashed exactly."""
+	if sector_size != 512 and '--sector-size' not in subprocess.run(['losetup', '--help'], capture_output=True, text=True).stdout:
+		pytest.skip('this losetup has no --sector-size (util-linux 2.23.2 on EL7)')
 	image = tmp_path / 'disk.img'
 	data = bytes(range(256)) * (5 << 12)
 	image.write_bytes(data)
@@ -2944,10 +3211,10 @@ def test_probe_identity_reads_a_cut_label_raw(hpcp_mod, reset_hpcp_globals, monk
 		calls.append(argv)
 		if '-o' in argv and argv[argv.index('-o') + 1] == 'value':
 			return [raw]
-		return ['ID_FS_UUID_ENC=u1', 'ID_FS_LABEL_ENC=' + enc, 'ID_FS_TYPE=btrfs']
+		return ['ID_FS_UUID_ENC=u1', 'ID_FS_LABEL_ENC=' + enc, 'ID_FS_TYPE=f2fs']
 
 	monkeypatch.setattr(hpcp_mod, 'run_command_in_multicmd_with_path_check', fake)
-	assert hpcp_mod._probe_identity('/dev/x1') == ('btrfs', 'u1', label)
+	assert hpcp_mod._probe_identity('/dev/x1') == ('f2fs', 'u1', label)
 	assert calls == [['blkid', '-p', '-o', 'udev', '/dev/x1'], ['blkid', '-p', '-o', 'value', '-s', 'LABEL', '/dev/x1']]
 
 
@@ -2957,9 +3224,64 @@ def test_probe_identity_reads_a_whole_label_from_udev_alone(hpcp_mod, reset_hpcp
 	enc = 'a' * 250 + 'b\\x5cx\\x20'
 	assert len(enc) == 260
 	monkeypatch.setattr(hpcp_mod, 'run_command_in_multicmd_with_path_check',
-		lambda argv, **kwargs: calls.append(argv) or ['ID_FS_LABEL_ENC=' + enc, 'ID_FS_TYPE=btrfs'])
-	assert hpcp_mod._probe_identity('/dev/x1') == ('btrfs', '', 'a' * 250 + 'b\\x ')
+		lambda argv, **kwargs: calls.append(argv) or ['ID_FS_LABEL_ENC=' + enc, 'ID_FS_TYPE=f2fs'])
+	assert hpcp_mod._probe_identity('/dev/x1') == ('f2fs', '', 'a' * 250 + 'b\\x ')
 	assert len(calls) == 1
+
+
+def _fake_btrfs_probe(monkeypatch, hpcp_mod, enc, tool_output, have_tool=True):
+	"""blkid finds btrfs with label enc; `btrfs filesystem label` prints tool_output. Returns the list of argvs run."""
+	calls = []
+
+	def fake(argv, **kwargs):
+		calls.append(argv)
+		if argv[0] == 'btrfs':
+			if not tool_output:
+				# what run_command_in_multicmd_with_path_check does for a tool that exits non-zero
+				hpcp_mod.ERRORS.append("Task return code error: Command '['btrfs', 'filesystem', 'label']' failed with return code 1.")
+			return tool_output
+		if '-o' in argv and argv[argv.index('-o') + 1] == 'value':
+			return ['from blkid raw']
+		return ['ID_FS_UUID_ENC=u1', 'ID_FS_LABEL_ENC=' + enc, 'ID_FS_TYPE=btrfs']
+
+	monkeypatch.setattr(hpcp_mod, 'run_command_in_multicmd_with_path_check', fake)
+	monkeypatch.setattr(hpcp_mod, 'check_path', lambda tool: have_tool)
+	return calls
+
+
+def test_probe_identity_reads_a_btrfs_label_with_the_btrfs_tool(hpcp_mod, reset_hpcp_globals, monkeypatch):
+	"""blkid 2.23.2 (EL7) cuts a label at 127 bytes, and then trims what is left, so its length does not show the cut."""
+	label = 'a' * 120 + ' \\x41 ' + 'b' * 100 + '\\xff'
+	calls = _fake_btrfs_probe(monkeypatch, hpcp_mod, 'a' * 120, [label])
+	assert hpcp_mod._probe_identity('/dev/x1') == ('btrfs', 'u1', 'a' * 120 + ' \\x41 ' + 'b' * 100 + '\udcff')
+	assert calls == [['blkid', '-p', '-o', 'udev', '/dev/x1'], ['btrfs', 'filesystem', 'label', '/dev/x1']]
+
+
+def test_probe_identity_runs_no_label_tool_for_no_label(hpcp_mod, reset_hpcp_globals, monkeypatch):
+	calls = _fake_btrfs_probe(monkeypatch, hpcp_mod, '', ['never'])
+	assert hpcp_mod._probe_identity('/dev/x1') == ('btrfs', 'u1', '')
+	assert len(calls) == 1
+
+
+@pytest.mark.parametrize('have_tool, output', [(True, []), (True, ['']), (False, ['never'])], ids=['failed', 'printed-nothing', 'no-tool'])
+def test_probe_identity_keeps_blkids_btrfs_label_when_the_tool_gives_none(hpcp_mod, reset_hpcp_globals, monkeypatch, capsys, have_tool, output):
+	"""A disk can be read on a system without btrfs-progs, or with a device the tool cannot open: blkid still answers."""
+	_fake_btrfs_probe(monkeypatch, hpcp_mod, 'short\\x20label', output, have_tool=have_tool)
+	assert hpcp_mod._probe_identity('/dev/x1') == ('btrfs', 'u1', 'short label')
+	assert capsys.readouterr().err == ''
+	assert hpcp_mod.ERRORS == []
+
+
+def test_probe_identity_reads_a_cut_btrfs_label_from_the_tool_alone(hpcp_mod, reset_hpcp_globals, monkeypatch):
+	"""The raw blkid probe is for a cut label no tool answered for: a tool's label is whole."""
+	calls = _fake_btrfs_probe(monkeypatch, hpcp_mod, 'a' * 258 + '\\x2', ['the tool label'])
+	assert hpcp_mod._probe_identity('/dev/x1')[2] == 'the tool label'
+	assert calls == [['blkid', '-p', '-o', 'udev', '/dev/x1'], ['btrfs', 'filesystem', 'label', '/dev/x1']]
+
+
+def test_probe_identity_falls_back_to_the_raw_probe_for_a_cut_btrfs_label(hpcp_mod, reset_hpcp_globals, monkeypatch):
+	_fake_btrfs_probe(monkeypatch, hpcp_mod, 'a' * 258 + '\\x2', [], have_tool=False)
+	assert hpcp_mod._probe_identity('/dev/x1')[2] == 'from blkid raw'
 
 
 @pytest.mark.skipif(shutil.which('mkfs.btrfs') is None or shutil.which('blkid') is None, reason='needs mkfs.btrfs and blkid')
@@ -2972,6 +3294,35 @@ def test_probe_identity_reads_a_long_btrfs_label_exactly(tmp_path, hpcp_mod, res
 		f.truncate(128 << 20)
 	_run('mkfs.btrfs', '-q', '-f', '-L', label, image)
 	assert hpcp_mod._probe_identity(str(image))[2] == label
+
+
+@pytest.mark.skipif(shutil.which('mkfs.btrfs') is None or shutil.which('btrfs') is None or shutil.which('blkid') is None, reason='needs btrfs-progs and blkid')
+@pytest.mark.parametrize('label', ['b' * 200, 'a' * 124 + '  ' + 'c' * 40, 'ü' * 100], ids=['long', 'space-where-blkid-cuts', 'multibyte'])
+def test_probe_identity_reads_a_btrfs_label_past_127_bytes(tmp_path, hpcp_mod, reset_hpcp_globals, label):
+	image = tmp_path / 'btrfs.img'
+	with open(str(image), 'wb') as f:
+		f.truncate(128 << 20)
+	_run('mkfs.btrfs', '-q', '-f', '-L', label, image)
+	assert hpcp_mod._probe_identity(str(image))[2] == label
+
+
+@pytest.mark.skipif(shutil.which('mkfs.ntfs') is None or shutil.which('ntfslabel') is None or shutil.which('blkid') is None, reason='needs ntfsprogs and blkid')
+@pytest.mark.parametrize('label', ['n' * 128, 'ü' * 100], ids=['longest', 'multibyte'])
+def test_probe_identity_reads_an_ntfs_label_past_127_bytes(tmp_path, hpcp_mod, reset_hpcp_globals, label):
+	image = tmp_path / 'ntfs.img'
+	with open(str(image), 'wb') as f:
+		f.truncate(32 << 20)
+	_run('mkfs.ntfs', '-Q', '-F', '-L', label, image)
+	assert hpcp_mod._probe_identity(str(image))[2] == label
+
+
+def test_probe_identity_asks_ntfslabel_for_an_ntfs_label(hpcp_mod, reset_hpcp_globals, monkeypatch):
+	calls = []
+	monkeypatch.setattr(hpcp_mod, 'run_command_in_multicmd_with_path_check', lambda argv, **kwargs: calls.append(argv)
+		or (['n' * 128] if argv[0] == 'ntfslabel' else ['ID_FS_LABEL_ENC=' + 'n' * 127, 'ID_FS_TYPE=ntfs']))
+	monkeypatch.setattr(hpcp_mod, 'check_path', lambda tool: True)
+	assert hpcp_mod._probe_identity('/dev/x1')[2] == 'n' * 128
+	assert calls[1] == ['ntfslabel', '/dev/x1']
 
 
 @pytest.mark.parametrize('line, name', [
@@ -3137,6 +3488,42 @@ def test_partition_paths_come_from_lsblk_full_names(hpcp_mod, reset_hpcp_globals
 	assert hpcp_mod.get_partitions(disk) == partitions
 	assert hpcp_mod.get_largest_partition(disk) == largest
 	assert all('-p' in argv and '-P' in argv and argv[argv.index('-o') + 1] == 'NAME,SIZE,KNAME,PKNAME,TYPE' for argv in argvs)
+
+
+@pytest.mark.parametrize('disk, lsblk, kernel_partitions, partitions', [
+	# lsblk 2.23.2 (EL7) and 2.32.1 (EL8) call a loop device's partitions TYPE loop.
+	('/dev/loop3', [_lsblk_p('/dev/loop3', 1000, '/dev/loop3', '', 'loop'),
+		_lsblk_p('/dev/loop3p1', 400, '/dev/loop3p1', '/dev/loop3', 'loop'),
+		_lsblk_p('/dev/loop3p2', 600, '/dev/loop3p2', '/dev/loop3', 'loop')],
+		{'/dev/loop3p1', '/dev/loop3p2'}, ['/dev/loop3p1', '/dev/loop3p2']),
+	# TYPE is only ever a hint: a partitioned array's partition under any name it may have there.
+	('/dev/md0', [_lsblk_p('/dev/md0', 1000, '/dev/md0', '', 'raid1'),
+		_lsblk_p('/dev/md0p1', 900, '/dev/md0p1', '/dev/md0', 'md')], {'/dev/md0p1'}, ['/dev/md0p1']),
+	# A loop device stacked on a partition is no partition of the disk, whatever its name: wrong parent, and sysfs says no.
+	('/dev/sdc', [_lsblk_p('/dev/sdc', 1000, '/dev/sdc', '', 'disk'),
+		_lsblk_p('/dev/sdc1', 900, '/dev/sdc1', '/dev/sdc', 'part'),
+		_lsblk_p('/dev/loop4', 800, '/dev/loop4', '/dev/sdc1', 'loop')], {'/dev/sdc1'}, ['/dev/sdc1']),
+	# A partition of an array on the disk: the kernel calls it a partition, but of the array.
+	('/dev/loop5', [_lsblk_p('/dev/loop5', 1000, '/dev/loop5', '', 'loop'),
+		_lsblk_p('/dev/md127', 990, '/dev/md127', '/dev/loop5', 'raid1'),
+		_lsblk_p('/dev/md127p1', 400, '/dev/md127p1', '/dev/md127', 'md')], {'/dev/md127p1'}, []),
+], ids=['loop', 'md', 'loop-on-a-partition', 'partition-of-an-array'])
+def test_a_partition_is_what_the_kernel_says_whatever_lsblk_calls_it(hpcp_mod, reset_hpcp_globals, monkeypatch, disk, lsblk, kernel_partitions, partitions):
+	monkeypatch.setattr(hpcp_mod, 'run_command_in_multicmd_with_path_check', lambda argv, **kwargs: list(lsblk))
+	monkeypatch.setattr(hpcp_mod, '_udev_settle', lambda: None)
+	monkeypatch.setattr(hpcp_mod, '_is_kernel_partition', lambda device: device in kernel_partitions)
+	assert hpcp_mod.get_partitions(disk) == partitions
+
+
+def test_is_kernel_partition_reads_sysfs(tmp_path, hpcp_mod):
+	"""The kernel's own answer: a device with a 'partition' file in its sysfs directory, under its kernel name."""
+	for name in ('loop0', 'loop0p1', 'cciss!c0d0p1', 'dm-1'):
+		(tmp_path / name).mkdir()
+	(tmp_path / 'loop0p1' / 'partition').write_text('1\n')
+	(tmp_path / 'cciss!c0d0p1' / 'partition').write_text('1\n')
+	check = lambda device: hpcp_mod._is_kernel_partition(device, sys_block_path=str(tmp_path))
+	assert check('/dev/loop0p1') and check('/dev/cciss!c0d0p1') and check('/dev/cciss/c0d0p1')
+	assert not check('/dev/loop0') and not check('/dev/dm-1') and not check('/dev/nosuch')
 
 
 def test_target_partition_uses_lsblk_full_names(hpcp_mod, reset_hpcp_globals, monkeypatch):

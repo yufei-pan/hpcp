@@ -240,6 +240,7 @@ def test_rmtree_needs_no_read_permission_on_the_parent(tmp_path, hpcp_mod):
 
 
 def _run_dropbox_case(outer, hpcp_mod):
+	import pwd
 	tmp_path = outer
 	work = outer / 'work'
 	(work / 'dropbox' / 'tree' / 'sub').mkdir(parents=True)
@@ -251,7 +252,9 @@ def _run_dropbox_case(outer, hpcp_mod):
 	os.chmod(str(tmp_path), 0o755)
 	subprocess.run(['chown', '-R', 'nobody', str(work / 'dropbox')], check=True)
 	os.chmod(str(work / 'dropbox'), 0o333)
-	result = subprocess.run(['setpriv', '--reuid=65534', '--regid=65534', '--clear-groups', sys.executable, '-c',
+	# nobody is 99 on EL7 (65534 is nfsnobody there).
+	nobody = pwd.getpwnam('nobody')
+	result = subprocess.run(['setpriv', f'--reuid={nobody.pw_uid}', f'--regid={nobody.pw_gid}', '--clear-groups', sys.executable, '-c',
 		f'import sys; sys.path.insert(0, {str(work)!r}); import hpcp; hpcp._rmtree({str(work / "dropbox" / "tree")!r})'],
 		capture_output=True, text=True)
 	os.chmod(str(work / 'dropbox'), 0o755)

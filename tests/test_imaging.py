@@ -1,5 +1,7 @@
 import os
 import shutil
+import stat
+import sys
 import subprocess
 import warnings
 import pytest
@@ -69,6 +71,160 @@ def test_create_and_detach_loop_device(loop_image, hpcp_mod, reset_hpcp_globals)
 		)
 	# Re-detach should not crash
 	hpcp_mod.detach_loop_device(loop)
+
+
+def test_flush_loop_device_flushes_the_device_and_the_file_behind_it(tmp_path, hpcp_mod, monkeypatch):
+	device, image = tmp_path / 'dev' / 'loop7', tmp_path / 'img'
+	(tmp_path / 'dev').mkdir()
+	device.write_bytes(b'')
+	image.write_bytes(b'x')
+	sysfs = tmp_path / 'sys' / 'loop7' / 'loop'
+	sysfs.mkdir(parents=True)
+	(sysfs / 'backing_file').write_text(str(image) + '\n')
+	flushed = []
+	real_fsync = os.fsync
+	monkeypatch.setattr(os, 'fsync', lambda fd: flushed.append(os.fstat(fd).st_ino) or real_fsync(fd))
+	hpcp_mod._flush_loop_device(str(device), sysfs=str(tmp_path / 'sys'))
+	assert flushed == [os.stat(str(device)).st_ino, os.stat(str(image)).st_ino]
+
+
+def test_flush_loop_device_ignores_what_it_cannot_flush(tmp_path, hpcp_mod):
+	# no such device, no sysfs entry, a backing file that is gone
+	hpcp_mod._flush_loop_device(str(tmp_path / 'nosuch'), sysfs=str(tmp_path))
+	(tmp_path / 'loop8' / 'loop').mkdir(parents=True)
+	(tmp_path / 'loop8' / 'loop' / 'backing_file').write_text(str(tmp_path / 'gone\n'))
+	hpcp_mod._flush_loop_device(str(tmp_path / 'loop8'), sysfs=str(tmp_path))
+
+
+@pytest.mark.skipif(os.name != 'posix', reason='a name that is not text is a POSIX matter')
+def test_flush_loop_device_reads_a_backing_file_name_that_is_not_text(tmp_path, hpcp_mod, monkeypatch):
+	# backing_file holds the name's bytes. Read as text it raised UnicodeDecodeError (not an OSError) under LC_ALL=C or for a
+	# latin-1 name, and -dd ended in a traceback from clean_up with loop devices still attached.
+	image = os.path.join(os.fsencode(str(tmp_path)), b'latin\xff.img')
+	try:
+		with open(image, 'wb') as f:
+			f.write(b'x')
+	except OSError:
+		pytest.skip('this filesystem refuses a name that is not UTF-8')
+	(tmp_path / 'loop8' / 'loop').mkdir(parents=True)
+	with open(str(tmp_path / 'loop8' / 'loop' / 'backing_file'), 'wb') as f:
+		f.write(image + b'\n')
+	opened = []
+	real_open = os.open
+	def spy(path, *args, **kwargs):
+		opened.append(path)
+		return real_open(path, *args, **kwargs)
+	monkeypatch.setattr(os, 'open', spy)
+	hpcp_mod._flush_loop_device(str(tmp_path / 'loop8'), sysfs=str(tmp_path))
+	assert opened == [str(tmp_path / 'loop8'), image]
+
+
+def test_syncfs_writes_the_filesystem_of_the_path_it_is_given(tmp_path, hpcp_mod, monkeypatch):
+	import ctypes
+	seen = []
+	fds = []
+	class Libc:
+		def syncfs(self, fd):
+			seen.append(os.fstat(fd).st_ino)
+			fds.append(fd)
+			return 0
+	monkeypatch.setattr(ctypes, 'CDLL', lambda *args, **kwargs: Libc())
+	hpcp_mod._syncfs(str(tmp_path))
+	assert seen == [os.stat(str(tmp_path)).st_ino]
+	with pytest.raises(OSError):
+		os.fstat(fds[0])  # closed again
+
+
+@pytest.mark.parametrize('fails', [False, True], ids=['applied', 'raised'])
+def test_a_patch_onto_a_directory_writes_its_filesystem_whatever_the_apply_does(tmp_path, hpcp_mod, monkeypatch, fails):
+	# -siff onto a directory of a filesystem someone else mounted: the unmount that would write it never comes.
+	target = tmp_path / 'live'
+	target.mkdir()
+	flushed = []
+	def apply(*args, **kwargs):
+		if fails:
+			raise RuntimeError('apply failed')
+		return 'applied'
+	monkeypatch.setattr(hpcp_mod, '_mount_single_fs_image', lambda *args: str(tmp_path))
+	monkeypatch.setattr(hpcp_mod, '_patch_layout', lambda roots: 'tree')
+	monkeypatch.setattr(hpcp_mod, 'apply_patch_tree', apply)
+	monkeypatch.setattr(hpcp_mod, '_syncfs', flushed.append)
+	(tmp_path / 'p.img').write_bytes(b'')
+	call = lambda: hpcp_mod.process_load_diff_image(str(tmp_path / 'p.img'), [], [str(target)], None, [], [])
+	if fails:
+		with pytest.raises(RuntimeError):
+			call()
+	else:
+		assert call() == 'applied'
+	assert flushed == [str(target)]
+
+
+def test_a_syncfs_that_cannot_be_made_does_not_stop_the_run(tmp_path, hpcp_mod, monkeypatch):
+	import ctypes
+	hpcp_mod._syncfs(str(tmp_path / 'nosuch'))
+	monkeypatch.setattr(ctypes, 'CDLL', lambda *args, **kwargs: object())  # a libc without syncfs
+	hpcp_mod._syncfs(str(tmp_path))
+	def no_libc(*args, **kwargs):
+		raise OSError('no libc')
+	monkeypatch.setattr(ctypes, 'CDLL', no_libc)
+	hpcp_mod._syncfs(str(tmp_path))
+
+
+@pytest.mark.skipif(not sys.platform.startswith('linux'), reason='syncfs(2) is Linux')
+def test_the_real_syncfs_runs_on_this_libc(tmp_path, hpcp_mod, monkeypatch):
+	import ctypes
+	calls = []
+	real_cdll = ctypes.CDLL
+	def spy(*args, **kwargs):
+		libc = real_cdll(*args, **kwargs)
+		calls.append(libc.syncfs)
+		return libc
+	monkeypatch.setattr(ctypes, 'CDLL', spy)
+	hpcp_mod._syncfs(str(tmp_path))
+	assert len(calls) == 1
+
+
+def test_detach_loop_device_flushes_before_it_detaches(hpcp_mod, monkeypatch, tmp_path):
+	events = []
+	device = tmp_path / 'loop9'
+	device.write_bytes(b'')
+	monkeypatch.setattr(hpcp_mod, '_flush_loop_device', lambda loop: events.append('flush'))
+
+	class Task:
+		returncode = 0
+		stderr = []
+
+	monkeypatch.setattr(hpcp_mod.multiCMD, 'run_commands', lambda commands, **kwargs: events.append('losetup') or [Task()])
+	assert hpcp_mod.detach_loop_device(str(device)) is True
+	assert events == ['flush', 'losetup']
+
+
+def test_detaching_a_loop_device_fsyncs_it_and_its_image(loop_image, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	flushed = []
+	real_fsync = os.fsync
+	rdev, inode = os.stat(loop_image['loop']).st_rdev, os.stat(loop_image['image']).st_ino
+
+	def spy(fd):
+		status = os.fstat(fd)
+		flushed.append(('device', status.st_rdev) if stat.S_ISBLK(status.st_mode) else ('file', status.st_ino))
+		return real_fsync(fd)
+
+	monkeypatch.setattr(os, 'fsync', spy)
+	assert hpcp_mod.detach_loop_device(loop_image['loop']) is True
+	assert flushed == [('device', rdev), ('file', inode)]
+
+
+def test_hpcp_never_calls_global_sync():
+	"""os.sync and the sync command write every filesystem on the host; hpcp flushes what it wrote. Python has no os.syncfs: a
+	patched filesystem is flushed by syncfs(2) through ctypes (_syncfs), which writes that one filesystem only."""
+	import ast
+	with open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'hpcp.py'), encoding='utf-8') as f:
+		tree = ast.parse(f.read())
+	for node in ast.walk(tree):
+		if isinstance(node, ast.Attribute) and node.attr in ('sync', 'syncfs') and isinstance(node.value, ast.Name) and node.value.id == 'os':
+			pytest.fail(f'os.{node.attr} at line {node.lineno}')
+		if isinstance(node, ast.Constant if sys.version_info >= (3, 8) else ast.Str) and (node.value if sys.version_info >= (3, 8) else node.s) == 'sync':
+			pytest.fail(f'the sync command at line {node.lineno}')
 
 
 def test_get_partitions_on_loop_without_table(loop_image, hpcp_mod, reset_hpcp_globals):
