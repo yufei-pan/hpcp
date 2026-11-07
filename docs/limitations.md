@@ -135,8 +135,8 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 ### An 8.3 alias beside its long name on vfat
 - **Kind:** deferred.
 - **What the operator sees:** `hpcp a/ b/ -d out/ -rf` onto vfat with `a/longfilename.txt` and `b/LONGFI~1.TXT` exits 0 and one content is gone, in about half of the runs: vfat made `LONGFI~1.TXT` the short name of the first file, so the second source is written onto it. The sources are removed. 9.82 does the same.
-- **Why:** the alias is not in either name, so no rule on names catches it, and asking the directory about the pair (`_ask_names`) cannot see that one file already has the other's name. It is a filesystem's invention, not a spelling.
-- **Plan:** before a move removes anything, check that no two sources share a landing identity (device and inode of what the copy wrote), and keep every source when two do.
+- **Why:** a numbered alias such as `LONGFI~1.TXT` is in neither name, so no rule on names catches it, and asking the directory about the pair (`_ask_names`) cannot see that one file already has the other's name: it is the filesystem's invention, not a spelling. (A short name that is a plain fold of the long one, such as `KIZ.TXT` for `kız.txt` with codepage 850 or 857, is caught: dotless `ı` folds with `i`.)
+- **Plan:** the same backstop as for legacy names: before a move removes a source, check that its landing holds that source (the size and modification time `cp -a` gave it, and that the landing is not the source itself, asked by doing in the same directory where they share it), and where it does not, keep the source and report a clash.
 - **Revisit when:** the next hpcp release.
 
 ### A copy into its own inside under another spelling on FUSE exFAT
@@ -146,11 +146,22 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - **Plan:** where a source's real path folds like the start of a destination's, ask the directory whether they are one (`_RealPlaces.same_place`), as the move check does, and leave the destination out of the walk as for one spelling.
 - **Revisit when:** the next hpcp release.
 
-### A legacy name that is valid UTF-8 by chance, against its other case
+### A legacy name read as UTF-8 or ASCII, against its other case
 - **Kind:** deferred.
-- **What the operator sees:** on a vfat or exFAT mounted with a codepage `iocharset` (`iso8859-1`, `cp1251`, `koi8-r`; not `utf8`), two names that the mount takes for one, where the bytes of one happen to be valid UTF-8 and the other's are not, are not asked about: the bytes `C3 A9 74` (Latin-1 `Ã©t`, UTF-8 `ét`) and `E3 A9 74`, which a cp1251 mount reads as `Г©t` and `г©t`. `hpcp a/ b/ -d out/ -rf` with one in `a/` and the other in `b/` exits 0 with one content gone, and `hpcp Ã©t -d ã©t -rf` (a rename in case) exits 0 and the file is gone. Checked on vfat mounted `iocharset=cp1251`, `koi8-r` and `iso8859-1` (`utf8=0`), and kernel exFAT mounted `iocharset=cp1251` (VM 901). Only for such a pair, and only on such a mount: names that are not UTF-8 as a whole fold byte by byte and meet.
-- **Why:** a name that is valid UTF-8 is read as UTF-8, which it is on every other mount, and its other case read byte by byte is not the same text. Joining every valid name with every non-UTF-8 name of the same length and ASCII would ask about most legacy trees pair by pair again.
-- **Plan:** a second, byte-level key for valid names (ASCII casefolded, every byte at or above 0x80 one mark), joined only with the keys of names that are not UTF-8, at every place names are grouped; or read the mount's `iocharset` and fold by it.
+- **What the operator sees:** on a vfat or exFAT mounted with a codepage `iocharset` (`iso8859-1`, `iso8859-9`, `cp1251`, `koi8-r`; not `utf8`), two names that the mount takes for one are not asked about when the net reads one of them as UTF-8 or ASCII, which happens in three ways:
+  - one name's bytes happen to be valid UTF-8 and the other's are not: `C3 A9 74` (Latin-1 `Ã©t`, UTF-8 `ét`) against `E3 A9 74`, which a cp1251 mount reads as `Г©t` and `г©t`;
+  - both names' bytes are valid UTF-8, but not as each other's case: KOI8-R `бё` and `бЁ` (`C2 A3` and `C2 B3`), CP1251 `EF B8 B8` and `EF A8 B8`; CP1251 alone has 880 such two-byte pairs;
+  - an ASCII name against a legacy one: `istanbul` against ISO 8859-9 `İstanbul` (`DD` for `İ`, which that table makes the other case of `i`).
+  `hpcp a/ b/ -d out/ -rf` with one in `a/` and the other in `b/` exits 0 with one content gone, and the rename in case (`hpcp out/ONE -d out/OTHER -rf`) exits 0 and the file is gone. Checked on vfat mounted `iocharset=cp1251`, `koi8-r`, `iso8859-1` and `iso8859-9` (`utf8=0`), and kernel exFAT mounted `iocharset=cp1251` (VM 901). Only for such pairs, and only on such a mount: names that are not UTF-8 as a whole fold byte by byte and meet.
+- **Why:** a name that is valid UTF-8 is read as UTF-8, which it is on every other mount, and the mount's own table, not UTF-8, says what its other case is. Joining every valid name with every name of the same length would ask about most trees pair by pair again.
+- **Plan:** first a backstop that needs no fold rule: before a move removes a source, check that its landing holds that source (the size and modification time `cp -a` gave it, and that the landing is not the source itself, which is asked by doing, in the same directory, where they share it), and where it does not, keep the source and report a clash. Then catch the pairs before the copy: fold every name byte by byte on a mount with a codepage `iocharset` (read from the mount options), or join byte-level keys across all names.
+- **Revisit when:** the next hpcp release.
+
+### A file and a directory that only a later `-d` takes for one name, with `-nds`
+- **Kind:** deferred.
+- **What the operator sees:** with `a/F` a file and `b/f/F` a file in a directory, `hpcp a/ b/ -d one/ -d two/ -rf -rds -nds`, where only `two/` folds case, exits 0 with one content gone in about a third of the runs (6 of 20 runs of 100 such pairs, `-j 16`, vfat on VM 901; 9.82 the same). `-nds` makes `two/f` only as `b/f/F` is copied, so `a/F` can pass the check that its landing is no directory and then be written into `two/f`, onto `two/f/F`. Without `-nds` the directories are made on every destination before any file, and nothing was lost in 1,100 pairs; without `-rds` the file goes to `one/` unless that fills.
+- **Why:** the check for a file meeting a directory of another source (`_settle_destinations`) runs on the first destination only, as files may spill to the others.
+- **Plan:** run that check on every destination's landing, not only `buckets[0]`, so the pair is refused as two files are (see "Several destinations and a pair one of them takes for one name").
 - **Revisit when:** the next hpcp release.
 
 ### A landing within about 57 characters of PATH_MAX

@@ -4528,6 +4528,17 @@ def test_the_net_folds_names_that_python_holds_as_escapes(hpcp_mod):
 			('koi8-r', '\u0436\u0451\u043b\u0442\u044b\u0439', '\u0416\u0451\u043b\u0442\u044b\u0439')):
 		one, other = (os.fsdecode(name.encode(encoding)) for name in (first, second))
 		assert same(one, other) and same('/o/' + one, '/O/' + other) and same('/\u00e9/' + one, '/\u00c9/' + other), encoding
+	# Only a name that is not UTF-8 is read byte by byte: below it, a name that is UTF-8 folds as UTF-8 (composed and decomposed
+	# 'caf\u00e9' are 5 bytes and 6, one name to ext4 casefold).
+	assert same('/o/\udcff/caf\u00e9', '/o/\udcff/cafe\u0301') and same('/o/\udcff/Stra\u00dfe', '/o/\udcff/STRASSE')
+	# Serbian '\u0402' and '\u0452' are 80 and 90 in cp1251: the first byte past ASCII is a mark too.
+	assert same(os.fsdecode('\u0402'.encode('cp1251')), os.fsdecode('\u0452'.encode('cp1251')))
+	# The tables of iso8859-9 (also iso8859-3, cp857) make ASCII 'i' the other case of 'I' with a dot, DD: in a name that is
+	# not UTF-8, an ASCII letter is a mark too. 'i\u015f.txt' and '\u0130\u015f.txt' were two names to the net, one to the mount.
+	assert same(os.fsdecode('i\u015f.txt'.encode('iso8859-9')), os.fsdecode('\u0130\u015f.txt'.encode('iso8859-9')))
+	assert not same(os.fsdecode('i\u015f1.txt'.encode('iso8859-9')), os.fsdecode('i\u015f2.txt'.encode('iso8859-9')))
+	# A vfat with codepage 850 or 857 gives 'k\u0131z.txt' the short name 'KIZ.TXT', and casefold keeps dotless '\u0131'.
+	assert same('k\u0131z.txt', 'KIZ.TXT') and same('/o/K\u0131Z', '/o/kiz')
 
 
 _C_LOCALE_PAIR = """
@@ -4975,8 +4986,9 @@ def test_the_question_hands_the_signals_back_when_it_is_asked_nothing_is_made_ei
 		assert not {signal.SIGINT, signal.SIGTERM, signal.SIGHUP} & set(blocked)
 
 
-def test_names_that_are_not_utf8_are_folded_by_their_ascii_and_kept_apart_otherwise(folding, hpcp_mod):
-	# A latin-1 'café' (the bytes of 'caf\xe9'): two cases of the ascii part are one name, a different byte is another.
+def test_names_that_are_not_utf8_meet_their_other_case_and_stay_apart_from_other_bytes(folding, hpcp_mod):
+	# A latin-1 'café' (the bytes of 'caf\xe9'): the net joins all three, and the directory says two cases of the ascii part are
+	# one name and a different byte is another.
 	for directory, name in (('a', b'caf\xe9'), ('b', b'CAF\xe9'), ('c', b'caf\xe8')):
 		write(folding / directory / os.fsdecode(name), directory)
 	assert _copy(hpcp_mod, ['a/', 'c/']) == 0
@@ -5521,6 +5533,6 @@ def test_a_destination_the_filesystem_will_not_make_is_an_error_not_a_crash(tmp_
 			raise OSError(errno.ENAMETOOLONG, 'File name too long', name)
 		return real(name, *args, **kwargs)
 	monkeypatch.setattr(hpcp_mod, '_makedirs', refusing)
-	assert hpcp_mod.hpcp(['t/'], ['out/x./'], single_thread=True, max_workers=1, batch=True, remove_force=True) not in (0, 70)
+	assert hpcp_mod.hpcp(['t/'], ['out/x./'], single_thread=True, max_workers=1, batch=True, remove_force=True) == 202
 	assert 'Directory sync error: cannot make out/x./ (File name too long), ignoring it' in capsys.readouterr().err
 	assert (tmp_path / 't/f').read_text() == 'T'

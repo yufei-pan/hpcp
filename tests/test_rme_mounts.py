@@ -312,6 +312,8 @@ _FOLDING = {
 	'vfat-utf8': ('mkfs.vfat', [], ['-o', 'iocharset=utf8']),
 	'exfat': ('mkfs.exfat', [], []),
 	'ntfs': ('mkfs.ntfs', ['-F', '-f', '-q'], ['-t', 'lowntfs-3g', '-o', 'ignore_case']),
+	'vfat-iso8859-9': ('mkfs.vfat', [], ['-o', 'iocharset=iso8859-9,utf8=0,codepage=857']),
+	'vfat-codepage-850': ('mkfs.vfat', [], ['-o', 'iocharset=utf8,codepage=850']),
 }
 
 
@@ -390,6 +392,57 @@ def test_a_move_of_two_names_that_are_one_removes_nothing(tmp_path, kind):
 		assert task.returncode == 213 and b'where the destination folds case' in task.stdout, task.stdout[-2000:]
 		assert (fold / 'out/x').read_text() == 'upper'
 	assert (tmp_path / 'a/X').read_text() == 'upper' and (tmp_path / 'b/x').read_text() == 'lower'
+
+
+@pytest.mark.parametrize('kind, first, second', [
+	# The kernel's iso8859-9 table makes ASCII 'i' the other case of DD, dotted 'I'.
+	('vfat-iso8859-9', 'i\u015f.txt'.encode('iso8859-9'), '\u0130\u015f.txt'.encode('iso8859-9')),
+	# Codepage 850 gives 'k\u0131z.txt' the short name 'KIZ.TXT'.
+	('vfat-codepage-850', b'KIZ.TXT', 'k\u0131z.txt'.encode('utf-8')),
+], ids=['iso8859-9', 'codepage-850'])
+@pytest.mark.parametrize('order', ['ab', 'ba'])
+def test_a_move_of_turkish_names_that_the_mount_takes_for_one_removes_nothing(tmp_path, kind, first, second, order):
+	"""Both were exit 0 with one content gone: iso8859-9 always, codepage 850 in about half the runs."""
+	base = os.fsencode(str(tmp_path))
+	for source, name, content in ((b'a', first, 'A'), (b'b', second, 'B')):
+		os.makedirs(os.path.join(base, source))
+		with open(os.path.join(base, source, name), 'w') as f:
+			f.write(content)
+	with _folding_directory(tmp_path, kind) as fold:
+		sources = ['a/', 'b/'] if order == 'ab' else ['b/', 'a/']
+		task = _hpcp(sources + ['-d', str(fold / 'out') + os.sep, '-rf'], tmp_path)
+		assert task.returncode == 213 and b'where the destination folds case' in task.stdout, task.stdout[-2000:]
+		assert len(os.listdir(fold / 'out')) == 1
+	with open(os.path.join(base, b'a', first)) as f:
+		assert f.read() == 'A'
+	with open(os.path.join(base, b'b', second)) as f:
+		assert f.read() == 'B'
+
+
+def test_names_below_a_directory_that_is_not_utf8_are_still_folded_as_utf8(tmp_path):
+	"""Only the name that is not UTF-8 is read byte by byte: below it, 'Stra\u00dfe' and 'STRASSE', and 'caf\u00e9' composed and
+	decomposed, are one name each to ext4 casefold, and to the net."""
+	pairs = [('Stra\u00dfe', 'STRASSE'), ('caf\u00e9', 'cafe\u0301')]
+	odd = b'\xff'
+	base = os.fsencode(str(tmp_path))
+	for index, (first, second) in enumerate(pairs):
+		for source, name, content in ((b'a', first, 'A%d' % index), (b'b', second, 'B%d' % index)):
+			os.makedirs(os.path.join(base, source, odd), exist_ok=True)
+			with open(os.path.join(base, source, odd, name.encode('utf-8')), 'w') as f:
+				f.write(content)
+	with _folding_directory(tmp_path, 'ext4') as fold:
+		try:
+			os.mkdir(os.path.join(os.fsencode(str(fold)), odd))
+			os.rmdir(os.path.join(os.fsencode(str(fold)), odd))
+		except OSError:
+			pytest.skip('this ext4 refuses a name that is not UTF-8 in a casefold directory')
+		task = _hpcp(['a/', 'b/', '-d', str(fold / 'out') + os.sep, '-rf'], tmp_path)
+		assert task.returncode == 213 and b'where the destination folds case' in task.stdout, task.stdout[-2000:]
+		assert len(os.listdir(os.path.join(os.fsencode(str(fold)), b'out', odd))) == len(pairs)
+	for index, (first, second) in enumerate(pairs):
+		for source, name, content in ((b'a', first, 'A%d' % index), (b'b', second, 'B%d' % index)):
+			with open(os.path.join(base, source, odd, name.encode('utf-8'))) as f:
+				assert f.read() == content
 
 
 def test_a_folding_directory_below_a_plain_destination_is_asked(tmp_path):

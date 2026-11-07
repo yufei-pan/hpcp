@@ -10774,24 +10774,28 @@ def _folded(path):
 	"""What two paths have in common when some filesystem could read them as one: a wide net, as the filesystem itself is asked
 	about what it catches (_ask_names). Read as UTF-8 whatever the locale: under C, Python 3.6 holds 'É' as two escapes, which
 	nothing folds. A name that is not UTF-8 is in a legacy encoding (cp1251, koi8-r, latin-1), which a filesystem mounted with
-	that charset folds by its own table: past ASCII any byte may be another's case there, so each such byte is one mark,
-	even where a few of them happen to make a UTF-8 character ('Пё' in cp1251), which its other case does not."""
+	that charset folds by its own table: there any letter, ASCII too, and any byte past ASCII may be another's case ('i' and
+	iso8859-9 'İ'), so each is one mark, even where a few of them happen to make a UTF-8 character ('Пё' in cp1251), which its
+	other case does not. Dotless 'ı' is 'i': a vfat with codepage 850 or 857 gives 'kız.txt' the short name 'KIZ.TXT'."""
 	raw = os.fsencode(path)
 	try:
 		path = raw.decode('utf-8')
 	except UnicodeDecodeError:
 		path = os.sep.join(_legacy_name(name) for name in raw.split(os.fsencode(os.sep)))
-	path = _IGNORABLE.sub('', unicodedata.normalize('NFD', unicodedata.normalize('NFD', path).casefold()))
+	path = _IGNORABLE.sub('', unicodedata.normalize('NFD', unicodedata.normalize('NFD', path).casefold().replace('\u0131', 'i')))
 	# Most names have a dot, and few end one: the pattern runs for those only.
 	return _TRAILING_DOTS.sub('', path) if path.endswith('.') or '.' + os.sep in path else path
 
+# In a name that is not UTF-8, the bytes a mount's own table may take for another's case: ASCII letters and every byte past ASCII.
+_LEGACY_MARKS = dict.fromkeys([*range(0x41, 0x5b), *range(0x61, 0x7b), *range(0x80, 0x100)], '\ufffd')
+
 def _legacy_name(name):
-	"""A name of a path that is not UTF-8 as a whole, as _folded reads it: as UTF-8 where it is, else its ASCII as it is and every
-	other byte as the one mark U+FFFD."""
+	"""A name of a path that is not UTF-8 as a whole, as _folded reads it: as UTF-8 where it is, else its digits and punctuation
+	as they are and every other byte as the one mark U+FFFD."""
 	try:
 		return name.decode('utf-8')
 	except UnicodeDecodeError:
-		return ''.join(chr(byte) if byte < 0x80 else '\ufffd' for byte in name)
+		return name.decode('latin-1').translate(_LEGACY_MARKS)
 
 def _names_may_fold(jobs, listing):
 	"""The landings of jobs (of _settle_destinations) that another landing matches in everything but spelling: none when no two
@@ -11743,7 +11747,8 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = multipr
 			except FileExistsError :
 				eprint(f"Destination path {dest} may be a mounted dir, known issue with os.path.exists\nContinuing without creating dest folder...")
 			except OSError as e:
-				# A name the filesystem will not make (exFAT mounted iocharset=cp1251 refuses 'x.'): that destination is out.
+				# A destination that cannot be made (no permission, a read-only or full filesystem, a file in its path, a name the
+				# filesystem refuses such as 'x.' on exFAT mounted iocharset=cp1251): that destination is out, and the rest go on.
 				eprint(f"Directory sync error: cannot make {dest} ({e.strerror}), ignoring it")
 				dests_to_remove.append(dest)
 		if dests and dests_to_remove == dests:
