@@ -120,14 +120,14 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 
 ### A probe left behind by SIGKILL
 - **Kind:** known limitation.
-- **What the operator sees:** hpcp killed with SIGKILL in the moment it asks a directory about a pair leaves a hidden `.hpcp-case-probe-PID-uuid` directory in the destination, empty or holding one empty file. No data is affected. SIGINT, SIGTERM and SIGHUP wait for the probe to go, and left nothing in 30 kills each.
+- **What the operator sees:** hpcp killed with SIGKILL in the moment it asks a directory about a pair leaves a hidden `.hpcp-case-probe-PID-uuid` directory in the destination, empty or holding the empty files of one or both names. No data is affected. SIGINT, SIGTERM and SIGHUP wait for the probe to go, and left nothing in 30 kills each.
 - **Why:** SIGKILL cannot be handled, and the only way to ask a directory about two names is to make them.
 - **Revisit when:** an operator reports finding one.
 - **Approved:** 2026-11-06, the user chose "Known limitation (Recommended)".
 
 ### A directory that cannot be asked about a new pair
 - **Kind:** known limitation.
-- **What the operator sees:** two names that fold alike (`X` and `x`), at least one of them new, landing in a directory where nothing can be made, such as an owned mode 555 directory, are refused with 213: `may be one name, and the destination cannot be asked: make that directory writable and run again`. On a case-sensitive filesystem the refusal is false: 9.82 opened an owned directory and landed both. No file is lost. When both names are already there as different files nothing is asked, so a rerun passes.
+- **What the operator sees:** two names that fold alike (`X` and `x`), at least one of them new, landing in a directory where nothing can be made, such as an owned mode 555 directory, are refused with 213: `may be one name, and the destination cannot be asked: nothing can be made in DIR to ask it (Permission denied): make it writable and run again` (a read-only mount or a full disk names its own fix). On a case-sensitive filesystem the refusal is false: 9.82 opened an owned directory and landed both. No file is lost. Where nothing can be made, the directory's listing answers: both names in it are two names, so a rerun with both names there passes.
 - **Why:** it takes that exact mix, and opening the directory for the probe means another chmod and restore in the path that writes to destinations.
 - **Revisit when:** someone hits it.
 - **Approved:** 2026-11-06, the user chose "Known limitation (Recommended)".

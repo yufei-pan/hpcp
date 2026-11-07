@@ -23,3 +23,4 @@ same commit as the change. Keep this file under 20 KB: at the cap, merge lines b
 - **2026-11-06 One door for a directory**: the flag that skips a step must not skip what the step refused; the refusal and the making of a directory are one helper, or the second route ends in a traceback.
 - **2026-11-06 A refusal offers a fix its reader can run**: name the thing in the reader's own tree (the link), not only where the walk stopped, which can belong to anyone.
 - **2026-11-06 The reason travels with the error**: a runner that knows what a tool said puts it in the error it raises, or every caller reports only a return code.
+- **2026-11-07 Different numbers prove nothing**: equal st_ino means one file, but a filesystem may number each spelling of one name (exFAT through FUSE, CIFS noserverino); whether two names are one is asked by doing it, and a listing answers only where nothing can be made.
