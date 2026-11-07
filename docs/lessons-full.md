@@ -126,3 +126,9 @@ entries go last, in the same commit as the change:
 - Original design was wrong because: the question took the shape of its callers, a pair at a time, so its cost was the square of a group, and how big a group gets is set by how wide the net is, which safety keeps wide. And every error after the probe directory was made was put down to the name.
 - Lesson: when a wide net groups candidates for a costly question, ask about the whole group in one go, keep the answer for the run, and read the pairs off it; and a refusal's reason names what failed, the name or the place it was made in.
 
+## 2026-11-07 A net over bytes is cast per byte
+- Changed: `_folded` reads a path that is not UTF-8 as a whole name by name, and a name that is not UTF-8 keeps its ASCII and turns every other byte into one mark, where it was decoded with `replace`. A landing on a source file in another spelling that cannot be asked says so (`may land on the source file ...: ... may be one name, and the destination cannot be asked: <reason>`), where it said `which is the source file`. A destination the filesystem will not make is a `Directory sync error`, not a traceback (exit 70).
+- Why we had to change: `replace` decodes whatever bytes happen to form UTF-8, so cp1251 `Пё` (CF B8, UTF-8 `ϸ`) and `пё` (EF B8, not UTF-8) folded apart, and on a vfat or exFAT mounted cp1251, koi8-r or iso8859-1 a move, a rename in case and `-rme` each lost a file. The 213 for a landing that could not be asked named a source file as the target and offered no fix.
+- Original design was wrong because: the net was meant to be "any byte past ASCII may be any other", and a decoder's partial success is not that rule; a name valid only by chance still gets past it (deferred).
+- Lesson: when a rule is about bytes, apply it to the bytes; a lenient decoder decides by accident what the rule should decide. And a check that could not tell says that, not the answer it would give if it could.
+
