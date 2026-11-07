@@ -3568,6 +3568,26 @@ def test_the_probe_node_is_removed_and_nothing_is_made_when_nothing_is_at_risk(t
 	assert os.path.dirname(made[0][0]) == str(tmp_path / 'out')
 
 
+@pytest.mark.skipif(not os.path.exists('/dev/null'), reason='needs /dev/null as a device source')
+def test_every_existing_destination_is_asked_until_one_answers(tmp_path, hpcp_mod, monkeypatch):
+	# A read-only mount answers EROFS, which is no answer: the next destination's directory may say EPERM (not root).
+	write(tmp_path / 'ro/null', 'old')
+	write(tmp_path / 'rw/null', 'old')
+	asked = []
+	def mknod(path, *args):
+		asked.append(os.path.dirname(path))
+		if os.path.dirname(path) == str(tmp_path / 'ro'):
+			raise OSError(30, 'Read-only file system')
+		raise PermissionError(1, 'Operation not permitted')
+	monkeypatch.setattr(hpcp_mod.os, 'mknod', mknod)
+	dests = [str(tmp_path / 'ro/null'), str(tmp_path / 'rw/null')]
+	assert hpcp_mod._can_make_node('/dev/null', dests) is False
+	assert asked == [str(tmp_path / 'ro'), str(tmp_path / 'rw')]
+	# no directory answers: cp's to answer
+	monkeypatch.setattr(hpcp_mod.os, 'mknod', lambda path, *args: (_ for _ in ()).throw(OSError(30, 'Read-only file system')))
+	assert hpcp_mod._can_make_node('/dev/null', dests) is True
+
+
 def _bare_and_source(tmp_path, source_minor=5):
 	"""a/n a character device (1, source_minor); bare one at (1, 3), a name of its own; both with the same times."""
 	write(tmp_path / 'a/keep', 'k')
@@ -3606,13 +3626,14 @@ def test_a_regular_file_onto_a_link_to_a_device_writes_through_as_before(tmp_pat
 @pytest.mark.parametrize('order', ['dir-first', 'device-first'])
 @pytest.mark.parametrize('flags', [[], ['-co'], ['-nb'], ['-co', '-s']], ids=' '.join)
 def test_a_device_among_several_destinations_leaves_the_others_their_files(tmp_path, order, flags):
-	# Several -d are spill-over: each file lands on one. The device is refused, the file goes where it can.
+	# Several -d are spill-over: each file lands on one. The device is passed over with a note, the file goes where it can,
+	# and the run ends as any other run of that source (200 for a named node), not in a clash.
 	before = _bare_and_source(tmp_path)
 	dests = ['-d', 'out/', '-d', 'bare'] if order == 'dir-first' else ['-d', 'bare', '-d', 'out/']
 	rc, output = _run_bounded(['a/n'] + dests + flags, tmp_path, seconds=30)
 	assert _same_node(tmp_path / 'bare', before), output[-2000:]
 	assert stat.S_ISCHR(os.lstat(tmp_path / 'out/n').st_mode) and os.lstat(tmp_path / 'out/n').st_rdev == os.makedev(1, 5), (rc, output[-2000:])
-	assert rc == 213 and b'Destination clash' in output, (rc, output[-2000:])
+	assert rc == 200 and b'Destination clash' not in output and b'leaving it out' in output, (rc, output[-2000:])
 
 
 @needs_root
@@ -3624,7 +3645,8 @@ def test_a_regular_file_among_destinations_one_of_which_is_a_device_with_other_n
 	before = os.lstat(tmp_path / 'bare')
 	dests = ['-d', 'out/', '-d', 'bare'] if order == 'dir-first' else ['-d', 'bare', '-d', 'out/']
 	rc, output = _run_bounded(['a/f'] + dests, tmp_path, seconds=30)
-	assert (tmp_path / 'out/f').read_text() == 'F' and _same_node(tmp_path / 'bare', before) and rc == 213, (rc, output[-2000:])
+	assert (tmp_path / 'out/f').read_text() == 'F' and _same_node(tmp_path / 'bare', before) and rc == 0, (rc, output[-2000:])
+	assert b'Destination clash' not in output and b'leaving it out' in output, (rc, output[-2000:])
 
 
 @needs_root
@@ -3636,11 +3658,40 @@ def test_a_move_with_no_destination_left_keeps_the_source(tmp_path, flags):
 
 
 @needs_root
-def test_a_move_to_a_device_and_a_directory_lands_in_the_directory_and_keeps_the_source_on_the_error(tmp_path):
-	before = _bare_and_source(tmp_path)
-	rc, output = _run_bounded(['a/n', '-d', 'bare', '-d', 'out/', '-rf'], tmp_path, seconds=30)
-	assert _same_node(tmp_path / 'bare', before) and stat.S_ISCHR(os.lstat(tmp_path / 'out/n').st_mode), (rc, output[-2000:])
-	assert rc == 213 and os.path.lexists(tmp_path / 'a/n'), (rc, output[-2000:])
+def test_a_move_to_a_device_and_a_directory_completes_in_the_directory(tmp_path):
+	# The file landed on the other destination, so the move is done: the source goes, the exit is 0.
+	write(tmp_path / 'a/f', 'F')
+	_device_node(str(tmp_path / 'bare'), 3, str(tmp_path / 'a/f'))
+	os.link(tmp_path / 'bare', tmp_path / 'other')
+	before = os.lstat(tmp_path / 'bare')
+	rc, output = _run_bounded(['a/f', '-d', 'bare', '-d', 'out/', '-rf'], tmp_path, seconds=30)
+	assert rc == 0 and (tmp_path / 'out/f').read_text() == 'F' and not os.path.lexists(tmp_path / 'a/f') and _same_node(tmp_path / 'bare', before), (rc, output[-2000:])
+
+
+@needs_root
+@pytest.mark.parametrize('order', ['dir-first', 'name-first'])
+def test_a_landing_on_a_name_another_d_gives_is_named_too(tmp_path, order):
+	# -d out/ -d out/n: the first lands on out/n, which the second names. One clash, printed once, and the node stays.
+	write(tmp_path / 'a/keep', 'k')
+	_device_node(str(tmp_path / 'a/n'), 5, str(tmp_path))
+	os.makedirs(tmp_path / 'out')
+	_device_node(str(tmp_path / 'out/n'), 3, str(tmp_path / 'a/n'))
+	before = os.lstat(tmp_path / 'out/n')
+	dests = ['-d', 'out/', '-d', 'out/n'] if order == 'dir-first' else ['-d', 'out/n', '-d', 'out/']
+	rc, output = _run_bounded(['a/n'] + dests, tmp_path, seconds=30)
+	assert rc == 213 and _same_node(tmp_path / 'out/n', before), (rc, output[-2000:])
+	assert output.count(b'Destination clash: ') == 1, output[-2000:]
+
+
+def test_an_excluded_source_gets_no_clash(tmp_path, hpcp_mod, monkeypatch, capsys):
+	# Left out of the copy, so there is nothing to refuse or to note.
+	write(tmp_path / 'a/f', 'F')
+	write(tmp_path / 'out/f', 'old')
+	monkeypatch.setattr(hpcp_mod, '_would_unlink_device', lambda src, dest: True)
+	hpcp_mod._settle_destinations([str(tmp_path / 'a/f')], [str(tmp_path / 'out/f')], exclude=['*/a/f'])
+	assert 'Destination clash' not in capsys.readouterr().err
+	hpcp_mod._settle_destinations([str(tmp_path / 'a/f')], [str(tmp_path / 'out/f')])
+	assert 'Destination clash' in capsys.readouterr().err
 
 
 @needs_root

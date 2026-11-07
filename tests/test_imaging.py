@@ -135,6 +135,30 @@ def test_syncfs_writes_the_filesystem_of_the_path_it_is_given(tmp_path, hpcp_mod
 		os.fstat(fds[0])  # closed again
 
 
+@pytest.mark.parametrize('fails', [False, True], ids=['applied', 'raised'])
+def test_a_patch_onto_a_directory_writes_its_filesystem_whatever_the_apply_does(tmp_path, hpcp_mod, monkeypatch, fails):
+	# -siff onto a directory of a filesystem someone else mounted: the unmount that would write it never comes.
+	target = tmp_path / 'live'
+	target.mkdir()
+	flushed = []
+	def apply(*args, **kwargs):
+		if fails:
+			raise RuntimeError('apply failed')
+		return 'applied'
+	monkeypatch.setattr(hpcp_mod, '_mount_single_fs_image', lambda *args: str(tmp_path))
+	monkeypatch.setattr(hpcp_mod, '_patch_layout', lambda roots: 'tree')
+	monkeypatch.setattr(hpcp_mod, 'apply_patch_tree', apply)
+	monkeypatch.setattr(hpcp_mod, '_syncfs', flushed.append)
+	(tmp_path / 'p.img').write_bytes(b'')
+	call = lambda: hpcp_mod.process_load_diff_image(str(tmp_path / 'p.img'), [], [str(target)], None, [], [])
+	if fails:
+		with pytest.raises(RuntimeError):
+			call()
+	else:
+		assert call() == 'applied'
+	assert flushed == [str(target)]
+
+
 def test_a_syncfs_that_cannot_be_made_does_not_stop_the_run(tmp_path, hpcp_mod, monkeypatch):
 	import ctypes
 	hpcp_mod._syncfs(str(tmp_path / 'nosuch'))

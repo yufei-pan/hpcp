@@ -3222,8 +3222,9 @@ def _can_open(path):
 def _can_make_node(src_path, dest_paths):
 	"""False when src_path is a device node that this user cannot make, and a destination holds something. cp -a unlinks
 	what is there before its mknod, so a user who may not make nodes (not root) would lose the old file and get nothing.
-	Asked by doing it: a node of src_path's kind and number is made under a name of its own beside the first destination
-	that exists, and removed again; PermissionError is the answer. Any other error is cp's to answer. Nothing is made for a
+	Asked by doing it: a node of src_path's kind and number is made under a name of its own beside a destination that
+	exists, and removed again; PermissionError is the answer. Any other error (EROFS, say) is no answer: the next existing
+	destination is asked, and when none answers it is cp's to answer. Nothing is made for a
 	source that is no device, or when no destination exists (cp then has nothing to lose)."""
 	try:
 		st = os.lstat(src_path)
@@ -3232,17 +3233,20 @@ def _can_make_node(src_path, dest_paths):
 	existing = [dest for dest in dest_paths if os.path.lexists(dest)]
 	if not existing or not (stat.S_ISBLK(st.st_mode) or stat.S_ISCHR(st.st_mode)):
 		return True
-	probe = os.path.join(os.path.dirname(existing[0]), '.hpcp-node-probe-%d-%s' % (os.getpid(), uuid.uuid4().hex))
-	try:
-		os.mknod(probe, 0o600 | stat.S_IFMT(st.st_mode), st.st_rdev)
-	except PermissionError:
-		return False
-	except OSError:
+	for dest in existing:
+		probe = os.path.join(os.path.dirname(dest), '.hpcp-node-probe-%d-%s' % (os.getpid(), uuid.uuid4().hex))
+		try:
+			os.mknod(probe, 0o600 | stat.S_IFMT(st.st_mode), st.st_rdev)
+		except PermissionError:
+			return False
+		except OSError:
+			# This directory cannot answer (a read-only mount, say); the next destination may.
+			continue
+		try:
+			os.unlink(probe)
+		except OSError:
+			pass
 		return True
-	try:
-		os.unlink(probe)
-	except OSError:
-		pass
 	return True
 
 def _copy_state(path):
@@ -6706,8 +6710,12 @@ def process_load_diff_image(load_diff_image, src_paths, dest_paths, dest_image, 
 			raise RuntimeError(f'Invalid arguments: -siff needs exactly one existing target directory, got {dest_paths or src_paths}')
 		target_root = os.path.abspath(targets[0])
 		store_note = target_root != os.path.abspath(os.sep)
-	return apply_patch_tree(volume_roots, target_root, force=force, max_workers=max_workers, verbose=verbose,
-		volume_names=volume_names, store_note=store_note)
+	try:
+		return apply_patch_tree(volume_roots, target_root, force=force, max_workers=max_workers, verbose=verbose,
+			volume_names=volume_names, store_note=store_note)
+	finally:
+		# A directory on a filesystem someone else mounted is written to the page cache only (see apply_disk_patch).
+		_syncfs(target_root)
 
 def _validate_diff_args(get_diff_image, load_diff_image, force_apply, src_path, src_image, dest_paths, dest_image,
 		dd=False, remove=False, remove_extra=False, target_file_list=None, compare_file_list=False,
@@ -10390,16 +10398,18 @@ def _copy_job(source, dests, dest_image=None):
 	"""(src, its destinations, the destinations it must not take) as a copy job names them: 'path/' for a directory, as is
 	for a file or a symlink. A destination the operator named that is a device node the copy would replace
 	(_would_unlink_device) is not among its destinations, so each file lands on the others, and the job has none left only
-	when every one is such a node."""
+	when every one is such a node. A name any of dests gives counts as named."""
 	src = os.path.abspath(source)
 	directory = os.path.isdir(src) and not os.path.islink(src)
 	if directory:
 		src += os.path.sep
 	kept, refused = [], []
+	named = {os.path.abspath(dest) for dest in dests}
 	for dest in dests:
 		actual = _source_dest(source, dest, bool(dest_image))
-		# A directory onto a node is refused by its directory sync, which says so (it replaces nothing).
-		if not directory and actual == os.path.abspath(dest) and _would_unlink_device(src, actual):
+		# A directory onto a node is refused by its directory sync, which says so (it replaces nothing). A landing on a name
+		# any -d gives counts (-d out/ -d out/n), not only the one -d names with its own.
+		if not directory and actual in named and _would_unlink_device(src, actual):
 			refused.append(actual)
 		else:
 			kept.append(actual)
@@ -10471,7 +10481,7 @@ def _settle_destinations(src_paths, dests, dest_image=None, directory_only=False
 	  * a file where another source makes a directory (itself, or the directory a listed path implies): the directory
 	    stays, whichever came first, and the file is reported as a clash (cp would nest it, or fail);
 	  * a file that would take the name of a device node the destination names itself (-d /dev/sdb): the node stays, the
-	    file is reported as a clash, and it lands on the other destinations (_copy_job); with none left, nothing is copied.
+	    file lands on the other destinations (_copy_job) with a note; with none left it is reported as a clash and nothing is copied.
 	    Below a destination a node is a file of the tree, and a source replaces it.
 	A source met again at its own place is no clash.
 
@@ -10493,7 +10503,7 @@ def _settle_destinations(src_paths, dests, dest_image=None, directory_only=False
 		src, actual_dests, refused = _copy_job(source, dests, dest_image)
 		if exclude and is_excluded(src, exclude):
 			continue
-		taken.extend((src, dest) for dest in refused)
+		taken.extend((src, dest, tuple(actual_dests)) for dest in refused)
 		if not actual_dests:
 			continue
 		directory = src.endswith(os.path.sep)
@@ -10514,9 +10524,13 @@ def _settle_destinations(src_paths, dests, dest_image=None, directory_only=False
 	if directory_only:
 		# Nothing is copied.
 		return dropped, 0, set()
-	for src, dest in taken:
-		eprint(f'Destination clash: {dest} is a device, and copying {src} would replace it: not copying it. '
-			'-dd clones a disk; remove the node to replace it')
+	for src, dest, left in dict.fromkeys(taken):
+		if left:
+			# The file lands on another destination: the run goes on as any other.
+			print(f'Note: {dest} is a device, and copying {src} would replace it: leaving it out; it goes to {", ".join(left)}')
+		else:
+			eprint(f'Destination clash: {dest} is a device, and copying {src} would replace it: not copying it. '
+				'-dd clones a disk; remove the node to replace it')
 	roots = [land for job in jobs for land in job[4]]
 	# An image is a tree of its own. A source that holds its mount point (hpcp / -di) reads what an earlier run put there.
 	if not dest_image:
