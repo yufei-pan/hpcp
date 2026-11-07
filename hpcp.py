@@ -11742,6 +11742,10 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = multipr
 							dests_to_remove.append(dest)
 			except FileExistsError :
 				eprint(f"Destination path {dest} may be a mounted dir, known issue with os.path.exists\nContinuing without creating dest folder...")
+			except OSError as e:
+				# A name the filesystem will not make (exFAT mounted iocharset=cp1251 refuses 'x.'): that destination is out.
+				eprint(f"Directory sync error: cannot make {dest} ({e.strerror}), ignoring it")
+				dests_to_remove.append(dest)
 		if dests and dests_to_remove == dests:
 			raise RuntimeError("No valid destination: Exiting due to no valid destination paths.")
 		for dest in dests_to_remove:

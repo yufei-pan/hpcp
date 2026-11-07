@@ -5509,3 +5509,18 @@ def test_a_question_that_cannot_be_asked_gives_the_reasons_of_its_own_two_names(
 	places.expect([root + '/X', root + '/x.', root + '/x'])
 	assert places.same_place(root + '/X', root + '/x') is None
 	assert places.cannot_ask(root + '/X', root + '/x') == 'the reason for x'
+
+
+def test_a_destination_the_filesystem_will_not_make_is_an_error_not_a_crash(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch, capsys):
+	# exFAT mounted iocharset=cp1251 refuses 'x.' with ENAMETOOLONG: hpcp t/ -d out/x./ ended in a traceback, exit 70.
+	monkeypatch.chdir(tmp_path)
+	write(tmp_path / 't/f', 'T')
+	real = hpcp_mod._makedirs
+	def refusing(name, *args, **kwargs):
+		if os.path.basename(name.rstrip(os.sep)) == 'x.':
+			raise OSError(errno.ENAMETOOLONG, 'File name too long', name)
+		return real(name, *args, **kwargs)
+	monkeypatch.setattr(hpcp_mod, '_makedirs', refusing)
+	assert hpcp_mod.hpcp(['t/'], ['out/x./'], single_thread=True, max_workers=1, batch=True, remove_force=True) not in (0, 70)
+	assert 'Directory sync error: cannot make out/x./ (File name too long), ignoring it' in capsys.readouterr().err
+	assert (tmp_path / 't/f').read_text() == 'T'
