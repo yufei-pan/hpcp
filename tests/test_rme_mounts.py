@@ -311,6 +311,7 @@ _FOLDING = {
 	'vfat': ('mkfs.vfat', [], []),
 	'vfat-utf8': ('mkfs.vfat', [], ['-o', 'iocharset=utf8']),
 	'exfat': ('mkfs.exfat', [], []),
+	'ntfs': ('mkfs.ntfs', ['-F', '-f', '-q'], ['-t', 'lowntfs-3g', '-o', 'ignore_case']),
 }
 
 
@@ -907,3 +908,132 @@ def test_a_directory_swapped_after_it_is_opened_is_not_read_by_its_path(tmp_path
 	files, _, _, _ = hpcp_mod.get_file_list_serial(str(dst), boundary=boundary)
 	assert not any('secret.txt' in path for path in files)
 	assert any(error.startswith('Listing error: ' + str(dst / 'sub') + ':') for error in hpcp_mod.ERRORS)
+
+
+# ---- 9.83, review round 2 ----
+
+@pytest.mark.parametrize('kind', ['ext4', 'f2fs', 'vfat', 'vfat-utf8', 'exfat', 'ntfs'])
+@pytest.mark.parametrize('layout', [('X', 'x'), ('d/X', 'd/x'), ('d/X', 'D/x')], ids=['file', 'in-a-directory', 'directory-in-another-case'])
+def test_a_move_that_renames_a_file_in_case_only_removes_nothing(tmp_path, kind, layout):
+	"""It was exit 0 and the file was gone: the copy skipped it as identical, and the move removed the only copy."""
+	source, dest = layout
+	with _folding_directory(tmp_path, kind) as fold:
+		_filled(fold / source, 'data')
+		task = _hpcp([source, '-d', dest, '-rf'], fold)
+		assert task.returncode == 241 and (fold / source).read_text() == 'data', task.stdout[-2000:]
+		assert [name for name in os.listdir(fold) if name.startswith('.hpcp')] == []
+
+
+def test_a_rename_in_case_on_a_directory_that_keeps_both_names_still_moves(tmp_path):
+	with _folding_directory(tmp_path, 'ext4') as fold:
+		plain = fold.parent / 'plain'
+		plain.mkdir()
+		_filled(plain / 'X', 'data')
+		task = _hpcp(['X', '-d', 'x', '-rf'], plain)
+		assert task.returncode == 0 and os.listdir(plain) == ['x'], task.stdout[-2000:]
+
+
+@pytest.mark.parametrize('kind', ['ext4', 'f2fs', 'vfat', 'vfat-utf8', 'exfat', 'ntfs'])
+@pytest.mark.parametrize('environment', [{}, {'LC_ALL': 'C', 'PYTHONUTF8': '0', 'PYTHONCOERCECLOCALE': '0'}], ids=['locale', 'ascii'])
+def test_a_pair_that_only_the_filesystem_folds_is_caught_whatever_the_locale(tmp_path, kind, environment):
+	"""\u00c9 and \u00e9 under the C locale of Python 3.6 (or forced on a newer one) are escapes that nothing folds: exit 0, both
+	sources removed, one content lost."""
+	_filled(tmp_path / 'a' / '\u00c9', 'upper')
+	_filled(tmp_path / 'b' / '\u00e9', 'lower')
+	with _folding_directory(tmp_path, kind) as fold:
+		try:
+			(fold / '\u00c9').write_text('')
+		except OSError:
+			pytest.skip(f'{kind} takes no such name')
+		try:
+			os.close(os.open(str(fold / '\u00e9'), os.O_WRONLY | os.O_CREAT | os.O_EXCL))
+			(fold / '\u00e9').unlink()
+			one = False
+		except FileExistsError:
+			one = True
+		(fold / '\u00c9').unlink()
+		if not one:
+			pytest.skip(f'{kind} keeps these two names apart')
+		task = subprocess.run([sys.executable, HPCP, 'a/', 'b/', '-d', str(fold / 'out') + os.sep, '-rf'], cwd=str(tmp_path), stdin=subprocess.DEVNULL,
+			stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=dict(os.environ, **environment))
+		assert task.returncode == 213 and len(os.listdir(fold / 'out')) == 1, task.stdout[-2000:]
+	assert (tmp_path / 'a' / '\u00c9').exists() and (tmp_path / 'b' / '\u00e9').exists()
+
+
+@pytest.mark.parametrize('kind', ['vfat', 'vfat-utf8', 'exfat'])
+@pytest.mark.parametrize('pair', [('a/x.', 'b/x'), ('a/d./f', 'b/d/f')], ids=['file', 'directory'])
+def test_names_a_trailing_dot_apart_are_one_name_on_fat_and_exfat(tmp_path, kind, pair):
+	"""a/x. and b/x: exit 0, both sources removed, one content gone."""
+	_filled(tmp_path / pair[0], 'one')
+	_filled(tmp_path / pair[1], 'two')
+	with _folding_directory(tmp_path, kind) as fold:
+		task = _hpcp(['a/', 'b/', '-d', str(fold / 'out') + os.sep, '-rf'], tmp_path)
+		assert task.returncode == 213 and b'are one name where the destination folds case' in task.stdout, task.stdout[-2000:]
+	assert (tmp_path / pair[0]).exists() and (tmp_path / pair[1]).exists()
+
+
+def test_names_a_trailing_dot_apart_are_two_names_where_the_directory_keeps_them_apart(tmp_path):
+	_filled(tmp_path / 'a/x.', 'one')
+	_filled(tmp_path / 'b/x', 'two')
+	with _folding_directory(tmp_path, 'ext4') as fold:
+		task = _hpcp(['a/', 'b/', '-d', str(fold / 'out') + os.sep, '-rf'], tmp_path)
+		assert task.returncode == 0 and sorted(os.listdir(fold / 'out')) == ['x', 'x.'], task.stdout[-2000:]
+
+
+@pytest.mark.parametrize('kind', ['ext4', 'f2fs', 'vfat', 'vfat-utf8', 'exfat', 'ntfs'])
+def test_two_directories_in_another_case_clash_on_every_run_and_keep_the_first(tmp_path, kind):
+	"""The first run was 213 with D/f from a/; the second, with nothing changed, exit 0 with D/f from b/."""
+	_filled(tmp_path / 'a/D/f', 'one')
+	_filled(tmp_path / 'b/d/f', 'two')
+	with _folding_directory(tmp_path, kind) as fold:
+		for run_count in range(3):
+			task = _hpcp(['a/', 'b/', '-d', str(fold / 'out') + os.sep], tmp_path)
+			assert task.returncode == 213, (run_count, task.stdout[-2000:])
+			assert (fold / 'out/D/f').read_text() == 'one'
+
+
+@pytest.mark.parametrize('kind', ['ext4', 'vfat', 'ntfs'])
+def test_one_tree_with_two_spellings_onto_an_existing_directory_clashes(tmp_path, kind):
+	"""a/D/f and a/d/f onto an existing out/D: exit 0, and one file never landed."""
+	_filled(tmp_path / 'a/D/f', 'one')
+	_filled(tmp_path / 'a/d/f', 'two')
+	with _folding_directory(tmp_path, kind) as fold:
+		(fold / 'out/D').mkdir(parents=True)
+		task = _hpcp(['a/', '-d', str(fold / 'out') + os.sep, '-rf'], tmp_path)
+		assert task.returncode == 213 and (fold / 'out/D/f').read_text() == 'one', task.stdout[-2000:]
+	assert (tmp_path / 'a/D/f').exists() and (tmp_path / 'a/d/f').exists()
+
+
+def test_a_rerun_with_both_names_there_is_not_a_clash_on_a_read_only_mount(tmp_path):
+	"""Two names on a case-sensitive directory below a read-only mount: nothing can be made there to ask, and nothing needs to be."""
+	if os.geteuid() != 0:
+		pytest.skip('needs root to mount')
+	_filled(tmp_path / 'a/s/X', '1')
+	_filled(tmp_path / 'a/s/x', '2')
+	assert _hpcp(['a/', '-d', 'out/'], tmp_path).returncode == 0
+	if subprocess.run(['mount', '--bind', str(tmp_path / 'out'), str(tmp_path / 'out')], capture_output=True).returncode:
+		pytest.skip('bind mount failed')
+	try:
+		if subprocess.run(['mount', '-o', 'remount,bind,ro', str(tmp_path / 'out')], capture_output=True).returncode:
+			pytest.skip('read-only remount failed')
+		task = _hpcp(['a/', '-d', 'out/'], tmp_path)
+		# The copy itself cannot write there (193, as 9.82 ends); it is no clash.
+		assert task.returncode == 193 and b'clash' not in task.stdout and b'Read-only file system' in task.stdout, task.stdout[-2000:]
+	finally:
+		subprocess.run(['umount', '-l', str(tmp_path / 'out')], capture_output=True)
+
+
+@pytest.mark.parametrize('move', [False, True], ids=['mirror', 'move'])
+def test_rme_after_a_rename_in_case_only_keeps_an_empty_directory_and_does_not_announce_it(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch, capsys, move):
+	(tmp_path / 'a/Empty').mkdir(parents=True)
+	(tmp_path / 'a/P/Q').mkdir(parents=True)
+	_filled(tmp_path / 'a/k/f', 'f')
+	monkeypatch.chdir(tmp_path)
+	with _folding_directory(tmp_path, 'ext4') as fold:
+		assert _mirror(hpcp_mod, monkeypatch, ['a/'], fold / 'out') == 0
+		os.rename(tmp_path / 'a/Empty', tmp_path / 'a/empty')
+		os.rename(tmp_path / 'a/P', tmp_path / 'a/p')
+		capsys.readouterr()
+		assert _mirror(hpcp_mod, monkeypatch, ['a/'], fold / 'out', remove_force=move) == 0
+		assert 'Deleting extra directory' not in capsys.readouterr().out
+		assert sorted(os.listdir(fold / 'out')) == ['Empty', 'P', 'k'] and os.listdir(fold / 'out/P') == ['Q']
