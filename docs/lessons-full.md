@@ -71,3 +71,39 @@ entries go last, in the same commit as the change:
 - Why we had to change: the first version dropped the whole job when one `-d` was such a node, so `hpcp a/n -d out/ -d dev2` copied nothing where 9.81 landed `out/n`. It judged the destination's name (`lstat`), so a link to a disk was replaced by the source's node, and it called a matching pair a clash. A non-root device copy deleted the old file because `cp -a` unlinks before its `mknod`.
 - Original design was wrong because: the reason (one destination is a device) was recorded against the job, which has many destinations, and the check asked what the name is, not what it leads to. And a refusal reasoned from `cp`'s documentation said "would replace it" for cases `cp` never runs in.
 - Lesson: keep a refusal at the grain of its reason (per destination, per file), and decide what it covers by asking what the thing leads to (`stat`) and whether the tool runs at all. A permission that decides whether data is lost is asked by doing it (make the node, remove it), before the step that takes the old data away.
+
+## 2026-11-06 A name that matched nothing is still a name
+- Changed: a source named as an argument that matches nothing is kept by `_named_sources`, so `verify_src_path` reports it: `hpcp nosuch ok/g -d out/` was exit 0 and is 207, with the rest copied. A move (`-rf`) and `-rme` count it as an error, by arguments and lists alike: arguments were 0, a list was 207 with the rest moved, and both are now 212 with everything kept. A removal with no destination goes on, exit 207. A name under a directory that cannot be searched says `cannot be reached`. `hpcp nosuch ok/g` was 70 and is 240. A name with glob characters that match nothing as a pattern is that file, where it was dropped.
+- Why we had to change: a mistyped source was dropped with exit 0. With `-rme` that is worse: what the mistyped source holds at the destination looks extra.
+- Original design was wrong because: `expand_paths` answers "what matches", and `hpcp()` used that as "what was named", so nothing that matched nothing reached the one check that reports it. The last word with no `-d` may be a destination that does not exist, so that word alone is left to `get_dest_from_path`. And the remove gate counted errors from the copy's start, so a list's missing entry, reported earlier, did not count.
+- Lesson: when a step can drop what the operator typed, keep it until the step that can report it. When one question has two routes, change both, and say so when one of them changes behaviour.
+
+## 2026-11-06 A name is what the destination reads
+- Changed: each destination is asked once per run, by `_folds_case`, whether it folds case, when more than one file can land. On one that does, two landings that differ only in case (or normal form) are a clash, exit 213, directory sources and one tree too, where the run was exit 0 with one file's content gone. The first stays, by source and then by name.
+- Why we had to change: `a/X` and `b/x` onto a casefold directory lost one, and either could win.
+- Original design was wrong because: `_settle_destinations` compared landings as strings, and a lone source on a disjoint destination was not listed at all, so the check could not see a clash inside one tree. The probe has to come before that shortcut, which is why it costs one small file per destination on every run and not only when a pair turns up. A clash between directory sources stays an overlay only when the names are equal: names that differ in case say the operator did not mean the same file.
+- Lesson: no single call answers what a filesystem does with a name (a directory's flag, a mount's option, a server's rule), so ask by doing it, inside the directory that gets the files, and leave its times as they were. Put the question ahead of any shortcut that assumes the answer.
+
+## 2026-11-06 Could not compare is not a crash
+- Changed: `copy_file` asks `_known_identical`: a `PermissionError` on either side of the identity check means "not known to be the same". An unreadable source then stops at `_can_open`, exit 190 where it was 191, and the old copy stays. An unreadable destination is copied again, exit 0 where it was 191. Any other read error stays a crash.
+- Why we had to change: the identical-file check ran before the readability check, so a rerun with a source gone unreadable ended as `Copy process crashed`.
+- Original design was wrong because: a check meant to skip work was treated as one that cannot fail. Moving `_can_open` ahead of it would have added an open per skipped file on every rerun, and catching every `OSError` would have sent an I/O error on to `cp`, which truncates the old copy before its first read.
+- Lesson: when a shortcut's question cannot be answered, fall through to the step that owns the failure, and only for the failure that step really handles.
+
+## 2026-11-06 One door for a directory
+- Changed: `-nds` makes a directory through `_make_dest_directory`, as the sync does: a file in the way is a clash, exit 213, where it was 70 with a traceback; a directory it cannot make is `Directory sync error`, 193, where it was 70.
+- Why we had to change: `process_copy` called `_makedirs` itself, outside every handler.
+- Original design was wrong because: "skip the sync" was written as a second way of making the directory, without the checks the sync had.
+- Lesson: a flag that skips a step skips what the step changes, not the checks around it. Share the part that stays.
+
+## 2026-11-06 A refusal offers a fix its reader can run
+- Changed: a 213 for a place that cannot be searched names the link that led there, what it leads to, and `rm` of it, when the path asked about has a link on the way (`_last_link`, on the failure path only). Exit codes stay.
+- Why we had to change: `out/l -> /root/secret/f` said `/root cannot be searched` and offered a `chmod` a user cannot run.
+- Original design was wrong because: `_RealPlaces` raised from the walk, which no longer knew the path it was asked about. The public calls now add the link on the way out, so the walk stays as it was.
+- Lesson: a refusal states what would let it pass, in terms of what its reader controls. Add that where the question was asked, not where the walk stopped.
+
+## 2026-11-06 The reason travels with the error
+- Changed: a `Task return code error` carries the last three lines of what the tool printed to stderr, after the return code, so `Copy failed` says `No space left on device`. A tool that says nothing keeps the old sentence. The prefix, and so the exit code, stays.
+- Why we had to change: a full disk said only "return code 1".
+- Original design was wrong because: the runner had the task, and with it the stderr, and passed on only the number.
+- Lesson: the layer that sees a tool's own words puts them in the error. Prefixes decide; the words only inform.

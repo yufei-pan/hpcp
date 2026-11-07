@@ -29,6 +29,7 @@ import sys
 import tempfile
 import threading
 import time
+import unicodedata
 import uuid
 from collections import deque, namedtuple
 from concurrent.futures import ProcessPoolExecutor
@@ -609,7 +610,9 @@ def run_commands_in_multicmd_with_path_check(commands, timeout=...,max_threads=1
 		# e2fsck encodes "errors corrected" as bits 0 and 1 (exit 1, 2, or 3): a live clone's journal replay is exit 1,
 		# a success, not a failed delayed UUID rewrite
 		elif task.returncode != 0 and not (tool == 'e2fsck' and task.returncode in (1, 2, 3)):
-			error = f"Task return code error: Command '{task.command}' failed with return code {task.returncode}."
+			# What the tool said is the reason (a full disk, a permission): the last lines, as a tool may print a lot.
+			said = ' '.join(line.strip() for line in task.stderr[-3:] if line.strip())
+			error = f"Task return code error: Command '{task.command}' failed with return code {task.returncode}" + (f": {said}" if said else '.')
 		else:
 			continue
 		if not quiet:
@@ -760,6 +763,19 @@ def expand_paths(paths):
 		else:
 			output_list.append(src_pattern)
 	return output_list
+
+def _named_sources(src_path, may_name_destination):
+	"""Sources as expand_paths gives them, with a pattern that matches nothing kept as the name it is: verify_src_path then
+	reports it as it does a list entry, and a file whose name holds glob characters is that file. may_name_destination: the
+	last of several may be the destination (get_dest_from_path), which need not exist."""
+	patterns = [src_path] if isinstance(src_path, str) else list(src_path)
+	named = []
+	for index, pattern in enumerate(patterns):
+		found = expand_paths([pattern])
+		if not found and not (may_name_destination and len(patterns) > 1 and index == len(patterns) - 1):
+			found = [os.path.expanduser(pattern)]
+		named.extend(found)
+	return named
 
 def _on_worker_start():
 	parent = os.getppid()
@@ -3264,6 +3280,14 @@ def _remove_what_failed(path, before):
 	if _copy_state(path) not in (None, before):
 		os.remove(path)
 
+def _known_identical(src_path, dest_path, src_size, full_hash):
+	"""is_file_identical, where a side that may not be read is not known to be the same: the copy then goes on, and a source
+	stops at _can_open, its old copy kept. Only that: any other read error stays a crash, because cp would truncate first."""
+	try:
+		return is_file_identical(src_path, dest_path, src_size, full_hash)
+	except PermissionError:
+		return False
+
 def copy_file(src_path, dest_paths, full_hash=False, verbose=False, concurrent_processes=0):
 	"""
 	Copy a file from the source path to the destination path.
@@ -3299,7 +3323,7 @@ def copy_file(src_path, dest_paths, full_hash=False, verbose=False, concurrent_p
 		src_size = get_file_size(src_path)
 		copiedSize = 0
 		for dest in dest_paths:
-			if os.path.exists(dest) and (not os.path.islink(src_path)) and is_file_identical(src_path, dest,os.path.getsize(src_path),full_hash):
+			if os.path.exists(dest) and (not os.path.islink(src_path)) and _known_identical(src_path, dest,os.path.getsize(src_path),full_hash):
 				if not CONTENT_ONLY:
 					st = os.stat(src_path,follow_symlinks=False)
 					_remove_stale_xattrs(src_path, dest)
@@ -3942,6 +3966,19 @@ def _below(dest, relative):
 	"""dest/relative; the directory itself (relative '.') is dest, not 'dest/.', which does not exist when dest is a file."""
 	return dest if relative == os.curdir else os.path.join(dest, relative)
 
+def _make_dest_directory(src_path, dest_path):
+	"""dest_path as the directory src_path lands on, made if missing; False when a file is in the way, which is reported."""
+	if os.path.lexists(dest_path) and not os.path.isdir(dest_path):
+		# A file (or a link to one) is no directory's to take: its mode and owner stay, and nothing can be made below it.
+		eprint(f'Destination clash: {dest_path} is not a directory, not syncing the directory {src_path} onto it')
+		return False
+	try:
+		if not (os.path.exists(dest_path) or os.path.ismount(dest_path)):
+			_makedirs(dest_path, exist_ok=True)
+	except FileExistsError:
+		print(f"Destination path {dest_path} maybe a mounted dir, known issue with os.path.exists\nContinuing without creating dest folder...", file=sys.stderr)
+	return True
+
 def sync_directory_metadata(src_path, dest_paths):
 	global CONTENT_ONLY
 	dest_paths = _validate_paths(src_path, dest_paths)
@@ -3966,15 +4003,8 @@ def sync_directory_metadata(src_path, dest_paths):
 	for dest_path in dest_paths:
 		# One directory that cannot be created or synced is recorded; the others (and the other dests) go on.
 		try:
-			if os.path.lexists(dest_path) and not os.path.isdir(dest_path):
-				# A file (or a link to one) is no directory's to take: its mode and owner stay, and nothing can be made below it.
-				eprint(f'Destination clash: {dest_path} is not a directory, not syncing the directory {src_path} onto it')
+			if not _make_dest_directory(src_path, dest_path):
 				continue
-			try:
-				if not (os.path.exists(dest_path) or os.path.ismount(dest_path)):
-					_makedirs(dest_path, exist_ok=True)
-			except FileExistsError:
-				print(f"Destination path {dest_path} maybe a mounted dir, known issue with os.path.exists\nContinuing without creating dest folder...", file=sys.stderr)
 			# Sync the metadata
 			if not CONTENT_ONLY:
 				_remove_stale_xattrs(src_path, dest_path)
@@ -8814,13 +8844,17 @@ def mount_src_image(src_images: list,src_paths: list,mount_points: list,loop_dev
 	return src_str.strip('-')
 
 def verify_src_path(src_paths: list):
-	# lexists: a dangling symlink is a source like any other, copied as a link (find lists them).
+	# lstat: a dangling symlink is a source like any other, copied as a link (find lists them).
 	found = []
 	for src in src_paths:
-		if os.path.lexists(src):
+		try:
+			os.lstat(src)
 			found.append(src)
-		else:
+		except (FileNotFoundError, NotADirectoryError):
 			eprint(f"Source path not found: {src} does not exist")
+		except OSError as e:
+			# Nobody could look: it may well be there.
+			eprint(f"Source path not found: {src} cannot be reached ({e.strerror})")
 	src_paths[:] = found
 	if len(src_paths) == 0:
 		raise RuntimeError("No source paths: No source paths specified, exiting")
@@ -8964,9 +8998,31 @@ def _without_covered_sources(src_paths):
 		kept.append(src)
 	return kept
 
-def _cannot_search(directory, error):
-	return RuntimeError(f'Destination clash: {directory} cannot be searched ({error.strerror}), so a link in it could hide a clash; '
-		f'nothing is copied or removed. To let it through: chmod u+rx {directory}')
+class _CannotSearch(RuntimeError):
+	"""A refusal: directory cannot be searched. When the path that was asked about got there by a link, link names it: the
+	operator's way out is the link, as the directory can belong to anyone."""
+	def __init__(self, directory, reason):
+		super().__init__(directory, reason)
+		self.directory, self.reason, self.link = directory, reason, None
+	def __str__(self):
+		if self.link:
+			return (f'Destination clash: {self.link} leads to {os.path.realpath(self.link)}, and {self.directory} on the way cannot be '
+				f'searched ({self.reason}), so a clash could hide there; nothing is copied or removed. '
+				f'To let it through: rm {self.link}, or, as its owner, chmod u+rx {self.directory}')
+		return (f'Destination clash: {self.directory} cannot be searched ({self.reason}), so a link in it could hide a clash; '
+			f'nothing is copied or removed. To let it through: chmod u+rx {self.directory}')
+
+def _last_link(path):
+	"""The last symlink on the way down the absolute path, as far as it can be followed, or None."""
+	found, current = None, os.sep
+	for part in path.split(os.sep):
+		current = os.path.join(current, part)
+		try:
+			if stat.S_ISLNK(os.lstat(current).st_mode):
+				found = current
+		except OSError:
+			break
+	return found
 
 class _RealPlaces:
 	"""Where paths really are, for one run. The one answer for every check that compares a source with a destination: a
@@ -8981,6 +9037,12 @@ class _RealPlaces:
 	def directory(self, path):
 		"""os.path.realpath(path) for an absolute path, by each directory on the way once, with one name for one directory.
 		It need not exist."""
+		try:
+			return self._walk(path)
+		except _CannotSearch as e:
+			e.link = e.link or _last_link(path)
+			raise
+	def _walk(self, path):
 		known, below = self.directories, []
 		while path not in known:
 			parent = os.path.dirname(path)
@@ -8997,11 +9059,11 @@ class _RealPlaces:
 			try:
 				st = os.lstat(real)
 			except PermissionError as e:
-				raise _cannot_search(parent, e)
+				raise _CannotSearch(parent, e.strerror)
 			except OSError:
 				continue
 			if stat.S_ISLNK(st.st_mode):
-				real = known[path] = self.directory(os.path.realpath(real))
+				real = known[path] = self._walk(os.path.realpath(real))
 			elif stat.S_ISDIR(st.st_mode):
 				real = known[path] = self.identities.setdefault((st.st_dev, st.st_ino), real)
 		return real
@@ -9040,15 +9102,19 @@ class _RealPlaces:
 		try:
 			return stat.S_ISLNK(os.lstat(os.path.join(directory, name)).st_mode)
 		except PermissionError as e:
-			raise _cannot_search(directory, e)
+			raise _CannotSearch(directory, e.strerror)
 		except OSError:
 			return False
 	def landing(self, path, source):
 		"""Where source ends up when copied to path: path's place, or what a link there leads to (cp writes through it; a
 		link source replaces it)."""
 		place = self.place(path)
-		if self.is_link(*os.path.split(place)) and not os.path.islink(source):
-			return self.directory(place)
+		try:
+			if self.is_link(*os.path.split(place)) and not os.path.islink(source):
+				return self.directory(place)
+		except _CannotSearch as e:
+			e.link = e.link or _last_link(path)
+			raise
 		return place
 
 def _inside_destinations(src_paths, dests, places):
@@ -10204,6 +10270,8 @@ def get_dest_from_path(dest_path,src_paths: list,src_path,can_be_none = False):
 			if (not inStr) or inStr.lower() == 'l':
 				dest = str(src_path[-1])
 				src_paths.remove(dest) if dest in src_paths else None
+				if not src_paths:
+					raise RuntimeError(f"No source paths: only the destination {dest} is left, exiting")
 				print(f"Destination path not specified, using {dest}")
 			elif cwd and inStr.lower() == 'y':
 				dest = cwd
@@ -10445,6 +10513,37 @@ def _roots_overlap(roots):
 	ordered = sorted(root.rstrip(os.path.sep) + os.path.sep for root in roots)
 	return any(below.startswith(root) for root, below in zip(ordered, ordered[1:]))
 
+def _folds_case(dest):
+	"""True when a file landing in dest answers to its name in any case. Asked by doing it, as no one call answers for every
+	filesystem (it is a directory's flag on ext4 and f2fs, the mount's on vfat, exFAT, NTFS and SMB): a name is made in the
+	directory dest is, or the nearest that exists above it, as a new directory takes after that, and asked for in capitals.
+	The directory keeps its times. No, when nothing can be made there: nothing lands in it then."""
+	directory = os.path.abspath(dest)
+	while not os.path.isdir(directory):
+		parent = os.path.dirname(directory)
+		if parent == directory:
+			return False
+		directory = parent
+	name = '.hpcp-case-probe-%d-%s' % (os.getpid(), uuid.uuid4().hex)
+	probe = os.path.join(directory, name)
+	try:
+		st = os.stat(directory)
+		os.close(os.open(probe, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
+	except OSError:
+		return False
+	try:
+		return os.path.lexists(os.path.join(directory, name.upper()))
+	finally:
+		try:
+			os.unlink(probe)
+			os.utime(directory, ns=(st.st_atime_ns, st.st_mtime_ns))
+		except OSError:
+			pass
+
+def _folded(path):
+	"""path as a destination that folds case reads it: two paths with one answer are one name there."""
+	return unicodedata.normalize('NFD', path).casefold()
+
 def _would_unlink_device(src, dest):
 	"""True when a copy of src to dest would take the name of the device node that dest is, or leads to (a link to a disk
 	is the disk to whoever writes through it). cp -a (_cp_flags) unlinks what is there for anything but a regular file; a
@@ -10482,11 +10581,15 @@ def _settle_destinations(src_paths, dests, dest_image=None, directory_only=False
 	    stays, whichever came first, and the file is reported as a clash (cp would nest it, or fail);
 	  * a file that would take the name of a device node the destination names itself (-d /dev/sdb): the node stays, the
 	    file lands on the other destinations (_copy_job) with a note; with none left it is reported as a clash and nothing is copied.
-	    Below a destination a node is a file of the tree, and a source replaces it.
+	    Below a destination a node is a file of the tree, and a source replaces it;
+	  * on a destination that folds case (_folds_case), two names that differ only in case are one file: a clash even between
+	    directory sources, and in one tree, as nothing says which the operator meant. The first stays, by source and then by
+	    name, so a rerun keeps the same one. Directories that differ only in case merge, as they will there.
 	A source met again at its own place is no clash.
 
-	Cost: files are compared only when two real roots meet, which a copy with disjoint source and destination never
-	does. Up to there a file source costs what its parent directory costs (_RealPlaces). A directory source that lands
+	Cost: one small file made and removed in each destination, when more than one file can land. Files are compared only
+	when two real roots meet or a destination folds case, which a copy with disjoint source and destination on a usual
+	filesystem never does. Up to there a file source costs what its parent directory costs (_RealPlaces). A directory source that lands
 	where nothing exists is not even listed; one that lands in an existing directory is listed, as the copy would, and
 	each directory it lands in is read once, so a link there cannot hide a landing. Listings are cached, so the copy reads
 	the same ones. Returns ({job: paths it must not copy}, files a later source replaced, the jobs of directories that land
@@ -10531,6 +10634,8 @@ def _settle_destinations(src_paths, dests, dest_image=None, directory_only=False
 		else:
 			eprint(f'Destination clash: {dest} is a device, and copying {src} would replace it: not copying it. '
 				'-dd clones a disk; remove the node to replace it')
+	# Several destinations take the files in turn, so one that folds case may get both. An image is hpcp's own ext4 or xfs.
+	folds = not dest_image and (len(jobs) > 1 or any(job[2] for job in jobs)) and any(_folds_case(dest) for dest in dests)
 	roots = [land for job in jobs for land in job[4]]
 	# An image is a tree of its own. A source that holds its mount point (hpcp / -di) reads what an earlier run put there.
 	if not dest_image:
@@ -10540,7 +10645,7 @@ def _settle_destinations(src_paths, dests, dest_image=None, directory_only=False
 				for dest, land in zip(actual_dests, lands):
 					if os.path.isdir(land):
 						roots.extend(_link_targets(src, dest, listing(src), places))
-	if not _roots_overlap(roots):
+	if not folds and not _roots_overlap(roots):
 		return dropped, 0, in_place
 	def files_of(job):
 		"""(path, its place, where it lands in each destination) for each file of job that the copy really takes: the listing's."""
@@ -10598,7 +10703,7 @@ def _settle_destinations(src_paths, dests, dest_image=None, directory_only=False
 				add_directory(places.directory(below))
 		else:
 			add_directory(os.path.dirname(lands[0]))
-		for path, place, landings in files_of(entry):
+		for path, place, landings in sorted(files_of(entry)) if folds else files_of(entry):
 			if directory and place in landings:
 				continue
 			dest = landings[0]
@@ -10620,6 +10725,16 @@ def _settle_destinations(src_paths, dests, dest_image=None, directory_only=False
 				holders[dest] = (path, job, directory)
 			else:
 				clash(path, job, f'{dest} is already copied from {held[0]}')
+	if folds:
+		made = {_folded(path) for path in dirs}
+		seen = {}
+		for dest, (path, job, _) in list(holders.items()):
+			name = _folded(dest)
+			first = seen.setdefault(name, dest)
+			if name in made and not os.path.islink(path):
+				clash(path, job, f'{dest} is a directory of another source where the destination folds case')
+			elif first != dest:
+				clash(path, job, f'{dest} and {first} are one name where the destination folds case')
 	return dropped, replaced, in_place
 
 def process_copy(src_paths: list, dests:list = [], single_thread = False, max_workers = multiprocessing.cpu_count(),verbose = False, 
@@ -10641,6 +10756,9 @@ def process_copy(src_paths: list, dests:list = [], single_thread = False, max_wo
 		src, dests, _ = _copy_job(source, argDest, dest_image)
 		if not dests:
 			# Every destination is a device it would replace (_settle_destinations said so).
+			continue
+		if src in (dropped or {}).get((src, tuple(dests)), ()):
+			# A named source that was refused has nothing left to copy: listing it would only report it a second time.
 			continue
 		if (src, tuple(dests)) in in_place:
 			# It lands on itself. Another source may be writing these very files: not read, but -rme has to know them.
@@ -10689,7 +10807,10 @@ def process_copy(src_paths: list, dests:list = [], single_thread = False, max_wo
 					print("Skipping directory sync")
 					if not NO_CREATE_DIR:
 						for dest in dests:
-							_makedirs(dest, exist_ok=True)
+							try:
+								_make_dest_directory(src, dest)
+							except OSError as e:
+								eprint(f'Directory sync error: {src} to {dest}: {e}')
 				else:
 					cs.add_dir_sync(src, dests)
 			if not directory_only:
@@ -11221,8 +11342,11 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = multipr
 		elif not src_path and not sys.stdin.isatty():
 			print("Reading source file list from stdin...")
 			src_paths.extend(load_source_list('-'))
-		src_paths.extend(expand_paths(src_path))
+		src_paths.extend(_named_sources(src_path, not (dest_paths or dest_image or remove or target_file_list)))
+		error_start = len(ERRORS)
 		verify_src_path(src_paths)
+		# A source that is not there counts against a move and -rme as a file that failed to copy: see copy_failures.
+		missing_sources = ERRORS[error_start:]
 		src_paths[:] = _without_covered_sources(src_paths)
 		# Names the -dfl file, so only then (a list would make a name of every entry).
 		if not src_str and diff_file_list == 'auto':
@@ -11340,7 +11464,7 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = multipr
 			link_targets = create_sym_links(total_sym_links,exclude=exclude,link_tracking=link_tracking and not no_link_tracking)
 			# A copy that reported errors is incomplete: removing the sources (a move) would lose what was not copied,
 			# and an unlisted source subtree would make its destination counterpart look extra.
-			copy_failures = [error for error in ERRORS[copy_error_start:] if _is_failure(error)]
+			copy_failures = missing_sources + [error for error in ERRORS[copy_error_start:] if _is_failure(error)]
 			if remove_extra and copy_failures:
 				eprint(f'Remove skipped: not removing extra files from {dests}: the copy reported {len(copy_failures)} error(s); '
 					'fix them (or exclude those paths with -e) and re-run')

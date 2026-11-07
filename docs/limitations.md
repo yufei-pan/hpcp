@@ -41,13 +41,6 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - **Revisit when:** someone hits it.
 - **Approved:** 2026-11-05, the user chose "Known limitation (Recommended)".
 
-### `-nds` with a directory source meeting a file in the destination
-- **Kind:** deferred.
-- **What the operator sees:** with `-nds`, `hpcp a/x -d out/` where a/x is a directory and out/x a file exits 70 with a `File exists` traceback instead of a clean clash, exit 213. The file is untouched, as in 9.80.
-- **Why:** ugly but safe, and old.
-- **Revisit when:** the next hpcp release.
-- **Approved:** 2026-11-05, the user chose "Deferred to 9.82 (Recommended)".
-
 ### Positional `-rme` judges the whole destination
 - **Kind:** deferred.
 - **What the operator sees:** `hpcp b -d out/ -rme` lands in `out/b`, but at the prompt's y it also deletes what lies outside that, such as `out/keep`; `hpcp a/x b -d out/ -rme` does the same. Same as 9.80. A source from a list is already limited to what it covers.
@@ -79,35 +72,11 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - **Why:** it needs `-rme` to know what the run reads, and that belongs with limiting positional `-rme` to where a source lands.
 - **Revisit when:** the next hpcp release, with "Positional `-rme` judges the whole destination".
 
-### A landing through a link into an unreachable place blames the wrong directory
-- **Kind:** deferred.
-- **What the operator sees:** with `out/l -> /root/secret/f`, the 213 says `/root` cannot be searched and offers a `chmod` a non-root user cannot run. The refusal is right; it should name the link.
-- **Why:** `_RealPlaces.directory` raises where the walk stopped and no longer knows which landing led there.
-- **Revisit when:** the next hpcp release.
-
-### A named source that matches nothing beside a good one is dropped silently
-- **Kind:** deferred.
-- **What the operator sees:** `hpcp nosuch ok/g -d out/`, also with `-rf`, copies `ok/g` and exits 0 without a word about `nosuch`, as 9.80 does. Alone it is exit 240, and the list route gives 207.
-- **Why:** the glob expansion (near line 756) drops it. It should say so and exit 207 after copying the rest.
-- **Revisit when:** the next hpcp release.
-
 ### A source that opens and then fails on read costs the old copy
 - **Kind:** deferred.
 - **What the operator sees:** `cp` truncates the destination before its first read, so a source that opens and then fails (`/proc/self/mem` with an old `out/mem`) ends in exit 190 and the old copy is gone. 9.80 left it empty.
   - With several destinations, a part written through a link at the first destination and the file then taken by the second ends exit 0 with the link's target half written (`hpcp a/ -d out/ -d two/` with `out/x -> ../t/f`).
 - **Why:** keeping it takes a temporary name and a rename, which is its own design; that covers the link case too. It covers landings in a tree only: a name given by `-d` keeps the write-through, because a rename would replace a FIFO named by `-d` and break a pipe feed that works today (a regular file onto a lone FIFO with a reader).
-- **Revisit when:** the next hpcp release.
-
-### A rerun with a source that became unreadable ends in exit 191
-- **Kind:** deferred.
-- **What the operator sees:** the destination matches the source by size and mtime, then the source becomes unreadable (mode 000, not root): the identical-file check hashes first, `hash_file`'s open raises, and a copy says `Copy process crashed: Fatal Error copying ...: Permission denied` and ends with exit 191 instead of the clean 190 (no traceback since 9.82; 9.81 printed one). A move ends 212 as usual (the exit is the highest of the errors), with its sources kept. Nothing is lost. Same on 9.80.
-- **Why:** old and safe. The fix is to move the readability check ahead of the identical loop, or to catch `PermissionError` around the hash.
-- **Revisit when:** the next hpcp release.
-
-### `Copy failed` does not carry cp's stderr
-- **Kind:** deferred.
-- **What the operator sees:** when `cp` fails, hpcp says `Copy failed: ... failed with return code 1`; why (a full disk, a loop in a destination link, a permission) is in cp's stderr, which is not shown. A full disk says only "return code 1".
-- **Why:** old behaviour: the traceback 9.81 printed did not carry it either. The runner has the stderr (the task keeps it); the error text does not carry it.
 - **Revisit when:** the next hpcp release.
 
 ### A FIFO that blocks the copy
@@ -118,7 +87,7 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 
 ### A named FIFO or socket is copied and still exits 200
 - **Kind:** deferred.
-- **What the operator sees:** `hpcp a/p -d out/` makes the node, prints `Source path type error` and ends exit 200. With `-s` the exit is 0 (9.81 too). The line also follows a refusal where no destination is left (`Destination clash: ... is a device`), where it reads as a second, different failure. With `-rf` it is 212 and every named source stays, files included; nothing is lost. The same FIFO in a directory source is skipped silently with exit 0. Same on 9.80.
+- **What the operator sees:** `hpcp a/p -d out/` makes the node, prints `Source path type error` and ends exit 200. With `-s` the exit is 0 (9.81 too). A file that is refused is not listed, so a clash adds no such line; a named FIFO whose landing is a directory prints it before the clash, and a device source a user may not make before the `Copy failed`. With `-rf` it is 212 and every named source stays, files included; nothing is lost. The same FIFO in a directory source is skipped silently with exit 0. Same on 9.80.
 - **Why:** old and safe. A named special should either copy cleanly or be skipped as in a tree, and that is its own decision.
 - **Revisit when:** the next hpcp release.
 
@@ -141,9 +110,3 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - **Why:** catching it needs an lstat per directory on every run, for a layout that takes root to make.
 - **Revisit when:** someone hits it.
 - **Approved:** 2026-11-06, the user chose "Known limitation (Recommended)".
-
-### Two names that differ only in case on a case-insensitive destination
-- **Kind:** deferred.
-- **What the operator sees:** with `a/X` and `b/x`, `hpcp a/ b/ -d out/ -rf` onto a casefold directory exits 0, one file's content is gone, and either source can win (ext4 casefold: the earlier source in 3 of 9 runs, on every version). SMB, NTFS and exFAT destinations should do the same (reasoned, not run).
-- **Why:** the check compares real paths before the files exist. The fix is to ask whether the destination folds case and refuse the clash, exit 213.
-- **Revisit when:** the next hpcp release.

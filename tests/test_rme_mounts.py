@@ -305,6 +305,83 @@ def test_a_landing_by_another_case_is_a_landing(tmp_path):
 		subprocess.run(['umount', '-l', str(mount)], capture_output=True)
 
 
+@contextlib.contextmanager
+def _folding_directory(tmp_path, kind):
+	"""A directory that folds case, on a filesystem of its own: an ext4 directory with the casefold flag, or the root of a vfat."""
+	mkfs = shutil.which('mkfs.ext4' if kind == 'ext4' else 'mkfs.vfat')
+	image, mount = tmp_path / 'fold.img', tmp_path / 'fold'
+	if os.geteuid() != 0 or not mkfs or not shutil.which('chattr'):
+		pytest.skip('needs root, mkfs and chattr')
+	image.write_bytes(b'')
+	os.truncate(str(image), 64 << 20)
+	command = [mkfs, '-q', '-O', 'casefold', '-E', 'encoding=utf8', str(image)] if kind == 'ext4' else [mkfs, str(image)]
+	if subprocess.run(command, capture_output=True).returncode:
+		pytest.skip(f'mkfs for {kind} refused')
+	mount.mkdir()
+	if subprocess.run(['mount', '-o', 'loop', str(image), str(mount)], capture_output=True).returncode:
+		pytest.skip(f'this kernel does not mount {kind}, or not with casefold')
+	try:
+		fold = mount
+		if kind == 'ext4':
+			fold = mount / 'w'
+			fold.mkdir()
+			if subprocess.run(['chattr', '+F', str(fold)], capture_output=True).returncode:
+				pytest.skip('casefold flag refused')
+		yield fold
+	finally:
+		subprocess.run(['umount', '-l', str(mount)], capture_output=True)
+
+
+def _write_cases(tmp_path):
+	(tmp_path / 'a').mkdir()
+	(tmp_path / 'b').mkdir()
+	(tmp_path / 'a/X').write_text('upper')
+	(tmp_path / 'b/x').write_text('lower')
+
+
+@pytest.mark.parametrize('kind', ['ext4', 'vfat'])
+def test_the_probe_sees_a_real_folding_directory(tmp_path, hpcp_mod, kind):
+	with _folding_directory(tmp_path, kind) as fold:
+		assert hpcp_mod._folds_case(str(fold)) is True
+		assert hpcp_mod._folds_case(str(fold / 'not/yet')) is True  # a new directory takes after its parent
+		assert not [name for name in os.listdir(fold) if name.startswith('.hpcp')]
+
+
+def test_the_probe_is_of_the_directory_not_of_the_filesystem(tmp_path, hpcp_mod):
+	with _folding_directory(tmp_path, 'ext4') as fold:
+		assert hpcp_mod._folds_case(str(fold.parent)) is False
+
+
+@pytest.mark.parametrize('kind', ['ext4', 'vfat'])
+@pytest.mark.parametrize('flags', [['-rf'], []], ids=['move', 'copy'])
+def test_two_names_that_are_one_on_a_folding_destination_are_refused(tmp_path, kind, flags):
+	"""Each was exit 0 with one file's content gone, and in a move its source too."""
+	_write_cases(tmp_path)
+	with _folding_directory(tmp_path, kind) as fold:
+		task = subprocess.run([sys.executable, HPCP, 'a/', 'b/', '-d', str(fold / 'out') + os.sep] + flags, cwd=str(tmp_path), stdin=subprocess.DEVNULL,
+			stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+		assert task.returncode == 213 and b'where the destination folds case' in task.stdout, task.stdout[-2000:]
+		assert (fold / 'out/x').read_text() == 'upper'
+	assert (tmp_path / 'a/X').read_text() == 'upper' and (tmp_path / 'b/x').read_text() == 'lower'
+
+
+def test_a_full_disk_says_so(tmp_path):
+	"""'Copy failed' said only 'return code 1'."""
+	(tmp_path / 'big').write_bytes(os.urandom(1 << 20))
+	out = tmp_path / 'out'
+	out.mkdir()
+	if os.geteuid() != 0:
+		pytest.skip('needs root to mount')
+	if subprocess.run(['mount', '-t', 'tmpfs', '-o', 'size=64k', 'hpcp-test', str(out)], capture_output=True).returncode:
+		pytest.skip('mount failed')
+	try:
+		task = subprocess.run([sys.executable, HPCP, 'big', '-d', str(out) + os.sep], cwd=str(tmp_path), stdin=subprocess.DEVNULL,
+			stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+		assert task.returncode == 190 and b'No space left on device' in task.stdout, task.stdout[-2000:]
+	finally:
+		subprocess.run(['umount', '-l', str(out)], capture_output=True)
+
+
 # ---- 9.75: re-review of 127f141..HEAD ----
 
 @pytest.mark.parametrize('dest', ['dst/', './dst/', 'x/../dst/'])

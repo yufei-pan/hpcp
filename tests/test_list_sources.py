@@ -3104,8 +3104,8 @@ def test_a_cp_that_fails_says_so_in_lines_and_shows_no_traceback(tmp_path, hpcp_
 
 
 @pytest.mark.parametrize('error, verbose, traceback_shown', [
-	(PermissionError(13, 'Permission denied', 'a/x'), False, False),
-	(PermissionError(13, 'Permission denied', 'a/x'), True, True),
+	(OSError(5, 'Input/output error', 'a/x'), False, False),
+	(OSError(5, 'Input/output error', 'a/x'), True, True),
 	(TypeError('a bug'), False, True),
 ], ids=['an OSError is one line', 'an OSError under -v has its traceback', 'anything else keeps its traceback'])
 def test_a_copy_that_crashes_shows_a_traceback_only_for_what_is_not_an_oserror_or_under_verbose(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch, capsys, error, verbose, traceback_shown):
@@ -3856,3 +3856,397 @@ def test_a_write_that_keeps_failing_through_a_link_keeps_the_link(tmp_path, hpcp
 	_cp_through_a_link(hpcp_mod, monkeypatch, 100)
 	assert hpcp_mod.copy_file(source, [landing])[0] == 0
 	assert os.path.islink(landing)
+
+
+# ---- 9.83: a named source that matches nothing ----
+
+@pytest.fixture
+def good(tmp_path):
+	write(tmp_path / 'ok/g', 'g')
+	return tmp_path
+
+
+@pytest.mark.parametrize('flags', [[], ['-s'], ['-nb']], ids=['batch', 'serial', 'no-batch'])
+def test_a_named_source_that_matches_nothing_is_said_and_the_rest_copied(good, flags):
+	# It was dropped silently, exit 0, where a list says the same thing and exits 207.
+	rc, output = run(['nosuch', 'ok/g', '-d', 'out/'] + flags, good)
+	assert rc == 207 and b'Source path not found: nosuch does not exist' in output and files(good / 'out') == {b'g': b'g'}
+
+
+def test_a_pattern_that_matches_nothing_is_said_too(good):
+	rc, output = run(['ok/g', 'no*such', '-d', 'out/'], good)
+	assert rc == 207 and b'Source path not found: no*such does not exist' in output and files(good / 'out') == {b'g': b'g'}
+
+
+def test_a_name_with_glob_characters_that_matches_nothing_as_a_pattern_is_that_file(good):
+	write(good / 'a[1]', 'bracket')
+	rc, output = run(['a[1]', '-d', 'out/'], good)
+	assert rc == 0 and files(good / 'out') == {b'a[1]': b'bracket'}, output[-2000:]
+
+
+@pytest.mark.parametrize('stdin,arguments', [(b'', ['nosuch', 'ok/g']), (b'nosuch\nok/g\n', [])], ids=['arguments', 'list'])
+def test_a_move_with_a_missing_source_removes_nothing(good, stdin, arguments):
+	# The usual rule on errors, by either route: a list moved the rest and exited 207, and arguments did the same with no word.
+	rc, output = run(arguments + ['-d', 'out/', '-rf'], good, stdin)
+	assert rc == 212 and b'Source path not found: nosuch' in output and b'Remove skipped' in output, output[-2000:]
+	assert (good / 'ok/g').read_text() == 'g'
+
+
+def test_rme_takes_nothing_for_extra_when_a_source_is_missing(good):
+	# With the source's name mistyped, what it holds at the destination looks extra.
+	write(good / 'd/x', 'x')
+	write(good / 'out/typo/keep', 'k')
+	rc, output = run(['typo', 'd/', '-d', 'out/', '-rme'], good)
+	assert rc == 212 and b'Remove skipped: not removing extra files' in output and (good / 'out/typo/keep').exists(), output[-2000:]
+
+
+def test_a_removal_goes_on_past_a_missing_name_as_rm_does(good):
+	rc, output = run(['nosuch', 'ok/g', '-rf'], good)
+	assert rc == 207 and b'Source path not found: nosuch' in output and not (good / 'ok/g').exists(), output[-2000:]
+
+
+def test_a_missing_source_alone_is_still_240_and_says_which(good):
+	rc, output = run(['nosuch', '-d', 'out/'], good)
+	assert rc == 240 and b'Source path not found: nosuch does not exist' in output and not (good / 'out').exists()
+
+
+def test_the_last_word_as_the_destination_need_not_exist(good):
+	rc, output = run(['ok/g', 'new/'], good)
+	assert rc == 0 and b'not found' not in output and files(good / 'new') == {b'g': b'g'}, output[-2000:]
+
+
+def test_only_the_destination_left_is_no_sources_not_a_traceback(good):
+	# 'hpcp nosuch ok/g' with no -d: the last word is the destination, and nothing is left to copy (exit 70, an IndexError).
+	rc, output = run(['nosuch', 'ok/g'], good)
+	assert rc == 240 and b'Traceback' not in output and b'Source path not found: nosuch' in output, output[-2000:]
+
+
+def test_a_stored_list_of_a_missing_source_says_so(good):
+	rc, output = run(['nosuch', 'ok', '-fl', 'stored'], good)
+	assert rc == 207 and b'Source path not found: nosuch' in output and (good / 'stored').exists(), output[-2000:]
+
+
+@no_permissions_as_root
+def test_a_source_nobody_could_look_at_is_not_said_to_be_missing(good):
+	write(good / 'locked/f', 'f')
+	os.chmod(good / 'locked', 0o000)
+	try:
+		rc, output = run(['locked/f', 'ok/g', '-d', 'out/'], good)
+	finally:
+		os.chmod(good / 'locked', 0o755)
+	assert rc == 207 and b'Source path not found: locked/f cannot be reached (Permission denied)' in output, output[-2000:]
+	assert files(good / 'out') == {b'g': b'g'}
+
+
+# ---- 9.83: cp's reason, -nds, an unreadable side of a rerun, the link that led there, a refused FIFO ----
+
+def test_a_failed_copy_says_what_cp_said(tmp_path, exec_dir):
+	write(tmp_path / 'a/x', 'x')
+	fake = exec_dir / 'my-cp'
+	fake.write_text('#!/bin/sh\necho "cp: error writing: No space left on device" >&2\nexit 1\n')
+	os.chmod(str(fake), 0o755)
+	rc, output = run(['a/x', '-d', 'out/'], tmp_path, env={'CP_PATH': str(fake)})
+	assert rc == 190 and b'failed with return code 1: cp: error writing: No space left on device' in output, output[-2000:]
+
+
+def test_the_runner_keeps_the_last_lines_of_what_a_tool_said(hpcp_mod, reset_hpcp_globals):
+	hpcp_mod.run_commands_in_multicmd_with_path_check([['sh', '-c', 'for n in 1 2 3 4 5; do echo line$n >&2; done; exit 3']], quiet=True)
+	assert hpcp_mod.ERRORS[-1].endswith('failed with return code 3: line3 line4 line5')
+
+
+def test_a_tool_that_says_nothing_keeps_the_old_sentence(hpcp_mod, reset_hpcp_globals):
+	hpcp_mod.run_commands_in_multicmd_with_path_check([['sh', '-c', 'exit 3']], quiet=True)
+	assert hpcp_mod.ERRORS[-1].endswith('failed with return code 3.')
+
+
+def test_nds_with_a_directory_meeting_a_file_is_a_clash(tmp_path):
+	write(tmp_path / 'a/x/f', 'f')
+	write(tmp_path / 'out/x', 'file')
+	rc, output = run(['a/x', '-d', 'out/', '-nds'], tmp_path)
+	assert rc == 213 and b'Traceback' not in output and b'is not a directory, not syncing' in output, output[-2000:]
+	assert (tmp_path / 'out/x').read_text() == 'file'
+
+
+@no_permissions_as_root
+def test_nds_with_a_directory_that_cannot_be_made_is_a_directory_sync_error(tmp_path):
+	write(tmp_path / 'a/x/f', 'f')
+	os.makedirs(tmp_path / 'out')
+	os.chmod(tmp_path / 'out', 0o555)
+	try:
+		rc, output = run(['a/x', '-d', 'out/', '-nds'], tmp_path)
+	finally:
+		os.chmod(tmp_path / 'out', 0o755)
+	assert rc == 193 and b'Traceback' not in output and b'Directory sync error' in output, output[-2000:]
+
+
+def _copied_then_unreadable(tmp_path):
+	write(tmp_path / 'a/x', 'the only other copy')
+	assert run(['a/x', '-d', 'out/'], tmp_path)[0] == 0
+	os.chmod(tmp_path / 'a/x', 0o000)
+
+
+@no_permissions_as_root
+def test_a_rerun_with_an_unreadable_source_is_a_clean_190_and_keeps_the_old_copy(tmp_path):
+	_copied_then_unreadable(tmp_path)
+	rc, output = run(['a/x', '-d', 'out/'], tmp_path)
+	assert rc == 190 and b'Copy failed: cannot open' in output and b'crashed' not in output, output[-2000:]
+	assert (tmp_path / 'out/x').read_text() == 'the only other copy'
+
+
+@no_permissions_as_root
+def test_a_move_of_an_unreadable_source_on_a_rerun_keeps_both(tmp_path):
+	_copied_then_unreadable(tmp_path)
+	rc, output = run(['a/x', '-d', 'out/', '-rf'], tmp_path)
+	assert rc == 212 and b'crashed' not in output and os.path.lexists(tmp_path / 'a/x'), output[-2000:]
+	assert (tmp_path / 'out/x').read_text() == 'the only other copy'
+
+
+@no_permissions_as_root
+def test_a_rerun_with_a_destination_it_cannot_read_copies_again(tmp_path):
+	write(tmp_path / 'a/x', 'x')
+	assert run(['a/x', '-d', 'out/'], tmp_path)[0] == 0
+	os.chmod(tmp_path / 'out/x', 0o000)
+	rc, output = run(['a/x', '-d', 'out/'], tmp_path)
+	assert rc == 0 and b'crashed' not in output and (tmp_path / 'out/x').read_text() == 'x', output[-2000:]
+
+
+def test_another_read_error_on_the_hash_keeps_the_old_copy(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	# cp truncates before its first read, so only a refused open may go on to it.
+	write(tmp_path / 'a/x', 'old')
+	write(tmp_path / 'out/x', 'old')
+	os.utime(tmp_path / 'out/x', ns=(os.stat(tmp_path / 'a/x').st_atime_ns, os.stat(tmp_path / 'a/x').st_mtime_ns))
+	def broken(path, *args):
+		raise OSError(5, 'Input/output error', path)
+	monkeypatch.setattr(hpcp_mod, 'hash_file', broken)
+	hpcp_mod.copy_file(str(tmp_path / 'a/x'), [str(tmp_path / 'out/x')])
+	assert hpcp_mod.ERRORS[-1].startswith('Copy process crashed:') and (tmp_path / 'out/x').read_text() == 'old'
+
+
+def _locked(tmp_path):
+	write(tmp_path / 'src/l', 'x')
+	write(tmp_path / 'locked/sub/f', 'kept')
+	os.makedirs(tmp_path / 'out')
+
+
+@no_permissions_as_root
+@pytest.mark.parametrize('target,mode', [('../locked/sub/f', 0o000), ('../locked/sub/f', 0o755)], ids=['above-the-target', 'at-the-parent'])
+def test_a_landing_through_a_link_into_an_unreachable_place_names_the_link(tmp_path, target, mode):
+	_locked(tmp_path)
+	os.symlink(target, tmp_path / 'out/l')
+	os.chmod(tmp_path / 'locked/sub', 0o000)
+	os.chmod(tmp_path / 'locked', mode)
+	try:
+		rc, output = run(['src/', '-d', 'out/'], tmp_path)
+	finally:
+		os.chmod(tmp_path / 'locked', 0o755)
+		os.chmod(tmp_path / 'locked/sub', 0o755)
+	link = str(tmp_path / 'out/l').encode()
+	assert rc == 213 and b'Destination clash: ' + link + b' leads to ' in output and b'To let it through: rm ' + link in output, output[-2000:]
+	assert (tmp_path / 'locked/sub/f').read_text() == 'kept'
+
+
+@no_permissions_as_root
+def test_a_landing_through_a_link_to_a_directory_names_the_link(tmp_path):
+	# The walk passes: the link leads to a directory it can see. The landing in it is what cannot be asked about.
+	write(tmp_path / 'src/d/x', 'x')
+	write(tmp_path / 'locked/x', 'kept')
+	os.makedirs(tmp_path / 'out')
+	os.symlink('../locked', tmp_path / 'out/d')
+	os.chmod(tmp_path / 'locked', 0o000)
+	try:
+		rc, output = run(['src/d/x', 'src/l/x', '-d', 'out/d/'], tmp_path)
+	finally:
+		os.chmod(tmp_path / 'locked', 0o755)
+	link = str(tmp_path / 'out/d').encode()
+	assert rc == 213 and b'Destination clash: ' + link + b' leads to ' in output, output[-2000:]
+
+
+@no_permissions_as_root
+def test_a_directory_with_no_link_on_the_way_keeps_its_chmod(tmp_path):
+	write(tmp_path / 'src/x', 'x')
+	os.makedirs(tmp_path / 'out')
+	os.chmod(tmp_path / 'out', 0o000)
+	try:
+		rc, output = run(['src/', '-d', 'out/'], tmp_path)
+	finally:
+		os.chmod(tmp_path / 'out', 0o755)
+	assert rc == 213 and b'To let it through: chmod u+rx ' + str(tmp_path / 'out').encode() in output and b' leads to ' not in output, output[-2000:]
+
+
+def test_the_last_link_on_the_way_is_found_and_none_when_there_is_none(tmp_path, hpcp_mod):
+	root = os.path.realpath(str(tmp_path))
+	os.makedirs(root + '/d/e')
+	os.symlink('d', root + '/one')
+	os.symlink('e', root + '/d/two')
+	assert hpcp_mod._last_link(root + '/d/e') is None
+	assert hpcp_mod._last_link(root + '/one/e/f') == root + '/one'
+	assert hpcp_mod._last_link(root + '/d/two/f') == root + '/d/two'
+
+
+def test_a_refused_named_fifo_is_reported_once(tmp_path):
+	# Its listing added 'Source path type error', which reads as a second failure of a file that was not going to be copied.
+	os.makedirs(tmp_path / 'a')
+	os.makedirs(tmp_path / 'b')
+	os.mkfifo(tmp_path / 'a/p')
+	os.mkfifo(tmp_path / 'b/p')
+	rc, output = run(['a/p', 'b/p', '-d', 'out/'], tmp_path)
+	refused = str(tmp_path / 'b/p').encode()
+	assert rc == 213 and b'not copying ' + refused + b' over it' in output and b'Source path type error: ' + refused not in output, output[-2000:]
+
+
+# ---- 9.83: a destination that folds case ----
+
+@pytest.fixture
+def folding(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	"""The probe answers yes on this filesystem, which does not fold: so a file that lands at all was not refused. On a real
+	one, test_rme_mounts.py. Commands run in tmp_path."""
+	monkeypatch.setattr(hpcp_mod, '_folds_case', lambda dest: True)
+	monkeypatch.chdir(tmp_path)
+	return tmp_path
+
+
+def _copy(hpcp_mod, sources, **kwargs):
+	return hpcp_mod.hpcp(sources, ['out/'], single_thread=True, max_workers=1, batch=True, **kwargs)
+
+
+def test_two_directories_with_names_that_differ_in_case_clash_on_a_folding_destination(folding, hpcp_mod, capsys):
+	write(folding / 'a/X', 'upper')
+	write(folding / 'b/x', 'lower')
+	assert _copy(hpcp_mod, ['a/', 'b/']) == 213
+	assert files(folding / 'out') == {b'X': b'upper'}
+	assert 'are one name where the destination folds case' in capsys.readouterr().err
+
+
+def test_a_move_of_such_a_clash_keeps_every_source(folding, hpcp_mod):
+	write(folding / 'a/X', 'upper')
+	write(folding / 'b/x', 'lower')
+	assert _copy(hpcp_mod, ['a/', 'b/'], remove_force=True) == 213
+	assert (folding / 'a/X').exists() and (folding / 'b/x').exists()
+
+
+def test_two_names_in_one_tree_clash_though_no_roots_meet(folding, hpcp_mod):
+	# A lone source on a usual destination is not even listed.
+	write(folding / 'a/X', 'upper')
+	write(folding / 'a/x', 'lower')
+	assert _copy(hpcp_mod, ['a/']) == 213
+	assert files(folding / 'out') == {b'X': b'upper'}  # by name, so a rerun keeps the same one
+
+
+def test_named_files_that_differ_in_case_clash(folding, hpcp_mod):
+	write(folding / 'a/X', 'upper')
+	write(folding / 'b/x', 'lower')
+	assert _copy(hpcp_mod, ['b/x', 'a/X']) == 213
+	assert files(folding / 'out') == {b'x': b'lower'}  # the first stays
+
+
+def test_a_file_against_a_directory_in_another_case_gives_way(folding, hpcp_mod):
+	write(folding / 'a/X', 'file')
+	write(folding / 'b/x/f', 'below')
+	assert _copy(hpcp_mod, ['a/', 'b/']) == 213
+	assert files(folding / 'out') == {b'x/f': b'below'}
+
+
+def test_files_below_directories_that_differ_in_case_clash(folding, hpcp_mod):
+	write(folding / 'a/D/f', 'one')
+	write(folding / 'b/d/f', 'two')
+	assert _copy(hpcp_mod, ['a/', 'b/']) == 213
+	assert files(folding / 'out') == {b'D/f': b'one'}
+
+
+def test_directories_that_differ_in_case_with_different_files_merge(folding, hpcp_mod):
+	write(folding / 'a/D/f', 'one')
+	write(folding / 'b/d/g', 'two')
+	assert _copy(hpcp_mod, ['a/', 'b/']) == 0
+
+
+def test_an_overlay_in_one_case_is_still_an_overlay(folding, hpcp_mod):
+	write(folding / 'a/x', 'old')
+	write(folding / 'b/x', 'new')
+	assert _copy(hpcp_mod, ['a/', 'b/']) == 0
+	assert files(folding / 'out') == {b'x': b'new'}
+
+
+def test_a_file_replaced_by_an_overlay_clashes_with_nothing(folding, hpcp_mod):
+	write(folding / 'a/X', 'lost')
+	write(folding / 'b/X', 'kept')
+	write(folding / 'c/y', 'y')
+	assert _copy(hpcp_mod, ['a/', 'b/', 'c/']) == 0
+	assert files(folding / 'out') == {b'X': b'kept', b'y': b'y'}
+
+
+def test_composed_and_decomposed_names_are_one_name(folding, hpcp_mod):
+	# ext4 and f2fs compare names normalised.
+	write(folding / 'a/café', 'composed')
+	write(folding / 'b/café', 'decomposed')
+	assert _copy(hpcp_mod, ['a/', 'b/']) == 213
+
+
+def test_a_destination_that_does_not_fold_keeps_both(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	monkeypatch.chdir(tmp_path)
+	write(tmp_path / 'a/X', 'upper')
+	write(tmp_path / 'b/x', 'lower')
+	assert _copy(hpcp_mod, ['a/', 'b/']) == 0
+	assert files(tmp_path / 'out') == {b'X': b'upper', b'x': b'lower'}
+
+
+def _probes(hpcp_mod, monkeypatch):
+	asked = []
+	monkeypatch.setattr(hpcp_mod, '_folds_case', lambda dest: asked.append(dest) or False)
+	return asked
+
+
+def test_one_probe_per_destination_however_many_files(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	monkeypatch.chdir(tmp_path)
+	for name in 'abcdef':
+		write(tmp_path / 'a' / name, name)
+		write(tmp_path / 'b' / name, name)
+	asked = _probes(hpcp_mod, monkeypatch)
+	assert hpcp_mod.hpcp(['a/', 'b/'], ['one/', 'two/'], single_thread=True, max_workers=1, batch=True) == 0
+	assert sorted(os.path.basename(dest.rstrip(os.sep)) for dest in asked) == ['one', 'two']
+
+
+def test_a_single_file_asks_nothing(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	monkeypatch.chdir(tmp_path)
+	write(tmp_path / 'a/x', 'x')
+	asked = _probes(hpcp_mod, monkeypatch)
+	assert _copy(hpcp_mod, ['a/x']) == 0 and asked == []
+
+
+def test_directories_only_and_images_ask_nothing(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	write(tmp_path / 'a/x', 'x')
+	asked = _probes(hpcp_mod, monkeypatch)
+	source, out = str(tmp_path / 'a') + os.sep, str(tmp_path / 'out') + os.sep
+	hpcp_mod._settle_destinations([source], [out], directory_only=True)
+	hpcp_mod._settle_destinations([source], [out], dest_image=str(tmp_path / 'image.img'))
+	assert asked == []
+
+
+def test_the_probe_leaves_the_directory_as_it_was(tmp_path, hpcp_mod):
+	# It says no here (these suites do not run on a folding filesystem), and no trace of asking stays.
+	os.utime(tmp_path, (1000000000, 1000000000))
+	assert hpcp_mod._folds_case(str(tmp_path) + os.sep) is False
+	assert os.listdir(tmp_path) == [] and os.stat(tmp_path).st_mtime == 1000000000
+
+
+def test_the_probe_answers_yes_when_the_other_case_is_there(tmp_path, hpcp_mod, monkeypatch):
+	real = os.path.lexists
+	monkeypatch.setattr(hpcp_mod.os.path, 'lexists', lambda path: real(path.lower()))
+	assert hpcp_mod._folds_case(str(tmp_path)) is True
+	assert os.listdir(tmp_path) == []
+
+
+def test_the_probe_asks_the_nearest_directory_that_exists(tmp_path, hpcp_mod, monkeypatch):
+	made = []
+	real = os.open
+	monkeypatch.setattr(hpcp_mod.os, 'open', lambda path, *args, **kwargs: made.append(path) or real(path, *args, **kwargs))
+	hpcp_mod._folds_case(str(tmp_path / 'new/deep') + os.sep)
+	assert [os.path.dirname(path) for path in made] == [str(tmp_path)] and not (tmp_path / 'new').exists()
+
+
+@no_permissions_as_root
+def test_the_probe_says_no_where_nothing_can_land(tmp_path, hpcp_mod):
+	os.chmod(tmp_path, 0o555)
+	try:
+		assert hpcp_mod._folds_case(str(tmp_path)) is False
+	finally:
+		os.chmod(tmp_path, 0o755)
