@@ -10821,7 +10821,7 @@ def _settle_destinations(src_paths, dests, dest_image=None, directory_only=False
 		"""pairs: (where the file it meets lands, where path lands), one for each destination. A clash, said for the first
 		destination where the directory takes them for one name or cannot say, when there is one (True then)."""
 		answers = [places.same_place(*pair) for pair in pairs]
-		for answer, text in ((True, 'are one name where the destination folds case'), (None, 'may be one name, and the destination cannot be asked')):
+		for answer, text in ((True, 'are one name where the destination folds case'), (None, 'may be one name, and the destination cannot be asked: make that directory writable and run again')):
 			if answer in answers:
 				theirs, ours = pairs[answers.index(answer)]
 				clash(path, job, f'{ours} and {theirs} {text}')
@@ -10891,7 +10891,7 @@ def _settle_destinations(src_paths, dests, dest_image=None, directory_only=False
 					clash(path, job, f'{dest} is a directory of another source where the destination folds case')
 					continue
 				if None in verdicts:
-					clash(path, job, f'{dest} and {verdicts[None]} may be one name, and the destination cannot be asked')
+					clash(path, job, f'{dest} and {verdicts[None]} may be one name, and the destination cannot be asked: make that directory writable and run again')
 					continue
 			for first, first_landings in kept.get(name, ()):
 				if alike(path, job, list(zip(first_landings, landings))):
