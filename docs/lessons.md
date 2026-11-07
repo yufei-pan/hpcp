@@ -24,3 +24,6 @@ same commit as the change. Keep this file under 20 KB: at the cap, merge lines b
 - **2026-11-06 A refusal offers a fix its reader can run**: name the thing in the reader's own tree (the link), not only where the walk stopped, which can belong to anyone.
 - **2026-11-06 The reason travels with the error**: a runner that knows what a tool said puts it in the error it raises, or every caller reports only a return code.
 - **2026-11-07 Different numbers prove nothing**: equal st_ino means one file, but a filesystem may number each spelling of one name (exFAT through FUSE, CIFS noserverino); whether two names are one is asked by doing it, and a listing answers only where nothing can be made.
+- **2026-11-07 A cheaper filter is no narrower net**: speed up a safety check by making it cheaper, never by a cheaper rule in front of it that is not a superset of it (lowercasing is not folding: it let a landing through a link, and `σ`/`ς`, through).
+- **2026-11-07 Ask the whole group at once**: when a wide net groups candidates for a costly question, ask about the whole group in one go and keep the answer for the run, or the cost is the square of a group that safety keeps large; a reason names what failed, the name or the place.
+

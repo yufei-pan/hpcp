@@ -120,7 +120,7 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 
 ### A probe left behind by SIGKILL
 - **Kind:** known limitation.
-- **What the operator sees:** hpcp killed with SIGKILL in the moment it asks a directory about a pair leaves a hidden `.hpcp-case-probe-PID-uuid` directory in the destination, empty or holding the empty files of one or both names. No data is affected. SIGINT, SIGTERM and SIGHUP wait for the probe to go, and left nothing in 30 kills each.
+- **What the operator sees:** hpcp killed with SIGKILL in the moment it asks a directory about a pair leaves a hidden `.hpcp-case-probe-PID-uuid` directory in the destination, empty or holding a small file for each spelling of the name it was asking about. No data is affected. SIGINT, SIGTERM and SIGHUP wait for the probe to go, and left nothing in 30 kills each.
 - **Why:** SIGKILL cannot be handled, and the only way to ask a directory about two names is to make them.
 - **Revisit when:** an operator reports finding one.
 - **Approved:** 2026-11-06, the user chose "Known limitation (Recommended)".
@@ -137,4 +137,11 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - **What the operator sees:** `hpcp a/ b/ -d out/ -rf` onto vfat with `a/longfilename.txt` and `b/LONGFI~1.TXT` exits 0 and one content is gone, in about half of the runs: vfat made `LONGFI~1.TXT` the short name of the first file, so the second source is written onto it. The sources are removed. 9.82 does the same.
 - **Why:** the alias is not in either name, so no rule on names catches it, and asking the directory about the pair (`_one_name`) cannot see that one file already has the other's name. It is a filesystem's invention, not a spelling.
 - **Plan:** before a move removes anything, check that no two sources share a landing identity (device and inode of what the copy wrote), and keep every source when two do.
+- **Revisit when:** the next hpcp release.
+
+### A copy into its own inside under another spelling on FUSE exFAT
+- **Kind:** deferred.
+- **What the operator sees:** on exFAT through FUSE (EL7 and EL8), `hpcp D/ -d d/sub/` without `-rf` exits 0 and adds `D/sub/sub/f`: `d` is `D`, so the destination is inside the source, and the copy reads the destination's own files and copies them into it, one level deeper each run. Nothing is lost. The move form, `hpcp D/ -d d/sub/ -rf`, is refused (241), and in one spelling (`hpcp D/ -d D/sub/`) the destination is left out, as it should be.
+- **Why:** the check that a source holds the destination compares real paths, and FUSE exFAT gives each spelling of one directory a number of its own, so `D` and `d` are two real paths there. Kernel filesystems give both one number, and the check sees one directory.
+- **Plan:** where a source's real path folds like the start of a destination's, ask the directory whether they are one (`_RealPlaces.same_place`), as the move check does, and leave the destination out of the walk as for one spelling.
 - **Revisit when:** the next hpcp release.
