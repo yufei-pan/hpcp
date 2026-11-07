@@ -11434,7 +11434,7 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = multipr
 		elif not src_path and not sys.stdin.isatty():
 			print("Reading source file list from stdin...")
 			src_paths.extend(load_source_list('-'))
-		named, held_back = _named_sources(src_path, not (dest_paths or dest_image or remove or target_file_list))
+		named, held_back = _named_sources(src_path, not (dest_paths or target_file_list))
 		src_paths.extend(named)
 		# A source that is not there stops -rme, and a move as a file that failed to copy does: see copy_failures.
 		missing_sources = verify_src_path(src_paths, exclude)

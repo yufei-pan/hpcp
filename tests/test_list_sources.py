@@ -3939,15 +3939,12 @@ def test_a_missing_last_word_of_a_removal_or_a_stored_list_is_a_source(good):
 	assert rc == 207 and b'Source path not found: nosuch' in output and (good / 'stored').exists(), output[-2000:]
 
 
-def test_a_missing_last_word_beside_an_image_is_a_source(good, hpcp_mod, reset_hpcp_globals, monkeypatch):
-	def stop(*args, **kwargs):
-		raise RuntimeError('Runtime Error: stop here')
-	monkeypatch.setattr(hpcp_mod, 'get_dests', stop)
+def test_a_missing_last_word_beside_an_image_is_a_source(good, hpcp_mod, reset_hpcp_globals, monkeypatch, capsys):
+	monkeypatch.setattr(hpcp_mod, 'get_dests', lambda *args, **kwargs: ([str(good / 'mount') + '/'], 'mount', str(good / 'mount')))
+	monkeypatch.setattr(hpcp_mod, 'process_copy', lambda *args, **kwargs: (set(), {}))
 	monkeypatch.chdir(good)
-	seen = []
-	monkeypatch.setattr(hpcp_mod, 'get_rc_from_error', lambda: seen.extend(hpcp_mod.ERRORS) or 0)
 	hpcp_mod.hpcp(['ok/g', 'nosuch'], dest_image='x.img')
-	assert 'Source path not found: nosuch does not exist' in seen
+	assert 'Source path not found: nosuch does not exist' in capsys.readouterr().err
 
 
 def test_a_name_under_a_file_does_not_exist_and_a_tilde_is_said_expanded(good):
