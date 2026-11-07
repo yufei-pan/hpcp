@@ -4899,6 +4899,33 @@ def test_a_file_and_a_directory_that_only_a_later_destination_takes_for_one_name
 	assert {**files(tmp_path / 'one'), **files(tmp_path / 'two')} == {b'x/X': b'below'}
 
 
+def test_a_later_destination_is_asked_once_about_a_file_and_the_directories_it_meets(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	# Every spelling it gets, its directories' too, in one question: 'x.' is 'x' on vfat.
+	monkeypatch.chdir(tmp_path)
+	write(tmp_path / 'a/X', 'file')
+	write(tmp_path / 'b/x/f', 'below')
+	write(tmp_path / 'c/x./g', 'below too')
+	asked = _answering(hpcp_mod, monkeypatch, lambda directory, first, second: os.path.basename(directory) == 'two' and first.lower().rstrip('.') == second.lower().rstrip('.'))
+	assert hpcp_mod.hpcp(['a/', 'b/', 'c/'], ['one/', 'two/'], single_thread=True, max_workers=1, batch=True) == 213
+	assert [sorted(names) for directory, names in asked if os.path.basename(directory) == 'two'] == [['X', 'x', 'x.']]
+
+
+def test_a_file_and_the_directory_a_listed_path_implies_in_a_later_destination_are_a_clash(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch, capsys):
+	# A listed l/x/f implies the directory l/x, which a later destination takes for a/l/X. (The net looks only where names
+	# fold alike: a/Y and a/y.)
+	monkeypatch.chdir(tmp_path)
+	write(tmp_path / 'l/x/f', 'below')
+	write(tmp_path / 'a/l/X', 'file')
+	write(tmp_path / 'a/Y', 'Y')
+	write(tmp_path / 'a/y', 'y')
+	(tmp_path / 'the-list').write_text('l/x/f\n')
+	_answering(hpcp_mod, monkeypatch, lambda directory, first, second: os.path.basename(os.path.dirname(directory)) == 'two' or os.path.basename(directory) == 'two')
+	assert hpcp_mod.hpcp(['a/'], ['one/', 'two/'], source_file_list='the-list', single_thread=True, max_workers=1, batch=True) == 213
+	said = [line for line in capsys.readouterr().err.splitlines() if 'is a directory of another source where the destination folds case' in line]
+	assert said and str(tmp_path / 'two/l/X') in said[0]
+	assert 'l/X' not in files(tmp_path / 'one') and 'l/X' not in files(tmp_path / 'two')
+
+
 def test_a_question_that_is_asked_of_two_parts_ends_unknown_if_one_part_cannot_be_asked(tmp_path, hpcp_mod, monkeypatch):
 	# Unknown, then one name: not one name. Where the first cannot be asked there is no directory to ask the second of.
 	asked = _answering(hpcp_mod, monkeypatch, lambda directory, first, second: None if first.lower() == 'a' else True)
