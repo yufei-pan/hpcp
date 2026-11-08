@@ -31,7 +31,7 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - **Kind:** deferred.
 - **What the operator sees:** with `out/d -> ../elsewhere`, `hpcp src/ -d out/` writes src/d's files into elsewhere and changes elsewhere's mode, and as root its owner, exit 0, as in 9.80. A user who can write the destination can plant `d -> /etc` before root restores into it. `hpcp src/ -d out/ -rme` with `out/d -> ../src/d` removes the link as an extra, and `d` is not mirrored. The same at a file's path, identical or not: with `out/x -> ../t/f`, `t/f` takes the mode, and as root the owner, of `a/x`.
 - **Why:** not a regression (a link there that leads onto a source file is refused, exit 213), and it needs its own decision: refuse as `cp -a` does, or write through without touching the target's mode and owner, since someone with a symlinked data directory may rely on writing through.
-- **Revisit when:** the next hpcp release.
+- **Revisit when:** 9.85.
 - **Approved:** 2026-11-05, the user chose "Deferred to 9.82 (Recommended)".
 
 ### A stored list used under another spelling can match by chance
@@ -45,44 +45,44 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - **Kind:** deferred.
 - **What the operator sees:** `printf 'lb/\n' | hpcp -sfl - lb/x -d out/ -rf`, with `lb` a link to `b`: `out/x` and the link `out/lb -> b` land, `lb` goes and `b/x`, `b/y`, `b/s/z` stay, in every run. Some runs then end with "not removing lb: it, or a directory on its path, is no longer what the copy listed" and exit 192, the others exit 0. Nothing is lost: the tree comes out the same either way.
 - **Why:** the removal of `lb/x` and of the link `lb` run side by side, and the check before removing sees the link already gone. 7617241 does the same (67 runs in 200, against 66).
-- **Revisit when:** the next hpcp release.
+- **Revisit when:** 9.85.
 
 ### A million-entry list holds its jobs in memory
 - **Kind:** deferred.
 - **What the operator sees:** the check before the copy keeps every entry's paths at once: a peak of about 741 bytes more per entry than 7617241 with the copy stubbed out (740 MB for a million), and +143 bytes per file measured in a real copy of 300,000. The extra CPU is nearly all garbage collection over the kept jobs: a stubbed million took 19.08, 20.56 and 22.22 s with it on, 19.26, 19.15 and 19.56 s with it off.
 - **Why:** it reads the jobs twice, and generators need `_settle_destinations` reshaped; the copy works either way.
-- **Revisit when:** the next hpcp release.
+- **Revisit when:** 9.85.
 
 ### A rerun scans the destination directories one by one
 - **Kind:** deferred.
 - **What the operator sees:** a copy onto an existing tree reads each directory it lands in, on one worker, before the first file is copied: about 1 us per file on a local disk, longer on network storage.
 - **Why:** correct and bounded as it is; a parallel scan is its own change.
-- **Revisit when:** the next hpcp release.
+- **Revisit when:** 9.85 (part 2).
 
 ### A source that opens and then fails on read costs the old copy
 - **Kind:** deferred.
 - **What the operator sees:** `cp` truncates the destination before its first read, so a source that opens and then fails (`/proc/self/mem` with an old `out/mem`) ends in exit 190 and the old copy is gone. 9.80 left it empty.
   - With several destinations, a part written through a link at the first destination and the file then taken by the second ends exit 0 with the link's target half written (`hpcp a/ -d out/ -d two/` with `out/x -> ../t/f`).
 - **Why:** keeping it takes a temporary name and a rename, which is its own design; that covers the link case too. It covers landings in a tree only: a name given by `-d` keeps the write-through, because a rename would replace a FIFO named by `-d` and break a pipe feed that works today (a regular file onto a lone FIFO with a reader).
-- **Revisit when:** the next hpcp release.
+- **Revisit when:** 9.85.
 
 ### A FIFO that blocks the copy
 - **Kind:** deferred.
 - **What the operator sees:** a regular file onto a lone FIFO at the destination hangs with or without `-co`, because `cp` writes to it and waits for a reader. As on 9.80. A regular file onto a FIFO with other names does not hang: it lands as a regular file at that name, as `-a` always did, and the other names keep the FIFO.
 - **Why:** rare, and the hang is old. The temporary name and rename above (tree landings only) keeps the name until the copy is whole, and never opens the FIFO; a FIFO named by `-d` keeps today's behaviour, so a feed that works is not broken.
-- **Revisit when:** the next hpcp release.
+- **Revisit when:** 9.85.
 
 ### A named FIFO or socket is copied and still exits 200
 - **Kind:** deferred.
 - **What the operator sees:** `hpcp a/p -d out/` makes the node, prints `Source path type error` and ends exit 200. With `-s` the exit is 0 (9.81 too). A file that is refused is not listed, so a clash adds no such line; a named FIFO whose landing is a directory prints it before the clash, and a device source a user may not make before the `Copy failed`. With `-rf` it is 212 and every named source stays, files included; nothing is lost. The same FIFO in a directory source is skipped silently with exit 0. Same on 9.80.
 - **Why:** old and safe. A named special should either copy cleanly or be skipped as in a tree, and that is its own decision.
-- **Revisit when:** the next hpcp release.
+- **Revisit when:** 9.85.
 
 ### A regular file writes through a device node at the destination
 - **Kind:** deferred.
 - **What the operator sees:** a regular source that lands on a device node, in a tree or named by `-d`, is written through it, with or without `-co`: into the device, or the disk behind it, which on a mounted disk writes over live blocks (reasoned, not run). Without `-co` the node also takes the source's mode and times. A link to a device is the device: a regular file named onto `-d lnk` writes the disk behind it. The same on 9.80. A device or FIFO source no longer does this: since 9.82 it is never read, with or without `-co`, and it never replaces a device (or a link to one) that `-d` names.
 - **Why:** old, and it needs a node where a file belongs. Leaving a destination that is not a regular file alone belongs with the temporary name and rename above. A device named by `-d` may be what the operator meant to write.
-- **Revisit when:** the next hpcp release.
+- **Revisit when:** 9.85.
 
 ### Rerunning an overlapping form is refused
 - **Kind:** known limitation.
@@ -124,7 +124,7 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - **What the operator sees:** on exFAT through FUSE (EL7 and EL8), with `D/f` and `D/sub/f`, `hpcp D/ -d d/sub/` without `-rf` exits 0 and adds `D/sub/sub/f`: `d` is `D`, so the destination is inside the source, and the copy reads the destination's own files and copies them into it, one level deeper each run. The file it adds holds either content, as its copy races with the one that writes `D/f` onto `D/sub/f`. In one spelling (`hpcp D/ -d D/sub/`) the destination is left out of the walk, and `D/sub/f` takes `D/f`'s content as any file of a destination would, so the other spelling adds only the extra copies. The move form, `hpcp D/ -d d/sub/ -rf`, is refused (241), as in one spelling.
 - **Why:** the check that a source holds the destination compares real paths, and FUSE exFAT gives each spelling of one directory a number of its own, so `D` and `d` are two real paths there. Kernel filesystems give both one number, and the check sees one directory.
 - **Plan:** where a source's real path folds like the start of a destination's, ask the directory whether they are one (`_RealPlaces.same_place`), as the move check does, and leave the destination out of the walk as for one spelling.
-- **Revisit when:** the next hpcp release.
+- **Revisit when:** 9.85.
 
 ### A legacy name read as UTF-8 or ASCII, against its other case
 - **Kind:** deferred.
@@ -143,11 +143,11 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - **What the operator sees:** on a vfat mounted with `iocharset=utf8` given explicitly, `hpcp a/ b/ -d out/` with `a/D/f` and `b/d/g` exits 193 (`Directory sync error: .../b/d to .../out/d: [Errno 2] No such file or directory`, then `Copy failed ... No more destination paths to try`), and `g` is not copied; with `-rf` it exits 212 and keeps both sources. Nothing is lost, and 9.82 does the same. Checked on VM 901; vfat with its default charset or `iocharset=iso8859-1`, kernel exFAT, NTFS (`ignore_case`) and ext4 casefold merge the two, exit 0.
 - **Why:** vfat mounted that way looks a name up in its own case only (`out/d` is not found) but will not make it either, as `out/D` holds the name; the copy names the directory as the source spells it.
 - **Plan:** write a merged directory's files under the spelling the directory holds, which `_RealPlaces` knows from asking it, or report the pair as a clash.
-- **Revisit when:** the next hpcp release.
+- **Revisit when:** 9.85.
 
 ### A landing within about 57 characters of PATH_MAX
 - **Kind:** deferred.
 - **What the operator sees:** two names that fold alike landing at a path within about 57 characters of the system's path limit (4096 on Linux) are refused with 213, `refuses the name ... (File name too long)`, because the probe directory makes the path longer. Never a loss; 9.83's earlier probe did the same.
 - **Why:** the probe makes its names at the probe directory's full path.
 - **Plan:** make the probe directory and its names relative to a descriptor of the directory (`dir_fd`), so their length is the name's own.
-- **Revisit when:** the next hpcp release.
+- **Revisit when:** 9.85.
