@@ -832,3 +832,24 @@ def test_a_destination_that_may_be_inside_the_source_and_cannot_be_asked_is_refu
 	_spellings_are_one(hpcp_mod, monkeypatch, None)
 	assert hpcp_mod.hpcp(['D/'], ['d/sub/'], single_thread=True, max_workers=1, batch=True) == 241
 	assert 'may lie inside the source' in capsys.readouterr().err and os.listdir(str(tmp_path / 'd/sub')) == []
+
+
+# ---- entry 7: the probe by descriptors ----
+
+@posix_only
+def test_a_pair_landing_within_a_few_characters_of_path_max_is_asked_and_copied(tmp_path):
+	# A landing directory of 4,066 characters: 9.84 made the probe's names at its full path, past PATH_MAX (213, "File name
+	# too long"). Relative to descriptors a name costs its own length.
+	write(tmp_path / 'a/X', 'upper')
+	write(tmp_path / 'b/x', 'lower')
+	root = str(tmp_path / 'out')
+	parts = []
+	while len(root) + 1 + sum(len(part) + 1 for part in parts) + 200 <= 4066:
+		parts.append('d' * 200)
+	parts.append('e' * (4066 - len(root) - sum(len(part) + 1 for part in parts) - 1))
+	deep = os.path.join(root, *parts)
+	assert len(deep) == 4066
+	os.makedirs(deep)
+	rc, output = run(['a/', 'b/', '-d', deep + '/'], tmp_path)
+	assert rc == 0 and b'File name too long' not in output, output[-2000:]
+	assert read(os.path.join(deep, 'X')) == 'upper' and read(os.path.join(deep, 'x')) == 'lower'

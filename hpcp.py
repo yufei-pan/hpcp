@@ -3634,19 +3634,26 @@ def _can_make_node(src_path, dest_paths):
 	if not existing or not (stat.S_ISBLK(st.st_mode) or stat.S_ISCHR(st.st_mode)):
 		return True
 	for dest in existing:
-		probe = os.path.join(os.path.dirname(dest), '.hpcp-node-probe-%d-%s' % (os.getpid(), uuid.uuid4().hex))
+		name = '.hpcp-node-probe-%d-%s' % (os.getpid(), uuid.uuid4().hex)
+		base = None
 		try:
-			os.mknod(probe, 0o600 | stat.S_IFMT(st.st_mode), st.st_rdev)
+			# Relative to the directory's descriptor where it can be (_ask_names): the name costs its own length.
+			base = os.open(os.path.dirname(dest) or os.curdir, _PARENT_FLAGS) if _PROBE_BY_FD and os.mknod in os.supports_dir_fd else os.path.dirname(dest)
+			os.mknod(*_at(base, name), 0o600 | stat.S_IFMT(st.st_mode), st.st_rdev, **_fd_of(base))
 		except PermissionError:
 			return False
 		except OSError:
 			# This directory cannot answer (a read-only mount, say); the next destination may.
 			continue
-		try:
-			os.unlink(probe)
-		except OSError:
-			pass
-		return True
+		else:
+			try:
+				os.unlink(*_at(base, name), **_fd_of(base))
+			except OSError:
+				pass
+			return True
+		finally:
+			if isinstance(base, int):
+				os.close(base)
 	return True
 
 def _copy_state(path):
@@ -11333,30 +11340,48 @@ def _ask_names(directory, names):
 	them). SIGINT, SIGTERM and SIGHUP wait until the probe is gone. SIGKILL cannot wait, and a signal sent while another
 	thread of the process exists may still reach that thread."""
 	answers, why = {}, {}
-	probe = os.path.join(directory, '.hpcp-case-probe-%d-%s' % (os.getpid(), uuid.uuid4().hex))
+	probe = '.hpcp-case-probe-%d-%s' % (os.getpid(), uuid.uuid4().hex)
 	held = signal.pthread_sigmask(signal.SIG_BLOCK, _STOPS) if hasattr(signal, 'pthread_sigmask') else None
 	try:
+		base = probe_base = None
 		try:
 			st = os.stat(directory)
-			os.mkdir(probe, 0o700)
+			# Relative to descriptors where the platform can (Linux, the BSDs): a name then costs its own length, never the
+			# probe's full path (a landing near PATH_MAX). The directory's by O_PATH: search permission is enough.
+			base = os.open(directory, _PARENT_FLAGS) if _PROBE_BY_FD else directory
+			os.mkdir(*_at(base, probe), 0o700, **_fd_of(base))
 		except OSError as e:
 			failed = e
 		else:
 			made = []
 			try:
-				failed = _make_names(probe, names, made, answers, why)
+				try:
+					probe_base = os.open(probe, _BELOW_FLAGS, dir_fd=base) if _PROBE_BY_FD else os.path.join(directory, probe)
+				except OSError as e:
+					failed = e
+				else:
+					failed = _make_names(probe_base, directory, names, made, answers, why)
 			finally:
 				left = set(made)
-				try:
-					left.update(os.listdir(probe))
-				except OSError:
-					pass
-				undoing = [functools.partial(os.unlink, os.path.join(probe, name)) for name in left]
-				for undo in undoing + [functools.partial(os.rmdir, probe), functools.partial(os.utime, directory, ns=(st.st_atime_ns, st.st_mtime_ns))]:
+				if probe_base is not None:
+					try:
+						left.update(os.listdir(probe_base))
+					except OSError:
+						pass
+				undoing = [functools.partial(os.unlink, *_at(probe_base, name), **_fd_of(probe_base)) for name in left if probe_base is not None]
+				undoing.append(functools.partial(os.rmdir, *_at(base, probe), **_fd_of(base)))
+				# By path: futimens on an O_PATH descriptor fails.
+				undoing.append(functools.partial(os.utime, directory, ns=(st.st_atime_ns, st.st_mtime_ns)))
+				for undo in undoing:
 					try:
 						undo()
 					except OSError:
 						pass
+				if isinstance(probe_base, int):
+					os.close(probe_base)
+		finally:
+			if isinstance(base, int):
+				os.close(base)
 		if failed is not None:
 			answers.clear()
 			why.clear()
@@ -11374,16 +11399,27 @@ def _ask_names(directory, names):
 			signal.pthread_sigmask(signal.SIG_SETMASK, held)
 	return answers, why
 
-def _make_names(probe, names, made, answers, why):
-	"""Make each of names in probe, a new directory (_ask_names), filling answers and why, and made with what was made, in
-	order; each file holds its place in made. The error that stopped it, or None."""
-	directory = os.path.dirname(probe)
+# A probe is made relative to descriptors where every call it makes takes one.
+_PROBE_BY_FD = (os.mkdir in os.supports_dir_fd and os.open in os.supports_dir_fd and os.unlink in os.supports_dir_fd and
+	os.rmdir in os.supports_dir_fd and os.listdir in os.supports_fd and bool(getattr(os, 'O_PATH', 0)))
+
+def _at(base, name):
+	"""(name,) relative to base, a directory's descriptor, or (its path,) below base, a path."""
+	return (name,) if isinstance(base, int) else (os.path.join(base, name),)
+
+def _fd_of(base):
+	return {'dir_fd': base} if isinstance(base, int) else {}
+
+def _make_names(probe, directory, names, made, answers, why):
+	"""Make each of names in probe (a descriptor or a path: _at), the new directory _ask_names made in directory, filling
+	answers and why, and made with what was made, in order; each file holds its place in made. The error that stopped it,
+	or None."""
 	for name in names:
 		try:
-			fd = os.open(os.path.join(probe, name), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+			fd = os.open(*_at(probe, name), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, **_fd_of(probe))
 		except FileExistsError:
 			# Made, not looked up: vfat with iocharset=utf8 finds only the one spelling, and still refuses the other.
-			holder, reasons = (made[0], ()) if len(made) == 1 else _holder(probe, name, made)
+			holder, reasons = (made[0], ()) if len(made) == 1 else _holder(probe, directory, name, made)
 			if holder is None:
 				why[name] = '; '.join([f'{directory} takes {name} for a name it holds, and cannot say which'] + list(dict.fromkeys(reasons)))
 			else:
@@ -11404,19 +11440,19 @@ def _make_names(probe, names, made, answers, why):
 		answers[name] = name
 	return None
 
-def _holder(probe, name, made):
-	"""Which of made, the names made in probe so far, holds name, that is there already, and why the questions that could not
-	say could not: (the name or None, reasons). The file says; where it cannot (a lookup that misses the spelling it refused, a
-	write that found no space), each one is asked on its own."""
+def _holder(probe, directory, name, made):
+	"""Which of made, the names made in probe (_make_names) so far, holds name, that is there already, and why the questions
+	that could not say could not: (the name or None, reasons). The file says; where it cannot (a lookup that misses the
+	spelling it refused, a write that found no space), each one is asked on its own."""
 	try:
-		fd = os.open(os.path.join(probe, name), os.O_RDONLY)
+		fd = os.open(*_at(probe, name), os.O_RDONLY, **_fd_of(probe))
 		try:
 			return made[int(os.read(fd, 32))], ()
 		finally:
 			os.close(fd)
 	except (OSError, ValueError, IndexError):
 		pass
-	directory, reasons = os.path.dirname(probe), []
+	reasons = []
 	for other in made:
 		answers, why = _ask_names(directory, [other, name])
 		if answers.get(name) == other:

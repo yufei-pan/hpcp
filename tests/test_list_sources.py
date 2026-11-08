@@ -4275,18 +4275,39 @@ def test_a_refused_named_fifo_is_reported_once(tmp_path):
 
 # ---- 9.83: a destination that folds case ----
 
+def _spelled(path, kwargs):
+	"""path as a full path: one relative to a dir_fd (the probe makes its names so since 9.85) joined to where it leads."""
+	path = os.fspath(path)
+	dir_fd = kwargs.get('dir_fd')
+	if dir_fd is None or os.path.isabs(path):
+		return path
+	try:
+		return os.path.join(os.readlink('/proc/self/fd/%d' % dir_fd), path)
+	except OSError:
+		return path
+
+
 def _fold_probes(monkeypatch):
 	"""The real question (_ask_names), on a filesystem that does not fold: names made in its probe directory fold (NFD,
 	casefold and no trailing dots), as in a folding directory. So a file that lands at all was not refused. On a real one, test_rme_mounts.py."""
 	import unicodedata
-	def folded(path):
+	def folded(path, dir_fd=None):
+		# A name made relative to the probe's descriptor (9.85) or below its path.
 		directory, name = os.path.split(os.fspath(path))
+		if dir_fd is not None and not directory:
+			try:
+				directory = os.readlink('/proc/self/fd/%d' % dir_fd)
+			except OSError:
+				return path
+			if os.path.basename(directory).startswith('.hpcp-case-probe-'):
+				return unicodedata.normalize('NFD', name).casefold().rstrip('.')
+			return path
 		if os.path.basename(directory).startswith('.hpcp-case-probe-'):
 			return os.path.join(directory, unicodedata.normalize('NFD', name).casefold().rstrip('.'))
 		return path
 	real_open, real_unlink = os.open, os.unlink
-	monkeypatch.setattr(os, 'open', lambda path, *args, **kwargs: real_open(folded(path), *args, **kwargs))
-	monkeypatch.setattr(os, 'unlink', lambda path, *args, **kwargs: real_unlink(folded(path), *args, **kwargs))
+	monkeypatch.setattr(os, 'open', lambda path, *args, **kwargs: real_open(folded(path, kwargs.get('dir_fd')), *args, **kwargs))
+	monkeypatch.setattr(os, 'unlink', lambda path, *args, **kwargs: real_unlink(folded(path, kwargs.get('dir_fd')), *args, **kwargs))
 
 
 def _answering(hpcp_mod, monkeypatch, pair):
@@ -5183,7 +5204,8 @@ def test_a_name_the_directory_refuses_says_so_and_not_to_make_it_writable(tmp_pa
 	monkeypatch.chdir(tmp_path)
 	real = os.open
 	def refusing(path, *args, **kwargs):
-		if '.hpcp-case-probe-' in os.fspath(path):
+		# A name made in the probe, not the probe itself, which 9.85 opens to make its names relative to it.
+		if args and args[0] & os.O_CREAT and '.hpcp-case-probe-' in _spelled(path, kwargs):
 			raise OSError(errno.EINVAL, 'Invalid argument', path)
 		return real(path, *args, **kwargs)
 	write(tmp_path / 'a/X', '1')
@@ -5430,11 +5452,11 @@ def _probes_folding_case(monkeypatch, readable=True):
 	iocharset=utf8 finds only the one spelling)."""
 	real = os.open
 	def opening(path, flags, *args, **kwargs):
-		directory, name = os.path.split(os.fspath(path))
+		directory, name = os.path.split(_spelled(path, kwargs))
 		if os.path.basename(directory).startswith('.hpcp-case-probe-'):
 			if not readable and not flags & os.O_CREAT:
 				raise FileNotFoundError(errno.ENOENT, 'No such file or directory', path)
-			path = os.path.join(directory, name.lower())
+			path = os.path.join(os.path.dirname(os.fspath(path)), name.lower())
 		return real(path, flags, *args, **kwargs)
 	monkeypatch.setattr(os, 'open', opening)
 
@@ -5459,7 +5481,7 @@ def test_a_probe_whose_files_cannot_be_written_still_says_which_name_is_which(tm
 def test_a_probe_file_that_cannot_be_made_says_what_fixes_that_and_not_that_the_name_is_refused(tmp_path, hpcp_mod, monkeypatch, number, fix):
 	real = os.open
 	def failing(path, *args, **kwargs):
-		if '.hpcp-case-probe-' in os.fspath(path) and os.path.basename(path) == 'x':
+		if '.hpcp-case-probe-' in _spelled(path, kwargs) and os.path.basename(os.fspath(path)) == 'x':
 			raise OSError(number, os.strerror(number), path)
 		return real(path, *args, **kwargs)
 	monkeypatch.setattr(os, 'open', failing)
@@ -5508,7 +5530,7 @@ def test_a_name_that_is_there_already_but_alone_with_none_is_one_that_cannot_be_
 	# The directory takes z for a name it holds once a and b are made, and for neither of them alone: no answer is a guess.
 	real = os.open
 	def opening(path, flags, *args, **kwargs):
-		directory, name = os.path.split(os.fspath(path))
+		directory, name = os.path.split(_spelled(path, kwargs))
 		if name == 'z' and flags & os.O_CREAT and len(os.listdir(directory)) > 1:
 			raise FileExistsError(errno.EEXIST, 'File exists', path)
 		return real(path, flags, *args, **kwargs)
@@ -5581,7 +5603,7 @@ def test_a_name_that_is_there_already_says_why_each_made_name_alone_could_not_sa
 	# Asked alone, a then b: the first question finds no space, the second no permission. Both reasons are the fix.
 	real_open, real_mkdir, probes = os.open, os.mkdir, []
 	def opening(path, flags, *args, **kwargs):
-		directory, name = os.path.split(os.fspath(path))
+		directory, name = os.path.split(_spelled(path, kwargs))
 		if name == 'z' and flags & os.O_CREAT and len(os.listdir(directory)) > 1:
 			raise FileExistsError(errno.EEXIST, 'File exists', path)
 		if not flags & os.O_CREAT and name == 'z':
