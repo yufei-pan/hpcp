@@ -1462,14 +1462,21 @@ def test_rme_never_removes_what_lies_deep_in_a_source_or_a_link_a_source_holds_o
 	assert not os.path.exists('out/extra') and open('out/f').read() == 'F'
 
 
-def test_rme_asks_about_sources_once_a_directory_not_once_an_extra(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+@pytest.mark.parametrize('extra', ['file', 'link'])
+def test_rme_asks_about_sources_once_a_directory_not_once_an_extra(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch, extra):
 	# On NFS with actimeo=0 each stat is a round trip: 9.84 at a1d61e8 took a realpath (an lstat of each part) and a stat for
-	# every extra, 52 s for 10,000 extras where the walk took 0.35 s.
+	# every extra, 52 s for 10,000 extras where the walk took 0.35 s. 9.84 still lstat'ed each extra link.
+	if extra == 'link' and os.name == 'nt':
+		pytest.skip('symlinks')
 	monkeypatch.chdir(tmp_path)
 	_write('b/f', 'f')
 	_write('out/sub/x', 'S')
+	os.makedirs('out/b/many')
 	for i in range(500):
-		_write('out/b/many/%d' % i, 'e')
+		if extra == 'link':
+			os.symlink('nowhere', 'out/b/many/%d' % i)
+		else:
+			_write('out/b/many/%d' % i, 'e')
 	calls, inside = [0], [False]
 	for name in ('stat', 'lstat'):
 		real = getattr(os, name)

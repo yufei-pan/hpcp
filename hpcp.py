@@ -8568,7 +8568,7 @@ def _source_guard(src_paths):
 	it; kind 'dir', 'file' or 'link') is a source or lies in one, whatever the destination calls it: a source named
 	inside the destination (hpcp out/sub/ b/ -d out/, a list entry inside it), a named link. Asked by identity,
 	(st_dev, st_ino). The walks never follow a link, so each directory they found is what its name says: one stat of each
-	(once) answers for everything below it, and a file is stat'ed only in a directory that holds a file source. A link is
+	(once) answers for everything below it, and a file or a link is stat'ed only in a directory that holds a file source. A link is
 	judged as a link, never by where it leads: one that leads into a source is an extra like any other (a move that would
 	land a file on its source is refused before any copy). (A directory that holds a source holds something, so it is
 	never removed.) src_paths: the sources as named, those the copy left in place too."""
@@ -8626,9 +8626,13 @@ def _source_guard(src_paths):
 		inside, parent = directory(os.path.dirname(path))
 		if inside:
 			return True
+		if parent not in file_parents:
+			# No file or link source is in this directory: asked once a directory, not once an extra (an lstat each on NFS).
+			return False
 		if kind != 'link':
-			return parent in file_parents and identity(path) in files
+			return identity(path) in files
 		# A link is itself a source only when it is a named one (copied as a link): where it leads does not make it one.
+		# A named link, dangling too, put its own directory in file_parents.
 		try:
 			st = os.lstat(path)
 		except OSError:
