@@ -1286,18 +1286,40 @@ def test_rme_never_removes_a_source_inside_the_destination(tmp_path, hpcp_mod, r
 
 
 @pytest.mark.skipif(not hasattr(os, 'symlink') or os.name == 'nt', reason='symlinks')
-def test_rme_never_removes_a_link_that_leads_into_a_source(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
-	# out/d -> ../src/d: the copy of src/d/f is src/d/f itself, through the link; 9.83 removed the link, and with it the
-	# destination's only view of d/f. A link that leads elsewhere is still extra.
+def test_rme_removes_a_destination_link_that_leads_into_a_source_as_an_extra(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch, capsys):
+	# Where a link leads makes it no source. Kept, it stayed on every run and src/d was never mirrored (9.83 removed it).
+	# 1. out/d -> ../src/d at src/d's landing: the first run removes it, the second mirrors d.
+	# 2. a link left by a source that is gone (an absolute one into the tree) is an extra, not kept for its target's sake.
 	monkeypatch.chdir(tmp_path)
 	_write('src/d/f', 'F')
-	_write('src/g', 'G')
+	_write('src/rel/v1', 'V')
 	_write('elsewhere/z', 'Z')
 	os.makedirs('out')
 	os.symlink(os.path.join('..', 'src', 'd'), 'out/d')
 	os.symlink(os.path.join('..', 'elsewhere'), 'out/l')
+	os.symlink(os.path.abspath('src/rel/v1'), 'out/old')
 	assert _rme_answered(hpcp_mod, monkeypatch, ['src/']) == 0
-	assert os.path.islink('out/d') and not os.path.lexists('out/l') and open('src/d/f').read() == 'F' and open('elsewhere/z').read() == 'Z'
+	assert 'Not removing' not in capsys.readouterr().out
+	assert not any(os.path.lexists('out/' + name) for name in ('old', 'l')) and not os.path.islink('out/d')
+	assert open('src/d/f').read() == 'F' and open('src/rel/v1').read() == 'V' and open('elsewhere/z').read() == 'Z'
+	assert _rme_answered(hpcp_mod, monkeypatch, ['src/']) == 0
+	assert open('out/d/f').read() == 'F' and not os.path.islink('out/d') and open('src/d/f').read() == 'F'
+
+
+@pytest.mark.skipif(not hasattr(os, 'symlink') or os.name == 'nt', reason='symlinks')
+@pytest.mark.parametrize('flags', [{'remove': True}, {'remove': True, 'remove_extra': True}], ids=['move', 'move-rme'])
+def test_a_move_onto_a_link_that_leads_to_its_source_is_still_refused_before_any_copy(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch, flags):
+	# The case the removed rule was written for: out/d -> ../src/d with src/ moved. Refused as landing on itself, nothing touched.
+	monkeypatch.chdir(tmp_path)
+	_write('src/d/f', 'F')
+	_write('src/g', 'G')
+	os.makedirs('out')
+	os.symlink(os.path.join('..', 'src', 'd'), 'out/d')
+	monkeypatch.setattr(sys.stdin, 'isatty', lambda: True)
+	monkeypatch.setattr('builtins.input', lambda *args: 'y')
+	rc = hpcp_mod.hpcp(['src/'], ['out/'], single_thread=True, max_workers=1, batch=True, **flags)
+	assert rc == 213
+	assert open('src/d/f').read() == 'F' and open('src/g').read() == 'G' and os.path.islink('out/d') and not os.path.exists('out/g')
 
 
 @pytest.mark.skipif(not hasattr(os, 'symlink') or os.name == 'nt', reason='symlinks')

@@ -29,7 +29,7 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 
 ### Destination symlink at a directory's path
 - **Kind:** deferred.
-- **What the operator sees:** with `out/d -> ../elsewhere`, `hpcp src/ -d out/` writes src/d's files into elsewhere and changes elsewhere's mode, and as root its owner, exit 0, as in 9.80. A user who can write the destination can plant `d -> /etc` before root restores into it. `hpcp src/ -d out/ -rme` with `out/d -> ../src/d` keeps the link, which leads into a source (9.83 removed it as an extra), and `d` is not mirrored. The same at a file's path, identical or not: with `out/x -> ../t/f`, `t/f` takes the mode, and as root the owner, of `a/x`.
+- **What the operator sees:** with `out/d -> ../elsewhere`, `hpcp src/ -d out/` writes src/d's files into elsewhere and changes elsewhere's mode, and as root its owner, exit 0, as in 9.80. A user who can write the destination can plant `d -> /etc` before root restores into it. `hpcp src/ -d out/ -rme` with `out/d -> ../src/d` removes the link as an extra, and `d` is not mirrored. The same at a file's path, identical or not: with `out/x -> ../t/f`, `t/f` takes the mode, and as root the owner, of `a/x`.
 - **Why:** not a regression (a link there that leads onto a source file is refused, exit 213), and it needs its own decision: refuse as `cp -a` does, or write through without touching the target's mode and owner, since someone with a symlinked data directory may rely on writing through.
 - **Revisit when:** the next hpcp release.
 - **Approved:** 2026-11-05, the user chose "Deferred to 9.82 (Recommended)".
@@ -159,3 +159,10 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - **Plan:** make the probe directory and its names relative to a descriptor of the directory (`dir_fd`), so their length is the name's own.
 - **Revisit when:** the next hpcp release.
 
+### vfat: files dated before 1980 are copied again on every rerun
+- **Kind:** deferred (9.85).
+- **What the operator sees:** on vfat, a copy rerun copies every file dated before 1980 again, as 9.83 did (2000 of 2000 in the EL8 test). FAT cannot store a time before 1980, so the landing's time never matches the source's.
+- **Why:** the skip check does not read the files when only the time disagrees; the 9.84 move backstop does (`_same_contents`).
+- **Plan:** let the skip check read both files on a time-only mismatch, as the backstop does. That costs two reads instead of one copy.
+- **Revisit when:** 9.85.
+- **Noted:** 2026-11-07, the user's standing rule that deferrals are noted, not asked.

@@ -140,7 +140,8 @@ entries go last, in the same commit as the change:
 
 ## 2026-11-07 A mirror judges only what a source speaks for
 - Changed: `-rme` judges only below where a directory source lands (all of `out/` for `src/`, `out/b` for `b`), for positional sources as for a list, and never removes what is a source, lies in one or holds one, asked by identity (`(st_dev, st_ino)` of each source and the directories above it, against the extra's real path).
-- Why we had to change: `hpcp b -d out/ -rme` lands in `out/b` but deleted `out/keep`; `hpcp out/sub/ b/ -d out/ -rme` deleted `out/sub/x`, a source and the only copy of what `b/x` replaced; and a link `out/d -> ../src/d` was removed as extra though the copy of `src/d` was `src/d` itself through it.
+- Why we had to change: `hpcp b -d out/ -rme` lands in `out/b` but deleted `out/keep`; `hpcp out/sub/ b/ -d out/ -rme` deleted `out/sub/x`, a source and the only copy of what `b/x` replaced.
+- Corrected the same day: the first version also kept a link that leads into a source (`out/d -> ../src/d`), taking it for the source's own copy. That protected nothing (a move that would land on its source is refused before any copy, and the backstop runs after `-rme`) and kept a real extra on every run, so `d` was never mirrored. A link is judged as a link: it is a source only when named as one, and 9.83's removal stands.
 - Original design was wrong because: "extra" was computed as "in the destination and not in the copy", over the whole destination, by path. A source says what to copy to one place; it says nothing about the rest of the destination, and a path's spelling in the destination says nothing about what it is.
 - Lesson: a cleanup judges only the part a given source speaks for, and asks of each thing it would remove what it is (identity), not where it was found; whatever is a source is never extra.
 

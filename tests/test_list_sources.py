@@ -1069,6 +1069,39 @@ def test_a_skipped_directory_entry_is_no_listed_directory_for_rme(work, hpcp_mod
 	assert (work / 'out/gone/stale').exists() and '-rme checked nothing' in output and 'inside the destination' in output
 
 
+@pytest.mark.parametrize('entries', [b'out\nb\n', b'out/\nb\n', b'./out\n./b\n', b'b\nout/b/sub/f\nout\n'], ids=['name', 'slash', 'dot-slash', 'with-an-entry-inside'])
+def test_a_list_that_names_the_destination_checks_nothing_as_an_argument_does(tmp_path, hpcp_mod, reset_hpcp_globals, at_a_tty, monkeypatch, capsys, entries):
+	# hpcp out b -d out -rme keeps all of out, with one note; a list naming out (or ./out) is the same source. 9.84 at 3c7dcc9
+	# walked out/b and printed "Not removing" for each extra instead (a1d61e8 and 9.83 deleted them).
+	monkeypatch.chdir(tmp_path)
+	def build():
+		shutil.rmtree('out', ignore_errors=True)
+		write(tmp_path / 'b/f', 'F')
+		write(tmp_path / 'out/b/stale', 'S')
+		write(tmp_path / 'out/b/sub/f', 'only copy')
+		write(tmp_path / 'out/other', 'O')
+	build()
+	assert hpcp_mod.hpcp(['out', 'b'], dest_paths=['out'], single_thread=True, remove_extra=True) == 0
+	positional = capsys.readouterr().out, files(tmp_path / 'out')
+	build()
+	assert hpcp_list(hpcp_mod, tmp_path, entries, remove_extra=True) == 0
+	listed = capsys.readouterr().out, files(tmp_path / 'out')
+	assert listed[1] == positional[1] and set(listed[1]) >= {b'b/stale', b'b/sub/f', b'other', b'b/f'}
+	for output, _ in (positional, listed):
+		assert output.count('-rme checked nothing: a source is or holds the destination') == 1 and 'Not removing' not in output
+
+
+def test_a_list_entry_inside_the_destination_that_is_not_the_destination_is_still_judged_and_kept(tmp_path, hpcp_mod, reset_hpcp_globals, at_a_tty, monkeypatch, capsys):
+	# The entry out/b/sub/f is named and kept; extras around it go, as before the destination itself was a list entry's question.
+	monkeypatch.chdir(tmp_path)
+	write(tmp_path / 'b/f', 'F')
+	write(tmp_path / 'out/b/sub/f', 'only copy')
+	write(tmp_path / 'out/b/stale', 'S')
+	assert hpcp_list(hpcp_mod, tmp_path, b'out/b/sub/f\nb\n', remove_extra=True) == 0
+	output = capsys.readouterr().out
+	assert files(tmp_path / 'out') == {b'b/f': b'F', b'b/sub/f': b'only copy'} and '-rme checked nothing' not in output
+
+
 # A source that is another source's destination.
 
 def test_a_source_that_another_source_would_overwrite_is_a_clash(tmp_path):

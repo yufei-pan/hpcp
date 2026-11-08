@@ -8516,7 +8516,7 @@ def remove_extra_dirs(src_paths, dests,exclude=None,dest_image=False,keep=(),des
 				if (not in_source and not _is_kept(os.path.abspath(dest_dir_path), kept, os.path.abspath(dest), copied_roots)
 						and (scope is None or any(part in scope for part in _path_and_parents(os.path.abspath(dest_dir_path))))):
 					if guarded(dest_dir_path, 'dir'):
-						print(f"Not removing {dest_dir_path}: it is a source, or lies in one or leads into one")
+						print(f"Not removing {dest_dir_path}: it is a source or lies in one")
 					else:
 						extraDirs[os.path.abspath(dest_dir_path)] = (os.path.abspath(dest), dest_dir_path)
 			# Excluded trees and other filesystems are never walked into.
@@ -8556,11 +8556,12 @@ def _landing_in_other_spelling(source, dest, relative, listings, places):
 def _source_guard(src_paths):
 	"""-rme's last word on a path it found extra: guarded(path, kind) is True when path (as the destination's walk spells
 	it; kind 'dir', 'file' or 'link') is a source or lies in one, whatever the destination calls it: a source named
-	inside the destination (hpcp out/sub/ b/ -d out/, a list entry inside it), a link in it that leads into a source (out/d
-	-> ../src/d). Asked by identity, (st_dev, st_ino). The walks never follow a link, so each directory they found is
-	what its name says: one stat of each (once) answers for everything below it, and a file is stat'ed only in a directory
-	that holds a file source. A link is followed, by its real path. (A directory that holds a source holds something, so it
-	is never removed; a link to it is removed as a link.) src_paths: the sources as named, those the copy left in place too."""
+	inside the destination (hpcp out/sub/ b/ -d out/, a list entry inside it), a named link. Asked by identity,
+	(st_dev, st_ino). The walks never follow a link, so each directory they found is what its name says: one stat of each
+	(once) answers for everything below it, and a file is stat'ed only in a directory that holds a file source. A link is
+	judged as a link, never by where it leads: one that leads into a source is an extra like any other (a move that would
+	land a file on its source is refused before any copy). (A directory that holds a source holds something, so it is
+	never removed.) src_paths: the sources as named, those the copy left in place too."""
 	def identity(path):
 		try:
 			st = os.stat(path)
@@ -8617,16 +8618,12 @@ def _source_guard(src_paths):
 			return True
 		if kind != 'link':
 			return parent in file_parents and identity(path) in files
+		# A link is itself a source only when it is a named one (copied as a link): where it leads does not make it one.
 		try:
 			st = os.lstat(path)
-			if (st.st_dev, st.st_ino) in files:
-				return True
 		except OSError:
 			return False
-		real = os.path.realpath(path)
-		found = identity(real)
-		# A link that leads nowhere leads into no source.
-		return found is not None and (found in files or found in dirs or directory(os.path.dirname(real))[0])
+		return (st.st_dev, st.st_ino) in files
 	return guarded
 
 def _directory_sources(mapping):
@@ -8853,7 +8850,7 @@ def remove_extra_files(total_file_list, dests,max_workers,verbose,files_per_job,
 						if (not _excluded_at_source(path, mapping, exclude, excluded_roots=excluded_roots) and not _is_kept(path, kept, dest_abs_root, copied_roots)
 								and not _in_root_lost_and_found(path, dest_abs_root)):
 							if guarded(path, 'link' if path in link_paths else 'file'):
-								print(f"Not removing {path}: it is a source, or lies in one or leads into one")
+								print(f"Not removing {path}: it is a source or lies in one")
 								continue
 							inDestNotInSrc.add(path)
 							extra_roots[path] = dest_abs_root
@@ -9352,7 +9349,11 @@ def _inside_destinations(src_paths, dests, places):
 		spellings = (path, places.directory(path) if directory else places.place(path))
 		if isinstance(src, _ListedSource) and any(spelling in roots or spelling.startswith(prefixes) for spelling in spellings):
 			if os.path.isabs(src) or not _lands_elsewhere(spellings, src.landing, roots, real_cwd):
-				skipped += 1
+				if directory and any(spelling in roots for spelling in spellings):
+					# The destination itself, named by a list as by an argument: all that is in it belongs to that source (-rme checks nothing).
+					left_out.append(path)
+				else:
+					skipped += 1
 				continue
 		if directory and not isinstance(src, _ListedSource) and any(places.directory(os.path.abspath(dest)) == spellings[1] and
 				_source_dest(src, dest) != os.path.abspath(dest) for dest in dests):
