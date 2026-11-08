@@ -116,7 +116,7 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - **What the operator sees:** with several `-d`, two names that one destination takes for one name (`a/X` and `b/x`, the second `-d` folding case) are a clash, exit 213, though both would have fitted on another destination that keeps them apart. The same holds for a file and a directory of another source (`a/X` and `b/x/`). It is a false 213 for that pair, never a lost file.
 - **Why:** files spill from one destination to the next as space runs out, and `-rds` picks at random, so which destination gets each file is not known before the copy.
 - **Revisit when:** someone hits it.
-- **Approved:** 2026-11-06, the user chose "Known limitation (Recommended)".
+- **Approved:** 2026-11-06, the user chose "Known limitation (Recommended)". Widened to a file and a directory of another source: 2026-11-07, the user chose "Keep it (Recommended)".
 
 ### A probe left behind by SIGKILL
 - **Kind:** known limitation.
