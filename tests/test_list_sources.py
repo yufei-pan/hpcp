@@ -4988,19 +4988,23 @@ def test_a_later_destination_is_asked_once_about_a_file_and_the_directories_it_m
 
 
 @pytest.mark.parametrize('listed', ['l/x/f', 'l/x/m/f'])
-def test_a_file_and_the_directory_a_listed_path_implies_in_a_later_destination_are_a_clash(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch, capsys, listed):
+@pytest.mark.parametrize('dests, remove', [(['one/', 'two/'], False), (['two/'], True)], ids=['later-destination', 'one-destination-move'])
+def test_a_file_and_the_directory_a_listed_path_implies_in_a_later_destination_are_a_clash(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch, capsys, listed,
+		dests, remove):
 	# A listed l/x/f, or l/x/m/f, implies the directory l/x, which a later destination takes for a/l/X. The net did not see the
 	# directories a listed path implies, so the check never ran: with -nds -rds the file was written into l/x as it was made,
-	# exit 0 and one content gone in 2 to 4 of 10 runs of 100 such pairs (vfat).
+	# exit 0 and one content gone in 2 to 4 of 10 runs of 100 such pairs (vfat). The same in the only destination, moved:
+	# both sources stay.
 	monkeypatch.chdir(tmp_path)
 	write(tmp_path / listed, 'below')
 	write(tmp_path / 'a/l/X', 'file')
 	(tmp_path / 'the-list').write_text(listed + '\n')
 	_answering(hpcp_mod, monkeypatch, lambda directory, first, second: os.path.basename(os.path.dirname(directory)) == 'two' or os.path.basename(directory) == 'two')
-	assert hpcp_mod.hpcp(['a/'], ['one/', 'two/'], source_file_list='the-list', single_thread=True, max_workers=1, batch=True) == 213
+	assert hpcp_mod.hpcp(['a/'], dests, source_file_list='the-list', single_thread=True, max_workers=1, batch=True, remove=remove, remove_force=remove) == 213
 	said = [line for line in capsys.readouterr().err.splitlines() if 'is a directory of another source where the destination folds case' in line]
 	assert said and str(tmp_path / 'two/l/X') in said[0]
 	assert 'l/X' not in files(tmp_path / 'one') and 'l/X' not in files(tmp_path / 'two')
+	assert (tmp_path / 'a/l/X').read_text() == 'file' and (tmp_path / listed).read_text() == 'below'
 
 
 def test_a_question_that_is_asked_of_two_parts_ends_unknown_if_one_part_cannot_be_asked(tmp_path, hpcp_mod, monkeypatch):
