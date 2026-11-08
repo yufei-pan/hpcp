@@ -161,8 +161,16 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 
 ### vfat: files dated before 1980 are copied again on every rerun
 - **Kind:** deferred (9.85).
-- **What the operator sees:** on vfat, a copy rerun copies every file dated before 1980 again, as 9.83 did (2000 of 2000 in the EL8 test). FAT cannot store a time before 1980, so the landing's time never matches the source's.
+- **What the operator sees:** on vfat, a copy rerun copies every file dated before 1980 again, as 9.83 did (in the EL8 test, each such file and no other). FAT cannot store a time before 1980, so the landing's time never matches the source's.
 - **Why:** the skip check does not read the files when only the time disagrees; the 9.84 move backstop does (`_same_contents`).
-- **Plan:** let the skip check read both files on a time-only mismatch, as the backstop does. That costs two reads instead of one copy.
+- **Plan:** let the skip check read both files when the landing's time is one the filesystem could not keep (a source dated before vfat's floor, 1980-01-01, 315532800), as the backstop does. That costs two reads instead of one copy, for those files only; reading on every time-only mismatch would read each changed file of the same size twice before copying it anyway.
+- **Revisit when:** 9.85.
+- **Noted:** 2026-11-07, the user's standing rule that deferrals are noted, not asked.
+
+### A list entry that is a link to the destination is taken for a source
+- **Kind:** deferred (9.85).
+- **What the operator sees:** `printf 'outl\nb\n' | hpcp -sfl - -d out -rme`, with `outl -> out`, removes no extra and prints "Not removing" for each one, with no "-rme checked nothing" note; 9.83 cleaned `out/b`. Every version, 9.83 too, also copies the link in as `out/outl`, a link to its own directory. Nothing is lost.
+- **Why:** `_inside_destinations` takes only a real directory for the destination (`isdir and not islink`), so the link is copied as a source, and `-rme`'s guard keeps what it leads to: the whole destination.
+- **Plan:** a named link whose target is a destination is left out as the destination itself is, with the one note. That also stops the junk link.
 - **Revisit when:** 9.85.
 - **Noted:** 2026-11-07, the user's standing rule that deferrals are noted, not asked.
