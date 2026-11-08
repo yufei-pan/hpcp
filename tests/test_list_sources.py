@@ -3586,9 +3586,9 @@ def test_a_failed_write_through_a_device_the_destination_names_leaves_the_node(t
 @needs_root
 @pytest.mark.parametrize('where', ['named', 'tree'])
 @pytest.mark.parametrize('flags', [[], ['-co']], ids=['plain', 'co'])
-def test_a_regular_file_onto_a_device_node_writes_through_as_before(tmp_path, flags, where):
-	# No -co rule for this: a regular source is cp -f, which keeps the node as it was (cp -a gives it the source's mode). The
-	# proper fix is a temporary name (docs/limitations.md).
+def test_a_regular_file_onto_a_device_node_named_writes_through_and_in_a_tree_is_replaced(tmp_path, flags, where):
+	# Named with -d: written through as cp does, the node kept as it was (cp -f; cp -a gives it the source's mode). In a tree
+	# (since 9.85): replaced by the file, never opened (9.84 wrote the file into the device).
 	write(tmp_path / 'a/f', 'F')
 	os.chmod(tmp_path / 'a/f', 0o640)
 	os.makedirs(tmp_path / 'out')
@@ -3598,6 +3598,9 @@ def test_a_regular_file_onto_a_device_node_writes_through_as_before(tmp_path, fl
 	before = os.lstat(node)
 	rc, output = _run_bounded(['a/f', '-d', str(node) if where == 'named' else 'out/'] + flags, tmp_path, seconds=30)
 	after = os.lstat(node)
+	if where == 'tree':
+		assert rc == 0 and stat.S_ISREG(after.st_mode) and node.read_text() == 'F', (rc, output[-2000:])
+		return
 	assert rc == 0 and (after.st_ino, after.st_rdev) == (before.st_ino, before.st_rdev) and stat.S_ISCHR(after.st_mode), (rc, output[-2000:])
 	if flags:
 		assert (after.st_mode, after.st_mtime_ns) == (before.st_mode, before.st_mtime_ns)
@@ -3741,14 +3744,13 @@ def test_a_regular_file_onto_a_link_to_a_device_writes_through_as_before(tmp_pat
 @pytest.mark.parametrize('flags', [[], ['-co'], ['-nb'], ['-co', '-s']], ids=' '.join)
 def test_a_device_among_several_destinations_leaves_the_others_their_files(tmp_path, order, flags):
 	# Several -d are spill-over: each file lands on one. The device is passed over with a note, the file goes where it can,
-	# and the run ends as any other run of that source (200 for a named node), not in a clash.
+	# and the run ends as any other run of that source (0 for a named node since 9.85, as cp copies it), not in a clash.
 	before = _bare_and_source(tmp_path)
 	dests = ['-d', 'out/', '-d', 'bare'] if order == 'dir-first' else ['-d', 'bare', '-d', 'out/']
 	rc, output = _run_bounded(['a/n'] + dests + flags, tmp_path, seconds=30)
 	assert _same_node(tmp_path / 'bare', before), output[-2000:]
 	assert stat.S_ISCHR(os.lstat(tmp_path / 'out/n').st_mode) and os.lstat(tmp_path / 'out/n').st_rdev == os.makedev(1, 5), (rc, output[-2000:])
-	# 200 as for any named node (a serial run, -s, exits 0 for one: the same on 9.81)
-	assert rc == (0 if '-s' in flags else 200) and b'Destination clash' not in output and b'leaving it out' in output, (rc, output[-2000:])
+	assert rc == 0 and b'Destination clash' not in output and b'leaving it out' in output, (rc, output[-2000:])
 
 
 @needs_root

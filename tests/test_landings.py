@@ -47,6 +47,11 @@ def write(path, content='x'):
 		f.write(content if isinstance(content, bytes) else content.encode())
 
 
+def _user_xattrs(path):
+	# The user.* names only: a host with SELinux labels every file (security.selinux), the copy's own label not a carry.
+	return sorted(name for name in os.listxattr(str(path)) if name.startswith('user.'))
+
+
 def read(path):
 	with open(str(path), 'rb') as f:
 		return f.read().decode()
@@ -161,6 +166,12 @@ def test_a_rename_that_is_refused_goes_in_place_at_once(tmp_path, hpcp_mod, rese
 def test_a_sticky_directory_keeps_9_84_s_outcome_for_another_user_s_file(tmp_path):
 	# The re-review's stickyprobe: a root-owned sticky directory, another user's 0666 file, a growing source, run as nobody.
 	# The rename over it is refused (EPERM): written in place, as 9.84 did; the content is new and the owner kept.
+	for path in (os.path.realpath(sys.executable), os.path.realpath(HPCP), str(tmp_path)):
+		above = os.path.dirname(path)
+		while above != os.path.dirname(above):
+			if not os.stat(above).st_mode & stat.S_IXOTH:
+				pytest.skip(f'nobody cannot reach {path}: {above} is not searchable by others')
+			above = os.path.dirname(above)
 	os.chmod(str(tmp_path), 0o755)
 	os.makedirs(str(tmp_path / 'out'))
 	os.chmod(str(tmp_path / 'out'), 0o1777)
@@ -400,7 +411,7 @@ def test_a_rewrite_carries_the_source_s_xattrs_only(tmp_path):
 		pytest.skip('no user xattrs here')
 	rc, output = run(['a/', '-d', 'out/'], tmp_path)
 	assert rc == 0, output[-2000:]
-	assert os.listxattr(str(tmp_path / 'out/x')) == ['user.kept']
+	assert _user_xattrs(tmp_path / 'out/x') == ['user.kept']
 
 
 # ---- -co, option A': decide first, then carry exactly what was there ----
@@ -420,7 +431,7 @@ def test_content_only_carries_the_old_file_s_mode_and_xattrs_to_a_new_inode(tmp_
 	assert rc == 0 and read(tmp_path / 'out/x') == 'new and longer', output[-2000:]
 	st = os.stat(str(tmp_path / 'out/x'))
 	assert st.st_ino != inode and stat.S_IMODE(st.st_mode) == 0o604
-	assert os.listxattr(str(tmp_path / 'out/x')) == ['user.mine'] and os.getxattr(str(tmp_path / 'out/x'), 'user.mine') == b'kept'
+	assert _user_xattrs(tmp_path / 'out/x') == ['user.mine'] and os.getxattr(str(tmp_path / 'out/x'), 'user.mine') == b'kept'
 
 
 def _acl(*entries):
