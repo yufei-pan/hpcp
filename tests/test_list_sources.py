@@ -19,6 +19,19 @@ import unicodedata
 
 import pytest
 
+# The test's own names need a UTF-8 filesystem encoding to be made (Python 3.6 with LANG unset has ASCII); hpcp's side of
+def _find_run(command, **kwargs):
+	"""subprocess.run of a find command line, skipped where the image has no find (EL8's minimal one): the tests feed hpcp
+	what find lists, and hpcp itself never runs it."""
+	if shutil.which('find') is None:
+		pytest.skip('no find here')
+	return subprocess.run(command, **kwargs)
+
+
+# such a locale is test_landings' test_a_non_ascii_name_copies_with_lang_unset.
+utf8_names = pytest.mark.skipif(sys.getfilesystemencoding().lower().replace('-', '') != 'utf8',
+	reason='needs a UTF-8 filesystem encoding for its own non-ASCII names')
+
 HPCP = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'hpcp.py')
 
 
@@ -86,7 +99,7 @@ def test_list_file_keeps_the_tree(work):
 
 
 def test_real_find_from_inside_the_source_leaves_it_out(work):
-	listing = subprocess.run(['find', '.', '-type', 'f'], cwd=str(work / 'src'), stdout=subprocess.PIPE).stdout
+	listing = _find_run(['find', '.', '-type', 'f'], cwd=str(work / 'src'), stdout=subprocess.PIPE).stdout
 	rc, _ = run(['-d', str(work / 'out')], work / 'src', listing)
 	assert rc == 0 and files(work / 'out') == {b'a/x.txt': b'one', b'b/x.txt': b'two', b'a/deep/y.log': b'three'}
 
@@ -149,7 +162,7 @@ def test_directory_in_a_list_copies_recursively(work):
 def test_plain_find_gives_a_complete_tree_copying_nothing_twice(work):
 	(work / 'src/empty').mkdir()
 	os.symlink('a/x.txt', str(work / 'src/link'))
-	listing = subprocess.run(['find', 'src'], cwd=str(work), stdout=subprocess.PIPE).stdout
+	listing = _find_run(['find', 'src'], cwd=str(work), stdout=subprocess.PIPE).stdout
 	rc, output = run(['-d', 'out'], work, listing)
 	assert rc == 0
 	assert files(work / 'out') == {b'src/link': b'-> a/x.txt', b'src/a/x.txt': b'one', b'src/b/x.txt': b'two', b'src/a/deep/y.log': b'three'}
@@ -159,13 +172,13 @@ def test_plain_find_gives_a_complete_tree_copying_nothing_twice(work):
 
 
 def test_find_dot_with_directories(work):
-	listing = subprocess.run(['find', '.'], cwd=str(work / 'src'), stdout=subprocess.PIPE).stdout
+	listing = _find_run(['find', '.'], cwd=str(work / 'src'), stdout=subprocess.PIPE).stdout
 	rc, _ = run(['-d', str(work / 'out')], work / 'src', listing)
 	assert rc == 0 and files(work / 'out') == {b'a/x.txt': b'one', b'b/x.txt': b'two', b'a/deep/y.log': b'three'}
 
 
 def test_top_level_find_copies_directories_to_their_paths(work):
-	listing = subprocess.run(['find', 'src', '-mindepth', '1', '-maxdepth', '1'], cwd=str(work), stdout=subprocess.PIPE).stdout
+	listing = _find_run(['find', 'src', '-mindepth', '1', '-maxdepth', '1'], cwd=str(work), stdout=subprocess.PIPE).stdout
 	rc, _ = run(['-d', 'out'], work, listing)
 	assert rc == 0 and files(work / 'out') == TREE
 
@@ -468,7 +481,7 @@ def test_nul_separated_names_are_exact(hpcp_mod, tmp_path):
 
 def test_lines_split_on_newline_only(hpcp_mod, tmp_path):
 	# Not str.splitlines: \v, \f, \x85, U+2028 are parts of names.
-	assert parsed(hpcp_mod, tmp_path, b'a\x0bb\nc\x0cd\ne\xe2\x80\xa8f\n') == ['a\x0bb', 'c\x0cd', 'e f']
+	assert parsed(hpcp_mod, tmp_path, b'a\x0bb\nc\x0cd\ne\xe2\x80\xa8f\n') == ['a\x0bb', 'c\x0cd', os.fsdecode(b'e\xe2\x80\xa8f')]
 
 
 def test_crlf_lines_drop_the_cr(hpcp_mod, tmp_path):
@@ -518,7 +531,7 @@ ODD_NAMES = [b'latin\xe9', b'trail ', b' lead', b'ls\xe2\x80\xa8x', b'new\nline'
 def test_odd_names_copy_and_print_end_to_end(tmp_path, env, flags):
 	for name in ODD_NAMES:
 		write(os.path.join(os.fsencode(str(tmp_path)), b's', name), name)
-	listing = subprocess.run(['find', 's', '-type', 'f', '-print0'], cwd=str(tmp_path), stdout=subprocess.PIPE).stdout
+	listing = _find_run(['find', 's', '-type', 'f', '-print0'], cwd=str(tmp_path), stdout=subprocess.PIPE).stdout
 	rc, output = run(['-d', 'out'] + flags, tmp_path, listing, env)
 	assert rc == 0, output[-2000:]
 	assert files(tmp_path / 'out') == {os.path.join(b's', name): name for name in ODD_NAMES}
@@ -853,7 +866,7 @@ def test_exclude_drops_a_listed_file_without_touching_the_rest(work):
 
 
 def test_exclude_prunes_below_a_directory_that_covers_entries(work):
-	listing = subprocess.run(['find', 'src'], cwd=str(work), stdout=subprocess.PIPE).stdout
+	listing = _find_run(['find', 'src'], cwd=str(work), stdout=subprocess.PIPE).stdout
 	rc, _ = run(['-d', 'out', '-e', '*/deep'], work, listing)
 	assert rc == 0 and files(work / 'out') == {b'src/a/x.txt': b'one', b'src/b/x.txt': b'two'}
 
@@ -971,7 +984,7 @@ def test_auto_diff_name_of_a_long_list_is_short(work, hpcp_mod, reset_hpcp_globa
 def test_list_output_stays_quiet(tmp_path):
 	for index in range(50):
 		write(tmp_path / ('s/f%d' % index))
-	listing = subprocess.run(['find', 's', '-type', 'f'], cwd=str(tmp_path), stdout=subprocess.PIPE).stdout
+	listing = _find_run(['find', 's', '-type', 'f'], cwd=str(tmp_path), stdout=subprocess.PIPE).stdout
 	rc, output = run(['-d', 'out'], tmp_path, listing)
 	assert rc == 0 and b'Getting file list' not in output and b'not writable' not in output and b's/f7' not in output
 	assert b'Copying from 50 sources' in output
@@ -989,7 +1002,7 @@ def test_help_and_readme_tell_the_layout():
 # ---- fixes after the review of 9.81 ----
 
 def find_in(directory, *args):
-	return subprocess.run(['find'] + list(args), cwd=str(directory), stdout=subprocess.PIPE).stdout
+	return _find_run(['find'] + list(args), cwd=str(directory), stdout=subprocess.PIPE).stdout
 
 
 # F1: a list entry inside the destination stays where it is.
@@ -1614,7 +1627,7 @@ def test_find_dash_l_run_twice_does_not_nest(tmp_path):
 	os.makedirs(str(tmp_path / 'archive'))
 	os.symlink('../archive', str(tmp_path / 'logs/arch'))
 	for _ in range(2):
-		listing = subprocess.run(['find', '-L', '.', '-name', '*.log'], cwd=str(tmp_path / 'logs'), stdout=subprocess.PIPE).stdout
+		listing = _find_run(['find', '-L', '.', '-name', '*.log'], cwd=str(tmp_path / 'logs'), stdout=subprocess.PIPE).stdout
 		rc, output = run(['-d', '../archive/', '-rf'], tmp_path / 'logs', listing)
 		assert rc == 0, output[-2000:]
 	assert files(tmp_path / 'archive') == {b'one.log': b'1', b'sub/two.log': b'2'}
@@ -1726,7 +1739,7 @@ def _overlay_dir(tmp_path):
 @pytest.mark.parametrize('flags', MODES, ids=MODE_IDS)
 def test_entries_below_a_working_directory_inside_the_destination_are_copied(tmp_path, flags):
 	overlay = _overlay_dir(tmp_path)
-	listing = subprocess.run(['find', 'etc', '-type', 'f'], cwd=str(overlay), stdout=subprocess.PIPE).stdout
+	listing = _find_run(['find', 'etc', '-type', 'f'], cwd=str(overlay), stdout=subprocess.PIPE).stdout
 	rc, output = run(['-d', '..'] + flags, overlay, listing)
 	assert rc == 0, output[-2000:]
 	assert files(tmp_path / 't') == {b'overlay/etc/conf': b'C', b'overlay/etc/sub/more': b'M', b'etc/conf': b'C', b'etc/sub/more': b'M'}
@@ -1770,7 +1783,7 @@ def test_entries_that_land_on_themselves_still_stay(tmp_path):
 def test_find_dot_into_a_directory_below_still_leaves_that_directory_out(tmp_path):
 	write(tmp_path / 'src/a', '1')
 	write(tmp_path / 'src/out/old', 'o')
-	listing = subprocess.run(['find', '.', '-type', 'f'], cwd=str(tmp_path / 'src'), stdout=subprocess.PIPE).stdout
+	listing = _find_run(['find', '.', '-type', 'f'], cwd=str(tmp_path / 'src'), stdout=subprocess.PIPE).stdout
 	rc, output = run(['-d', 'out'], tmp_path / 'src', listing)
 	assert rc == 0 and files(tmp_path / 'src/out') == {b'a': b'1', b'old': b'o'}
 
@@ -1980,7 +1993,7 @@ def test_find_of_the_destination_run_twice_adds_nothing(tmp_path):
 	before = files(tmp_path)
 	after = []
 	for _ in range(2):
-		listing = subprocess.run(['find', '../../a', '-type', 'f'], cwd=str(cwd), stdout=subprocess.PIPE).stdout
+		listing = _find_run(['find', '../../a', '-type', 'f'], cwd=str(cwd), stdout=subprocess.PIPE).stdout
 		rc, output = run(['-d', '..'], cwd, listing)
 		assert rc == 0, output[-2000:]
 		after.append(files(tmp_path))
@@ -2007,7 +2020,7 @@ def test_two_destinations_one_holding_the_entry_keeps_it_and_copies_the_other(tm
 
 def test_entries_below_the_working_directory_still_copy_to_its_parent(tmp_path):
 	overlay = _overlay_dir(tmp_path)
-	listing = subprocess.run(['find', 'etc', '-type', 'f'], cwd=str(overlay), stdout=subprocess.PIPE).stdout
+	listing = _find_run(['find', 'etc', '-type', 'f'], cwd=str(overlay), stdout=subprocess.PIPE).stdout
 	for _ in range(2):
 		rc, output = run(['-d', '..'], overlay, listing)
 		assert rc == 0, output[-2000:]
@@ -2042,7 +2055,7 @@ def test_find_dash_l_through_a_link_out_of_the_destination_adds_no_nested_copy(t
 	write(tmp_path / 'ext/x', 'E')
 	write(tmp_path / 'out/own', 'O')
 	os.symlink('../ext', str(tmp_path / 'out/lk'))
-	listing = subprocess.run(['find', '-L', '.', '-type', 'f'], cwd=str(tmp_path), stdout=subprocess.PIPE).stdout
+	listing = _find_run(['find', '-L', '.', '-type', 'f'], cwd=str(tmp_path), stdout=subprocess.PIPE).stdout
 	rc, output = run(['-d', 'out'], tmp_path, listing)
 	assert rc == 0, output[-2000:]
 	assert not os.path.exists(str(tmp_path / 'out/out')) and files(tmp_path / 'ext') == {b'x': b'E'}
@@ -2065,7 +2078,7 @@ def test_find_dash_l_into_a_directory_with_a_link_out_of_it_run_with_a_move_keep
 	os.makedirs(str(tmp_path / 't/a'))
 	os.symlink('../../o', str(tmp_path / 't/a/l'))
 	before = files(tmp_path)
-	listing = subprocess.run(['find', '-L', 'a', '-type', 'f'], cwd=str(tmp_path / 't'), stdout=subprocess.PIPE).stdout
+	listing = _find_run(['find', '-L', 'a', '-type', 'f'], cwd=str(tmp_path / 't'), stdout=subprocess.PIPE).stdout
 	rc, output = run(['-d', 'a/', '-rf'], tmp_path / 't', listing)
 	assert rc == 0, output[-2000:]
 	assert files(tmp_path) == before
@@ -2076,7 +2089,7 @@ def test_a_link_out_of_the_overlay_still_copies_where_the_path_parts_from_the_de
 	overlay = _overlay_dir(tmp_path)
 	write(tmp_path / 'o2/x', 'L')
 	os.symlink('../../../o2', str(overlay / 'etc/l'))
-	listing = subprocess.run(['find', '-L', 'etc', '-type', 'f'], cwd=str(overlay), stdout=subprocess.PIPE).stdout
+	listing = _find_run(['find', '-L', 'etc', '-type', 'f'], cwd=str(overlay), stdout=subprocess.PIPE).stdout
 	rc, output = run(['-d', '..'] + flags, overlay, listing)
 	assert rc == 0, output[-2000:]
 	assert files(tmp_path / 't').get(b'etc/l/x') == b'L' and files(tmp_path / 't').get(b'etc/conf') == b'C'
@@ -2631,7 +2644,7 @@ def test_a_link_entry_gets_its_directory(tmp_path, args, stdin, expected):
 
 def test_find_with_links_followed_copies_every_link_entry(tmp_path):
 	_linked_tree(tmp_path)
-	listing = subprocess.run(['find', '-L', '.', '-type', 'f'], cwd=str(tmp_path), stdout=subprocess.PIPE).stdout
+	listing = _find_run(['find', '-L', '.', '-type', 'f'], cwd=str(tmp_path), stdout=subprocess.PIPE).stdout
 	rc, output = run(['-d', 'out'], tmp_path, listing)
 	assert rc == 0, output[-2000:]
 	assert files(tmp_path / 'out') == {b'f0': b'X', b'lnk/l': b'-> ../f0', b'real/l': b'-> ../f0'}
@@ -4440,6 +4453,7 @@ def test_a_file_replaced_by_an_overlay_clashes_with_nothing(folding, hpcp_mod):
 	assert files(folding / 'out') == {b'X': b'kept', b'y': b'y'}
 
 
+@utf8_names
 def test_composed_and_decomposed_names_are_one_name(folding, hpcp_mod):
 	# ext4 and f2fs compare names normalised.
 	write(folding / 'a/café', 'composed')
@@ -4524,6 +4538,7 @@ def test_each_destination_is_asked_and_one_that_says_yes_is_enough(tmp_path, hpc
 	assert files(tmp_path / 'one') == {b'X': b'1'}
 
 
+@utf8_names
 def test_three_names_are_judged_each_against_the_others(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
 	# vfat: STRASSE and strasse are one, and Stra\u00dfe is another name.
 	monkeypatch.chdir(tmp_path)
@@ -4574,6 +4589,7 @@ def test_a_directory_that_takes_nothing_cannot_be_asked(tmp_path, hpcp_mod):
 		os.chmod(tmp_path, 0o755)
 
 
+@utf8_names
 def test_what_the_net_catches(hpcp_mod):
 	folded = hpcp_mod._folded
 	assert folded('Stra\u00dfe') == folded('STRASSE') and folded('caf\u00e9') == folded('cafe\u0301') and folded('a\u200db') == folded('ab')
@@ -4641,6 +4657,7 @@ def test_a_move_onto_a_hard_link_of_itself_in_another_case_still_works_where_the
 	assert os.listdir(tmp_path) == ['x'] and (tmp_path / 'x').read_text() == 'data'
 
 
+@utf8_names
 def test_the_net_folds_names_that_python_holds_as_escapes(hpcp_mod):
 	# What Python 3.6 holds under the C locale for the UTF-8 bytes of 'É' and 'é': nothing folds a surrogate escape.
 	# (Compared into booleans: a failure message holding a lone surrogate takes the xdist worker down.)
@@ -4689,6 +4706,7 @@ print('rc', hpcp.hpcp(['a/', 'b/'], ['out/'], single_thread=True, max_workers=1,
 """
 
 
+@utf8_names
 @pytest.mark.skipif(os.name != 'posix', reason='the locale decides how names are held on POSIX')
 def test_two_names_the_locale_cannot_decode_clash_as_they_do_in_utf8(tmp_path):
 	# Python 3.6 under the C locale (EL7 with no locale set, cron), and later ones with it forced: the file system encoding is
@@ -5390,6 +5408,7 @@ def test_a_link_in_the_destination_onto_a_source_file_in_another_spelling_is_rep
 	assert (folding / 's/d/F').exists() != move and (folding / 't/d/f').exists() != move
 
 
+@utf8_names
 @pytest.mark.parametrize('source,dest', [('s', 'S'), ('s', 's.'), ('\u03c3', '\u03c2'), ('e\u0301', '\u00e9')], ids=['case', 'dot', 'sigma', 'nfd'])
 def test_a_landing_on_a_source_file_through_a_destination_in_another_spelling_with_a_number_of_its_own_is_refused(folding, hpcp_mod, source, dest):
 	# The destination is the source directory in another spelling, as FUSE exFAT shows it: a directory with a number of its own.
@@ -5531,6 +5550,7 @@ def test_a_probe_that_fails_on_the_way_leaves_nothing(tmp_path, hpcp_mod, monkey
 	assert os.listdir(tmp_path) == []
 
 
+@utf8_names
 def test_paths_in_different_buckets_are_never_one_place(tmp_path, hpcp_mod, monkeypatch):
 	# The buckets only find the candidates: a pair same_place may take for one (or cannot tell) shares one.
 	root = os.path.realpath(str(tmp_path))

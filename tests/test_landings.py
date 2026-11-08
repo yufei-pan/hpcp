@@ -23,12 +23,12 @@ SMALL_FS = os.environ.get('HPCP_TEST_SMALL_FS')
 small_fs = pytest.mark.skipif(not SMALL_FS, reason='HPCP_TEST_SMALL_FS: a 5 MiB filesystem of its own')
 
 
-def run(args, cwd, stdin=b'', env=None, timeout=120):
+def run(args, cwd, stdin=b'', env=None, timeout=120, unset=()):
 	"""The CLI in a session of its own: (return code, stdout and stderr as bytes); ('timeout', output) when it hung. A cp
 	that hangs (on a FIFO, in 9.84) holds the pipe in a process group of its own: the run's group is killed, and the output is
 	read only as far as is there."""
 	task = subprocess.Popen([sys.executable, HPCP] + args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-		cwd=str(cwd), env=dict(os.environ, **(env or {})), start_new_session=True)
+		cwd=str(cwd), env={k: v for k, v in dict(os.environ, **(env or {})).items() if k not in unset}, start_new_session=True)
 	try:
 		output = task.communicate(stdin, timeout=timeout)[0]
 	except subprocess.TimeoutExpired:
@@ -1002,3 +1002,42 @@ def test_the_check_keeps_its_jobs_where_the_gc_does_not_look(tmp_path, hpcp_mod,
 	gc.collect()
 	gc.collect()
 	assert len(seen) == 21 and not any(gc.is_tracked(job) for job in seen)
+
+
+# ---- a locale with no LANG ----
+
+@posix_only
+def test_a_non_ascii_name_copies_with_lang_unset(tmp_path):
+	# LANG unset, as cron and some ssh sessions give it on EL7: Python 3.6 then holds paths in ASCII with escapes, and its
+	# stdout is ASCII. (Newer Pythons are kept there by PYTHONUTF8=0 and PYTHONCOERCECLOCALE=0.) A tree, a rerun, a list, a
+	# message naming such a file and a move all work, and nothing is printed that the terminal cannot take.
+	root = os.fsencode(str(tmp_path))
+	def p(*parts):
+		return os.path.join(root, *parts)
+	os.makedirs(p(b's', b'd\xc3\xa9'))
+	for name, content in ((b'd\xc3\xa9/f\xc3\xafle', b'x'), (b'na\xc3\xafve', b'y'), (b'legacy\xe9', b'z')):
+		with open(p(b's', name), 'wb') as f:
+			f.write(content)
+	os.makedirs(p(b'o', b'clash\xc3\xa9'))
+	with open(p(b's', b'clash\xc3\xa9'), 'wb') as f:
+		f.write(b'c')
+	unset = [k for k in os.environ if k == 'LANG' or k.startswith('LC_') or k in ('PYTHONIOENCODING', 'LANGUAGE')]
+	env = {'PYTHONUTF8': '0', 'PYTHONCOERCECLOCALE': '0'}
+	def check(rc, output, want):
+		assert rc == want and b'Traceback' not in output and b'UnicodeEncodeError' not in output, (rc, output[-3000:])
+	for _ in range(2):
+		rc, output = run(['s/', '-d', 'o/'], tmp_path, env=env, unset=unset)
+		check(rc, output, 213)
+		assert b'is a directory, not copying' in output
+	for name, content in ((b'd\xc3\xa9/f\xc3\xafle', b'x'), (b'na\xc3\xafve', b'y'), (b'legacy\xe9', b'z')):
+		with open(p(b'o', name), 'rb') as f:
+			assert f.read() == content
+	rc, output = run(['-sfl', '-', '-d', 'o2/'], tmp_path / 's', b'd\xc3\xa9/f\xc3\xafle\nlegacy\xe9\n', env=env, unset=unset)
+	check(rc, output, 0)
+	assert sorted(os.listdir(p(b's', b'o2'))) == [b'd\xc3\xa9', b'legacy\xe9']
+	os.remove(p(b's', b'clash\xc3\xa9'))
+	rc, output = run(['s/', '-d', 'o3/', '-rf', '-v'], tmp_path, env=env, unset=unset)
+	check(rc, output, 0)
+	with open(p(b'o3', b'd\xc3\xa9', b'f\xc3\xafle'), 'rb') as f:
+		assert f.read() == b'x'
+	assert not os.path.lexists(p(b's', b'na\xc3\xafve'))
