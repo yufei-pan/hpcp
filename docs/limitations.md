@@ -39,6 +39,7 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - **What the operator sees:** a copy onto an existing tree reads each directory it lands in, on one worker, before the first file is copied: about 1 us per file on a local disk, longer on network storage.
 - **Why:** correct and bounded as it is; a parallel scan is its own change.
 - **Measured (9.85, 2026-11-08):** 9.85 has no serial scan (`_link_targets` is gone; the directory checks run in the workers), but a rerun is not faster for it: 100,000 files in 10,000 directories, nothing to copy, NFSv4.1 loopback `actimeo=0` on EL7 (2 vCPUs): 9.84 1764, 2301, 2212 s, 9.85 1871, 1878, 3044 s. On a local disk (Docker, a loaded host): 9.84 9.3 to 19.8 s, 9.85 6.5 to 15.7 s. The time goes to the per-file checks over NFS (about 60 to 80 GETATTRs per file rewritten, 9.84 as 9.85), not to a scan.
+- **Plan (9.86):** cut the per-file checks that ask again what is known. One is new in 9.85: copy_file's look-only pass through the door calls `_landing_of(dest)` only for its path, an lstat per destination per file, a round trip each on NFS `actimeo=0`; the path needs no lstat there.
 - **Revisit when:** 9.86, with the copy check's second pass (stat only the entries met twice).
 
 ### Rerunning an overlapping form is refused
@@ -124,6 +125,22 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - **What the operator sees:** `-sfl` with a list holding `x` and `x/y`, where `x -> ../elsewhere`: `out/x` becomes a real directory holding `y`, the link is not copied, and the run exits 0, in either order. 9.84 does the same. Named as arguments (`hpcp x -sfl list -d out/`), the same pair is a 213 for `x/y` and `out/x` is the link (rule 11).
 - **Why:** rule 11 looks only at the link sources named as arguments (`singles`); list entries are not among them.
 - **Plan:** build `singles` from list entries too, so a list entry below a listed link is the same 213.
+- **Revisit when:** 9.86.
+- **Noted:** 2026-11-08, the user's standing rule that deferrals are noted, not asked.
+
+### Hints quote names as Python escapes, not for the shell
+- **Kind:** deferred (9.86).
+- **What the operator sees:** with a name that is not UTF-8, the hints that give a command to run (the replaced-link Note, the `-ncd` refusal's `-d` form) print it with Python's escapes, such as `hpcp W/s/d\udcc3\udca9/ -d W/o/d\udcc3\udca9/`, which a shell cannot run as pasted.
+- **Why:** the hints print the path as Python holds it; messages do the same, which is fine for reading.
+- **Plan:** shell-quote the names in a hint as coreutils does (`$'d\303\251'`); messages keep the `\udcXX` forms.
+- **Revisit when:** 9.86.
+- **Noted:** 2026-11-08, the user's standing rule that deferrals are noted, not asked.
+
+### Change lists, manifests and disk TSVs read back non-UTF-8-locale names wrong
+- **Kind:** deferred (9.86).
+- **What the operator sees:** with LANG unset (Python 3.6 on EL7, as under cron), a name such as `new\xc3\xa9` in a change list, manifest or disk TSV (`-dfl`, the `-siff` patch apply through `_load_patch`) reads back as `'new\xe9'`, which matches no name `os.listdir` gives (`'new\udcc3\udca9'`), and an `lstat` of it raises UnicodeEncodeError. Checked in the EL7 image. 9.83, 9.84 and 9.85 all have it: `read_changes`, `read_manifest` and `read_disk_tsv` are unchanged since they came in (2026-10-10).
+- **Why:** they open the file as UTF-8 text, where `_read_list_entries` reads bytes and decodes each name with `os.fsdecode`.
+- **Plan:** read those files in binary and `os.fsdecode` each name field, as `_read_list_entries` does, with a LANG-unset test.
 - **Revisit when:** 9.86.
 - **Noted:** 2026-11-08, the user's standing rule that deferrals are noted, not asked.
 

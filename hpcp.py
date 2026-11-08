@@ -3763,7 +3763,7 @@ def copy_file(src_path, dest_paths, full_hash=False, verbose=False, concurrent_p
 		if not dest_paths:
 			for refusal in refused.values():
 				_copy_failed(src_path, refusal.text(src_path))
-			return 0, 0, symLinks
+			return 0, time.monotonic() - start_time, symLinks
 	if not os.path.islink(src_path):
 		# cp would put the file inside a directory at its place (dest/x/x), and a move would then lose the source. A link there
 		# is a name of the tree, replaced, unless the operator named it (_landing_of).
@@ -3876,9 +3876,9 @@ def copy_file(src_path, dest_paths, full_hash=False, verbose=False, concurrent_p
 				if copied:
 					break
 				if using_bak_paths and not dest_paths:
-					for refused in failures.values():
-						if isinstance(refused, _Refused):
-							_copy_failed(src_path, refused.text(src_path))
+					for failure in failures.values():
+						if isinstance(failure, _Refused):
+							_copy_failed(src_path, failure.text(src_path))
 					last = failures[dest_path]
 					if isinstance(last, _KeptOld):
 						_copy_failed(src_path, f'Copy failed: cannot copy {src_path} to {dest_path}, leaving {dest_path} as it is: {last}')

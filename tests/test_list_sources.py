@@ -20,6 +20,11 @@ import unicodedata
 import pytest
 
 # The test's own names need a UTF-8 filesystem encoding to be made (Python 3.6 with LANG unset has ASCII); hpcp's side of
+# such a locale is test_landings' test_a_non_ascii_name_copies_with_lang_unset.
+utf8_names = pytest.mark.skipif(sys.getfilesystemencoding().lower().replace('-', '') != 'utf8',
+	reason='needs a UTF-8 filesystem encoding for its own non-ASCII names')
+
+
 def _find_run(command, **kwargs):
 	"""subprocess.run of a find command line, skipped where the image has no find (EL8's minimal one): the tests feed hpcp
 	what find lists, and hpcp itself never runs it."""
@@ -27,10 +32,6 @@ def _find_run(command, **kwargs):
 		pytest.skip('no find here')
 	return subprocess.run(command, **kwargs)
 
-
-# such a locale is test_landings' test_a_non_ascii_name_copies_with_lang_unset.
-utf8_names = pytest.mark.skipif(sys.getfilesystemencoding().lower().replace('-', '') != 'utf8',
-	reason='needs a UTF-8 filesystem encoding for its own non-ASCII names')
 
 HPCP = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'hpcp.py')
 
