@@ -8464,6 +8464,9 @@ def remove_extra_dirs(src_paths, dests,exclude=None,dest_image=False,keep=(),des
 		for src_abs, actual_dests in mapping:
 			for actual_dest in actual_dests:
 				listed_scope.setdefault(actual_dest, []).append(src_abs)
+	# Positional sources too: only below where a directory source lands (see remove_extra_files); -di is judged whole.
+	scope = None if listed_scope is not None or dest_image else {actual_dest for _, actual_dests in _directory_sources(mapping) for actual_dest in actual_dests}
+	guarded = _source_guard(src_paths)
 	kept = _kept_paths(keep, mapping)
 	copied_roots = {actual_dest for _, actual_dests in mapping for actual_dest in actual_dests}
 	excluded_roots = _excluded_roots(mapping, exclude)
@@ -8533,8 +8536,12 @@ def remove_extra_dirs(src_paths, dests,exclude=None,dest_image=False,keep=(),des
 				else:
 					in_source = any(os.path.exists(os.path.join(os.path.dirname(src_path), relative_path)) or
 						_landing_in_other_spelling(os.path.dirname(src_path) or os.curdir, dest, relative_path, source_listings, places) for src_path in src_paths)
-				if not in_source and not _is_kept(os.path.abspath(dest_dir_path), kept, os.path.abspath(dest), copied_roots):
-					extraDirs[os.path.abspath(dest_dir_path)] = (os.path.abspath(dest), dest_dir_path)
+				if (not in_source and not _is_kept(os.path.abspath(dest_dir_path), kept, os.path.abspath(dest), copied_roots)
+						and (scope is None or any(part in scope for part in _path_and_parents(os.path.abspath(dest_dir_path))))):
+					if guarded(dest_dir_path):
+						print(f"Not removing {dest_dir_path}: it is a source, or lies in one or leads into one")
+					else:
+						extraDirs[os.path.abspath(dest_dir_path)] = (os.path.abspath(dest), dest_dir_path)
 			# Excluded trees and other filesystems are never walked into.
 			dirnames[:] = walk_into
 	# Once the walks have entered them all (one on another device then is no longer here).
@@ -8568,6 +8575,39 @@ def _landing_in_other_spelling(source, dest, relative, listings, places):
 			if not rest or _landing_in_other_spelling(os.path.join(source, name), landing, rest, listings, places):
 				return True
 	return False
+
+def _source_guard(src_paths):
+	"""-rme's last word on a path it found extra: True when it is a source or lies in one, whatever the destination calls it:
+	a source named inside the destination (hpcp out/sub/ b/ -d out/), a link in it that leads into a source (out/d ->
+	../src/d). Asked by identity, (st_dev, st_ino), of each source against the path's real place and each directory above
+	it, each directory once. (A directory that holds a source holds something, so it is never removed; a link to it is
+	removed as a link.)"""
+	roots, known = set(), {}
+	for src in src_paths or ():
+		try:
+			st = os.stat(os.path.realpath(src))
+		except OSError:
+			continue
+		roots.add((st.st_dev, st.st_ino))
+	def guarded(path):
+		if not roots:
+			return False
+		# Up to the first place already answered, then each answered on the way down.
+		unknown = []
+		for part in _path_and_parents(os.path.realpath(path)):
+			if part in known:
+				break
+			unknown.append(part)
+		answer = known.get(part, False) if not unknown or unknown[-1] != part else False
+		for part in reversed(unknown):
+			try:
+				st = os.stat(part)
+				answer = answer or (st.st_dev, st.st_ino) in roots
+			except OSError:
+				pass
+			known[part] = answer
+		return answer
+	return guarded
 
 def _directory_sources(mapping):
 	"""The directory sources of _src_to_dest_map's mapping: what -rme cleans below when a source came from a list."""
@@ -8753,13 +8793,18 @@ def remove_extra_files(total_file_list, dests,max_workers,verbose,files_per_job,
 		if src_paths:
 			mapping = _src_to_dest_map(src_paths, dests, dest_image)
 			expected = _expected_dest_paths(src_entries, src_paths, dests, dest_image, mapping)
-			# With a list, only what its directories cover is judged: a list says what to copy, not that the rest of the
-			# destination is extra (9.81 moved list sources; a whole-destination reading would delete earlier copies).
+			# Only what a directory source's copy covers is judged: a source says what to copy, not that the rest of the
+			# destination is extra (9.81 moved list sources; 9.83 and earlier judged all of out/ for hpcp b -d out/, deleting
+			# out/keep). src/ lands in the destination itself, which is all judged. -di mirrors each source at its absolute
+			# path in the image, which is judged whole.
 			listed_scope = None
 			if _has_listed(src_paths) if listed is None else listed:
 				mapping = _directory_sources(mapping)
 				listed_scope = {actual_dest for _, actual_dests in mapping for actual_dest in actual_dests}
 				print("Sources from a list: only the directories it names are cleaned of extra files")
+			elif not dest_image:
+				listed_scope = {actual_dest for _, actual_dests in _directory_sources(mapping) for actual_dest in actual_dests}
+			guarded = _source_guard(src_paths)
 			kept = _kept_paths(keep, mapping)
 			copied_roots = {actual_dest for _, actual_dests in mapping for actual_dest in actual_dests}
 			excluded_roots = _excluded_roots(mapping, exclude)
@@ -8786,6 +8831,9 @@ def remove_extra_files(total_file_list, dests,max_workers,verbose,files_per_job,
 						# The copy of an excluded source path is not extra: it was left out, not deleted.
 						if (not _excluded_at_source(path, mapping, exclude, excluded_roots=excluded_roots) and not _is_kept(path, kept, dest_abs_root, copied_roots)
 								and not _in_root_lost_and_found(path, dest_abs_root)):
+							if guarded(path):
+								print(f"Not removing {path}: it is a source, or lies in one or leads into one")
+								continue
 							inDestNotInSrc.add(path)
 							extra_roots[path] = dest_abs_root
 		else:
@@ -10288,6 +10336,15 @@ def _moved_not_held(entries, src_paths, dests, dest_image=False, max_workers=1):
 	one file with the landing of another source (another file) holds neither: both stay. One lstat of each source and
 	each landing, in max_workers threads; nothing is read."""
 	by_source = _by_source(_src_to_dest_map(src_paths, dests, dest_image))
+	# A file's landings are its directory's, with its name: each directory is mapped once (a source itself goes by _landings).
+	in_directory = {}
+	def landings_of(path):
+		if path in by_source:
+			return list(dict.fromkeys(_landings(path, by_source)))
+		parent, name = os.path.split(path)
+		if parent not in in_directory:
+			in_directory[parent] = list(dict.fromkeys(_landings(parent, by_source)))
+		return [os.path.join(landing, name) for landing in in_directory[parent]]
 	def look(chunk):
 		looked = []
 		for path in chunk:
@@ -10297,7 +10354,7 @@ def _moved_not_held(entries, src_paths, dests, dest_image=False, max_workers=1):
 				# Gone already: the removal has nothing to take.
 				continue
 			found = []
-			for landing in dict.fromkeys(_landings(path, by_source)):
+			for landing in landings_of(path):
 				try:
 					found.append((landing, os.lstat(landing)))
 				except OSError:
@@ -10329,7 +10386,7 @@ def _moved_not_held(entries, src_paths, dests, dest_image=False, max_workers=1):
 				ask.setdefault(os.path.dirname(path), []).append((path, landing))
 			held.setdefault(path, []).append((landing, lt))
 		if path not in held:
-			not_held[path] = why or f'it is at none of its landings ({", ".join(dict.fromkeys(_landings(path, by_source)))})'
+			not_held[path] = why or f'it is at none of its landings ({", ".join(landings_of(path))})'
 	# A move in one directory under another name: are the two one name there? Each directory once, about all its names.
 	for directory, pairs in ask.items():
 		answers, unknown = _ask_names(directory, list(dict.fromkeys(os.path.basename(name) for pair in pairs for name in pair)))
@@ -11524,7 +11581,7 @@ def get_args(args = None):
 	parser.add_argument('-nhfl', '--no_hash_file_list', action='store_true', help='Do not append hash to file list')
 	parser.add_argument('-rm', '--remove', action='store_true', help='Remove all files and folders specified in src_path')
 	parser.add_argument('-rf', '--remove_force', action='store_true', help='Remove all files without prompt')
-	parser.add_argument('-rme', '--remove_extra', action='store_true', help='Remove all files and folders in dest_path that are not in src_path')
+	parser.add_argument('-rme', '--remove_extra', action='store_true', help='Remove the files and folders the sources do not copy, below where each directory source lands (all of out/ for src/, out/b for b); never a source, or what lies in or holds one')
 	parser.add_argument('-rwloff','--do_not_remove_files_while_listing', action='store_true', help='With -rm and no destination: list the trees first, then remove the listed files in parallel jobs (default: remove while walking the trees).')
 	parser.add_argument('-e', '--exclude', action='append', default=[], help='Exclude source files matching the pattern')
 	parser.add_argument('-x', '--exclude_file', type=str, help='Exclude source files matching the pattern in the file')
@@ -11977,10 +12034,9 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = multipr
 				'fix them (or exclude those paths with -e) and re-run')
 		elif remove and dests != ... and replaced:
 			# Removing the earlier directory would destroy the only copy of each file the later one replaced.
-			# -rme ran before this, and takes a source inside the destination for extra (docs/limitations.md).
-			outcome = 'the earlier source held their only copy, unless -rme removed it above' if remove_extra else 'the earlier source holds their only copy; every source stays'
+			# -rme ran before this, and never removes a source (_source_guard).
 			eprint(f"Remove skipped: not removing {_sources_text(src_paths)}: {replaced} file(s) in merged directories "
-				f'were replaced by a later source, and {outcome}')
+				'were replaced by a later source, and the earlier source holds their only copy; every source stays')
 		elif remove and dests != ...:
 			# A move: only what the copy listed goes (see remove_moved_sources).
 			remove_moved_sources(src_paths, total_file_list, total_sym_links, single_thread=single_thread, max_workers=max_workers,

@@ -17,6 +17,14 @@ Block-image functionality is in **beta**. Only available on Linux. Possible use 
 
 hpcp.bat available on github: simple old tk based GUI intended for basic windows functionality.
 
+## Upgrading to 9.84 from 9.83
+
+Nothing needs doing to upgrade. What changed:
+
+- **A move keeps a source that its landing does not hold (exit 213):** before a move removes a source file or link, one of its landings must hold it: there, of its kind, of its size and, unless `-co`, its modification time; not the source itself; and not one file with another source's landing. A destination can take two names for one where no rule on names says so, and the second source is then written onto the first one's landing: an 8.3 alias on vfat (`a/longfilename.txt` and `b/LONGFI~1.TXT`), and on a vfat mounted with a codepage `iocharset`, a legacy name that happens to be valid UTF-8 (cp1251 `C3 A9 74` against `E3 A9 74`, KOI8-R `бё` against `бЁ`) or ASCII against a legacy one (`istanbul` against ISO 8859-9 `İstanbul`). 9.83 exited 0 with one content gone, and a rename between two such names (`hpcp out/ONE -d out/OTHER -rf`) lost the file. Each such source now stays, with `Destination clash: not removing SRC: WHY`, and the rest of the move goes on; checked on vfat on EL8. It costs an `lstat` of each source and of each landing before the removal, run in parallel; nothing is read. A copy without a move removes nothing and is not checked: there such a pair still exits 0 with one landing holding the other's content, both sources kept (deferred, see [docs/limitations.md](docs/limitations.md)).
+- **`-rme` with a source that lands in a directory of its name judges only that directory:** `hpcp b -d out/ -rme` lands in `out/b`, and no longer removes `out/keep`; `hpcp a/x b -d out/ -rme` the same. `hpcp src/ -d out/ -rme` still judges all of `out/`, and a list is judged as before. What else is in `out/` is no longer judged at all: a script that counted on it to leave `out/` holding only `b` now has to remove the rest itself.
+- **`-rme` never removes a source, or what lies in or holds one:** asked by identity, whatever the destination calls it. `hpcp out/sub/ b/ -d out/ -rme`, answered y, deleted `out/sub/x`, the only copy where `b/x` replaced it at `out/x`; and `hpcp src/ -d out/ -rme` with `out/d -> ../src/d` removed the link, the destination's only way to `src/d`'s files, before a move removed them. Both stay now, with a note.
+
 ## Upgrading to 9.83 from 9.82
 
 Nothing needs doing to upgrade. What changed:
@@ -215,7 +223,7 @@ Several `-d` are spill-over, not copies: each file goes to one destination, the 
 ## Remove Extra Feature Note
 
 `-rme --remove_extra`: Especially when combined with `-rf`, **PLEASE PAY CLOSE ATTENTION TO YOUR TARGET DIRECTORY!**  
-`--remove_extra` will remove **all** files that are not in the source path. When every source is a named file or a link (`hpcp a/x -d out/ -rme`), or a source is or holds the destination (`hpcp . -d out/ -rme`), it checks nothing, says so, and removes nothing. With arguments, as soon as one source is a directory, the whole destination is judged against everything the sources copy, so check what is in it before you confirm. With a list, only what the list's directories cover is judged (see [Copying from a list](#copying-from-a-list)). A source inside the destination can be taken for extra (`hpcp out/sub/ b/ -d out/ -rme`, deferred: [docs/limitations.md](docs/limitations.md)).
+`--remove_extra` removes the files that the sources do not copy, below where each directory source lands: all of the destination for `src/` (it lands in `out/` itself), only `out/b` for `b`, and what a list's directories cover for a list (see [Copying from a list](#copying-from-a-list)). A named file or a link judges nothing, so when every source is one (`hpcp a/x -d out/ -rme`), or a source is or holds the destination (`hpcp . -d out/ -rme`), it checks nothing, says so, and removes nothing. Check what is in a mirrored destination before you confirm. Nothing that is a source, lies in one, or holds one is removed, whatever the destination calls it: a source inside the destination (`hpcp out/sub/ b/ -d out/ -rme` keeps `out/sub/x`) and a link in it that leads into a source (`out/d -> ../src/d`) stay, with a note.
 
 It runs only after a copy that reported no errors: if a source path could not be listed, its copy in the destination would look extra. Otherwise hpcp leaves the destination as it is and exits with `Remove skipped` (212). With `-di` the image holds each source at its absolute path, and `-rme` compares against that layout: it mirrors the **whole image** to this run's sources, so another source copied into the same image on an earlier run is removed too. The destination's copy of an excluded path (`-e`, `-x`, absolute or not, a link's excluded target included) is never removed, and a directory that still holds one is kept. With `-lt`, link targets that link tracking placed in the destination are kept too; without it they are not part of the copy and are removed like any other extra file, unless excluded. A filesystem mounted below the destination (a mount or a bind mount, or another device such as a btrfs subvolume, as with `rsync -x`) is left alone with everything in it: its files are not listed as extra and its directories are not removed. That includes one mounted only when its directory is entered (an automount, an NFSv4 submount): each directory is checked once open, before anything in it is read. A destination, or a moved source, that is itself such a mount is taken as mounted. The destination's own filesystem is cleaned even when the destination is a mount point itself (a `-di` image, a disk). A filesystem's own `lost+found` (directly at its root, as in a `-di` image or an ext4 destination) and what fsck put in it are never removed.
 
@@ -304,8 +312,10 @@ options:
                         Do not append hash to file list
   -rm, --remove         Remove all files and folders specified in src_path
   -rf, --remove_force   Remove all files without prompt
-  -rme, --remove_extra  Remove all files and folders in dest_path that are not
-                        in src_path
+  -rme, --remove_extra  Remove the files and folders the sources do not copy,
+                        below where each directory source lands (all of out/
+                        for src/, out/b for b); never a source, or what lies
+                        in or holds one
   -rwloff, --do_not_remove_files_while_listing
                         With -rm and no destination: list the trees first,
                         then remove the listed files in parallel jobs

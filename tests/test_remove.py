@@ -332,8 +332,8 @@ def test_remove_extra_keeps_the_copy_of_an_excluded_source_path(tmp_path, hpcp_m
 
 @pytest.mark.parametrize('track_on_rme', [True, False])
 def test_remove_extra_keeps_link_targets_that_tracking_placed(tmp_path, hpcp_mod, reset_hpcp_globals, require_linux, monkeypatch, track_on_rme):
-	"""A tracked target belongs to the copy: -rme -lt must not delete it (it would come back on every run). Without -lt
-	it is not part of the copy, so -rme removes it like any other extra."""
+	"""A tracked target belongs to the copy: -rme -lt must not delete it (it would come back on every run). It lands at
+	dst/other/x, outside dst/src where src lands, which -rme does not judge since 9.84: it stays without -lt too."""
 	src = tmp_path / 's' / 'src'
 	src.mkdir(parents=True)
 	(tmp_path / 's' / 'other').mkdir()
@@ -344,13 +344,13 @@ def test_remove_extra_keeps_link_targets_that_tracking_placed(tmp_path, hpcp_mod
 	opts = dict(single_thread=True, batch=True, do_not_remove_files_while_listing=True)
 	assert hpcp_mod.hpcp([str(src)], dest_paths=[dst], link_tracking=True, **opts) == 0
 	assert (tmp_path / 'dst' / 'src' / 'lnk').read_text() == 'x'
-	(tmp_path / 'dst' / 'stale.txt').write_text('extra')
+	(tmp_path / 'dst' / 'src' / 'stale.txt').write_text('extra')
 	monkeypatch.setattr(sys.stdin, 'isatty', lambda: True)
 	monkeypatch.setattr('builtins.input', lambda: 'y')
 	assert hpcp_mod.hpcp([str(src)], dest_paths=[dst], remove_extra=True, link_tracking=track_on_rme, **opts) == 0
-	assert (tmp_path / 'dst' / 'other' / 'x').exists() is track_on_rme
+	assert (tmp_path / 'dst' / 'other' / 'x').exists()
 	assert os.readlink(tmp_path / 'dst' / 'src' / 'lnk') == '../other/x'
-	assert not (tmp_path / 'dst' / 'stale.txt').exists()
+	assert not (tmp_path / 'dst' / 'src' / 'stale.txt').exists()
 
 
 def test_remove_extra_dirs_with_dest_image_follows_this_runs_sources(tmp_path, hpcp_mod, reset_hpcp_globals):
@@ -465,11 +465,11 @@ def test_tracked_target_that_contains_the_copy_shields_nothing(tmp_path, hpcp_mo
 	(src / 'a.txt').write_text('a')
 	os.symlink(target, str(src / 'sub' / 'up' if target == '../..' else src / 'up'))
 	dst = tmp_path / 'backup'
-	dst.mkdir()
-	(dst / 'stale.txt').write_text('stale')
+	(dst / 'proj').mkdir(parents=True)
+	(dst / 'proj' / 'stale.txt').write_text('stale')
 	assert _rme(hpcp_mod, monkeypatch, [str(src)], [str(dst) + os.sep], link_tracking=True) == 0
 	assert (dst / 'proj' / 'a.txt').read_text() == 'a'
-	assert not (dst / 'stale.txt').exists()
+	assert not (dst / 'proj' / 'stale.txt').exists()
 
 
 @pytest.mark.parametrize('link_tracking', [True, False])
@@ -1006,8 +1006,11 @@ def test_two_sources_that_one_landing_file_holds_are_both_kept(tmp_path, hpcp_mo
 	not_held = _not_held(hpcp_mod, tmp_path, ['a/p', 'b/q'], sources=('a/', 'b/'))
 	assert sorted(not_held) == [str(tmp_path / 'a/p'), str(tmp_path / 'b/q')]
 	assert 'the destination took the names for one' in not_held[str(tmp_path / 'a/p')] and str(tmp_path / 'b/q') in not_held[str(tmp_path / 'a/p')]
-	# One source given twice is no such pair.
+	# One source given twice is no such pair, and neither are two names of one source file (a hard link): one content.
 	assert _not_held(hpcp_mod, tmp_path, ['b/q'], sources=('b/', 'b/')) == {}
+	os.unlink(str(tmp_path / 'a/p'))
+	os.link(str(tmp_path / 'b/q'), str(tmp_path / 'a/p'))
+	assert _not_held(hpcp_mod, tmp_path, ['a/p', 'b/q'], sources=('a/', 'b/')) == {}
 
 
 @pytest.mark.parametrize('one_name', [False, True])
@@ -1046,3 +1049,78 @@ def test_a_move_keeps_the_sources_whose_landings_another_source_overwrote(tmp_pa
 	assert 'Destination clash: not removing ' + str(tmp_path / 'a/p') + ': ' + str(tmp_path / 'out/p') + ' holds other content' in error
 	assert 'Move left entries' not in error
 	assert open('a/p').read() == 'A' and open('out/p').read() == 'BB'
+
+
+def test_a_file_that_went_to_a_later_destination_is_held_there(tmp_path, hpcp_mod, reset_hpcp_globals):
+	# Files spill from one -d to the next: any landing that holds it will do.
+	_write(str(tmp_path / 'a/f'), 'data', 1_600_000_000)
+	_write(str(tmp_path / 'two/f'), 'data', 1_600_000_000)
+	assert _not_held(hpcp_mod, tmp_path, ['a/f'], dests=('one/', 'two/')) == {}
+	_write(str(tmp_path / 'one/f'), 'other', 1_600_000_000)
+	assert _not_held(hpcp_mod, tmp_path, ['a/f'], dests=('one/', 'two/')) == {}
+
+
+# -rme judges only below where a directory source lands, and never removes a source, or what lies in or holds one.
+
+def _rme_answered(hpcp_mod, monkeypatch, sources, dest='out/'):
+	monkeypatch.setattr(sys.stdin, 'isatty', lambda: True)
+	monkeypatch.setattr('builtins.input', lambda *args: 'y')
+	return hpcp_mod.hpcp(sources, [dest], single_thread=True, max_workers=1, batch=True, remove_extra=True)
+
+
+def _tree(root):
+	return sorted(os.path.relpath(os.path.join(path, name), root) for path, dirs, names in os.walk(root) for name in names + [d for d in dirs if os.path.islink(os.path.join(path, d))])
+
+
+@pytest.mark.parametrize('sources', [['b'], ['a/x', 'b']], ids=['directory', 'file-and-directory'])
+def test_rme_with_a_source_that_lands_in_a_directory_of_its_name_judges_only_that_directory(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch, sources):
+	# hpcp b -d out/ -rme lands in out/b: out/keep is not its to judge. 9.83 deleted it.
+	monkeypatch.chdir(tmp_path)
+	_write('a/x', 'x')
+	_write('b/f', 'f')
+	_write('out/keep', 'k')
+	_write('out/b/extra', 'e')
+	os.makedirs('out/kept-dir')
+	os.makedirs('out/b/extra-dir')
+	assert _rme_answered(hpcp_mod, monkeypatch, sources) == 0
+	assert 'keep' in _tree('out') and 'b/extra' not in _tree('out') and 'b/f' in _tree('out')
+	assert os.path.isdir('out/kept-dir') and not os.path.exists('out/b/extra-dir')
+
+
+def test_rme_with_a_source_that_mirrors_into_the_destination_still_judges_all_of_it(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	monkeypatch.chdir(tmp_path)
+	_write('b/f', 'f')
+	_write('out/extra', 'e')
+	_write('out/sub/extra', 'e')
+	assert _rme_answered(hpcp_mod, monkeypatch, ['b/']) == 0
+	assert _tree('out') == ['f']
+
+
+def test_rme_never_removes_a_source_inside_the_destination(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	# out/sub/x is a source: 9.83 took it for extra and deleted it, its only copy when b/x replaced it at out/x.
+	monkeypatch.chdir(tmp_path)
+	_write('out/sub/x', 'S')
+	_write('out/deep/sub2/y', 'Y')
+	_write('b/x', 'B')
+	_write('out/extra', 'e')
+	# A directory of a source is a source too, an empty one included, and so is an empty source.
+	os.makedirs('out/sub/empty')
+	os.makedirs('out/empty-source')
+	assert _rme_answered(hpcp_mod, monkeypatch, ['out/sub/', 'out/deep/sub2/', 'out/empty-source/', 'b/']) == 0
+	assert open('out/sub/x').read() == 'S' and open('out/deep/sub2/y').read() == 'Y' and not os.path.exists('out/extra')
+	assert os.path.isdir('out/sub/empty') and os.path.isdir('out/empty-source')
+
+
+@pytest.mark.skipif(not hasattr(os, 'symlink') or os.name == 'nt', reason='symlinks')
+def test_rme_never_removes_a_link_that_leads_into_a_source(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	# out/d -> ../src/d: the copy of src/d/f is src/d/f itself, through the link; 9.83 removed the link, and with it the
+	# destination's only view of d/f. A link that leads elsewhere is still extra.
+	monkeypatch.chdir(tmp_path)
+	_write('src/d/f', 'F')
+	_write('src/g', 'G')
+	_write('elsewhere/z', 'Z')
+	os.makedirs('out')
+	os.symlink(os.path.join('..', 'src', 'd'), 'out/d')
+	os.symlink(os.path.join('..', 'elsewhere'), 'out/l')
+	assert _rme_answered(hpcp_mod, monkeypatch, ['src/']) == 0
+	assert os.path.islink('out/d') and not os.path.lexists('out/l') and open('src/d/f').read() == 'F' and open('elsewhere/z').read() == 'Z'

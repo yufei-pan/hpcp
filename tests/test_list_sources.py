@@ -1777,10 +1777,11 @@ def test_safe_remove_skipped_says_every_source_stays(tmp_path):
 	assert files(tmp_path) == {b'out/sub/x': b'S', b'b/x': b'B', b'out/x': b'B'}
 
 
-def test_remove_skipped_does_not_claim_what_rme_took(tmp_path):
-	# -rme runs first and takes a source inside the destination for extra (docs/limitations.md).
+def test_rme_before_a_skipped_removal_leaves_the_source_inside_the_destination(tmp_path):
+	# -rme runs first: out/sub/x is a source, the only copy of what b/x replaced at out/x. 9.83 took it for extra.
 	rc, output = _rme_in_a_terminal(tmp_path, _a_merge_out_of_the_destination(tmp_path))
-	assert rc == 212 and b'unless -rme removed it above' in output and b'every source stays' not in output, output[-2000:]
+	assert rc == 212 and b'every source stays' in output, output[-2000:]
+	assert _but_log(files(tmp_path)) == {b'out/sub/x': b'S', b'b/x': b'B', b'out/x': b'B'}
 
 
 def test_rme_with_a_named_file_into_its_own_directory_checks_nothing(tmp_path):
