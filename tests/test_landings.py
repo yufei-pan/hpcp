@@ -182,7 +182,7 @@ def test_a_sticky_directory_keeps_9_84_s_outcome_for_another_user_s_file(tmp_pat
 	os.chown(str(tmp_path / 'out/x'), 1000, 1000)
 	os.chmod(str(tmp_path / 'out/x'), 0o666)
 	for flags in ([], ['-co']):
-		task = subprocess.run([sys.executable, HPCP, 'a/x', '-d', 'out/'] + flags, cwd=str(tmp_path), stdout=subprocess.PIPE,
+		task = subprocess.run([os.path.realpath(sys.executable), HPCP, 'a/x', '-d', 'out/'] + flags, cwd=str(tmp_path), stdout=subprocess.PIPE,
 			stderr=subprocess.STDOUT, timeout=120, preexec_fn=lambda: (os.setgid(65534), os.setuid(65534)))
 		assert read(tmp_path / 'out/x') == 'a longer new content' and os.stat(str(tmp_path / 'out/x')).st_uid == 1000, task.stdout[-2000:]
 		write(tmp_path / 'out/x', 'old')
