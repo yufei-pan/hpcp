@@ -1088,9 +1088,16 @@ def test_a_copy_reports_two_sources_that_landed_in_one_file(tmp_path, hpcp_mod, 
 		'the destination took the names for one')
 
 
-@pytest.mark.parametrize('landing', [None, 'other content', 'dirt', 'self'])
+def test_a_copy_reports_a_source_at_none_of_its_landings(tmp_path, hpcp_mod, reset_hpcp_globals):
+	_write(str(tmp_path / 'a/f'), 'data', 1_600_000_000)
+	assert 'it is at none of its landings' in _copy_not_held(hpcp_mod, tmp_path, ['a/f'])[str(tmp_path / 'a/f')]
+	# A source gone since has nothing to say.
+	assert _copy_not_held(hpcp_mod, tmp_path, ['a/gone']) == {}
+
+
+@pytest.mark.parametrize('landing', ['other content', 'dirt', 'self'])
 def test_a_copy_that_is_no_clash_reports_nothing_and_reads_nothing(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch, landing):
-	# A source changed during the copy, a landing gone since, or a directory that lands on itself is what cp did, not a clash.
+	# A source changed during the copy, or a directory that lands on itself, is what cp did, not a clash.
 	monkeypatch.setattr(hpcp_mod, '_same_contents', lambda *args: pytest.fail('a copy reads no file'))
 	_write(str(tmp_path / 'a/f'), 'data', 1_600_000_000)
 	if landing == 'self':
@@ -1136,6 +1143,27 @@ def test_a_copy_whose_sources_landed_in_one_file_exits_213_naming_both(tmp_path,
 			f'(from {tmp_path / other}): the destination took the names for one') in error
 	# The landing holds whichever was written last (in parallel, either), whole.
 	assert open('a/p').read() == 'A' and open('b/q').read() == 'BB' and open('out/p').read() in ('A', 'BB')
+
+
+@pytest.mark.parametrize('copy_failed', [False, True])
+def test_a_copy_whose_landing_is_gone_exits_213_unless_its_copy_said_why(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch, capsys, copy_failed):
+	# On vfat beside an 8.3 alias a source can end at no landing, and 9.85 at f7d03d8 exited 0. Stood in for here by a
+	# landing removed once the copy is done. A copy that failed has its own error, and no clash line is added to it.
+	monkeypatch.chdir(tmp_path)
+	_write('a/p', 'A')
+	_write('a/q', 'Q')
+	real = hpcp_mod.create_sym_links
+	def then_lost(*args, **kwargs):
+		os.unlink('out/p')
+		if copy_failed:
+			hpcp_mod.eprint(f'Copy failed: {tmp_path / "a/p"}: stood in for')
+		return real(*args, **kwargs)
+	monkeypatch.setattr(hpcp_mod, 'create_sym_links', then_lost)
+	rc = hpcp_mod.hpcp(['a/'], ['out/'], single_thread=True, max_workers=1, batch=True)
+	error = capsys.readouterr().err
+	said = f'Destination clash: copied {tmp_path / "a/p"}, but it is at none of its landings ({tmp_path / "out/p"})'
+	assert (rc, said in error) == ((190, False) if copy_failed else (213, True))
+	assert 'a/q' not in error
 
 
 def test_a_copy_onto_a_tree_with_other_contents_exits_0(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch, capsys):

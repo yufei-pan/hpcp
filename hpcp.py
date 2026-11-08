@@ -10381,8 +10381,9 @@ def _not_held(entries, src_paths, dests, dest_image=False, max_workers=1, move=T
 	file with another source's landing, or is the source itself.
 
 	move=False, the end of a copy that removes nothing: only a landing that is one file with another source's landing
-	is reported, the clash itself, as both of its sources' lines. A landing of the source's own file is held, and one
-	that differs from a source changed during the copy is what cp copied: neither is a clash, and nothing is read.
+	is reported, the clash itself, as both of its sources' lines, and a source that is at none of its landings. A landing
+	of the source's own file is held, and one that differs from a source changed during the copy is what cp copied:
+	neither is a clash, and nothing is read.
 
 	A landing (each source above an entry gives one in each destination, as -rme's expected paths) holds its source when
 	it is there and of its kind (a file's landing that is a symlink is what it leads to: the copy wrote through it); a
@@ -10474,6 +10475,11 @@ def _not_held(entries, src_paths, dests, dest_image=False, max_workers=1, move=T
 				looked += [item for part in pool.map(look, chunks) for item in part]
 			break
 	not_held, held, ask = {}, {}, {}
+	for path, st, found in () if move else looked:
+		# A copy whose landing is not there, though its source still is: lost (on vfat, beside an 8.3 alias of its name). A
+		# copy that failed has said so, and hpcp() leaves these out then.
+		if not found and (st or source_stat(path)):
+			not_held[path] = f'it is at none of its landings ({", ".join(landings_of(path))})'
 	for path, st, found in looked if move else ():
 		why = None
 		for landing, lt, reason in found:
@@ -12102,9 +12108,12 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = multipr
 				# The move's backstop, at the end of a copy: two sources that landed in one file, where the destination took their
 				# names for one and no check on names could say so (an 8.3 alias, a legacy name read as UTF-8). The landing is left
 				# as it is: it holds one source whole, and the other content has no name of its own there. A move asks before removing.
+				# A file whose copy failed is at none of its landings too, and its error says why: only the other reasons then.
+				failed = any(_is_failure(error) for error in ERRORS[copy_error_start:])
 				for path, why in sorted(_not_held((os.path.abspath(entry) for entry in itertools.chain(total_file_list, total_sym_links)), src_paths, dests, bool(dest_image),
 						1 if single_thread else max_workers, move=False).items()):
-					eprint(f'Destination clash: copied {path}, but {why}')
+					if not (failed and why.startswith('it is at none of its landings')):
+						eprint(f'Destination clash: copied {path}, but {why}')
 			# A copy that reported errors is incomplete: removing the sources (a move) would lose what was not copied,
 			# and an unlisted source subtree would make its destination counterpart look extra.
 			copy_failures = [error for error in ERRORS[copy_error_start:] if _is_failure(error)]
