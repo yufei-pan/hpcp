@@ -26,6 +26,7 @@ Nothing needs doing to upgrade. What changed:
 - **A rerun onto vfat no longer copies every file dated before 1980 again:** FAT keeps no earlier time, so such a file's landing never had its time. Where the source is from before 1980-01-01 and its landing at or after it, the skip check reads both files in full instead of copying; for those files only.
 - **A link to the destination, named or listed, is the destination:** `printf 'outl\nb\n' | hpcp -sfl - -d out -rme` with `outl -> out` printed "Not removing" for each extra and copied the link in as `out/outl`, a link to its own directory. It is now left out as the destination itself is (`Left out ...: a source that is the destination, or a link to it, is not copied or moved`), with the one `-rme checked nothing` note; the same for `hpcp outl b -d out`.
 - **`-rme` asks about extra links once a directory:** an extra symlink is `lstat`ed only in a directory that holds a file or link source, as an extra file already was; on NFS mounted `actimeo=0` that saves about 0.6 ms an extra link.
+- **The license is package metadata as an SPDX expression:** the wheel carries `License-Expression: GPL-3.0-or-later` (setuptools 77 and later build it without the "License classifiers are deprecated" warning). pip 9.0.3, the pip of EL7 and EL8, installs and uninstalls it as before (checked on Python 3.6 with pip 9.0.3); it does not read that field, so `pip3 show hpcp` there says `License: None`.
 
 ## Upgrading to 9.84 from 9.83
 
