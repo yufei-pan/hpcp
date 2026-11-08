@@ -3276,13 +3276,13 @@ def test_a_service_with_read_capability_copies_what_it_cannot_read_by_mode(tmp_p
 @pytest.mark.parametrize('mode', [0o000, 0o644], ids=oct)
 def test_a_fifo_is_no_read_so_its_mode_stops_nothing(tmp_path, mode):
 	# cp -a makes a new one, reading nothing. And asking must not hang on it: no writer is coming.
-	# The exit is 200 ("Source path type error") for both modes, as on 9.80: the node is made all the same. That exit is wrong and
-	# deferred (docs/limitations.md, "A named FIFO or socket is copied and still exits 200"): this holds both modes to one route.
+	# The exit is 0 for both modes since 9.85: a FIFO the operator names is a source, copied as cp -a copies it (9.80 to 9.84
+	# made the node and exited 200, "Source path type error").
 	os.makedirs(tmp_path / 'a')
 	os.mkfifo(tmp_path / 'a/p', mode)
 	task = subprocess.run([sys.executable, HPCP, 'a/p', '-d', 'out/'], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
 		cwd=str(tmp_path), timeout=60, start_new_session=True)
-	assert stat.S_ISFIFO(os.lstat(tmp_path / 'out/p').st_mode) and task.returncode == 200, task.stdout[-2000:]
+	assert stat.S_ISFIFO(os.lstat(tmp_path / 'out/p').st_mode) and task.returncode == 0, task.stdout[-2000:]
 
 
 _FIFO_WRITER = 'import os, sys; print("ready", flush=True); os.write(os.open(sys.argv[1], os.O_WRONLY), b"x")'
@@ -3298,7 +3298,7 @@ def test_a_fifo_with_a_waiting_writer_is_not_disturbed_by_being_named(tmp_path):
 		time.sleep(0.3)
 		task = subprocess.run([sys.executable, HPCP, 'a/p', '-d', 'out/'], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
 			cwd=str(tmp_path), timeout=60, start_new_session=True)
-		assert stat.S_ISFIFO(os.lstat(tmp_path / 'out/p').st_mode) and task.returncode == 200, task.stdout[-2000:]
+		assert stat.S_ISFIFO(os.lstat(tmp_path / 'out/p').st_mode) and task.returncode == 0, task.stdout[-2000:]
 		with pytest.raises(subprocess.TimeoutExpired):
 			writer.wait(timeout=1)
 	finally:
@@ -3326,7 +3326,7 @@ def test_a_named_fifo_run_twice_ends_both_times(tmp_path):
 	os.mkfifo(tmp_path / 'a/p')
 	for attempt in range(2):
 		rc, output = _run_bounded(['a/p', '-d', 'out/'], tmp_path, seconds=30)
-		assert rc == 200 and stat.S_ISFIFO(os.lstat(tmp_path / 'out/p').st_mode), (attempt, rc, output[-2000:])
+		assert rc == 0 and stat.S_ISFIFO(os.lstat(tmp_path / 'out/p').st_mode), (attempt, rc, output[-2000:])
 
 
 def test_a_list_holding_a_fifo_run_twice_ends_both_times(tmp_path):
@@ -3335,16 +3335,18 @@ def test_a_list_holding_a_fifo_run_twice_ends_both_times(tmp_path):
 	write(tmp_path / 'a/f', 'F')
 	for attempt in range(2):
 		rc, output = _run_bounded(['-d', 'out/'], tmp_path, stdin=b'a/p\na/f\n')
-		assert rc == 200 and stat.S_ISFIFO(os.lstat(tmp_path / 'out/a/p').st_mode) and (tmp_path / 'out/a/f').read_text() == 'F', (attempt, rc, output[-2000:])
+		assert rc == 0 and stat.S_ISFIFO(os.lstat(tmp_path / 'out/a/p').st_mode) and (tmp_path / 'out/a/f').read_text() == 'F', (attempt, rc, output[-2000:])
 
 
-def test_a_move_of_a_list_holding_a_fifo_keeps_the_sources_on_a_rerun(tmp_path):
+def test_a_move_of_a_list_holding_a_fifo_moves_it_on_a_rerun(tmp_path):
 	os.makedirs(tmp_path / 'a')
 	os.mkfifo(tmp_path / 'a/p')
 	write(tmp_path / 'a/f', 'F')
 	_run_bounded(['-d', 'out/'], tmp_path, stdin=b'a/p\na/f\n')
 	rc, output = _run_bounded(['-d', 'out/', '-rf'], tmp_path, stdin=b'a/p\na/f\n')
-	assert rc == 212 and stat.S_ISFIFO(os.lstat(tmp_path / 'a/p').st_mode) and (tmp_path / 'a/f').read_text() == 'F', (rc, output[-2000:])
+	# 9.85: a named FIFO is a source, and the move takes it (9.80 to 9.84: 212, every source kept).
+	assert rc == 0 and not os.path.lexists(tmp_path / 'a/p') and not (tmp_path / 'a/f').exists(), (rc, output[-2000:])
+	assert stat.S_ISFIFO(os.lstat(tmp_path / 'out/a/p').st_mode) and (tmp_path / 'out/a/f').read_text() == 'F'
 
 
 @pytest.mark.parametrize('fifo_is', ['source', 'destination'])
@@ -3420,15 +3422,15 @@ def test_a_content_only_rerun_over_the_fifo_a_plain_run_made_ends(tmp_path):
 	os.mkfifo(tmp_path / 'a/p')
 	for flags in ([], ['-co']):
 		rc, output = _run_bounded(['a/p', '-d', 'out/'] + flags, tmp_path)
-		assert rc == 200 and stat.S_ISFIFO(os.lstat(tmp_path / 'out/p').st_mode), (flags, rc, output[-2000:])
+		assert rc == 0 and stat.S_ISFIFO(os.lstat(tmp_path / 'out/p').st_mode), (flags, rc, output[-2000:])
 
 
 def test_a_content_only_first_run_makes_the_fifo_without_opening_it(tmp_path):
-	# cp -f read the source FIFO and waited for a writer that never comes, on 9.80 as well. Exit 200: see the first FIFO test.
+	# cp -f read the source FIFO and waited for a writer that never comes, on 9.80 as well. Exit 0 since 9.85 (200 before).
 	os.makedirs(tmp_path / 'a')
 	os.mkfifo(tmp_path / 'a/p')
 	rc, output = _run_bounded(['a/p', '-d', 'out/', '-co'], tmp_path, seconds=15)
-	assert rc == 200 and stat.S_ISFIFO(os.lstat(tmp_path / 'out/p').st_mode), (rc, output[-2000:])
+	assert rc == 0 and stat.S_ISFIFO(os.lstat(tmp_path / 'out/p').st_mode), (rc, output[-2000:])
 
 
 def test_a_content_only_fifo_over_a_hard_linked_file_takes_the_name_and_ends(tmp_path):
@@ -3437,7 +3439,7 @@ def test_a_content_only_fifo_over_a_hard_linked_file_takes_the_name_and_ends(tmp
 	write(tmp_path / 'out/p', 'old')
 	os.link(tmp_path / 'out/p', tmp_path / 'other')
 	rc, output = _run_bounded(['a/p', '-d', 'out/', '-co'], tmp_path, seconds=15)
-	assert rc == 200 and stat.S_ISFIFO(os.lstat(tmp_path / 'out/p').st_mode), (rc, output[-2000:])
+	assert rc == 0 and stat.S_ISFIFO(os.lstat(tmp_path / 'out/p').st_mode), (rc, output[-2000:])
 	assert (tmp_path / 'other').read_text() == 'old'
 
 
@@ -3449,7 +3451,7 @@ def test_a_content_only_fifo_with_a_waiting_writer_is_not_disturbed(tmp_path):
 		assert writer.stdout.readline() == b'ready\n'
 		time.sleep(0.3)
 		rc, output = _run_bounded(['a/p', '-d', 'out/', '-co'], tmp_path, seconds=15)
-		assert rc == 200 and stat.S_ISFIFO(os.lstat(tmp_path / 'out/p').st_mode), (rc, output[-2000:])
+		assert rc == 0 and stat.S_ISFIFO(os.lstat(tmp_path / 'out/p').st_mode), (rc, output[-2000:])
 		with pytest.raises(subprocess.TimeoutExpired):
 			writer.wait(timeout=1)
 	finally:
@@ -3484,6 +3486,7 @@ def test_a_source_that_is_gone_is_left_to_cp_under_content_only(tmp_path, hpcp_m
 @needs_root
 @pytest.mark.parametrize('matching_mtime', [True, False], ids=['same-mtime', 'other-mtime'])
 def test_content_only_makes_the_device_node_and_never_reads_the_source(tmp_path, matching_mtime):
+	# 9.85: a device the operator names is a source, exit 0 (200 before: 'Source path type error').
 	# cp -f read /dev/zero's number to no end and wrote it through out/n. A read of a real disk ends, but writes the other disk.
 	os.makedirs(tmp_path / 'a')
 	os.makedirs(tmp_path / 'out')
@@ -3493,18 +3496,19 @@ def test_content_only_makes_the_device_node_and_never_reads_the_source(tmp_path,
 		os.utime(tmp_path / 'out/n', (1, 1))
 	rc, output = _run_bounded(['a/n', '-d', 'out/', '-co'], tmp_path, seconds=15)
 	st = os.lstat(tmp_path / 'out/n')
-	assert rc == 200 and stat.S_ISCHR(st.st_mode) and st.st_rdev == os.makedev(1, 5), (rc, output[-2000:])
+	assert rc == 0 and stat.S_ISCHR(st.st_mode) and st.st_rdev == os.makedev(1, 5), (rc, output[-2000:])
 
 
 @needs_root
 def test_content_only_first_run_makes_the_device_node_and_a_rerun_leaves_it(tmp_path):
+	# 9.85: a device the operator names is a source, exit 0 (200 before: 'Source path type error').
 	os.makedirs(tmp_path / 'a')
 	_device_node(str(tmp_path / 'a/n'), 5, str(tmp_path))
 	inodes = set()
 	for attempt in range(2):
 		rc, output = _run_bounded(['a/n', '-d', 'out/', '-co'], tmp_path, seconds=15)
 		st = os.lstat(tmp_path / 'out/n')
-		assert rc == 200 and stat.S_ISCHR(st.st_mode) and st.st_rdev == os.makedev(1, 5), (attempt, rc, output[-2000:])
+		assert rc == 0 and stat.S_ISCHR(st.st_mode) and st.st_rdev == os.makedev(1, 5), (attempt, rc, output[-2000:])
 		inodes.add(st.st_ino)
 	assert len(inodes) == 1
 
@@ -3796,16 +3800,17 @@ def test_the_refusal_says_what_fixes_it(tmp_path):
 @needs_root
 @pytest.mark.parametrize('flags', [[], ['-co']], ids=['plain', 'co'])
 def test_a_matching_node_pair_is_no_clash(tmp_path, flags):
+	# 9.85: a device the operator names is a source, exit 0 (200 before: 'Source path type error').
 	# The same device under another name, and the pair a first run left: replacing the node would only make it again.
 	write(tmp_path / 'a/keep', 'k')
 	_device_node(str(tmp_path / 'a/n'), 5, str(tmp_path))
 	for attempt in range(2):
 		rc, output = _run_bounded(['a/n', '-d', 'b/n'] + flags, tmp_path, seconds=30)
-		assert rc == 200 and b'Destination clash' not in output, (attempt, rc, output[-2000:])
+		assert rc == 0 and b'Destination clash' not in output, (attempt, rc, output[-2000:])
 		assert os.lstat(tmp_path / 'b/n').st_rdev == os.makedev(1, 5)
 	_device_node(str(tmp_path / 'again'), 5, str(tmp_path / 'a/n'))
 	rc, output = _run_bounded(['a/n', '-d', 'again'] + flags, tmp_path, seconds=30)
-	assert rc == 200 and b'Destination clash' not in output, (rc, output[-2000:])
+	assert rc == 0 and b'Destination clash' not in output, (rc, output[-2000:])
 	rc, output = _run_bounded(['again', '-d', 'again'] + flags, tmp_path, seconds=30)
 	assert b'Destination clash' not in output and os.lstat(tmp_path / 'again').st_rdev == os.makedev(1, 5), (rc, output[-2000:])
 
@@ -3872,6 +3877,7 @@ def _disk_of_b_is_whole(image):
 
 @pytest.mark.parametrize('matching_mtime', [True, False], ids=['same-mtime', 'other-mtime'])
 def test_content_only_never_copies_one_disk_over_another(tmp_path, two_loops, matching_mtime):
+	# 9.85: a device the operator names is a source, exit 0 (200 before: 'Source path type error').
 	loop_a, loop_b, image_b = two_loops
 	os.makedirs(tmp_path / 'a')
 	os.makedirs(tmp_path / 'out')
@@ -3882,7 +3888,7 @@ def test_content_only_never_copies_one_disk_over_another(tmp_path, two_loops, ma
 	rc, output = _run_bounded(['a/n', '-d', 'out/', '-co'], tmp_path, seconds=30)
 	subprocess.run(['blockdev', '--flushbufs', loop_b], check=False)
 	assert _disk_of_b_is_whole(image_b), (rc, output[-2000:])
-	assert rc == 200 and os.lstat(tmp_path / 'out/n').st_rdev == os.stat(loop_a).st_rdev, (rc, output[-2000:])
+	assert rc == 0 and os.lstat(tmp_path / 'out/n').st_rdev == os.stat(loop_a).st_rdev, (rc, output[-2000:])
 
 
 @pytest.mark.parametrize('flags', [[], ['-co']], ids=['plain', 'co'])

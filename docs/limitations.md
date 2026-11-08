@@ -66,12 +66,6 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - **Why:** rare, and the hang is old. The temporary name and rename above (tree landings only) keeps the name until the copy is whole, and never opens the FIFO; a FIFO named by `-d` keeps today's behaviour, so a feed that works is not broken.
 - **Revisit when:** 9.85.
 
-### A named FIFO or socket is copied and still exits 200
-- **Kind:** deferred.
-- **What the operator sees:** `hpcp a/p -d out/` makes the node, prints `Source path type error` and ends exit 200. With `-s` the exit is 0 (9.81 too). A file that is refused is not listed, so a clash adds no such line; a named FIFO whose landing is a directory prints it before the clash, and a device source a user may not make before the `Copy failed`. With `-rf` it is 212 and every named source stays, files included; nothing is lost. The same FIFO in a directory source is skipped silently with exit 0. Same on 9.80.
-- **Why:** old and safe. A named special should either copy cleanly or be skipped as in a tree, and that is its own decision.
-- **Revisit when:** 9.85.
-
 ### A regular file writes through a device node at the destination
 - **Kind:** deferred.
 - **What the operator sees:** a regular source that lands on a device node, in a tree or named by `-d`, is written through it, with or without `-co`: into the device, or the disk behind it, which on a mounted disk writes over live blocks (reasoned, not run). Without `-co` the node also takes the source's mode and times. A link to a device is the device: a regular file named onto `-d lnk` writes the disk behind it. The same on 9.80. A device or FIFO source no longer does this: since 9.82 it is never read, with or without `-co`, and it never replaces a device (or a link to one) that `-d` names.

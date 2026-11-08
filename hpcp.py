@@ -2885,6 +2885,14 @@ def _enter_directory(path, device):
 	os.close(fd)
 	return None
 
+def _named_special(path):
+	"""True when path itself (lstat) is a FIFO, socket or device node."""
+	try:
+		mode = os.lstat(path).st_mode
+	except OSError:
+		return False
+	return stat.S_ISFIFO(mode) or stat.S_ISSOCK(mode) or stat.S_ISBLK(mode) or stat.S_ISCHR(mode)
+
 def _special_file_kind(entry):
 	"""'FIFO', 'socket', 'block device' or 'character device' for such a scandir entry, else None: a regular file,
 	directory or link, or an entry deleted since the directory was read (without d_type, is_file() stats it, and a
@@ -2983,7 +2991,10 @@ def get_file_list_serial(root,exclude=None,append_hash=False,full_hash=False,rec
 			file_list.add(get_file_repr(current,append_hash,full_hash))
 			continue
 		if not (is_dir or (is_dir is None and os.path.isdir(current))):
-			eprint(f'Source path type error: {current} is not a file or directory')
+			# A FIFO, socket or device the operator named is a source, copied as cp -a copies it (one met in a tree is
+			# skipped by the walk); never hashed: opening it is an act of its own.
+			if not (current == root and _named_special(current)):
+				eprint(f'Source path type error: {current} is not a file or directory')
 			file_list.add(current)
 			continue
 		folders.add(current)
@@ -3139,7 +3150,8 @@ def get_file_list_parallel(path,max_workers=56,exclude=None,append_hash=False,fu
 					folder_list.update(dir_folder_list)
 			
 	else:
-		eprint(f'Source path type error: {path} is not a file or directory')
+		if not _named_special(path):
+			eprint(f'Source path type error: {path} is not a file or directory')
 		return frozenset([path]) ,frozenset(), 0,frozenset()
 	return frozenset(file_list), frozenset(link_list) ,size, frozenset(folder_list - set(['.', '..']))
 
@@ -10779,6 +10791,8 @@ def _not_held(entries, src_paths, dests, dest_image=False, max_workers=1, move=T
 			return None
 		if stat.S_IFMT(lt.st_mode) != stat.S_IFMT(st.st_mode):
 			return f'{landing} is another kind of entry'
+		if (stat.S_ISCHR(st.st_mode) or stat.S_ISBLK(st.st_mode)) and lt.st_rdev != st.st_rdev:
+			return f'{landing} is another device'
 		if not stat.S_ISREG(st.st_mode):
 			return None
 		if lt.st_size != st.st_size:

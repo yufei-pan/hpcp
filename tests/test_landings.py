@@ -757,3 +757,31 @@ def test_a_move_of_a_link_and_a_directory_through_it_moves_that_directory(tmp_pa
 		rc, output = run(['lb', 'lb/d/', '-d', 'out/', '-rf', '-j', '8'], root)
 		assert rc == 0 and not os.path.lexists(str(root / 'lb')) and not os.path.exists(str(root / 'b/d')), output[-2000:]
 		assert read(root / 'out/w') == 'W' and read(root / 'b/y') == 'Y' and read(root / 'b/x') == 'X'
+
+
+# ---- entry 3: a FIFO, socket or device named as a source ----
+
+@posix_only
+@pytest.mark.skipif(not hasattr(__import__('socket'), 'AF_UNIX'), reason='unix sockets')
+@pytest.mark.parametrize('flags', [[], ['-s'], ['-rf']], ids=['parallel', 'serial', 'move'])
+def test_a_named_socket_and_fifo_are_copied_as_cp_copies_them(tmp_path, flags):
+	# 9.80 to 9.84 made the node and exited 200 ("Source path type error"), and -rf kept every source (212); -s exited 0.
+	import socket
+	os.makedirs(str(tmp_path / 'a'))
+	os.mkfifo(str(tmp_path / 'a/p'))
+	sock = socket.socket(socket.AF_UNIX)
+	sock.bind(str(tmp_path / 'a/s'))
+	sock.close()
+	write(tmp_path / 'a/f', 'F')
+	rc, output = run(['a/p', 'a/s', 'a/f', '-d', 'out/'] + flags, tmp_path, timeout=60)
+	assert rc == 0 and b'Source path type error' not in output, output[-2000:]
+	assert stat.S_ISFIFO(os.lstat(str(tmp_path / 'out/p')).st_mode) and stat.S_ISSOCK(os.lstat(str(tmp_path / 'out/s')).st_mode)
+	assert all(os.path.lexists(str(tmp_path / 'a' / name)) != (flags == ['-rf']) for name in 'psf')
+
+
+@posix_only
+def test_a_fifo_in_a_tree_is_still_skipped(tmp_path):
+	os.makedirs(str(tmp_path / 'a'))
+	os.mkfifo(str(tmp_path / 'a/p'))
+	rc, output = run(['a/', '-d', 'out/'], tmp_path, timeout=60)
+	assert rc == 0 and not os.path.lexists(str(tmp_path / 'out/p')) and b'Special file skipped' in output, output[-2000:]
