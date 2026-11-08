@@ -11248,10 +11248,10 @@ def _settle_destinations(src_paths, dests, dest_image=None, directory_only=False
 							f'name, and the destination cannot be asked: {places.cannot_ask(land, read)}; nothing is copied or removed')
 	replaced = 0
 	holders = {}
+	# The directories the sources make at the destinations. Those of the other destinations count where names fold alike: a
+	# file can meet a directory of another source in any destination it may go to (files spill, -rds picks at random), and
+	# only a later one may take the two for one name.
 	dirs = set()
-	# The directories of the other destinations, for the fold check only: a file can meet a directory of another source in
-	# any destination it may go to (files spill, -rds picks at random), and only a later one may take the two for one name.
-	later = set()
 	def clash(path, job, why):
 		eprint(f'Destination clash: {why}, not copying {path} over it')
 		dropped.setdefault(job, set()).add(path)
@@ -11270,13 +11270,6 @@ def _settle_destinations(src_paths, dests, dest_image=None, directory_only=False
 					f'{ours} and {theirs} may be one name, and the destination cannot be asked: {places.cannot_ask(theirs, ours)}')
 				return True
 		return False
-	def add_later(path):
-		while path not in later:
-			later.add(path)
-			parent = os.path.dirname(path)
-			if parent == path:
-				return
-			path = parent
 	def add_directory(path):
 		"""path and the directories above it are directories at the destination: a file held there gives way."""
 		while path not in dirs:
@@ -11296,16 +11289,15 @@ def _settle_destinations(src_paths, dests, dest_image=None, directory_only=False
 		count_later = folds and len(lands) > 1
 		if directory:
 			src_root = src.rstrip(os.path.sep)
-			for index, (dest, land) in enumerate(zip(actual_dests, lands) if count_later else [(actual_dests[0], lands[0])]):
-				add = add_directory if index == 0 else add_later
-				add(land)
+			for dest, land in zip(actual_dests, lands) if count_later else [(actual_dests[0], lands[0])]:
+				add_directory(land)
 				dest_root = dest.rstrip(os.path.sep)
 				for folder in listing(src)[3]:
-					add(places.directory((dest_root + folder[len(src_root):]).rstrip(os.path.sep)))
+					add_directory(places.directory((dest_root + folder[len(src_root):]).rstrip(os.path.sep)))
 		else:
 			add_directory(os.path.dirname(lands[0]))
 			for land in lands[1:] if count_later else ():
-				add_later(os.path.dirname(land))
+				add_directory(os.path.dirname(land))
 		for path, place, landings in sorted(files_of(entry)) if folds else files_of(entry):
 			if directory and place in landings:
 				continue
@@ -11334,7 +11326,7 @@ def _settle_destinations(src_paths, dests, dest_image=None, directory_only=False
 				clash(path, job, f'{dest} is already copied from {held[0]}')
 	if folds:
 		made = {}
-		for path in itertools.chain(dirs, later):
+		for path in dirs:
 			made.setdefault(_folded(path), []).append(path)
 		names = [_folded(dest) for dest in holders]
 		count = Counter(names)
