@@ -38,7 +38,8 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - **Kind:** deferred.
 - **What the operator sees:** a copy onto an existing tree reads each directory it lands in, on one worker, before the first file is copied: about 1 us per file on a local disk, longer on network storage.
 - **Why:** correct and bounded as it is; a parallel scan is its own change.
-- **Revisit when:** 9.85 (part 2).
+- **Measured (9.85, 2026-11-08):** 9.85 has no serial scan (`_link_targets` is gone; the directory checks run in the workers), but a rerun is not faster for it: 100,000 files in 10,000 directories, nothing to copy, NFSv4.1 loopback `actimeo=0` on EL7 (2 vCPUs): 9.84 1764, 2301, 2212 s, 9.85 1871, 1878, 3044 s. On a local disk (Docker, a loaded host): 9.84 9.3 to 19.8 s, 9.85 6.5 to 15.7 s. The time goes to the per-file checks over NFS (about 60 to 80 GETATTRs per file rewritten, 9.84 as 9.85), not to a scan.
+- **Revisit when:** 9.86, with the copy check's second pass (stat only the entries met twice).
 
 ### Rerunning an overlapping form is refused
 - **Kind:** known limitation.
