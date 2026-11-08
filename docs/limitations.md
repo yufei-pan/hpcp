@@ -41,13 +41,6 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - **Revisit when:** someone hits it.
 - **Approved:** 2026-11-05, the user chose "Known limitation (Recommended)".
 
-### `-nds` with a directory source meeting a file in the destination
-- **Kind:** deferred.
-- **What the operator sees:** with `-nds`, `hpcp a/x -d out/` where a/x is a directory and out/x a file exits 70 with a `File exists` traceback instead of a clean clash, exit 213. The file is untouched, as in 9.80.
-- **Why:** ugly but safe, and old.
-- **Revisit when:** the next hpcp release.
-- **Approved:** 2026-11-05, the user chose "Deferred to 9.82 (Recommended)".
-
 ### Positional `-rme` judges the whole destination
 - **Kind:** deferred.
 - **What the operator sees:** `hpcp b -d out/ -rme` lands in `out/b`, but at the prompt's y it also deletes what lies outside that, such as `out/keep`; `hpcp a/x b -d out/ -rme` does the same. Same as 9.80. A source from a list is already limited to what it covers.
@@ -79,35 +72,11 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - **Why:** it needs `-rme` to know what the run reads, and that belongs with limiting positional `-rme` to where a source lands.
 - **Revisit when:** the next hpcp release, with "Positional `-rme` judges the whole destination".
 
-### A landing through a link into an unreachable place blames the wrong directory
-- **Kind:** deferred.
-- **What the operator sees:** with `out/l -> /root/secret/f`, the 213 says `/root` cannot be searched and offers a `chmod` a non-root user cannot run. The refusal is right; it should name the link.
-- **Why:** `_RealPlaces.directory` raises where the walk stopped and no longer knows which landing led there.
-- **Revisit when:** the next hpcp release.
-
-### A named source that matches nothing beside a good one is dropped silently
-- **Kind:** deferred.
-- **What the operator sees:** `hpcp nosuch ok/g -d out/`, also with `-rf`, copies `ok/g` and exits 0 without a word about `nosuch`, as 9.80 does. Alone it is exit 240, and the list route gives 207.
-- **Why:** the glob expansion (near line 756) drops it. It should say so and exit 207 after copying the rest.
-- **Revisit when:** the next hpcp release.
-
 ### A source that opens and then fails on read costs the old copy
 - **Kind:** deferred.
 - **What the operator sees:** `cp` truncates the destination before its first read, so a source that opens and then fails (`/proc/self/mem` with an old `out/mem`) ends in exit 190 and the old copy is gone. 9.80 left it empty.
   - With several destinations, a part written through a link at the first destination and the file then taken by the second ends exit 0 with the link's target half written (`hpcp a/ -d out/ -d two/` with `out/x -> ../t/f`).
 - **Why:** keeping it takes a temporary name and a rename, which is its own design; that covers the link case too. It covers landings in a tree only: a name given by `-d` keeps the write-through, because a rename would replace a FIFO named by `-d` and break a pipe feed that works today (a regular file onto a lone FIFO with a reader).
-- **Revisit when:** the next hpcp release.
-
-### A rerun with a source that became unreadable ends in exit 191
-- **Kind:** deferred.
-- **What the operator sees:** the destination matches the source by size and mtime, then the source becomes unreadable (mode 000, not root): the identical-file check hashes first, `hash_file`'s open raises, and a copy says `Copy process crashed: Fatal Error copying ...: Permission denied` and ends with exit 191 instead of the clean 190 (no traceback since 9.82; 9.81 printed one). A move ends 212 as usual (the exit is the highest of the errors), with its sources kept. Nothing is lost. Same on 9.80.
-- **Why:** old and safe. The fix is to move the readability check ahead of the identical loop, or to catch `PermissionError` around the hash.
-- **Revisit when:** the next hpcp release.
-
-### `Copy failed` does not carry cp's stderr
-- **Kind:** deferred.
-- **What the operator sees:** when `cp` fails, hpcp says `Copy failed: ... failed with return code 1`; why (a full disk, a loop in a destination link, a permission) is in cp's stderr, which is not shown. A full disk says only "return code 1".
-- **Why:** old behaviour: the traceback 9.81 printed did not carry it either. The runner has the stderr (the task keeps it); the error text does not carry it.
 - **Revisit when:** the next hpcp release.
 
 ### A FIFO that blocks the copy
@@ -118,7 +87,7 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 
 ### A named FIFO or socket is copied and still exits 200
 - **Kind:** deferred.
-- **What the operator sees:** `hpcp a/p -d out/` makes the node, prints `Source path type error` and ends exit 200. With `-s` the exit is 0 (9.81 too). The line also follows a refusal where no destination is left (`Destination clash: ... is a device`), where it reads as a second, different failure. With `-rf` it is 212 and every named source stays, files included; nothing is lost. The same FIFO in a directory source is skipped silently with exit 0. Same on 9.80.
+- **What the operator sees:** `hpcp a/p -d out/` makes the node, prints `Source path type error` and ends exit 200. With `-s` the exit is 0 (9.81 too). A file that is refused is not listed, so a clash adds no such line; a named FIFO whose landing is a directory prints it before the clash, and a device source a user may not make before the `Copy failed`. With `-rf` it is 212 and every named source stays, files included; nothing is lost. The same FIFO in a directory source is skipped silently with exit 0. Same on 9.80.
 - **Why:** old and safe. A named special should either copy cleanly or be skipped as in a tree, and that is its own decision.
 - **Revisit when:** the next hpcp release.
 
@@ -142,8 +111,64 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - **Revisit when:** someone hits it.
 - **Approved:** 2026-11-06, the user chose "Known limitation (Recommended)".
 
-### Two names that differ only in case on a case-insensitive destination
+### Several destinations and a pair one of them takes for one name
+- **Kind:** known limitation.
+- **What the operator sees:** with several `-d`, two names that one destination takes for one name (`a/X` and `b/x`, the second `-d` folding case) are a clash, exit 213, though both would have fitted on another destination that keeps them apart. The same holds for a file and a directory of another source (`a/X` and `b/x/`). It is a false 213 for that pair, never a lost file.
+- **Why:** files spill from one destination to the next as space runs out, and `-rds` picks at random, so which destination gets each file is not known before the copy.
+- **Revisit when:** someone hits it.
+- **Approved:** 2026-11-06, the user chose "Known limitation (Recommended)". Widened to a file and a directory of another source: 2026-11-07, the user chose "Keep it (Recommended)".
+
+### A probe left behind by SIGKILL
+- **Kind:** known limitation.
+- **What the operator sees:** hpcp killed with SIGKILL in the moment it asks a directory about a name leaves a hidden `.hpcp-case-probe-PID-uuid` directory in the destination, empty or holding a small file for each spelling of the name it was asking about; where the probe asks each made name alone (a spelling the directory will not look up, as on vfat), a second such directory can be left beside it. No data is affected. SIGINT, SIGTERM and SIGHUP wait for the probe to go, and left nothing in 30 kills each.
+- **Why:** SIGKILL cannot be handled, and the only way to ask a directory about two names is to make them.
+- **Revisit when:** an operator reports finding one.
+- **Approved:** 2026-11-06, the user chose "Known limitation (Recommended)".
+
+### A directory that cannot be asked about a new pair
+- **Kind:** known limitation.
+- **What the operator sees:** two names that fold alike (`X` and `x`), at least one of them new, landing in a directory where nothing can be made, such as an owned mode 555 directory, are refused with 213: `may be one name, and the destination cannot be asked: nothing can be made in DIR to ask it (Permission denied): make it writable and run again` (a read-only mount or a full disk names its own fix). On a case-sensitive filesystem the refusal is false: 9.82 opened an owned directory and landed both. No file is lost. Where nothing can be made, the directory's listing answers: both names in it are two names, so a rerun with both names there passes.
+- **Why:** it takes that exact mix, and opening the directory for the probe means another chmod and restore in the path that writes to destinations.
+- **Revisit when:** someone hits it.
+- **Approved:** 2026-11-06, the user chose "Known limitation (Recommended)".
+
+### An 8.3 alias beside its long name on vfat
 - **Kind:** deferred.
-- **What the operator sees:** with `a/X` and `b/x`, `hpcp a/ b/ -d out/ -rf` onto a casefold directory exits 0, one file's content is gone, and either source can win (ext4 casefold: the earlier source in 3 of 9 runs, on every version). SMB, NTFS and exFAT destinations should do the same (reasoned, not run).
-- **Why:** the check compares real paths before the files exist. The fix is to ask whether the destination folds case and refuse the clash, exit 213.
+- **What the operator sees:** `hpcp a/ b/ -d out/ -rf` onto vfat with `a/longfilename.txt` and `b/LONGFI~1.TXT` exits 0 and one content is gone, in about half of the runs: vfat made `LONGFI~1.TXT` the short name of the first file, so the second source is written onto it. The sources are removed. 9.82 does the same.
+- **Why:** a numbered alias such as `LONGFI~1.TXT` is in neither name, so no rule on names catches it, and asking the directory about the pair (`_ask_names`) cannot see that one file already has the other's name: it is the filesystem's invention, not a spelling. (A short name that is a plain fold of the long one, such as `KIZ.TXT` for `kız.txt` with codepage 850 or 857, is caught: dotless `ı` folds with `i`.)
+- **Plan:** the same backstop as for legacy names: before a move removes a source, check that its landing holds that source (the size and modification time `cp -a` gave it, and that the landing is not the source itself, asked by doing in the same directory where they share it), and where it does not, keep the source and report a clash.
 - **Revisit when:** the next hpcp release.
+
+### A copy into its own inside under another spelling on FUSE exFAT
+- **Kind:** deferred.
+- **What the operator sees:** on exFAT through FUSE (EL7 and EL8), with `D/f` and `D/sub/f`, `hpcp D/ -d d/sub/` without `-rf` exits 0 and adds `D/sub/sub/f`: `d` is `D`, so the destination is inside the source, and the copy reads the destination's own files and copies them into it, one level deeper each run. The file it adds holds either content, as its copy races with the one that writes `D/f` onto `D/sub/f`. In one spelling (`hpcp D/ -d D/sub/`) the destination is left out of the walk, and `D/sub/f` takes `D/f`'s content as any file of a destination would, so the other spelling adds only the extra copies. The move form, `hpcp D/ -d d/sub/ -rf`, is refused (241), as in one spelling.
+- **Why:** the check that a source holds the destination compares real paths, and FUSE exFAT gives each spelling of one directory a number of its own, so `D` and `d` are two real paths there. Kernel filesystems give both one number, and the check sees one directory.
+- **Plan:** where a source's real path folds like the start of a destination's, ask the directory whether they are one (`_RealPlaces.same_place`), as the move check does, and leave the destination out of the walk as for one spelling.
+- **Revisit when:** the next hpcp release.
+
+### A legacy name read as UTF-8 or ASCII, against its other case
+- **Kind:** deferred.
+- **What the operator sees:** on a vfat or exFAT mounted with a codepage `iocharset` (`iso8859-1`, `iso8859-9`, `cp1251`, `koi8-r`; not `utf8`), two names that the mount takes for one are not asked about when the net reads one of them as UTF-8 or ASCII, which happens in three ways:
+  - one name's bytes happen to be valid UTF-8 and the other's are not: `C3 A9 74` (Latin-1 `Ã©t`, UTF-8 `ét`) against `E3 A9 74`, which a cp1251 mount reads as `Г©t` and `г©t`;
+  - both names' bytes are valid UTF-8, but not as each other's case: KOI8-R `бё` and `бЁ` (`C2 A3` and `C2 B3`), CP1251 `EF B8 B8` and `EF A8 B8`; CP1251 alone has 880 such two-byte pairs;
+  - an ASCII name against a legacy one: `istanbul` against ISO 8859-9 `İstanbul` (`DD` for `İ`, which that table makes the other case of `i`).
+  - two cases of different lengths: EUC-JP `ς` is three bytes (`8F A6 F8`) and `Σ` two (`A6 B2`), and no rule over single bytes can join names of different lengths.
+  `hpcp a/ b/ -d out/ -rf` with one in `a/` and the other in `b/` exits 0 with one content gone, and the rename in case (`hpcp out/ONE -d out/OTHER -rf`) exits 0 and the file is gone. Checked on vfat mounted `iocharset=cp1251`, `koi8-r`, `iso8859-1` and `iso8859-9` (`utf8=0`), and kernel exFAT mounted `iocharset=cp1251` (VM 901). Only for such pairs, and only on such a mount: names that are not UTF-8 as a whole fold byte by byte and meet.
+- **Why:** a name that is valid UTF-8 is read as UTF-8, which it is on every other mount, and the mount's own table, not UTF-8, says what its other case is. Joining every valid name with every name of the same length would ask about most trees pair by pair again.
+- **Plan:** first a backstop that needs no fold rule, the only one that catches names of different lengths: before a move removes a source, check that its landing holds that source (the size and modification time `cp -a` gave it, and that the landing is not the source itself, which is asked by doing, in the same directory, where they share it), and where it does not, keep the source and report a clash. Then catch the pairs before the copy: fold every name byte by byte on a mount with a codepage `iocharset` (read from the mount options), or join byte-level keys across all names.
+- **Revisit when:** the next hpcp release.
+
+### Directories that differ only in case on vfat mounted `iocharset=utf8`
+- **Kind:** deferred.
+- **What the operator sees:** on a vfat mounted with `iocharset=utf8` given explicitly, `hpcp a/ b/ -d out/` with `a/D/f` and `b/d/g` exits 193 (`Directory sync error: .../b/d to .../out/d: [Errno 2] No such file or directory`, then `Copy failed ... No more destination paths to try`), and `g` is not copied; with `-rf` it exits 212 and keeps both sources. Nothing is lost, and 9.82 does the same. Checked on VM 901; vfat with its default charset or `iocharset=iso8859-1`, kernel exFAT, NTFS (`ignore_case`) and ext4 casefold merge the two, exit 0.
+- **Why:** vfat mounted that way looks a name up in its own case only (`out/d` is not found) but will not make it either, as `out/D` holds the name; the copy names the directory as the source spells it.
+- **Plan:** write a merged directory's files under the spelling the directory holds, which `_RealPlaces` knows from asking it, or report the pair as a clash.
+- **Revisit when:** the next hpcp release.
+
+### A landing within about 57 characters of PATH_MAX
+- **Kind:** deferred.
+- **What the operator sees:** two names that fold alike landing at a path within about 57 characters of the system's path limit (4096 on Linux) are refused with 213, `refuses the name ... (File name too long)`, because the probe directory makes the path longer. Never a loss; 9.83's earlier probe did the same.
+- **Why:** the probe makes its names at the probe directory's full path.
+- **Plan:** make the probe directory and its names relative to a descriptor of the directory (`dir_fd`), so their length is the name's own.
+- **Revisit when:** the next hpcp release.
+
