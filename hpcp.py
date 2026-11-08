@@ -833,7 +833,12 @@ def _install_stops(signals=_STOP_NAMES):
 			signal.signal(signum, _stop)
 
 def _on_worker_start():
+	# The process that started the pool: under forkserver (Python 3.14's default) and spawn the worker's own parent is the
+	# fork server, which outlives it, so the main process is watched by its sentinel (Python 3.8+); else by getppid.
+	main = getattr(multiprocessing, 'parent_process', lambda: None)()
 	parent = os.getppid()
+	def parent_alive():
+		return main.is_alive() if main is not None else os.getppid() == parent
 	_install_stops()
 	watch = _WATCH_SIGNAL is not None and hasattr(signal, 'pthread_kill')
 	if watch:
@@ -843,7 +848,7 @@ def _on_worker_start():
 	def watch_parent():
 		# every 0.5s, check if parent still exists
 		while True:
-			if os.getppid() != parent:
+			if not parent_alive():
 				if watch:
 					# The main thread stops its cp and discards its temporary file (_stop), then ends; the grace is for that.
 					signal.pthread_kill(main_thread, _WATCH_SIGNAL)
