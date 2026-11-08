@@ -1,6 +1,7 @@
 import errno
 import os
 import shutil
+import subprocess
 import sys
 import pytest
 
@@ -1084,6 +1085,9 @@ def test_a_copy_reports_two_sources_that_landed_in_one_file(tmp_path, hpcp_mod, 
 	os.symlink('p', str(tmp_path / 'out/q'))
 	not_held = _copy_not_held(hpcp_mod, tmp_path, ['a/p', 'b/q'], sources=('a/', 'b/'))
 	assert sorted(not_held) == [str(tmp_path / 'a/p'), str(tmp_path / 'b/q')]
+	# Entries given as an iterator are read twice all the same: once for the fingerprints, once for the pair.
+	assert hpcp_mod._not_held(iter([str(tmp_path / 'a/p'), str(tmp_path / 'b/q')]), [str(tmp_path / 'a/'), str(tmp_path / 'b/')],
+		[str(tmp_path / 'out/')], move=False) == not_held
 	assert not_held[str(tmp_path / 'a/p')] == (f'{tmp_path / "out/p"} is one file with {tmp_path / "out/q"} (from {tmp_path / "b/q"}): '
 		'the destination took the names for one')
 
@@ -1156,7 +1160,7 @@ def test_a_copy_whose_landing_is_gone_exits_213_unless_its_copy_said_why(tmp_pat
 	def then_lost(*args, **kwargs):
 		os.unlink('out/p')
 		if copy_failed:
-			hpcp_mod.eprint(f'Copy failed: {tmp_path / "a/p"}: stood in for')
+			hpcp_mod._copy_failed(str(tmp_path / 'a/p'), f'Copy failed: {tmp_path / "a/p"}: stood in for')
 		return real(*args, **kwargs)
 	monkeypatch.setattr(hpcp_mod, 'create_sym_links', then_lost)
 	rc = hpcp_mod.hpcp(['a/'], ['out/'], single_thread=True, max_workers=1, batch=True)
@@ -1164,6 +1168,81 @@ def test_a_copy_whose_landing_is_gone_exits_213_unless_its_copy_said_why(tmp_pat
 	said = f'Destination clash: copied {tmp_path / "a/p"}, but it is at none of its landings ({tmp_path / "out/p"})'
 	assert (rc, said in error) == ((190, False) if copy_failed else (213, True))
 	assert 'a/q' not in error
+
+
+@pytest.mark.skipif(os.name == 'nt' or (hasattr(os, 'geteuid') and os.geteuid() == 0), reason='symlinks, and a mode root ignores')
+@pytest.mark.parametrize('single_thread', [True, False])
+def test_a_source_that_failed_to_copy_is_not_said_to_be_copied(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch, capsys, single_thread):
+	# a/p cannot be read, and its landing is one file with b/q's. 9.85 at b339895 said "copied a/p, but".
+	monkeypatch.chdir(tmp_path)
+	_write('a/p', 'A')
+	_write('b/q', 'BB')
+	_write('out/p', 'old')
+	os.symlink('p', 'out/q')
+	os.chmod('a/p', 0)
+	monkeypatch.setattr(hpcp_mod, '_settle_destinations', lambda *args, **kwargs: ({}, 0, set()))
+	assert hpcp_mod.hpcp(['a/', 'b/'], ['out/'], single_thread=single_thread, max_workers=1 if single_thread else 4, batch=True) == 213
+	captured = capsys.readouterr()
+	error = captured.err
+	# In a worker it is printed there, and recorded with the run's errors.
+	assert f'Copy failed: cannot open {tmp_path / "a/p"}' in captured.out + error
+	assert f'copied {tmp_path / "a/p"}' not in captured.out + error
+	assert (f'Destination clash: {tmp_path / "a/p"} failed to copy, and {tmp_path / "out/p"} is one file with {tmp_path / "out/q"} '
+		f'(from {tmp_path / "b/q"})') in error
+	assert f'Destination clash: copied {tmp_path / "b/q"}, but {tmp_path / "out/q"} is one file with' in error
+
+
+def test_a_copy_failure_is_named_by_its_source_through_a_worker(hpcp_mod):
+	import pickle
+	failure = pickle.loads(pickle.dumps(hpcp_mod._CopyFailure('Copy failed: x', '/s/x')))
+	assert isinstance(failure, hpcp_mod._CopyFailure) and failure == 'Copy failed: x' and failure.source == '/s/x'
+
+
+@pytest.mark.skipif(os.name == 'nt', reason='symlinks')
+def test_each_clash_line_starts_a_line_of_a_redirected_log(tmp_path):
+	# stdout redirected is buffered: an error printed past it was glued to the progress bar's last line.
+	_write(str(tmp_path / 'a/p'), 'A')
+	_write(str(tmp_path / 'b/q'), 'BB')
+	_write(str(tmp_path / 'out/p'), 'old')
+	os.symlink('p', str(tmp_path / 'out/q'))
+	script = ('import sys; sys.path.insert(0, sys.argv[1]); import hpcp\n'
+		'if __name__ == "__main__":\n'
+		'	hpcp._settle_destinations = lambda *a, **k: ({}, 0, set())\n'
+		'	sys.argv = ["hpcp", "a/", "b/", "-d", "out/"]\n'
+		'	hpcp.main()\n')
+	(tmp_path / 'run.py').write_text(script)
+	with open(str(tmp_path / 'log'), 'wb') as log:
+		subprocess.run([sys.executable, str(tmp_path / 'run.py'), os.path.dirname(os.path.dirname(os.path.abspath(__file__)))],
+			cwd=str(tmp_path), stdin=subprocess.DEVNULL, stdout=log, stderr=log)
+	assert sum(line.startswith(b'Destination clash: copied') for line in (tmp_path / 'log').read_bytes().split(b'\n')) == 2
+
+
+@pytest.mark.parametrize('move', [False, True])
+def test_the_check_holds_no_record_for_each_file(tmp_path, hpcp_mod, reset_hpcp_globals, move):
+	# 9.85 at b339895 kept a stat and a landing for every file, 1.3 to 2.3 KB each: a copy of a million files peaked 1.3 GB
+	# above 9.84. Kept now: a fingerprint a landing (8 bytes), and 40 more while they are sorted. Measured as the growth
+	# from one size to another, past what any run holds (a chunk, the code's own first use).
+	import tracemalloc
+	def peak(files):
+		root = tmp_path / str(files)
+		for d in range(20):
+			os.makedirs(str(root / 'a' / str(d)))
+			os.makedirs(str(root / 'out' / str(d)))
+		entries = []
+		for i in range(files):
+			for side in ('a', 'out'):
+				open(str(root / side / str(i % 20) / str(i)), 'w').close()
+			entries.append(str(root / 'a' / str(i % 20) / str(i)))
+		tracemalloc.start()
+		try:
+			start = tracemalloc.get_traced_memory()[0]
+			assert hpcp_mod._not_held(entries, [str(root / 'a/')], [str(root / 'out/')], move=move) == {}
+			return tracemalloc.get_traced_memory()[1] - start
+		finally:
+			tracemalloc.stop()
+	peak(1000)
+	small, large = peak(2000), peak(8000)
+	assert (large - small) / 6000 < 200, (small, large)
 
 
 def test_a_copy_onto_a_tree_with_other_contents_exits_0(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch, capsys):

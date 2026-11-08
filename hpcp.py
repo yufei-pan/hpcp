@@ -7,6 +7,7 @@
 # ]
 # ///
 import argparse
+import array
 import concurrent.futures
 import contextlib
 import errno
@@ -364,6 +365,12 @@ SINGLE_PASS_FILE_LIMIT = 1_000_000
 #%% ---- Helper Functions ----
 def eprint(*args, **kwargs):
 	global ERRORS
+	# What stdout holds goes first: a redirected stdout is buffered, and an error printed past it lands mid-line (after a
+	# progress bar's carriage return).
+	try:
+		sys.stdout.flush()
+	except Exception:
+		pass
 	try:
 		if 'file' in kwargs:
 			print(*args, **kwargs)
@@ -3286,6 +3293,22 @@ def _known_identical(src_path, dest_path, src_size, full_hash):
 	except PermissionError:
 		return False
 
+class _CopyFailure(str):
+	"""A 'Copy failed' error in ERRORS that names its source (.source): the copy's check (_not_held) asks which sources
+	failed. It goes back from a worker with the task's errors, as text does."""
+	def __new__(cls, text, source):
+		error = str.__new__(cls, text)
+		error.source = source
+		return error
+	def __reduce__(self):
+		return _CopyFailure, (str(self), self.source)
+
+def _copy_failed(source, text):
+	"""eprint(text), recorded as the failure of source's copy."""
+	eprint(text)
+	if ERRORS and ERRORS[-1] == text:
+		ERRORS[-1] = _CopyFailure(text, source)
+
 def copy_file(src_path, dest_paths, full_hash=False, verbose=False, concurrent_processes=0):
 	"""
 	Copy a file from the source path to the destination path.
@@ -3340,10 +3363,10 @@ def copy_file(src_path, dest_paths, full_hash=False, verbose=False, concurrent_p
 		else:
 			if not _can_open(src_path):
 				# No cp at all: cp -a takes away a destination with other names before it finds it cannot read.
-				eprint(f'Copy failed: cannot open {src_path}, leaving {dest_paths} as they are')
+				_copy_failed(src_path, f'Copy failed: cannot open {src_path}, leaving {dest_paths} as they are')
 				return 0, time.monotonic() - start_time, symLinks
 			if not _can_make_node(src_path, dest_paths):
-				eprint(f'Copy failed: cannot make a device node like {src_path} here, leaving {dest_paths} as they are')
+				_copy_failed(src_path, f'Copy failed: cannot make a device node like {src_path} here, leaving {dest_paths} as they are')
 				return 0, time.monotonic() - start_time, symLinks
 			copied = False
 			copy_error_start = len(ERRORS)
@@ -3425,7 +3448,7 @@ def copy_file(src_path, dest_paths, full_hash=False, verbose=False, concurrent_p
 				except Exception as e:
 					_remove_what_failed(dest_path, before)
 					if using_bak_paths and not dest_paths:
-						eprint(f'Copy failed: ERROR copying {src_path} to {dest_path}, No more destination paths to try: {e}')
+						_copy_failed(src_path, f'Copy failed: ERROR copying {src_path} to {dest_path}, No more destination paths to try: {e}')
 						return 0, time.monotonic() - start_time, symLinks #, task_to_run
 					elif verbose:
 						print(f'Re-Retrying with a different destination path in {dest_paths}')
@@ -3435,7 +3458,7 @@ def copy_file(src_path, dest_paths, full_hash=False, verbose=False, concurrent_p
 					using_bak_paths = True
 					dest_paths = bak_dest_paths
 			if not copied:
-				eprint(f'Copy failed: FAILED to copy {src_path} to {dest_paths}')
+				_copy_failed(src_path, f'Copy failed: FAILED to copy {src_path} to {dest_paths}')
 				return 0, time.monotonic() - start_time, symLinks
 			# A successful retry resolves this file's failed attempts. Preserve
 			# errors from earlier files and from path validation above.
@@ -9337,6 +9360,14 @@ class _RealPlaces:
 				return '; '.join(dict.fromkeys(one[3][1][name] for name in (one[0], other[0]) if name in one[3][1]))
 		return 'the destination cannot be asked'
 
+def _identity_or_none(path):
+	"""(st_dev, st_ino) of what path leads to, or None when it cannot be stat'ed."""
+	try:
+		st = os.stat(path)
+		return st.st_dev, st.st_ino
+	except OSError:
+		return None
+
 def _inside_destinations(src_paths, dests, places):
 	"""(src_paths without the list entries that lie inside a destination and the arguments that are one, how many entries
 	that were, the paths of the destinations that a kept directory holds, as its walk spells them, those arguments). An entry inside a destination (or the
@@ -9352,6 +9383,7 @@ def _inside_destinations(src_paths, dests, places):
 	for dest in dests:
 		roots.update((os.path.abspath(dest), places.directory(os.path.abspath(dest))))
 	prefixes = tuple(root.rstrip(os.path.sep) + os.path.sep for root in roots)
+	root_ids = {_identity_or_none(os.path.abspath(dest)) for dest in dests} - {None}
 	kept, skipped, holding, left_out = [], 0, set(), []
 	try:
 		real_cwd = os.path.realpath(os.getcwd())
@@ -9373,9 +9405,10 @@ def _inside_destinations(src_paths, dests, places):
 				_source_dest(src, dest) != os.path.abspath(dest) for dest in dests):
 			left_out.append(path)
 			continue
-		if not directory and os.path.islink(path) and places.directory(path) in roots:
+		if not directory and os.path.islink(path) and _identity_or_none(path) in root_ids:
 			# A link to the destination, named or listed, is that destination: copied, it would be a link to its own directory,
-			# and -rme would keep all that it leads to.
+			# and -rme would keep all that it leads to. Asked by identity: a link whose way cannot be searched is not the
+			# destination, and is copied as a link.
 			left_out.append(path)
 			continue
 		if directory:
@@ -10393,7 +10426,9 @@ def _not_held(entries, src_paths, dests, dest_image=False, max_workers=1, move=T
 	spelling a number of its own), the directory is asked by making both names (_ask_names). A landing that is one file
 	with the landing of another source (another file) holds neither: both stay, whatever the content each now shows. One
 	lstat of each source and each landing (a copy: of each landing), in max_workers threads where a stat waits; a file is
-	read only when its landing's time disagrees."""
+	read only when its landing's time disagrees. entries is read twice when two landings may be one file (it is listed
+	first if it is an iterator). Memory: 8 bytes for each landing, and records only for what is reported or asked; the
+	stats are dropped once looked at."""
 	by_source = _by_source(_src_to_dest_map(src_paths, dests, dest_image))
 	# A file's landings are its directory's, with its name: each directory is mapped once (a source itself goes by _landings).
 	in_directory = {}
@@ -10431,88 +10466,110 @@ def _not_held(entries, src_paths, dests, dest_image=False, max_workers=1, move=T
 			return os.lstat(path)
 		except OSError:
 			return None
+	def landed(path, st):
+		"""(the source's lstat or None, [(landing, its stat, written through a link)] for each landing there)."""
+		found = []
+		for landing in landings_of(path):
+			try:
+				lt = os.lstat(landing)
+			except OSError:
+				continue
+			if stat.S_ISLNK(lt.st_mode) and st is None:
+				# A copy asks the source only beside a link at its landing, or where two sources may share a landing (below).
+				st = source_stat(path)
+				if st is None:
+					return None, []
+			through_link = stat.S_ISLNK(lt.st_mode) and not stat.S_ISLNK(st.st_mode)
+			if through_link:
+				try:
+					lt = os.stat(landing)
+				except OSError:
+					# A link that leads nowhere holds nothing.
+					through_link = False
+			found.append((landing, lt, through_link))
+		return st, found
+	# A landing file with other names was not written by this run (the copy leaves a file with other names first: cp -a
+	# unlinks it, -co by _leave_hard_links): it was there, and held the source already (a destination deduplicated by hard
+	# links). Any other landing file is fingerprinted, (st_dev, st_ino) hashed, to find two that may be one file.
 	def look(chunk):
-		looked = []
+		"""(the fingerprints of chunk's landing files, {path: why} not held, {directory: [(path, landing)]} to ask, and
+		{path: its held landings} for those asked about)."""
+		prints, not_held, ask, held = array.array('q'), {}, {}, {}
 		for path in chunk:
-			# A copy asks the source only beside a link at its landing, or where two sources share a landing (below).
 			st = source_stat(path) if move else None
 			if move and st is None:
 				# Gone already: the removal has nothing to take.
 				continue
-			found = []
-			for landing in landings_of(path):
-				try:
-					lt = os.lstat(landing)
-				except OSError:
-					continue
-				if stat.S_ISLNK(lt.st_mode) and st is None:
-					st = source_stat(path)
-					if st is None:
-						break
-				through_link = stat.S_ISLNK(lt.st_mode) and not stat.S_ISLNK(st.st_mode)
-				if through_link:
-					try:
-						lt = os.stat(landing)
-					except OSError:
-						# A link that leads nowhere holds nothing.
-						through_link = False
-				found.append((landing, lt, judge(path, st, landing, lt, through_link) if move else None))
-			looked.append((path, st, found))
-		return looked
-	entries = list(entries)
-	chunks = deque(entries[i:i + 1024] for i in range(0, len(entries), 1024))
-	# Threads pay only where a stat waits (network storage, a cold disk): in GIL handoffs they cost more than a stat that
-	# does not. 100,000 files on a local disk took 0.31 s in one thread and 0.55 s in 32 for a copy (3 us an entry), 0.72 s
-	# and 1.2 s for a move (7 us). So chunks are looked at here while each takes under 20 us an entry, and the rest in
-	# max_workers threads once one takes longer.
-	looked = []
-	while chunks:
-		started = time.monotonic()
-		looked += look(chunks[0])
-		slow = time.monotonic() - started > 20e-6 * len(chunks.popleft())
-		if slow and chunks and max_workers > 1:
-			with concurrent.futures.ThreadPoolExecutor(min(max_workers, len(chunks))) as pool:
-				looked += [item for part in pool.map(look, chunks) for item in part]
-			break
-	not_held, held, ask = {}, {}, {}
-	for path, st, found in () if move else looked:
-		# A copy whose landing is not there, though its source still is: lost (on vfat, beside an 8.3 alias of its name). A
-		# copy that failed has said so, and hpcp() leaves these out then.
-		if not found and (st or source_stat(path)):
-			not_held[path] = f'it is at none of its landings ({", ".join(landings_of(path))})'
-	for path, st, found in looked if move else ():
-		why = None
-		for landing, lt, reason in found:
-			if reason:
-				why = why or reason
+			st, found = landed(path, st)
+			for _, lt, _ in found:
+				if lt.st_nlink < 2:
+					prints.append(hash((lt.st_dev, lt.st_ino)))
+			if not move:
+				# A copy whose landing is not there, though its source still is: lost (on vfat, beside an 8.3 alias of its
+				# name). A copy that failed has said so, and hpcp() leaves these out for its sources.
+				if not found and (st or source_stat(path)):
+					not_held[path] = f'it is at none of its landings ({", ".join(landings_of(path))})'
 				continue
-			if os.path.dirname(landing) == os.path.dirname(path) and (lt.st_dev, lt.st_ino) != (st.st_dev, st.st_ino):
-				ask.setdefault(os.path.dirname(path), []).append((path, landing))
-			held.setdefault(path, []).append((landing, lt))
-		if path not in held:
-			not_held[path] = why or f'it is at none of its landings ({", ".join(landings_of(path))})'
+			why, mine, pairs = None, [], []
+			for landing, lt, through_link in found:
+				reason = judge(path, st, landing, lt, through_link)
+				if reason:
+					why = why or reason
+					continue
+				if os.path.dirname(landing) == os.path.dirname(path) and (lt.st_dev, lt.st_ino) != (st.st_dev, st.st_ino):
+					pairs.append((path, landing))
+				mine.append(landing)
+			if not mine:
+				not_held[path] = why or f'it is at none of its landings ({", ".join(landings_of(path))})'
+			elif pairs:
+				ask.setdefault(os.path.dirname(path), []).extend(pairs)
+				held[path] = mine
+		return prints, not_held, ask, held
+	if iter(entries) is entries:
+		entries = list(entries)
+	def chunks():
+		it = iter(entries)
+		return iter(lambda: list(itertools.islice(it, 1024)), [])
+	prints, not_held, ask, held = array.array('q'), {}, {}, {}
+	for part_prints, part_not_held, part_ask, part_held in _looked_at(chunks(), look, max_workers):
+		prints.extend(part_prints)
+		not_held.update(part_not_held)
+		for directory, pairs in part_ask.items():
+			ask.setdefault(directory, []).extend(pairs)
+		held.update(part_held)
 	# A move in one directory under another name: are the two one name there? Each directory once, about all its names.
 	for directory, pairs in ask.items():
 		answers, unknown = _ask_names(directory, list(dict.fromkeys(os.path.basename(name) for pair in pairs for name in pair)))
 		for path, landing in pairs:
 			mine, theirs = os.path.basename(path), os.path.basename(landing)
 			if mine in unknown or theirs in unknown or answers.get(mine) == answers.get(theirs):
-				held[path] = [(other, lt) for other, lt in held.get(path, ()) if other != landing]
+				held[path] = [other for other in held.get(path, ()) if other != landing]
 				reason = unknown.get(mine) or unknown.get(theirs)
 				why = f'{landing} may be the source itself, and the directory cannot be asked: {reason}' if reason else f'{landing} is the source itself, under another spelling'
 				if not held[path]:
 					not_held[path] = why
-					del held[path]
 	# Two sources (two files) at one landing file, whatever it holds now: the destination took their names for one, and
-	# one of the contents is not there. A landing that is the source's own file is no other source's.
-	# A landing file with other names was not written by this run (the copy leaves a file with other names first: cp -a
-	# unlinks it, -co by _leave_hard_links): it was there, and held the source already (a destination deduplicated by hard links).
+	# one of the contents is not there. Fingerprints met twice are looked at again, for those landings only.
+	shared, previous = set(), None
+	for fingerprint in sorted(prints):
+		if fingerprint == previous:
+			shared.add(fingerprint)
+		previous = fingerprint
+	del prints
+	if not shared:
+		return not_held
+	def collect(chunk):
+		met = []
+		for path in chunk:
+			st, found = landed(path, None)
+			met.extend(((lt.st_dev, lt.st_ino), path, landing) for landing, lt, _ in found
+				if lt.st_nlink < 2 and hash((lt.st_dev, lt.st_ino)) in shared)
+		return met
 	by_file = {}
-	for path, _, found in looked:
-		for landing, lt, _ in found:
-			if lt.st_nlink < 2:
-				by_file.setdefault((lt.st_dev, lt.st_ino), []).append((path, landing))
-	identity = {path: (st.st_dev, st.st_ino) for path, st, _ in looked if st is not None}
+	for met in _looked_at(chunks(), collect, max_workers):
+		for file_id, path, landing in met:
+			by_file.setdefault(file_id, []).append((path, landing))
+	identity = {}
 	def identity_of(path):
 		if path not in identity:
 			st = source_stat(path)
@@ -10521,12 +10578,43 @@ def _not_held(entries, src_paths, dests, dest_image=False, max_workers=1, move=T
 	for file_id, sharing in by_file.items():
 		if len(sharing) < 2:
 			continue
+		# A landing that is the source's own file is no other source's.
 		sharing = [(path, landing) for path, landing in sharing if identity_of(path) not in (None, file_id)]
 		if len({identity_of(path) for path, _ in sharing}) > 1:
 			for path, landing in sharing:
 				others = ', '.join(f'{other_landing} (from {other})' for other, other_landing in sharing if identity_of(other) != identity_of(path))
 				not_held[path] = f'{landing} is one file with {others}: the destination took the names for one'
 	return not_held
+
+class _Joined:
+	"""Several collections read as one, as often as asked, without a list of them all."""
+	def __init__(self, *parts):
+		self.parts = parts
+	def __iter__(self):
+		return itertools.chain(*self.parts)
+
+def _looked_at(chunks, look, max_workers):
+	"""look(chunk) for each of chunks (an iterator), yielded as each is done. Threads pay only where a stat waits (network
+	storage, a cold disk): in GIL handoffs they cost more than a stat that does not. 100,000 files on a local disk took
+	0.31 s in one thread and 0.55 s in 32 for a copy's check (3 us an entry), 0.72 s and 1.2 s for a move's (7 us); on NFS
+	mounted actimeo=0, 10,000 took 6.4 s in one and 3.0 s in 4. So chunks are looked at here while each takes under 20 us
+	an entry, and the rest in max_workers threads once one takes longer, with two chunks a thread in flight, so that the
+	chunks are never all held at once."""
+	for chunk in chunks:
+		started = time.monotonic()
+		yield look(chunk)
+		if max_workers > 1 and time.monotonic() - started > 20e-6 * len(chunk):
+			break
+	else:
+		return
+	with concurrent.futures.ThreadPoolExecutor(max_workers) as pool:
+		pending = deque()
+		for chunk in chunks:
+			pending.append(pool.submit(look, chunk))
+			if len(pending) >= 2 * max_workers:
+				yield pending.popleft().result()
+		while pending:
+			yield pending.popleft().result()
 
 def remove_moved_sources(src_paths, file_list, sym_links, single_thread=False, max_workers=multiprocessing.cpu_count(),
 		verbose=False, files_per_job=1, remove_force=False, exclude=None, root_ids=None, dests=None, dest_image=False):
@@ -12108,12 +12196,15 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = multipr
 				# The move's backstop, at the end of a copy: two sources that landed in one file, where the destination took their
 				# names for one and no check on names could say so (an 8.3 alias, a legacy name read as UTF-8). The landing is left
 				# as it is: it holds one source whole, and the other content has no name of its own there. A move asks before removing.
-				# A file whose copy failed is at none of its landings too, and its error says why: only the other reasons then.
-				failed = any(_is_failure(error) for error in ERRORS[copy_error_start:])
-				for path, why in sorted(_not_held((os.path.abspath(entry) for entry in itertools.chain(total_file_list, total_sym_links)), src_paths, dests, bool(dest_image),
+				# A file whose copy failed has said so: at none of its landings it says nothing more, and a clash is not said
+				# to follow a copy of it.
+				failed = {error.source for error in ERRORS[copy_error_start:] if isinstance(error, _CopyFailure)}
+				for path, why in sorted(_not_held(_Joined(total_file_list, total_sym_links), src_paths, dests, bool(dest_image),
 						1 if single_thread else max_workers, move=False).items()):
-					if not (failed and why.startswith('it is at none of its landings')):
+					if path not in failed:
 						eprint(f'Destination clash: copied {path}, but {why}')
+					elif not why.startswith('it is at none of its landings'):
+						eprint(f'Destination clash: {path} failed to copy, and {why}')
 			# A copy that reported errors is incomplete: removing the sources (a move) would lose what was not copied,
 			# and an unlisted source subtree would make its destination counterpart look extra.
 			copy_failures = [error for error in ERRORS[copy_error_start:] if _is_failure(error)]
