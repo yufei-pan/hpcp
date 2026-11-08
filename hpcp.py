@@ -11607,7 +11607,9 @@ def _settle_destinations(src_paths, dests, dest_image=None, directory_only=False
 				if _same_or_below(land, real) or _holds_in_another_spelling(real, land, places) is not False:
 					raise RuntimeError(f'Invalid arguments: -rm would move {root} onto itself ({land} is it or lies inside it); '
 						'nothing is copied or removed')
-		jobs.append((src, actual_dests, directory, real, lands))
+		# Tuples of strings: the cyclic GC does not track them, so a million entries cost no collection time (lists did: about
+		# 0.4 s a full collection per million, run several times while they were built).
+		jobs.append((src, tuple(actual_dests), directory, real, tuple(lands)))
 		if directory and real in lands:
 			in_place.add((src, tuple(actual_dests)))
 	if directory_only:

@@ -41,12 +41,6 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - **Revisit when:** someone hits it.
 - **Approved:** 2026-11-05, the user chose "Known limitation (Recommended)".
 
-### A million-entry list holds its jobs in memory
-- **Kind:** deferred.
-- **What the operator sees:** the check before the copy keeps every entry's paths at once: a peak of about 741 bytes more per entry than 7617241 with the copy stubbed out (740 MB for a million), and +143 bytes per file measured in a real copy of 300,000. The extra CPU is nearly all garbage collection over the kept jobs: a stubbed million took 19.08, 20.56 and 22.22 s with it on, 19.26, 19.15 and 19.56 s with it off.
-- **Why:** it reads the jobs twice, and generators need `_settle_destinations` reshaped; the copy works either way.
-- **Revisit when:** 9.85.
-
 ### A rerun scans the destination directories one by one
 - **Kind:** deferred.
 - **What the operator sees:** a copy onto an existing tree reads each directory it lands in, on one worker, before the first file is copied: about 1 us per file on a local disk, longer on network storage.

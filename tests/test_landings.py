@@ -853,3 +853,22 @@ def test_a_pair_landing_within_a_few_characters_of_path_max_is_asked_and_copied(
 	rc, output = run(['a/', 'b/', '-d', deep + '/'], tmp_path)
 	assert rc == 0 and b'File name too long' not in output, output[-2000:]
 	assert read(os.path.join(deep, 'X')) == 'upper' and read(os.path.join(deep, 'x')) == 'lower'
+
+
+# ---- entry 10: the check's records cost the GC nothing ----
+
+def test_the_check_keeps_its_jobs_where_the_gc_does_not_look(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	# Lists inside each record made every one a container the cyclic GC tracked and rescanned: 1 to 2 s per million entries.
+	import gc
+	for name in range(20):
+		write(tmp_path / 'a' / str(name), 'x')
+	seen = []
+	real = hpcp_mod._names_may_fold
+	monkeypatch.setattr(hpcp_mod, '_names_may_fold', lambda jobs, listing: seen.extend(jobs) or real(jobs, listing))
+	sources = [str(tmp_path / 'a' / str(name)) for name in range(20)] + [str(tmp_path / 'a') + os.sep]
+	hpcp_mod._settle_destinations(sources, [str(tmp_path / 'out') + os.sep, str(tmp_path / 'two') + os.sep])
+	# CPython untracks a tuple of untracked objects at a collection that meets it (the outer one at the next, once its inner
+	# ones are); a list stays tracked for good.
+	gc.collect()
+	gc.collect()
+	assert len(seen) == 21 and not any(gc.is_tracked(job) for job in seen)
