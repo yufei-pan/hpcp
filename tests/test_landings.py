@@ -304,6 +304,24 @@ def test_a_link_at_a_directory_s_landing_is_replaced_with_a_note(tmp_path, order
 
 
 @posix_only
+@pytest.mark.parametrize('listed', [False, True], ids=['tree', 'list'])
+def test_a_link_to_a_sibling_directory_below_the_destination_is_not_taken_for_it(tmp_path, listed):
+	# out/l -> d, with l and d both directories in the source: l/s/x lands at out/l/s/x, never at out/d/s/x through the link,
+	# so the two are two landings, no clash, and the link becomes a directory of its own.
+	write(tmp_path / 'd/s/x', 'D')
+	write(tmp_path / 'l/s/x', 'L')
+	os.makedirs(str(tmp_path / 'out/d/s'))
+	os.symlink('d', str(tmp_path / 'out/l'))
+	for _ in range(2):
+		if listed:
+			rc, output = run(['-sfl', '-', '-d', 'out/', '-j', '4'], tmp_path, b'd/s/x\nl/s/x\n')
+		else:
+			rc, output = run(['d', 'l', '-d', 'out/', '-j', '4'], tmp_path)
+		assert rc == 0 and not os.path.islink(str(tmp_path / 'out/l')), output[-2000:]
+		assert read(tmp_path / 'out/d/s/x') == 'D' and read(tmp_path / 'out/l/s/x') == 'L'
+
+
+@posix_only
 def test_a_link_two_levels_up_is_replaced_when_the_children_sync_first(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
 	# The folder sync hands folders out in any order: the door replaces the link at out/d whoever reaches it first.
 	write(tmp_path / 'src/d/e/f', 'F')
