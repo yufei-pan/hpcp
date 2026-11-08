@@ -11538,6 +11538,25 @@ def _settle_destinations(src_paths, dests, dest_image=None, directory_only=False
 		else:
 			eprint(f'Destination clash: {dest} is a device, and copying {src} would replace it: not copying it. '
 				'-dd clones a disk; remove the node to replace it')
+	# A source whose landing lies below the landing of a link source (lb at out/lb, and lb/x at out/lb/x): the link is copied,
+	# the path through it is a clash, so the outcome never hangs on which copy runs first. (A file there gives way to the
+	# directory a path below it makes: add_directory, below.)
+	singles = {}
+	for src, actual_dests, directory, _, _ in jobs:
+		if not directory and os.path.islink(src):
+			for dest in actual_dests:
+				singles.setdefault(dest, src)
+	for src, actual_dests, directory, _, _ in jobs if singles else ():
+		for dest in actual_dests:
+			parent = os.path.dirname(dest.rstrip(os.sep))
+			while parent not in singles and parent != os.path.dirname(parent):
+				parent = os.path.dirname(parent)
+			if parent in singles:
+				above = singles[parent]
+				eprint(f'Destination clash: {dest.rstrip(os.sep)} lies below {parent}, where this run puts the link {above}: '
+					f'not copying {src.rstrip(os.sep)}')
+				dropped.setdefault((src, tuple(actual_dests)), set()).add(src)
+				break
 	folds = _names_may_fold(jobs, listing)
 	roots = [land for job in jobs for land in job[4]]
 	# An image is a tree of its own. A source that holds its mount point (hpcp / -di) reads what an earlier run put there.
