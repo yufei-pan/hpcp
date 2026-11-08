@@ -120,25 +120,19 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - **Plan:** set a directory's metadata (mode, then times) after the files below it, as `cp -a` and rsync do, keeping the directory writable for the runner meanwhile.
 - **Revisit when:** 9.86.
 - **Noted:** 2026-11-08, the user's standing rule that deferrals are noted, not asked.
-### A list that names both a link and a path below it drops the link
-- **Kind:** deferred (9.86).
-- **What the operator sees:** `-sfl` with a list holding `x` and `x/y`, where `x -> ../elsewhere`: `out/x` becomes a real directory holding `y`, the link is not copied, and the run exits 0, in either order. 9.84 does the same. Named as arguments (`hpcp x -sfl list -d out/`), the same pair is a 213 for `x/y` and `out/x` is the link (rule 11).
-- **Why:** rule 11 looks only at the link sources named as arguments (`singles`); list entries are not among them.
-- **Plan:** build `singles` from list entries too, so a list entry below a listed link is the same 213.
-- **Revisit when:** 9.86.
-- **Noted:** 2026-11-08, the user's standing rule that deferrals are noted, not asked.
 
 ### Hints quote names as Python escapes, not for the shell
 - **Kind:** deferred (9.86).
-- **What the operator sees:** with a name that is not UTF-8, the hints that give a command to run (the replaced-link Note, the `-ncd` refusal's `-d` form) print it with Python's escapes, such as `hpcp W/s/d\udcc3\udca9/ -d W/o/d\udcc3\udca9/`, which a shell cannot run as pasted.
+- **What the operator sees:** with a name the locale cannot show (any non-ASCII name with LANG unset, a non-UTF-8 one under a UTF-8 locale), the hints that give a command to run (the replaced-link Note, the `-ncd` refusal's `-d` form) print it with Python's escapes, such as `hpcp W/s/d\udcc3\udca9/ -d W/o/d\udcc3\udca9/`, which a shell cannot run as pasted.
 - **Why:** the hints print the path as Python holds it; messages do the same, which is fine for reading.
 - **Plan:** shell-quote the names in a hint as coreutils does (`$'d\303\251'`); messages keep the `\udcXX` forms.
 - **Revisit when:** 9.86.
 - **Noted:** 2026-11-08, the user's standing rule that deferrals are noted, not asked.
 
-### Change lists, manifests and disk TSVs read back non-UTF-8-locale names wrong
+### With LANG unset, a `-siff` apply stops at the first non-ASCII name
 - **Kind:** deferred (9.86).
-- **What the operator sees:** with LANG unset (Python 3.6 on EL7, as under cron), a name such as `new\xc3\xa9` in a change list, manifest or disk TSV (`-dfl`, the `-siff` patch apply through `_load_patch`) reads back as `'new\xe9'`, which matches no name `os.listdir` gives (`'new\udcc3\udca9'`), and an `lstat` of it raises UnicodeEncodeError. Checked in the EL7 image. 9.83, 9.84 and 9.85 all have it: `read_changes`, `read_manifest` and `read_disk_tsv` are unchanged since they came in (2026-10-10).
+- **What the operator sees:** with LANG unset (Python 3.6 on EL7, as under cron), the `-siff` patch apply reads the names in its change list, manifest and disk TSV (`read_changes`, `read_manifest`, `read_disk_tsv`, through `_load_patch`) as UTF-8 text: `new\xc3\xa9` reads back as `'new\xe9'`, which matches no name `os.listdir` gives (`'new\udcc3\udca9'`), and the apply stops with a UnicodeEncodeError on the first such name. A patch made with LANG unset applies whole under `LANG=en_US.UTF-8`, and one made under it fails applied with LANG unset (checked in the EL7 image, 9.84 and 9.85 alike). Making the patch (`-diff`) and `-dfl` lists are not affected: hpcp writes those correctly under any locale and never reads `-dfl` back. The readers are unchanged since they came in (2026-10-10), so 9.83 has it too (not run).
+- **Workaround:** run the `-siff` apply with `LANG=en_US.UTF-8`; the locale must be installed (`locale -a` lists `en_US.utf8`), or Python 3.6 falls back to ASCII and nothing changes.
 - **Why:** they open the file as UTF-8 text, where `_read_list_entries` reads bytes and decodes each name with `os.fsdecode`.
 - **Plan:** read those files in binary and `os.fsdecode` each name field, as `_read_list_entries` does, with a LANG-unset test.
 - **Revisit when:** 9.86.
