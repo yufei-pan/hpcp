@@ -143,6 +143,8 @@ hpcp -V
 
 It is recommended to install via **pip**, but **hpcp** can also function as a single script using Python’s default libraries.
 
+On EL7 and EL8, run `python3 -m pip install --user -U pip` once before a `--user` install or upgrade: the stock pip there leaves the old version's record behind on `pip3 install --user -U`, so a later `pip3 uninstall hpcp` leaves it listed and `pip3 install --user hpcp` then does nothing (cas-toolbox's README, Installation, has the details and the way back). A venv, a system-wide install and a pinned `hpcp==9.85` are not affected.
+
 **Note**:  
 - On Python 3.7 and later `pip` also installs the hashing library [xxhash](https://github.com/Cyan4973/xxHash), which can reduce CPU usage for partial hashing and increase performance when using `-fh --full_hash`. On Python 3.6 (EL7 and EL8) it does not, because building it there needs a compiler: hpcp uses blake2b instead. To add it, upgrade pip first (`pip3 install -U pip`, then `pip3 install xxhash`): on stock pip 9.0.3 it fails there.  
 - `pip` also installs [multiCMD](https://github.com/yufei-pan/multiCMD), used to issue commands and provide helper functions. If it is not available, or older than the version hpcp requires, `hpcp.py` uses its built-in copy, which is the full multiCMD.
