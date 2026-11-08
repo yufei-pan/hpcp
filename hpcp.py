@@ -10355,11 +10355,15 @@ def _same_contents(first, second):
 			if not chunk:
 				return True
 
-def _moved_not_held(entries, src_paths, dests, dest_image=False, max_workers=1):
-	"""The files and links of a move (entries: absolute source paths) that no landing holds, as {path: why}: the move keeps
+def _not_held(entries, src_paths, dests, dest_image=False, max_workers=1, move=True):
+	"""The files and links of a copy (entries: absolute source paths) that no landing holds, as {path: why}: a move keeps
 	them. A backstop that needs no rule on names: whatever the destination took for one name (an 8.3 alias, a legacy
 	charset's other case, names of different lengths), one source's landing then holds another's content, or is one
 	file with another source's landing, or is the source itself.
+
+	move=False, the end of a copy that removes nothing: only a landing that is one file with another source's landing
+	is reported, the clash itself, as both of its sources' lines. A landing of the source's own file is held, and one
+	that differs from a source changed during the copy is what cp copied: neither is a clash, and nothing is read.
 
 	A landing (each source above an entry gives one in each destination, as -rme's expected paths) holds its source when
 	it is there and of its kind (a file's landing that is a symlink is what it leads to: the copy wrote through it); a
@@ -10367,8 +10371,9 @@ def _moved_not_held(entries, src_paths, dests, dest_image=False, max_workers=1):
 	contents; not the source itself (one inode, unless the source has other names that keep it, and never through a
 	symlink); and, where the two share a directory as spelled and only their numbers differ (exFAT through FUSE gives each
 	spelling a number of its own), the directory is asked by making both names (_ask_names). A landing that is one file
-	with the landing of another source (another file) holds neither: both stay. One lstat of each source and each landing,
-	in max_workers threads; a file is read only when its landing's time disagrees."""
+	with the landing of another source (another file) holds neither: both stay, whatever the content each now shows. One
+	lstat of each source and each landing (a copy: of each landing), in max_workers threads where a stat waits; a file is
+	read only when its landing's time disagrees."""
 	by_source = _by_source(_src_to_dest_map(src_paths, dests, dest_image))
 	# A file's landings are its directory's, with its name: each directory is mapped once (a source itself goes by _landings).
 	in_directory = {}
@@ -10401,12 +10406,17 @@ def _moved_not_held(entries, src_paths, dests, dest_image=False, max_workers=1):
 		except OSError as e:
 			return f'{landing} could not be compared with it ({e.strerror})'
 		return f'{landing} holds other content (modified at another time)'
+	def source_stat(path):
+		try:
+			return os.lstat(path)
+		except OSError:
+			return None
 	def look(chunk):
 		looked = []
 		for path in chunk:
-			try:
-				st = os.lstat(path)
-			except OSError:
+			# A copy asks the source only beside a link at its landing, or where two sources share a landing (below).
+			st = source_stat(path) if move else None
+			if move and st is None:
 				# Gone already: the removal has nothing to take.
 				continue
 			found = []
@@ -10415,6 +10425,10 @@ def _moved_not_held(entries, src_paths, dests, dest_image=False, max_workers=1):
 					lt = os.lstat(landing)
 				except OSError:
 					continue
+				if stat.S_ISLNK(lt.st_mode) and st is None:
+					st = source_stat(path)
+					if st is None:
+						break
 				through_link = stat.S_ISLNK(lt.st_mode) and not stat.S_ISLNK(st.st_mode)
 				if through_link:
 					try:
@@ -10422,15 +10436,26 @@ def _moved_not_held(entries, src_paths, dests, dest_image=False, max_workers=1):
 					except OSError:
 						# A link that leads nowhere holds nothing.
 						through_link = False
-				found.append((landing, lt, judge(path, st, landing, lt, through_link)))
+				found.append((landing, lt, judge(path, st, landing, lt, through_link) if move else None))
 			looked.append((path, st, found))
 		return looked
 	entries = list(entries)
-	chunks = [entries[i:i + 1024] for i in range(0, len(entries), 1024)]
-	with concurrent.futures.ThreadPoolExecutor(max(1, min(max_workers, len(chunks)))) as pool:
-		looked = [item for part in pool.map(look, chunks) for item in part]
+	chunks = deque(entries[i:i + 1024] for i in range(0, len(entries), 1024))
+	# Threads pay only where a stat waits (network storage, a cold disk): in GIL handoffs they cost more than a stat that
+	# does not. 100,000 files on a local disk took 0.31 s in one thread and 0.55 s in 32 for a copy (3 us an entry), 0.72 s
+	# and 1.2 s for a move (7 us). So chunks are looked at here while each takes under 20 us an entry, and the rest in
+	# max_workers threads once one takes longer.
+	looked = []
+	while chunks:
+		started = time.monotonic()
+		looked += look(chunks[0])
+		slow = time.monotonic() - started > 20e-6 * len(chunks.popleft())
+		if slow and chunks and max_workers > 1:
+			with concurrent.futures.ThreadPoolExecutor(min(max_workers, len(chunks))) as pool:
+				looked += [item for part in pool.map(look, chunks) for item in part]
+			break
 	not_held, held, ask = {}, {}, {}
-	for path, st, found in looked:
+	for path, st, found in looked if move else ():
 		why = None
 		for landing, lt, reason in found:
 			if reason:
@@ -10453,19 +10478,28 @@ def _moved_not_held(entries, src_paths, dests, dest_image=False, max_workers=1):
 				if not held[path]:
 					not_held[path] = why
 					del held[path]
-	# Two sources (two files) held by one landing file: the destination took their names for one.
+	# Two sources (two files) at one landing file, whatever it holds now: the destination took their names for one, and
+	# one of the contents is not there. A landing that is the source's own file is no other source's.
 	# A landing file with other names was not written by this run (the copy leaves a file with other names first: cp -a
 	# unlinks it, -co by _leave_hard_links): it was there, and held the source already (a destination deduplicated by hard links).
 	by_file = {}
-	for path, found in held.items():
-		for landing, lt in found:
+	for path, _, found in looked:
+		for landing, lt, _ in found:
 			if lt.st_nlink < 2:
 				by_file.setdefault((lt.st_dev, lt.st_ino), []).append((path, landing))
-	identity = {path: (st.st_dev, st.st_ino) for path, st, _ in looked}
-	for sharing in by_file.values():
-		if len({identity[path] for path, _ in sharing}) > 1:
+	identity = {path: (st.st_dev, st.st_ino) for path, st, _ in looked if st is not None}
+	def identity_of(path):
+		if path not in identity:
+			st = source_stat(path)
+			identity[path] = st and (st.st_dev, st.st_ino)
+		return identity[path]
+	for file_id, sharing in by_file.items():
+		if len(sharing) < 2:
+			continue
+		sharing = [(path, landing) for path, landing in sharing if identity_of(path) not in (None, file_id)]
+		if len({identity_of(path) for path, _ in sharing}) > 1:
 			for path, landing in sharing:
-				others = ', '.join(f'{other_landing} (from {other})' for other, other_landing in sharing if identity[other] != identity[path])
+				others = ', '.join(f'{other_landing} (from {other})' for other, other_landing in sharing if identity_of(other) != identity_of(path))
 				not_held[path] = f'{landing} is one file with {others}: the destination took the names for one'
 	return not_held
 
@@ -10477,7 +10511,7 @@ def remove_moved_sources(src_paths, file_list, sym_links, single_thread=False, m
 	path. What stays, other than excluded paths, is named in a 'Move left entries' note. root_ids: {source root: its
 	_directory_identity when the copy started}; a root no longer that one removes nothing (taken now when not given).
 	dests, dest_image: where the copy went; given, each file and link whose landing does not hold it stays, as a
-	'Destination clash' (_moved_not_held)."""
+	'Destination clash' (_not_held)."""
 	roots = []
 	for src in src_paths:
 		path = os.path.abspath(src)
@@ -10507,7 +10541,7 @@ def remove_moved_sources(src_paths, file_list, sym_links, single_thread=False, m
 		root = outermost_root(path)
 		if root is not None:
 			pairs.append((path, root))
-	kept = _moved_not_held([path for path, _ in pairs], src_paths, dests, dest_image, 1 if single_thread else max_workers) if dests else {}
+	kept = _not_held([path for path, _ in pairs], src_paths, dests, dest_image, 1 if single_thread else max_workers) if dests else {}
 	for path in sorted(kept):
 		eprint(f'Destination clash: not removing {path}: {kept[path]}')
 	pairs = [(path, root) for path, root in pairs if path not in kept]
@@ -12053,6 +12087,13 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = multipr
 				for link in total_sym_links:
 					print(f"Link: {link} -> {total_sym_links[link]}")
 			link_targets = create_sym_links(total_sym_links,exclude=exclude,link_tracking=link_tracking and not no_link_tracking)
+			if not remove:
+				# The move's backstop, at the end of a copy: two sources that landed in one file, where the destination took their
+				# names for one and no check on names could say so (an 8.3 alias, a legacy name read as UTF-8). The landing is left
+				# as it is: it holds one source whole, and the other content has no name of its own there. A move asks before removing.
+				for path, why in sorted(_not_held((os.path.abspath(entry) for entry in itertools.chain(total_file_list, total_sym_links)), src_paths, dests, bool(dest_image),
+						1 if single_thread else max_workers, move=False).items()):
+					eprint(f'Destination clash: copied {path}, but {why}')
 			# A copy that reported errors is incomplete: removing the sources (a move) would lose what was not copied,
 			# and an unlisted source subtree would make its destination counterpart look extra.
 			copy_failures = [error for error in ERRORS[copy_error_start:] if _is_failure(error)]

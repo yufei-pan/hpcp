@@ -119,13 +119,6 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - **Revisit when:** someone hits it.
 - **Approved:** 2026-11-06, the user chose "Known limitation (Recommended)".
 
-### An 8.3 alias beside its long name on vfat
-- **Kind:** deferred.
-- **What the operator sees:** a copy without a move, `hpcp a/ b/ -d out/` onto vfat with `a/longfilename.txt` and `b/LONGFI~1.TXT`, exits 0 in about a third of the runs with one landing holding the other's content: vfat made `LONGFI~1.TXT` the short name of the first file, so the second source is written onto it. Both sources stay, so nothing is lost, but the destination lacks one of the two files and nothing says so. Since 9.84 a move keeps the source whose landing does not hold it, exit 213 (EL8 vfat: 7 of 20 moves lost a content in 9.83, none in 9.84).
-- **Why:** a numbered alias such as `LONGFI~1.TXT` is in neither name, so no rule on names catches it before the copy, and asking the directory about the pair (`_ask_names`) cannot see that one file already has the other's name: it is the filesystem's invention, not a spelling. The move's backstop (`_moved_not_held`) runs before a removal, and a copy removes nothing.
-- **Plan:** run the same check at the end of a copy, and report each landing that does not hold its source as a `Destination clash` (213).
-- **Revisit when:** the next hpcp release.
-
 ### A copy into its own inside under another spelling on FUSE exFAT
 - **Kind:** deferred.
 - **What the operator sees:** on exFAT through FUSE (EL7 and EL8), with `D/f` and `D/sub/f`, `hpcp D/ -d d/sub/` without `-rf` exits 0 and adds `D/sub/sub/f`: `d` is `D`, so the destination is inside the source, and the copy reads the destination's own files and copies them into it, one level deeper each run. The file it adds holds either content, as its copy races with the one that writes `D/f` onto `D/sub/f`. In one spelling (`hpcp D/ -d D/sub/`) the destination is left out of the walk, and `D/sub/f` takes `D/f`'s content as any file of a destination would, so the other spelling adds only the extra copies. The move form, `hpcp D/ -d d/sub/ -rf`, is refused (241), as in one spelling.
@@ -140,10 +133,10 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   - both names' bytes are valid UTF-8, but not as each other's case: KOI8-R `бё` and `бЁ` (`C2 A3` and `C2 B3`), CP1251 `EF B8 B8` and `EF A8 B8`; CP1251 alone has 880 such two-byte pairs;
   - an ASCII name against a legacy one: `istanbul` against ISO 8859-9 `İstanbul` (`DD` for `İ`, which that table makes the other case of `i`);
   - two cases of different lengths: EUC-JP `ς` is three bytes (`8F A6 F8`) and `Σ` two (`A6 B2`), and no rule over single bytes can join names of different lengths.
-  A copy without a move, `hpcp a/ b/ -d out/` with one in `a/` and the other in `b/`, exits 0 with one landing holding the other's content: both sources stay, and the destination lacks one file. Since 9.84 a move keeps the source whose landing does not hold it (213), and so does a rename in case between two such names (`hpcp out/ONE -d out/OTHER -rf`), where 9.83 exited 0 with a content or the file gone. Checked on vfat mounted `iocharset=cp1251`, `koi8-r` and `iso8859-9` (`utf8=0`) on EL8; the EUC-JP pair on kernel exFAT is not checked yet (it needs VM 901). Only for such pairs, and only on such a mount: names that are not UTF-8 as a whole fold byte by byte and meet.
-- **Why:** a name that is valid UTF-8 is read as UTF-8, which it is on every other mount, and the mount's own table, not UTF-8, says what its other case is. Joining every valid name with every name of the same length would ask about most trees pair by pair again. The move's backstop runs before a removal, and a copy removes nothing.
-- **Plan:** run the move's check at the end of a copy too, and report such a landing as a `Destination clash` (213). Then catch the pairs before the copy, so that neither content is written over: fold every name byte by byte on a mount with a codepage `iocharset` (read from the mount options), or join byte-level keys across all names.
-- **Revisit when:** the next hpcp release.
+  So the pair is found only after the copy, by the backstop: `hpcp a/ b/ -d out/` with one in `a/` and the other in `b/` ends in exit 213, `Destination clash: copied SRC, but LANDING is one file with OTHER (from OTHER_SRC)`, and the landing holds whichever source was written last, which in a parallel copy can differ from run to run; every rerun copies both again, and with `-rf` both sources stay. A pair caught before the copy is refused there instead: the first source lands and the second is not written, the same on every run. Checked on vfat mounted `iocharset=cp1251`, `koi8-r` and `iso8859-9` (`utf8=0`) on EL8; the EUC-JP pair on kernel exFAT is not checked yet (it needs VM 901). Only for such pairs, and only on such a mount: names that are not UTF-8 as a whole fold byte by byte and meet.
+- **Why:** a name that is valid UTF-8 is read as UTF-8, which it is on every other mount, and the mount's own table, not UTF-8, says what its other case is. Joining every valid name with every name of the same length would ask about most trees pair by pair again.
+- **Plan:** catch the pairs before the copy, so that neither content is written over: fold every name byte by byte on a mount with a codepage `iocharset` (read from the mount options), or join byte-level keys across all names.
+- **Revisit when:** 9.85.
 
 ### Directories that differ only in case on vfat mounted `iocharset=utf8`
 - **Kind:** deferred.
