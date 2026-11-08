@@ -584,6 +584,22 @@ def test_rme_with_listed_files_deletes_nothing(work, hpcp_mod, reset_hpcp_global
 	assert files(work / 'out') == {b'x.txt': b'an earlier flat copy', b'other/keep': b'not from this list', b'src/a/x.txt': b'one'}
 
 
+@pytest.mark.parametrize('entry', [b'out/b/sub/f', b'out/b/sub', b'out/b/sub/'])
+def test_rme_never_removes_a_list_entry_left_in_place_inside_the_destination(tmp_path, hpcp_mod, reset_hpcp_globals, at_a_tty, monkeypatch, entry):
+	# out/b/sub/f is named, and stays where it is ('Skipped 1 list entries inside the destination'); b lands at out/b and has no
+	# sub. 9.84 at a1d61e8 built its guard after the entry was dropped, and removed out/b/sub/f, its only copy, with exit 0.
+	monkeypatch.chdir(tmp_path)
+	write(tmp_path / 'b/f', 'F')
+	write(tmp_path / 'out/b/sub/f', 'only copy')
+	write(tmp_path / 'out/b/stale', 'gone')
+	# An empty directory named in the list is a source too.
+	os.makedirs(str(tmp_path / 'out/b/empty'))
+	os.makedirs(str(tmp_path / 'out/b/stale-dir'))
+	assert hpcp_list(hpcp_mod, tmp_path, entry + b'\nout/b/empty\nb\n', remove_extra=True) == 0
+	assert files(tmp_path / 'out') == {b'b/f': b'F', b'b/sub/f': b'only copy'}
+	assert (tmp_path / 'out/b/empty').is_dir() and not (tmp_path / 'out/b/stale-dir').exists()
+
+
 def test_rme_cleans_only_below_listed_directories(work, hpcp_mod, reset_hpcp_globals, at_a_tty, monkeypatch):
 	monkeypatch.chdir(work)
 	write(work / 'out/src/a/stale', 'gone')

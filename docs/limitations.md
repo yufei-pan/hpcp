@@ -29,7 +29,7 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 
 ### Destination symlink at a directory's path
 - **Kind:** deferred.
-- **What the operator sees:** with `out/d -> ../elsewhere`, `hpcp src/ -d out/` writes src/d's files into elsewhere and changes elsewhere's mode, and as root its owner, exit 0, as in 9.80. A user who can write the destination can plant `d -> /etc` before root restores into it. `hpcp src/ -d out/ -rme` with `out/d -> ../src/d` removes the link as an extra, and `d` is not mirrored. The same at a file's path, identical or not: with `out/x -> ../t/f`, `t/f` takes the mode, and as root the owner, of `a/x`.
+- **What the operator sees:** with `out/d -> ../elsewhere`, `hpcp src/ -d out/` writes src/d's files into elsewhere and changes elsewhere's mode, and as root its owner, exit 0, as in 9.80. A user who can write the destination can plant `d -> /etc` before root restores into it. `hpcp src/ -d out/ -rme` with `out/d -> ../src/d` keeps the link, which leads into a source (9.83 removed it as an extra), and `d` is not mirrored. The same at a file's path, identical or not: with `out/x -> ../t/f`, `t/f` takes the mode, and as root the owner, of `a/x`.
 - **Why:** not a regression (a link there that leads onto a source file is refused, exit 213), and it needs its own decision: refuse as `cp -a` does, or write through without touching the target's mode and owner, since someone with a symlinked data directory may rely on writing through.
 - **Revisit when:** the next hpcp release.
 - **Approved:** 2026-11-05, the user chose "Deferred to 9.82 (Recommended)".
@@ -107,7 +107,7 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 
 ### A probe left behind by SIGKILL
 - **Kind:** known limitation.
-- **What the operator sees:** hpcp killed with SIGKILL in the moment it asks a directory about a name leaves a hidden `.hpcp-case-probe-PID-uuid` directory in the destination, empty or holding a small file for each spelling of the name it was asking about; where the probe asks each made name alone (a spelling the directory will not look up, as on vfat), a second such directory can be left beside it. No data is affected. SIGINT, SIGTERM and SIGHUP wait for the probe to go, and left nothing in 30 kills each.
+- **What the operator sees:** hpcp killed with SIGKILL in the moment it asks a directory about a name leaves a hidden `.hpcp-case-probe-PID-uuid` directory in the directory it was asking: a destination directory, or, for a move that renames a file within one directory (`hpcp out/ONE -d out/OTHER -rf`), that source directory, empty or holding a small file for each spelling of the name it was asking about; where the probe asks each made name alone (a spelling the directory will not look up, as on vfat), a second such directory can be left beside it. No data is affected. SIGINT, SIGTERM and SIGHUP wait for the probe to go, and left nothing in 30 kills each.
 - **Why:** SIGKILL cannot be handled, and the only way to ask a directory about two names is to make them.
 - **Revisit when:** an operator reports finding one.
 - **Approved:** 2026-11-06, the user chose "Known limitation (Recommended)".

@@ -16,6 +16,7 @@ import glob
 import hashlib
 import itertools
 import locale
+import math
 import multiprocessing
 import os
 import pathlib
@@ -664,42 +665,26 @@ def get_file_size(path):
 			realSize = 0
 	return realSize
 
-def _mtimes_agree(first, second):
-	"""Two modification times are one as a copy keeps them: within twice the coarser precision either shows (vfat keeps 2
-	seconds, exFAT 10 ms, NTFS 100 ns; get_timestamp_precision guesses it from the value)."""
-	return abs(first - second) <= max(get_timestamp_precision(first), get_timestamp_precision(second)) * 2
+# The steps a filesystem keeps a modification time in, coarsest first: vfat 2 s, ext3 and HFS+ 1 s, exFAT 10 ms, 1 ms, UDF
+# 1 us, NTFS and SMB 100 ns, ext4, xfs and btrfs 1 ns (each as a copy onto it reads back).
+_MTIME_STEPS_NS = (2 * 10**9, 10**9, 10**7, 10**6, 10**3, 100, 1)
 
-def get_timestamp_precision(num):
-	"""
-	Get the precision of a timestamp.
+def _mtime_step_ns(mtime_ns):
+	"""The step a modification time (integer nanoseconds) was kept in, guessed as the coarsest of _MTIME_STEPS_NS that divides
+	it. A finer time that divides by a coarser step by chance (1 NTFS time in 10,000 divides by 1 ms) only widens the
+	tolerance. Integers, as a float near 1.7e9 s carries about 2.4e-7 s of noise and can show no step finer than 1 s."""
+	for step in _MTIME_STEPS_NS:
+		if mtime_ns % step == 0:
+			return step
+	return 1
 
-	Args:
-		num (float): The number to get the precision of.
-
-	Returns:
-		int: The precision of the number. Possible precisions are 2, 1,  0.01, 0.0000001 , 1e-9
-
-	Examples:
-		>>> get_timestamp_precision(10)
-		0
-		>>> get_timestamp_precision(10.0)
-		2
-		>>> get_timestamp_precision(10.5)
-		0.01
-	"""
-	if isinstance(num, int):
-		return 0
-	elif isinstance(num, float):
-		if num / 2 == int(num / 2):
-			return 2
-		if num == int(num):
-			return 1
-		if num * 100 == int(num * 100):
-			return 0.01
-		if num * 1e7 == int(num * 1e7):
-			return 0.0000001
-		return 1e-9
-	return 0
+def _mtimes_agree(first_ns, second_ns):
+	"""Two modification times (integer nanoseconds, st_mtime_ns) are one as a copy keeps them: a filesystem truncates or
+	rounds a time to its step, so a copy's time lies less than one step of the coarser time away (_mtime_step_ns). And a
+	time set through float seconds (os.utime with st_mtime, as many Python tools do) lands within half a float step of
+	where it was, so one float step at that time is the least difference: 238 ns from 2004 to 2038."""
+	float_step_ns = 2.0 ** (math.frexp(max(abs(first_ns), abs(second_ns)) / 1e9)[1] - 53) * 1e9
+	return abs(first_ns - second_ns) <= max(_mtime_step_ns(first_ns), _mtime_step_ns(second_ns), float_step_ns)
 
 def get_last_existing_parent(path):
 	"""
@@ -2588,14 +2573,11 @@ def is_file_identical(src_path, dest_path,src_size,full_hash=False,compare_metad
 	# try to find the mtime are different
 	if src_size != dst_size:
 		return False
-	try:
-		if not _mtimes_agree(os.path.getmtime(src_path), os.path.getmtime(dest_path)):
-			return False
-	except Exception:
-		pass
+	src_st, dst_st = os.stat(src_path), os.stat(dest_path)
+	if not _mtimes_agree(src_st.st_mtime_ns, dst_st.st_mtime_ns):
+		return False
 	# A node has no contents to compare, and opening one is an act of its own (a FIFO waits for a writer): nodes of one kind for
 	# the same device are the same, and a changed device number is not.
-	src_st, dst_st = os.stat(src_path), os.stat(dest_path)
 	if not (stat.S_ISREG(src_st.st_mode) and stat.S_ISREG(dst_st.st_mode)):
 		return stat.S_IFMT(src_st.st_mode) == stat.S_IFMT(dst_st.st_mode) and src_st.st_rdev == dst_st.st_rdev
 	if hash_file(src_path,src_size,full_hash) != hash_file(dest_path,dst_size,full_hash):
@@ -3338,7 +3320,7 @@ def copy_file(src_path, dest_paths, full_hash=False, verbose=False, concurrent_p
 						owner_kept, group_kept = _chown_like_cp(dest, st)
 						#also copy the modes (as cp -a: no set-user-ID / set-group-ID bit for an owner / group not kept)
 						os.chmod(dest, st.st_mode & ~((0 if owner_kept else stat.S_ISUID) | (0 if group_kept else stat.S_ISGID)))
-					os.utime(dest, (st.st_atime, st.st_mtime),follow_symlinks=False)
+					os.utime(dest, ns=(st.st_atime_ns, st.st_mtime_ns),follow_symlinks=False)
 				endTime = time.monotonic()
 				return 0, endTime - start_time , symLinks #, task_to_run
 		bak_dest_paths = dest_paths.copy()
@@ -4021,7 +4003,7 @@ def sync_directory_metadata(src_path, dest_paths):
 					lost = (0 if owner_kept else stat.S_ISUID) | (0 if group_kept else stat.S_ISGID)
 					if st.st_mode & lost:
 						os.chmod(dest_path, stat.S_IMODE(st.st_mode) & ~lost)
-				os.utime(dest_path, (st.st_atime, st.st_mtime))
+				os.utime(dest_path, ns=(st.st_atime_ns, st.st_mtime_ns))
 		except OSError as e:
 			eprint(f'Directory sync error: {src_path} to {dest_path}: {e}')
 	return 1,time.monotonic()-start_time,frozenset()
@@ -4409,11 +4391,6 @@ def encode_state(info):
 			f"{info['hash']}:{info['xattr']}")
 	raise ValueError(f'bad entry state type {kind!r}')
 
-def _mtime_ns_close(a_ns, b_ns):
-	"""Same tolerance as is_file_identical(): 2 x the coarser timestamp precision."""
-	precision = max(get_timestamp_precision(a_ns / 1e9), get_timestamp_precision(b_ns / 1e9))
-	return abs(a_ns - b_ns) <= precision * 2 * 1e9
-
 _TZ_STEP_NS = 15 * 60 * 10**9
 _TZ_MAX_NS = 24 * 3600 * 10**9
 
@@ -4421,7 +4398,7 @@ def _tz_shift_close(a_ns, b_ns):
 	"""True when a_ns and b_ns are a whole number of 15-minute steps apart (at most 24 hours), within the usual
 	timestamp tolerance: one FAT timestamp read under two timezone settings (sys_tz, tz=, time_offset=)."""
 	shift = int(round((a_ns - b_ns) / _TZ_STEP_NS)) * _TZ_STEP_NS
-	return 0 < abs(shift) <= _TZ_MAX_NS and _mtime_ns_close(a_ns, b_ns + shift)
+	return 0 < abs(shift) <= _TZ_MAX_NS and _mtimes_agree(a_ns, b_ns + shift)
 
 def states_equal(a, b, compare_hash=True, metadata=True, full_hash=False, tz_tolerant=False):
 	"""True when two entry states describe the same entry.
@@ -4456,7 +4433,7 @@ def states_equal(a, b, compare_hash=True, metadata=True, full_hash=False, tz_tol
 		return False
 	if compare_hash and info_a['hash'] != info_b['hash']:
 		return False
-	if _mtime_ns_close(info_a['mtime_ns'], info_b['mtime_ns']):
+	if _mtimes_agree(info_a['mtime_ns'], info_b['mtime_ns']):
 		return True
 	# FAT stores local times: read under another timezone setting the same file shows a whole-step offset. Only
 	# FAT comparisons whose hashes confirmed the whole content accept it.
@@ -8424,7 +8401,7 @@ def _in_root_lost_and_found(path, dest_root):
 		path = os.path.dirname(path)
 	return False
 
-def remove_extra_dirs(src_paths, dests,exclude=None,dest_image=False,keep=(),dest_roots=None,listed=None):
+def remove_extra_dirs(src_paths, dests,exclude=None,dest_image=False,keep=(),dest_roots=None,listed=None,named=None):
 	"""
 	Removes extra directories in destination that are not present in the source paths.
 
@@ -8466,7 +8443,7 @@ def remove_extra_dirs(src_paths, dests,exclude=None,dest_image=False,keep=(),des
 				listed_scope.setdefault(actual_dest, []).append(src_abs)
 	# Positional sources too: only below where a directory source lands (see remove_extra_files); -di is judged whole.
 	scope = None if listed_scope is not None or dest_image else {actual_dest for _, actual_dests in _directory_sources(mapping) for actual_dest in actual_dests}
-	guarded = _source_guard(src_paths)
+	guarded = _source_guard(src_paths if named is None else named)
 	kept = _kept_paths(keep, mapping)
 	copied_roots = {actual_dest for _, actual_dests in mapping for actual_dest in actual_dests}
 	excluded_roots = _excluded_roots(mapping, exclude)
@@ -8538,7 +8515,7 @@ def remove_extra_dirs(src_paths, dests,exclude=None,dest_image=False,keep=(),des
 						_landing_in_other_spelling(os.path.dirname(src_path) or os.curdir, dest, relative_path, source_listings, places) for src_path in src_paths)
 				if (not in_source and not _is_kept(os.path.abspath(dest_dir_path), kept, os.path.abspath(dest), copied_roots)
 						and (scope is None or any(part in scope for part in _path_and_parents(os.path.abspath(dest_dir_path))))):
-					if guarded(dest_dir_path):
+					if guarded(dest_dir_path, 'dir'):
 						print(f"Not removing {dest_dir_path}: it is a source, or lies in one or leads into one")
 					else:
 						extraDirs[os.path.abspath(dest_dir_path)] = (os.path.abspath(dest), dest_dir_path)
@@ -8577,36 +8554,79 @@ def _landing_in_other_spelling(source, dest, relative, listings, places):
 	return False
 
 def _source_guard(src_paths):
-	"""-rme's last word on a path it found extra: True when it is a source or lies in one, whatever the destination calls it:
-	a source named inside the destination (hpcp out/sub/ b/ -d out/), a link in it that leads into a source (out/d ->
-	../src/d). Asked by identity, (st_dev, st_ino), of each source against the path's real place and each directory above
-	it, each directory once. (A directory that holds a source holds something, so it is never removed; a link to it is
-	removed as a link.)"""
-	roots, known = set(), {}
+	"""-rme's last word on a path it found extra: guarded(path, kind) is True when path (as the destination's walk spells
+	it; kind 'dir', 'file' or 'link') is a source or lies in one, whatever the destination calls it: a source named
+	inside the destination (hpcp out/sub/ b/ -d out/, a list entry inside it), a link in it that leads into a source (out/d
+	-> ../src/d). Asked by identity, (st_dev, st_ino). The walks never follow a link, so each directory they found is
+	what its name says: one stat of each (once) answers for everything below it, and a file is stat'ed only in a directory
+	that holds a file source. A link is followed, by its real path. (A directory that holds a source holds something, so it
+	is never removed; a link to it is removed as a link.) src_paths: the sources as named, those the copy left in place too."""
+	def identity(path):
+		try:
+			st = os.stat(path)
+			return st.st_dev, st.st_ino
+		except OSError:
+			return None
+	dirs, files, file_parents, parents_seen = set(), set(), set(), {}
 	for src in src_paths or ():
 		try:
-			st = os.stat(os.path.realpath(src))
+			st = os.lstat(src)
 		except OSError:
 			continue
-		roots.add((st.st_dev, st.st_ino))
-	def guarded(path):
-		if not roots:
-			return False
-		# Up to the first place already answered, then each answered on the way down.
-		unknown = []
-		for part in _path_and_parents(os.path.realpath(path)):
-			if part in known:
+		if stat.S_ISDIR(st.st_mode):
+			dirs.add((st.st_dev, st.st_ino))
+			continue
+		# A file, or a link (copied as one): it, and what a link leads to; and the directories they are in (each once).
+		files.add((st.st_dev, st.st_ino))
+		places = [os.path.dirname(os.path.abspath(src))]
+		target = identity(src) if stat.S_ISLNK(st.st_mode) else None
+		if target:
+			(dirs if os.path.isdir(src) else files).add(target)
+			places.append(os.path.dirname(os.path.realpath(src)))
+		for place in places:
+			if place not in parents_seen:
+				parents_seen[place] = identity(place)
+				file_parents.add(parents_seen[place])
+	file_parents.discard(None)
+	# {directory: (it is or lies in a source, its identity)}, each asked once.
+	known = {}
+	def directory(path):
+		# Up the directories to the first one answered, then each answered on the way down. (Above a destination only a
+		# source that holds it can answer yes, and hpcp() then runs no -rme.)
+		chain = []
+		while path not in known:
+			chain.append(path)
+			parent = os.path.dirname(path)
+			if parent == path:
 				break
-			unknown.append(part)
-		answer = known.get(part, False) if not unknown or unknown[-1] != part else False
-		for part in reversed(unknown):
-			try:
-				st = os.stat(part)
-				answer = answer or (st.st_dev, st.st_ino) in roots
-			except OSError:
-				pass
-			known[part] = answer
-		return answer
+			path = parent
+		answer = known[path][0] if path in known else False
+		for part in reversed(chain):
+			found = identity(part)
+			answer = answer or found in dirs
+			known[part] = answer, found
+		return known[chain[0] if chain else path]
+	def guarded(path, kind='file'):
+		if not (dirs or files):
+			return False
+		path = os.path.abspath(path)
+		if kind == 'dir':
+			return directory(path)[0]
+		inside, parent = directory(os.path.dirname(path))
+		if inside:
+			return True
+		if kind != 'link':
+			return parent in file_parents and identity(path) in files
+		try:
+			st = os.lstat(path)
+			if (st.st_dev, st.st_ino) in files:
+				return True
+		except OSError:
+			return False
+		real = os.path.realpath(path)
+		found = identity(real)
+		# A link that leads nowhere leads into no source.
+		return found is not None and (found in files or found in dirs or directory(os.path.dirname(real))[0])
 	return guarded
 
 def _directory_sources(mapping):
@@ -8757,7 +8777,7 @@ def _landings(entry_abs, by_source):
 			rel = os.path.relpath(entry_abs, src_abs)
 			yield from (os.path.join(actual_dest, rel) for actual_dest in actual_dests)
 
-def remove_extra_files(total_file_list, dests,max_workers,verbose,files_per_job,single_thread=False,exclude=None,parallel_file_listing=False,src_paths=None,sym_links=None,dest_image=False,keep=(),dest_roots=None,listed=None):
+def remove_extra_files(total_file_list, dests,max_workers,verbose,files_per_job,single_thread=False,exclude=None,parallel_file_listing=False,src_paths=None,sym_links=None,dest_image=False,keep=(),dest_roots=None,listed=None,named=None):
 		"""Remove files in ``dests`` that have no counterpart in ``total_file_list``.
 
 		``total_file_list`` may contain absolute src-side paths (as returned by
@@ -8804,7 +8824,7 @@ def remove_extra_files(total_file_list, dests,max_workers,verbose,files_per_job,
 				print("Sources from a list: only the directories it names are cleaned of extra files")
 			elif not dest_image:
 				listed_scope = {actual_dest for _, actual_dests in _directory_sources(mapping) for actual_dest in actual_dests}
-			guarded = _source_guard(src_paths)
+			guarded = _source_guard(src_paths if named is None else named)
 			kept = _kept_paths(keep, mapping)
 			copied_roots = {actual_dest for _, actual_dests in mapping for actual_dest in actual_dests}
 			excluded_roots = _excluded_roots(mapping, exclude)
@@ -8814,7 +8834,8 @@ def remove_extra_files(total_file_list, dests,max_workers,verbose,files_per_job,
 				dest_file_list, links, _, _ = get_file_list(dest, max_workers=max_workers, exclude=exclude, parallel_file_listing=parallel_file_listing,
 					boundary=_filesystem_boundary(dest, dest_roots[dest_abs_root][0], visible_mounts))
 				actual = {os.path.abspath(p) for p in dest_file_list}
-				actual.update({os.path.abspath(p) for p in links})
+				link_paths = {os.path.abspath(p) for p in links}
+				actual.update(link_paths)
 				# Only consider entries that actually live under this dest so we
 				# never accidentally point os.remove outside of the destination.
 				extra = actual - expected
@@ -8831,7 +8852,7 @@ def remove_extra_files(total_file_list, dests,max_workers,verbose,files_per_job,
 						# The copy of an excluded source path is not extra: it was left out, not deleted.
 						if (not _excluded_at_source(path, mapping, exclude, excluded_roots=excluded_roots) and not _is_kept(path, kept, dest_abs_root, copied_roots)
 								and not _in_root_lost_and_found(path, dest_abs_root)):
-							if guarded(path):
+							if guarded(path, 'link' if path in link_paths else 'file'):
 								print(f"Not removing {path}: it is a source, or lies in one or leads into one")
 								continue
 							inDestNotInSrc.add(path)
@@ -10323,18 +10344,30 @@ def _rmdir_below(root, root_id, rel):
 			os.close(fd)
 	return None
 
+def _same_contents(first, second):
+	"""True when two regular files hold the same bytes, read to the end; an OSError is the caller's."""
+	with open(first, 'rb') as one, open(second, 'rb') as other:
+		while True:
+			chunk = one.read(1 << 20)
+			if chunk != other.read(1 << 20):
+				return False
+			if not chunk:
+				return True
+
 def _moved_not_held(entries, src_paths, dests, dest_image=False, max_workers=1):
 	"""The files and links of a move (entries: absolute source paths) that no landing holds, as {path: why}: the move keeps
 	them. A backstop that needs no rule on names: whatever the destination took for one name (an 8.3 alias, a legacy
 	charset's other case, names of different lengths), one source's landing then holds another's content, or is one
 	file with another source's landing, or is the source itself.
 
-	A landing (each source above an entry gives one in each destination, as -rme's expected paths) holds its source when it is there and of its kind; a regular file's of its size and, unless -co, its
-	modification time (_mtimes_agree, as the skip check); not the source itself (one inode, unless the source has other
-	names that keep it); and, where the two share a directory as spelled and only their numbers differ (exFAT through FUSE
-	gives each spelling a number of its own), the directory is asked by making both names (_ask_names). A landing that is
-	one file with the landing of another source (another file) holds neither: both stay. One lstat of each source and
-	each landing, in max_workers threads; nothing is read."""
+	A landing (each source above an entry gives one in each destination, as -rme's expected paths) holds its source when
+	it is there and of its kind (a file's landing that is a symlink is what it leads to: the copy wrote through it); a
+	regular file's of its size and, unless -co, of its modification time (_mtimes_agree, as the skip check) or else of its
+	contents; not the source itself (one inode, unless the source has other names that keep it, and never through a
+	symlink); and, where the two share a directory as spelled and only their numbers differ (exFAT through FUSE gives each
+	spelling a number of its own), the directory is asked by making both names (_ask_names). A landing that is one file
+	with the landing of another source (another file) holds neither: both stay. One lstat of each source and each landing,
+	in max_workers threads; a file is read only when its landing's time disagrees."""
 	by_source = _by_source(_src_to_dest_map(src_paths, dests, dest_image))
 	# A file's landings are its directory's, with its name: each directory is mapped once (a source itself goes by _landings).
 	in_directory = {}
@@ -10345,6 +10378,28 @@ def _moved_not_held(entries, src_paths, dests, dest_image=False, max_workers=1):
 		if parent not in in_directory:
 			in_directory[parent] = list(dict.fromkeys(_landings(parent, by_source)))
 		return [os.path.join(landing, name) for landing in in_directory[parent]]
+	def judge(path, st, landing, lt, through_link):
+		# Why landing does not hold path, or None when it does (the directory may still be asked, below).
+		if (lt.st_dev, lt.st_ino) == (st.st_dev, st.st_ino):
+			if landing == path or st.st_nlink < 2 or through_link:
+				return f'{landing} is the source itself'
+			return None
+		if stat.S_IFMT(lt.st_mode) != stat.S_IFMT(st.st_mode):
+			return f'{landing} is another kind of entry'
+		if not stat.S_ISREG(st.st_mode):
+			return None
+		if lt.st_size != st.st_size:
+			return f'{landing} holds other content ({lt.st_size} bytes, not {st.st_size})'
+		if CONTENT_ONLY or _mtimes_agree(st.st_mtime_ns, lt.st_mtime_ns):
+			return None
+		# A time the landing could not keep is no proof of other content: vfat keeps none before 1980 (it sets
+		# 315532800), so such a file's landing is read against it; a read only where the time disagrees.
+		try:
+			if _same_contents(path, landing):
+				return None
+		except OSError as e:
+			return f'{landing} could not be compared with it ({e.strerror})'
+		return f'{landing} holds other content (modified at another time)'
 	def look(chunk):
 		looked = []
 		for path in chunk:
@@ -10356,9 +10411,17 @@ def _moved_not_held(entries, src_paths, dests, dest_image=False, max_workers=1):
 			found = []
 			for landing in landings_of(path):
 				try:
-					found.append((landing, os.lstat(landing)))
+					lt = os.lstat(landing)
 				except OSError:
-					pass
+					continue
+				through_link = stat.S_ISLNK(lt.st_mode) and not stat.S_ISLNK(st.st_mode)
+				if through_link:
+					try:
+						lt = os.stat(landing)
+					except OSError:
+						# A link that leads nowhere holds nothing.
+						through_link = False
+				found.append((landing, lt, judge(path, st, landing, lt, through_link)))
 			looked.append((path, st, found))
 		return looked
 	entries = list(entries)
@@ -10368,21 +10431,11 @@ def _moved_not_held(entries, src_paths, dests, dest_image=False, max_workers=1):
 	not_held, held, ask = {}, {}, {}
 	for path, st, found in looked:
 		why = None
-		for landing, lt in found:
-			if (lt.st_dev, lt.st_ino) == (st.st_dev, st.st_ino):
-				if landing == path or st.st_nlink < 2:
-					why = f'{landing} is the source itself'
-					continue
-			elif stat.S_IFMT(lt.st_mode) != stat.S_IFMT(st.st_mode):
-				why = why or f'{landing} is another kind of entry'
+		for landing, lt, reason in found:
+			if reason:
+				why = why or reason
 				continue
-			elif stat.S_ISREG(st.st_mode) and lt.st_size != st.st_size:
-				why = why or f'{landing} holds other content ({lt.st_size} bytes, not {st.st_size})'
-				continue
-			elif stat.S_ISREG(st.st_mode) and not CONTENT_ONLY and not _mtimes_agree(st.st_mtime, lt.st_mtime):
-				why = why or f'{landing} holds other content (modified at another time)'
-				continue
-			elif os.path.dirname(landing) == os.path.dirname(path):
+			if os.path.dirname(landing) == os.path.dirname(path) and (lt.st_dev, lt.st_ino) != (st.st_dev, st.st_ino):
 				ask.setdefault(os.path.dirname(path), []).append((path, landing))
 			held.setdefault(path, []).append((landing, lt))
 		if path not in held:
@@ -10400,10 +10453,13 @@ def _moved_not_held(entries, src_paths, dests, dest_image=False, max_workers=1):
 					not_held[path] = why
 					del held[path]
 	# Two sources (two files) held by one landing file: the destination took their names for one.
+	# A landing file with other names was not written by this run (the copy leaves a file with other names first: cp -a
+	# unlinks it, -co by _leave_hard_links): it was there, and held the source already (a destination deduplicated by hard links).
 	by_file = {}
 	for path, found in held.items():
 		for landing, lt in found:
-			by_file.setdefault((lt.st_dev, lt.st_ino), []).append((path, landing))
+			if lt.st_nlink < 2:
+				by_file.setdefault((lt.st_dev, lt.st_ino), []).append((path, landing))
 	identity = {path: (st.st_dev, st.st_ino) for path, st, _ in looked}
 	for sharing in by_file.values():
 		if len({identity[path] for path, _ in sharing}) > 1:
@@ -11958,6 +12014,8 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = multipr
 			# Decided before the entries inside a destination go: what is left of the sources is still a list's.
 			listed = _has_listed(src_paths)
 			holding = left_out = None
+			# -rme never removes a source: the ones left in place inside a destination too (_source_guard).
+			named_sources = list(src_paths)
 			if listed or not dest_image:
 				src_paths[:], skipped, holding, left_out = _inside_destinations(src_paths, dests, places)
 				if skipped:
@@ -12019,10 +12077,10 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = multipr
 				print('-'*80)
 				dest_roots = _checked_destination_roots(dests, pinned_dest_roots)
 				remove_extra_files(total_file_list, dests,max_workers,verbose,files_per_job,single_thread,exclude=exclude,parallel_file_listing=parallel_file_listing,src_paths=src_paths,sym_links=total_sym_links,
-					dest_image=bool(dest_image),keep=link_targets,dest_roots=dest_roots,listed=listed)
+					dest_image=bool(dest_image),keep=link_targets,dest_roots=dest_roots,listed=listed,named=named_sources)
 				print('-'*80)
 				print("Removing extra directories...")
-				remove_extra_dirs(src_paths, dests,exclude=exclude,dest_image=bool(dest_image),keep=link_targets,dest_roots=dest_roots,listed=listed)
+				remove_extra_dirs(src_paths, dests,exclude=exclude,dest_image=bool(dest_image),keep=link_targets,dest_roots=dest_roots,listed=listed,named=named_sources)
 			print('-'*80)
 			if len(src_paths) > 1:
 				print("Overall Summary:")

@@ -1,4 +1,6 @@
+import errno
 import os
+import shutil
 import sys
 import pytest
 
@@ -996,13 +998,14 @@ def test_a_landing_that_is_the_source_holds_it_only_through_another_name(tmp_pat
 	assert _not_held(hpcp_mod, tmp_path, ['a/f']) == {}
 
 
-@pytest.mark.skipif(not hasattr(os, 'link'), reason='hard links')
+@pytest.mark.skipif(not hasattr(os, 'link') or os.name == 'nt', reason='hard links and symlinks')
 def test_two_sources_that_one_landing_file_holds_are_both_kept(tmp_path, hpcp_mod, reset_hpcp_globals):
 	# Of one size and one time, each landing would pass for its source: that they are one file says they were taken for one.
+	# out/q leads to out/p, one file of one name, as a folding destination has it.
 	_write(str(tmp_path / 'a/p'), 'AAAA', 1_600_000_000)
 	_write(str(tmp_path / 'b/q'), 'BBBB', 1_600_000_000)
 	_write(str(tmp_path / 'out/p'), 'BBBB', 1_600_000_000)
-	os.link(str(tmp_path / 'out/p'), str(tmp_path / 'out/q'))
+	os.symlink('p', str(tmp_path / 'out/q'))
 	not_held = _not_held(hpcp_mod, tmp_path, ['a/p', 'b/q'], sources=('a/', 'b/'))
 	assert sorted(not_held) == [str(tmp_path / 'a/p'), str(tmp_path / 'b/q')]
 	assert 'the destination took the names for one' in not_held[str(tmp_path / 'a/p')] and str(tmp_path / 'b/q') in not_held[str(tmp_path / 'a/p')]
@@ -1058,6 +1061,177 @@ def test_a_file_that_went_to_a_later_destination_is_held_there(tmp_path, hpcp_mo
 	assert _not_held(hpcp_mod, tmp_path, ['a/f'], dests=('one/', 'two/')) == {}
 	_write(str(tmp_path / 'one/f'), 'other', 1_600_000_000)
 	assert _not_held(hpcp_mod, tmp_path, ['a/f'], dests=('one/', 'two/')) == {}
+
+
+# Times as each filesystem keeps them: a copy's time lies within one step of the coarser time (_mtime_step_ns).
+
+_SOURCE_NS = 1_700_000_000_123_456_789
+
+
+@pytest.mark.parametrize('step', [100, 1000, 10**6, 10**7, 2 * 10**9, None], ids=['100ns-ntfs', '1us-udf', '1ms', '10ms-exfat', '2s-vfat', 'float-seconds'])
+def test_a_landing_whose_filesystem_keeps_a_coarser_time_holds_the_source(tmp_path, hpcp_mod, reset_hpcp_globals, step):
+	# 9.84 at a1d61e8 compared float seconds and guessed no 1 us or 1 ms step: ntfs-3g and udf moves exited 213.
+	_write(str(tmp_path / 'a/f'), 'data')
+	os.utime(str(tmp_path / 'a/f'), ns=(_SOURCE_NS, _SOURCE_NS))
+	_write(str(tmp_path / 'out/f'), 'data')
+	if step is None:
+		# Set through float seconds (os.utime with st_mtime): within half a float step, 119 ns.
+		os.utime(str(tmp_path / 'out/f'), (os.stat(str(tmp_path / 'a/f')).st_mtime,) * 2)
+		assert _not_held(hpcp_mod, tmp_path, ['a/f']) == {} and os.stat(str(tmp_path / 'out/f')).st_mtime_ns != _SOURCE_NS
+		assert hpcp_mod.is_file_identical(str(tmp_path / 'a/f'), str(tmp_path / 'out/f'), 4) is True
+		return
+	for landing_ns in (_SOURCE_NS // step * step, -(-_SOURCE_NS // step) * step):
+		os.utime(str(tmp_path / 'out/f'), ns=(landing_ns, landing_ns))
+		assert _not_held(hpcp_mod, tmp_path, ['a/f']) == {}, landing_ns
+		# The skip check: such a copy is not copied again on every run.
+		assert hpcp_mod.is_file_identical(str(tmp_path / 'a/f'), str(tmp_path / 'out/f'), 4) is True, landing_ns
+	# One step more (at least 1 us, past a float step) is another time, and the contents say whose.
+	_write(str(tmp_path / 'out/f'), 'dirt')
+	other_ns = _SOURCE_NS // step * step - max(step, 1000)
+	os.utime(str(tmp_path / 'out/f'), ns=(other_ns, other_ns))
+	assert 'holds other content (modified at another time)' in _not_held(hpcp_mod, tmp_path, ['a/f'])[str(tmp_path / 'a/f')]
+	assert hpcp_mod.is_file_identical(str(tmp_path / 'a/f'), str(tmp_path / 'out/f'), 4) is False
+
+
+_1973_NS = 100_000_000_123_456_789
+
+
+@pytest.mark.parametrize('first, second, agree', [
+	# One float step at 1.7e9 s is 238.4 ns: a time set through float seconds lands within half of it.
+	(_SOURCE_NS, _SOURCE_NS + 238, True),
+	(_SOURCE_NS, _SOURCE_NS - 238, True),
+	(_SOURCE_NS, _SOURCE_NS + 239, False),
+	(_SOURCE_NS, _SOURCE_NS // 1000 * 1000, True),
+	(_SOURCE_NS, _SOURCE_NS // 1000 * 1000 - 1000, False),
+	(_SOURCE_NS, _SOURCE_NS // 10**6 * 10**6, True),
+	# In 1973 a float step is 14.9 ns, and NTFS's 100 ns step decides.
+	(_1973_NS, _1973_NS // 100 * 100, True),
+	(_1973_NS, _1973_NS // 100 * 100 - 1, False),
+	(_1973_NS, _1973_NS + 14, True),
+	(_1973_NS, _1973_NS + 16, False),
+	(1_700_000_000 * 10**9, 1_700_000_002 * 10**9, True),
+	(1_700_000_000 * 10**9, 1_700_000_002 * 10**9 + 1, False),
+	(1_700_000_001 * 10**9, 1_700_000_002 * 10**9, True),
+	(1_700_000_001 * 10**9, 1_700_000_003 * 10**9, False),
+	# A 1 s filesystem's time against a finer one within that second.
+	(1_700_000_001 * 10**9, 1_700_000_001_500_000_000, True),
+	# Across 2**31 s (2038) the float step doubles: the later time's, 476.8 ns, decides.
+	(2**31 * 10**9 - 200, 2**31 * 10**9 + 250, True),
+	(2**31 * 10**9 - 200, 2**31 * 10**9 + 276, True),
+	(2**31 * 10**9 - 200, 2**31 * 10**9 + 277, False),
+	(1_700_000_000 * 10**9 + 10**7, 1_700_000_000 * 10**9 + 2 * 10**7, True),
+	(1_700_000_000 * 10**9 + 10**7, 1_700_000_000 * 10**9 + 3 * 10**7, False),
+])
+def test_two_times_agree_within_one_step_of_the_coarser(hpcp_mod, first, second, agree):
+	assert hpcp_mod._mtimes_agree(first, second) is agree and hpcp_mod._mtimes_agree(second, first) is agree
+	state = 'f:4:{}:644:0:0:h:-'
+	assert hpcp_mod.states_equal(state.format(first), state.format(second)) is agree
+
+
+def test_a_rerun_keeps_the_times_to_the_nanosecond(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	# A file found identical gets its times again: 9.84 at a1d61e8 set them through float seconds, up to 119 ns off.
+	monkeypatch.chdir(tmp_path)
+	_write('a/d/f', 'data')
+	os.utime('a/d/f', ns=(_SOURCE_NS, _SOURCE_NS))
+	for _ in range(2):
+		assert hpcp_mod.hpcp(['a/'], ['out/'], single_thread=True, max_workers=1, batch=True) == 0
+		assert os.stat('out/d/f').st_mtime_ns == _SOURCE_NS
+
+
+def test_a_landing_whose_time_vfat_could_not_keep_holds_the_source_of_its_contents(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	# vfat keeps no time before 1980: it sets 315532800. 9.84 at a1d61e8 kept every such source, with 213.
+	_write(str(tmp_path / 'a/f'), 'data', 0)
+	_write(str(tmp_path / 'out/f'), 'data', 315532800)
+	assert _not_held(hpcp_mod, tmp_path, ['a/f']) == {}
+	_write(str(tmp_path / 'out/f'), 'dirt', 315532800)
+	assert 'holds other content (modified at another time)' in _not_held(hpcp_mod, tmp_path, ['a/f'])[str(tmp_path / 'a/f')]
+	# A landing that cannot be read is not known to hold it.
+	_write(str(tmp_path / 'out/f'), 'data', 315532800)
+	def refused(first, second):
+		raise PermissionError(errno.EACCES, 'Permission denied', second)
+	monkeypatch.setattr(hpcp_mod, '_same_contents', refused)
+	assert 'could not be compared with it (Permission denied)' in _not_held(hpcp_mod, tmp_path, ['a/f'])[str(tmp_path / 'a/f')]
+
+
+def test_the_contents_are_read_only_when_the_time_disagrees(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	read = []
+	real = hpcp_mod._same_contents
+	monkeypatch.setattr(hpcp_mod, '_same_contents', lambda first, second: read.append(first) or real(first, second))
+	_write(str(tmp_path / 'a/same'), 'data', 1_600_000_000)
+	_write(str(tmp_path / 'out/same'), 'data', 1_600_000_000)
+	_write(str(tmp_path / 'a/longer'), 'data', 1_600_000_000)
+	_write(str(tmp_path / 'out/longer'), 'datadata', 1_600_000_100)
+	_write(str(tmp_path / 'a/later'), 'data', 1_600_000_000)
+	_write(str(tmp_path / 'out/later'), 'data', 1_600_000_100)
+	# A time its landing's filesystem kept to the microsecond is the same time: nothing to read.
+	_write(str(tmp_path / 'a/coarse'), 'data')
+	os.utime(str(tmp_path / 'a/coarse'), ns=(_SOURCE_NS, _SOURCE_NS))
+	_write(str(tmp_path / 'out/coarse'), 'data')
+	os.utime(str(tmp_path / 'out/coarse'), ns=(_SOURCE_NS // 1000 * 1000,) * 2)
+	assert sorted(_not_held(hpcp_mod, tmp_path, ['a/same', 'a/longer', 'a/later', 'a/coarse'])) == [str(tmp_path / 'a/longer')]
+	assert read == [str(tmp_path / 'a/later')]
+
+
+def test_contents_compare_to_the_end(tmp_path, hpcp_mod):
+	big = b'x' * (3 << 20)
+	(tmp_path / 'one').write_bytes(big)
+	(tmp_path / 'two').write_bytes(big)
+	(tmp_path / 'three').write_bytes(big[:-1] + b'y')
+	assert hpcp_mod._same_contents(str(tmp_path / 'one'), str(tmp_path / 'two'))
+	assert not hpcp_mod._same_contents(str(tmp_path / 'one'), str(tmp_path / 'three'))
+
+
+@pytest.mark.skipif(not hasattr(os, 'symlink') or os.name == 'nt', reason='symlinks')
+def test_a_landing_that_is_a_link_to_a_file_holds_what_the_copy_wrote_through_it(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	# cp writes through a link at the landing: out/x -> ../t/f holds a/x in t/f. 9.84 at a1d61e8 said 'another kind of entry', 213.
+	monkeypatch.chdir(tmp_path)
+	_write('a/x', 'A')
+	_write('t/f', 'old')
+	os.makedirs('out')
+	os.symlink(os.path.join('..', 't', 'f'), 'out/x')
+	assert hpcp_mod.hpcp(['a/'], ['out/'], single_thread=True, max_workers=1, batch=True, remove_force=True) == 0
+	assert not os.path.exists('a/x') and open('t/f').read() == 'A' and os.path.islink('out/x')
+
+
+@pytest.mark.skipif(not hasattr(os, 'symlink') or not hasattr(os, 'link') or os.name == 'nt', reason='symlinks and hard links')
+def test_a_landing_that_is_a_link_to_the_source_is_the_source_itself(tmp_path, hpcp_mod, reset_hpcp_globals):
+	# However many names the source has, removing it takes what the link shows. A link that leads nowhere holds nothing.
+	_write(str(tmp_path / 'a/x'), 'A')
+	os.makedirs(tmp_path / 'out')
+	os.symlink(os.path.join('..', 'a', 'x'), str(tmp_path / 'out/x'))
+	assert 'is the source itself' in _not_held(hpcp_mod, tmp_path, ['a/x'])[str(tmp_path / 'a/x')]
+	os.link(str(tmp_path / 'a/x'), str(tmp_path / 'a/other-name'))
+	assert 'is the source itself' in _not_held(hpcp_mod, tmp_path, ['a/x'])[str(tmp_path / 'a/x')]
+	os.unlink(str(tmp_path / 'out/x'))
+	os.symlink('nowhere', str(tmp_path / 'out/x'))
+	assert 'another kind of entry' in _not_held(hpcp_mod, tmp_path, ['a/x'])[str(tmp_path / 'a/x')]
+
+
+@pytest.mark.skipif(not hasattr(os, 'link'), reason='hard links')
+def test_a_move_onto_a_destination_deduplicated_by_hard_links_removes_the_sources(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	# out/p and out/q are one file, as a deduplicating tool leaves them, and hold a/p and b/q: the copy skips both and writes
+	# nothing. 9.84 at a1d61e8 took the shared file for two names the destination took for one, 213.
+	monkeypatch.chdir(tmp_path)
+	_write('a/p', 'same', 1_600_000_000)
+	_write('b/q', 'same', 1_600_000_000)
+	_write('out/p', 'same', 1_600_000_000)
+	os.link('out/p', 'out/q')
+	assert hpcp_mod.hpcp(['a/', 'b/'], ['out/'], single_thread=True, max_workers=1, batch=True, remove_force=True) == 0
+	assert not os.path.exists('a/p') and not os.path.exists('b/q') and open('out/q').read() == 'same'
+
+
+@pytest.mark.skipif(not hasattr(os, 'link'), reason='hard links')
+def test_a_copy_leaves_a_landing_with_other_names_before_writing_it(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	# What the backstop's hard-link rule rests on: a landing the copy writes has one name after it, -co too.
+	monkeypatch.chdir(tmp_path)
+	for content_only in (False, True):
+		monkeypatch.setattr(hpcp_mod, 'CONTENT_ONLY', content_only)
+		shutil.rmtree('out', ignore_errors=True)
+		_write('a/p', 'new %s' % content_only)
+		_write('out/p', 'old')
+		os.link('out/p', 'out/elsewhere')
+		assert hpcp_mod.hpcp(['a/'], ['out/'], single_thread=True, max_workers=1, batch=True) == 0
+		assert os.stat('out/p').st_nlink == 1 and open('out/p').read() == 'new %s' % content_only and open('out/elsewhere').read() == 'old'
 
 
 # -rme judges only below where a directory source lands, and never removes a source, or what lies in or holds one.
@@ -1124,3 +1298,52 @@ def test_rme_never_removes_a_link_that_leads_into_a_source(tmp_path, hpcp_mod, r
 	os.symlink(os.path.join('..', 'elsewhere'), 'out/l')
 	assert _rme_answered(hpcp_mod, monkeypatch, ['src/']) == 0
 	assert os.path.islink('out/d') and not os.path.lexists('out/l') and open('src/d/f').read() == 'F' and open('elsewhere/z').read() == 'Z'
+
+
+@pytest.mark.skipif(not hasattr(os, 'symlink') or os.name == 'nt', reason='symlinks')
+def test_rme_never_removes_what_lies_deep_in_a_source_or_a_link_a_source_holds_or_is(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	# out/sub/ mirrors into out/, so all of out/ is judged: its own files and links are sources, however deep, wherever a link
+	# leads, and a named link is a source though it leads nowhere. 9.84 at a1d61e8 followed each link first, and removed both.
+	monkeypatch.chdir(tmp_path)
+	_write('out/sub/inner/z', 'Z')
+	_write('elsewhere/e', 'E')
+	os.symlink(os.path.join('..', '..', 'elsewhere'), 'out/sub/l')
+	os.makedirs('out/x')
+	os.symlink('nowhere', 'out/x/dangling')
+	_write('b/f', 'F')
+	_write('out/extra', 'e')
+	assert _rme_answered(hpcp_mod, monkeypatch, ['out/sub/', 'out/x/dangling', 'b/']) == 0
+	assert open('out/sub/inner/z').read() == 'Z' and os.path.islink('out/sub/l') and os.path.islink('out/x/dangling')
+	assert not os.path.exists('out/extra') and open('out/f').read() == 'F'
+
+
+def test_rme_asks_about_sources_once_a_directory_not_once_an_extra(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	# On NFS with actimeo=0 each stat is a round trip: 9.84 at a1d61e8 took a realpath (an lstat of each part) and a stat for
+	# every extra, 52 s for 10,000 extras where the walk took 0.35 s.
+	monkeypatch.chdir(tmp_path)
+	_write('b/f', 'f')
+	_write('out/sub/x', 'S')
+	for i in range(500):
+		_write('out/b/many/%d' % i, 'e')
+	calls, inside = [0], [False]
+	for name in ('stat', 'lstat'):
+		real = getattr(os, name)
+		def counted(*args, _real=real, **kwargs):
+			if inside[0]:
+				calls[0] += 1
+			return _real(*args, **kwargs)
+		monkeypatch.setattr(os, name, counted)
+	make = hpcp_mod._source_guard
+	def counting_guard(*args, **kwargs):
+		guarded = make(*args, **kwargs)
+		def wrapped(*args, **kwargs):
+			inside[0] = True
+			try:
+				return guarded(*args, **kwargs)
+			finally:
+				inside[0] = False
+		return wrapped
+	monkeypatch.setattr(hpcp_mod, '_source_guard', counting_guard)
+	assert _rme_answered(hpcp_mod, monkeypatch, ['b', 'out/sub/']) == 0
+	assert not os.path.exists('out/b/many') and open('out/sub/x').read() == 'S'
+	assert calls[0] < 50, calls[0]
