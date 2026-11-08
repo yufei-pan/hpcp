@@ -1110,6 +1110,28 @@ def test_a_link_to_the_destination_is_the_destination(tmp_path, hpcp_mod, reset_
 	assert os.path.islink('outl')
 
 
+@pytest.mark.skipif(os.name == 'nt' or (hasattr(os, 'geteuid') and os.geteuid() == 0), reason='symlinks, and a mode root ignores')
+@pytest.mark.parametrize('form', ['lnk', 'lnk b', 'flnk', 'list'])
+def test_a_named_link_into_a_directory_that_cannot_be_searched_is_copied_as_a_link(tmp_path, hpcp_mod, reset_hpcp_globals, at_a_tty, monkeypatch, form):
+	# 9.85 at b339895 asked where each named link leads, and refused the whole run (213) at a directory it could not search.
+	monkeypatch.chdir(tmp_path)
+	write(tmp_path / 'locked/x/f', 'X')
+	write(tmp_path / 'b/f', 'B')
+	os.makedirs('out')
+	os.symlink('locked/x', 'lnk')
+	os.symlink('locked/x/f', 'flnk')
+	os.chmod('locked', 0)
+	try:
+		if form == 'list':
+			assert hpcp_list(hpcp_mod, tmp_path, b'lnk\nb\n') == 0
+		else:
+			assert hpcp_mod.hpcp(form.split(), dest_paths=['out/'], single_thread=True) == 0
+	finally:
+		os.chmod('locked', 0o755)
+	name = 'flnk' if form == 'flnk' else 'lnk'
+	assert os.readlink(str(tmp_path / 'out' / name)) == os.readlink(name)
+
+
 def test_a_list_entry_inside_the_destination_that_is_not_the_destination_is_still_judged_and_kept(tmp_path, hpcp_mod, reset_hpcp_globals, at_a_tty, monkeypatch, capsys):
 	# The entry out/b/sub/f is named and kept; extras around it go, as before the destination itself was a list entry's question.
 	monkeypatch.chdir(tmp_path)
