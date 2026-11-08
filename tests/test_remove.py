@@ -932,3 +932,117 @@ def test_plain_remove_without_remove_while_listing_reports_no_copy_notes(tmp_tre
 	hpcp_mod.process_remove([str(tmp_tree.src)], single_thread=True, remove_force=True)
 	assert not tmp_tree.src.exists()
 	assert [error for error in hpcp_mod.ERRORS if error.startswith(('Special file skipped', 'Listing error'))] == []
+
+
+# The move backstop (_moved_not_held): before a move removes a source, a landing must hold it. A destination that takes two
+# names for one (an 8.3 alias, a legacy charset's other case) is stood in for here by two landings that are one file.
+
+def _write(path, content, mtime=None):
+	os.makedirs(os.path.dirname(path), exist_ok=True)
+	with open(path, 'w') as f:
+		f.write(content)
+	if mtime is not None:
+		os.utime(path, (mtime, mtime))
+	return path
+
+
+def _not_held(hpcp_mod, tmp_path, entries, dests=('out/',), sources=('a/',)):
+	return hpcp_mod._moved_not_held([str(tmp_path / entry) for entry in entries], [str(tmp_path / source) for source in sources],
+		[str(tmp_path / dest) for dest in dests])
+
+
+def test_a_landing_of_the_source_s_size_and_time_holds_it(tmp_path, hpcp_mod, reset_hpcp_globals):
+	_write(str(tmp_path / 'a/f'), 'data', 1_600_000_000)
+	_write(str(tmp_path / 'out/f'), 'data', 1_600_000_000)
+	assert _not_held(hpcp_mod, tmp_path, ['a/f']) == {}
+
+
+@pytest.mark.parametrize('landing, why', [
+	(None, 'it is at none of its landings'),
+	('other content', 'holds other content (13 bytes, not 4)'),
+	('dirt', 'holds other content (modified at another time)'),
+])
+def test_a_landing_that_is_not_the_source_s_holds_nothing(tmp_path, hpcp_mod, reset_hpcp_globals, landing, why):
+	_write(str(tmp_path / 'a/f'), 'data', 1_600_000_000)
+	if landing is not None:
+		_write(str(tmp_path / 'out/f'), landing, 1_600_000_100)
+	assert why in _not_held(hpcp_mod, tmp_path, ['a/f'])[str(tmp_path / 'a/f')]
+
+
+def test_a_content_only_move_does_not_ask_for_the_time(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	# -co sets no times.
+	monkeypatch.setattr(hpcp_mod, 'CONTENT_ONLY', True)
+	_write(str(tmp_path / 'a/f'), 'data', 1_600_000_000)
+	_write(str(tmp_path / 'out/f'), 'dirt', 1_600_000_100)
+	assert _not_held(hpcp_mod, tmp_path, ['a/f']) == {}
+
+
+def test_a_directory_at_the_landing_holds_no_file(tmp_path, hpcp_mod, reset_hpcp_globals):
+	_write(str(tmp_path / 'a/f'), 'data')
+	os.makedirs(tmp_path / 'out/f')
+	assert 'another kind of entry' in _not_held(hpcp_mod, tmp_path, ['a/f'])[str(tmp_path / 'a/f')]
+
+
+@pytest.mark.skipif(not hasattr(os, 'link'), reason='hard links')
+def test_a_landing_that_is_the_source_holds_it_only_through_another_name(tmp_path, hpcp_mod, reset_hpcp_globals):
+	# out leads into a: the landing out/f is a/f itself, and removing a/f removes it. A source with another name (a hard link)
+	# keeps its content there.
+	_write(str(tmp_path / 'a/f'), 'data')
+	os.symlink('a', str(tmp_path / 'out'))
+	assert 'is the source itself' in _not_held(hpcp_mod, tmp_path, ['a/f'])[str(tmp_path / 'a/f')]
+	os.unlink(str(tmp_path / 'out'))
+	os.makedirs(tmp_path / 'out')
+	os.link(str(tmp_path / 'a/f'), str(tmp_path / 'out/f'))
+	assert _not_held(hpcp_mod, tmp_path, ['a/f']) == {}
+
+
+@pytest.mark.skipif(not hasattr(os, 'link'), reason='hard links')
+def test_two_sources_that_one_landing_file_holds_are_both_kept(tmp_path, hpcp_mod, reset_hpcp_globals):
+	# Of one size and one time, each landing would pass for its source: that they are one file says they were taken for one.
+	_write(str(tmp_path / 'a/p'), 'AAAA', 1_600_000_000)
+	_write(str(tmp_path / 'b/q'), 'BBBB', 1_600_000_000)
+	_write(str(tmp_path / 'out/p'), 'BBBB', 1_600_000_000)
+	os.link(str(tmp_path / 'out/p'), str(tmp_path / 'out/q'))
+	not_held = _not_held(hpcp_mod, tmp_path, ['a/p', 'b/q'], sources=('a/', 'b/'))
+	assert sorted(not_held) == [str(tmp_path / 'a/p'), str(tmp_path / 'b/q')]
+	assert 'the destination took the names for one' in not_held[str(tmp_path / 'a/p')] and str(tmp_path / 'b/q') in not_held[str(tmp_path / 'a/p')]
+	# One source given twice is no such pair.
+	assert _not_held(hpcp_mod, tmp_path, ['b/q'], sources=('b/', 'b/')) == {}
+
+
+@pytest.mark.parametrize('one_name', [False, True])
+def test_a_rename_in_one_directory_asks_the_directory_whether_the_names_are_one(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch, one_name):
+	# exFAT through FUSE gives each spelling of one file a number of its own: only the directory can say.
+	_write(str(tmp_path / 'd/p'), 'data', 1_600_000_000)
+	_write(str(tmp_path / 'd/q'), 'data', 1_600_000_000)
+	asked = []
+	def ask(directory, names):
+		asked.append((directory, sorted(names)))
+		return ({name: names[0] for name in names} if one_name else {name: name for name in names}), {}
+	monkeypatch.setattr(hpcp_mod, '_ask_names', ask)
+	not_held = _not_held(hpcp_mod, tmp_path, ['d/p'], dests=('d/q',), sources=('d/p',))
+	assert asked == [(str(tmp_path / 'd'), ['p', 'q'])]
+	assert ('is the source itself, under another spelling' in not_held.get(str(tmp_path / 'd/p'), '')) == one_name
+
+
+def test_a_rename_the_directory_cannot_be_asked_about_keeps_the_source(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	_write(str(tmp_path / 'd/p'), 'data', 1_600_000_000)
+	_write(str(tmp_path / 'd/q'), 'data', 1_600_000_000)
+	monkeypatch.setattr(hpcp_mod, '_ask_names', lambda directory, names: ({}, {name: 'the reason given' for name in names}))
+	assert 'cannot be asked: the reason given' in _not_held(hpcp_mod, tmp_path, ['d/p'], dests=('d/q',), sources=('d/p',))[str(tmp_path / 'd/p')]
+
+
+def test_a_move_keeps_the_sources_whose_landings_another_source_overwrote(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch, capsys):
+	# What the net misses, on a destination that takes two names for one: out/q leads to out/p, and nothing checks before the
+	# copy, so b/q is written onto a/p's landing. Without the backstop the move exited 0 with A gone.
+	monkeypatch.chdir(tmp_path)
+	_write('a/p', 'A')
+	_write('b/q', 'BB')
+	_write('out/p', 'old')
+	os.symlink('p', 'out/q')
+	monkeypatch.setattr(hpcp_mod, '_settle_destinations', lambda *args, **kwargs: ({}, 0, set()))
+	assert hpcp_mod.hpcp(['a/', 'b/'], ['out/'], single_thread=True, max_workers=1, batch=True, remove_force=True) == 213
+	error = capsys.readouterr().err
+	assert 'Destination clash: not removing ' + str(tmp_path / 'a/p') + ': ' + str(tmp_path / 'out/p') + ' holds other content' in error
+	assert 'Move left entries' not in error
+	assert open('a/p').read() == 'A' and open('out/p').read() == 'BB'

@@ -664,6 +664,11 @@ def get_file_size(path):
 			realSize = 0
 	return realSize
 
+def _mtimes_agree(first, second):
+	"""Two modification times are one as a copy keeps them: within twice the coarser precision either shows (vfat keeps 2
+	seconds, exFAT 10 ms, NTFS 100 ns; get_timestamp_precision guesses it from the value)."""
+	return abs(first - second) <= max(get_timestamp_precision(first), get_timestamp_precision(second)) * 2
+
 def get_timestamp_precision(num):
 	"""
 	Get the precision of a timestamp.
@@ -2584,10 +2589,7 @@ def is_file_identical(src_path, dest_path,src_size,full_hash=False,compare_metad
 	if src_size != dst_size:
 		return False
 	try:
-		src_mtime = os.path.getmtime(src_path)
-		dst_mtime = os.path.getmtime(dest_path)
-		precision = max(get_timestamp_precision(src_mtime), get_timestamp_precision(dst_mtime))
-		if abs(src_mtime - dst_mtime) > precision * 2:
+		if not _mtimes_agree(os.path.getmtime(src_path), os.path.getmtime(dest_path)):
 			return False
 	except Exception:
 		pass
@@ -8688,25 +8690,32 @@ def _expected_dest_paths(src_entries, src_paths, dests, dest_image=False, mappin
 		return expected
 	if mapping is None:
 		mapping = _src_to_dest_map(src_paths, dests, dest_image)
-	# By the entry's ancestors, not each entry against each source: a list gives one source per file. Every source above
-	# an entry counts: each copied it to its own place.
+	by_source = _by_source(mapping)
+	for entry in src_entries:
+		if entry and os.path.isabs(entry):
+			expected.update(_landings(os.path.abspath(entry), by_source))
+	return expected
+
+def _by_source(mapping):
+	"""{source: its landing in each destination}, from _src_to_dest_map's mapping, for _landings."""
 	by_source = {}
 	for src_abs, actual_dests in mapping:
 		by_source.setdefault(src_abs, []).extend(actual_dests)
-	for entry in src_entries:
-		if not entry or not os.path.isabs(entry):
+	return by_source
+
+def _landings(entry_abs, by_source):
+	"""Where the copy put entry_abs, a path of a source (by_source: _by_source): one place in each destination for each source
+	it lies in or is. By the entry's ancestors, not each entry against each source: a list gives one source per file. Every
+	source above an entry counts: each copied it to its own place."""
+	for src_abs in _path_and_parents(entry_abs):
+		actual_dests = by_source.get(src_abs)
+		if actual_dests is None:
 			continue
-		entry_abs = os.path.abspath(entry)
-		for src_abs in _path_and_parents(entry_abs):
-			actual_dests = by_source.get(src_abs)
-			if actual_dests is None:
-				continue
-			if src_abs == entry_abs:
-				expected.update(actual_dests)
-			else:
-				rel = os.path.relpath(entry_abs, src_abs)
-				expected.update(os.path.join(actual_dest, rel) for actual_dest in actual_dests)
-	return expected
+		if src_abs == entry_abs:
+			yield from actual_dests
+		else:
+			rel = os.path.relpath(entry_abs, src_abs)
+			yield from (os.path.join(actual_dest, rel) for actual_dest in actual_dests)
 
 def remove_extra_files(total_file_list, dests,max_workers,verbose,files_per_job,single_thread=False,exclude=None,parallel_file_listing=False,src_paths=None,sym_links=None,dest_image=False,keep=(),dest_roots=None,listed=None):
 		"""Remove files in ``dests`` that have no counterpart in ``total_file_list``.
@@ -10266,13 +10275,95 @@ def _rmdir_below(root, root_id, rel):
 			os.close(fd)
 	return None
 
+def _moved_not_held(entries, src_paths, dests, dest_image=False, max_workers=1):
+	"""The files and links of a move (entries: absolute source paths) that no landing holds, as {path: why}: the move keeps
+	them. A backstop that needs no rule on names: whatever the destination took for one name (an 8.3 alias, a legacy
+	charset's other case, names of different lengths), one source's landing then holds another's content, or is one
+	file with another source's landing, or is the source itself.
+
+	A landing (each source above an entry gives one in each destination, as -rme's expected paths) holds its source when it is there and of its kind; a regular file's of its size and, unless -co, its
+	modification time (_mtimes_agree, as the skip check); not the source itself (one inode, unless the source has other
+	names that keep it); and, where the two share a directory as spelled and only their numbers differ (exFAT through FUSE
+	gives each spelling a number of its own), the directory is asked by making both names (_ask_names). A landing that is
+	one file with the landing of another source (another file) holds neither: both stay. One lstat of each source and
+	each landing, in max_workers threads; nothing is read."""
+	by_source = _by_source(_src_to_dest_map(src_paths, dests, dest_image))
+	def look(chunk):
+		looked = []
+		for path in chunk:
+			try:
+				st = os.lstat(path)
+			except OSError:
+				# Gone already: the removal has nothing to take.
+				continue
+			found = []
+			for landing in dict.fromkeys(_landings(path, by_source)):
+				try:
+					found.append((landing, os.lstat(landing)))
+				except OSError:
+					pass
+			looked.append((path, st, found))
+		return looked
+	entries = list(entries)
+	chunks = [entries[i:i + 1024] for i in range(0, len(entries), 1024)]
+	with concurrent.futures.ThreadPoolExecutor(max(1, min(max_workers, len(chunks)))) as pool:
+		looked = [item for part in pool.map(look, chunks) for item in part]
+	not_held, held, ask = {}, {}, {}
+	for path, st, found in looked:
+		why = None
+		for landing, lt in found:
+			if (lt.st_dev, lt.st_ino) == (st.st_dev, st.st_ino):
+				if landing == path or st.st_nlink < 2:
+					why = f'{landing} is the source itself'
+					continue
+			elif stat.S_IFMT(lt.st_mode) != stat.S_IFMT(st.st_mode):
+				why = why or f'{landing} is another kind of entry'
+				continue
+			elif stat.S_ISREG(st.st_mode) and lt.st_size != st.st_size:
+				why = why or f'{landing} holds other content ({lt.st_size} bytes, not {st.st_size})'
+				continue
+			elif stat.S_ISREG(st.st_mode) and not CONTENT_ONLY and not _mtimes_agree(st.st_mtime, lt.st_mtime):
+				why = why or f'{landing} holds other content (modified at another time)'
+				continue
+			elif os.path.dirname(landing) == os.path.dirname(path):
+				ask.setdefault(os.path.dirname(path), []).append((path, landing))
+			held.setdefault(path, []).append((landing, lt))
+		if path not in held:
+			not_held[path] = why or f'it is at none of its landings ({", ".join(dict.fromkeys(_landings(path, by_source)))})'
+	# A move in one directory under another name: are the two one name there? Each directory once, about all its names.
+	for directory, pairs in ask.items():
+		answers, unknown = _ask_names(directory, list(dict.fromkeys(os.path.basename(name) for pair in pairs for name in pair)))
+		for path, landing in pairs:
+			mine, theirs = os.path.basename(path), os.path.basename(landing)
+			if mine in unknown or theirs in unknown or answers.get(mine) == answers.get(theirs):
+				held[path] = [(other, lt) for other, lt in held.get(path, ()) if other != landing]
+				reason = unknown.get(mine) or unknown.get(theirs)
+				why = f'{landing} may be the source itself, and the directory cannot be asked: {reason}' if reason else f'{landing} is the source itself, under another spelling'
+				if not held[path]:
+					not_held[path] = why
+					del held[path]
+	# Two sources (two files) held by one landing file: the destination took their names for one.
+	by_file = {}
+	for path, found in held.items():
+		for landing, lt in found:
+			by_file.setdefault((lt.st_dev, lt.st_ino), []).append((path, landing))
+	identity = {path: (st.st_dev, st.st_ino) for path, st, _ in looked}
+	for sharing in by_file.values():
+		if len({identity[path] for path, _ in sharing}) > 1:
+			for path, landing in sharing:
+				others = ', '.join(f'{other_landing} (from {other})' for other, other_landing in sharing if identity[other] != identity[path])
+				not_held[path] = f'{landing} is one file with {others}: the destination took the names for one'
+	return not_held
+
 def remove_moved_sources(src_paths, file_list, sym_links, single_thread=False, max_workers=multiprocessing.cpu_count(),
-		verbose=False, files_per_job=1, remove_force=False, exclude=None, root_ids=None):
+		verbose=False, files_per_job=1, remove_force=False, exclude=None, root_ids=None, dests=None, dest_image=False):
 	"""-rm with a destination (a move): remove what the copy listed, file_list and the links (sym_links' keys), then
 	each source directory that is empty after that, deepest first. Anything the copy did not list stays, with the
 	directories holding it: a file written to a source after the copy listed its directory, a special file, an excluded
 	path. What stays, other than excluded paths, is named in a 'Move left entries' note. root_ids: {source root: its
-	_directory_identity when the copy started}; a root no longer that one removes nothing (taken now when not given)."""
+	_directory_identity when the copy started}; a root no longer that one removes nothing (taken now when not given).
+	dests, dest_image: where the copy went; given, each file and link whose landing does not hold it stays, as a
+	'Destination clash' (_moved_not_held)."""
 	roots = []
 	for src in src_paths:
 		path = os.path.abspath(src)
@@ -10302,6 +10393,10 @@ def remove_moved_sources(src_paths, file_list, sym_links, single_thread=False, m
 		root = outermost_root(path)
 		if root is not None:
 			pairs.append((path, root))
+	kept = _moved_not_held([path for path, _ in pairs], src_paths, dests, dest_image, 1 if single_thread else max_workers) if dests else {}
+	for path in sorted(kept):
+		eprint(f'Destination clash: not removing {path}: {kept[path]}')
+	pairs = [(path, root) for path, root in pairs if path not in kept]
 	listed = _items_below(pairs, {root: (root, root_ids[root], root_ids[root]) for root in roots})
 	print(f"Removing the {len(listed)} files and links copied from {_sources_text(roots)} with {max_workers if not single_thread else '1'} workers")
 	if not remove_force:
@@ -10314,7 +10409,7 @@ def remove_moved_sources(src_paths, file_list, sym_links, single_thread=False, m
 		if not os.path.isdir(root) or os.path.islink(root) or outermost_root(root) != root:
 			continue
 		_, root_left, errors = _remove_tree_fd(root, root_ids[root], exclude)
-		left.extend(root_left)
+		left.extend(path for path in root_left if os.path.abspath(path) not in kept)
 		for directory, e in errors:
 			if e.errno in (errno.ELOOP, errno.ENOTDIR, errno.ESTALE):
 				eprint(f'Remove directory failed: not removing {directory}: it, or a directory on its path, is no longer what the copy listed ({e.strerror})')
@@ -11889,7 +11984,8 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = multipr
 		elif remove and dests != ...:
 			# A move: only what the copy listed goes (see remove_moved_sources).
 			remove_moved_sources(src_paths, total_file_list, total_sym_links, single_thread=single_thread, max_workers=max_workers,
-						verbose=verbose, files_per_job=files_per_job, remove_force=remove_force, exclude=exclude, root_ids=source_ids)
+						verbose=verbose, files_per_job=files_per_job, remove_force=remove_force, exclude=exclude, root_ids=source_ids,
+						dests=dests, dest_image=bool(dest_image))
 		elif remove:
 			process_remove(src_paths,single_thread=single_thread, max_workers=max_workers,verbose=verbose,
 						files_per_job=files_per_job, remove_force=remove_force,exclude=exclude,batch=batch,parallel_file_listing=parallel_file_listing)

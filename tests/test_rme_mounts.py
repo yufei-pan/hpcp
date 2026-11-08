@@ -318,9 +318,9 @@ _FOLDING = {
 
 
 @contextlib.contextmanager
-def _folding_directory(tmp_path, kind):
+def _folding_directory(tmp_path, kind, table=_FOLDING):
 	"""A directory on a filesystem of its own: ext4 or f2fs with the casefold flag, or the root of the others."""
-	tool, mkfs_options, mount_options = _FOLDING[kind]
+	tool, mkfs_options, mount_options = table[kind]
 	mkfs = shutil.which(tool) or shutil.which('/usr/sbin/' + tool) or shutil.which('/sbin/' + tool)
 	image, mount = tmp_path / 'fold.img', tmp_path / 'fold'
 	if os.geteuid() != 0 or not mkfs or not shutil.which('chattr'):
@@ -443,6 +443,67 @@ def test_names_below_a_directory_that_is_not_utf8_are_still_folded_as_utf8(tmp_p
 		for source, name, content in ((b'a', first, 'A%d' % index), (b'b', second, 'B%d' % index)):
 			with open(os.path.join(base, source, odd, name.encode('utf-8'))) as f:
 				assert f.read() == content
+
+
+# Mounts that take two names for one where no rule on names says so, and the pairs: what only the move's backstop catches.
+_BACKSTOP_MOUNTS = {
+	'vfat': ('mkfs.vfat', [], []),
+	'vfat-cp1251': ('mkfs.vfat', [], ['-o', 'iocharset=cp1251,utf8=0,codepage=866']),
+	'vfat-koi8-r': ('mkfs.vfat', [], ['-o', 'iocharset=koi8-r,utf8=0,codepage=866']),
+	'vfat-iso8859-9': ('mkfs.vfat', [], ['-o', 'iocharset=iso8859-9,utf8=0,codepage=857']),
+	'exfat-euc-jp': ('mkfs.exfat', [], ['-t', 'exfat', '-o', 'iocharset=euc-jp']),
+}
+_BACKSTOP_PAIRS = {
+	# vfat gives the long name the short name LONGFI~1.TXT, which the second is.
+	'8.3-alias': ('vfat', b'longfilename.txt', b'LONGFI~1.TXT'),
+	# Valid UTF-8 by chance against its other case, which is not.
+	'cp1251-utf8-by-chance': ('vfat-cp1251', b'\xc3\xa9t', b'\xe3\xa9t'),
+	# Both valid UTF-8, not as each other's case: KOI8-R '\u0431\u0451' and '\u0431\u0401'.
+	'koi8-r-both-utf8': ('vfat-koi8-r', b'\xc2\xa3', b'\xc2\xb3'),
+	# ASCII against ISO 8859-9 '\u0130', which that table makes the other case of 'i'.
+	'iso8859-9-ascii': ('vfat-iso8859-9', b'istanbul', b'\xddstanbul'),
+	# Two cases of different lengths: EUC-JP '\u03c2' is 8F A6 F8, '\u03a3' A6 B2.
+	'euc-jp-lengths': ('exfat-euc-jp', b'\x8f\xa6\xf8', b'\xa6\xb2'),
+}
+
+
+@pytest.mark.parametrize('form', ['move-ab', 'move-ba', 'rename'])
+@pytest.mark.parametrize('pair', sorted(_BACKSTOP_PAIRS))
+def test_a_move_keeps_a_source_its_landing_does_not_hold_where_no_rule_on_names_says_why(tmp_path, pair, form):
+	"""9.83 exited 0 with one content gone (a rename: the file gone). Whatever exit, both contents are still there, and an exit
+	of 0 is two landed files. -j 1: in source order, so that an 8.3 alias is the first name's when the second comes."""
+	kind, first, second = _BACKSTOP_PAIRS[pair]
+	base = os.fsencode(str(tmp_path))
+	with _folding_directory(tmp_path, kind, _BACKSTOP_MOUNTS) as fold:
+		out = os.path.join(os.fsencode(str(fold)), b'out')
+		os.makedirs(out)
+		try:
+			for name in (first, second):
+				os.close(os.open(os.path.join(out, name), os.O_WRONLY | os.O_CREAT | os.O_EXCL))
+				os.unlink(os.path.join(out, name))
+		except OSError:
+			pytest.skip(f'{kind} takes no such names')
+		if form == 'rename':
+			with open(os.path.join(out, first), 'w') as f:
+				f.write('AAAA')
+			task = subprocess.run([sys.executable, HPCP, first, '-d', second, '-rf'], cwd=out, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+			assert task.returncode == 213 and b'is the source itself' in task.stdout, task.stdout[-2000:]
+			assert [open(os.path.join(out, name)).read() for name in os.listdir(out)] == ['AAAA']
+			return
+		for source, name, content in ((b'a', first, 'AAAA'), (b'b', second, 'BBBB')):
+			os.makedirs(os.path.join(base, source))
+			with open(os.path.join(base, source, name), 'w') as f:
+				f.write(content)
+		sources = ['a/', 'b/'] if form == 'move-ab' else ['b/', 'a/']
+		task = _hpcp(sources + ['-d', os.fsdecode(out) + os.sep, '-rf', '-j', '1'], tmp_path)
+		landed = [open(os.path.join(out, name)).read() for name in os.listdir(out)]
+		left = [open(os.path.join(path, name)).read() for path, _, names in os.walk(os.path.join(base, b'a')) for name in names]
+		left += [open(os.path.join(path, name)).read() for path, _, names in os.walk(os.path.join(base, b'b')) for name in names]
+		assert {'AAAA', 'BBBB'} <= set(landed + left), task.stdout[-2000:]
+		if task.returncode == 0:
+			assert sorted(landed) == ['AAAA', 'BBBB'], task.stdout[-2000:]
+		else:
+			assert task.returncode == 213 and b'Destination clash: not removing' in task.stdout, task.stdout[-2000:]
 
 
 def test_a_folding_directory_below_a_plain_destination_is_asked(tmp_path):
