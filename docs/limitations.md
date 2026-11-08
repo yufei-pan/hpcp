@@ -152,14 +152,6 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - **Plan:** make the probe directory and its names relative to a descriptor of the directory (`dir_fd`), so their length is the name's own.
 - **Revisit when:** the next hpcp release.
 
-### vfat: files dated before 1980 are copied again on every rerun
-- **Kind:** deferred (9.85).
-- **What the operator sees:** on vfat, a copy rerun copies every file dated before 1980 again, as 9.83 did (in the EL8 test, each such file and no other). FAT cannot store a time before 1980, so the landing's time never matches the source's.
-- **Why:** the skip check does not read the files when only the time disagrees; the 9.84 move backstop does (`_same_contents`).
-- **Plan:** let the skip check read both files when the landing's time is one the filesystem could not keep (a source dated before vfat's floor, 1980-01-01, 315532800), as the backstop does. That costs two reads instead of one copy, for those files only; reading on every time-only mismatch would read each changed file of the same size twice before copying it anyway.
-- **Revisit when:** 9.85.
-- **Noted:** 2026-11-07, the user's standing rule that deferrals are noted, not asked.
-
 ### A list entry that is a link to the destination is taken for a source
 - **Kind:** deferred (9.85).
 - **What the operator sees:** `printf 'outl\nb\n' | hpcp -sfl - -d out -rme`, with `outl -> out`, removes no extra and prints "Not removing" for each one, with no "-rme checked nothing" note; 9.83 cleaned `out/b`. Every version, 9.83 too, also copies the link in as `out/outl`, a link to its own directory. Nothing is lost.

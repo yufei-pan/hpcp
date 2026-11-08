@@ -1249,6 +1249,33 @@ def test_a_landing_whose_time_vfat_could_not_keep_holds_the_source_of_its_conten
 	assert 'could not be compared with it (Permission denied)' in _not_held(hpcp_mod, tmp_path, ['a/f'])[str(tmp_path / 'a/f')]
 
 
+@pytest.mark.parametrize('landing, landing_s, identical', [
+	('data', 315532800, True),
+	# vfat keeps the floor in local time: any time at or after it is one it could not have kept.
+	('data', 315532800 + 3600, True),
+	# Of one size, differing only where the tail hash does not look: read in full.
+	('DAta', 315532800, False),
+	# A landing that kept a time before 1980 kept the source's: one that differs is another time.
+	('data', 5, False),
+])
+def test_the_skip_check_reads_a_file_from_before_1980_against_its_vfat_landing(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch,
+		landing, landing_s, identical):
+	# 9.84 copied every such file again on every rerun onto vfat.
+	monkeypatch.setattr(hpcp_mod, 'HASH_SIZE', 2)
+	_write(str(tmp_path / 'a/f'), 'data', 0)
+	_write(str(tmp_path / 'out/f'), landing, landing_s)
+	assert hpcp_mod.is_file_identical(str(tmp_path / 'a/f'), str(tmp_path / 'out/f'), 4) is identical
+
+
+def test_the_skip_check_reads_nothing_more_for_a_time_after_1980(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	monkeypatch.setattr(hpcp_mod, '_same_contents', lambda *args: pytest.fail('read in full'))
+	_write(str(tmp_path / 'a/f'), 'data', 1_600_000_000)
+	_write(str(tmp_path / 'out/f'), 'data', 1_600_000_100)
+	assert hpcp_mod.is_file_identical(str(tmp_path / 'a/f'), str(tmp_path / 'out/f'), 4) is False
+	_write(str(tmp_path / 'out/f'), 'data', 1_600_000_000)
+	assert hpcp_mod.is_file_identical(str(tmp_path / 'a/f'), str(tmp_path / 'out/f'), 4) is True
+
+
 def test_the_contents_are_read_only_when_the_time_disagrees(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
 	read = []
 	real = hpcp_mod._same_contents

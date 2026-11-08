@@ -669,6 +669,9 @@ def get_file_size(path):
 # 1 us, NTFS and SMB 100 ns, ext4, xfs and btrfs 1 ns (each as a copy onto it reads back).
 _MTIME_STEPS_NS = (2 * 10**9, 10**9, 10**7, 10**6, 10**3, 100, 1)
 
+# vfat keeps no time before 1980-01-01 (FAT dates start there): a copy of an older file lands at or after it.
+_FAT_TIME_FLOOR_NS = 315532800 * 10**9
+
 def _mtime_step_ns(mtime_ns):
 	"""The step a modification time (integer nanoseconds) was kept in, guessed as the coarsest of _MTIME_STEPS_NS that divides
 	it. A finer time that divides by a coarser step by chance (1 NTFS time in 10,000 divides by 1 ms) only widens the
@@ -2574,13 +2577,20 @@ def is_file_identical(src_path, dest_path,src_size,full_hash=False,compare_metad
 	if src_size != dst_size:
 		return False
 	src_st, dst_st = os.stat(src_path), os.stat(dest_path)
-	if not _mtimes_agree(src_st.st_mtime_ns, dst_st.st_mtime_ns):
+	# A landing at a time its filesystem could not keep (a source from before 1980, on vfat at or after it) says nothing of its
+	# contents: both are read in full, as the move's backstop does, for those files only. Two reads instead of a copy on
+	# every rerun; reading on every other time that differs would read a changed file twice before copying it anyway.
+	floored = src_st.st_mtime_ns < _FAT_TIME_FLOOR_NS <= dst_st.st_mtime_ns
+	if not floored and not _mtimes_agree(src_st.st_mtime_ns, dst_st.st_mtime_ns):
 		return False
 	# A node has no contents to compare, and opening one is an act of its own (a FIFO waits for a writer): nodes of one kind for
 	# the same device are the same, and a changed device number is not.
 	if not (stat.S_ISREG(src_st.st_mode) and stat.S_ISREG(dst_st.st_mode)):
-		return stat.S_IFMT(src_st.st_mode) == stat.S_IFMT(dst_st.st_mode) and src_st.st_rdev == dst_st.st_rdev
-	if hash_file(src_path,src_size,full_hash) != hash_file(dest_path,dst_size,full_hash):
+		return not floored and stat.S_IFMT(src_st.st_mode) == stat.S_IFMT(dst_st.st_mode) and src_st.st_rdev == dst_st.st_rdev
+	if floored:
+		if not _same_contents(src_path, dest_path):
+			return False
+	elif hash_file(src_path,src_size,full_hash) != hash_file(dest_path,dst_size,full_hash):
 		return False
 	if compare_metadata:
 		src_st = os.lstat(src_path)
