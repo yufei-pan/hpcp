@@ -27,13 +27,6 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - **Revisit when:** someone hits it.
 - **Approved:** 2026-11-05, the user chose "Known limitation (Recommended)".
 
-### Destination symlink at a directory's path
-- **Kind:** deferred.
-- **What the operator sees:** with `out/d -> ../elsewhere`, `hpcp src/ -d out/` writes src/d's files into elsewhere and changes elsewhere's mode, and as root its owner, exit 0, as in 9.80. A user who can write the destination can plant `d -> /etc` before root restores into it. `hpcp src/ -d out/ -rme` with `out/d -> ../src/d` removes the link as an extra, and `d` is not mirrored. The same at a file's path, identical or not: with `out/x -> ../t/f`, `t/f` takes the mode, and as root the owner, of `a/x`.
-- **Why:** not a regression (a link there that leads onto a source file is refused, exit 213), and it needs its own decision: refuse as `cp -a` does, or write through without touching the target's mode and owner, since someone with a symlinked data directory may rely on writing through.
-- **Revisit when:** 9.85.
-- **Approved:** 2026-11-05, the user chose "Deferred to 9.82 (Recommended)".
-
 ### A stored list used under another spelling can match by chance
 - **Kind:** known limitation.
 - **What the operator sees:** after `hpcp s -fl S`, `hpcp s/ -fl S -rme` with s/a and s/s/a present shares one name with the list (`s/a` against `a`), so the matches-nothing rule does not fire, and the prompt offers the other files for deletion.
@@ -46,25 +39,6 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - **What the operator sees:** a copy onto an existing tree reads each directory it lands in, on one worker, before the first file is copied: about 1 us per file on a local disk, longer on network storage.
 - **Why:** correct and bounded as it is; a parallel scan is its own change.
 - **Revisit when:** 9.85 (part 2).
-
-### A source that opens and then fails on read costs the old copy
-- **Kind:** deferred.
-- **What the operator sees:** `cp` truncates the destination before its first read, so a source that opens and then fails (`/proc/self/mem` with an old `out/mem`) ends in exit 190 and the old copy is gone. 9.80 left it empty.
-  - With several destinations, a part written through a link at the first destination and the file then taken by the second ends exit 0 with the link's target half written (`hpcp a/ -d out/ -d two/` with `out/x -> ../t/f`).
-- **Why:** keeping it takes a temporary name and a rename, which is its own design; that covers the link case too. It covers landings in a tree only: a name given by `-d` keeps the write-through, because a rename would replace a FIFO named by `-d` and break a pipe feed that works today (a regular file onto a lone FIFO with a reader).
-- **Revisit when:** 9.85.
-
-### A FIFO that blocks the copy
-- **Kind:** deferred.
-- **What the operator sees:** a regular file onto a lone FIFO at the destination hangs with or without `-co`, because `cp` writes to it and waits for a reader. As on 9.80. A regular file onto a FIFO with other names does not hang: it lands as a regular file at that name, as `-a` always did, and the other names keep the FIFO.
-- **Why:** rare, and the hang is old. The temporary name and rename above (tree landings only) keeps the name until the copy is whole, and never opens the FIFO; a FIFO named by `-d` keeps today's behaviour, so a feed that works is not broken.
-- **Revisit when:** 9.85.
-
-### A regular file writes through a device node at the destination
-- **Kind:** deferred.
-- **What the operator sees:** a regular source that lands on a device node, in a tree or named by `-d`, is written through it, with or without `-co`: into the device, or the disk behind it, which on a mounted disk writes over live blocks (reasoned, not run). Without `-co` the node also takes the source's mode and times. A link to a device is the device: a regular file named onto `-d lnk` writes the disk behind it. The same on 9.80. A device or FIFO source no longer does this: since 9.82 it is never read, with or without `-co`, and it never replaces a device (or a link to one) that `-d` names.
-- **Why:** old, and it needs a node where a file belongs. Leaving a destination that is not a regular file alone belongs with the temporary name and rename above. A device named by `-d` may be what the operator meant to write.
-- **Revisit when:** 9.85.
 
 ### Rerunning an overlapping form is refused
 - **Kind:** known limitation.
@@ -114,12 +88,36 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - **Revisit when:** 9.85.
 
 ### Directories that differ only in case on vfat mounted `iocharset=utf8`
-- **Kind:** deferred.
-- **What the operator sees:** on a vfat mounted with `iocharset=utf8` given explicitly, `hpcp a/ b/ -d out/` with `a/D/f` and `b/d/g` exits 193 (`Directory sync error: .../b/d to .../out/d: [Errno 2] No such file or directory`, then `Copy failed ... No more destination paths to try`), and `g` is not copied; with `-rf` it exits 212 and keeps both sources. Nothing is lost, and 9.82 does the same. Checked on VM 901; vfat with its default charset or `iocharset=iso8859-1`, kernel exFAT, NTFS (`ignore_case`) and ext4 casefold merge the two, exit 0.
-- **Why:** vfat mounted that way looks a name up in its own case only (`out/d` is not found) but will not make it either, as `out/D` holds the name; the copy names the directory as the source spells it.
-- **Plan:** write a merged directory's files under the spelling the directory holds, which `_RealPlaces` knows from asking it, or report the pair as a clash.
-- **Revisit when:** 9.85.
+- **Kind:** deferred (9.86).
+- **What the operator sees:** on a vfat mounted with `iocharset=utf8` given explicitly, `hpcp a/ b/ -d out/` with `a/D/f` and `b/d/g` exits 193 (`Directory sync error: .../b/d to .../out/d: [Errno 2] No such file or directory`, then `Copy failed ... No more destination paths to try`), and `g` is not copied; with `-rf` it exits 212 and keeps both sources. A single source does it too: `out/D` from an earlier run, and a source that now spells it `d`, exit 193 and nothing below it copied (checked on EL7 by the 9.85 designer). Nothing is lost, and 9.82 does the same. Checked on VM 901; vfat with its default charset, `utf8=1` or `iocharset=iso8859-1`, kernel exFAT, NTFS (`ignore_case`) and ext4 casefold merge the two, exit 0. Since 9.85 the directory door says so: `mkdir` meets `EEXIST` twice where `lstat` finds nothing, and the 193 names the mount option to use instead.
+- **Why:** vfat mounted that way looks a name up in its own case only (`out/d` is not found) but will not make it either, as `out/D` holds the name; the copy names the directory as the source spells it. A loud failure with nothing lost, on a mount option the kernel's vfat documentation advises against.
+- **Plan:** in `_dest_directory`, when `mkdir` says `EEXIST` and `lstat` says `ENOENT`, list the parent and take the one entry whose fold matches as the spelling for that directory (cached), so the folder sync, the files and the links below it land there; the move's backstop asks the same helper for the spelling. More than one entry, or none, stays a 193 that says why.
+- **Revisit when:** 9.86.
+- **Noted:** 2026-11-08, the user's standing rule that deferrals are noted, not asked.
 
+### A user who can write the destination can race a check by path
+- **Kind:** deferred (9.86).
+- **What the operator sees:** every write below a destination goes by path, so a user who can write a destination directory can swap a directory there for a link between hpcp's look (`_dest_directory`) and `cp`'s open, and a root run then writes where the link leads. The static plant (a link left there before the run) is replaced since 9.85; only the race in that moment remains.
+- **Why:** closing it needs each landing's directory opened by descriptors from the destination root with `O_NOFOLLOW`, as the removal does (`_descend`), and `cp` run in that directory: its own change.
+- **Plan:** open each landing directory from the root by descriptors (`O_NOFOLLOW` at each step), `fchdir` to it in the worker and give `cp` relative names.
+- **Revisit when:** 9.86.
+- **Noted:** 2026-11-08, the user's standing rule that deferrals are noted, not asked.
+
+### `-co` reruns rewrite every unchanged file
+- **Kind:** deferred (9.86).
+- **What the operator sees:** a second `hpcp -co a/ -d out/` with nothing changed copies every file again ("Total files copied" counts them all, and each landing's mtime moves on each run). The cost is the whole copy on every rerun.
+- **Why:** `-co` carries no times, so the landing's mtime is that of the last copy and the skip check (size and mtime) never matches.
+- **Plan:** under `-co`, where the size matches and only the time differs, compare the full contents (`_same_contents`, as the move's backstop does) and skip a file that reads the same. Not `is_file_identical`'s hash: with the default `-hs 65536` it reads only the last 64 KiB, and a same-size change before that would be skipped on every rerun.
+- **Revisit when:** 9.86.
+- **Noted:** 2026-11-08, the user's standing rule that deferrals are noted, not asked.
+
+### A 0555 source directory, first copied by a non-root user, exits 190
+- **Kind:** deferred (9.86).
+- **What the operator sees:** `hpcp s/ -d out/` as a non-root user, with `s/d` mode 0555 holding files: exit 190, `out/d` made with mode 0555 and empty, and a rerun fails the same way (checked by the 9.85 designer). Root is not affected.
+- **Why:** the folder sync sets each directory's mode before its files are copied into it.
+- **Plan:** set a directory's metadata (mode, then times) after the files below it, as `cp -a` and rsync do, keeping the directory writable for the runner meanwhile.
+- **Revisit when:** 9.86.
+- **Noted:** 2026-11-08, the user's standing rule that deferrals are noted, not asked.
 ### `-rme` keeps an extra directory named like one beside a source
 - **Kind:** deferred (9.86).
 - **What the operator sees:** `hpcp a/ b -d out/ -rme`, run where a directory `zzz` exists beside `b` (in the working directory), keeps an extra `out/zzz` that no source has, exit 0 (checked in Docker at 9.85). A directory is judged extra by whether its path below the destination exists below each source's parent (`dirname(src)`), and `b`'s parent is the working directory, which holds `zzz`. Only a kept extra, never a loss: what a source is or holds is guarded by identity.
