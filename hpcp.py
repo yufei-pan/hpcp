@@ -9369,6 +9369,11 @@ def _inside_destinations(src_paths, dests, places):
 				_source_dest(src, dest) != os.path.abspath(dest) for dest in dests):
 			left_out.append(path)
 			continue
+		if not directory and os.path.islink(path) and places.directory(path) in roots:
+			# A link to the destination, named or listed, is that destination: copied, it would be a link to its own directory,
+			# and -rme would keep all that it leads to.
+			left_out.append(path)
+			continue
 		if directory:
 			# Named as this entry's walk will spell it, whichever spelling of the entry holds the destination.
 			for spelling in spellings:
@@ -12066,7 +12071,7 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = multipr
 				if skipped:
 					print(f"Skipped {skipped} list entries inside the destination {', '.join(dests)}: not copied or moved")
 				if left_out:
-					print(f"Left out {', '.join(left_out)}: a source that is the destination is not copied or moved")
+					print(f"Left out {', '.join(left_out)}: a source that is the destination, or a link to it, is not copied or moved")
 				if holding:
 					copy_exclude = _exclude_roots(exclude, holding)
 					print(f"A source holds the destination ({', '.join(sorted(holding))}): the destination is left out of its copy")

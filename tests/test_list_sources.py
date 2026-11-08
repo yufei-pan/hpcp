@@ -1091,6 +1091,25 @@ def test_a_list_that_names_the_destination_checks_nothing_as_an_argument_does(tm
 		assert output.count('-rme checked nothing: a source is or holds the destination') == 1 and 'Not removing' not in output
 
 
+@pytest.mark.skipif(os.name == 'nt', reason='symlinks')
+@pytest.mark.parametrize('named', ['list', 'argument', 'absolute link'])
+def test_a_link_to_the_destination_is_the_destination(tmp_path, hpcp_mod, reset_hpcp_globals, at_a_tty, monkeypatch, capsys, named):
+	# outl -> out: 9.84 copied it in as out/outl, a link to its own directory, and -rme printed "Not removing" for each extra.
+	monkeypatch.chdir(tmp_path)
+	write(tmp_path / 'b/f', 'F')
+	write(tmp_path / 'out/b/stale', 'S')
+	write(tmp_path / 'out/other', 'O')
+	os.symlink(str(tmp_path / 'out') if named == 'absolute link' else 'out', 'outl')
+	if named == 'argument':
+		assert hpcp_mod.hpcp(['outl', 'b'], dest_paths=['out'], single_thread=True, remove_extra=True) == 0
+	else:
+		assert hpcp_list(hpcp_mod, tmp_path, b'outl\nb\n', remove_extra=True) == 0
+	output = capsys.readouterr().out
+	assert output.count('-rme checked nothing: a source is or holds the destination') == 1 and 'Not removing' not in output
+	assert not os.path.lexists('out/outl') and files(tmp_path / 'out') == {b'b/f': b'F', b'b/stale': b'S', b'other': b'O'}
+	assert os.path.islink('outl')
+
+
 def test_a_list_entry_inside_the_destination_that_is_not_the_destination_is_still_judged_and_kept(tmp_path, hpcp_mod, reset_hpcp_globals, at_a_tty, monkeypatch, capsys):
 	# The entry out/b/sub/f is named and kept; extras around it go, as before the destination itself was a list entry's question.
 	monkeypatch.chdir(tmp_path)
