@@ -41,6 +41,8 @@ Nothing needs doing to upgrade. What changed:
 - **A copy into its own inside under another spelling (FUSE exFAT):** `hpcp D/ -d d/sub/` there added a nested copy on every run; the destination is now left out of the walk, as for one spelling, and a pair the directory cannot be asked about is refused (241).
 - **A pair of names that fold alike near PATH_MAX is copied:** the probe makes its names relative to directory descriptors, so a landing within about 57 characters of the path limit is no longer a false 213 (`File name too long`).
 - **The check before a copy costs the garbage collector nothing per entry:** about 1 to 2 s less per million entries of a list.
+- **Known, for 9.86: hints with a name that is not UTF-8 cannot be pasted into a shell:** the replaced-link Note and the `-ncd` hint print such a name with Python's escapes (`d\udcc3\udca9`), not shell-quoted (deferred, see [docs/limitations.md](docs/limitations.md)).
+- **Known, for 9.86: with LANG unset, change lists, manifests and disk TSVs read non-ASCII names back wrong:** under Python 3.6 on EL7 with no locale (cron, some ssh sessions), a name such as `new\xc3\xa9` read from a `-dfl` list or a `-siff` patch matches no file and fails on `lstat`; 9.83 and 9.84 do the same. Run such jobs with `LANG=en_US.UTF-8` (deferred, see [docs/limitations.md](docs/limitations.md)).
 
 ## Upgrading to 9.84 from 9.83
 
