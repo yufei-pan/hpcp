@@ -3569,7 +3569,7 @@ def _cp_once(src_path, dest_path, cp_flags, sparse, forced):
 		if not beside:
 			return _cp_in_place(command, src_path, target)
 		temp = _temp_sibling(target)
-		whole = False
+		whole = renamed = False
 		try:
 			run_command_in_multicmd_with_path_check(command + [src_path, temp], quiet=True, strict=True)
 			whole = True
@@ -3580,6 +3580,7 @@ def _cp_once(src_path, dest_path, cp_flags, sparse, forced):
 			elif not CONTENT_ONLY:
 				_remove_stale_xattrs(src_path, temp)
 			os.rename(temp, target)
+			renamed = True  # nothing left to discard: an unlink of the gone name costs a round trip on NFS
 			if attributes is not None and attributes != _fat_attributes(target):
 				_set_fat_attributes(target, attributes, target)
 			return get_file_size(target)
@@ -3589,7 +3590,8 @@ def _cp_once(src_path, dest_path, cp_flags, sparse, forced):
 				raise
 			failure = e
 		finally:
-			_discard_temp(temp)
+			if not renamed:
+				_discard_temp(temp)
 		if not stat.S_ISREG(st.st_mode):
 			parent = os.path.dirname(target)
 			raise _Refused(f'cannot replace the {_kind_of(st)} {target} ({parent}: {_why(failure)}): not writing ',
