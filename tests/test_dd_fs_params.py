@@ -1576,7 +1576,7 @@ def test_dd_roundtrip_uses_defaults_with_no_fs_param_mirror(tmp_path):
 
 
 def test_version_bumped():
-	assert hpcp.version == '9.83'
+	assert hpcp.version == '9.84'
 	assert hpcp.__version__ == hpcp.version
 	assert hpcp.COMMIT_DATE == '2026-11-06'
 
