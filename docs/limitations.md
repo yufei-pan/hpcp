@@ -119,6 +119,14 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - **Plan:** set a directory's metadata (mode, then times) after the files below it, as `cp -a` and rsync do, keeping the directory writable for the runner meanwhile.
 - **Revisit when:** 9.86.
 - **Noted:** 2026-11-08, the user's standing rule that deferrals are noted, not asked.
+### A list that names both a link and a path below it drops the link
+- **Kind:** deferred (9.86).
+- **What the operator sees:** `-sfl` with a list holding `x` and `x/y`, where `x -> ../elsewhere`: `out/x` becomes a real directory holding `y`, the link is not copied, and the run exits 0, in either order. 9.84 does the same. Named as arguments (`hpcp x -sfl list -d out/`), the same pair is a 213 for `x/y` and `out/x` is the link (rule 11).
+- **Why:** rule 11 looks only at the link sources named as arguments (`singles`); list entries are not among them.
+- **Plan:** build `singles` from list entries too, so a list entry below a listed link is the same 213.
+- **Revisit when:** 9.86.
+- **Noted:** 2026-11-08, the user's standing rule that deferrals are noted, not asked.
+
 ### `-rme` keeps an extra directory named like one beside a source
 - **Kind:** deferred (9.86).
 - **What the operator sees:** `hpcp a/ b -d out/ -rme`, run where a directory `zzz` exists beside `b` (in the working directory), keeps an extra `out/zzz` that no source has, exit 0 (checked in Docker at 9.85). A directory is judged extra by whether its path below the destination exists below each source's parent (`dirname(src)`), and `b`'s parent is the working directory, which holds `zzz`. Only a kept extra, never a loss: what a source is or holds is guarded by identity.

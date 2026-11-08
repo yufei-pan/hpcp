@@ -383,6 +383,92 @@ def test_a_link_under_ncd_is_refused_naming_the_d_form(tmp_path):
 
 
 @posix_only
+@pytest.mark.parametrize('form', ['nds', 'ncd', 'list-nds'])
+def test_the_skip_check_never_syncs_a_file_behind_a_link_below_the_destination(tmp_path, form):
+	# out/d -> ../elsewhere holds the same file (content, mtime), mode 600: 9.84 and 9.85 before this gave it src's 644
+	# through the link under -nds and -ncd, the link kept. Now the door meets the link first.
+	write(tmp_path / 'src/d/x', 'same')
+	write(tmp_path / 'elsewhere/x', 'same')
+	os.chmod(str(tmp_path / 'src/d/x'), 0o644)
+	os.chmod(str(tmp_path / 'elsewhere/x'), 0o600)
+	os.utime(str(tmp_path / 'src/d/x'), (1000000000, 1000000000))
+	os.utime(str(tmp_path / 'elsewhere/x'), (1000000000, 1000000000))
+	xattrs = True
+	try:
+		os.setxattr(str(tmp_path / 'elsewhere/x'), 'user.mine', b'1')
+	except OSError:
+		xattrs = False
+	os.makedirs(str(tmp_path / 'out'))
+	os.symlink('../elsewhere', str(tmp_path / 'out/d'))
+	if form == 'list-nds':
+		rc, output = run(['-sfl', '-', '-d', str(tmp_path / 'out') + '/', '-nds'], tmp_path / 'src', b'd/x\n')
+	else:
+		rc, output = run(['src/', '-d', 'out/', '-' + form], tmp_path)
+	ex = os.stat(str(tmp_path / 'elsewhere/x'))
+	assert stat.S_IMODE(ex.st_mode) == 0o600 and read(tmp_path / 'elsewhere/x') == 'same', (rc, output[-2000:])
+	if xattrs:
+		assert _user_xattrs(tmp_path / 'elsewhere/x') == ['user.mine']
+	if form == 'ncd':
+		assert rc == 213 and os.path.islink(str(tmp_path / 'out/d')), output[-2000:]
+	else:
+		assert rc == 0 and not os.path.islink(str(tmp_path / 'out/d')) and read(tmp_path / 'out/d/x') == 'same', output[-2000:]
+
+
+@posix_only
+@root_only
+def test_the_skip_check_never_chowns_a_file_behind_a_link_below_the_destination(tmp_path):
+	write(tmp_path / 'src/d/x', 'same')
+	write(tmp_path / 'elsewhere/x', 'same')
+	os.chown(str(tmp_path / 'elsewhere/x'), 1000, 1000)
+	for path in ('src/d/x', 'elsewhere/x'):
+		os.utime(str(tmp_path / path), (1000000000, 1000000000))
+	os.makedirs(str(tmp_path / 'out'))
+	os.symlink('../elsewhere', str(tmp_path / 'out/d'))
+	for flag in ('-nds', '-ncd'):
+		run(['src/', '-d', 'out/', flag], tmp_path)
+		st = os.stat(str(tmp_path / 'elsewhere/x'))
+		assert (st.st_uid, st.st_gid) == (1000, 1000)
+
+
+@posix_only
+def test_a_named_link_that_dangles_is_not_written_through(tmp_path):
+	# As cp and 9.84: exit 190, nothing made where the link points.
+	write(tmp_path / 'a/x', 'A')
+	os.makedirs(str(tmp_path / 'out'))
+	os.symlink('../nowhere/f', str(tmp_path / 'out/y'))
+	rc, output = run(['a/x', '-d', 'out/y'], tmp_path)
+	assert rc == 190 and not os.path.lexists(str(tmp_path / 'nowhere')) and os.path.islink(str(tmp_path / 'out/y')), output[-2000:]
+	assert (str(tmp_path / 'out/y') + ' is a link to ../nowhere/f, which does not exist').encode() in output
+
+
+def test_the_door_looks_again_when_another_worker_makes_the_directory(tmp_path, hpcp_mod, monkeypatch):
+	# The race the review reasoned: this worker sees the link, another unlinks it, this unlink meets ENOENT, the next lstat
+	# finds nothing, the other's mkdir lands, and this mkdir meets EEXIST: a directory, not vfat's case.
+	out, d = str(tmp_path / 'out'), str(tmp_path / 'out/d')
+	os.makedirs(out)
+	os.symlink('elsewhere', d)
+	real_lstat, real_unlink, real_mkdir = os.lstat, os.unlink, os.mkdir
+	state = {'unlinked': False}
+	def unlink(path, *args, **kwargs):
+		if str(path) == d and not state['unlinked']:
+			state['unlinked'] = True
+			real_unlink(d)  # the other worker's
+			raise FileNotFoundError(errno.ENOENT, 'No such file or directory', path)
+		return real_unlink(path, *args, **kwargs)
+	def mkdir(path, *args, **kwargs):
+		if str(path) == d and not os.path.lexists(d):
+			real_mkdir(d)  # the other worker's lands first
+			raise FileExistsError(errno.EEXIST, 'File exists', path)
+		return real_mkdir(path, *args, **kwargs)
+	monkeypatch.setattr(hpcp_mod.os, 'unlink', unlink)
+	monkeypatch.setattr(hpcp_mod.os, 'mkdir', mkdir)
+	monkeypatch.setattr(hpcp_mod, 'NAMED_DESTS', frozenset([out]))
+	monkeypatch.setattr(hpcp_mod, 'RUN_ID', object())
+	hpcp_mod._dest_directory(d)
+	assert os.path.isdir(d) and not os.path.islink(d)
+
+
+@posix_only
 def test_a_link_at_an_implied_parent_of_a_list_entry_is_replaced(tmp_path):
 	write(tmp_path / 'src/d/x', 'x')
 	os.makedirs(str(tmp_path / 'elsewhere'))

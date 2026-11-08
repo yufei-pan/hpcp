@@ -3427,8 +3427,8 @@ def _dest_directory(path, make=True, source=None):
 	NotADirectoryError, the clash it always was. Raises _Refused where the component cannot be replaced (its directory
 	refuses the unlink), and under -ncd, which makes no directory in place of anything: nothing is written through it.
 	Workers racing on one path look again: an unlink meeting ENOENT or EISDIR, a mkdir meeting EEXIST, are fine when the next
-	lstat says directory. A mkdir that meets EEXIST twice where lstat finds nothing (vfat iocharset=utf8 holds the name in
-	another case) raises ENOENT."""
+	lstat says directory. A mkdir that meets EEXIST where lstat then finds nothing, on a second attempt (vfat iocharset=utf8
+	holds the name in another case), raises ENOENT."""
 	if _DOORS_RUN[0] != RUN_ID:
 		_DOORS.clear()
 		_DOORS_RUN[0] = RUN_ID
@@ -3437,13 +3437,16 @@ def _dest_directory(path, make=True, source=None):
 		return
 	root = _named_root(path)
 	if root is None or root == path:
+		# Remembered only once made: a look without make (copy_file's) leaves the making to the copy.
 		if make:
 			_makedirs(path, exist_ok=True)
-		_DOORS[path] = True
+			_DOORS[path] = True
 		return
 	if root not in _DOORS:
 		if make:
 			_makedirs(root, exist_ok=True)
+		elif not os.path.isdir(root):
+			return
 		_DOORS[root] = True
 	parts = path[len(root.rstrip(os.sep)) + 1:].split(os.sep)
 	current = root
@@ -3462,7 +3465,14 @@ def _dest_directory(path, make=True, source=None):
 				try:
 					os.mkdir(current)
 				except FileExistsError:
-					if attempt:
+					# Another worker may have made it since the lstat: look again before calling it vfat's.
+					try:
+						again = os.lstat(current)
+					except FileNotFoundError:
+						again = None
+					if again is not None and stat.S_ISDIR(again.st_mode):
+						break
+					if again is None and attempt:
 						raise OSError(errno.ENOENT, 'the directory holds this name in another case and does not find it in this '
 							'one (vfat mounted iocharset=utf8: mount with utf8 instead)', current)
 					continue
@@ -3552,6 +3562,10 @@ def _cp_once(src_path, dest_path, cp_flags, sparse, forced):
 	whole, the destination's free space is at least the source's size; otherwise, and for a file with other names (a write
 	would change them), _KeptOld."""
 	target, st, named = _landing_of(dest_path)
+	if named and st is None and os.path.islink(dest_path):
+		# cp writes through no dangling link, and nor does hpcp: a planted link would have it make directories and a file
+		# wherever the link points.
+		raise _KeptOld(f'{dest_path} is a link to {os.readlink(dest_path)}, which does not exist (cp writes through no dangling link)')
 	_dest_directory(os.path.dirname(target), make=not NO_CREATE_DIR, source=os.path.dirname(os.path.abspath(src_path)))
 	command = ["cp", cp_flags] + (["--sparse=always"] if sparse and cp_supports_sparse() else [])
 	held = _claim_device(target, st, named, src_path)
@@ -3733,6 +3747,23 @@ def copy_file(src_path, dest_paths, full_hash=False, verbose=False, concurrent_p
 	if dest_paths is None:
 		return 0, 0, symLinks
 	start_time = time.monotonic()
+	# Each destination's directories go through the door first (_dest_directory, nothing made: the file lands on one of
+	# them), so a link there is replaced before anything looks below it: the skip check's metadata sync, the space and the
+	# node probes would otherwise go through it. A destination the door refuses is left out, its refusal kept.
+	refused = {}
+	for dest in dest_paths:
+		try:
+			_dest_directory(os.path.dirname(_landing_of(dest)[0]), make=False, source=os.path.dirname(os.path.abspath(src_path)))
+		except _Refused as e:
+			refused[dest] = e
+		except OSError:
+			pass  # _cp_once meets it again, as the copy's error
+	if refused:
+		dest_paths = [dest for dest in dest_paths if dest not in refused]
+		if not dest_paths:
+			for refusal in refused.values():
+				_copy_failed(src_path, refusal.text(src_path))
+			return 0, 0, symLinks
 	if not os.path.islink(src_path):
 		# cp would put the file inside a directory at its place (dest/x/x), and a move would then lose the source. A link there
 		# is a name of the tree, replaced, unless the operator named it (_landing_of).
@@ -3782,8 +3813,8 @@ def copy_file(src_path, dest_paths, full_hash=False, verbose=False, concurrent_p
 			copied = False
 			copy_error_start = len(ERRORS)
 			cp_flags = _cp_flags(src_path)
-			# Why each destination failed, the last attempt's.
-			failures = {}
+			# Why each destination failed, the last attempt's (the door's refusals first).
+			failures = dict(refused)
 			while (not copied) and dest_paths:
 				if RANDOM_DESTINATION_SELECTION:
 					idx = random.randrange(len(dest_paths))
