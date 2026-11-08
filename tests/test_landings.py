@@ -785,3 +785,50 @@ def test_a_fifo_in_a_tree_is_still_skipped(tmp_path):
 	os.mkfifo(str(tmp_path / 'a/p'))
 	rc, output = run(['a/', '-d', 'out/'], tmp_path, timeout=60)
 	assert rc == 0 and not os.path.lexists(str(tmp_path / 'out/p')) and b'Special file skipped' in output, output[-2000:]
+
+
+# ---- entry 9: a copy into its own inside under another spelling ----
+
+def _spellings_are_one(hpcp_mod, monkeypatch, answer):
+	"""Every probe says the spellings it is asked about are one name (answer True), two (False), or cannot say (None): a
+	destination where D and d have numbers of their own, as FUSE exFAT gives them."""
+	def ask(directory, names):
+		if answer is None:
+			return {}, {name: 'the reason given' for name in names}
+		return ({name: names[0] for name in names} if answer else {name: name for name in names}), {}
+	monkeypatch.setattr(hpcp_mod, '_ask_names', ask)
+
+
+@posix_only
+def test_a_copy_into_its_own_inside_in_another_spelling_leaves_the_destination_out(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch, capsys):
+	# FUSE exFAT: d is D, so d/sub is D/sub. 9.84 walked it and nested a copy one level deeper on every run.
+	monkeypatch.chdir(tmp_path)
+	write(tmp_path / 'D/f', 'f')
+	write(tmp_path / 'D/sub/f', 'sub')
+	os.makedirs(str(tmp_path / 'd/sub'))
+	_spellings_are_one(hpcp_mod, monkeypatch, True)
+	for _ in range(3):
+		assert hpcp_mod.hpcp(['D/'], ['d/sub/'], single_thread=True, max_workers=1, batch=True) == 0
+	assert not os.path.exists(str(tmp_path / 'd/sub/sub')) and not os.path.exists(str(tmp_path / 'D/sub/sub'))
+	assert 'A source holds the destination' in capsys.readouterr().out
+
+
+@posix_only
+def test_two_real_directories_that_differ_in_case_are_copied_as_before(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	monkeypatch.chdir(tmp_path)
+	write(tmp_path / 'D/f', 'f')
+	write(tmp_path / 'D/sub/f', 'sub')
+	os.makedirs(str(tmp_path / 'd/sub'))
+	_spellings_are_one(hpcp_mod, monkeypatch, False)
+	assert hpcp_mod.hpcp(['D/'], ['d/sub/'], single_thread=True, max_workers=1, batch=True) == 0
+	assert read(tmp_path / 'd/sub/sub/f') == 'sub' and read(tmp_path / 'd/sub/f') == 'f'
+
+
+@posix_only
+def test_a_destination_that_may_be_inside_the_source_and_cannot_be_asked_is_refused(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch, capsys):
+	monkeypatch.chdir(tmp_path)
+	write(tmp_path / 'D/f', 'f')
+	os.makedirs(str(tmp_path / 'd/sub'))
+	_spellings_are_one(hpcp_mod, monkeypatch, None)
+	assert hpcp_mod.hpcp(['D/'], ['d/sub/'], single_thread=True, max_workers=1, batch=True) == 241
+	assert 'may lie inside the source' in capsys.readouterr().err and os.listdir(str(tmp_path / 'd/sub')) == []

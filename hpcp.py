@@ -9757,12 +9757,38 @@ def _inside_destinations(src_paths, dests, places):
 			left_out.append(path)
 			continue
 		if directory:
-			# Named as this entry's walk will spell it, whichever spelling of the entry holds the destination.
+			# Named as this entry's walk will spell it, whichever spelling of the entry holds the destination; a spelling
+			# the directory takes for the entry's own counts too (FUSE exFAT gives D and d numbers of their own).
 			for spelling in spellings:
 				above = spelling.rstrip(os.path.sep) + os.path.sep
-				holding.update(path.rstrip(os.path.sep) + os.path.sep + root[len(above):] for root in roots if root.startswith(above))
+				depth = len(spelling.rstrip(os.path.sep).split(os.path.sep))
+				for root in roots:
+					if root.startswith(above):
+						holding.add(path.rstrip(os.path.sep) + os.path.sep + root[len(above):])
+						continue
+					rest = root.rstrip(os.path.sep).split(os.path.sep)[depth:]
+					if not rest:
+						continue
+					answer = _holds_in_another_spelling(spelling, root, places)
+					if answer is None:
+						head = os.path.sep.join(root.split(os.path.sep)[:depth])
+						raise RuntimeError(f'Invalid arguments: {root} may lie inside the source {path}, and the destination cannot be asked: '
+							f'{places.cannot_ask(head, spelling.rstrip(os.path.sep))}; nothing is copied or removed')
+					if answer:
+						holding.add(path.rstrip(os.path.sep) + os.path.sep + os.path.sep.join(rest))
 		kept.append(src)
 	return kept, skipped, holding, left_out
+
+def _holds_in_another_spelling(directory, path, places):
+	"""Is path, or what lies below it, inside directory (both real paths) under another spelling of directory, one that folds
+	like it (_folded) and that the destination takes for it? True, False, or None when it cannot be asked (cannot_ask says
+	why). One probe per pair whose folds meet and whose spellings do not: none in a run with no such pair. The one answer
+	of the walk's check (_inside_destinations) and the move's (_settle_destinations)."""
+	directory = directory.rstrip(os.sep) or os.sep
+	head = os.sep.join(path.split(os.sep)[:len(directory.split(os.sep))])
+	if head == directory or _folded(head) != _folded(directory):
+		return False
+	return places.same_place(head, directory)
 
 def _lands_elsewhere(spellings, landing, roots, real_cwd):
 	"""True when a relative list entry that lies inside a destination is still copied (see _inside_destinations)."""
@@ -11542,8 +11568,7 @@ def _settle_destinations(src_paths, dests, dest_image=None, directory_only=False
 				# Every file is identical to itself, so the copy skips it and the removal would delete the only copy (9.72 did).
 				# Nor may it be the same file under another spelling (X onto x, D into d/sub where the directory folds): asked of the
 				# directory, as two spellings of one directory can have two numbers (exFAT through FUSE).
-				head = os.sep.join(land.split(os.sep)[:len(real.split(os.sep))])
-				if _same_or_below(land, real) or (_folded(head) == _folded(real) and places.same_place(head, real) is not False):
+				if _same_or_below(land, real) or _holds_in_another_spelling(real, land, places) is not False:
 					raise RuntimeError(f'Invalid arguments: -rm would move {root} onto itself ({land} is it or lies inside it); '
 						'nothing is copied or removed')
 		jobs.append((src, actual_dests, directory, real, lands))
