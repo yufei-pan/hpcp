@@ -1317,7 +1317,9 @@ def test_an_existing_parent_keeps_its_mode(tmp_path):
 	assert stat.S_IMODE(os.stat(str(tmp_path / 'root/etc/app')).st_mode) == 0o700
 
 
-def test_a_parent_that_is_a_symlink_leaves_its_target_alone(tmp_path):
+def test_a_parent_that_is_a_symlink_is_replaced_and_its_target_left_alone(tmp_path):
+	# 9.85: an implied parent that is a link below the destination is replaced by the directory, with a note; 9.84 wrote x into
+	# target through it.
 	write(tmp_path / 'src/d/x', 'x')
 	os.chmod(str(tmp_path / 'src/d'), 0o700)
 	os.makedirs(str(tmp_path / 'target'))
@@ -1326,7 +1328,9 @@ def test_a_parent_that_is_a_symlink_leaves_its_target_alone(tmp_path):
 	os.symlink('../../target', str(tmp_path / 'out/src/d'))
 	rc, output = run(['-d', 'out'], tmp_path, b'src/d/x\n')
 	assert rc == 0, output[-2000:]
-	assert stat.S_IMODE(os.stat(str(tmp_path / 'target')).st_mode) == 0o711 and (tmp_path / 'target/x').read_text() == 'x'
+	assert stat.S_IMODE(os.stat(str(tmp_path / 'target')).st_mode) == 0o711 and os.listdir(str(tmp_path / 'target')) == []
+	assert not os.path.islink(str(tmp_path / 'out/src/d')) and (tmp_path / 'out/src/d/x').read_text() == 'x'
+	assert stat.S_IMODE(os.stat(str(tmp_path / 'out/src/d')).st_mode) == 0o700 and b'was a link to ../../target' in output
 
 
 def test_a_parent_that_is_a_file_keeps_its_mode(tmp_path):
@@ -1427,8 +1431,12 @@ def test_settling_compares_no_file_when_destinations_cannot_meet(hpcp_mod, monke
 	listings = {'/data/source_a/': (frozenset(['/data/source_a/f']), frozenset(), 0, frozenset(['/data/source_a/'])),
 		'/data/source_b/': (frozenset(['/data/source_b/g']), frozenset(), 0, frozenset(['/data/source_b/']))}
 	monkeypatch.setattr(hpcp_mod, 'get_file_list', lambda path, **kwargs: listings[path])
-	def fail(*args, **kwargs):
-		raise AssertionError('compared')
+	real = hpcp_mod._RealPlaces.landing
+	def fail(self, root, path, whole=False):
+		# Where a directory lands is no file compared.
+		if not whole:
+			raise AssertionError('compared')
+		return real(self, root, path, whole)
 	monkeypatch.setattr(hpcp_mod._RealPlaces, 'landing', fail)
 	monkeypatch.setattr(hpcp_mod.os.path, 'isdir', lambda path: path.startswith('/data/source'))
 	assert hpcp_mod._settle_destinations(['/data/source_a', '/data/source_b'], ['/o/out/'], None, False, None, 4, False)[:2] == ({}, 0)
@@ -1663,15 +1671,17 @@ def test_a_directory_onto_a_file_is_a_clash_and_leaves_its_mode(tmp_path, flags)
 	assert files(tmp_path / 'out') == {b'x': b'KEEP'} and stat.S_IMODE(os.stat(str(tmp_path / 'out/x')).st_mode) == 0o600
 
 
-def test_a_directory_onto_a_link_to_a_private_file_leaves_the_file(tmp_path):
+def test_a_directory_onto_a_link_to_a_private_file_replaces_the_link_and_leaves_the_file(tmp_path):
+	# 9.85: a link below a destination is a name of the tree; the directory replaces it, with a note (9.84 refused, 213).
 	write(tmp_path / 'a/x/in', 'in')
 	write(tmp_path / 'private', 'KEEP')
 	os.chmod(str(tmp_path / 'private'), 0o600)
 	os.makedirs(str(tmp_path / 'out'))
 	os.symlink('../private', str(tmp_path / 'out/x'))
 	rc, output = run(['a/x', '-d', 'out/'], tmp_path)
-	assert rc == 213, output[-2000:]
-	assert stat.S_IMODE(os.stat(str(tmp_path / 'private')).st_mode) == 0o600 and files(tmp_path / 'out') == {b'x': b'-> ../private'}
+	assert rc == 0, output[-2000:]
+	assert stat.S_IMODE(os.stat(str(tmp_path / 'private')).st_mode) == 0o600 and (tmp_path / 'private').read_text() == 'KEEP'
+	assert files(tmp_path / 'out') == {b'x/in': b'in'} and b'Note: ' + str(tmp_path / 'out/x').encode() + b' was a link to ../private' in output
 
 
 # -rf with every entry inside the destination.
@@ -2234,41 +2244,43 @@ def test_a_link_in_a_list_path_hides_no_clash(tmp_path, listing, dest):
 	assert rc == 213 and files(tmp_path / 'w') == {b'c/r': b'OUT', b'D/c/r': b'IN', b'lnk': b'-> D'}, output[-2000:]
 
 
-def test_a_link_in_the_destination_hides_no_listed_directory(tmp_path):
+# 9.85: a link below a destination is a name of the tree, never a way. What the source has there replaces it, so the
+# moves below land in the destination and remove their sources; 9.84 refused each (213) because the copy wrote through.
+
+def test_a_link_in_the_destination_is_replaced_by_a_listed_directory(tmp_path):
 	write(tmp_path / 'p/x', 'A')
 	write(tmp_path / 'src/p/x', 'B')
 	os.makedirs(tmp_path / 'out')
 	os.symlink('../src/p', tmp_path / 'out/p')
 	rc, output = run(['-d', 'out', '-rf'], tmp_path, b'p/x\nsrc/p\n')
-	assert rc == 213 and files(tmp_path) == {b'p/x': b'A', b'src/p/x': b'B', b'out/p': b'-> ../src/p'}, output[-2000:]
+	assert rc == 0 and files(tmp_path) == {b'out/p/x': b'A', b'out/src/p/x': b'B'}, output[-2000:]
 
 
-def test_a_directory_link_in_the_destination_hides_no_clash(tmp_path):
-	# src/e/x would go through out/e onto src/d/x: a directory source meets a link below the destination.
+def test_a_directory_link_in_the_destination_is_replaced(tmp_path):
+	# out/e -> ../src/d: src/e/x lands in a directory out/e, never onto src/d/x.
 	write(tmp_path / 'src/d/x', 'D')
 	write(tmp_path / 'src/e/x', 'E')
 	os.makedirs(tmp_path / 'out')
 	os.symlink('../src/d', tmp_path / 'out/e')
 	rc, output = run(['src/', '-d', 'out/', '-rf'], tmp_path)
-	assert rc == 213 and files(tmp_path) == {b'src/d/x': b'D', b'src/e/x': b'E', b'out/e': b'-> ../src/d'}, output[-2000:]
+	assert rc == 0 and files(tmp_path) == {b'out/d/x': b'D', b'out/e/x': b'E'}, output[-2000:]
 
 
-def test_a_move_through_a_file_link_onto_its_own_file_is_refused(tmp_path):
-	# cp writes through out/x, onto a/x itself: the copy skips it, and the removal would leave a dangling link.
+def test_a_move_onto_a_link_to_its_own_file_replaces_the_link(tmp_path):
 	write(tmp_path / 'a/x', 'A')
 	os.makedirs(tmp_path / 'out')
 	os.symlink('../a/x', tmp_path / 'out/x')
 	rc, output = run(['a/', '-d', 'out/', '-rf'], tmp_path)
-	assert rc == 213 and files(tmp_path) == {b'a/x': b'A', b'out/x': b'-> ../a/x'}, output[-2000:]
+	assert rc == 0 and files(tmp_path) == {b'out/x': b'A'}, output[-2000:]
 
 
-def test_a_file_link_in_the_destination_hides_no_clash(tmp_path):
+def test_a_file_link_in_the_destination_is_replaced(tmp_path):
 	write(tmp_path / 'a/y', 'A')
 	write(tmp_path / 'b/x', 'B')
 	os.makedirs(tmp_path / 'out')
 	os.symlink('../b/x', tmp_path / 'out/y')
 	rc, output = run(['a/', 'b/', '-d', 'out/', '-rf'], tmp_path)
-	assert rc == 213 and files(tmp_path) == {b'a/y': b'A', b'b/x': b'B', b'out/y': b'-> ../b/x'}, output[-2000:]
+	assert rc == 0 and files(tmp_path) == {b'out/y': b'A', b'out/x': b'B'}, output[-2000:]
 
 
 def test_safe_a_link_source_replaces_a_link_at_its_landing(tmp_path):
@@ -2283,15 +2295,15 @@ def test_safe_a_link_source_replaces_a_link_at_its_landing(tmp_path):
 	assert files(tmp_path / 'out') == {b'y': b'-> elsewhere', b'x': b'B'} and (tmp_path / 'b/x').read_text() == 'B'
 
 
-def test_two_spellings_of_one_landing_are_one_file(tmp_path):
-	# out/l -> real: both entries land on out/real/x. The first stays and nothing is removed.
+def test_a_link_beside_its_target_directory_is_a_landing_of_its_own(tmp_path):
+	# out/l -> real: 9.84 landed both entries on out/real/x (213). 9.85 replaces the link, so each has its own landing.
 	write(tmp_path / 'l/x', 'A')
 	write(tmp_path / 'real/x', 'B')
 	os.makedirs(tmp_path / 'out/real')
 	os.symlink('real', tmp_path / 'out/l')
 	rc, output = run(['-d', 'out', '-rf'], tmp_path, b'l/x\nreal/x\n')
-	assert rc == 213, output[-2000:]
-	assert (tmp_path / 'l/x').read_text() == 'A' and (tmp_path / 'real/x').read_text() == 'B' and (tmp_path / 'out/real/x').read_text() == 'A'
+	assert rc == 0, output[-2000:]
+	assert files(tmp_path) == {b'out/l/x': b'A', b'out/real/x': b'B'}
 
 
 def test_safe_a_landing_in_a_later_destination_counts(tmp_path):
@@ -2515,19 +2527,21 @@ def run_python(code, args, stdin):
 # Cost: a directory is looked at once, and no file gets a stat.
 
 def test_real_places_look_at_each_directory_once(hpcp_mod, tmp_path, monkeypatch):
+	# Below a destination nothing is followed (a link there is replaced) and nothing is listed; a source path is followed.
 	for name in range(50):
 		write(tmp_path / 'out/d' / f'f{name}', 'x')
 	os.symlink('d', tmp_path / 'out/l')
 	scans, stats = [], []
-	real_scandir, real_islink = os.scandir, os.path.islink
+	real_scandir, real_lstat = os.scandir, os.lstat
 	monkeypatch.setattr(hpcp_mod.os, 'scandir', lambda path: scans.append(path) or real_scandir(path))
-	monkeypatch.setattr(hpcp_mod.os.path, 'islink', lambda path: stats.append(path) or real_islink(path))
+	monkeypatch.setattr(hpcp_mod.os, 'lstat', lambda path, **kwargs: stats.append(str(path)) or real_lstat(path, **kwargs))
 	places = hpcp_mod._RealPlaces()
 	root = os.path.realpath(tmp_path)
 	for name in range(50):
-		assert places.landing(root + f'/out/l/f{name}', root + f'/s/f{name}') == root + f'/out/d/f{name}'
+		assert places.landing(root + '/out', root + f'/out/l/f{name}') == root + f'/out/l/f{name}'
+		assert places.landing(root + '/out', root + f'/out/d/f{name}') == root + f'/out/d/f{name}'
 		assert places.place(root + f'/out/l/f{name}') == root + f'/out/d/f{name}'
-	assert scans == [root + '/out/d'] and not [path for path in stats if os.path.basename(path).startswith('f')]
+	assert scans == [] and not [path for path in stats if os.path.basename(path).startswith('f')]
 
 
 def test_real_places_agree_with_realpath(hpcp_mod, tmp_path):
@@ -2551,7 +2565,7 @@ def test_safe_a_copy_into_a_new_destination_reads_its_source_once(hpcp_mod, rese
 	assert len(scans) == 1 and (tmp_path / 'new/src/d/x').exists()
 
 
-def test_a_copy_onto_an_existing_tree_reads_each_directory_once_and_stats_no_file(hpcp_mod, tmp_path, monkeypatch):
+def test_a_copy_onto_an_existing_tree_lists_no_directory_and_stats_no_file(hpcp_mod, tmp_path, monkeypatch):
 	for name in range(30):
 		write(tmp_path / 'src/d' / f'f{name}', 'x')
 		write(tmp_path / 'out/d' / f'f{name}', 'x')
@@ -2566,8 +2580,8 @@ def test_a_copy_onto_an_existing_tree_reads_each_directory_once_and_stats_no_fil
 		assert hpcp_mod._settle_destinations(['src/'], ['out/'], max_workers=1)[:2] == ({}, 0)
 	finally:
 		hpcp_mod._get_file_list_cache.clear()
-	root = str(tmp_path)
-	assert sorted(scans) == [root + '/out', root + '/out/d']
+	# 9.84 listed out and out/d, one by one, for links (the deferred serial scan); nothing below a destination is followed now.
+	assert scans == []
 	assert not [path for path in lstats if os.path.basename(str(path)).startswith('f')]
 
 
@@ -2687,8 +2701,12 @@ def test_a_source_that_holds_the_image_is_compared_with_nothing(tmp_path, hpcp_m
 	# hpcp / -di in small: an image is a tree of its own, so nothing it holds counts as a clash.
 	write(tmp_path / 'src/x', 'X')
 	write(tmp_path / 'src/tmp/x', 'earlier run')
-	def compared(*args, **kwargs):
-		raise AssertionError('compared')
+	real = hpcp_mod._RealPlaces.landing
+	def compared(self, root, path, whole=False):
+		# Where a directory lands is no file compared.
+		if not whole:
+			raise AssertionError('compared')
+		return real(self, root, path, whole)
 	monkeypatch.setattr(hpcp_mod._RealPlaces, 'landing', compared)
 	got = hpcp_mod._settle_destinations([str(tmp_path / 'src')], [str(tmp_path / 'src/tmp')], dest_image=str(tmp_path / 'dest.img'))
 	assert got == ({}, 0, set())
@@ -2710,25 +2728,24 @@ def test_sources_that_meet_in_an_image_are_no_clash_with_what_it_holds(tmp_path,
 # ---- a directory job judged as a whole; a hard link at the landing; a source that is the destination ----
 
 
-def test_a_link_in_the_destination_onto_a_source_directory_protects_its_files(tmp_path):
-	# src/d/x lands on itself through out/d, yet src/ as a whole does not land on itself, so it still reads src/d/x.
+def test_a_link_in_the_destination_onto_a_source_directory_is_replaced_and_the_source_kept(tmp_path):
+	# out/d -> ../src/d: 9.84 refused (213), as src/d/x would land on itself through it. The link is replaced now, and b/d/x,
+	# the later source, lands in the new out/d; src/d/x is never written.
 	write(tmp_path / 'src/d/x', 'S')
 	write(tmp_path / 'b/d/x', 'B')
 	os.makedirs(tmp_path / 'out')
 	os.symlink('../src/d', tmp_path / 'out/d')
-	tree = files(tmp_path)
 	rc, output = run(['src/', 'b/', '-d', 'out/'], tmp_path)
-	assert rc == 213 and files(tmp_path) == tree, output[-2000:]
+	assert rc == 0 and files(tmp_path) == {b'src/d/x': b'S', b'b/d/x': b'B', b'out/d/x': b'B'}, output[-2000:]
 
 
-def test_a_link_in_the_destination_onto_a_source_file_protects_it(tmp_path):
+def test_a_link_in_the_destination_onto_a_source_file_is_replaced_and_the_source_kept(tmp_path):
 	write(tmp_path / 'a/x', 'A')
 	write(tmp_path / 'b/x', 'B')
 	os.makedirs(tmp_path / 'out')
 	os.symlink('../a/x', tmp_path / 'out/x')
-	tree = files(tmp_path)
 	rc, output = run(['a/', 'b/', '-d', 'out/'], tmp_path)
-	assert rc == 213 and files(tmp_path) == tree, output[-2000:]
+	assert rc == 0 and files(tmp_path) == {b'a/x': b'A', b'b/x': b'B', b'out/x': b'B'}, output[-2000:]
 
 
 def test_safe_one_source_over_a_link_to_itself_copies_nothing_and_runs(tmp_path):
@@ -2778,7 +2795,8 @@ def test_a_content_only_move_keeps_every_file_through_a_hard_link(tmp_path, sour
 		assert wanted <= set(files(root).values()), (rc, output[-2000:])
 
 
-def test_safe_content_only_keeps_a_plain_destination_and_makes_a_new_one(tmp_path):
+def test_safe_content_only_keeps_a_plain_destination_s_mode_on_a_new_file(tmp_path):
+	# 9.85: -co writes a new file beside the old one and gives it the old one's mode, owner and xattrs (a new inode).
 	write(tmp_path / 'a/x', 'new')
 	write(tmp_path / 'a/y', 'made')
 	write(tmp_path / 'out/x', 'old')
@@ -2787,7 +2805,7 @@ def test_safe_content_only_keeps_a_plain_destination_and_makes_a_new_one(tmp_pat
 	rc, output = run(['a/', '-d', 'out/', '-co'], tmp_path)
 	assert rc == 0, output[-2000:]
 	assert (tmp_path / 'out/x').read_text() == 'new' and (tmp_path / 'out/y').read_text() == 'made'
-	assert os.stat(tmp_path / 'out/x').st_ino == inode and stat.S_IMODE(os.stat(tmp_path / 'out/x').st_mode) == 0o640
+	assert os.stat(tmp_path / 'out/x').st_ino != inode and stat.S_IMODE(os.stat(tmp_path / 'out/x').st_mode) == 0o640
 
 
 @pytest.mark.parametrize('sources, dest, nested', [
@@ -2855,7 +2873,8 @@ no_permissions_as_root = pytest.mark.skipif(not hasattr(os, 'geteuid') or os.get
 
 
 def _link_at_a_landing(tmp_path, mode):
-	"""a/y would write through out/y onto b/x, in an out of that mode. (out's mode comes back when the test ends.)"""
+	"""a/y would write through out/y onto b/x, in an out of that mode. (out's mode comes back when the test ends.) 9.85
+	replaces the link; a/x and b/x merge (the later wins), so a move keeps both sources (212)."""
 	write(tmp_path / 'a/x', 'A')
 	write(tmp_path / 'a/y', 'C')
 	write(tmp_path / 'b/x', 'B')
@@ -2873,12 +2892,17 @@ def out_back(tmp_path):
 		os.chmod(tmp_path / 'out', 0o700)
 
 
+# 9.84 listed each landing directory for links, and refused (213) where it could not; 9.85 follows none, so nothing hides.
+
+_MERGED = {b'a/x': b'A', b'a/y': b'C', b'b/x': b'B', b'out/x': b'B', b'out/y': b'C'}
+
+
 @no_permissions_as_root
-def test_a_directory_that_cannot_be_listed_is_asked_by_name(tmp_path, out_back):
-	tree = _link_at_a_landing(tmp_path, 0o300)
+def test_a_link_at_a_landing_in_a_directory_that_cannot_be_listed_is_replaced(tmp_path, out_back):
+	_link_at_a_landing(tmp_path, 0o300)
 	rc, output = run(['a/', 'b/', '-d', 'out/', '-rf'], tmp_path)
 	os.chmod(tmp_path / 'out', 0o700)
-	assert rc == 213 and files(tmp_path) == tree, output[-2000:]
+	assert rc == 212 and files(tmp_path) == _MERGED, output[-2000:]
 
 
 @no_permissions_as_root
@@ -2894,23 +2918,22 @@ def test_safe_a_directory_that_cannot_be_listed_still_takes_a_safe_copy(tmp_path
 
 @no_permissions_as_root
 @pytest.mark.parametrize('mode', [0o000, 0o600], ids=['nothing', 'read-only'])
-def test_a_directory_that_cannot_be_searched_is_refused_by_name(tmp_path, out_back, mode):
-	tree = _link_at_a_landing(tmp_path, mode)
+def test_a_link_at_a_landing_in_a_directory_that_cannot_be_searched_is_replaced(tmp_path, out_back, mode):
+	_link_at_a_landing(tmp_path, mode)
 	rc, output = run(['a/', 'b/', '-d', 'out/', '-rf'], tmp_path)
 	os.chmod(tmp_path / 'out', 0o700)
-	assert rc == 213 and files(tmp_path) == tree, output[-2000:]
-	assert b'chmod u+rx' in output and str(tmp_path / 'out').encode() in output
+	assert rc == 212 and files(tmp_path) == _MERGED, output[-2000:]
 
 
 @no_permissions_as_root
-def test_a_landing_in_a_directory_that_answers_nothing_is_refused_without_a_link(tmp_path, out_back):
+def test_a_landing_in_a_directory_that_answers_nothing_takes_the_copy(tmp_path, out_back):
+	# The directory sync gives out a/'s mode before the files land, as for any destination.
 	write(tmp_path / 'a/x', 'A')
 	os.makedirs(tmp_path / 'out')
 	os.chmod(tmp_path / 'out', 0o000)
 	rc, output = run(['a/', '-d', 'out/', '-rf'], tmp_path)
 	os.chmod(tmp_path / 'out', 0o700)
-	assert rc == 213 and files(tmp_path) == {b'a/x': b'A'}, output[-2000:]
-	assert b'chmod u+rx' in output
+	assert rc == 0 and files(tmp_path) == {b'out/x': b'A'}, output[-2000:]
 
 
 @no_permissions_as_root
@@ -2963,31 +2986,29 @@ def test_safe_a_directory_no_file_lands_in_does_not_stop_a_rerun(tmp_path, made,
 @no_permissions_as_root
 @pytest.mark.parametrize('mode', [0o000, 0o100, 0o200, 0o300, 0o400, 0o500, 0o600], ids=oct)
 @pytest.mark.parametrize('link, name', [('../b/x', 'a/y'), ('../b', 'a/y/x')], ids=['link', 'middle-link'])
-def test_a_link_at_a_landing_is_refused_at_every_mode(tmp_path, out_back, mode, link, name):
+def test_a_link_at_a_landing_is_replaced_at_every_mode(tmp_path, out_back, mode, link, name):
+	# b/x is never written through out/y: it lands at out/x, and the move removes every source.
 	write(tmp_path / 'a/k', 'K')
 	write(tmp_path / name, 'C')
 	write(tmp_path / 'b/x', 'B')
 	os.makedirs(tmp_path / 'out')
 	os.symlink(link, tmp_path / 'out/y')
-	tree = files(tmp_path)
 	os.chmod(tmp_path / 'out', mode)
 	rc, output = run(['a/', 'b/', '-d', 'out/', '-rf'], tmp_path)
 	os.chmod(tmp_path / 'out', 0o700)
-	assert rc == 213 and files(tmp_path) == tree, output[-2000:]
+	assert rc == 0 and files(tmp_path) == {b'out/k': b'K', ('out/' + name[2:]).encode(): b'C', b'out/x': b'B'}, output[-2000:]
 
 
 @no_permissions_as_root
-def test_one_source_through_a_link_in_a_directory_that_cannot_be_listed(tmp_path, out_back):
-	# One source: no two landings meet, so only the unknown listing opens the gate.
+def test_one_source_over_a_link_in_a_directory_that_cannot_be_listed_replaces_it(tmp_path, out_back):
 	write(tmp_path / 'a/x', 'A')
 	write(tmp_path / 'a/y', 'C')
 	os.makedirs(tmp_path / 'out')
 	os.symlink('../a/x', tmp_path / 'out/y')
-	tree = files(tmp_path)
 	os.chmod(tmp_path / 'out', 0o300)
 	rc, output = run(['a/', '-d', 'out/', '-rf'], tmp_path)
 	os.chmod(tmp_path / 'out', 0o700)
-	assert rc == 213 and files(tmp_path) == tree, output[-2000:]
+	assert rc == 0 and files(tmp_path) == {b'out/x': b'A', b'out/y': b'C'}, output[-2000:]
 
 
 def _a_big_directory(root, entries):
@@ -2996,22 +3017,23 @@ def _a_big_directory(root, entries):
 		os.close(os.open(os.path.join(str(root), f'e{number}'), os.O_CREAT | os.O_WRONLY))
 
 
-def test_safe_a_link_past_the_listing_limit_is_still_found(tmp_path):
+def test_safe_a_link_in_a_big_directory_is_replaced(tmp_path):
 	_a_big_directory(tmp_path / 'out', 10100)
 	write(tmp_path / 'a/y', 'A')
 	write(tmp_path / 'b/x', 'B')
 	os.symlink('../b/x', tmp_path / 'out/y')
 	rc, output = run(['a/', 'b/', '-d', 'out/', '-rf'], tmp_path)
-	assert rc == 213 and (tmp_path / 'a/y').read_text() == 'A' and (tmp_path / 'b/x').read_text() == 'B', output[-2000:]
+	assert rc == 0 and (tmp_path / 'out/y').read_text() == 'A' and (tmp_path / 'out/x').read_text() == 'B', output[-2000:]
+	assert not os.path.islink(tmp_path / 'out/y') and not (tmp_path / 'a/y').exists() and not (tmp_path / 'b/x').exists()
 
 
-def test_one_source_through_a_link_past_the_listing_limit(tmp_path):
+def test_one_source_over_a_link_in_a_big_directory_replaces_it(tmp_path):
 	_a_big_directory(tmp_path / 'out', 10100)
 	write(tmp_path / 'a/x', 'A')
 	write(tmp_path / 'a/y', 'C')
 	os.symlink('../a/x', tmp_path / 'out/y')
 	rc, output = run(['a/', '-d', 'out/', '-rf'], tmp_path)
-	assert rc == 213 and (tmp_path / 'a/x').read_text() == 'A' and (tmp_path / 'a/y').read_text() == 'C', output[-2000:]
+	assert rc == 0 and (tmp_path / 'out/x').read_text() == 'A' and (tmp_path / 'out/y').read_text() == 'C', output[-2000:]
 
 
 def test_safe_a_run_past_the_listing_limit_copies(tmp_path):
@@ -3023,7 +3045,7 @@ def test_safe_a_run_past_the_listing_limit_copies(tmp_path):
 	assert (tmp_path / 'out/y').read_text() == 'A' and (tmp_path / 'out/x').read_text() == 'B'
 
 
-def test_one_file_into_a_big_directory_reads_only_the_limit(hpcp_mod, reset_hpcp_globals, tmp_path, monkeypatch):
+def test_one_file_into_a_big_directory_reads_none_of_it(hpcp_mod, reset_hpcp_globals, tmp_path, monkeypatch):
 	_a_big_directory(tmp_path / 'out', 20000)
 	write(tmp_path / 'f', 'F')
 	read = []
@@ -3044,27 +3066,9 @@ def test_one_file_into_a_big_directory_reads_only_the_limit(hpcp_mod, reset_hpcp
 	monkeypatch.setattr(os, 'scandir', Counted)
 	monkeypatch.chdir(tmp_path)
 	places = hpcp_mod._RealPlaces()
-	assert places.landing(str(tmp_path / 'out/f'), str(tmp_path / 'f')) == str(tmp_path / 'out/f')
-	assert len(read) <= 10001
-
-
-def test_the_listing_reads_as_far_as_the_names_asked_about(hpcp_mod, tmp_path):
-	_a_big_directory(tmp_path / 'out', 10100)
-	os.symlink('e0', tmp_path / 'out/l')
-	assert hpcp_mod._RealPlaces().links(str(tmp_path / 'out')) is None
-	assert hpcp_mod._RealPlaces().links(str(tmp_path / 'out'), 20000) == {'l'}
-	assert hpcp_mod._RealPlaces(20000).links(str(tmp_path / 'out')) == {'l'}
-
-
-def test_no_directory_answers_no_links_and_a_failed_scan_answers_nothing(hpcp_mod, tmp_path, monkeypatch):
-	os.makedirs(tmp_path / 'out')
-	assert hpcp_mod._RealPlaces().links(str(tmp_path / 'gone')) == set()
-
-	def refused(path):
-		raise PermissionError(13, 'Permission denied', path)
-
-	monkeypatch.setattr(os, 'scandir', refused)
-	assert hpcp_mod._RealPlaces().links(str(tmp_path / 'out')) is None
+	assert places.landing(str(tmp_path / 'out'), str(tmp_path / 'out/f')) == str(tmp_path / 'out/f')
+	# 9.84 read up to 10,001 entries for links; nothing below a destination is followed now.
+	assert read == []
 
 
 def test_two_paths_of_one_directory_are_one_place(hpcp_mod, tmp_path, monkeypatch):
@@ -3118,10 +3122,12 @@ def test_a_source_that_cannot_be_read_leaves_a_hard_linked_destination_alone(tmp
 
 
 def _cp_writing_a_part(hpcp_mod, monkeypatch, fails):
-	"""A cp that dies part way through its write to each path in fails, and works elsewhere."""
+	"""A cp that dies part way through its write to each path in fails, or to a temporary name beside one, and works
+	elsewhere."""
 	real = hpcp_mod.run_command_in_multicmd_with_path_check
+	beside = {os.path.dirname(path) for path in fails}
 	def cp(command, *args, **kwargs):
-		if command[-1] in fails:
+		if command[-1] in fails or (os.path.basename(command[-1]).startswith('.hpcp_tmp_') and os.path.dirname(command[-1]) in beside):
 			with open(command[-1], 'w') as target:
 				target.write('par')
 			raise RuntimeError('cp: write error: No space left on device')
@@ -3148,7 +3154,9 @@ def test_a_part_of_a_copy_goes_before_the_next_destination(tmp_path, hpcp_mod, r
 		write(tmp_path / 'one/x', there)
 	_cp_writing_a_part(hpcp_mod, monkeypatch, [first])
 	hpcp_mod.copy_file(str(tmp_path / 'a/x'), [first, second])
-	assert not os.path.exists(first) and (tmp_path / 'two/x').read_text() == 'the whole file'
+	# 9.85: an old file is never written into; its copy went beside it and that part is gone (9.84 removed the old file).
+	assert (open(first).read() == there if there else not os.path.exists(first)) and (tmp_path / 'two/x').read_text() == 'the whole file'
+	assert not [name for name in os.listdir(str(tmp_path / 'one')) if name.startswith('.hpcp_tmp_')] if there else True
 
 
 def test_a_part_of_a_copy_goes_when_no_destination_takes_it(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
@@ -4178,7 +4186,8 @@ def _locked(tmp_path):
 
 @no_permissions_as_root
 @pytest.mark.parametrize('target,mode', [('../locked/sub/f', 0o000), ('../locked/sub/f', 0o755)], ids=['above-the-target', 'at-the-parent'])
-def test_a_landing_through_a_link_into_an_unreachable_place_names_the_link(tmp_path, target, mode):
+def test_a_link_into_an_unreachable_place_is_replaced(tmp_path, target, mode):
+	# 9.84 refused (213), naming the link: it could not see where a write through it would go. Nothing is written through it now.
 	_locked(tmp_path)
 	os.symlink(target, tmp_path / 'out/l')
 	os.chmod(tmp_path / 'locked/sub', 0o000)
@@ -4188,14 +4197,14 @@ def test_a_landing_through_a_link_into_an_unreachable_place_names_the_link(tmp_p
 	finally:
 		os.chmod(tmp_path / 'locked', 0o755)
 		os.chmod(tmp_path / 'locked/sub', 0o755)
-	link = str(tmp_path / 'out/l').encode()
-	assert rc == 213 and b'Destination clash: ' + link + b' leads to ' in output and b'To let it through: rm ' + link in output, output[-2000:]
+	assert rc == 0 and (tmp_path / 'out/l').read_text() == 'x' and not os.path.islink(tmp_path / 'out/l'), output[-2000:]
 	assert (tmp_path / 'locked/sub/f').read_text() == 'kept'
 
 
 @no_permissions_as_root
-def test_a_landing_through_a_link_to_a_directory_names_the_link(tmp_path):
-	# The walk passes: the link leads to a directory it can see. The landing in it is what cannot be asked about.
+def test_a_landing_through_a_named_link_into_a_place_that_cannot_be_searched_fails_and_keeps_it(tmp_path):
+	# -d out/d/ names the link: it is followed, as cp follows it. 9.84 refused before the copy (213), as a link could hide in
+	# the place it leads to; with nothing below a destination followed, nothing hides there, and each file fails on its own.
 	write(tmp_path / 'src/d/x', 'x')
 	write(tmp_path / 'src/e', 'e')
 	write(tmp_path / 'locked/x', 'kept')
@@ -4206,13 +4215,13 @@ def test_a_landing_through_a_link_to_a_directory_names_the_link(tmp_path):
 		rc, output = run(['src/d/x', 'src/e', '-d', 'out/d/'], tmp_path)
 	finally:
 		os.chmod(tmp_path / 'locked', 0o755)
-	link = str(tmp_path / 'out/d').encode()
-	assert rc == 213 and b'Destination clash: ' + link + b' leads to ' in output, output[-2000:]
+	assert rc == 190 and (tmp_path / 'locked/x').read_text() == 'kept' and os.path.islink(tmp_path / 'out/d'), output[-2000:]
 
 
 @no_permissions_as_root
-def test_a_link_that_only_spells_the_way_is_not_blamed(tmp_path):
-	# alias -> real, real/out mode 000: the link leads to a place that is fine, and rm of it would not help.
+def test_a_destination_that_cannot_be_searched_through_a_link_takes_the_copy(tmp_path):
+	# alias -> real, real/out mode 000: 9.84 refused (213), as it could not list real/out for links; the directory sync gives
+	# it src/'s mode before the files land, as for any destination.
 	write(tmp_path / 'src/x', 'x')
 	os.makedirs(tmp_path / 'real/out')
 	os.symlink('real', tmp_path / 'alias')
@@ -4221,11 +4230,11 @@ def test_a_link_that_only_spells_the_way_is_not_blamed(tmp_path):
 		rc, output = run(['src/', '-d', 'alias/out/'], tmp_path)
 	finally:
 		os.chmod(tmp_path / 'real/out', 0o755)
-	assert rc == 213 and b' leads to ' not in output and b'chmod u+rx ' + str(tmp_path / 'real/out').encode() in output, output[-2000:]
+	assert rc == 0 and (tmp_path / 'real/out/x').read_text() == 'x', output[-2000:]
 
 
 @no_permissions_as_root
-def test_a_directory_with_no_link_on_the_way_keeps_its_chmod(tmp_path):
+def test_a_destination_that_cannot_be_searched_takes_the_copy(tmp_path):
 	write(tmp_path / 'src/x', 'x')
 	os.makedirs(tmp_path / 'out')
 	os.chmod(tmp_path / 'out', 0o000)
@@ -4233,7 +4242,7 @@ def test_a_directory_with_no_link_on_the_way_keeps_its_chmod(tmp_path):
 		rc, output = run(['src/', '-d', 'out/'], tmp_path)
 	finally:
 		os.chmod(tmp_path / 'out', 0o755)
-	assert rc == 213 and b'To let it through: chmod u+rx ' + str(tmp_path / 'out').encode() in output and b' leads to ' not in output, output[-2000:]
+	assert rc == 0 and (tmp_path / 'out/x').read_text() == 'x', output[-2000:]
 
 
 def test_the_last_link_on_the_way_is_found_and_none_when_there_is_none(tmp_path, hpcp_mod):
@@ -4722,30 +4731,6 @@ def test_a_link_in_another_case_where_the_destination_keeps_the_names_apart_is_n
 	assert rc == 0 and (tmp_path / 'out/x').read_text() == 'x' and (tmp_path / 'locked/sub/f').read_text() == 'kept', output[-2000:]
 
 
-def _link_targets(hpcp_mod, tmp_path):
-	listed = hpcp_mod.get_file_list(str(tmp_path / 'src') + os.sep)
-	return hpcp_mod._link_targets(str(tmp_path / 'src') + os.sep, str(tmp_path / 'out') + os.sep, listed, hpcp_mod._RealPlaces())
-
-
-def test_a_link_in_another_case_is_followed_where_the_directory_reads_it_as_the_source_name(tmp_path, hpcp_mod, monkeypatch):
-	write(tmp_path / 'src/x', 'x')
-	write(tmp_path / 'elsewhere/f', 'f')
-	os.makedirs(tmp_path / 'out')
-	os.symlink('../elsewhere', tmp_path / 'out/X')
-	assert _link_targets(hpcp_mod, tmp_path) == []
-	_fold_probes(monkeypatch)
-	assert _link_targets(hpcp_mod, tmp_path) == [os.path.realpath(str(tmp_path / 'elsewhere'))]
-
-
-def test_a_link_in_another_case_of_a_source_directory_is_followed_where_the_directory_folds(tmp_path, hpcp_mod, monkeypatch):
-	write(tmp_path / 'src/D/f', 'f')
-	write(tmp_path / 'elsewhere/f', 'f')
-	os.makedirs(tmp_path / 'out')
-	os.symlink('../elsewhere', tmp_path / 'out/d')
-	_fold_probes(monkeypatch)
-	assert _link_targets(hpcp_mod, tmp_path) == [os.path.realpath(str(tmp_path / 'elsewhere'))]
-
-
 @no_permissions_as_root
 def test_a_rerun_with_both_names_there_asks_nothing_of_a_directory_it_cannot_write(tmp_path, hpcp_mod):
 	# The question needs a new directory, and the two names are there: they are two names.
@@ -4846,7 +4831,7 @@ def test_one_pair_in_a_tree_costs_the_files_that_pair_not_all(tmp_path, hpcp_mod
 	_answering(hpcp_mod, monkeypatch, lambda directory, first, second: False)
 	landings = []
 	real = hpcp_mod._RealPlaces.landing
-	monkeypatch.setattr(hpcp_mod._RealPlaces, 'landing', lambda self, path, source: landings.append(source) or real(self, path, source))
+	monkeypatch.setattr(hpcp_mod._RealPlaces, 'landing', lambda self, root, path, whole=False: (whole or landings.append(path)) and None or real(self, root, path, whole))
 	assert _copy(hpcp_mod, ['a/']) == 0
 	assert 0 < len(landings) and all(os.path.basename(path) in ('P', 'p') for path in landings)
 
@@ -4858,7 +4843,7 @@ def test_the_files_of_a_pair_are_all_judged_when_the_roots_overlap(tmp_path, hpc
 	write(tmp_path / 'a/p', '2')
 	landings = []
 	real = hpcp_mod._RealPlaces.landing
-	monkeypatch.setattr(hpcp_mod._RealPlaces, 'landing', lambda self, path, source: landings.append(os.path.basename(source)) or real(self, path, source))
+	monkeypatch.setattr(hpcp_mod._RealPlaces, 'landing', lambda self, root, path, whole=False: (whole or landings.append(os.path.basename(path))) and None or real(self, root, path, whole))
 	# The destination inside the source: the roots meet, so every file is looked at.
 	hpcp_mod._settle_destinations([str(tmp_path / 'a') + os.sep], [str(tmp_path / 'a/out') + os.sep])
 	assert 'f' in landings
@@ -5165,12 +5150,12 @@ def test_an_overlay_of_names_that_do_not_fold_alike_asks_nothing(tmp_path, hpcp_
 	assert asked == []
 
 
-def test_a_directory_with_no_links_folds_no_name_to_ask_about_one(tmp_path, hpcp_mod, monkeypatch):
-	# Every landing asks is_link: a directory without links answers at once.
+def test_a_landing_folds_no_name(tmp_path, hpcp_mod, monkeypatch):
+	# Every file of an overlapping run asks for its landing: that costs no fold of its own.
 	os.makedirs(tmp_path / 'out')
 	places = hpcp_mod._RealPlaces()
 	monkeypatch.setattr(hpcp_mod, '_folded', lambda path: pytest.fail('folded'))
-	assert places.is_link(str(tmp_path / 'out'), 'x') is False
+	assert places.landing(str(tmp_path / 'out'), str(tmp_path / 'out/x')) == str(tmp_path / 'out/x')
 
 
 @no_permissions_as_root
@@ -5341,15 +5326,16 @@ def test_a_file_against_a_directory_that_cannot_be_asked_says_why(tmp_path, hpcp
 # ---- 9.83, review round 4 ----
 
 @pytest.mark.parametrize('move', [False, True], ids=['copy', 'move'])
-def test_a_landing_through_a_link_onto_a_source_file_in_another_spelling_is_refused(folding, hpcp_mod, move):
-	# out/d -> ../s/d, with t/d/f and s/d/F: the copy of t/d/f writes through the link onto s/d/F, and a move then removes it.
-	# Only the files below a destination's spelling were folded, so the source behind the link was not: exit 0, S gone.
+def test_a_link_in_the_destination_onto_a_source_file_in_another_spelling_is_replaced(folding, hpcp_mod, move):
+	# out/d -> ../s/d, with t/d/f and s/d/F: 9.83 wrote t/d/f through the link onto s/d/F (exit 0, S gone), 9.84 refused (213).
+	# The link is replaced now: t/d/f lands in a directory out/d, and s/d/F is never written.
 	write(folding / 't/d/f', 'T')
 	write(folding / 's/d/F', 'S')
 	os.makedirs(folding / 'out')
 	os.symlink('../s/d', folding / 'out/d')
-	assert hpcp_mod.hpcp(['t/', 's/d/F'], ['out/'], single_thread=True, max_workers=1, batch=True, remove_force=move) == 213
-	assert (folding / 't/d/f').read_text() == 'T' and (folding / 's/d/F').read_text() == 'S'
+	assert hpcp_mod.hpcp(['t/', 's/d/F'], ['out/'], single_thread=True, max_workers=1, batch=True, remove=move, remove_force=move) == 0
+	assert (folding / 'out/d/f').read_text() == 'T' and not os.path.islink(folding / 'out/d') and (folding / 'out/F').read_text() == 'S'
+	assert (folding / 's/d/F').exists() != move and (folding / 't/d/f').exists() != move
 
 
 @pytest.mark.parametrize('source,dest', [('s', 'S'), ('s', 's.'), ('\u03c3', '\u03c2'), ('e\u0301', '\u00e9')], ids=['case', 'dot', 'sigma', 'nfd'])
@@ -5381,15 +5367,6 @@ def test_a_landing_on_a_source_file_in_another_spelling_that_cannot_be_asked_abo
 	_answering(hpcp_mod, monkeypatch, lambda directory, first, second: None)
 	assert _move(hpcp_mod, ['t/', 's/sub/F'], ['s/']) == 213
 	assert (tmp_path / 't/sub/f').read_text() == 'T' and (tmp_path / 's/sub/F').read_text() == 'S'
-
-
-def test_a_link_in_another_case_that_cannot_be_asked_about_is_followed(tmp_path, hpcp_mod, monkeypatch):
-	write(tmp_path / 'src/x', 'x')
-	write(tmp_path / 'elsewhere/f', 'f')
-	os.makedirs(tmp_path / 'out')
-	os.symlink('../elsewhere', tmp_path / 'out/X')
-	_answering(hpcp_mod, monkeypatch, lambda directory, first, second: None)
-	assert _link_targets(hpcp_mod, tmp_path) == [os.path.realpath(str(tmp_path / 'elsewhere'))]
 
 
 def _counting(hpcp_mod, monkeypatch):

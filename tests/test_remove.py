@@ -948,6 +948,13 @@ def _write(path, content, mtime=None):
 	return path
 
 
+def _taken_for_one(hpcp_mod, monkeypatch, tmp_path):
+	"""A destination that takes out/q for out/p, stood in for by a link out/q -> p that the operator named (-d): a named link
+	is written through, as cp follows its destination, and a landing below a destination never is (9.85)."""
+	os.symlink('p', str(tmp_path / 'out/q'))
+	monkeypatch.setattr(hpcp_mod, 'NAMED_DESTS', frozenset([str(tmp_path / 'out/q')]))
+
+
 def _not_held(hpcp_mod, tmp_path, entries, dests=('out/',), sources=('a/',)):
 	return hpcp_mod._not_held([str(tmp_path / entry) for entry in entries], [str(tmp_path / source) for source in sources],
 		[str(tmp_path / dest) for dest in dests])
@@ -999,13 +1006,13 @@ def test_a_landing_that_is_the_source_holds_it_only_through_another_name(tmp_pat
 
 
 @pytest.mark.skipif(not hasattr(os, 'link') or os.name == 'nt', reason='hard links and symlinks')
-def test_two_sources_that_one_landing_file_holds_are_both_kept(tmp_path, hpcp_mod, reset_hpcp_globals):
+def test_two_sources_that_one_landing_file_holds_are_both_kept(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
 	# Of one size and one time, each landing would pass for its source: that they are one file says they were taken for one.
-	# out/q leads to out/p, one file of one name, as a folding destination has it.
+	# out/q is out/p, one file of one name, as a folding destination has it.
 	_write(str(tmp_path / 'a/p'), 'AAAA', 1_600_000_000)
 	_write(str(tmp_path / 'b/q'), 'BBBB', 1_600_000_000)
 	_write(str(tmp_path / 'out/p'), 'BBBB', 1_600_000_000)
-	os.symlink('p', str(tmp_path / 'out/q'))
+	_taken_for_one(hpcp_mod, monkeypatch, tmp_path)
 	not_held = _not_held(hpcp_mod, tmp_path, ['a/p', 'b/q'], sources=('a/', 'b/'))
 	assert sorted(not_held) == [str(tmp_path / 'a/p'), str(tmp_path / 'b/q')]
 	assert 'the destination took the names for one' in not_held[str(tmp_path / 'a/p')] and str(tmp_path / 'b/q') in not_held[str(tmp_path / 'a/p')]
@@ -1039,14 +1046,16 @@ def test_a_rename_the_directory_cannot_be_asked_about_keeps_the_source(tmp_path,
 
 
 def test_a_move_keeps_the_sources_whose_landings_another_source_overwrote(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch, capsys):
-	# What the net misses, on a destination that takes two names for one: out/q leads to out/p, and nothing checks before the
+	# What the net misses, on a destination that takes two names for one: out/q is out/p, and nothing checks before the
 	# copy, so b/q is written onto a/p's landing. Without the backstop the move exited 0 with A gone.
 	monkeypatch.chdir(tmp_path)
 	_write('a/p', 'A')
 	_write('b/q', 'BB')
 	_write('out/p', 'old')
 	os.symlink('p', 'out/q')
-	monkeypatch.setattr(hpcp_mod, '_settle_destinations', lambda *args, **kwargs: ({}, 0, set()))
+	# Set where the run sets what it names: out/q stands for out/p (_taken_for_one).
+	monkeypatch.setattr(hpcp_mod, '_settle_destinations', lambda *args, **kwargs: (setattr(hpcp_mod, 'NAMED_DESTS',
+		hpcp_mod.NAMED_DESTS | {str(tmp_path / 'out/q')}), ({}, 0, set()))[1])
 	assert hpcp_mod.hpcp(['a/', 'b/'], ['out/'], single_thread=True, max_workers=1, batch=True, remove_force=True) == 213
 	error = capsys.readouterr().err
 	# Both: the landing that holds b/q is one file with a/p's (9.84 kept a/p only, as its landing's size differs).
@@ -1057,13 +1066,13 @@ def test_a_move_keeps_the_sources_whose_landings_another_source_overwrote(tmp_pa
 
 
 @pytest.mark.skipif(os.name == 'nt', reason='symlinks')
-def test_a_move_keeps_both_sources_that_landed_in_one_file_whatever_it_holds(tmp_path, hpcp_mod, reset_hpcp_globals):
+def test_a_move_keeps_both_sources_that_landed_in_one_file_whatever_it_holds(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
 	# Of other sizes, only a/p's landing fails its own checks; b/q's holds it, yet a/p's content is gone from the
 	# destination too: both stay (9.84 removed b/q).
 	_write(str(tmp_path / 'a/p'), 'A', 1_600_000_000)
 	_write(str(tmp_path / 'b/q'), 'BB', 1_600_000_000)
 	_write(str(tmp_path / 'out/p'), 'BB', 1_600_000_000)
-	os.symlink('p', str(tmp_path / 'out/q'))
+	_taken_for_one(hpcp_mod, monkeypatch, tmp_path)
 	not_held = _not_held(hpcp_mod, tmp_path, ['a/p', 'b/q'], sources=('a/', 'b/'))
 	assert sorted(not_held) == [str(tmp_path / 'a/p'), str(tmp_path / 'b/q')]
 	assert all('the destination took the names for one' in why for why in not_held.values())
@@ -1077,11 +1086,11 @@ def _copy_not_held(hpcp_mod, tmp_path, entries, dests=('out/',), sources=('a/',)
 
 
 @pytest.mark.skipif(os.name == 'nt', reason='symlinks')
-def test_a_copy_reports_two_sources_that_landed_in_one_file(tmp_path, hpcp_mod, reset_hpcp_globals):
+def test_a_copy_reports_two_sources_that_landed_in_one_file(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
 	_write(str(tmp_path / 'a/p'), 'A', 1_600_000_000)
 	_write(str(tmp_path / 'b/q'), 'BB', 1_600_000_000)
 	_write(str(tmp_path / 'out/p'), 'BB', 1_600_000_000)
-	os.symlink('p', str(tmp_path / 'out/q'))
+	_taken_for_one(hpcp_mod, monkeypatch, tmp_path)
 	not_held = _copy_not_held(hpcp_mod, tmp_path, ['a/p', 'b/q'], sources=('a/', 'b/'))
 	assert sorted(not_held) == [str(tmp_path / 'a/p'), str(tmp_path / 'b/q')]
 	assert not_held[str(tmp_path / 'a/p')] == (f'{tmp_path / "out/p"} is one file with {tmp_path / "out/q"} (from {tmp_path / "b/q"}): '
@@ -1128,14 +1137,16 @@ def test_a_copy_onto_a_destination_deduplicated_by_hard_links_is_no_clash(tmp_pa
 @pytest.mark.skipif(os.name == 'nt', reason='symlinks')
 @pytest.mark.parametrize('single_thread', [True, False])
 def test_a_copy_whose_sources_landed_in_one_file_exits_213_naming_both(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch, capsys, single_thread):
-	# What the net misses, on a destination that takes two names for one (an 8.3 alias on vfat): out/q leads to out/p, so b/q
+	# What the net misses, on a destination that takes two names for one (an 8.3 alias on vfat): out/q is out/p, so b/q
 	# is written onto a/p's landing. 9.84 exited 0 with A in neither landing; both sources stay, and so does the landing.
 	monkeypatch.chdir(tmp_path)
 	_write('a/p', 'A')
 	_write('b/q', 'BB')
 	_write('out/p', 'old')
 	os.symlink('p', 'out/q')
-	monkeypatch.setattr(hpcp_mod, '_settle_destinations', lambda *args, **kwargs: ({}, 0, set()))
+	# Set where the run sets what it names: out/q stands for out/p (_taken_for_one).
+	monkeypatch.setattr(hpcp_mod, '_settle_destinations', lambda *args, **kwargs: (setattr(hpcp_mod, 'NAMED_DESTS',
+		hpcp_mod.NAMED_DESTS | {str(tmp_path / 'out/q')}), ({}, 0, set()))[1])
 	assert hpcp_mod.hpcp(['a/', 'b/'], ['out/'], single_thread=single_thread, max_workers=1 if single_thread else 4, batch=True) == 213
 	error = capsys.readouterr().err
 	for path, landing, other, other_landing in (('a/p', 'out/p', 'b/q', 'out/q'), ('b/q', 'out/q', 'a/p', 'out/p')):
@@ -1333,23 +1344,32 @@ def test_contents_compare_to_the_end(tmp_path, hpcp_mod):
 
 
 @pytest.mark.skipif(not hasattr(os, 'symlink') or os.name == 'nt', reason='symlinks')
-def test_a_landing_that_is_a_link_to_a_file_holds_what_the_copy_wrote_through_it(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
-	# cp writes through a link at the landing: out/x -> ../t/f holds a/x in t/f. 9.84 at a1d61e8 said 'another kind of entry', 213.
+def test_a_link_at_a_landing_is_replaced_and_a_named_one_holds_what_the_copy_wrote_through_it(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	# 9.85: out/x -> ../t/f below a destination is replaced by the file, and t/f keeps its content (9.84 wrote a/x into t/f).
+	# Named with -d it is followed, as cp follows it, and holds a/x in t/f: the move removes a/x.
 	monkeypatch.chdir(tmp_path)
 	_write('a/x', 'A')
 	_write('t/f', 'old')
 	os.makedirs('out')
 	os.symlink(os.path.join('..', 't', 'f'), 'out/x')
-	assert hpcp_mod.hpcp(['a/'], ['out/'], single_thread=True, max_workers=1, batch=True, remove_force=True) == 0
+	assert hpcp_mod.hpcp(['a/'], ['out/'], single_thread=True, max_workers=1, batch=True, remove=True, remove_force=True) == 0
+	assert not os.path.exists('a/x') and open('t/f').read() == 'old' and not os.path.islink('out/x') and open('out/x').read() == 'A'
+	os.unlink('out/x')
+	os.symlink(os.path.join('..', 't', 'f'), 'out/x')
+	_write('a/x', 'A')
+	assert hpcp_mod.hpcp(['a/x'], ['out/x'], single_thread=True, max_workers=1, batch=True, remove=True, remove_force=True) == 0
 	assert not os.path.exists('a/x') and open('t/f').read() == 'A' and os.path.islink('out/x')
 
 
 @pytest.mark.skipif(not hasattr(os, 'symlink') or not hasattr(os, 'link') or os.name == 'nt', reason='symlinks and hard links')
-def test_a_landing_that_is_a_link_to_the_source_is_the_source_itself(tmp_path, hpcp_mod, reset_hpcp_globals):
-	# However many names the source has, removing it takes what the link shows. A link that leads nowhere holds nothing.
+def test_a_landing_that_is_a_link_to_the_source_is_the_source_itself(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	# However many names the source has, removing it takes what a named link shows. A link that leads nowhere holds nothing,
+	# and one below a destination holds no file (the copy replaces it, 9.85).
 	_write(str(tmp_path / 'a/x'), 'A')
 	os.makedirs(tmp_path / 'out')
 	os.symlink(os.path.join('..', 'a', 'x'), str(tmp_path / 'out/x'))
+	assert 'another kind of entry' in _not_held(hpcp_mod, tmp_path, ['a/x'])[str(tmp_path / 'a/x')]
+	monkeypatch.setattr(hpcp_mod, 'NAMED_DESTS', frozenset([str(tmp_path / 'out/x')]))
 	assert 'is the source itself' in _not_held(hpcp_mod, tmp_path, ['a/x'])[str(tmp_path / 'a/x')]
 	os.link(str(tmp_path / 'a/x'), str(tmp_path / 'a/other-name'))
 	assert 'is the source itself' in _not_held(hpcp_mod, tmp_path, ['a/x'])[str(tmp_path / 'a/x')]
@@ -1459,8 +1479,9 @@ def test_rme_removes_a_destination_link_that_leads_into_a_source_as_an_extra(tmp
 
 @pytest.mark.skipif(not hasattr(os, 'symlink') or os.name == 'nt', reason='symlinks')
 @pytest.mark.parametrize('flags', [{'remove': True}, {'remove': True, 'remove_extra': True}], ids=['move', 'move-rme'])
-def test_a_move_onto_a_link_that_leads_to_its_source_is_still_refused_before_any_copy(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch, flags):
-	# The case the removed rule was written for: out/d -> ../src/d with src/ moved. Refused as landing on itself, nothing touched.
+def test_a_move_onto_a_link_that_leads_to_its_source_replaces_the_link(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch, flags):
+	# out/d -> ../src/d with src/ moved: 9.84 refused it as landing on itself (213). 9.85 replaces the link by a directory,
+	# so src/d/f lands there and its move removes it; nothing is written through the link.
 	monkeypatch.chdir(tmp_path)
 	_write('src/d/f', 'F')
 	_write('src/g', 'G')
@@ -1469,8 +1490,9 @@ def test_a_move_onto_a_link_that_leads_to_its_source_is_still_refused_before_any
 	monkeypatch.setattr(sys.stdin, 'isatty', lambda: True)
 	monkeypatch.setattr('builtins.input', lambda *args: 'y')
 	rc = hpcp_mod.hpcp(['src/'], ['out/'], single_thread=True, max_workers=1, batch=True, **flags)
-	assert rc == 213
-	assert open('src/d/f').read() == 'F' and open('src/g').read() == 'G' and os.path.islink('out/d') and not os.path.exists('out/g')
+	assert rc == 0
+	assert open('out/d/f').read() == 'F' and open('out/g').read() == 'G' and not os.path.islink('out/d')
+	assert not os.path.exists('src/d/f') and not os.path.exists('src/g')
 
 
 @pytest.mark.skipif(not hasattr(os, 'symlink') or os.name == 'nt', reason='symlinks')
