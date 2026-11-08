@@ -174,3 +174,11 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - **Plan:** a named link whose target is a destination is left out as the destination itself is, with the one note. That also stops the junk link.
 - **Revisit when:** 9.85.
 - **Noted:** 2026-11-07, the user's standing rule that deferrals are noted, not asked.
+
+### `-rme` asks about every extra link on its own
+- **Kind:** deferred (9.85).
+- **What the operator sees:** `-rme` with many extra symlinks in the destination, on NFS mounted `actimeo=0`, spends about 0.6 ms on each (an estimate from the NFS figures for files: about 6 s for 10,000 extra links, against about 0.3 s for the walk that finds them). Extra files are asked once a directory.
+- **Why:** the guard `lstat`s every extra link, to see whether it is a named link source, while for a file it first checks that the file's directory holds a file source. Found in 9.84's review, after the guard stopped following links; it is a cost only.
+- **Plan:** in `guarded(path, 'link')`, return before the `lstat` when the link's directory is not in `file_parents`; a named link always puts its own directory there, a dangling one too.
+- **Revisit when:** 9.85.
+- **Noted:** 2026-11-07, the user's standing rule that deferrals are noted, not asked.
