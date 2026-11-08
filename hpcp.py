@@ -10917,17 +10917,19 @@ def remove_moved_sources(src_paths, file_list, sym_links, single_thread=False, m
 		roots.append(path)
 	root_ids = {root: (root_ids or {}).get(root, _directory_identity(root) if root_ids is None else None) for root in roots}
 	# Each listed entry with the outermost source root it lies below, so its removal is checked from there down: a
-	# lookup of the entry's ancestors (-sfl gives one root per file).
+	# lookup of the entry's ancestors (-sfl gives one root per file). Only a root that is a directory holds what lies below
+	# it: lb/x named beside lb, a link, is a root of its own (opened by its path, through the link), whatever its spelling.
 	root_set = set(roots)
+	holders = {root for root in roots if os.path.isdir(root) and not os.path.islink(root)}
 	def outermost_root(path):
-		found, candidate = None, path
+		found, candidate = (path if path in root_set else None), path
 		while True:
-			if candidate in root_set:
-				found = candidate
 			parent = os.path.dirname(candidate)
 			if parent == candidate:
 				return found
 			candidate = parent
+			if candidate in holders:
+				found = candidate
 	pairs = []
 	for path in set(file_list) | set(sym_links or ()):
 		if not os.path.isabs(path):
@@ -10944,6 +10946,9 @@ def remove_moved_sources(src_paths, file_list, sym_links, single_thread=False, m
 	if not remove_force:
 		_confirm("Do you want to continue? (y/n)", "Not removing files")
 	start_time = time.monotonic()
+	# A named link goes last, after the trees too: a path named through it (lb/x, lb/d/) is reached while it is there.
+	last = [item for item in listed if item[2] == '.' and item[0] not in holders and os.path.islink(item[0])]
+	listed = [item for item in listed if item not in last]
 	_remove_items(listed, single_thread, max_workers, verbose, files_per_job)
 	left = []
 	for root in roots:
@@ -10957,6 +10962,8 @@ def remove_moved_sources(src_paths, file_list, sym_links, single_thread=False, m
 				eprint(f'Remove directory failed: not removing {directory}: it, or a directory on its path, is no longer what the copy listed ({e.strerror})')
 			else:
 				eprint(f'Remove directory failed: {directory}: {e}')
+	if last:
+		_remove_items(last, single_thread, max_workers, verbose, files_per_job)
 	if left:
 		shown = ', '.join(pformat(path) for path in left[:10]) + (f' and {len(left) - 10} more' if len(left) > 10 else '')
 		eprint(f'Move left entries: {len(left)} source entries the copy did not list (written during the move, or special '

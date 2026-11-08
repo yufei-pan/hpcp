@@ -723,3 +723,37 @@ def test_stop_handlers_keep_an_ignored_signal_ignored(hpcp_mod, monkeypatch):
 	monkeypatch.setattr(hpcp_mod.signal, 'signal', lambda signum, handler: installed.__setitem__(signum, handler))
 	hpcp_mod._install_stops()
 	assert installed == {signal.SIGINT: hpcp_mod._stop, signal.SIGTERM: hpcp_mod._stop}
+
+
+# ---- entry 6: a move of a link and a path through it ----
+
+def _linked(root):
+	write(root / 'b/x', 'X')
+	write(root / 'b/y', 'Y')
+	write(root / 'b/s/z', 'Z')
+	write(root / 'b/d/w', 'W')
+	os.symlink('b', str(root / 'lb'))
+
+
+@posix_only
+@pytest.mark.parametrize('batch', range(20))
+def test_a_move_of_a_link_and_a_path_through_it_removes_both_on_every_run(tmp_path, batch):
+	# The entry's form: 9.84 exited 192 in about a third of the runs, and in every run left b/x, which the operator named.
+	# Only a directory holds what lies below it, and a named link goes last. Twenty batches of ten runs.
+	for attempt in range(10):
+		root = tmp_path / str(attempt)
+		_linked(root)
+		rc, output = run(['-sfl', '-', 'lb/x', '-d', 'out/', '-rf', '-j', '8'], root, b'lb/\n')
+		assert rc == 0 and not os.path.lexists(str(root / 'lb')) and not os.path.exists(str(root / 'b/x')), output[-2000:]
+		assert read(root / 'out/x') == 'X' and os.path.islink(str(root / 'out/lb')) and read(root / 'b/y') == 'Y'
+
+
+@posix_only
+def test_a_move_of_a_link_and_a_directory_through_it_moves_that_directory(tmp_path):
+	# A second form, found by the designer: 9.84 exited 192 in 9 of 10 runs and moved none of b/d's files.
+	for attempt in range(10):
+		root = tmp_path / str(attempt)
+		_linked(root)
+		rc, output = run(['lb', 'lb/d/', '-d', 'out/', '-rf', '-j', '8'], root)
+		assert rc == 0 and not os.path.lexists(str(root / 'lb')) and not os.path.exists(str(root / 'b/d')), output[-2000:]
+		assert read(root / 'out/w') == 'W' and read(root / 'b/y') == 'Y' and read(root / 'b/x') == 'X'
