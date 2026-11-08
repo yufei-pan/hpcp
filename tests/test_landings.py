@@ -405,22 +405,33 @@ def test_content_only_carries_the_old_file_s_mode_and_xattrs_to_a_new_inode(tmp_
 	assert os.listxattr(str(tmp_path / 'out/x')) == ['user.mine'] and os.getxattr(str(tmp_path / 'out/x'), 'user.mine') == b'kept'
 
 
+def _acl(*entries):
+	"""A POSIX ACL as its xattr holds it: version 2, then (tag, perm, id) each, little-endian (u16, u16, u32)."""
+	import struct
+	return struct.pack('<I', 2) + b''.join(struct.pack('<HHI', tag, perm, ident) for tag, perm, ident in entries)
+
+# Tags: user_obj, user, group_obj, mask, other. 0xffffffff is "no id".
+_NO_ID = 0xffffffff
+
+
 @posix_only
 def test_content_only_carries_the_old_acl_and_drops_one_the_directory_gave(tmp_path):
 	# out has a default ACL, which a new file in it takes as its access ACL: removed, as the old file had none. A file
 	# that had an access ACL keeps exactly it.
-	if not shutil_which('setfacl'):
-		pytest.skip('setfacl')
 	write(tmp_path / 'a/x', 'new')
 	write(tmp_path / 'a/y', 'new')
 	write(tmp_path / 'out/x', 'old')
 	write(tmp_path / 'out/y', 'old')
-	if subprocess.run(['setfacl', '-m', 'u:12345:r', str(tmp_path / 'out/y')]).returncode or \
-			subprocess.run(['setfacl', '-d', '-m', 'u:54321:rw', str(tmp_path / 'out')]).returncode:
+	access = _acl((1, 6, _NO_ID), (2, 4, 12345), (4, 4, _NO_ID), (0x10, 4, _NO_ID), (0x20, 4, _NO_ID))
+	default = _acl((1, 7, _NO_ID), (2, 6, 54321), (4, 5, _NO_ID), (0x10, 7, _NO_ID), (0x20, 5, _NO_ID))
+	try:
+		os.setxattr(str(tmp_path / 'out/y'), 'system.posix_acl_access', access)
+		os.setxattr(str(tmp_path / 'out'), 'system.posix_acl_default', default)
+	except OSError:
 		pytest.skip('no ACLs here')
 	before = os.getxattr(str(tmp_path / 'out/y'), 'system.posix_acl_access')
 	rc, output = run(['a/', '-d', 'out/', '-co'], tmp_path)
-	assert rc == 0, output[-2000:]
+	assert rc == 0 and read(tmp_path / 'out/x') == 'new' and read(tmp_path / 'out/y') == 'new', output[-2000:]
 	assert 'system.posix_acl_access' not in os.listxattr(str(tmp_path / 'out/x'))
 	assert os.getxattr(str(tmp_path / 'out/y'), 'system.posix_acl_access') == before
 

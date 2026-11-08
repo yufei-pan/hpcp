@@ -157,3 +157,45 @@ entries go last, in the same commit as the change:
 - Why we had to change: `printf 'out/b/sub/f\nb\n' | hpcp -d out -rme` said "Skipped 1 list entries inside the destination", then removed `out/b/sub/f`, its only copy, with exit 0: the guard never saw the entry the filter had taken out. And it took a realpath (an lstat of each part) and a stat for every extra: on NFS with actimeo=0, 52 s for 10,000 extras where the walk that found them took 0.35 s.
 - Original design was wrong because: the guard was fed the list the copy works from, which by design lacks what the copy leaves alone, and that is exactly what the guard protects. And it asked per path what is known per directory.
 - Lesson: a safety check takes its input from what the operator said, before any step that narrows it for another purpose; and it asks each question at the level its answer lives at (a directory's identity once), not once per thing below it.
+
+## 2026-11-08 A write never goes into what is there
+- Changed: a copy onto an existing landing writes a new name beside it (`.hpcp_tmp_` and 16 random hex digits) and renames it over the landing once whole; a FIFO, socket, device node or link below a destination is replaced, never opened or written through; a directory below a destination goes through one door (`_dest_directory`) that replaces a link or node by a real directory, with a note for a link. Only what `-d` names is followed and written through, as `cp` follows its destination argument. `-co` writes beside too and carries the old file's owner, group, mode, `user.*` xattrs, ACLs, SELinux label and FAT bits (a new inode).
+- Why we had to change: `cp` was handed the landing and decided what to do with what was there: it truncated an old copy before its first read, so a source failing mid-file (a real EIO on EL7) cost the last good backup; it waited forever on a lone FIFO; it wrote a file into the disk behind a device node in the tree; it wrote through a planted link, so a user who could write the destination could steer a root restore into `/etc`. Each had its own guard (`_leave_hard_links`, `_remove_what_failed`, a serial scan of every landing directory for links), and none closed them.
+- Original design was wrong because: a copy tool was given the name of something that may hold the only good copy, or may be a way somewhere else, and every guard answered one thing the tool might do to it. Never giving the tool what is there removes all of them at once.
+- Lesson: give a copy tool a new name, not the landing; replace what is there once the new file is whole; follow and write through only what the operator named.
+
+## 2026-11-08 In place only after the source has read to its end
+- Changed: the fallback where the beside route fails (no new name, a refused rename, no room) writes in place only a regular file with one name, only once the source has just been read to its end (the temporary file got all of it, or hpcp reads it through), and only when the rewrite needs no space it does not free, or no data was written beside and the free space holds the source. Anything else keeps the old copy (190), and a FIFO, node or link that cannot be replaced is refused (213), never written through.
+- Why we had to change: the design's first fallbacks wrote in place wherever the beside route failed; the review showed that brought entry 1 back (a 0555 directory and a failing source: the old copy at 0 bytes; a growing rewrite with no room beside: the old copy gone) and wrote through a link and hung on a FIFO in a 0555 directory.
+- Original design was wrong because: a fallback to the old behaviour inherits the old behaviour's losses; it has to prove the conditions under which the old route is safe.
+- Lesson: a fallback that writes into the old copy first proves that the source reads whole and that the rewrite needs no space it does not have; anything else keeps the old copy, and what cannot be replaced is refused.
+
+## 2026-11-08 A stop is a cleanup
+- Changed: SIGINT, SIGTERM and SIGHUP run Ctrl-C's cleanup (KeyboardInterrupt, so multiCMD stops `cp` in its own process group and every `finally` runs) in the main process and every pool worker, except a signal the process was started ignoring; the main process passes a stop on to its workers and, after the cleanup, ends by SIGTERM or SIGHUP with the default action (SIGINT keeps 130). A worker's parent-death watch watches the main process by its sentinel and sends SIGUSR2, hpcp's own, to its main thread before it exits.
+- Why we had to change: with temporary files, a stop that skipped the `finally` left them: SIGTERM to the main process left four complete 128 MB ones, SIGINT to the group three partial ones (the watch called `os._exit` before multiCMD had stopped `cp`). `_thread.interrupt_main` would run whatever SIGINT's disposition is, and under `sh -c '... &'` on EL7 that is SIG_IGN, a TypeError. Under forkserver a worker's parent is the fork server, which outlives the main process, so getppid never changed.
+- Original design was wrong because: a stop by any signal but SIGINT was taken to need no cleanup, which was true only while nothing was left half made; and the watch asked about the wrong process.
+- Lesson: every process that can leave a temporary file turns each stop it can catch into its cleanup path and then ends as the signal asked; a signal it was started ignoring stays ignored; a watch that sees its parent gone stops the main thread with a signal of its own, and watches the process that matters, not its own parent.
+
+## 2026-11-08 A link below a destination is a name
+- Changed: a symlink below a destination is replaced by what the source has there (a file or a directory), with a note naming it and the `-d` form that writes through it; under `-ncd`, or where it cannot be removed, the files below it are refused (213). `_link_targets`, `_RealPlaces.links`, `is_link` and the serial listing of every landing directory are gone; a landing below a destination resolves by `lstat`, unfollowed. The move's backstop counts a link at a landing as what it leads to only when the operator named it.
+- Why we had to change: 9.80 to 9.84 wrote through such a link (another place took the files and the source's mode, and as root its owner), and the checks that predicted where each write would go had to scan every landing directory, refused a directory they could not read, and still missed what the kernel would do.
+- Original design was wrong because: following a link in a tree made every check predict where each write goes; replacing it leaves nothing to predict.
+- Lesson: a link below a destination is a name of the tree, not a way; replace it, say so, and let the operator name it to write through it.
+
+## 2026-11-08 Only a directory holds what lies below it
+- Changed: a move places a removal below a source root only when that root is a real directory (`lstat`), so `lb/x` named beside the link `lb` is a root of its own, opened through the link by its path; named links are removed after everything else. A path listed through a link that another source copies as a link is a clash (213).
+- Why we had to change: `hpcp lb lb/x -d out/ -rf` placed `lb/x` below `lb` by its spelling and then opened `lb` with `O_NOFOLLOW`: ELOOP (192) at random, and `b/x`, which the operator named, never removed.
+- Original design was wrong because: containment was read from the spelling; a spelling that puts a path below a link or a file says nothing about what holds it.
+- Lesson: ask what a root is before reaching through it, and remove a link after what was reached through it.
+
+## 2026-11-08 A special the operator names is a source
+- Changed: a FIFO, socket or device named as a source (an argument or a list entry) is copied as `cp -a` copies it, exit 0, and moved with `-rf`; one met in a tree is still skipped with a note.
+- Why we had to change: the listing said "not a file or directory" (200) for a named FIFO yet listed it, so the node was made and the run failed, and `-rf` kept every source (212); `-s` already exited 0.
+- Original design was wrong because: a refusal by type, which belongs to a walk that meets a special, was applied to a name the operator typed.
+- Lesson: a refusal by type belongs to a walk; what the operator names is what they asked for.
+
+## 2026-11-08 A probe costs only its names
+- Changed: the probe that asks a directory about names makes them relative to descriptors (`mkdir(dir_fd=)`, then the probe's own descriptor), and the node probe with `mknod(dir_fd=)`.
+- Why we had to change: made at the probe's full path, the question failed with "File name too long" for a landing within about 57 characters of PATH_MAX, a false 213 where the copy itself fits.
+- Original design was wrong because: the question was made longer than what it asks about.
+- Lesson: make what you ask a directory about relative to its descriptor, or the question fails where the answer would not.
