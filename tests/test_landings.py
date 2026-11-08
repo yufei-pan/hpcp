@@ -163,9 +163,13 @@ def test_a_rename_that_is_refused_goes_in_place_at_once(tmp_path, hpcp_mod, rese
 
 @posix_only
 @root_only
-def test_a_sticky_directory_keeps_9_84_s_outcome_for_another_user_s_file(tmp_path):
+def test_a_sticky_directory_keeps_9_84_s_outcome_for_another_user_s_file(tmp_path, tmp_path_factory):
 	# The re-review's stickyprobe: a root-owned sticky directory, another user's 0666 file, a growing source, run as nobody.
 	# The rename over it is refused (EPERM): written in place, as 9.84 did; the content is new and the owner kept.
+	base, above = str(tmp_path_factory.getbasetemp()), str(tmp_path)
+	while above.startswith(base):
+		os.chmod(above, 0o755)  # pytest makes its own temporary directories 0700
+		above = os.path.dirname(above)
 	for path in (os.path.realpath(sys.executable), os.path.realpath(HPCP), str(tmp_path)):
 		above = os.path.dirname(path)
 		while above != os.path.dirname(above):
