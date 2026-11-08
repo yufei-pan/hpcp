@@ -17,6 +17,10 @@ Block-image functionality is in **beta**. Only available on Linux. Possible use 
 
 hpcp.bat available on github: simple old tk based GUI intended for basic windows functionality.
 
+## Upgrading to 9.85 from 9.84
+
+Nothing needs doing to upgrade. What changed:
+
 ## Upgrading to 9.84 from 9.83
 
 Nothing needs doing to upgrade. What changed:
