@@ -1372,3 +1372,31 @@ def test_a_move_fsyncs_a_landing_on_a_filesystem_mounted_below_the_destination(t
 		assert not os.path.exists(str(tmp_path / 'a/sub/f'))
 	finally:
 		subprocess.run(['umount', '-l', str(tmp_path / 'out/sub')], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+
+@root_only
+@pytest.mark.skipif(not sys.platform.startswith('linux'), reason='loop devices and mounts are Linux')
+def test_a_move_into_an_image_fsyncs_each_landing_in_it_before_the_source_goes(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	# -di mounts the image on a loop device; the fsync of a file in it is flushed down to the image file by the loop driver
+	# (REQ_FLUSH becomes an fsync of the backing file), and one that fails is a failed copy as anywhere.
+	if subprocess.run(['sh', '-c', 'command -v mkfs.ext4'], stdout=subprocess.PIPE).returncode:
+		pytest.skip('needs mkfs.ext4')
+	image = str(tmp_path / 'x.img')
+	with open(image, 'wb') as f:
+		f.truncate(64 << 20)
+	if subprocess.run(['mkfs.ext4', '-q', '-F', image], stdout=subprocess.PIPE, stderr=subprocess.PIPE).returncode:
+		pytest.skip('mkfs.ext4 refused')
+	write(tmp_path / 'a/x', 'one')
+	write(tmp_path / 'a/d/y', 'two')
+	fsynced = []
+	real_fsync, real_remove = os.fsync, hpcp_mod.remove_moved_sources
+	def fsync(fd):
+		fsynced.append(os.readlink('/proc/self/fd/%d' % fd))
+		return real_fsync(fd)
+	def remove(*args, **kwargs):
+		assert sorted(os.path.basename(path) for path in fsynced) == ['x', 'y'] and os.path.exists(str(tmp_path / 'a/x')), fsynced
+		return real_remove(*args, **kwargs)
+	monkeypatch.setattr(hpcp_mod.os, 'fsync', fsync)
+	monkeypatch.setattr(hpcp_mod, 'remove_moved_sources', remove)
+	rc = hpcp_mod.hpcp([str(tmp_path / 'a') + os.sep], dest_image=image, single_thread=True, remove=True, remove_force=True)
+	assert rc == 0 and not os.path.exists(str(tmp_path / 'a'))
