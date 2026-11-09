@@ -159,6 +159,14 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - **Revisit when:** 9.86.
 - **Noted:** 2026-11-08, the user's standing rule that deferrals are noted, not asked.
 
+### A rewrite in place on a copy-on-write filesystem near a full disk can lose the old copy
+- **Kind:** deferred (9.86).
+- **What the operator sees:** on btrfs, or for an XFS file whose extents a reflink shares, a rewrite written in place (a 0555 directory, a sticky directory, a bind-mounted file) on a nearly full disk can run out of room part way: the old copy is torn (and removed where its directory lets it go), exit 190, as in 9.84.
+- **Why:** there an overwrite allocates new blocks, so writing over the old copy needs room as a new file does; the room reserved first (`posix_fallocate`) covers only the source's data landing in the old copy's holes, and on these filesystems it does not cover an overwrite.
+- **Plan:** on such a filesystem, write in place only when the free room holds the source's data; otherwise keep the old copy (exit 190).
+- **Revisit when:** 9.86.
+- **Noted:** 2026-11-09, found building 9.85's in-place rewrite; the main session's decision, not asked (a deferral).
+
 ### Each rewrite makes a new inode, with no way to write in place instead
 - **Kind:** deferred (9.86).
 - **What the operator sees:** a rewrite goes to a new file renamed over the old one, so what lives on the old inode is not carried: a per-file Lustre or GPFS layout (`lfs setstripe` on the file) is replaced by the directory's default, and readers holding the file open on other NFS clients may get `ESTALE`. There is no option to write in place instead.
@@ -217,25 +225,25 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 
 ### A stopped or broken run can still hang, rarely
 - **Kind:** deferred (9.86).
-- **What the operator sees:** on Python 3.6 (EL7, EL8) and 3.14, a run stopped early with Ctrl-C or SIGTERM (`kill`, `timeout`, a systemd stop), or one whose copy worker dies, can wait for good instead of ending. A second Ctrl-C does nothing there (9.85's parent ignores later stops); Ctrl-\ (SIGQUIT) or `kill -9` ends it. Measured with the reviewer's probe (early stops, 20 directories of 20 small files, `-j 8`, across EL7, EL8 and Docker 3.6 and 3.14): 9 hangs in 3300 runs with 9.85, against 22 of 3300 at the commit before the last fixes; EL8 early Ctrl-C alone, 4 of 300. 9.84 hung about as often (EL8: 3 of 150 Ctrl-Cs, 4 of 150 SIGTERMs). Sources stay: a stopped or broken copy removes nothing.
+- **What the operator sees:** on Python 3.6 (EL7, EL8) and 3.14, a run stopped early with Ctrl-C or SIGTERM (`kill`, `timeout`, a systemd stop), or one whose copy worker dies, can wait for good instead of ending. A second Ctrl-C does nothing there (9.85's parent ignores later stops); Ctrl-\ (SIGQUIT) or `kill -9` ends it, and like SIGKILL leaves a `.hpcp_tmp_` file where a rewrite was under way (its `cp`, in a process group of its own, runs on to its end). Measured with the reviewer's probe (early stops, 20 directories of 20 small files, `-j 8`, across EL7, EL8 and Docker 3.6 and 3.14): 9 hangs in 3300 runs with 9.85, against 22 of 3300 at the commit before the last fixes; EL8 early Ctrl-C alone, 4 of 300. 9.84 hung about as often (EL8: 3 of 150 Ctrl-Cs, 4 of 150 SIGTERMs). Sources stay: a stopped or broken copy removes nothing.
 - **Why:** the waits are in Python's process pool, not in hpcp's own code. A stop raised inside CPython's own lock handling strands a lock: the parent inside `concurrent.futures.wait`'s `_AcquireFutures` (verified by injection), or a worker on the pool's call-queue lock (inferred from the hang dumps, not injected). A stop that lands between the two writes of a result over 16 KiB also hangs (verified by injection).
 - **Plan (9.86):** kill workers still alive after a grace period, bound the parent's join and end with `os._exit`; consider polling the stop flag in the pool loops instead of raising in the parent; let a second Ctrl-C end a stuck parent.
 - **Revisit when:** 9.86.
 - **Noted:** 2026-11-09, found in the 9.85 re-reviews; the main session's decision, not asked (a deferral).
 
-### On Python 3.14 a stop can end with exit 191 instead of 130
+### A stop whose KeyboardInterrupt Python drops in the parent is not acted on
 - **Kind:** deferred (9.86).
-- **What the operator sees:** on Python 3.14, a stop whose `KeyboardInterrupt` Python drops in the parent (it was raised where Python reports and discards it) ends the run with `Copy process crashed: BrokenProcessPool`, exit 191, instead of 130 or 143. Once in 200 natural runs. Nothing is lost: the workers' cleanup ran, and no source is removed.
-- **Why:** Python 3.14 reports and drops a `KeyboardInterrupt` raised in a weakref callback or a `__del__`; the parent's stop is then spent, its workers end on theirs, and the pool reads as broken (not traced further).
-- **Plan (9.86):** where the parent has a stop of its own (`_STOPPED`) and the pool breaks, end as that stop asked.
+- **What the operator sees:** a stop whose `KeyboardInterrupt` Python drops in the parent (it was raised inside a weakref callback or a `__del__`, where every Python reports it as "Exception ignored" and goes on) is not acted on there. While a pool runs, its workers still end on the pass-on, the pool reads as broken, and the run ends with `Copy process crashed: BrokenProcessPool`, exit 191 for a Ctrl-C instead of 130 (a SIGTERM still ends by its signal, 143); seen once in 200 natural runs on Python 3.14. Outside a pool, nothing breaks: the run goes on to its end, a move removing its sources and `-rme` its extras, and a Ctrl-C exits 0; a second Ctrl-C is ignored as a later stop (injected on 3.6 and 3.14: a Ctrl-C dropped while the sources were checked, a second 0.2 s later, and the move ran whole, exit 0). Nothing is lost: what is removed was copied, fsynced and checked first.
+- **Why:** the parent acts on a stop only through the `KeyboardInterrupt` that `_stop` raises, and ignores later stops so that a second Ctrl-C cannot cut the cleanup halfway. Python 3.6 to 3.14 all drop a `KeyboardInterrupt` raised in a weakref callback or a `__del__` (checked: 3.6, 3.12, 3.14); such callbacks run in the parent's main thread as a pool's executor, queues and threads are freed (from reading Python's code, not traced in hpcp: `concurrent.futures`' `weakref_cb`, multiprocessing's `Finalize`, `threading`'s `WeakSet`), so the window is at least the end of each pool phase. Why only 3.14 showed it is not traced.
+- **Plan (9.86):** the parent checks its own stop (`_STOPPED_PID == os.getpid()`) where it can act on it, and raises `KeyboardInterrupt` there: each pass of its pool loops, and before each phase, above all before a removal. That also covers the broken pool (exit 130 or the signal, not 191).
 - **Revisit when:** 9.86.
 - **Noted:** 2026-11-09, found in the 9.85 last review round; the main session's decision, not asked (a deferral).
 
 ### On Python 3.14 an early Ctrl-C often prints a traceback
 - **Kind:** deferred (9.86).
 - **What the operator sees:** on Python 3.14, about one early Ctrl-C in three prints a traceback (a `KeyboardInterrupt`) before the run ends with 130. As in 9.84. Nothing is lost.
-- **Why:** under 3.14's default forkserver a worker imports hpcp afresh and a Ctrl-C landing before hpcp installs its handlers prints Python's own traceback; and a second stop landing in an exit path does the same.
-- **Plan (9.86):** a worker ignores the stop signals until its handlers are in place, and the exit paths end on the first stop (as `_end_by` now does in a worker).
+- **Why:** under 3.14's default forkserver a worker starts from the fork server, with Python's own SIGINT handler (the server puts back the handlers it started with), and hpcp's handlers go in only at the worker's first task (`_run_task`): the after-fork setup that 9.85's `main()` registers reaches only workers forked from the parent. A Ctrl-C landing before that prints Python's traceback; and a second stop landing in an exit path does the same.
+- **Plan (9.86):** set each worker up before its loop on Python 3.7+ with the pool's `initializer=` (as `-pfl` already does for its rate share), which reaches forkserver and spawn workers too; and the exit paths end on the first stop (as `_end_by` now does in a worker). Ignoring the stops until the handlers are in place cannot be done from the parent under forkserver (the server, not the parent, gives a worker its dispositions), and a stop ignored at a worker's start would stay ignored (`_install_stops` keeps what a process started ignoring).
 - **Revisit when:** 9.86.
 - **Noted:** 2026-11-09, found in the 9.85 last review round; the main session's decision, not asked (a deferral).
 
