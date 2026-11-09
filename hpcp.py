@@ -3598,14 +3598,86 @@ def _claim_device(target, st, named, src_path):
 		raise
 
 def _cp_in_place(command, src_path, target):
-	"""cp to target itself, as cp does: a part it leaves over an old file goes (_remove_what_failed). Its size."""
+	"""Copy src_path to target itself: a part it leaves over an old file goes (_remove_what_failed). Its size.
+
+	An old regular file at least the source's size is written over from its start and only then cut to the source's
+	length (_write_over): cp opens it with O_TRUNC, freeing its room before it writes, and on a nearly full disk another
+	writer (another worker's temporary file beside its landing) can take that room first, so the write runs short and the
+	old copy is gone. Written over, the rewrite needs no room of its own (a filesystem that copies on write, btrfs or an
+	XFS extent shared by a reflink, still does). Anything else is cp's, as before."""
 	before = _copy_state(target)
 	try:
-		run_command_in_multicmd_with_path_check(command + [src_path, target], quiet=True, strict=True)
+		written = _write_over(src_path, target)
+		if not written:
+			run_command_in_multicmd_with_path_check(command + [src_path, target], quiet=True, strict=True)
 	except BaseException:
 		_remove_what_failed(target, before)
 		raise
+	if written and not CONTENT_ONLY:
+		# What cp's -a carries (-co carries nothing). The new bytes are whole: a failure here is reported, and they stay.
+		run_command_in_multicmd_with_path_check(command + ['--attributes-only', src_path, target], quiet=True, strict=True)
 	return get_file_size(target)
+
+_WRITE_OVER_CHUNK = 1 << 20  # one read at a time: a chunk of zeros costs one hole test, whatever the file's size
+_WRITE_OVER_BLOCK = 1 << 16  # the grain a hole is kept at within a chunk that holds data. Measured on 4 GiB files on tmpfs
+# (Python 3.14): over a dense old copy 64 KiB blocks took 0.53 s and 4 KiB ones 1.16 s; over a sparse one, with 100 KB of data
+# every 37 MiB, 13 MiB were used against 10 MiB, in 0.12 s and 0.13 s. A sparse image's data comes in runs, so 64 KiB loses
+# next to nothing.
+_ZEROS = bytes(_WRITE_OVER_CHUNK)
+
+def _write_over(src_path, target):
+	"""Write src_path's bytes over target from its start and cut it to their length: True. False, with nothing written, where
+	cp is to do it: either side is not a regular file, they are one file, target is smaller than the source (it grows: room is
+	needed anyway), it cannot be opened for writing as it is (cp -f then replaces it), or cp is not GNU cp (no --attributes-only).
+
+	A hole stays one: a block of zeros where target holds no data is not written (cp --sparse=auto keeps the source's holes
+	the same way), so a sparse image rewritten over its older copy needs room for its data only. Where the filesystem cannot
+	say (no os.SEEK_DATA), the range counts as data and is written."""
+	try:
+		source, old = os.lstat(src_path), os.lstat(target)
+		if not (stat.S_ISREG(source.st_mode) and stat.S_ISREG(old.st_mode) and old.st_size >= source.st_size
+			and (source.st_dev, source.st_ino) != (old.st_dev, old.st_ino) and cp_supports_sparse()):
+			return False
+		fd = os.open(target, os.O_WRONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_CLOEXEC', 0))
+	except OSError:
+		return False
+	try:
+		offset = 0
+		with open(src_path, 'rb', buffering=0) as f:
+			for chunk in iter(lambda: f.read(_WRITE_OVER_CHUNK), b''):
+				if _is_zeros(chunk):
+					if not _holds_no_data(fd, offset, len(chunk)):
+						_pwrite_all(fd, chunk, offset)
+				else:
+					for start in range(0, len(chunk), _WRITE_OVER_BLOCK):
+						block = chunk[start:start + _WRITE_OVER_BLOCK]
+						if not (_is_zeros(block) and _holds_no_data(fd, offset + start, len(block))):
+							_pwrite_all(fd, block, offset + start)
+				offset += len(chunk)
+		os.ftruncate(fd, offset)
+	finally:
+		os.close(fd)
+	return True
+
+def _is_zeros(data):
+	return data == (_ZEROS if len(data) == len(_ZEROS) else _ZEROS[:len(data)])
+
+def _pwrite_all(fd, data, offset):
+	view = memoryview(data)
+	while view:
+		written = os.pwrite(fd, view, offset)
+		view, offset = view[written:], offset + written
+
+def _holds_no_data(fd, offset, length):
+	"""Whether fd's range [offset, offset + length) is a hole: False where that cannot be told."""
+	seek_data = getattr(os, 'SEEK_DATA', None)
+	if seek_data is None:
+		return False
+	try:
+		return os.lseek(fd, offset, seek_data) >= offset + length
+	except OSError as e:
+		# ENXIO: no data from offset to the end of the file, so a hole. Any other error: cannot tell.
+		return e.errno == errno.ENXIO
 
 def _cp_once(src_path, dest_path, cp_flags, sparse, forced):
 	"""One attempt at copying src_path to dest_path (copy_file); the size copied. Nothing at the landing is written into or

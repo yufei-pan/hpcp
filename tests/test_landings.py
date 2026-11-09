@@ -729,6 +729,120 @@ def test_the_space_cases_keep_every_old_copy(tmp_path):
 		subprocess.run(['rm', '-rf', out])
 
 
+_ROOM_TAKEN_CP = '''#!/bin/sh
+# cp, on a disk where another writer takes any room a rewrite frees: a copy beside its landing runs out of room part way;
+# a copy to the landing itself (cp truncates it first) finds the room it freed taken (the disk filled) before it writes.
+case "$1" in --version) exec cp "$@";; esac
+for last; do :; done
+case "$*" in *--attributes-only*) exec cp "$@";; esac
+case "$(basename "$last")" in
+.hpcp_tmp_*) head -c 1000 /dev/zero > "$last"; echo "cp: error writing '$last': No space left on device" >&2; exit 1;;
+esac
+: > "$last"
+head -c 100000000 /dev/zero > "$FILL" 2>/dev/null
+exec cp "$@"
+'''
+
+
+@posix_only
+@small_fs
+def test_a_rewrite_in_place_needs_no_room_it_frees(tmp_path):
+	# The forced pass's fallback writes a regular file in place when the old copy is at least the source's size. cp truncates
+	# it first, and with -j 4 on a nearly full disk another worker's temporary file took that room before cp wrote: the old
+	# copy was gone, exit 190 (the space test's C3, about 1 run in 250). Written over, the rewrite needs no room.
+	out = os.path.join(SMALL_FS, 'room-%d' % os.getpid())
+	subprocess.run(['rm', '-rf', out])
+	os.makedirs(out)
+	try:
+		write(os.path.join(out, 'x'), b'o' * (1 << 20))
+		write(tmp_path / 'a/x', b'n' * (1 << 20))
+		cp = tmp_path / 'roomcp'
+		cp.write_text(_ROOM_TAKEN_CP)
+		os.chmod(str(cp), 0o755)
+		rc, output = run([str(tmp_path / 'a/x'), '-d', out + '/'], tmp_path, env={'CP_PATH': str(cp), 'FILL': os.path.join(out, 'fill')})
+		assert rc == 0 and read(os.path.join(out, 'x')) == 'n' * (1 << 20) and temporaries(out) == [], output[-2000:]
+	finally:
+		subprocess.run(['rm', '-rf', out])
+
+
+_NO_ROOM_FOR_A_TEMPORARY_CP = '''#!/bin/sh
+# cp, on a disk too full for a copy beside its landing: that fails; a copy to the landing itself is not cp's job here (the
+# rewrite is written over the old copy), so it fails the test loudly.
+case "$1" in --version) exec cp "$@";; esac
+for last; do :; done
+case "$*" in *--attributes-only*) exec cp "$@";; esac
+case "$(basename "$last")" in
+.hpcp_tmp_*) echo "cp: error writing '$last': No space left on device" >&2; exit 1;;
+esac
+echo "cp ran on the landing itself" >&2
+exit 1
+'''
+
+_PAGE = 4096
+
+
+def _sparse(path, pieces, size):
+	"""A file of size bytes holding only pieces ({offset: bytes}); the rest is a hole."""
+	os.makedirs(os.path.dirname(str(path)), exist_ok=True)
+	with open(str(path), 'wb') as f:
+		for offset, data in pieces.items():
+			f.seek(offset)
+			f.write(data)
+		f.truncate(size)
+
+
+def _rewrite_in_place(tmp_path, old_maker, free):
+	"""Run hpcp over a source holding two pieces of data in 4 MiB, onto the small filesystem where old_maker made an old copy
+	and only free bytes are left; the pieces and the file as it ends."""
+	out = os.path.join(SMALL_FS, 'sparse-%d' % os.getpid())
+	subprocess.run(['rm', '-rf', out])
+	os.makedirs(out)
+	try:
+		size = 4 << 20
+		pieces = {0: b'n' * _PAGE, size - 3 * _PAGE: b'N' * (2 * _PAGE)}
+		_sparse(tmp_path / 'a/x', pieces, size)
+		old_maker(os.path.join(out, 'x'), size)
+		cp = tmp_path / 'noroomcp'
+		cp.write_text(_NO_ROOM_FOR_A_TEMPORARY_CP)
+		os.chmod(str(cp), 0o755)
+		left = os.statvfs(out).f_bavail * os.statvfs(out).f_frsize
+		if left > free:
+			with open(os.path.join(out, 'fill'), 'wb') as f:
+				f.write(b'f' * (left - free))
+		rc, output = run([str(tmp_path / 'a/x'), '-d', out + '/'], tmp_path, env={'CP_PATH': str(cp)})
+		assert os.path.exists(os.path.join(out, 'x')), (rc, output.decode(errors='replace'))
+		with open(os.path.join(out, 'x'), 'rb') as f:
+			content = f.read()
+		expected = bytearray(size)
+		for offset, data in pieces.items():
+			expected[offset:offset + len(data)] = data
+		return rc, output, content == bytes(expected), os.stat(os.path.join(out, 'x')), temporaries(out)
+	finally:
+		subprocess.run(['rm', '-rf', out])
+
+
+@posix_only
+@small_fs
+def test_a_sparse_rewrite_in_place_keeps_its_holes_and_needs_no_room_for_them(tmp_path):
+	# A 4 MiB source holding 12 KiB of data, over an old copy of the same layout, with 1 MiB free: written byte by byte it
+	# fills the old copy's holes with zeros, runs out of room, and the old copy is torn and removed. The holes stay holes.
+	def same_layout(path, size):
+		_sparse(path, {0: b'o' * _PAGE, size - 3 * _PAGE: b'O' * (2 * _PAGE)}, size)
+	rc, output, same, st, temps = _rewrite_in_place(tmp_path, same_layout, 1 << 20)
+	assert rc == 0 and same and temps == [], output[-2000:]
+	assert st.st_size == 4 << 20 and st.st_blocks * 512 < 1 << 18, st
+
+
+@posix_only
+@small_fs
+def test_a_sparse_source_rewritten_over_a_dense_old_copy_has_the_right_content(tmp_path):
+	# The zeros of the source's holes are written over the old copy's data: no hole to keep there.
+	def dense(path, size):
+		write(path, b'd' * size)
+	rc, output, same, st, temps = _rewrite_in_place(tmp_path, dense, 3 << 20)
+	assert rc == 0 and same and temps == [] and st.st_size == 4 << 20, output[-2000:]
+
+
 # ---- rule 9: a stop is a cleanup ----
 
 _SLOW_CP = '''#!/bin/sh
