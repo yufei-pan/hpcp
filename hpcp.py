@@ -240,7 +240,7 @@ except ImportError:
 	hasher = hashlib.blake2b()
 	xxhash_available = False
 
-version = '9.85'
+version = '9.86'
 __version__ = version
 COMMIT_DATE = '2026-11-09'
 
@@ -3624,22 +3624,31 @@ _MAX_BLOCK = 1 << 16  # the largest block or page size of any filesystem hpcp me
 _WRITE_OVER_CHUNK = 1 << 20  # one read or write at a time: big enough that a call's cost is lost in its bytes
 # posix_fallocate's errors that say the filesystem cannot allocate this way, not that it is short of room: nothing is reserved.
 _NO_FALLOCATE = frozenset(getattr(errno, name) for name in ('EINVAL', 'EOPNOTSUPP', 'ENOTSUP', 'ENOSYS', 'ENODEV') if hasattr(errno, name))
-# Filesystems that write every overwrite to new blocks (df -PT's names). An XFS extent shared by a reflink does too, per extent.
-_COPY_ON_WRITE = frozenset(('btrfs', 'zfs', 'bcachefs'))
+# The filesystems where an overwrite goes to the blocks already there, so writing over a file needs no room (df -PT's names;
+# an XFS extent shared by a reflink is the exception, per extent). Not a list of those that copy on write: df names the
+# filesystem the client sees, and behind an overlay, a FUSE mount, an NFS or SMB share or a Lustre OST the blocks can be
+# btrfs's or ZFS's (an overlay on a nearly full btrfs tore the old copy, written over, where cp wrote the file whole: VM 901,
+# 48 MiB with 4 MiB free). An unknown or unreadable type is cp's too.
+_WRITES_IN_PLACE = frozenset(('ext2', 'ext3', 'ext4', 'xfs', 'tmpfs'))
 _FS_TYPES = {}  # st_dev: df -PT's type, once per device in a worker
 
-def _copies_on_write(path, dev):
+def _writes_in_place(path, dev, src_dev):
+	"""Whether a file at path, on device dev, is to be written over: its filesystem is one of _WRITES_IN_PLACE, and it is not
+	XFS with the source on the same device (src_dev), where coreutils 9.0 or later clones the source and needs no room (9.84)."""
 	if dev not in _FS_TYPES:
 		_FS_TYPES[dev] = get_fs_type_from_path(path)
-	return _FS_TYPES[dev] in _COPY_ON_WRITE
+	fs_type = _FS_TYPES[dev]
+	return fs_type in _WRITES_IN_PLACE and not (fs_type == 'xfs' and src_dev == dev)
 
 def _write_over(src_path, target):
 	"""Write src_path's bytes over target and cut it to their length: True. False, with nothing written, where cp is to do
 	it: either side is not a regular file, they are one file, target is smaller than the source (it grows: room is needed
 	anyway), it cannot be opened for reading and writing as it is (cp -f then writes or replaces it), cp is not GNU cp (no
 	--attributes-only), target is sparse but its filesystem shows no hole (NFS before 4.2 says data everywhere: written
-	over, every hole would be filled; cp keeps them), or its filesystem copies on write (_COPY_ON_WRITE: written over, the
-	old copy needs room for all of it; cp frees it first, or clones a source on the same filesystem).
+	over, every hole would be filled; cp keeps them), or its filesystem is not one known to overwrite in place
+	(_WRITES_IN_PLACE: on one that copies on write, written over, the old copy needs room for all of it; cp frees it first,
+	or clones a source on the same filesystem), or is XFS with the source on the same device (cp clones it, coreutils 9.0 or
+	later: written over, the shared extents need room), or room cannot be reserved there (_NO_FALLOCATE).
 
 	Only the source's data is read and written (its data extents, SEEK_DATA/SEEK_HOLE; all of it where that cannot tell).
 	Where the source has a hole, target's data there is punched to a hole (_punch), so the result is as sparse as the source,
@@ -3653,9 +3662,11 @@ def _write_over(src_path, target):
 		if not (stat.S_ISREG(source.st_mode) and stat.S_ISREG(old.st_mode) and old.st_size >= source.st_size
 			and (source.st_dev, source.st_ino) != (old.st_dev, old.st_ino) and cp_supports_sparse()):
 			return False
-		if _copies_on_write(target, old.st_dev):
-			# Every overwrite there takes new room before the old blocks go: on a nearly full btrfs, written over, the old copy
-			# was torn where cp, truncating it first (or cloning a source on the same filesystem), wrote it whole. cp, as 9.84.
+		if not _writes_in_place(target, old.st_dev, source.st_dev):
+			# An overwrite there may take new room before the old blocks go: on a nearly full btrfs, written over, the old copy
+			# was torn where cp, truncating it first (or cloning a source on the same filesystem), wrote it whole. On XFS with
+			# the source on the same filesystem, coreutils 9.0 or later clones it, and the old copy's shared extents, written
+			# over, need room. cp, as 9.84.
 			return False
 		# Read and write: where the filesystem has no fallocate, glibc's posix_fallocate reads each block before it writes one
 		# (EBADF on a write-only descriptor: checked on EL8, ext4 without extents).
@@ -3690,14 +3701,17 @@ def _write_over(src_path, target):
 							reserved.append((hole, after))  # before the call: a failing one may have allocated a part
 							os.posix_fallocate(fd, hole, stop - hole)
 				except BaseException as e:
-					if not (isinstance(e, OSError) and e.errno in _NO_FALLOCATE):
-						# A short disk, or a stop: what was reserved goes back. Each was a hole: it reads zeros either way. Where it
-						# cannot be punched, the room stays.
-						for hole, after in reserved:
-							_punch(fd, hole, after)
-						if not isinstance(e, OSError):
-							raise  # the stop goes on: nothing was written, so _cp_in_place keeps the old copy (its times below)
-						raise _KeptOld(f"no room for the source's data where the old copy has holes ({_why(e)})")
+					# A short disk, or a stop: what was reserved goes back. Each was a hole: it reads zeros either way. Where it
+					# cannot be punched, the room stays.
+					for hole, after in reserved:
+						_punch(fd, hole, after)
+					if not isinstance(e, OSError):
+						raise  # the stop goes on: nothing was written, so _cp_in_place keeps the old copy (its times below)
+					if e.errno in _NO_FALLOCATE:
+						# No room can be reserved here (musl's posix_fallocate on ext3, which glibc writes block by block): written
+						# over unreserved, a short disk would tear the old copy. cp, as 9.84.
+						return False
+					raise _KeptOld(f"no room for the source's data where the old copy has holes ({_why(e)})")
 				finally:
 					# fallocate and the punch move the mtime (XFS; ext4 on EL8's kernel and later): put back, target reads as it
 					# did until the first write, so a short disk or a stop before then leaves it (_cp_in_place removes only a
