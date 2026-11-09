@@ -3679,13 +3679,14 @@ def _write_over(src_path, target):
 					for start, end in extents:
 						for hole, stop in _holes(fd, start, end):
 							try:
-								# Where the old copy's hole goes on past stop, the punch back goes on with it: a block cut by stop (the
-								# source's end) is freed only by a punch that covers it, which may run past the end of the file.
-								after = os.lseek(fd, stop, os.SEEK_DATA)
+								# Where the old copy's hole goes on past stop, the punch back goes on with it to the end of the block cut
+								# by stop (the source's end), which only a punch that covers it frees, and which may lie past the end of
+								# the file; no further, where the old copy may hold room of its own (fallocated, read as a hole).
+								after = min(os.lseek(fd, stop, os.SEEK_DATA), -(-stop // _MAX_BLOCK) * _MAX_BLOCK)
 							except OSError as e:
 								# ENXIO: no data from stop on. Any other error (an NFS soft timeout) cannot tell where the old copy's
 								# data starts: no further than stop, or the punch back would take that data.
-								after = old.st_size + _MAX_BLOCK if e.errno == errno.ENXIO else stop
+								after = -(-stop // _MAX_BLOCK) * _MAX_BLOCK if e.errno == errno.ENXIO else stop
 							reserved.append((hole, after))  # before the call: a failing one may have allocated a part
 							os.posix_fallocate(fd, hole, stop - hole)
 				except BaseException as e:
