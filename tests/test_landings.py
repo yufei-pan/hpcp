@@ -9,6 +9,7 @@ import stat
 import subprocess
 import sys
 import time
+import types
 
 import pytest
 
@@ -892,6 +893,7 @@ def test_a_sparse_old_copy_where_no_hole_shows_goes_to_cp(hpcp_mod, monkeypatch,
 	_sparse(old, {0: b'o' * _PAGE}, 4 << 20)
 	if os.stat(str(old)).st_blocks * 512 >= 4 << 20 or not hpcp_mod.cp_supports_sparse():
 		pytest.skip('no sparse files here, or no GNU cp')
+	monkeypatch.setattr(hpcp_mod, '_writes_in_place', lambda path, dev, src_dev: True)
 	lseek = os.lseek
 	def data_everywhere(fd, offset, whence):
 		if whence == os.SEEK_HOLE:
@@ -917,6 +919,7 @@ def test_a_write_over_reserves_room_only_over_holes_and_keeps_the_old_copy_witho
 				pytest.skip('no hole shows here')
 	if not (hpcp_mod.cp_supports_sparse() and hasattr(os, 'posix_fallocate')):
 		pytest.skip('no GNU cp, or no posix_fallocate')
+	monkeypatch.setattr(hpcp_mod, '_writes_in_place', lambda path, dev, src_dev: True)
 	os.utime(str(old), ns=(10 ** 18, 10 ** 18))
 	asked = []
 	def no_room(fd, offset, length):
@@ -945,7 +948,7 @@ def test_a_stop_right_after_the_reservation_keeps_the_old_copy(hpcp_mod, monkeyp
 			pytest.skip('no hole shows here')
 	if not (hpcp_mod.cp_supports_sparse() and hasattr(os, 'posix_fallocate')):
 		pytest.skip('no GNU cp, or no posix_fallocate')
-	monkeypatch.setattr(hpcp_mod, '_copies_on_write', lambda path, dev: False, raising=False)
+	monkeypatch.setattr(hpcp_mod, '_writes_in_place', lambda path, dev, src_dev: True)
 	os.utime(str(old), ns=(10 ** 18, 10 ** 18))
 	before = old.read_bytes()
 	def moved_then_stopped(fd, offset, length):
@@ -993,7 +996,7 @@ def test_a_failed_reservation_gives_back_the_room_it_took(hpcp_mod, monkeypatch,
 	size = (8 << 20) + 5000
 	_sparse(source, dict([(mib << 20, b'n' * (256 << 10)) for mib in (0, 4)] + [(8 << 20, b'N' * 5000)]), size)
 	_sparse(old, {0: b'o' * _PAGE}, size)
-	monkeypatch.setattr(hpcp_mod, '_copies_on_write', lambda path, dev: False, raising=False)
+	monkeypatch.setattr(hpcp_mod, '_writes_in_place', lambda path, dev, src_dev: True)
 	os.utime(str(old), ns=(10 ** 18, 10 ** 18))
 	before, blocks = old.read_bytes(), _blocks(old)
 	real, asked = os.posix_fallocate, []
@@ -1009,12 +1012,13 @@ def test_a_failed_reservation_gives_back_the_room_it_took(hpcp_mod, monkeypatch,
 	assert _blocks(old) == blocks and os.stat(str(old)).st_mtime_ns == 10 ** 18
 
 
-def test_a_sparse_source_rewritten_over_a_dense_old_copy_ends_sparse(hpcp_mod, tmp_path):
+def test_a_sparse_source_rewritten_over_a_dense_old_copy_ends_sparse(hpcp_mod, monkeypatch, tmp_path):
 	# Zeros over every source hole made the old copy's dense 8 MiB stay dense (a 1 TB image with 10 GB of data wrote 990 GB
 	# of zeros); cp, as in 9.84, leaves the holes. Where the source has a hole the old copy's data is punched out.
 	_can_punch(hpcp_mod, tmp_path)
 	source, old = tmp_path / 's', tmp_path / 'o'
 	_sparse(source, {0: b'n' * _PAGE, 7 << 20: b'N' * _PAGE}, 8 << 20)
+	monkeypatch.setattr(hpcp_mod, '_writes_in_place', lambda path, dev, src_dev: True)
 	write(old, b'o' * (8 << 20))
 	assert hpcp_mod._write_over(str(source), str(old)) is True
 	assert old.read_bytes() == source.read_bytes() and _blocks(old) * 512 < 1 << 20
@@ -1027,7 +1031,7 @@ def test_where_nothing_punches_zeros_go_over_the_old_copys_data(hpcp_mod, monkey
 	source, old = tmp_path / 's', tmp_path / 'o'
 	_sparse(source, {0: b'n' * _PAGE, 7 << 20: b'N' * _PAGE}, 8 << 20)
 	write(old, b'o' * (8 << 20))
-	monkeypatch.setattr(hpcp_mod, '_copies_on_write', lambda path, dev: False, raising=False)
+	monkeypatch.setattr(hpcp_mod, '_writes_in_place', lambda path, dev, src_dev: True)
 	monkeypatch.setattr(hpcp_mod, '_punch', lambda fd, start, end: False)
 	assert hpcp_mod._write_over(str(source), str(old)) is True
 	assert old.read_bytes() == source.read_bytes()
@@ -1040,7 +1044,7 @@ def test_a_stop_in_the_reservation_gives_back_the_room_it_took(hpcp_mod, monkeyp
 	source, old = tmp_path / 's', tmp_path / 'o'
 	_sparse(source, {0: b'n' * _PAGE, 1 << 20: b'N' * (256 << 10), 3 << 20: b'N' * (256 << 10)}, 4 << 20)
 	_sparse(old, {0: b'o' * _PAGE}, 4 << 20)
-	monkeypatch.setattr(hpcp_mod, '_copies_on_write', lambda path, dev: False, raising=False)
+	monkeypatch.setattr(hpcp_mod, '_writes_in_place', lambda path, dev, src_dev: True)
 	os.utime(str(old), ns=(10 ** 18, 10 ** 18))
 	before, blocks = old.read_bytes(), _blocks(old)
 	real, asked = os.posix_fallocate, []
@@ -1064,7 +1068,7 @@ def test_a_seek_that_fails_keeps_the_give_back_off_the_old_copys_data(hpcp_mod, 
 	source, old = tmp_path / 's', tmp_path / 'o'
 	_sparse(source, {0: b'n' * (512 << 10), 2 << 20: b'N' * (512 << 10)}, 4 << 20)
 	_sparse(old, {1 << 20: b'o' * (1 << 20), 3 << 20: b'O' * (1 << 20)}, 4 << 20)
-	monkeypatch.setattr(hpcp_mod, '_copies_on_write', lambda path, dev: False, raising=False)
+	monkeypatch.setattr(hpcp_mod, '_writes_in_place', lambda path, dev, src_dev: True)
 	before, ino = old.read_bytes(), os.stat(str(old)).st_ino
 	lseek, fallocate, asked = os.lseek, os.posix_fallocate, []
 	def fails_there(fd, offset, whence):
@@ -1084,15 +1088,93 @@ def test_a_seek_that_fails_keeps_the_give_back_off_the_old_copys_data(hpcp_mod, 
 	assert len(asked) == 2 and kept
 
 
-def test_a_copy_on_write_filesystem_is_left_to_cp(hpcp_mod, monkeypatch, tmp_path):
+@pytest.mark.parametrize('fs_type', ['btrfs', 'zfs', 'overlay', 'nfs', 'nfs4', 'cifs', 'fuse.mergerfs', 'lustre', ''])
+def test_a_filesystem_not_known_to_overwrite_in_place_is_left_to_cp(hpcp_mod, monkeypatch, tmp_path, fs_type):
 	# On a nearly full btrfs an overwrite takes new room before the old blocks go: written over, the old copy was torn where
-	# cp, truncating it first, wrote it whole (VM 901, Debian 12, 48 MiB with 24 MiB free).
+	# cp, truncating it first, wrote it whole (VM 901, Debian 12, 48 MiB with 24 MiB free). df names only the filesystem the
+	# client sees: an overlay on that btrfs tore it the same way with 4 MiB free (9.85, VM 901), as can an NFS or SMB share of
+	# one, a FUSE mount over one, or a Lustre OST on ZFS. An unknown type ('': df failed) is cp's too.
 	source, old = tmp_path / 's', tmp_path / 'o'
 	write(source, b'n' * (1 << 20))
 	write(old, b'o' * (1 << 20))
 	monkeypatch.setattr(hpcp_mod, '_FS_TYPES', {})
-	monkeypatch.setattr(hpcp_mod, 'get_fs_type_from_path', lambda path: 'btrfs')
+	monkeypatch.setattr(hpcp_mod, 'get_fs_type_from_path', lambda path: fs_type)
 	assert hpcp_mod._write_over(str(source), str(old)) is False and old.read_bytes() == b'o' * (1 << 20)
+
+
+def test_a_zfs_dataset_with_a_space_in_its_name_is_left_to_cp(hpcp_mod, monkeypatch, tmp_path):
+	# df -PT's second field is the type only where the filesystem's name has no space: for the dataset 'tank/my data' it is
+	# 'data'. Not a name in _WRITES_IN_PLACE, so cp's (9.85, which listed the copy-on-write names, wrote it over).
+	source, old = tmp_path / 's', tmp_path / 'o'
+	write(source, b'n' * (1 << 20))
+	write(old, b'o' * (1 << 20))
+	df = ['Filesystem Type 1024-blocks Used Available Capacity Mounted on', 'tank/my data zfs 1000 900 100 90% /tank/my data']
+	real = hpcp_mod.run_command_in_multicmd_with_path_check
+	monkeypatch.setattr(hpcp_mod, '_FS_TYPES', {})
+	monkeypatch.setattr(hpcp_mod, 'run_command_in_multicmd_with_path_check',
+		lambda command, *a, **k: df if command[0] == 'df' else real(command, *a, **k))
+	assert hpcp_mod.get_fs_type_from_path(str(old)) == 'data'
+	assert hpcp_mod._write_over(str(source), str(old)) is False and old.read_bytes() == b'o' * (1 << 20)
+
+
+@pytest.mark.parametrize('fs_type', ['ext2', 'ext3', 'ext4', 'tmpfs', 'xfs'])
+def test_a_filesystem_known_to_overwrite_in_place_is_written_over(hpcp_mod, monkeypatch, tmp_path, fs_type):
+	# The allowlist's names, as df -PT gives them (xfs with the source on another device: see the next test).
+	if not hpcp_mod.cp_supports_sparse():
+		pytest.skip('no GNU cp')
+	source, old = tmp_path / 's', tmp_path / 'o'
+	write(source, b'n' * (1 << 20))
+	write(old, b'o' * (1 << 20))
+	ino = os.stat(str(old)).st_ino
+	monkeypatch.setattr(hpcp_mod, '_FS_TYPES', {})
+	monkeypatch.setattr(hpcp_mod, 'get_fs_type_from_path', lambda path: fs_type)
+	real = os.lstat
+	def source_elsewhere(path, *args, **kwargs):
+		st = real(path, *args, **kwargs)
+		if path == str(source):  # only the fields _write_over reads
+			return types.SimpleNamespace(st_mode=st.st_mode, st_size=st.st_size, st_ino=st.st_ino, st_dev=st.st_dev + 1)
+		return st
+	monkeypatch.setattr(hpcp_mod.os, 'lstat', source_elsewhere)
+	assert hpcp_mod._write_over(str(source), str(old)) is True
+	assert old.read_bytes() == source.read_bytes() and os.stat(str(old)).st_ino == ino
+
+
+def test_xfs_with_the_source_on_the_same_device_is_left_to_cp(hpcp_mod, monkeypatch, tmp_path):
+	# On XFS with reflink, coreutils 9.0 or later clones a source on the same filesystem (9.84's cp, Debian 12, coreutils
+	# 9.1): no room needed. Written over, the old copy's shared extents need room, and on a nearly full disk it was torn.
+	source, old = tmp_path / 's', tmp_path / 'o'
+	write(source, b'n' * (1 << 20))
+	write(old, b'o' * (1 << 20))
+	assert os.stat(str(source)).st_dev == os.stat(str(old)).st_dev
+	monkeypatch.setattr(hpcp_mod, '_FS_TYPES', {})
+	monkeypatch.setattr(hpcp_mod, 'get_fs_type_from_path', lambda path: 'xfs')
+	assert hpcp_mod._write_over(str(source), str(old)) is False and old.read_bytes() == b'o' * (1 << 20)
+	# the same type, another device for the source: written over (nothing to clone)
+	assert hpcp_mod._writes_in_place(str(old), os.stat(str(old)).st_dev, os.stat(str(old)).st_dev + 1) is True
+	assert hpcp_mod._writes_in_place(str(old), os.stat(str(old)).st_dev, os.stat(str(old)).st_dev) is False
+
+
+@pytest.mark.parametrize('error', ['EOPNOTSUPP', 'EINVAL', 'ENOSYS'])
+def test_a_filesystem_that_cannot_reserve_room_is_left_to_cp(hpcp_mod, monkeypatch, tmp_path, error):
+	# musl's posix_fallocate on ext3 says EOPNOTSUPP (glibc writes the blocks instead): written over without the reservation,
+	# the source's data landing in the old copy's holes takes room the disk may not have, and the old copy is torn. cp, as
+	# 9.84, with the old copy as it was.
+	source, old = tmp_path / 's', tmp_path / 'o'
+	_sparse(source, {0: b'n' * _PAGE, 3 << 20: b'N' * _PAGE}, 4 << 20)
+	_sparse(old, {0: b'o' * _PAGE}, 4 << 20)
+	with open(str(old), 'rb') as f:
+		if os.lseek(f.fileno(), 0, os.SEEK_HOLE) >= 4 << 20:
+			pytest.skip('no hole shows here')
+	if not (hpcp_mod.cp_supports_sparse() and hasattr(os, 'posix_fallocate')):
+		pytest.skip('no GNU cp, or no posix_fallocate')
+	monkeypatch.setattr(hpcp_mod, '_writes_in_place', lambda path, dev, src_dev: True)
+	os.utime(str(old), ns=(10 ** 18, 10 ** 18))
+	before = old.read_bytes()
+	def cannot(fd, offset, length):
+		raise OSError(getattr(errno, error), os.strerror(getattr(errno, error)))
+	monkeypatch.setattr(hpcp_mod.os, 'posix_fallocate', cannot)
+	assert hpcp_mod._write_over(str(source), str(old)) is False
+	assert old.read_bytes() == before and os.stat(str(old)).st_mtime_ns == 10 ** 18
 
 
 def test_a_source_that_ends_early_is_cut_where_it_ended(hpcp_mod, monkeypatch, tmp_path):
@@ -1102,6 +1184,7 @@ def test_a_source_that_ends_early_is_cut_where_it_ended(hpcp_mod, monkeypatch, t
 	write(old, b'o' * (4 << 20))
 	if not hpcp_mod.cp_supports_sparse():
 		pytest.skip('no GNU cp')
+	monkeypatch.setattr(hpcp_mod, '_writes_in_place', lambda path, dev, src_dev: True)
 	extents = hpcp_mod._data_extents
 	def then_cut(fd, start, end):
 		yield from extents(fd, start, end)
