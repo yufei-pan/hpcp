@@ -788,10 +788,14 @@ def _named_sources(src_path, may_name_destination):
 _STOP_NAMES = ('SIGINT', 'SIGTERM', 'SIGHUP')
 # hpcp's own signal: a worker's parent-death watch sends it to the worker's main thread (neither hpcp nor multiCMD uses it).
 _WATCH_SIGNAL = getattr(signal, 'SIGUSR2', None)
-# The signal that stopped this process, once one did (_stop).
+# The signal that stopped this process, once one did (_stop), and that process: a worker forked after it has both.
 _STOPPED = None
+_STOPPED_PID = None
 # True in a worker while it runs a task (_run_task): a stop then ends the task by its cleanup path, else the worker at once.
 _IN_TASK = False
+# The process that put _stop in place for itself (_install_stops). A pool worker forked from it (Python before 3.14 forks
+# them) has _stop too before its first task, with nothing to clean up.
+_STOPS_PID = None
 # Twice multiCMD's longest stop of a command (0.01 s, up to 1 s, SIGKILL, up to 1 s more): the watch's grace before os._exit.
 _WATCH_GRACE = 4
 
@@ -813,23 +817,34 @@ def _stop(signum, frame):
 	cleaned up); later ones return, so a second Ctrl-C cannot cut the cleanup halfway. The stop is passed on to this
 	process's pool workers, which a signal to this process alone (kill PID, timeout) never reaches. A pool worker between
 	tasks has nothing to clean up and ends at once."""
-	global _STOPPED
-	if _STOPPED is not None:
+	global _STOPPED, _STOPPED_PID
+	if not _IN_TASK and (_worker_initialized or os.getpid() != _STOPS_PID):
+		# A worker between tasks, or one that has run none yet (forked with this handler, and with the parent's _STOPPED when
+		# forked after its stop): nothing to clean up, and any stop ends it. Kept, it would wait in the pool's queue for good,
+		# and the pool's shutdown with it. SystemExit unwinds through the queue's locks, letting go of the one it holds
+		# while it waits (killed holding it, the other workers could never read the pool's shutdown), and multiprocessing
+		# ends a worker on it without a traceback.
+		raise SystemExit(128 + signum)
+	if _STOPPED is not None and _STOPPED_PID == os.getpid():
 		return
-	_STOPPED = signum
+	_STOPPED, _STOPPED_PID = signum, os.getpid()
+	_pass_stop_on(signum)
+	raise KeyboardInterrupt
+
+def _pass_stop_on(signum):
+	"""Send a stop to this process's pool workers, which a signal to this process alone (kill PID, timeout) never reaches."""
 	for child in multiprocessing.active_children():
 		try:
 			os.kill(child.pid, signum if signum != _WATCH_SIGNAL else signal.SIGTERM)
 		except OSError:
 			pass
-	if _worker_initialized and not _IN_TASK:
-		_end_by(signum)
-	raise KeyboardInterrupt
 
 def _install_stops(signals=_STOP_NAMES):
 	"""_stop for each of signals that this process was not started ignoring: nohup starts a run with SIGHUP ignored, a
 	background job of a non-interactive sh with SIGINT ignored, and both must stay so, as Python itself keeps an ignored
 	SIGINT. Only from the main thread (signal.signal)."""
+	global _STOPS_PID
+	_STOPS_PID = os.getpid()
 	for name in signals:
 		signum = getattr(signal, name, None)
 		if signum is not None and signal.getsignal(signum) is not signal.SIG_IGN:
@@ -893,22 +908,25 @@ def _run_task(settings, func, *args, **kwargs):
 	ERRORS is process-local, so the errors go back through the future; a reused worker never carries them into its next task.
 	"""
 	global _IN_TASK
-	_init_worker()
-	globals().update(settings)
-	error_start = len(ERRORS)
-	_IN_TASK = True
 	try:
-		return func(*args, **kwargs), ERRORS[error_start:], None
-	except Exception as e:
-		return None, ERRORS[error_start:], f'{type(e).__name__}: {e}'
+		_init_worker()
+		globals().update(settings)
+		error_start = len(ERRORS)
+		_IN_TASK = True
+		try:
+			return func(*args, **kwargs), ERRORS[error_start:], None
+		except Exception as e:
+			return None, ERRORS[error_start:], f'{type(e).__name__}: {e}'
+		finally:
+			_IN_TASK = False
+			del ERRORS[error_start:]
 	except KeyboardInterrupt:
 		if _STOPPED is None:
 			raise
-		# A stop (_stop): the task's cleanup has run on the way here; the worker ends as the signal asked.
+		# A stop (_stop), wherever in the task it came (its setup, its cleanup): the task's cleanup has run on the way here,
+		# and the worker ends as the signal asked. Let through, the pool would take it for the task's error and keep the
+		# worker, which then ignores every later stop.
 		_end_by(_STOPPED)
-	finally:
-		_IN_TASK = False
-		del ERRORS[error_start:]
 
 def _task_result(future, default, crash_prefix):
 	"""A _submit_task future's result in the parent. The errors the task recorded join ERRORS (the worker printed them);
@@ -13043,6 +13061,9 @@ def main():
 			 exit_not_enough_space = args.exit_not_enough_space,do_not_remove_files_while_listing = args.do_not_remove_files_while_listing,
 			 no_fs_param_mirror = args.no_fs_param_mirror, get_diff_image = args.get_diff_image,
 			 load_diff_image = args.load_diff_image, force_apply = args.force_apply)
+		if _STOPPED is not None:
+			# A worker forked after the stop was passed on (a stop while the pool was starting) would hold the exit.
+			_pass_stop_on(_STOPPED)
 		if _STOPPED is not None and _STOPPED != getattr(signal, 'SIGINT', None):
 			# Cleaned up: end by the signal, as 9.84 died by it, so timeout, a shell and systemd see what they sent. Ctrl-C keeps 130.
 			_end_by(_STOPPED)

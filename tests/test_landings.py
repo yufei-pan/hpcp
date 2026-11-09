@@ -855,6 +855,50 @@ def test_stop_handlers_keep_an_ignored_signal_ignored(hpcp_mod, monkeypatch):
 	assert installed == {signal.SIGINT: hpcp_mod._stop, signal.SIGTERM: hpcp_mod._stop}
 
 
+@posix_only
+def test_a_stop_prints_no_traceback_from_workers_that_ran_no_task(tmp_path):
+	# Python 3.6 to 3.13 fork the pool's workers, and a worker has _stop before its first task: each idle one printed a
+	# KeyboardInterrupt traceback from the pool's queue (four here: four files, eight workers).
+	task, marks = _slow_run(tmp_path, ['-j', '8'])
+	try:
+		_wait_for(lambda: len(os.listdir(str(marks))) >= 4)
+		os.kill(task.pid, signal.SIGTERM)
+		output = task.communicate(timeout=60)[0]
+		_wait_for(lambda: _group_gone(task.pid), timeout=30)
+	finally:
+		if task.poll() is None:
+			os.killpg(task.pid, signal.SIGKILL)
+	assert task.returncode == -signal.SIGTERM and b'Traceback' not in output, output[-2000:]
+	assert temporaries(tmp_path / 'out') == [] and _each_old_or_new(tmp_path), output[-2000:]
+
+
+def test_a_stop_in_a_task_s_setup_ends_the_worker(hpcp_mod, monkeypatch):
+	# 9.85's first build: a stop in _init_worker raised KeyboardInterrupt outside _run_task's handler; the pool took it for the
+	# task's error and kept the worker, which then ignored every later stop, and the pool's shutdown waited for it for good
+	# (an early Ctrl-C hung about 1 run in 20 on EL8, Python 3.6).
+	ended = []
+	def interrupted():
+		raise KeyboardInterrupt
+	monkeypatch.setattr(hpcp_mod, '_STOPPED', signal.SIGTERM)
+	monkeypatch.setattr(hpcp_mod, '_init_worker', interrupted)
+	monkeypatch.setattr(hpcp_mod, '_end_by', ended.append)
+	hpcp_mod._run_task({}, lambda: None)
+	assert ended == [signal.SIGTERM] and not hpcp_mod._IN_TASK
+
+
+@pytest.mark.parametrize('initialized', [False, True], ids=['no-task-yet', 'between-tasks'])
+def test_an_idle_worker_ends_on_its_own_stop_after_its_parent_s(hpcp_mod, monkeypatch, initialized):
+	# A worker forked after its parent's stop has the parent's _STOPPED: that must not make it ignore a stop of its own.
+	other = os.getpid() + 1
+	monkeypatch.setattr(hpcp_mod, '_STOPPED', signal.SIGINT)
+	monkeypatch.setattr(hpcp_mod, '_STOPPED_PID', other)
+	monkeypatch.setattr(hpcp_mod, '_STOPS_PID', os.getpid() if initialized else other)
+	monkeypatch.setattr(hpcp_mod, '_worker_initialized', initialized)
+	monkeypatch.setattr(hpcp_mod, '_IN_TASK', False)
+	with pytest.raises(SystemExit):
+		hpcp_mod._stop(signal.SIGTERM, None)
+
+
 # ---- entry 6: a move of a link and a path through it ----
 
 def _linked(root):
