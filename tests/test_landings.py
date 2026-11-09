@@ -1041,3 +1041,137 @@ def test_a_non_ascii_name_copies_with_lang_unset(tmp_path):
 	with open(p(b'o3', b'd\xc3\xa9', b'f\xc3\xafle'), 'rb') as f:
 		assert f.read() == b'x'
 	assert not os.path.lexists(p(b's', b'na\xc3\xafve'))
+
+
+# ---- what a power cut finds: a rewrite and a move are on disk before the old copy or the source goes ----
+
+def _spy_fsync_and_renames(hpcp_mod, monkeypatch, fsync_error=None):
+	"""Record ('fsync', inode) for each fsync and ('rename', inode of what is renamed) for each rename or replace, in order;
+	fsync_error: an errno each fsync fails with instead."""
+	events = []
+	real_fsync, real_rename, real_replace = os.fsync, os.rename, os.replace
+	def fsync(fd):
+		events.append(('fsync', os.fstat(fd).st_ino))
+		if fsync_error is not None:
+			raise OSError(fsync_error, os.strerror(fsync_error))
+		return real_fsync(fd)
+	def renamer(real):
+		def rename(src, dst, *args, **kwargs):
+			events.append(('rename', os.lstat(src).st_ino))
+			return real(src, dst, *args, **kwargs)
+		return rename
+	monkeypatch.setattr(hpcp_mod.os, 'fsync', fsync)
+	monkeypatch.setattr(hpcp_mod.os, 'rename', renamer(real_rename))
+	monkeypatch.setattr(hpcp_mod.os, 'replace', renamer(real_replace))
+	return events
+
+
+@posix_only
+def test_a_rewrite_is_on_disk_before_it_is_renamed_over_the_old_copy(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	# XFS does not flush a file renamed over another, and no filesystem orders its data before the rename: unsynced, a power
+	# cut can leave the landing empty and the old copy gone.
+	write(tmp_path / 'a/x', 'new content')
+	write(tmp_path / 'out/x', 'old')
+	monkeypatch.setattr(hpcp_mod, 'NAMED_DESTS', frozenset([str(tmp_path / 'out')]))
+	events = _spy_fsync_and_renames(hpcp_mod, monkeypatch)
+	hpcp_mod.copy_file(str(tmp_path / 'a/x'), [str(tmp_path / 'out/x')])
+	assert read(tmp_path / 'out/x') == 'new content'
+	renamed = [inode for kind, inode in events if kind == 'rename']
+	assert renamed == [os.lstat(str(tmp_path / 'out/x')).st_ino]
+	assert events.index(('fsync', renamed[0])) < events.index(('rename', renamed[0]))
+
+
+@posix_only
+def test_a_rewrite_whose_new_copy_fails_to_reach_the_disk_keeps_the_old_copy(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	# An fsync that fails (EIO) is a failed rewrite: the temporary file goes, the old copy stays (never written in place over
+	# it, where the same disk would fail it too), Copy failed.
+	write(tmp_path / 'a/x', 'new content, longer')
+	write(tmp_path / 'out/x', 'old')
+	monkeypatch.setattr(hpcp_mod, 'NAMED_DESTS', frozenset([str(tmp_path / 'out')]))
+	_spy_fsync_and_renames(hpcp_mod, monkeypatch, errno.EIO)
+	hpcp_mod.copy_file(str(tmp_path / 'a/x'), [str(tmp_path / 'out/x')])
+	assert read(tmp_path / 'out/x') == 'old' and temporaries(tmp_path) == []
+	assert any('Copy failed' in error and 'the new copy cannot be written to disk' in error for error in hpcp_mod.ERRORS), hpcp_mod.ERRORS
+
+
+@posix_only
+@pytest.mark.parametrize('error', ['EINVAL', 'ENOTSUP', 'ENOSYS'])
+def test_a_filesystem_that_cannot_fsync_still_rewrites(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch, error):
+	# Some FUSE filesystems answer fsync with these: the copy goes on as before 9.85.
+	write(tmp_path / 'a/x', 'new content')
+	write(tmp_path / 'out/x', 'old')
+	monkeypatch.setattr(hpcp_mod, 'NAMED_DESTS', frozenset([str(tmp_path / 'out')]))
+	_spy_fsync_and_renames(hpcp_mod, monkeypatch, getattr(errno, error))
+	hpcp_mod.copy_file(str(tmp_path / 'a/x'), [str(tmp_path / 'out/x')])
+	assert read(tmp_path / 'out/x') == 'new content' and temporaries(tmp_path) == [] and not hpcp_mod.ERRORS
+
+
+@posix_only
+def test_a_patch_s_replacement_is_on_disk_before_it_is_renamed(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	write(tmp_path / 'live/x', 'old')
+	write(tmp_path / 'live/.tmpx', 'new')
+	row = type('Row', (), {'new': 'f:3', 'path': 'x'})()
+	monkeypatch.setattr(hpcp_mod, 'decode_state', lambda state: {'size': 3})
+	events = _spy_fsync_and_renames(hpcp_mod, monkeypatch)
+	inode = os.lstat(str(tmp_path / 'live/.tmpx')).st_ino
+	hpcp_mod._finish_replace((row, str(tmp_path / 'live/.tmpx'), str(tmp_path / 'live/x'), str(tmp_path / 'live/.tmpx')),
+		str(tmp_path / 'live'), lambda: None)
+	assert read(tmp_path / 'live/x') == 'new'
+	assert events.index(('fsync', inode)) < events.index(('rename', inode))
+
+
+@posix_only
+def test_a_patch_s_replacement_that_fails_to_reach_the_disk_keeps_the_old_file(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	write(tmp_path / 'live/x', 'old')
+	write(tmp_path / 'live/.tmpx', 'new')
+	row = type('Row', (), {'new': 'f:3', 'path': 'x'})()
+	monkeypatch.setattr(hpcp_mod, 'decode_state', lambda state: {'size': 3})
+	_spy_fsync_and_renames(hpcp_mod, monkeypatch, errno.EIO)
+	hpcp_mod._finish_replace((row, str(tmp_path / 'live/.tmpx'), str(tmp_path / 'live/x'), str(tmp_path / 'live/.tmpx')),
+		str(tmp_path / 'live'), lambda: None)
+	assert read(tmp_path / 'live/x') == 'old' and not os.path.lexists(str(tmp_path / 'live/.tmpx'))
+	assert any(error.startswith('Copy failed: x:') for error in hpcp_mod.ERRORS), hpcp_mod.ERRORS
+
+
+def _move(hpcp_mod, tmp_path, **extra):
+	return hpcp_mod.hpcp([str(tmp_path / 'a') + os.sep], dest_paths=[str(tmp_path / 'out') + os.sep], single_thread=True,
+		remove=True, remove_force=True, **extra)
+
+
+@pytest.mark.skipif(not sys.platform.startswith('linux'), reason='syncfs(2) is Linux')
+def test_a_move_writes_its_destination_to_disk_before_a_source_goes(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	write(tmp_path / 'a/x', 'X')
+	write(tmp_path / 'a/d/y', 'Y')
+	events = []
+	real_syncfs, real_remove = hpcp_mod._syncfs, hpcp_mod.remove_moved_sources
+	def syncfs(path):
+		events.append(('syncfs', path, os.path.exists(str(tmp_path / 'a/x'))))
+		return real_syncfs(path)
+	def remove(*args, **kwargs):
+		events.append(('remove',))
+		return real_remove(*args, **kwargs)
+	monkeypatch.setattr(hpcp_mod, '_syncfs', syncfs)
+	monkeypatch.setattr(hpcp_mod, 'remove_moved_sources', remove)
+	_move(hpcp_mod, tmp_path)
+	assert read(tmp_path / 'out/x') == 'X' and not os.path.exists(str(tmp_path / 'a'))
+	assert events == [('syncfs', str(tmp_path / 'out'), True), ('remove',)]
+
+
+@pytest.mark.skipif(not sys.platform.startswith('linux'), reason='syncfs(2) is Linux')
+@pytest.mark.parametrize('why', ['Input/output error', 'this system has no syncfs(2)'])
+def test_a_move_whose_destination_cannot_be_synced_removes_no_source(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch, capsys, why):
+	write(tmp_path / 'a/x', 'X')
+	monkeypatch.setattr(hpcp_mod, '_syncfs', lambda path: why)
+	rc = _move(hpcp_mod, tmp_path)
+	assert read(tmp_path / 'out/x') == 'X' and read(tmp_path / 'a/x') == 'X'
+	err = capsys.readouterr().err
+	assert 'Remove skipped: not removing ' in err and f'{tmp_path / "out"}/ cannot be written to disk ({why}), so the copies may not be on disk yet' in err, err
+	assert rc == 212
+
+
+@posix_only
+def test_a_move_writes_its_destination_to_disk_end_to_end(tmp_path):
+	# The real syncfs in a run: the move ends as before.
+	write(tmp_path / 'a/x', 'X')
+	rc, output = run(['a/', '-d', 'out/', '-rf'], tmp_path)
+	assert rc == 0 and read(tmp_path / 'out/x') == 'X' and not os.path.exists(str(tmp_path / 'a')), output[-2000:]

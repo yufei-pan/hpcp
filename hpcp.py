@@ -3593,12 +3593,19 @@ def _cp_once(src_path, dest_path, cp_flags, sparse, forced):
 				attributes = _fat_attributes(target)
 			elif not CONTENT_ONLY:
 				_remove_stale_xattrs(src_path, temp)
+			try:
+				_fsync_file(temp)
+			except OSError as e:
+				# The new copy may not reach the disk: renamed, a power cut could leave nothing where the old copy was.
+				raise _KeptOld(f'the new copy cannot be written to disk ({_why(e)})')
 			os.rename(temp, target)
 			renamed = True  # nothing left to discard: an unlink of the gone name costs a round trip on NFS
 			if attributes is not None and attributes != _fat_attributes(target):
 				_set_fat_attributes(target, attributes, target)
 			return get_file_size(target)
 		except Exception as e:
+			if isinstance(e, _KeptOld):
+				raise  # the destination failed the new copy's write: in place would fail it too, over the old one
 			made = os.path.lexists(temp)
 			if not (forced or whole):
 				raise
@@ -6267,6 +6274,7 @@ def _finish_replace(job, target_root, wait, metadata=True):
 			raise RuntimeError(reason)
 		# A FAT file keeps its read-only / hidden / system bits: the replacement would otherwise get the defaults.
 		attributes = None if metadata else _fat_attributes(dest)
+		_fsync_file(tmp)  # renamed unsynced, a power cut can leave dest empty (_fsync_file)
 		os.replace(tmp, dest)
 		if attributes is not None and attributes != _fat_attributes(dest):
 			_set_fat_attributes(dest, attributes, row.path)
@@ -12139,18 +12147,83 @@ def dd_partition(src_partition_path,dest_partition_path,partition,dd_src,dd_dest
 
 def _syncfs(path):
 	"""Write the filesystem path is on, and no other: syncfs(2), through ctypes (Python has no os.syncfs). os.sync and the sync
-	command write every filesystem on the host. No libc, no syncfs in it, or an error is a flush that was not made, which a
-	run does without (as a copy with cp does)."""
+	command write every filesystem on the host. None when it was made, else why not (no libc, no syncfs in it, path cannot be
+	opened, or the call's error): a patch or an image's flush goes on without it, as a copy with cp does; a move does not
+	remove its sources (_sync_destinations)."""
 	try:
 		import ctypes
 		libc = ctypes.CDLL(None, use_errno=True)
+		call = libc.syncfs
+	except Exception:
+		return 'this system has no syncfs(2)'
+	try:
 		fd = os.open(path, os.O_RDONLY | getattr(os, 'O_CLOEXEC', 0))
+	except OSError as e:
+		return e.strerror or str(e)
+	try:
+		if call(fd) != 0:
+			return os.strerror(ctypes.get_errno())
+	except Exception as e:
+		return str(e)
+	finally:
+		os.close(fd)
+	return None
+
+# fsync's errors that say the file cannot be written to disk this way at all (some FUSE filesystems), not that it failed:
+# the copy goes on without it, as it did before 9.85.
+_NO_FSYNC = frozenset(getattr(errno, name) for name in ('EINVAL', 'ENOTSUP', 'EOPNOTSUPP', 'ENOSYS') if hasattr(errno, name))
+
+def _fsync_file(path):
+	"""Write the data of path, a file this run made (a temporary copy about to be renamed over a landing), to disk: renamed
+	unsynced, a power cut can leave the landing empty where the old copy was (XFS does not flush on such a rename, and no
+	filesystem orders the data before the rename). Raises OSError when the filesystem fails it; returns when it cannot fsync
+	at all (_NO_FSYNC), or when the file's own mode lets its owner neither read nor write it (a copy of a source readable by
+	group or others only), which a filesystem then writes when it does."""
+	flags = getattr(os, 'O_CLOEXEC', 0) | getattr(os, 'O_NOFOLLOW', 0)
+	try:
+		fd = os.open(path, os.O_RDONLY | flags)
+	except PermissionError:
 		try:
-			libc.syncfs(fd)
-		finally:
-			os.close(fd)
-	except (OSError, AttributeError, ImportError):
-		pass
+			fd = os.open(path, os.O_WRONLY | flags)
+		except PermissionError:
+			return
+	try:
+		os.fsync(fd)
+	except OSError as e:
+		if e.errno not in _NO_FSYNC:
+			raise
+	finally:
+		os.close(fd)
+
+def _sync_destinations(dests):
+	"""Write each filesystem a move's copies went to (dests, the destinations as given) before its sources go: the copies'
+	data can still be in memory while the unlinks of the sources are on disk, and a power cut then loses both. Each
+	filesystem once (syncfs); a block device named by -d is fsynced itself. None when all were written, else why not, naming
+	the destination. Off Linux there is no syncfs: None, as before 9.85."""
+	if not sys.platform.startswith('linux'):
+		return None
+	done = set()
+	for dest in dests:
+		path = os.path.abspath(dest)
+		while not os.path.lexists(path) and os.path.dirname(path) != path:
+			path = os.path.dirname(path)
+		try:
+			st = os.stat(path)
+		except OSError as e:
+			return f'{dest} cannot be written to disk ({e.strerror})'
+		if stat.S_ISBLK(st.st_mode):
+			try:
+				_fsync_file(path)
+			except OSError as e:
+				return f'{dest} cannot be written to disk ({e.strerror})'
+			continue
+		if st.st_dev in done:
+			continue
+		why = _syncfs(path if stat.S_ISDIR(st.st_mode) else os.path.dirname(path))
+		if why is not None:
+			return f'{dest} cannot be written to disk ({why})'
+		done.add(st.st_dev)
+	return None
 
 def _flush_loop_device(loop_device, sysfs='/sys/block'):
 	"""
@@ -12738,10 +12811,15 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = multipr
 			eprint(f"Remove skipped: not removing {_sources_text(src_paths)}: {replaced} file(s) in merged directories "
 				'were replaced by a later source, and the earlier source holds their only copy; every source stays')
 		elif remove and dests != ...:
-			# A move: only what the copy listed goes (see remove_moved_sources).
-			remove_moved_sources(src_paths, total_file_list, total_sym_links, single_thread=single_thread, max_workers=max_workers,
-						verbose=verbose, files_per_job=files_per_job, remove_force=remove_force, exclude=exclude, root_ids=source_ids,
-						dests=dests, dest_image=bool(dest_image))
+			# A move: only what the copy listed goes (see remove_moved_sources), once the copies are on disk.
+			unsynced = _sync_destinations(dests)
+			if unsynced:
+				eprint(f'Remove skipped: not removing {_sources_text(src_paths)}: {unsynced}, so the copies may not be on disk '
+					'yet; every source stays. Fix that and re-run')
+			else:
+				remove_moved_sources(src_paths, total_file_list, total_sym_links, single_thread=single_thread, max_workers=max_workers,
+							verbose=verbose, files_per_job=files_per_job, remove_force=remove_force, exclude=exclude, root_ids=source_ids,
+							dests=dests, dest_image=bool(dest_image))
 		elif remove:
 			process_remove(src_paths,single_thread=single_thread, max_workers=max_workers,verbose=verbose,
 						files_per_job=files_per_job, remove_force=remove_force,exclude=exclude,batch=batch,parallel_file_listing=parallel_file_listing)
