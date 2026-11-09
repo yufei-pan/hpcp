@@ -584,6 +584,22 @@ def test_rme_with_listed_files_deletes_nothing(work, hpcp_mod, reset_hpcp_global
 	assert files(work / 'out') == {b'x.txt': b'an earlier flat copy', b'other/keep': b'not from this list', b'src/a/x.txt': b'one'}
 
 
+@pytest.mark.parametrize('entry', [b'out/b/sub/f', b'out/b/sub', b'out/b/sub/'])
+def test_rme_never_removes_a_list_entry_left_in_place_inside_the_destination(tmp_path, hpcp_mod, reset_hpcp_globals, at_a_tty, monkeypatch, entry):
+	# out/b/sub/f is named, and stays where it is ('Skipped 1 list entries inside the destination'); b lands at out/b and has no
+	# sub. 9.84 at a1d61e8 built its guard after the entry was dropped, and removed out/b/sub/f, its only copy, with exit 0.
+	monkeypatch.chdir(tmp_path)
+	write(tmp_path / 'b/f', 'F')
+	write(tmp_path / 'out/b/sub/f', 'only copy')
+	write(tmp_path / 'out/b/stale', 'gone')
+	# An empty directory named in the list is a source too.
+	os.makedirs(str(tmp_path / 'out/b/empty'))
+	os.makedirs(str(tmp_path / 'out/b/stale-dir'))
+	assert hpcp_list(hpcp_mod, tmp_path, entry + b'\nout/b/empty\nb\n', remove_extra=True) == 0
+	assert files(tmp_path / 'out') == {b'b/f': b'F', b'b/sub/f': b'only copy'}
+	assert (tmp_path / 'out/b/empty').is_dir() and not (tmp_path / 'out/b/stale-dir').exists()
+
+
 def test_rme_cleans_only_below_listed_directories(work, hpcp_mod, reset_hpcp_globals, at_a_tty, monkeypatch):
 	monkeypatch.chdir(work)
 	write(work / 'out/src/a/stale', 'gone')
@@ -1051,6 +1067,39 @@ def test_a_skipped_directory_entry_is_no_listed_directory_for_rme(work, hpcp_mod
 	assert hpcp_list(hpcp_mod, work, b'out/gone\nsrc/a/x.txt\n', remove_extra=True) == 0
 	output = capsys.readouterr().out
 	assert (work / 'out/gone/stale').exists() and '-rme checked nothing' in output and 'inside the destination' in output
+
+
+@pytest.mark.parametrize('entries', [b'out\nb\n', b'out/\nb\n', b'./out\n./b\n', b'b\nout/b/sub/f\nout\n'], ids=['name', 'slash', 'dot-slash', 'with-an-entry-inside'])
+def test_a_list_that_names_the_destination_checks_nothing_as_an_argument_does(tmp_path, hpcp_mod, reset_hpcp_globals, at_a_tty, monkeypatch, capsys, entries):
+	# hpcp out b -d out -rme keeps all of out, with one note; a list naming out (or ./out) is the same source. 9.84 at 3c7dcc9
+	# walked out/b and printed "Not removing" for each extra instead (a1d61e8 and 9.83 deleted them).
+	monkeypatch.chdir(tmp_path)
+	def build():
+		shutil.rmtree('out', ignore_errors=True)
+		write(tmp_path / 'b/f', 'F')
+		write(tmp_path / 'out/b/stale', 'S')
+		write(tmp_path / 'out/b/sub/f', 'only copy')
+		write(tmp_path / 'out/other', 'O')
+	build()
+	assert hpcp_mod.hpcp(['out', 'b'], dest_paths=['out'], single_thread=True, remove_extra=True) == 0
+	positional = capsys.readouterr().out, files(tmp_path / 'out')
+	build()
+	assert hpcp_list(hpcp_mod, tmp_path, entries, remove_extra=True) == 0
+	listed = capsys.readouterr().out, files(tmp_path / 'out')
+	assert listed[1] == positional[1] and set(listed[1]) >= {b'b/stale', b'b/sub/f', b'other', b'b/f'}
+	for output, _ in (positional, listed):
+		assert output.count('-rme checked nothing: a source is or holds the destination') == 1 and 'Not removing' not in output
+
+
+def test_a_list_entry_inside_the_destination_that_is_not_the_destination_is_still_judged_and_kept(tmp_path, hpcp_mod, reset_hpcp_globals, at_a_tty, monkeypatch, capsys):
+	# The entry out/b/sub/f is named and kept; extras around it go, as before the destination itself was a list entry's question.
+	monkeypatch.chdir(tmp_path)
+	write(tmp_path / 'b/f', 'F')
+	write(tmp_path / 'out/b/sub/f', 'only copy')
+	write(tmp_path / 'out/b/stale', 'S')
+	assert hpcp_list(hpcp_mod, tmp_path, b'out/b/sub/f\nb\n', remove_extra=True) == 0
+	output = capsys.readouterr().out
+	assert files(tmp_path / 'out') == {b'b/f': b'F', b'b/sub/f': b'only copy'} and '-rme checked nothing' not in output
 
 
 # A source that is another source's destination.
@@ -1777,10 +1826,11 @@ def test_safe_remove_skipped_says_every_source_stays(tmp_path):
 	assert files(tmp_path) == {b'out/sub/x': b'S', b'b/x': b'B', b'out/x': b'B'}
 
 
-def test_remove_skipped_does_not_claim_what_rme_took(tmp_path):
-	# -rme runs first and takes a source inside the destination for extra (docs/limitations.md).
+def test_rme_before_a_skipped_removal_leaves_the_source_inside_the_destination(tmp_path):
+	# -rme runs first: out/sub/x is a source, the only copy of what b/x replaced at out/x. 9.83 took it for extra.
 	rc, output = _rme_in_a_terminal(tmp_path, _a_merge_out_of_the_destination(tmp_path))
-	assert rc == 212 and b'unless -rme removed it above' in output and b'every source stays' not in output, output[-2000:]
+	assert rc == 212 and b'every source stays' in output, output[-2000:]
+	assert _but_log(files(tmp_path)) == {b'out/sub/x': b'S', b'b/x': b'B', b'out/x': b'B'}
 
 
 def test_rme_with_a_named_file_into_its_own_directory_checks_nothing(tmp_path):

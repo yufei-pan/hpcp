@@ -41,13 +41,6 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - **Revisit when:** someone hits it.
 - **Approved:** 2026-11-05, the user chose "Known limitation (Recommended)".
 
-### Positional `-rme` judges the whole destination
-- **Kind:** deferred.
-- **What the operator sees:** `hpcp b -d out/ -rme` lands in `out/b`, but at the prompt's y it also deletes what lies outside that, such as `out/keep`; `hpcp a/x b -d out/ -rme` does the same. Same as 9.80. A source from a list is already limited to what it covers.
-- **Why:** limiting it changes old behaviour and needs its own look; a source ending in a slash mirrors into the destination, where judging all of it is right.
-- **Revisit when:** the next hpcp release, limiting it to where the source lands.
-- **Approved:** 2026-11-05, the user chose "Deferred to 9.82 (Recommended)".
-
 ### A move of a link's directory and a path through the link can end in exit 192
 - **Kind:** deferred.
 - **What the operator sees:** `printf 'lb/\n' | hpcp -sfl - lb/x -d out/ -rf`, with `lb` a link to `b`: `out/x` and the link `out/lb -> b` land, `lb` goes and `b/x`, `b/y`, `b/s/z` stay, in every run. Some runs then end with "not removing lb: it, or a directory on its path, is no longer what the copy listed" and exit 192, the others exit 0. Nothing is lost: the tree comes out the same either way.
@@ -65,12 +58,6 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - **What the operator sees:** a copy onto an existing tree reads each directory it lands in, on one worker, before the first file is copied: about 1 us per file on a local disk, longer on network storage.
 - **Why:** correct and bounded as it is; a parallel scan is its own change.
 - **Revisit when:** the next hpcp release.
-
-### `-rme` can take a source inside the destination for extra
-- **Kind:** deferred.
-- **What the operator sees:** `hpcp out/sub/ b/ -d out/ -rme`, answered y at a terminal, deletes `out/sub/x`, the only copy when `b/x` replaced it at `out/x`: the file lies in the destination and no source lands on it, so it looks extra. With `-rf` the run then exits 212, and its message says -rme may have removed it. Same in 9.80.
-- **Why:** it needs `-rme` to know what the run reads, and that belongs with limiting positional `-rme` to where a source lands.
-- **Revisit when:** the next hpcp release, with "Positional `-rme` judges the whole destination".
 
 ### A source that opens and then fails on read costs the old copy
 - **Kind:** deferred.
@@ -120,7 +107,7 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 
 ### A probe left behind by SIGKILL
 - **Kind:** known limitation.
-- **What the operator sees:** hpcp killed with SIGKILL in the moment it asks a directory about a name leaves a hidden `.hpcp-case-probe-PID-uuid` directory in the destination, empty or holding a small file for each spelling of the name it was asking about; where the probe asks each made name alone (a spelling the directory will not look up, as on vfat), a second such directory can be left beside it. No data is affected. SIGINT, SIGTERM and SIGHUP wait for the probe to go, and left nothing in 30 kills each.
+- **What the operator sees:** hpcp killed with SIGKILL in the moment it asks a directory about a name leaves a hidden `.hpcp-case-probe-PID-uuid` directory in the directory it was asking: a destination directory, or, for a move that renames a file within one directory (`hpcp out/ONE -d out/OTHER -rf`), that source directory, empty or holding a small file for each spelling of the name it was asking about; where the probe asks each made name alone (a spelling the directory will not look up, as on vfat), a second such directory can be left beside it. No data is affected. SIGINT, SIGTERM and SIGHUP wait for the probe to go, and left nothing in 30 kills each.
 - **Why:** SIGKILL cannot be handled, and the only way to ask a directory about two names is to make them.
 - **Revisit when:** an operator reports finding one.
 - **Approved:** 2026-11-06, the user chose "Known limitation (Recommended)".
@@ -134,9 +121,9 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 
 ### An 8.3 alias beside its long name on vfat
 - **Kind:** deferred.
-- **What the operator sees:** `hpcp a/ b/ -d out/ -rf` onto vfat with `a/longfilename.txt` and `b/LONGFI~1.TXT` exits 0 and one content is gone, in about half of the runs: vfat made `LONGFI~1.TXT` the short name of the first file, so the second source is written onto it. The sources are removed. 9.82 does the same.
-- **Why:** a numbered alias such as `LONGFI~1.TXT` is in neither name, so no rule on names catches it, and asking the directory about the pair (`_ask_names`) cannot see that one file already has the other's name: it is the filesystem's invention, not a spelling. (A short name that is a plain fold of the long one, such as `KIZ.TXT` for `kız.txt` with codepage 850 or 857, is caught: dotless `ı` folds with `i`.)
-- **Plan:** the same backstop as for legacy names: before a move removes a source, check that its landing holds that source (the size and modification time `cp -a` gave it, and that the landing is not the source itself, asked by doing in the same directory where they share it), and where it does not, keep the source and report a clash.
+- **What the operator sees:** a copy without a move, `hpcp a/ b/ -d out/` onto vfat with `a/longfilename.txt` and `b/LONGFI~1.TXT`, exits 0 in about a third of the runs with one landing holding the other's content: vfat made `LONGFI~1.TXT` the short name of the first file, so the second source is written onto it. Both sources stay, so nothing is lost, but the destination lacks one of the two files and nothing says so. Since 9.84 a move keeps the source whose landing does not hold it, exit 213 (EL8 vfat: 7 of 20 moves lost a content in 9.83, none in 9.84).
+- **Why:** a numbered alias such as `LONGFI~1.TXT` is in neither name, so no rule on names catches it before the copy, and asking the directory about the pair (`_ask_names`) cannot see that one file already has the other's name: it is the filesystem's invention, not a spelling. The move's backstop (`_moved_not_held`) runs before a removal, and a copy removes nothing.
+- **Plan:** run the same check at the end of a copy, and report each landing that does not hold its source as a `Destination clash` (213).
 - **Revisit when:** the next hpcp release.
 
 ### A copy into its own inside under another spelling on FUSE exFAT
@@ -148,14 +135,14 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 
 ### A legacy name read as UTF-8 or ASCII, against its other case
 - **Kind:** deferred.
-- **What the operator sees:** on a vfat or exFAT mounted with a codepage `iocharset` (`iso8859-1`, `iso8859-9`, `cp1251`, `koi8-r`; not `utf8`), two names that the mount takes for one are not asked about when the net reads one of them as UTF-8 or ASCII, which happens in three ways:
+- **What the operator sees:** on a vfat or exFAT mounted with a codepage `iocharset` (`iso8859-1`, `iso8859-9`, `cp1251`, `koi8-r`, `euc-jp`; not `utf8`), two names that the mount takes for one are not asked about before the copy when the net reads one of them as UTF-8 or ASCII, which happens in four ways:
   - one name's bytes happen to be valid UTF-8 and the other's are not: `C3 A9 74` (Latin-1 `Ã©t`, UTF-8 `ét`) against `E3 A9 74`, which a cp1251 mount reads as `Г©t` and `г©t`;
   - both names' bytes are valid UTF-8, but not as each other's case: KOI8-R `бё` and `бЁ` (`C2 A3` and `C2 B3`), CP1251 `EF B8 B8` and `EF A8 B8`; CP1251 alone has 880 such two-byte pairs;
-  - an ASCII name against a legacy one: `istanbul` against ISO 8859-9 `İstanbul` (`DD` for `İ`, which that table makes the other case of `i`).
+  - an ASCII name against a legacy one: `istanbul` against ISO 8859-9 `İstanbul` (`DD` for `İ`, which that table makes the other case of `i`);
   - two cases of different lengths: EUC-JP `ς` is three bytes (`8F A6 F8`) and `Σ` two (`A6 B2`), and no rule over single bytes can join names of different lengths.
-  `hpcp a/ b/ -d out/ -rf` with one in `a/` and the other in `b/` exits 0 with one content gone, and the rename in case (`hpcp out/ONE -d out/OTHER -rf`) exits 0 and the file is gone. Checked on vfat mounted `iocharset=cp1251`, `koi8-r`, `iso8859-1` and `iso8859-9` (`utf8=0`), and kernel exFAT mounted `iocharset=cp1251` (VM 901). Only for such pairs, and only on such a mount: names that are not UTF-8 as a whole fold byte by byte and meet.
-- **Why:** a name that is valid UTF-8 is read as UTF-8, which it is on every other mount, and the mount's own table, not UTF-8, says what its other case is. Joining every valid name with every name of the same length would ask about most trees pair by pair again.
-- **Plan:** first a backstop that needs no fold rule, the only one that catches names of different lengths: before a move removes a source, check that its landing holds that source (the size and modification time `cp -a` gave it, and that the landing is not the source itself, which is asked by doing, in the same directory, where they share it), and where it does not, keep the source and report a clash. Then catch the pairs before the copy: fold every name byte by byte on a mount with a codepage `iocharset` (read from the mount options), or join byte-level keys across all names.
+  A copy without a move, `hpcp a/ b/ -d out/` with one in `a/` and the other in `b/`, exits 0 with one landing holding the other's content: both sources stay, and the destination lacks one file. Since 9.84 a move keeps the source whose landing does not hold it (213), and so does a rename in case between two such names (`hpcp out/ONE -d out/OTHER -rf`), where 9.83 exited 0 with a content or the file gone. Checked on vfat mounted `iocharset=cp1251`, `koi8-r` and `iso8859-9` (`utf8=0`) on EL8; the EUC-JP pair on kernel exFAT is not checked yet (it needs VM 901). Only for such pairs, and only on such a mount: names that are not UTF-8 as a whole fold byte by byte and meet.
+- **Why:** a name that is valid UTF-8 is read as UTF-8, which it is on every other mount, and the mount's own table, not UTF-8, says what its other case is. Joining every valid name with every name of the same length would ask about most trees pair by pair again. The move's backstop runs before a removal, and a copy removes nothing.
+- **Plan:** run the move's check at the end of a copy too, and report such a landing as a `Destination clash` (213). Then catch the pairs before the copy, so that neither content is written over: fold every name byte by byte on a mount with a codepage `iocharset` (read from the mount options), or join byte-level keys across all names.
 - **Revisit when:** the next hpcp release.
 
 ### Directories that differ only in case on vfat mounted `iocharset=utf8`
@@ -172,3 +159,26 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - **Plan:** make the probe directory and its names relative to a descriptor of the directory (`dir_fd`), so their length is the name's own.
 - **Revisit when:** the next hpcp release.
 
+### vfat: files dated before 1980 are copied again on every rerun
+- **Kind:** deferred (9.85).
+- **What the operator sees:** on vfat, a copy rerun copies every file dated before 1980 again, as 9.83 did (in the EL8 test, each such file and no other). FAT cannot store a time before 1980, so the landing's time never matches the source's.
+- **Why:** the skip check does not read the files when only the time disagrees; the 9.84 move backstop does (`_same_contents`).
+- **Plan:** let the skip check read both files when the landing's time is one the filesystem could not keep (a source dated before vfat's floor, 1980-01-01, 315532800), as the backstop does. That costs two reads instead of one copy, for those files only; reading on every time-only mismatch would read each changed file of the same size twice before copying it anyway.
+- **Revisit when:** 9.85.
+- **Noted:** 2026-11-07, the user's standing rule that deferrals are noted, not asked.
+
+### A list entry that is a link to the destination is taken for a source
+- **Kind:** deferred (9.85).
+- **What the operator sees:** `printf 'outl\nb\n' | hpcp -sfl - -d out -rme`, with `outl -> out`, removes no extra and prints "Not removing" for each one, with no "-rme checked nothing" note; 9.83 cleaned `out/b`. Every version, 9.83 too, also copies the link in as `out/outl`, a link to its own directory. Nothing is lost.
+- **Why:** `_inside_destinations` takes only a real directory for the destination (`isdir and not islink`), so the link is copied as a source, and `-rme`'s guard keeps what it leads to: the whole destination.
+- **Plan:** a named link whose target is a destination is left out as the destination itself is, with the one note. That also stops the junk link.
+- **Revisit when:** 9.85.
+- **Noted:** 2026-11-07, the user's standing rule that deferrals are noted, not asked.
+
+### `-rme` asks about every extra link on its own
+- **Kind:** deferred (9.85).
+- **What the operator sees:** `-rme` with many extra symlinks in the destination, on NFS mounted `actimeo=0`, spends about 0.6 ms on each (an estimate from the NFS figures for files: about 6 s for 10,000 extra links, against about 0.3 s for the walk that finds them). Extra files are asked once a directory.
+- **Why:** the guard `lstat`s every extra link, to see whether it is a named link source, while for a file it first checks that the file's directory holds a file source. Found in 9.84's review, after the guard stopped following links; it is a cost only.
+- **Plan:** in `guarded(path, 'link')`, return before the `lstat` when the link's directory is not in `file_parents`; a named link always puts its own directory there, a dangling one too.
+- **Revisit when:** 9.85.
+- **Noted:** 2026-11-07, the user's standing rule that deferrals are noted, not asked.
