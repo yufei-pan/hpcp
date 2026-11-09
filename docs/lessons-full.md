@@ -199,3 +199,9 @@ entries go last, in the same commit as the change:
 - Why we had to change: made at the probe's full path, the question failed with "File name too long" for a landing within about 57 characters of PATH_MAX, a false 213 where the copy itself fits.
 - Original design was wrong because: the question was made longer than what it asks about.
 - Lesson: make what you ask a directory about relative to its descriptor, or the question fails where the answer would not.
+
+## 2026-11-08 A rename is not a barrier
+- Changed: a rewrite's temporary copy is fsynced before it is renamed over the old copy (the core and the patch apply), and a move syncs each destination filesystem (syncfs) before it removes a source; a sync that fails removes nothing (212).
+- Why we had to change: XFS does not flush a file renamed over another (ext4's `auto_da_alloc` happened to), and neither filesystem writes a file's data before journaled renames and unlinks reach the disk. After a power cut a rewrite could leave the landing empty with the old copy gone, and a move could lose both the copy and the source. The build host was hard-reset four times in two weeks.
+- Original design was wrong because: it took old-or-new for granted from the rename alone ("hpcp fsyncs neither way"), which holds for a crash of the process, not of the machine.
+- Lesson: a rename orders names, not data; fsync before renaming over what must survive, and sync before removing what a copy replaced.

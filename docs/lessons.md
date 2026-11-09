@@ -38,3 +38,4 @@ same commit as the change. Keep this file under 20 KB: at the cap, merge lines b
 - **2026-11-08 Only a directory holds what lies below it**: a spelling that puts a path below a link or a file names no containment; ask what the root is before reaching through it, and remove a link after what was reached through it.
 - **2026-11-08 A special the operator names is a source**: a refusal by type belongs to a walk that meets it, not to a name the operator typed.
 - **2026-11-08 A probe costs only its names**: make what you ask a directory about relative to its descriptor, or the question fails where the answer would not.
+- **2026-11-08 A rename is not a barrier**: data renamed over a good copy, or a source unlinked after its copy, reaches the disk in no promised order; fsync what you rename over something, sync what a move copied before removing anything.
