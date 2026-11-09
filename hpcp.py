@@ -899,18 +899,15 @@ def _init_worker():
 		_escape_unencodable_stdout()
 		_worker_initialized = True
 
-class _WorkerStart:
+def _register_worker_start():
 	"""multiprocessing runs its after-fork hooks in each child it starts, before the child's work (a pool worker's loop):
 	the worker sets itself up there (_init_worker), not at its first task, so one that never runs a task, or that its pool
-	never counted (a stop landing as it was forked), still has its watch and ends when its parent does."""
-# Held here: multiprocessing's registry holds a hook's object weakly. main() registers it (not an import: a program that
-# imports hpcp must not get hpcp's stops and parent watch in its own multiprocessing children). Under fork the registry is
-# inherited, so every pool worker of the run sets up at its start; forkserver and spawn workers, which start from a new
-# interpreter, set up at their first task (_run_task).
-_WORKER_START = _WorkerStart()
-
-def _register_worker_start():
-	multiprocessing.util.register_after_fork(_WORKER_START, lambda _: _init_worker())
+	never counted (a stop landing as it was forked), still has its watch and ends when its parent does. main() registers it
+	(not an import: a program that imports hpcp must not get hpcp's stops and parent watch in its own multiprocessing
+	children). Under fork the registry is inherited, so every pool worker of the run sets up at its start; forkserver and
+	spawn workers, which start from a new interpreter, set up at their first task (_run_task). The registry holds its key
+	weakly: a module-level function lives as long as the module."""
+	multiprocessing.util.register_after_fork(_init_worker, lambda init: init())
 
 # The run settings hpcp() keeps in module globals. A pool worker that did not fork from the parent
 # (spawn, forkserver) would otherwise run with the import-time defaults.
@@ -934,6 +931,10 @@ def _run_task(settings, func, *args, **kwargs):
 	"""
 	global _IN_TASK
 	try:
+		if _STOPPED_PID == os.getpid():
+			# A stop the pool's worker loop took for an earlier task's error, or (Python 3.7+) its result's: kept, the worker
+			# would run this task whole, every later stop ignored as already handled.
+			_end_by(_STOPPED)
 		_init_worker()
 		globals().update(settings)
 		error_start = len(ERRORS)
