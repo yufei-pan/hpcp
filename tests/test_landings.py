@@ -1106,30 +1106,47 @@ def test_a_filesystem_that_cannot_fsync_still_rewrites(tmp_path, hpcp_mod, reset
 	assert read(tmp_path / 'out/x') == 'new content' and temporaries(tmp_path) == [] and not hpcp_mod.ERRORS
 
 
+def _patch_row(hpcp_mod, monkeypatch, path, size):
+	monkeypatch.setattr(hpcp_mod, 'decode_state', lambda state: {'size': size})
+	return type('Row', (), {'new': 'f:%d' % size, 'path': path})()
+
+
 @posix_only
 def test_a_patch_s_replacement_is_on_disk_before_it_is_renamed(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
 	write(tmp_path / 'live/x', 'old')
-	write(tmp_path / 'live/.tmpx', 'new')
-	row = type('Row', (), {'new': 'f:3', 'path': 'x'})()
-	monkeypatch.setattr(hpcp_mod, 'decode_state', lambda state: {'size': 3})
+	write(tmp_path / 'new/x', 'new')
+	row = _patch_row(hpcp_mod, monkeypatch, 'x', 3)
 	events = _spy_fsync_and_renames(hpcp_mod, monkeypatch)
-	inode = os.lstat(str(tmp_path / 'live/.tmpx')).st_ino
-	hpcp_mod._finish_replace((row, str(tmp_path / 'live/.tmpx'), str(tmp_path / 'live/x'), str(tmp_path / 'live/.tmpx')),
-		str(tmp_path / 'live'), lambda: None)
-	assert read(tmp_path / 'live/x') == 'new'
-	assert events.index(('fsync', inode)) < events.index(('rename', inode))
+	hpcp_mod._replace_files([(row, str(tmp_path / 'new/x'), str(tmp_path / 'live/x'))], str(tmp_path / 'live'), 1)
+	assert read(tmp_path / 'live/x') == 'new' and temporaries(tmp_path) == []
+	renamed = [inode for kind, inode in events if kind == 'rename']
+	assert renamed and events.index(('fsync', renamed[-1])) < events.index(('rename', renamed[-1])), events
+
+
+@posix_only
+def test_a_patch_s_replacements_are_fsynced_by_the_workers_not_one_at_a_time_by_the_parent(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	# The parent's loop took one fsync at a time (about 1 ms each on an idle disk) while the workers sat idle.
+	rows = []
+	for name in ('a', 'b', 'c'):
+		write(tmp_path / 'live' / name, 'old')
+		write(tmp_path / 'new' / name, 'new')
+		rows.append((_patch_row(hpcp_mod, monkeypatch, name, 3), str(tmp_path / 'new' / name), str(tmp_path / 'live' / name)))
+	parent_fsyncs = []
+	real_fsync = os.fsync
+	monkeypatch.setattr(hpcp_mod.os, 'fsync', lambda fd: parent_fsyncs.append(fd) or real_fsync(fd))
+	hpcp_mod._replace_files(rows, str(tmp_path / 'live'), 2)
+	assert [read(tmp_path / 'live' / name) for name in 'abc'] == ['new'] * 3 and temporaries(tmp_path) == []
+	assert parent_fsyncs == []
 
 
 @posix_only
 def test_a_patch_s_replacement_that_fails_to_reach_the_disk_keeps_the_old_file(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
 	write(tmp_path / 'live/x', 'old')
-	write(tmp_path / 'live/.tmpx', 'new')
-	row = type('Row', (), {'new': 'f:3', 'path': 'x'})()
-	monkeypatch.setattr(hpcp_mod, 'decode_state', lambda state: {'size': 3})
+	write(tmp_path / 'new/x', 'new')
+	row = _patch_row(hpcp_mod, monkeypatch, 'x', 3)
 	_spy_fsync_and_renames(hpcp_mod, monkeypatch, errno.EIO)
-	hpcp_mod._finish_replace((row, str(tmp_path / 'live/.tmpx'), str(tmp_path / 'live/x'), str(tmp_path / 'live/.tmpx')),
-		str(tmp_path / 'live'), lambda: None)
-	assert read(tmp_path / 'live/x') == 'old' and not os.path.lexists(str(tmp_path / 'live/.tmpx'))
+	hpcp_mod._replace_files([(row, str(tmp_path / 'new/x'), str(tmp_path / 'live/x'))], str(tmp_path / 'live'), 1)
+	assert read(tmp_path / 'live/x') == 'old' and temporaries(tmp_path) == []
 	assert any(error.startswith('Copy failed: x:') for error in hpcp_mod.ERRORS), hpcp_mod.ERRORS
 
 
@@ -1138,40 +1155,231 @@ def _move(hpcp_mod, tmp_path, **extra):
 		remove=True, remove_force=True, **extra)
 
 
-@pytest.mark.skipif(not sys.platform.startswith('linux'), reason='syncfs(2) is Linux')
-def test_a_move_writes_its_destination_to_disk_before_a_source_goes(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+@posix_only
+def test_a_move_fsyncs_every_landing_before_any_source_goes(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	# Each copy is written to disk by the worker that made it, while its source still stands: a power cut after the move
+	# cannot find the sources gone and the copies in memory.
 	write(tmp_path / 'a/x', 'X')
 	write(tmp_path / 'a/d/y', 'Y')
 	events = []
-	real_syncfs, real_remove = hpcp_mod._syncfs, hpcp_mod.remove_moved_sources
-	def syncfs(path):
-		events.append(('syncfs', path, os.path.exists(str(tmp_path / 'a/x'))))
-		return real_syncfs(path)
+	real_fsync, real_remove = os.fsync, hpcp_mod.remove_moved_sources
+	def fsync(fd):
+		events.append(('fsync', os.fstat(fd).st_ino, os.path.exists(str(tmp_path / 'a/x')) and os.path.exists(str(tmp_path / 'a/d/y'))))
+		return real_fsync(fd)
 	def remove(*args, **kwargs):
 		events.append(('remove',))
 		return real_remove(*args, **kwargs)
-	monkeypatch.setattr(hpcp_mod, '_syncfs', syncfs)
+	monkeypatch.setattr(hpcp_mod.os, 'fsync', fsync)
 	monkeypatch.setattr(hpcp_mod, 'remove_moved_sources', remove)
 	_move(hpcp_mod, tmp_path)
-	assert read(tmp_path / 'out/x') == 'X' and not os.path.exists(str(tmp_path / 'a'))
-	assert events == [('syncfs', str(tmp_path / 'out'), True), ('remove',)]
+	assert read(tmp_path / 'out/x') == 'X' and read(tmp_path / 'out/d/y') == 'Y' and not os.path.exists(str(tmp_path / 'a'))
+	assert events[-1] == ('remove',) and ('remove',) not in events[:-1]
+	fsyncs = [event for event in events if event[0] == 'fsync']
+	fsynced = {event[1] for event in fsyncs}
+	assert {os.lstat(str(tmp_path / 'out/x')).st_ino, os.lstat(str(tmp_path / 'out/d/y')).st_ino} <= fsynced
+	assert fsyncs and all(event[2] for event in fsyncs)
 
 
-@pytest.mark.skipif(not sys.platform.startswith('linux'), reason='syncfs(2) is Linux')
-@pytest.mark.parametrize('why', ['Input/output error', 'this system has no syncfs(2)'])
-def test_a_move_whose_destination_cannot_be_synced_removes_no_source(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch, capsys, why):
+@posix_only
+def test_a_move_whose_landing_fails_to_reach_the_disk_removes_no_source(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch, capsys):
+	# On the kernels of EL7 and EL8 a syncfs reports no write error; the fsync of the copy's own file does, while the data is
+	# still dirty and its descriptor holds the inode. That landing is a failed copy: its own line, the move's gate, nothing removed.
 	write(tmp_path / 'a/x', 'X')
-	monkeypatch.setattr(hpcp_mod, '_syncfs', lambda path: why)
+	write(tmp_path / 'a/y', 'Y')
+	real_fsync = os.fsync
+	def fsync(fd):
+		if os.path.basename(os.readlink('/proc/self/fd/%d' % fd)) == 'y':
+			raise OSError(errno.EIO, os.strerror(errno.EIO))
+		return real_fsync(fd)
+	monkeypatch.setattr(hpcp_mod.os, 'fsync', fsync)
 	rc = _move(hpcp_mod, tmp_path)
-	assert read(tmp_path / 'out/x') == 'X' and read(tmp_path / 'a/x') == 'X'
+	assert read(tmp_path / 'a/x') == 'X' and read(tmp_path / 'a/y') == 'Y'
 	err = capsys.readouterr().err
-	assert 'Remove skipped: not removing ' in err and f'{tmp_path / "out"}/ cannot be written to disk ({why}), so the copies may not be on disk yet' in err, err
-	assert rc == 212
+	assert f'{tmp_path / "out/y"} cannot be written to disk (Input/output error)' in err, err
+	assert 'Remove skipped: not removing ' in err and 'the copy reported 1 error(s)' in err, err
+	assert rc != 0
+	# The copy that could not be trusted is not left to be taken for the finished one by a rerun.
+	assert not os.path.lexists(str(tmp_path / 'out/y'))
+
+
+@posix_only
+def test_a_rerun_of_a_failed_move_copies_the_landing_again(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	write(tmp_path / 'a/y', 'Y')
+	real_fsync = os.fsync
+	def failing(fd):
+		raise OSError(errno.EIO, os.strerror(errno.EIO))
+	monkeypatch.setattr(hpcp_mod.os, 'fsync', failing)
+	assert _move(hpcp_mod, tmp_path) != 0 and read(tmp_path / 'a/y') == 'Y'
+	hpcp_mod.ERRORS.clear()
+	monkeypatch.setattr(hpcp_mod.os, 'fsync', real_fsync)
+	assert _move(hpcp_mod, tmp_path) == 0
+	assert read(tmp_path / 'out/y') == 'Y' and not os.path.exists(str(tmp_path / 'a'))
+
+
+@posix_only
+def test_a_move_fsyncs_a_landing_an_earlier_copy_left(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	# hpcp a/ -d out/ , then the same with -rm: the copy is there (same size and time, so not copied again) and may still be in
+	# memory, so the move fsyncs it before it removes the source.
+	write(tmp_path / 'a/x', 'X')
+	assert hpcp_mod.hpcp([str(tmp_path / 'a') + os.sep], dest_paths=[str(tmp_path / 'out') + os.sep], single_thread=True) == 0
+	fsynced = []
+	real_fsync = os.fsync
+	monkeypatch.setattr(hpcp_mod.os, 'fsync', lambda fd: fsynced.append(os.fstat(fd).st_ino) or real_fsync(fd))
+	assert _move(hpcp_mod, tmp_path) == 0
+	assert fsynced == [os.lstat(str(tmp_path / 'out/x')).st_ino] and not os.path.exists(str(tmp_path / 'a'))
+
+
+@posix_only
+def test_a_copy_that_is_not_a_move_is_not_fsynced(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	write(tmp_path / 'a/x', 'X')
+	fsynced = []
+	monkeypatch.setattr(hpcp_mod.os, 'fsync', lambda fd: fsynced.append(fd))
+	assert hpcp_mod.hpcp([str(tmp_path / 'a') + os.sep], dest_paths=[str(tmp_path / 'out') + os.sep], single_thread=True) == 0
+	assert fsynced == [] and read(tmp_path / 'out/x') == 'X'
+
+
+@not_root
+def test_a_move_into_a_write_only_destination_goes_through(tmp_path):
+	# 9.85's syncfs opened the destination directory for reading, which a 0333 directory refuses: exit 212, the sources kept.
+	write(tmp_path / 'a/x', 'X')
+	write(tmp_path / 'a/d/y', 'Y')
+	os.mkdir(str(tmp_path / 'out'))
+	os.chmod(str(tmp_path / 'out'), 0o333)
+	try:
+		rc, output = run(['a/x', 'a/d', '-d', 'out/', '-rf'], tmp_path)
+	finally:
+		os.chmod(str(tmp_path / 'out'), 0o755)
+	assert rc == 0, output[-2000:]
+	assert read(tmp_path / 'out/x') == 'X' and read(tmp_path / 'out/d/y') == 'Y'
+	assert not os.path.exists(str(tmp_path / 'a/x')) and not os.path.exists(str(tmp_path / 'a/d'))
+
+
+@not_root
+@pytest.mark.parametrize('mode', [0o000, 0o044, 0o070], ids=lambda mode: '%04o' % mode)
+def test_a_landing_its_owner_can_neither_read_nor_write_is_fsynced_and_keeps_its_mode(tmp_path, hpcp_mod, monkeypatch, mode):
+	# A non-root run copying another user's file of mode 0044 owns a landing it cannot open: the owner gets read for the open,
+	# and the exact mode is put back through the descriptor before the fsync.
+	write(tmp_path / 'f', 'data')
+	os.chmod(str(tmp_path / 'f'), mode)
+	seen = []
+	real_fsync = os.fsync
+	def fsync(fd):
+		seen.append(stat.S_IMODE(os.fstat(fd).st_mode))
+		return real_fsync(fd)
+	monkeypatch.setattr(hpcp_mod.os, 'fsync', fsync)
+	try:
+		hpcp_mod._fsync_file(str(tmp_path / 'f'))
+		assert seen == [mode] and stat.S_IMODE(os.lstat(str(tmp_path / 'f')).st_mode) == mode
+	finally:
+		os.chmod(str(tmp_path / 'f'), 0o600)
+
+
+@posix_only
+def test_a_move_to_a_destination_that_is_a_link_to_a_file_fsyncs_the_file_it_wrote(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	# What the operator named is followed (cp writes through it): the fsync goes to the file the link leads to.
+	write(tmp_path / 'a/x', 'new')
+	write(tmp_path / 'where/target', 'old')
+	os.symlink(str(tmp_path / 'where/target'), str(tmp_path / 'link'))
+	fsynced = []
+	real_fsync = os.fsync
+	monkeypatch.setattr(hpcp_mod.os, 'fsync', lambda fd: fsynced.append(os.fstat(fd).st_ino) or real_fsync(fd))
+	rc = hpcp_mod.hpcp([str(tmp_path / 'a/x')], dest_paths=[str(tmp_path / 'link')], single_thread=True, remove=True, remove_force=True)
+	assert rc == 0 and read(tmp_path / 'where/target') == 'new' and not os.path.exists(str(tmp_path / 'a/x'))
+	assert os.stat(str(tmp_path / 'where/target')).st_ino in fsynced
+
+
+@not_root
+def test_a_landing_that_cannot_be_opened_by_anyone_here_is_a_failed_fsync(tmp_path, hpcp_mod, monkeypatch):
+	# A file of another owner that this run cannot open is an error, not a silent skip.
+	write(tmp_path / 'f', 'data')
+	os.chmod(str(tmp_path / 'f'), 0o044)
+	monkeypatch.setattr(hpcp_mod.os, 'geteuid', lambda: os.stat(str(tmp_path / 'f')).st_uid + 1)
+	with pytest.raises(PermissionError):
+		hpcp_mod._fsync_file(str(tmp_path / 'f'))
+	assert stat.S_IMODE(os.lstat(str(tmp_path / 'f')).st_mode) == 0o044
+	os.chmod(str(tmp_path / 'f'), 0o600)
+
+
+@not_root
+def test_a_move_whose_landing_cannot_be_opened_is_a_failed_copy_not_a_removed_source(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch, capsys):
+	write(tmp_path / 'a/x', 'X')
+	def refuse(path):
+		raise PermissionError(errno.EACCES, os.strerror(errno.EACCES), path)
+	monkeypatch.setattr(hpcp_mod, '_fsync_file', refuse)
+	assert _move(hpcp_mod, tmp_path) != 0
+	assert read(tmp_path / 'a/x') == 'X' and 'cannot be written to disk (Permission denied)' in capsys.readouterr().err
+
+
+@posix_only
+def test_a_fifo_made_in_a_landing_s_place_is_not_opened_to_fsync_it(tmp_path, hpcp_mod):
+	# Nothing to write, and opening a FIFO would wait for a writer.
+	os.mkfifo(str(tmp_path / 'fifo'))
+	hpcp_mod._fsync_file(str(tmp_path / 'fifo'))
 
 
 @posix_only
 def test_a_move_writes_its_destination_to_disk_end_to_end(tmp_path):
-	# The real syncfs in a run: the move ends as before.
+	# The real fsync in a run: the move ends as before.
 	write(tmp_path / 'a/x', 'X')
+	write(tmp_path / 'a/d/y', 'Y')
 	rc, output = run(['a/', '-d', 'out/', '-rf'], tmp_path)
-	assert rc == 0 and read(tmp_path / 'out/x') == 'X' and not os.path.exists(str(tmp_path / 'a')), output[-2000:]
+	assert rc == 0 and read(tmp_path / 'out/x') == 'X' and read(tmp_path / 'out/d/y') == 'Y' and not os.path.exists(str(tmp_path / 'a')), output[-2000:]
+
+
+def _losetup(path):
+	result = subprocess.run(['losetup', '-f', '--show', str(path)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+	if result.returncode != 0:
+		pytest.skip('no loop device: ' + result.stderr.strip())
+	return result.stdout.strip()
+
+
+@root_only
+@pytest.mark.skipif(not sys.platform.startswith('linux'), reason='loop devices and mounts are Linux')
+def test_a_move_onto_a_block_device_fsyncs_the_device_before_the_source_goes(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	# A block device named by -d is written through, and hpcp fsyncs it, opened following links (/dev/disk/by-id names are
+	# links). Root and a loop device: the VMs.
+	with open(str(tmp_path / 'disk.img'), 'wb') as f:
+		f.truncate(8 << 20)
+	device = _losetup(tmp_path / 'disk.img')
+	link = str(tmp_path / 'by-id-disk')
+	os.symlink(device, link)
+	try:
+		write(tmp_path / 'a/x', 'device content')
+		fsynced = []
+		real_fsync, real_remove = os.fsync, hpcp_mod.remove_moved_sources
+		def fsync(fd):
+			fsynced.append(os.readlink('/proc/self/fd/%d' % fd))
+			return real_fsync(fd)
+		def remove(*args, **kwargs):
+			assert device in fsynced, fsynced
+			return real_remove(*args, **kwargs)
+		monkeypatch.setattr(hpcp_mod.os, 'fsync', fsync)
+		monkeypatch.setattr(hpcp_mod, 'remove_moved_sources', remove)
+		rc = hpcp_mod.hpcp([str(tmp_path / 'a/x')], dest_paths=[link], single_thread=True, remove=True, remove_force=True)
+		assert rc == 0 and device in fsynced and not os.path.exists(str(tmp_path / 'a/x'))
+		with open(device, 'rb') as d:
+			assert d.read(14) == b'device content'
+	finally:
+		subprocess.run(['losetup', '-d', device], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+
+@root_only
+@pytest.mark.skipif(not sys.platform.startswith('linux'), reason='mounts are Linux')
+def test_a_move_fsyncs_a_landing_on_a_filesystem_mounted_below_the_destination(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	# 9.85's syncfs was asked only about the destination root's filesystem: a landing on another one below it went unsynced.
+	os.makedirs(str(tmp_path / 'out/sub'))
+	result = subprocess.run(['mount', '-t', 'tmpfs', 'hpcp-test', str(tmp_path / 'out/sub')], stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+	if result.returncode != 0:
+		pytest.skip('mount failed: ' + result.stderr.strip())
+	try:
+		write(tmp_path / 'a/sub/f', 'F')
+		write(tmp_path / 'a/g', 'G')
+		fsynced = []
+		real_fsync = os.fsync
+		monkeypatch.setattr(hpcp_mod.os, 'fsync', lambda fd: fsynced.append(os.fstat(fd).st_ino) or real_fsync(fd))
+		assert _move(hpcp_mod, tmp_path) == 0
+		assert os.lstat(str(tmp_path / 'out/sub/f')).st_dev != os.lstat(str(tmp_path / 'out/g')).st_dev
+		assert os.lstat(str(tmp_path / 'out/sub/f')).st_ino in fsynced and os.lstat(str(tmp_path / 'out/g')).st_ino in fsynced
+		assert not os.path.exists(str(tmp_path / 'a/sub/f'))
+	finally:
+		subprocess.run(['umount', '-l', str(tmp_path / 'out/sub')], stdout=subprocess.PIPE, stderr=subprocess.PIPE)

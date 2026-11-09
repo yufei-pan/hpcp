@@ -252,6 +252,9 @@ FILES_RATE_LIMIT = 0
 COMMAND_TIMEOUT = 0
 NO_CREATE_DIR = False
 CONTENT_ONLY = False
+# True in a move (-rm with a destination): a copy is on disk before it is reported copied (_sync_landing), so no source goes
+# while its copy may be only in memory.
+SYNC_COPIES = False
 MIRROR_FS_PARAMS = True
 ERRORS = []
 
@@ -876,7 +879,7 @@ def _init_worker():
 # (_dest_directory) never outlives it.
 NAMED_DESTS = frozenset()
 RUN_ID = None
-_TASK_SETTINGS = ('NAMED_DESTS', 'RUN_ID', 'CONTENT_ONLY', 'NO_CREATE_DIR', 'RANDOM_DESTINATION_SELECTION', 'HASH_SIZE', 'COMMAND_TIMEOUT',
+_TASK_SETTINGS = ('NAMED_DESTS', 'RUN_ID', 'CONTENT_ONLY', 'NO_CREATE_DIR', 'SYNC_COPIES', 'RANDOM_DESTINATION_SELECTION', 'HASH_SIZE', 'COMMAND_TIMEOUT',
 	'BYTES_RATE_LIMIT', 'FILES_RATE_LIMIT', 'MIRROR_FS_PARAMS', 'REMOVE_FILES_WHILE_LISTING')
 
 def _submit_task(executor, func, *args, **kwargs):
@@ -3803,6 +3806,13 @@ def copy_file(src_path, dest_paths, full_hash=False, verbose=False, concurrent_p
 						#also copy the modes (as cp -a: no set-user-ID / set-group-ID bit for an owner / group not kept)
 						os.chmod(dest, st.st_mode & ~((0 if owner_kept else stat.S_ISUID) | (0 if group_kept else stat.S_ISGID)))
 					os.utime(dest, ns=(st.st_atime_ns, st.st_mtime_ns),follow_symlinks=False)
+				if SYNC_COPIES:
+					# A copy an earlier run left (or a plain copy before this move) may still be in memory.
+					try:
+						_sync_landing(dest)
+					except _NotOnDisk as e:
+						_copy_failed(src_path, f'Copy failed: ERROR copying {src_path} to {dest}: {e}')
+						return 0, time.monotonic() - start_time, symLinks
 				endTime = time.monotonic()
 				return 0, endTime - start_time , symLinks #, task_to_run
 		bak_dest_paths = dest_paths.copy()
@@ -3865,6 +3875,8 @@ def copy_file(src_path, dest_paths, full_hash=False, verbose=False, concurrent_p
 							shutil.copy(src_path, dest_path, follow_symlinks=False)
 						else:
 							shutil.copy2(src_path, dest_path, follow_symlinks=False)
+						if SYNC_COPIES:
+							_sync_landing(dest_path)
 						copied = True
 						break
 					except _Refused as e:
@@ -6258,7 +6270,7 @@ def _finish_replace(job, target_root, wait, metadata=True):
 	xattrs the payload lacks are removed from it before the rename (cp -af already set the
 	payload's mode, and with it the ACL mask, so the group bits stay right). On a content-only target
 	(metadata False) an existing FAT file's attribute bits are kept. Any failure is reported as 'Copy failed' and leaves the destination untouched; the
-	temporary file never outlives this call.
+	temporary file never outlives this call. The temporary file is already on disk (_copy_synced).
 	"""
 	row, source, dest, tmp = job
 	try:
@@ -6274,7 +6286,6 @@ def _finish_replace(job, target_root, wait, metadata=True):
 			raise RuntimeError(reason)
 		# A FAT file keeps its read-only / hidden / system bits: the replacement would otherwise get the defaults.
 		attributes = None if metadata else _fat_attributes(dest)
-		_fsync_file(tmp)  # renamed unsynced, a power cut can leave dest empty (_fsync_file)
 		os.replace(tmp, dest)
 		if attributes is not None and attributes != _fat_attributes(dest):
 			_set_fat_attributes(dest, attributes, row.path)
@@ -6290,6 +6301,17 @@ def _copy_content(src_path, dest_paths, full_hash=False, verbose=False):
 	for dest in dest_paths:
 		shutil.copyfile(src_path, dest)
 		os.utime(dest, ns=(st.st_atime_ns, st.st_mtime_ns))
+
+def _copy_synced(copy, source, dests, full_hash, verbose):
+	"""copy(source, dests) for a patch's temporary file, then that file written to disk (_fsync_file) by the worker that made it,
+	so the fsyncs of many files run side by side and not one at a time in the parent's loop: renamed unsynced over the live
+	file, a power cut can leave it empty. A copy that recorded a failure made nothing to write. Raises OSError when the
+	filesystem fails the fsync."""
+	error_start = len(ERRORS)
+	result = copy(source, dests, full_hash, verbose)
+	if not any(_is_failure(error) for error in ERRORS[error_start:]):
+		_fsync_file(dests[0])
+	return result
 
 def _replace_files(files, target_root, max_workers=1, verbose=False, full_hash=False, metadata=True):
 	"""Copy each (row, source, dest) to a temporary sibling of dest, then rename it over dest.
@@ -6315,10 +6337,10 @@ def _replace_files(files, target_root, max_workers=1, verbose=False, full_hash=F
 		for job in jobs:
 			row, source, dest, tmp = job
 			_finish_replace(job, target_root,
-				functools.partial(_call_raising_recorded_failures, copy, source, [tmp], full_hash, verbose), metadata)
+				functools.partial(_call_raising_recorded_failures, _copy_synced, copy, source, [tmp], full_hash, verbose), metadata)
 		return
 	with ProcessPoolExecutor(max_workers=max_workers) as executor:
-		futures = {_submit_task(executor, copy, source, [tmp], full_hash, verbose): (row, source, dest, tmp)
+		futures = {_submit_task(executor, _copy_synced, copy, source, [tmp], full_hash, verbose): (row, source, dest, tmp)
 			for row, source, dest, tmp in jobs}
 		for future in concurrent.futures.as_completed(futures):
 			_finish_replace(futures[future], target_root, functools.partial(_raise_task_failures, future), metadata)
@@ -12147,48 +12169,63 @@ def dd_partition(src_partition_path,dest_partition_path,partition,dd_src,dd_dest
 
 def _syncfs(path):
 	"""Write the filesystem path is on, and no other: syncfs(2), through ctypes (Python has no os.syncfs). os.sync and the sync
-	command write every filesystem on the host. None when it was made, else why not (no libc, no syncfs in it, path cannot be
-	opened, or the call's error): a patch or an image's flush goes on without it, as a copy with cp does; a move does not
-	remove its sources (_sync_destinations)."""
+	command write every filesystem on the host. No libc, no syncfs in it, or an error is a flush that was not made, which a
+	run does without (as a copy with cp does). Not for a move: before Linux 5.8 syncfs reports no write error at all (see
+	_fsync_file, which a move uses on each copy)."""
 	try:
 		import ctypes
 		libc = ctypes.CDLL(None, use_errno=True)
-		call = libc.syncfs
-	except Exception:
-		return 'this system has no syncfs(2)'
-	try:
 		fd = os.open(path, os.O_RDONLY | getattr(os, 'O_CLOEXEC', 0))
-	except OSError as e:
-		return e.strerror or str(e)
-	try:
-		if call(fd) != 0:
-			return os.strerror(ctypes.get_errno())
-	except Exception as e:
-		return str(e)
-	finally:
-		os.close(fd)
-	return None
+		try:
+			libc.syncfs(fd)
+		finally:
+			os.close(fd)
+	except (OSError, AttributeError, ImportError):
+		pass
 
 # fsync's errors that say the file cannot be written to disk this way at all (some FUSE filesystems), not that it failed:
 # the copy goes on without it, as it did before 9.85.
 _NO_FSYNC = frozenset(getattr(errno, name) for name in ('EINVAL', 'ENOTSUP', 'EOPNOTSUPP', 'ENOSYS') if hasattr(errno, name))
 
 def _fsync_file(path):
-	"""Write the data of path, a regular file this run made (a temporary copy about to be renamed over a landing), to disk: renamed
-	unsynced, a power cut can leave the landing empty where the old copy was (XFS does not flush on such a rename, and no
-	filesystem orders the data before the rename). Raises OSError when the filesystem fails it; returns when it cannot fsync
-	at all (_NO_FSYNC), or when the file's own mode lets its owner neither read nor write it (a copy of a source readable by
-	group or others only), which a filesystem then writes when it does."""
-	if not stat.S_ISREG(os.lstat(path).st_mode):
-		return  # a FIFO or node made in its place (cp -a of one) has no data, and opening a FIFO waits for a writer
+	"""Write the data of path, a regular file this run made (a temporary copy about to be renamed over a landing, or a move's
+	landing), to disk: renamed unsynced, a power cut can leave the landing empty where the old copy was (XFS does not flush on
+	such a rename, and no filesystem orders the data before the rename); and a move's source, removed after an unsynced copy,
+	is gone with it. On ext4 and XFS it also commits the transaction that made the file's name, and every earlier one (its
+	directories), so no directory is fsynced. Raises OSError when the filesystem fails it, or the file cannot be opened; returns
+	when the filesystem cannot fsync at all (_NO_FSYNC). Anything but a regular file returns at once: a FIFO or node made in its
+	place (cp -a of one) has no data, and opening a FIFO waits for a writer.
+
+	A file whose mode lets its owner neither read nor write it (a copy of another user's file readable by group or others
+	only, mode 0044) cannot be opened as it is: the owner (this run's effective uid) is given read for the open, and the exact
+	mode is put back through the descriptor (fchmod) before the fsync, so the file has the wider mode for microseconds, never
+	afterwards. Anyone else who cannot open it gets the error. Off POSIX it returns at once."""
+	if os.name != 'posix':
+		return  # Windows' fsync wants a descriptor open for writing, and nothing here has been run there
+	st = os.lstat(path)
+	if not stat.S_ISREG(st.st_mode):
+		return
 	flags = getattr(os, 'O_CLOEXEC', 0) | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NONBLOCK', 0)
 	try:
 		fd = os.open(path, os.O_RDONLY | flags)
-	except PermissionError:
+	except PermissionError as first:
 		try:
 			fd = os.open(path, os.O_WRONLY | flags)
 		except PermissionError:
-			return
+			if st.st_uid != os.geteuid():
+				raise first
+			mode = stat.S_IMODE(st.st_mode)
+			os.chmod(path, mode | stat.S_IRUSR)
+			try:
+				fd = os.open(path, os.O_RDONLY | flags)
+			except BaseException:
+				os.chmod(path, mode)
+				raise
+			try:
+				os.fchmod(fd, mode)
+			except BaseException:
+				os.close(fd)
+				raise
 	try:
 		os.fsync(fd)
 	except OSError as e:
@@ -12197,35 +12234,43 @@ def _fsync_file(path):
 	finally:
 		os.close(fd)
 
-def _sync_destinations(dests):
-	"""Write each filesystem a move's copies went to (dests, the destinations as given) before its sources go: the copies'
-	data can still be in memory while the unlinks of the sources are on disk, and a power cut then loses both. Each
-	filesystem once (syncfs); a block device named by -d is fsynced itself. None when all were written, else why not, naming
-	the destination. Off Linux there is no syncfs: None, as before 9.85."""
-	if not sys.platform.startswith('linux'):
-		return None
-	done = set()
-	for dest in dests:
-		path = os.path.abspath(dest)
-		while not os.path.lexists(path) and os.path.dirname(path) != path:
-			path = os.path.dirname(path)
+def _fsync_device(path):
+	"""Write a block device that a move's copy was written to (named by -d: cp wrote through it), to disk. Opened following
+	links, as /dev/disk/by-id names are links. Raises OSError as _fsync_file does."""
+	if os.name != 'posix':
+		return
+	fd = os.open(path, os.O_RDONLY | getattr(os, 'O_CLOEXEC', 0))
+	try:
+		os.fsync(fd)
+	except OSError as e:
+		if e.errno not in _NO_FSYNC:
+			raise
+	finally:
+		os.close(fd)
+
+class _NotOnDisk(Exception):
+	"""A move's copy that the filesystem failed to write to disk (_sync_landing): a failed copy, so no source is removed."""
+
+def _sync_landing(dest_path):
+	"""For a move (SYNC_COPIES): the copy at dest_path on disk before its file is reported copied, so no source goes while the
+	copy may be only in memory (a power cut then loses both), and a write error the filesystem reports is met here, on the
+	descriptor of the copy's own file while its data is still dirty (a writeback error is kept only on the in-memory inode,
+	and one evicted under memory pressure takes it along; syncfs before Linux 5.8 reports none). Raises _NotOnDisk, naming the
+	landing and why, after removing the regular file there: its content cannot be trusted, and a rerun would take it for the
+	finished copy (same size and time)."""
+	target = _landing_of(dest_path)[0]
+	try:
+		if stat.S_ISBLK(os.stat(target).st_mode):
+			_fsync_device(target)
+		else:
+			_fsync_file(target)
+	except OSError as e:
 		try:
-			st = os.stat(path)
-		except OSError as e:
-			return f'{dest} cannot be written to disk ({e.strerror})'
-		if stat.S_ISBLK(st.st_mode):
-			try:
-				_fsync_file(path)
-			except OSError as e:
-				return f'{dest} cannot be written to disk ({e.strerror})'
-			continue
-		if st.st_dev in done:
-			continue
-		why = _syncfs(path if stat.S_ISDIR(st.st_mode) else os.path.dirname(path))
-		if why is not None:
-			return f'{dest} cannot be written to disk ({why})'
-		done.add(st.st_dev)
-	return None
+			if stat.S_ISREG(os.lstat(target).st_mode):
+				os.remove(target)
+		except OSError:
+			pass
+		raise _NotOnDisk(f'{dest_path} cannot be written to disk ({_why(e)})')
 
 def _flush_loop_device(loop_device, sysfs='/sys/block'):
 	"""
@@ -12738,8 +12783,9 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = multipr
 			pinned_dest_roots = _destination_roots(dests) if remove_extra else None
 			copy_error_start = len(ERRORS)
 			# What the operator named is followed and written through, as cp follows its destination; below it nothing is.
-			global NAMED_DESTS, RUN_ID
+			global NAMED_DESTS, RUN_ID, SYNC_COPIES
 			NAMED_DESTS, RUN_ID = frozenset(os.path.abspath(dest) for dest in dests), uuid.uuid4().hex
+			SYNC_COPIES = bool(remove)
 			# Refuses a clash before anything is copied or removed.
 			dropped, replaced, in_place = _settle_destinations(src_paths, dests, dest_image, directory_only, copy_exclude, 1 if single_thread else max_workers,
 				parallel_file_listing, remove=remove, places=places)
@@ -12813,15 +12859,11 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = multipr
 			eprint(f"Remove skipped: not removing {_sources_text(src_paths)}: {replaced} file(s) in merged directories "
 				'were replaced by a later source, and the earlier source holds their only copy; every source stays')
 		elif remove and dests != ...:
-			# A move: only what the copy listed goes (see remove_moved_sources), once the copies are on disk.
-			unsynced = _sync_destinations(dests)
-			if unsynced:
-				eprint(f'Remove skipped: not removing {_sources_text(src_paths)}: {unsynced}, so the copies may not be on disk '
-					'yet; every source stays. Fix that and re-run')
-			else:
-				remove_moved_sources(src_paths, total_file_list, total_sym_links, single_thread=single_thread, max_workers=max_workers,
-							verbose=verbose, files_per_job=files_per_job, remove_force=remove_force, exclude=exclude, root_ids=source_ids,
-							dests=dests, dest_image=bool(dest_image))
+			# A move: only what the copy listed goes (see remove_moved_sources). Each copy was written to disk by its worker
+			# (_sync_landing), and one that could not be is a copy failure, which stopped this branch above.
+			remove_moved_sources(src_paths, total_file_list, total_sym_links, single_thread=single_thread, max_workers=max_workers,
+						verbose=verbose, files_per_job=files_per_job, remove_force=remove_force, exclude=exclude, root_ids=source_ids,
+						dests=dests, dest_image=bool(dest_image))
 		elif remove:
 			process_remove(src_paths,single_thread=single_thread, max_workers=max_workers,verbose=verbose,
 						files_per_job=files_per_job, remove_force=remove_force,exclude=exclude,batch=batch,parallel_file_listing=parallel_file_listing)
@@ -12838,7 +12880,7 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = multipr
 		track = traceback.format_exc()
 		eprint(f"General Exception: {e} \n{track}")
 	finally:
-		NAMED_DESTS, RUN_ID = frozenset(), None
+		NAMED_DESTS, RUN_ID, SYNC_COPIES = frozenset(), None, False
 		clean_up(mount_points,loop_devices,delayed_commands)
 		get_partition_details.cache_clear()
 		get_partition_infos.cache_clear()
