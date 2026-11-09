@@ -27,13 +27,6 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - **Revisit when:** someone hits it.
 - **Approved:** 2026-11-05, the user chose "Known limitation (Recommended)".
 
-### Destination symlink at a directory's path
-- **Kind:** deferred.
-- **What the operator sees:** with `out/d -> ../elsewhere`, `hpcp src/ -d out/` writes src/d's files into elsewhere and changes elsewhere's mode, and as root its owner, exit 0, as in 9.80. A user who can write the destination can plant `d -> /etc` before root restores into it. `hpcp src/ -d out/ -rme` with `out/d -> ../src/d` removes the link as an extra, and `d` is not mirrored. The same at a file's path, identical or not: with `out/x -> ../t/f`, `t/f` takes the mode, and as root the owner, of `a/x`.
-- **Why:** not a regression (a link there that leads onto a source file is refused, exit 213), and it needs its own decision: refuse as `cp -a` does, or write through without touching the target's mode and owner, since someone with a symlinked data directory may rely on writing through.
-- **Revisit when:** the next hpcp release.
-- **Approved:** 2026-11-05, the user chose "Deferred to 9.82 (Recommended)".
-
 ### A stored list used under another spelling can match by chance
 - **Kind:** known limitation.
 - **What the operator sees:** after `hpcp s -fl S`, `hpcp s/ -fl S -rme` with s/a and s/s/a present shares one name with the list (`s/a` against `a`), so the matches-nothing rule does not fire, and the prompt offers the other files for deletion.
@@ -41,48 +34,13 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - **Revisit when:** someone hits it.
 - **Approved:** 2026-11-05, the user chose "Known limitation (Recommended)".
 
-### A move of a link's directory and a path through the link can end in exit 192
-- **Kind:** deferred.
-- **What the operator sees:** `printf 'lb/\n' | hpcp -sfl - lb/x -d out/ -rf`, with `lb` a link to `b`: `out/x` and the link `out/lb -> b` land, `lb` goes and `b/x`, `b/y`, `b/s/z` stay, in every run. Some runs then end with "not removing lb: it, or a directory on its path, is no longer what the copy listed" and exit 192, the others exit 0. Nothing is lost: the tree comes out the same either way.
-- **Why:** the removal of `lb/x` and of the link `lb` run side by side, and the check before removing sees the link already gone. 7617241 does the same (67 runs in 200, against 66).
-- **Revisit when:** the next hpcp release.
-
-### A million-entry list holds its jobs in memory
-- **Kind:** deferred.
-- **What the operator sees:** the check before the copy keeps every entry's paths at once: a peak of about 741 bytes more per entry than 7617241 with the copy stubbed out (740 MB for a million), and +143 bytes per file measured in a real copy of 300,000. The extra CPU is nearly all garbage collection over the kept jobs: a stubbed million took 19.08, 20.56 and 22.22 s with it on, 19.26, 19.15 and 19.56 s with it off.
-- **Why:** it reads the jobs twice, and generators need `_settle_destinations` reshaped; the copy works either way.
-- **Revisit when:** the next hpcp release.
-
 ### A rerun scans the destination directories one by one
 - **Kind:** deferred.
 - **What the operator sees:** a copy onto an existing tree reads each directory it lands in, on one worker, before the first file is copied: about 1 us per file on a local disk, longer on network storage.
 - **Why:** correct and bounded as it is; a parallel scan is its own change.
-- **Revisit when:** the next hpcp release.
-
-### A source that opens and then fails on read costs the old copy
-- **Kind:** deferred.
-- **What the operator sees:** `cp` truncates the destination before its first read, so a source that opens and then fails (`/proc/self/mem` with an old `out/mem`) ends in exit 190 and the old copy is gone. 9.80 left it empty.
-  - With several destinations, a part written through a link at the first destination and the file then taken by the second ends exit 0 with the link's target half written (`hpcp a/ -d out/ -d two/` with `out/x -> ../t/f`).
-- **Why:** keeping it takes a temporary name and a rename, which is its own design; that covers the link case too. It covers landings in a tree only: a name given by `-d` keeps the write-through, because a rename would replace a FIFO named by `-d` and break a pipe feed that works today (a regular file onto a lone FIFO with a reader).
-- **Revisit when:** the next hpcp release.
-
-### A FIFO that blocks the copy
-- **Kind:** deferred.
-- **What the operator sees:** a regular file onto a lone FIFO at the destination hangs with or without `-co`, because `cp` writes to it and waits for a reader. As on 9.80. A regular file onto a FIFO with other names does not hang: it lands as a regular file at that name, as `-a` always did, and the other names keep the FIFO.
-- **Why:** rare, and the hang is old. The temporary name and rename above (tree landings only) keeps the name until the copy is whole, and never opens the FIFO; a FIFO named by `-d` keeps today's behaviour, so a feed that works is not broken.
-- **Revisit when:** the next hpcp release.
-
-### A named FIFO or socket is copied and still exits 200
-- **Kind:** deferred.
-- **What the operator sees:** `hpcp a/p -d out/` makes the node, prints `Source path type error` and ends exit 200. With `-s` the exit is 0 (9.81 too). A file that is refused is not listed, so a clash adds no such line; a named FIFO whose landing is a directory prints it before the clash, and a device source a user may not make before the `Copy failed`. With `-rf` it is 212 and every named source stays, files included; nothing is lost. The same FIFO in a directory source is skipped silently with exit 0. Same on 9.80.
-- **Why:** old and safe. A named special should either copy cleanly or be skipped as in a tree, and that is its own decision.
-- **Revisit when:** the next hpcp release.
-
-### A regular file writes through a device node at the destination
-- **Kind:** deferred.
-- **What the operator sees:** a regular source that lands on a device node, in a tree or named by `-d`, is written through it, with or without `-co`: into the device, or the disk behind it, which on a mounted disk writes over live blocks (reasoned, not run). Without `-co` the node also takes the source's mode and times. A link to a device is the device: a regular file named onto `-d lnk` writes the disk behind it. The same on 9.80. A device or FIFO source no longer does this: since 9.82 it is never read, with or without `-co`, and it never replaces a device (or a link to one) that `-d` names.
-- **Why:** old, and it needs a node where a file belongs. Leaving a destination that is not a regular file alone belongs with the temporary name and rename above. A device named by `-d` may be what the operator meant to write.
-- **Revisit when:** the next hpcp release.
+- **Measured (9.85, 2026-11-08):** 9.85 has no serial scan (`_link_targets` is gone; the directory checks run in the workers), but a rerun is not faster for it: 100,000 files in 10,000 directories, nothing to copy, NFSv4.1 loopback `actimeo=0` on EL7 (2 vCPUs): 9.84 1764, 2301, 2212 s, 9.85 1871, 1878, 3044 s. On a local disk (Docker, a loaded host): 9.84 9.3 to 19.8 s, 9.85 6.5 to 15.7 s. The time goes to the per-file checks over NFS (about 60 to 80 GETATTRs per file rewritten, 9.84 as 9.85), not to a scan.
+- **Plan (9.86):** cut the per-file checks that ask again what is known. One is new in 9.85: copy_file's look-only pass through the door calls `_landing_of(dest)` only for its path, an lstat per destination per file, a round trip each on NFS `actimeo=0`; the path needs no lstat there.
+- **Revisit when:** 9.86, with the copy check's second pass (stat only the entries met twice).
 
 ### Rerunning an overlapping form is refused
 - **Kind:** known limitation.
@@ -112,26 +70,54 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - **Revisit when:** an operator reports finding one.
 - **Approved:** 2026-11-06, the user chose "Known limitation (Recommended)".
 
+### A temporary file left by SIGKILL or Ctrl-\ (SIGQUIT)
+- **Kind:** known limitation.
+- **What the operator sees:** hpcp killed with SIGKILL, ended with Ctrl-\ (SIGQUIT), or cut by a power cut while it rewrites a file leaves a hidden `.hpcp_tmp_` file (16 hex digits after the prefix) beside it, in the destination; the file it was rewriting is untouched, its old copy whole. A rerun leaves the temporary file there; `-rme` removes it as an extra. SIGINT, SIGTERM and SIGHUP remove it (rule 9).
+- **Why:** SIGKILL cannot be handled, and a rewrite that keeps the old copy whole needs the new one under another name until it is. Ctrl-\ is left without a handler on purpose: it is the way out of a run that is stuck (see "A stopped or broken run can still hang, rarely"), so it must not wait for a cleanup.
+- **Revisit when:** an operator reports finding one.
+- **Approved:** 2026-11-08, the user chose "Approve (Recommended)"; widened to Ctrl-\ (SIGQUIT) 2026-11-09, the user chose "Approve (Recommended)" ("Ctrl-\ stays an instant exit").
+
+### A growing rewrite near a full disk or at quota keeps the old copy, exit 190
+- **Kind:** known limitation.
+- **What the operator sees:** a rewrite whose source is larger than the old copy, where the temporary file beside it runs out of room (`ENOSPC`, `EDQUOT`) part way, exits 190 with the old copy kept as it was (`Copy failed: ... leaving DEST as it is: ... growing it in place could cost the old copy`), where 9.84 wrote it in place and succeeded when the growth fitted. A rewrite that does not grow, or one where the free space is at least the source's size, is written in place as before.
+- **Why:** written in place, a source that grows past the room left would truncate the old copy first and then fail, losing both; the partial temporary file shows the room is short.
+- **Revisit when:** a portable space reservation (`fallocate` of the temporary file to the source's size) proves out on EL7's filesystems, so the room is known before anything is written.
+- **Approved:** 2026-11-08, the user chose "Exit 190, keep old (Recommended)".
+
+### A sparse rewrite in place without room for its new data keeps the old copy, exit 190
+- **Kind:** known limitation.
+- **What the operator sees:** a sparse file (a VM image, say) written in place over its older copy (the temporary file beside it could not be made or renamed, or ran out of room) on a nearly full disk or at quota, where the source's data lands in the old copy's holes and there is no room for it: `Copy failed: cannot copy SRC to DEST, leaving DEST as it is: no room for the source's data where the old copy has holes`, exit 190, the old copy as it was. Where that reservation fell short part way, part of the old copy's own preallocated room (fallocated, never written) can be released too; its content stays exact. 9.84 freed the old copy first and wrote the file: in the 9.85 review's runs it would have finished in about a quarter to a half of these cases (21 of 85 on tmpfs, 16 of 65 on EL8 ext4, 22 of 37 on EL8 XFS) and torn and lost the old copy in the rest.
+- **Why:** the room is reserved before anything is written so that a short disk can never tear the old copy; telling the old copy's own preallocated room from a real hole needs FIEMAP, which SEEK_DATA cannot do.
+- **Revisit when:** an operator reports a sparse rewrite that 9.84 finished and 9.85 refuses, or a preallocated file thinned after an exit 190.
+- **Approved:** 2026-11-09, the user chose "Approve (Recommended)" ("The old copy is never lost. Free some room and rerun to finish the rewrite.").
+
+### Windows: nothing is fsynced
+- **Kind:** known limitation.
+- **What the operator sees:** on Windows hpcp fsyncs no copy, so a move there can lose both the copy (still in memory) and the source (its removal already on disk) to a power cut, as with 9.84.
+- **Why:** Windows' fsync wants a descriptor open for writing, and there is no Windows machine here to build and test it on.
+- **Revisit when:** a Windows machine is available, or an operator runs hpcp moves on Windows.
+- **Approved:** 2026-11-09, the user chose "Approve (Recommended)".
+
+### A move's links in another user's unreadable directory are not fsynced
+- **Kind:** known limitation.
+- **What the operator sees:** a non-root move that makes links in a directory another user owns and the runner may not read (a write-only drop box) does not fsync that directory: a power cut soon after the move can lose those links while their sources are already gone.
+- **Why:** a directory is fsynced through a descriptor, and one the runner may not read cannot be opened; the alternative, `os.sync()` of every filesystem, can take seconds on a busy host, for a rare case.
+- **Revisit when:** an operator reports moving links into such a directory.
+- **Approved:** 2026-11-09, the user chose "Approve (Recommended)".
+
+### `-co` writes in place where the old file's metadata cannot be carried
+- **Kind:** known limitation.
+- **What the operator sees:** with `-co`, a rewrite of a file with one name whose owner, group or an xattr cannot be given to a new file (another user's file for a non-root runner, a group the runner cannot set, an xattr hpcp cannot carry such as `trusted.*`) is written in place after the source has read whole, as 9.84 did. A failure on the destination's side part way (a full disk, an I/O error, a kill) then leaves that file torn, which the beside route would not. A file with other names still gets a new file, owned by the runner.
+- **Why:** a new file there would change its owner, group or xattrs, which `-co` keeps; reading the source first rules out the commonest loss, a source that fails on read.
+- **Revisit when:** an operator needs `-co` rewrites of other users' files to survive a destination failure.
+- **Approved:** 2026-11-08, the user chose "Approve (Recommended)".
+
 ### A directory that cannot be asked about a new pair
 - **Kind:** known limitation.
 - **What the operator sees:** two names that fold alike (`X` and `x`), at least one of them new, landing in a directory where nothing can be made, such as an owned mode 555 directory, are refused with 213: `may be one name, and the destination cannot be asked: nothing can be made in DIR to ask it (Permission denied): make it writable and run again` (a read-only mount or a full disk names its own fix). On a case-sensitive filesystem the refusal is false: 9.82 opened an owned directory and landed both. No file is lost. Where nothing can be made, the directory's listing answers: both names in it are two names, so a rerun with both names there passes.
 - **Why:** it takes that exact mix, and opening the directory for the probe means another chmod and restore in the path that writes to destinations.
 - **Revisit when:** someone hits it.
 - **Approved:** 2026-11-06, the user chose "Known limitation (Recommended)".
-
-### An 8.3 alias beside its long name on vfat
-- **Kind:** deferred.
-- **What the operator sees:** a copy without a move, `hpcp a/ b/ -d out/` onto vfat with `a/longfilename.txt` and `b/LONGFI~1.TXT`, exits 0 in about a third of the runs with one landing holding the other's content: vfat made `LONGFI~1.TXT` the short name of the first file, so the second source is written onto it. Both sources stay, so nothing is lost, but the destination lacks one of the two files and nothing says so. Since 9.84 a move keeps the source whose landing does not hold it, exit 213 (EL8 vfat: 7 of 20 moves lost a content in 9.83, none in 9.84).
-- **Why:** a numbered alias such as `LONGFI~1.TXT` is in neither name, so no rule on names catches it before the copy, and asking the directory about the pair (`_ask_names`) cannot see that one file already has the other's name: it is the filesystem's invention, not a spelling. The move's backstop (`_moved_not_held`) runs before a removal, and a copy removes nothing.
-- **Plan:** run the same check at the end of a copy, and report each landing that does not hold its source as a `Destination clash` (213).
-- **Revisit when:** the next hpcp release.
-
-### A copy into its own inside under another spelling on FUSE exFAT
-- **Kind:** deferred.
-- **What the operator sees:** on exFAT through FUSE (EL7 and EL8), with `D/f` and `D/sub/f`, `hpcp D/ -d d/sub/` without `-rf` exits 0 and adds `D/sub/sub/f`: `d` is `D`, so the destination is inside the source, and the copy reads the destination's own files and copies them into it, one level deeper each run. The file it adds holds either content, as its copy races with the one that writes `D/f` onto `D/sub/f`. In one spelling (`hpcp D/ -d D/sub/`) the destination is left out of the walk, and `D/sub/f` takes `D/f`'s content as any file of a destination would, so the other spelling adds only the extra copies. The move form, `hpcp D/ -d d/sub/ -rf`, is refused (241), as in one spelling.
-- **Why:** the check that a source holds the destination compares real paths, and FUSE exFAT gives each spelling of one directory a number of its own, so `D` and `d` are two real paths there. Kernel filesystems give both one number, and the check sees one directory.
-- **Plan:** where a source's real path folds like the start of a destination's, ask the directory whether they are one (`_RealPlaces.same_place`), as the move check does, and leave the destination out of the walk as for one spelling.
-- **Revisit when:** the next hpcp release.
 
 ### A legacy name read as UTF-8 or ASCII, against its other case
 - **Kind:** deferred.
@@ -140,45 +126,162 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   - both names' bytes are valid UTF-8, but not as each other's case: KOI8-R `бё` and `бЁ` (`C2 A3` and `C2 B3`), CP1251 `EF B8 B8` and `EF A8 B8`; CP1251 alone has 880 such two-byte pairs;
   - an ASCII name against a legacy one: `istanbul` against ISO 8859-9 `İstanbul` (`DD` for `İ`, which that table makes the other case of `i`);
   - two cases of different lengths: EUC-JP `ς` is three bytes (`8F A6 F8`) and `Σ` two (`A6 B2`), and no rule over single bytes can join names of different lengths.
-  A copy without a move, `hpcp a/ b/ -d out/` with one in `a/` and the other in `b/`, exits 0 with one landing holding the other's content: both sources stay, and the destination lacks one file. Since 9.84 a move keeps the source whose landing does not hold it (213), and so does a rename in case between two such names (`hpcp out/ONE -d out/OTHER -rf`), where 9.83 exited 0 with a content or the file gone. Checked on vfat mounted `iocharset=cp1251`, `koi8-r` and `iso8859-9` (`utf8=0`) on EL8; the EUC-JP pair on kernel exFAT is not checked yet (it needs VM 901). Only for such pairs, and only on such a mount: names that are not UTF-8 as a whole fold byte by byte and meet.
-- **Why:** a name that is valid UTF-8 is read as UTF-8, which it is on every other mount, and the mount's own table, not UTF-8, says what its other case is. Joining every valid name with every name of the same length would ask about most trees pair by pair again. The move's backstop runs before a removal, and a copy removes nothing.
-- **Plan:** run the move's check at the end of a copy too, and report such a landing as a `Destination clash` (213). Then catch the pairs before the copy, so that neither content is written over: fold every name byte by byte on a mount with a codepage `iocharset` (read from the mount options), or join byte-level keys across all names.
-- **Revisit when:** the next hpcp release.
+  So the pair is found only after the copy, by the backstop: `hpcp a/ b/ -d out/` with one in `a/` and the other in `b/` ends in exit 213, `Destination clash: copied SRC, but LANDING is one file with OTHER (from OTHER_SRC)`, and the landing holds whichever source was written last, which in a parallel copy can differ from run to run; every rerun copies both again, and with `-rf` both sources stay. A pair caught before the copy is refused there instead: the first source lands and the second is not written, the same on every run. Checked on vfat mounted `iocharset=cp1251`, `koi8-r` and `iso8859-9` (`utf8=0`) on EL8; the EUC-JP pair on kernel exFAT is not checked yet (it needs VM 901). Only for such pairs, and only on such a mount: names that are not UTF-8 as a whole fold byte by byte and meet.
+- **Why:** a name that is valid UTF-8 is read as UTF-8, which it is on every other mount, and the mount's own table, not UTF-8, says what its other case is. Joining every valid name with every name of the same length would ask about most trees pair by pair again.
+- **Plan:** catch the pairs before the copy, so that neither content is written over: fold every name byte by byte on a mount with a codepage `iocharset` (read from the mount options), or join byte-level keys across all names.
+- **Revisit when:** 9.85.
 
 ### Directories that differ only in case on vfat mounted `iocharset=utf8`
-- **Kind:** deferred.
-- **What the operator sees:** on a vfat mounted with `iocharset=utf8` given explicitly, `hpcp a/ b/ -d out/` with `a/D/f` and `b/d/g` exits 193 (`Directory sync error: .../b/d to .../out/d: [Errno 2] No such file or directory`, then `Copy failed ... No more destination paths to try`), and `g` is not copied; with `-rf` it exits 212 and keeps both sources. Nothing is lost, and 9.82 does the same. Checked on VM 901; vfat with its default charset or `iocharset=iso8859-1`, kernel exFAT, NTFS (`ignore_case`) and ext4 casefold merge the two, exit 0.
-- **Why:** vfat mounted that way looks a name up in its own case only (`out/d` is not found) but will not make it either, as `out/D` holds the name; the copy names the directory as the source spells it.
-- **Plan:** write a merged directory's files under the spelling the directory holds, which `_RealPlaces` knows from asking it, or report the pair as a clash.
-- **Revisit when:** the next hpcp release.
+- **Kind:** deferred (9.86).
+- **What the operator sees:** on a vfat mounted with `iocharset=utf8` given explicitly, `hpcp a/ b/ -d out/` with `a/D/f` and `b/d/g` exits 193 (`Directory sync error: .../b/d to .../out/d: [Errno 2] No such file or directory`, then `Copy failed ... No more destination paths to try`), and `g` is not copied; with `-rf` it exits 212 and keeps both sources. A single source does it too: `out/D` from an earlier run, and a source that now spells it `d`, exit 193 and nothing below it copied (checked on EL7 by the 9.85 designer). Nothing is lost, and 9.82 does the same. Checked on VM 901; vfat with its default charset, `utf8=1` or `iocharset=iso8859-1`, kernel exFAT, NTFS (`ignore_case`) and ext4 casefold merge the two, exit 0. Since 9.85 the directory door says so: `mkdir` meets `EEXIST` twice where `lstat` finds nothing, and the 193 names the mount option to use instead.
+- **Why:** vfat mounted that way looks a name up in its own case only (`out/d` is not found) but will not make it either, as `out/D` holds the name; the copy names the directory as the source spells it. A loud failure with nothing lost, on a mount option the kernel's vfat documentation advises against.
+- **Plan:** in `_dest_directory`, when `mkdir` says `EEXIST` and `lstat` says `ENOENT`, list the parent and take the one entry whose fold matches as the spelling for that directory (cached), so the folder sync, the files and the links below it land there; the move's backstop asks the same helper for the spelling. More than one entry, or none, stays a 193 that says why.
+- **Revisit when:** 9.86.
+- **Noted:** 2026-11-08, the user's standing rule that deferrals are noted, not asked.
 
-### A landing within about 57 characters of PATH_MAX
-- **Kind:** deferred.
-- **What the operator sees:** two names that fold alike landing at a path within about 57 characters of the system's path limit (4096 on Linux) are refused with 213, `refuses the name ... (File name too long)`, because the probe directory makes the path longer. Never a loss; 9.83's earlier probe did the same.
-- **Why:** the probe makes its names at the probe directory's full path.
-- **Plan:** make the probe directory and its names relative to a descriptor of the directory (`dir_fd`), so their length is the name's own.
-- **Revisit when:** the next hpcp release.
+### A user who can write the destination can race a check by path
+- **Kind:** deferred (9.86).
+- **What the operator sees:** every write below a destination goes by path, so a user who can write a destination directory can swap a directory there for a link between hpcp's look (`_dest_directory`) and `cp`'s open, and a root run then writes where the link leads. The static plant (a link left there before the run) is replaced since 9.85; only the race in that moment remains.
+- **Why:** closing it needs each landing's directory opened by descriptors from the destination root with `O_NOFOLLOW`, as the removal does (`_descend`), and `cp` run in that directory: its own change.
+- **Plan:** open each landing directory from the root by descriptors (`O_NOFOLLOW` at each step), `fchdir` to it in the worker and give `cp` relative names.
+- **Revisit when:** 9.86.
+- **Noted:** 2026-11-08, the user's standing rule that deferrals are noted, not asked.
 
-### vfat: files dated before 1980 are copied again on every rerun
-- **Kind:** deferred (9.85).
-- **What the operator sees:** on vfat, a copy rerun copies every file dated before 1980 again, as 9.83 did (in the EL8 test, each such file and no other). FAT cannot store a time before 1980, so the landing's time never matches the source's.
-- **Why:** the skip check does not read the files when only the time disagrees; the 9.84 move backstop does (`_same_contents`).
-- **Plan:** let the skip check read both files when the landing's time is one the filesystem could not keep (a source dated before vfat's floor, 1980-01-01, 315532800), as the backstop does. That costs two reads instead of one copy, for those files only; reading on every time-only mismatch would read each changed file of the same size twice before copying it anyway.
-- **Revisit when:** 9.85.
-- **Noted:** 2026-11-07, the user's standing rule that deferrals are noted, not asked.
+### `-co` reruns rewrite every unchanged file
+- **Kind:** deferred (9.86).
+- **What the operator sees:** a second `hpcp -co a/ -d out/` with nothing changed copies every file again ("Total files copied" counts them all, and each landing's mtime moves on each run). The cost is the whole copy on every rerun.
+- **Why:** `-co` carries no times, so the landing's mtime is that of the last copy and the skip check (size and mtime) never matches.
+- **Plan:** under `-co`, where the size matches and only the time differs, compare the full contents (`_same_contents`, as the move's backstop does) and skip a file that reads the same. Not `is_file_identical`'s hash: with the default `-hs 65536` it reads only the last 64 KiB, and a same-size change before that would be skipped on every rerun.
+- **Revisit when:** 9.86.
+- **Noted:** 2026-11-08, the user's standing rule that deferrals are noted, not asked.
 
-### A list entry that is a link to the destination is taken for a source
-- **Kind:** deferred (9.85).
-- **What the operator sees:** `printf 'outl\nb\n' | hpcp -sfl - -d out -rme`, with `outl -> out`, removes no extra and prints "Not removing" for each one, with no "-rme checked nothing" note; 9.83 cleaned `out/b`. Every version, 9.83 too, also copies the link in as `out/outl`, a link to its own directory. Nothing is lost.
-- **Why:** `_inside_destinations` takes only a real directory for the destination (`isdir and not islink`), so the link is copied as a source, and `-rme`'s guard keeps what it leads to: the whole destination.
-- **Plan:** a named link whose target is a destination is left out as the destination itself is, with the one note. That also stops the junk link.
-- **Revisit when:** 9.85.
-- **Noted:** 2026-11-07, the user's standing rule that deferrals are noted, not asked.
+### A 0555 source directory, first copied by a non-root user, exits 190
+- **Kind:** deferred (9.86).
+- **What the operator sees:** `hpcp s/ -d out/` as a non-root user, with `s/d` mode 0555 holding files: exit 190, `out/d` made with mode 0555 and empty, and a rerun fails the same way (checked by the 9.85 designer). Root is not affected.
+- **Why:** the folder sync sets each directory's mode before its files are copied into it.
+- **Plan:** set a directory's metadata (mode, then times) after the files below it, as `cp -a` and rsync do, keeping the directory writable for the runner meanwhile.
+- **Revisit when:** 9.86.
+- **Noted:** 2026-11-08, the user's standing rule that deferrals are noted, not asked.
 
-### `-rme` asks about every extra link on its own
-- **Kind:** deferred (9.85).
-- **What the operator sees:** `-rme` with many extra symlinks in the destination, on NFS mounted `actimeo=0`, spends about 0.6 ms on each (an estimate from the NFS figures for files: about 6 s for 10,000 extra links, against about 0.3 s for the walk that finds them). Extra files are asked once a directory.
-- **Why:** the guard `lstat`s every extra link, to see whether it is a named link source, while for a file it first checks that the file's directory holds a file source. Found in 9.84's review, after the guard stopped following links; it is a cost only.
-- **Plan:** in `guarded(path, 'link')`, return before the `lstat` when the link's directory is not in `file_parents`; a named link always puts its own directory there, a dangling one too.
-- **Revisit when:** 9.85.
-- **Noted:** 2026-11-07, the user's standing rule that deferrals are noted, not asked.
+### Hints quote names as Python escapes, not for the shell
+- **Kind:** deferred (9.86).
+- **What the operator sees:** with a name the locale cannot show (any non-ASCII name with LANG unset, a non-UTF-8 one under a UTF-8 locale), the hints that give a command to run (the replaced-link Note, the `-ncd` refusal's `-d` form) print it with Python's escapes, such as `hpcp W/s/d\udcc3\udca9/ -d W/o/d\udcc3\udca9/`, which a shell cannot run as pasted.
+- **Why:** the hints print the path as Python holds it; messages do the same, which is fine for reading.
+- **Plan:** shell-quote the names in a hint as coreutils does (`$'d\303\251'`); messages keep the `\udcXX` forms.
+- **Revisit when:** 9.86.
+- **Noted:** 2026-11-08, the user's standing rule that deferrals are noted, not asked.
+
+### With LANG unset, a `-siff` apply stops at the first non-ASCII name
+- **Kind:** deferred (9.86).
+- **What the operator sees:** with LANG unset (Python 3.6 on EL7, as under cron), the `-siff` patch apply reads the names in its change list, manifest and disk TSV (`read_changes`, `read_manifest`, `read_disk_tsv`, through `_load_patch`) as UTF-8 text: `new\xc3\xa9` reads back as `'new\xe9'`, which matches no name `os.listdir` gives (`'new\udcc3\udca9'`), and the apply stops with a UnicodeEncodeError on the first such name. A patch made with LANG unset applies whole under `LANG=en_US.UTF-8`, and one made under it fails applied with LANG unset (checked in the EL7 image, 9.84 and 9.85 alike). Making the patch (`-diff`) and `-dfl` lists are not affected: hpcp writes those correctly under any locale and never reads `-dfl` back. The readers are unchanged since they came in (2026-10-10), so 9.83 has it too (not run).
+- **Workaround:** run the `-siff` apply with `LANG=en_US.UTF-8`; the locale must be installed (`locale -a` lists `en_US.utf8`), or Python 3.6 falls back to ASCII and nothing changes.
+- **Why:** they open the file as UTF-8 text, where `_read_list_entries` reads bytes and decodes each name with `os.fsdecode`.
+- **Plan:** read those files in binary and `os.fsdecode` each name field, as `_read_list_entries` does, with a LANG-unset test.
+- **Revisit when:** 9.86.
+- **Noted:** 2026-11-08, the user's standing rule that deferrals are noted, not asked.
+
+### A stop right after a rewrite in place reserves room can remove another user's old copy
+- **Kind:** deferred (9.86).
+- **What the operator sees:** a non-root run rewriting in place a sparse old copy that another user owns but the runner may write (group-writable, or an ACL): the room for the source's data is reserved first (`posix_fallocate`), which moves the old copy's mtime, and only the owner (or root) may set it back. A stop (Ctrl-C, SIGTERM) landing after the reservation and before the first write then finds the old copy's time changed, takes it for a torn copy and removes it, though it still reads as it did; a reservation that falls short (exit 190) keeps the old copy but with a new mtime.
+- **Why:** `_cp_in_place` tells a copy it wrote from the old one by inode, size and mtime, and the time cannot be put back without owning the file. The window is the reservation's own few calls; a sparse old copy of another user's, in a directory that refuses new names or on a nearly full disk, is rare.
+- **Plan:** remove a failed in-place copy only once its first byte was written (the rewrite reports how far it got), not by its times; with the stop backstop of 9.86.
+- **Revisit when:** 9.86.
+- **Noted:** 2026-11-09, from the second opinion on 9.85's last review; the main session's decision, not asked (a deferral).
+
+### A rewrite in place on a copy-on-write filesystem or a reflinked XFS file near a full disk can lose the old copy
+- **Kind:** deferred (9.86).
+- **What the operator sees:** a rewrite written in place (a 0555 directory, a sticky directory, a bind-mounted file, or a temporary file beside it that ran out of room) on a nearly full disk:
+  - on btrfs, ZFS or bcachefs it goes to `cp`, as in 9.84: `cp` truncates the old copy first (or clones a source on the same filesystem), so another writer, such as another worker's temporary file, can take the freed room, and the old copy is torn and removed, exit 190, as in 9.84. Written over instead, the old copy needed room for all of it: on Debian 12 btrfs (48 MiB rewritten with 4 or 24 MiB free, found in the 9.85 last review) the overwrite tore it in all 19 direct runs and in 5 of 30 runs of hpcp 3dee92d (exit 190, the old copy removed), where `cp` wrote it whole every time (16 runs of `cp` alone, 16 of hpcp 9.84);
+  - for an XFS file whose extents a reflink shares (a `cp --reflink` copy, or one an earlier `cp` of coreutils 9.0 or later cloned from a source on the same filesystem), the overwrite can run out of room part way: the old copy is torn (and removed where its directory lets it go), exit 190. As in 9.84 with coreutils before 9.0 (EL8: both tore); with coreutils 9.0 or later and the source on the same filesystem, 9.84's `cp` cloned it and needed no room (Debian 12, coreutils 9.1).
+- **Why:** there an overwrite allocates new blocks, so writing over the old copy needs room as a new file does; the room reserved first (`posix_fallocate`) covers only the source's data landing in the old copy's holes, and on these filesystems it does not cover an overwrite. Telling a shared XFS extent needs FIEMAP.
+- **Plan:** on such a filesystem or file, write in place only when the free room holds the source's data, otherwise keep the old copy (exit 190); for a source on the same filesystem, clone it (`FICLONE`), which needs no room.
+- **Revisit when:** 9.86.
+- **Noted:** 2026-11-09, found building 9.85's in-place rewrite; amended the same day after the last review sent btrfs, ZFS and bcachefs to `cp`; the main session's decision, not asked (a deferral).
+
+### Each rewrite makes a new inode, with no way to write in place instead
+- **Kind:** deferred (9.86).
+- **What the operator sees:** a rewrite goes to a new file renamed over the old one, so what lives on the old inode is not carried: a per-file Lustre or GPFS layout (`lfs setstripe` on the file) is replaced by the directory's default, and readers holding the file open on other NFS clients may get `ESTALE`. There is no option to write in place instead.
+- **Why:** the new inode is what keeps the old copy whole when a source fails on read, the disk fills or the run stops (9.85's core).
+- **Plan:** carry a Lustre layout onto the temporary file (`lfs getstripe` / `setstripe` before the copy, where `lfs` is there), and add an opt-out that writes in place, for operators who weigh those costs over the safety.
+- **Revisit when:** 9.86.
+- **Noted:** 2026-11-08, the user chose "Plan it for 9.86 (Recommended)".
+
+### `-rme` keeps an extra directory named like one beside a source
+- **Kind:** deferred (9.86).
+- **What the operator sees:** `hpcp a/ b -d out/ -rme`, run where a directory `zzz` exists beside `b` (in the working directory), keeps an extra `out/zzz` that no source has, exit 0 (checked in Docker at 9.85). A directory is judged extra by whether its path below the destination exists below each source's parent (`dirname(src)`), and `b`'s parent is the working directory, which holds `zzz`. Only a kept extra, never a loss: what a source is or holds is guarded by identity.
+- **Why:** found in 9.84's review; files are judged by where the copy put them (`_landings`), directories still by a path below each source's parent.
+- **Plan:** judge a directory as `remove_extra_files` judges a file: by the landings of the directory sources' listed folders, with the identity guard as it is.
+- **Revisit when:** 9.86.
+- **Noted:** 2026-11-08, the user's standing rule that deferrals are noted, not asked.
+
+### The copy check stats each landing by name
+- **Kind:** deferred (9.86).
+- **What the operator sees:** the check at the end of a copy, and the move's before its removal, `lstat`s each landing on its own: on a cached local disk about 0.3 s per 100,000 files idle, and more under load (a cached 100,000-file rerun at load 110 took 1.32-1.73 s in 9.84 and 1.81-2.01 s in 9.85), and on NFS mounted `actimeo=0` a round trip each, about 0.3 ms a file in 4 threads.
+- **Why:** correct as it is; reading each landing directory once is its own change.
+- **Plan:** read each landing directory once (`scandir`), take each name's file from the listing where the listing gives one, and `lstat` only the names missing from it (an 8.3 alias is not listed under its short name) or where the listing's numbers cannot be trusted (vfat makes up a number for an uncached inode, FUSE exFAT one for each spelling). And when two fingerprints meet, the second pass now stats every landing again (about 0.45 s per 100,000 files, paid by any merge whose sources share a file, or a source named twice): keep each landing's entry index beside its fingerprint, so it stats only the entries met twice.
+- **Revisit when:** 9.86.
+- **Noted:** 2026-11-08, the user's standing rule that deferrals are noted, not asked.
+
+### A move's directories are not fsynced
+- **Kind:** deferred (9.86).
+- **What the operator sees:** in a move across filesystems, each file is fsynced by its worker and each link's directory once after the last link, but a directory is fsynced only through those. After a power cut within the journal interval (ext4 5 s, XFS up to 30 s), an empty directory the move made, or the mode, owner, xattrs or times of a directory with no file or link made after it on that filesystem, can be missing at the destination while the source is already gone. On ext4 and XFS the fsync of a file or link also commits every earlier change on its filesystem (the directories made before it), so only the last directories of a tree with nothing after them are open: a tree of only empty directories, or the last sources of an `-nb` run that hold only directories. A file's content and name are never at risk by this.
+- **Why:** fsyncing each directory as the folder sync makes it costs 2.6 to 7.8 ms a directory, found in the 9.85 re-review (2,040 empty directories moved in 11.8 to 16.2 s on ext4 and 5.4 to 6.6 s on XFS, on EL7 and EL8, against about 0.4 to 0.6 s). Fsynced once each after all are made it is nearly free (1,000 directories and their 40 parents: 0.02 s on ext4 and 0.07 to 0.23 s on XFS, EL7). The cheap way needs plumbing through `sync_directories_*_batch`, `copy_scheduler` and `process_copy`.
+- **Plan (9.86):** the folder sync returns the destination directories it made or set in a move, as it returns links; after `create_sym_links` the parent fsyncs them and the link directories together, once each, and a failure is a Copy failed that stops the removal.
+- **Revisit when:** 9.86.
+- **Noted:** 2026-11-09, found in the 9.85 re-review; the main session's decision, not asked (a deferral).
+
+### On macOS a move's fsync does not flush the drive's cache
+- **Kind:** deferred (9.86).
+- **What the operator sees:** `os.fsync` on macOS returns once the data is in the drive's own write cache (Apple documents `fcntl(F_FULLFSYNC)` for the flush), so after a move a power cut can lose both the copy and the already removed source. Read from Apple's documentation; hpcp 9.85 has not been run on a Mac and the flush has not been measured.
+- **Why:** `F_FULLFSYNC` is slow on a Mac (it waits for the drive), so adding it blind could cost a move a lot, and there is no Mac here to measure.
+- **Plan (9.86):** use `fcntl(fd, F_FULLFSYNC)` where `fcntl` has it, measured on a Mac before it ships.
+- **Revisit when:** 9.86, or when a Mac run is possible.
+- **Noted:** 2026-11-09, found in the 9.85 re-review; the main session's decision, not asked (a deferral).
+
+### A move's fsync waits are serial in each worker
+- **Kind:** deferred (9.86).
+- **What the operator sees:** a move of many small files onto a slow disk takes about 1.6 to 1.9 times as long as without the sync (10,000 files of 4 KiB on an EL7 VM: 79 to 92 s on ext4 and 72 to 82 s on XFS, against 47 to 54 s and 43 to 47 s), because each worker waits for its own fsync before it copies the next file. A higher `-j` hides the wait: 2,000 files of 4 KiB with the default (one worker per CPU: 2 on the EL7 VM, 4 on the EL8 VM) against `-j 16`: 18.6 to 22.9 s against 10.3 to 11.7 s (EL7 ext4), 17.9 to 21.2 s against 10.1 to 11.7 s (EL7 XFS), 11.9 to 14.0 s against 9.3 to 11.8 s (EL8 ext4), 14.2 to 15.8 s against 8.2 to 10.5 s (EL8 XFS), 3 runs each. That the gain is overlapped waits and not CPU is an inference: the VMs have 2 and 4 vCPUs.
+- **Why:** more fsyncs in flight are batched by the filesystem into fewer journal commits, but a worker has one fsync in flight at a time; overlapping them (a few fsync threads per worker, or the parent's loop) is its own change.
+- **Plan (9.86):** overlap a worker's fsyncs, measured against `-j 16` on the same trees; until then the README says to raise `-j`.
+- **Revisit when:** 9.86.
+- **Noted:** 2026-11-09, found in the 9.85 re-review; the main session's decision, not asked (a deferral).
+
+### Worker error lines glue onto the progress bar in a log
+- **Kind:** deferred (9.86).
+- **What the operator sees:** with output redirected to a file, an error a worker prints (`Copy failed: ...`) can land after the progress bar on the bar's line, so `grep '^Copy failed'` misses it; `grep 'Copy failed'` finds it. Errors the main process prints start their own line (fixed in 9.85). Checked in 9.85 in Docker (Python 3.14 and 3.6): 12 files that cannot be read gave 9 to 11 lines that start with `Copy failed` in each of 6 runs, and the re-review counted the same on 13dcfa8, a commit earlier in 9.85's work, so it is not new in this round (9.84 itself was not run). Nothing is lost: the error is also in the end summary and the exit code is right.
+- **Why:** not traced yet. The bar ends its line with a carriage return and no newline, and a worker's error is written from another process, where the parent's flush-first (`eprint`) cannot order it; that is a reading, not a finding.
+- **Plan (9.86):** have a worker's error text go back to the parent with the task's results and print there, or end the bar's line before an error is printed.
+- **Revisit when:** 9.86.
+- **Noted:** 2026-11-09, found in the 9.85 re-review; the main session's decision, not asked (a deferral).
+
+### A stopped or broken run can still hang, rarely
+- **Kind:** deferred (9.86).
+- **What the operator sees:** on Python 3.6 (EL7, EL8) and 3.14, a run stopped early with Ctrl-C or SIGTERM (`kill`, `timeout`, a systemd stop), or one whose copy worker dies, can wait for good instead of ending. A second Ctrl-C does nothing there (9.85's parent ignores later stops); Ctrl-\ (SIGQUIT) or `kill -9` ends it, and like SIGKILL leaves a `.hpcp_tmp_` file where a rewrite was under way (its `cp`, in a process group of its own, runs on to its end). Measured with the reviewer's probe (early stops, 20 directories of 20 small files, `-j 8`, across EL7, EL8 and Docker 3.6 and 3.14): 9 hangs in 3300 runs with 9.85, against 22 of 3300 at the commit before the last fixes; EL8 early Ctrl-C alone, 4 of 300. 9.84 hung about as often (EL8: 3 of 150 Ctrl-Cs, 4 of 150 SIGTERMs). Sources stay: a stopped or broken copy removes nothing.
+- **Why:** the waits are in Python's process pool, not in hpcp's own code. A stop raised inside CPython's own lock handling strands a lock: the parent inside `concurrent.futures.wait`'s `_AcquireFutures` (verified by injection), or a worker on the pool's call-queue lock (inferred from the hang dumps, not injected). A stop that lands between the two writes of a result over 16 KiB also hangs (verified by injection).
+- **Plan (9.86):** kill workers still alive after a grace period, bound the parent's join and end with `os._exit`; consider polling the stop flag in the pool loops instead of raising in the parent; let a second Ctrl-C end a stuck parent.
+- **Revisit when:** 9.86.
+- **Noted:** 2026-11-09, found in the 9.85 re-reviews; the main session's decision, not asked (a deferral).
+
+### A stop whose KeyboardInterrupt Python drops in the parent is not acted on
+- **Kind:** deferred (9.86).
+- **What the operator sees:** a stop whose `KeyboardInterrupt` Python drops in the parent (it was raised inside a weakref callback or a `__del__`, where every Python reports it as "Exception ignored" and goes on) is not acted on there. While a pool runs, its workers still end on the pass-on, the pool reads as broken, and the run ends with `Copy process crashed: BrokenProcessPool`, exit 191 for a Ctrl-C instead of 130 (a SIGTERM still ends by its signal, 143); seen once in 200 natural runs on Python 3.14. Outside a pool, nothing breaks: the run goes on to its end, a move removing its sources and `-rme` its extras, and a Ctrl-C exits 0; a second Ctrl-C is ignored as a later stop (injected on 3.6 and 3.14: a Ctrl-C dropped while the sources were checked, a second 0.2 s later, and the move ran whole, exit 0). Nothing is lost: what is removed was copied, fsynced and checked first.
+- **Why:** the parent acts on a stop only through the `KeyboardInterrupt` that `_stop` raises, and ignores later stops so that a second Ctrl-C cannot cut the cleanup halfway. Python 3.6 to 3.14 all drop a `KeyboardInterrupt` raised in a weakref callback or a `__del__` (checked: 3.6, 3.12, 3.14); such callbacks run in the parent's main thread as a pool's executor, queues and threads are freed (from reading Python's code, not traced in hpcp: `concurrent.futures`' `weakref_cb`, multiprocessing's `Finalize`, `threading`'s `WeakSet`), so the window is at least the end of each pool phase. Why only 3.14 showed it is not traced.
+- **Plan (9.86):** the parent checks its own stop (`_STOPPED_PID == os.getpid()`) where it can act on it, and raises `KeyboardInterrupt` there: each pass of its pool loops, and before each phase, above all before a removal. That also covers the broken pool (exit 130 or the signal, not 191).
+- **Revisit when:** 9.86.
+- **Noted:** 2026-11-09, found in the 9.85 last review round; the main session's decision, not asked (a deferral).
+
+### On Python 3.14 an early Ctrl-C often prints a traceback
+- **Kind:** deferred (9.86).
+- **What the operator sees:** on Python 3.14, about one early Ctrl-C in three prints a traceback (a `KeyboardInterrupt`) before the run ends with 130. As in 9.84. Nothing is lost.
+- **Why:** under 3.14's default forkserver a worker starts from the fork server, with Python's own SIGINT handler (the server puts back the handlers it started with), and hpcp's handlers go in only at the worker's first task (`_run_task`): the after-fork setup that 9.85's `main()` registers reaches only workers forked from the parent. A Ctrl-C landing before that prints Python's traceback; and a second stop landing in an exit path does the same.
+- **Plan (9.86):** set each worker up before its loop on Python 3.7+ with the pool's `initializer=` (as `-pfl` already does for its rate share), which reaches forkserver and spawn workers too; and the exit paths end on the first stop (as `_end_by` now does in a worker). Ignoring the stops until the handlers are in place cannot be done from the parent under forkserver (the server, not the parent, gives a worker its dispositions), and a stop ignored at a worker's start would stay ignored (`_install_stops` keeps what a process started ignoring).
+- **Revisit when:** 9.86.
+- **Noted:** 2026-11-09, found in the 9.85 last review round; the main session's decision, not asked (a deferral).
+
+### A destination given through `link/..` also makes an empty directory where the link leads
+- **Kind:** deferred (9.86).
+- **What the operator sees:** `hpcp a/ -d l/../out/`, with `l` a link to `deep/inner`, copies into `out/` (the path is folded as written) and also leaves an empty `deep/out/`, made by following the link. 9.84 does the same. Nothing is lost.
+- **Why:** one step makes the destination's directory from the path as given, where the kernel follows `l` before `..`, while the copy uses the folded path. Not traced to the line yet.
+- **Plan (9.86):** fold `-d` once, at the start, and use only the folded path.
+- **Revisit when:** 9.86.
+- **Noted:** 2026-11-09, found in the 9.85 re-review (checked in Docker on 9.85 and 9.84); the main session's decision, not asked (a deferral).

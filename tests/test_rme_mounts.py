@@ -8,6 +8,11 @@ import sys
 
 import pytest
 
+# The test's own names need a UTF-8 filesystem encoding to be made (Python 3.6 with LANG unset has ASCII); hpcp's side of
+# such a locale is test_landings' test_a_non_ascii_name_copies_with_lang_unset.
+utf8_names = pytest.mark.skipif(sys.getfilesystemencoding().lower().replace('-', '') != 'utf8',
+	reason='needs a UTF-8 filesystem encoding for its own non-ASCII names')
+
 HPCP = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'hpcp.py')
 
 
@@ -356,6 +361,7 @@ def _filled(path, content):
 _PAIRS = {'case': ('X', 'x'), 'sharp-s': ('Stra\u00dfe', 'STRASSE'), 'normal-form': ('caf\u00e9', 'cafe\u0301'), 'joiner': ('a\u200db', 'ab')}
 
 
+@utf8_names
 @pytest.mark.parametrize('kind', sorted(_FOLDING))
 @pytest.mark.parametrize('pair', sorted(_PAIRS))
 def test_a_run_agrees_with_the_filesystem_about_a_pair(tmp_path, hpcp_mod, kind, pair):
@@ -1047,6 +1053,7 @@ def test_a_rename_in_case_on_a_directory_that_keeps_both_names_still_moves(tmp_p
 		assert task.returncode == 0 and os.listdir(plain) == ['x'], task.stdout[-2000:]
 
 
+@utf8_names
 @pytest.mark.parametrize('kind', ['ext4', 'f2fs', 'vfat', 'vfat-utf8', 'exfat', 'ntfs'])
 @pytest.mark.parametrize('environment', [{}, {'LC_ALL': 'C', 'PYTHONUTF8': '0', 'PYTHONCOERCECLOCALE': '0'}], ids=['locale', 'ascii'])
 def test_a_pair_that_only_the_filesystem_folds_is_caught_whatever_the_locale(tmp_path, kind, environment):
