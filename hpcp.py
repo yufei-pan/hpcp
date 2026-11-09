@@ -6270,7 +6270,8 @@ def _finish_replace(job, target_root, wait, metadata=True):
 	xattrs the payload lacks are removed from it before the rename (cp -af already set the
 	payload's mode, and with it the ACL mask, so the group bits stay right). On a content-only target
 	(metadata False) an existing FAT file's attribute bits are kept. Any failure is reported as 'Copy failed' and leaves the destination untouched; the
-	temporary file never outlives this call. The temporary file is already on disk (_copy_synced).
+	temporary file never outlives this call. The temporary file is written to disk here, in the parent's loop, one at a time:
+	measured against the workers fsyncing their own files, which came out slower on EL7 (ext4 and XFS, two workers).
 	"""
 	row, source, dest, tmp = job
 	try:
@@ -6286,6 +6287,7 @@ def _finish_replace(job, target_root, wait, metadata=True):
 			raise RuntimeError(reason)
 		# A FAT file keeps its read-only / hidden / system bits: the replacement would otherwise get the defaults.
 		attributes = None if metadata else _fat_attributes(dest)
+		_fsync_file(tmp)  # renamed unsynced, a power cut can leave dest empty (_fsync_file)
 		os.replace(tmp, dest)
 		if attributes is not None and attributes != _fat_attributes(dest):
 			_set_fat_attributes(dest, attributes, row.path)
@@ -6301,17 +6303,6 @@ def _copy_content(src_path, dest_paths, full_hash=False, verbose=False):
 	for dest in dest_paths:
 		shutil.copyfile(src_path, dest)
 		os.utime(dest, ns=(st.st_atime_ns, st.st_mtime_ns))
-
-def _copy_synced(copy, source, dests, full_hash, verbose):
-	"""copy(source, dests) for a patch's temporary file, then that file written to disk (_fsync_file) by the worker that made it,
-	so the fsyncs of many files run side by side and not one at a time in the parent's loop: renamed unsynced over the live
-	file, a power cut can leave it empty. A copy that recorded a failure made nothing to write. Raises OSError when the
-	filesystem fails the fsync."""
-	error_start = len(ERRORS)
-	result = copy(source, dests, full_hash, verbose)
-	if not any(_is_failure(error) for error in ERRORS[error_start:]):
-		_fsync_file(dests[0])
-	return result
 
 def _replace_files(files, target_root, max_workers=1, verbose=False, full_hash=False, metadata=True):
 	"""Copy each (row, source, dest) to a temporary sibling of dest, then rename it over dest.
@@ -6337,10 +6328,10 @@ def _replace_files(files, target_root, max_workers=1, verbose=False, full_hash=F
 		for job in jobs:
 			row, source, dest, tmp = job
 			_finish_replace(job, target_root,
-				functools.partial(_call_raising_recorded_failures, _copy_synced, copy, source, [tmp], full_hash, verbose), metadata)
+				functools.partial(_call_raising_recorded_failures, copy, source, [tmp], full_hash, verbose), metadata)
 		return
 	with ProcessPoolExecutor(max_workers=max_workers) as executor:
-		futures = {_submit_task(executor, _copy_synced, copy, source, [tmp], full_hash, verbose): (row, source, dest, tmp)
+		futures = {_submit_task(executor, copy, source, [tmp], full_hash, verbose): (row, source, dest, tmp)
 			for row, source, dest, tmp in jobs}
 		for future in concurrent.futures.as_completed(futures):
 			_finish_replace(futures[future], target_root, functools.partial(_raise_task_failures, future), metadata)

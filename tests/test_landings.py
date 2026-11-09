@@ -1124,22 +1124,6 @@ def test_a_patch_s_replacement_is_on_disk_before_it_is_renamed(tmp_path, hpcp_mo
 
 
 @posix_only
-def test_a_patch_s_replacements_are_fsynced_by_the_workers_not_one_at_a_time_by_the_parent(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
-	# The parent's loop took one fsync at a time (about 1 ms each on an idle disk) while the workers sat idle.
-	rows = []
-	for name in ('a', 'b', 'c'):
-		write(tmp_path / 'live' / name, 'old')
-		write(tmp_path / 'new' / name, 'new')
-		rows.append((_patch_row(hpcp_mod, monkeypatch, name, 3), str(tmp_path / 'new' / name), str(tmp_path / 'live' / name)))
-	parent_fsyncs = []
-	real_fsync = os.fsync
-	monkeypatch.setattr(hpcp_mod.os, 'fsync', lambda fd: parent_fsyncs.append(fd) or real_fsync(fd))
-	hpcp_mod._replace_files(rows, str(tmp_path / 'live'), 2)
-	assert [read(tmp_path / 'live' / name) for name in 'abc'] == ['new'] * 3 and temporaries(tmp_path) == []
-	assert parent_fsyncs == []
-
-
-@posix_only
 def test_a_patch_s_replacement_that_fails_to_reach_the_disk_keeps_the_old_file(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
 	write(tmp_path / 'live/x', 'old')
 	write(tmp_path / 'new/x', 'new')
