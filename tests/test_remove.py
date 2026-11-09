@@ -902,7 +902,10 @@ def test_move_with_many_source_roots_matches_each_entry_in_linear_time(tmp_path,
 	ids = {root: hpcp_mod._path_identity(root) for root in roots}
 	start = time.process_time()
 	hpcp_mod.remove_moved_sources(roots, roots, {}, single_thread=True, remove_force=True, root_ids=ids)
-	assert time.process_time() - start < 3
+	# Linear: 1.2 to 1.4 s of CPU on Python 3.6 in Docker with the host's load average at 190, 3.25 s on the EL8 VM under that
+	# load (it failed a 3 s bound once, 2026-11-09). The quadratic matching this guards against is 30000 x 30000 = 9e8 comparisons,
+	# 45 s or more at 50 ns each: 15 s tells them apart with room on both sides.
+	assert time.process_time() - start < 15
 	assert os.listdir(src) == []
 
 
