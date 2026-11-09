@@ -70,6 +70,27 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - **Revisit when:** an operator reports finding one.
 - **Approved:** 2026-11-06, the user chose "Known limitation (Recommended)".
 
+### A temporary file left by SIGKILL
+- **Kind:** known limitation.
+- **What the operator sees:** hpcp killed with SIGKILL (or a power cut) while it rewrites a file leaves a hidden `.hpcp_tmp_` file (16 hex digits after the prefix) beside it, in the destination; the file it was rewriting is untouched, its old copy whole. A rerun leaves the temporary file there; `-rme` removes it as an extra. SIGINT, SIGTERM and SIGHUP remove it (rule 9).
+- **Why:** SIGKILL cannot be handled, and a rewrite that keeps the old copy whole needs the new one under another name until it is.
+- **Revisit when:** an operator reports finding one.
+- **Approved:** 2026-11-08, the user chose "Approve (Recommended)".
+
+### A growing rewrite near a full disk or at quota keeps the old copy, exit 190
+- **Kind:** known limitation.
+- **What the operator sees:** a rewrite whose source is larger than the old copy, where the temporary file beside it runs out of room (`ENOSPC`, `EDQUOT`) part way, exits 190 with the old copy kept as it was (`Copy failed: ... leaving DEST as it is: ... growing it in place could cost the old copy`), where 9.84 wrote it in place and succeeded when the growth fitted. A rewrite that does not grow, or one where the free space is at least the source's size, is written in place as before.
+- **Why:** written in place, a source that grows past the room left would truncate the old copy first and then fail, losing both; the partial temporary file shows the room is short.
+- **Revisit when:** a portable space reservation (`fallocate` of the temporary file to the source's size) proves out on EL7's filesystems, so the room is known before anything is written.
+- **Approved:** 2026-11-08, the user chose "Exit 190, keep old (Recommended)".
+
+### `-co` writes in place where the old file's metadata cannot be carried
+- **Kind:** known limitation.
+- **What the operator sees:** with `-co`, a rewrite of a file with one name whose owner, group or an xattr cannot be given to a new file (another user's file for a non-root runner, a group the runner cannot set, an xattr hpcp cannot carry such as `trusted.*`) is written in place after the source has read whole, as 9.84 did. A failure on the destination's side part way (a full disk, an I/O error, a kill) then leaves that file torn, which the beside route would not. A file with other names still gets a new file, owned by the runner.
+- **Why:** a new file there would change its owner, group or xattrs, which `-co` keeps; reading the source first rules out the commonest loss, a source that fails on read.
+- **Revisit when:** an operator needs `-co` rewrites of other users' files to survive a destination failure.
+- **Approved:** 2026-11-08, the user chose "Approve (Recommended)".
+
 ### A directory that cannot be asked about a new pair
 - **Kind:** known limitation.
 - **What the operator sees:** two names that fold alike (`X` and `x`), at least one of them new, landing in a directory where nothing can be made, such as an owned mode 555 directory, are refused with 213: `may be one name, and the destination cannot be asked: nothing can be made in DIR to ask it (Permission denied): make it writable and run again` (a read-only mount or a full disk names its own fix). On a case-sensitive filesystem the refusal is false: 9.82 opened an owned directory and landed both. No file is lost. Where nothing can be made, the directory's listing answers: both names in it are two names, so a rerun with both names there passes.
@@ -137,6 +158,14 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - **Plan:** read those files in binary and `os.fsdecode` each name field, as `_read_list_entries` does, with a LANG-unset test.
 - **Revisit when:** 9.86.
 - **Noted:** 2026-11-08, the user's standing rule that deferrals are noted, not asked.
+
+### Each rewrite makes a new inode, with no way to write in place instead
+- **Kind:** deferred (9.86).
+- **What the operator sees:** a rewrite goes to a new file renamed over the old one, so what lives on the old inode is not carried: a per-file Lustre or GPFS layout (`lfs setstripe` on the file) is replaced by the directory's default, and readers holding the file open on other NFS clients may get `ESTALE`. There is no option to write in place instead.
+- **Why:** the new inode is what keeps the old copy whole when a source fails on read, the disk fills or the run stops (9.85's core).
+- **Plan:** carry a Lustre layout onto the temporary file (`lfs getstripe` / `setstripe` before the copy, where `lfs` is there), and add an opt-out that writes in place, for operators who weigh those costs over the safety.
+- **Revisit when:** 9.86.
+- **Noted:** 2026-11-08, the user chose "Plan it for 9.86 (Recommended)".
 
 ### `-rme` keeps an extra directory named like one beside a source
 - **Kind:** deferred (9.86).
