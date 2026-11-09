@@ -214,3 +214,19 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - **Plan (9.86):** have a worker's error text go back to the parent with the task's results and print there, or end the bar's line before an error is printed.
 - **Revisit when:** 9.86.
 - **Noted:** 2026-11-09, found in the 9.85 re-review; the main session's decision, not asked (a deferral).
+
+### On Python 3.6 a stopped or broken run can still hang, rarely
+- **Kind:** deferred (9.86).
+- **What the operator sees:** on Python 3.6 (EL7, EL8), a run stopped early with Ctrl-C, or one whose copy worker dies, can wait for good instead of ending, and needs a `kill -9`. Measured on EL8 with 9.85: 1 of 150 early Ctrl-Cs, and 1 of 240 runs with a copy worker killed; 9.84 hung in 1 of 240 such runs too. Sources stay: a stopped or broken copy removes nothing.
+- **Why:** the waits are in Python 3.6's process pool, not in hpcp's own code: once the parent's pool thread was blocked on a future's lock (a Ctrl-C landing inside `concurrent.futures.wait` while it takes those locks, by reading, not verified), and once two workers that had run no task did not act on the pool's SIGTERM (cause not found). 9.85 first made this worse (5 of 100 early Ctrl-Cs): fixed in 9.85 itself, which brought it back to about 9.84's rate.
+- **Plan (9.86):** after a stopped or broken pool, kill any worker still alive after a grace period, and bound the parent's own wait.
+- **Revisit when:** 9.86.
+- **Noted:** 2026-11-09, found in the 9.85 re-review; the main session's decision, not asked (a deferral).
+
+### A destination given through `link/..` also makes an empty directory where the link leads
+- **Kind:** deferred (9.86).
+- **What the operator sees:** `hpcp a/ -d l/../out/`, with `l` a link to `deep/inner`, copies into `out/` (the path is folded as written) and also leaves an empty `deep/out/`, made by following the link. 9.84 does the same. Nothing is lost.
+- **Why:** one step makes the destination's directory from the path as given, where the kernel follows `l` before `..`, while the copy uses the folded path. Not traced to the line yet.
+- **Plan (9.86):** fold `-d` once, at the start, and use only the folded path.
+- **Revisit when:** 9.86.
+- **Noted:** 2026-11-09, found in the 9.85 re-review (checked in Docker on 9.85 and 9.84); the main session's decision, not asked (a deferral).
