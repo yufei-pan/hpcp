@@ -3640,10 +3640,12 @@ def _write_over(src_path, target):
 	over, every hole would be filled; cp keeps them), or its filesystem copies on write (_COPY_ON_WRITE: written over, the
 	old copy needs room for all of it; cp frees it first, or clones a source on the same filesystem).
 
-	Only the source's data is read and written (its data extents, SEEK_DATA/SEEK_HOLE; all of it where that cannot tell);
-	where the source has a hole, zeros are written only over target's data, so target's holes stay holes. A dense old copy
-	needs no room. Where the source's data lands in target's holes, that room is reserved first (posix_fallocate, which
-	leaves what target reads as it was): a disk or quota short of it raises _KeptOld before anything is written. An XFS
+	Only the source's data is read and written (its data extents, SEEK_DATA/SEEK_HOLE; all of it where that cannot tell).
+	Where the source has a hole, target's data there is punched to a hole (_punch), so the result is as sparse as the source,
+	as cp makes it; zeros are written over it only where the filesystem cannot punch. A dense old copy needs no room. Where
+	the source's data lands in target's holes, that room is reserved first (posix_fallocate on those holes only, which leaves
+	what target reads as it was): a disk or quota short of it gives back what was reserved (punched to holes again, where the
+	filesystem punches) and raises _KeptOld before anything is written. An XFS
 	extent shared by a reflink needs room for its overwrite, which nothing reserves."""
 	try:
 		source, old = os.lstat(src_path), os.lstat(target)
@@ -3671,16 +3673,21 @@ def _write_over(src_path, target):
 		try:
 			extents = list(_data_extents(src, 0, size))
 			if first_hole < size and hasattr(os, 'posix_fallocate'):
+				reserved = []
 				try:
 					for start, end in extents:
-						os.posix_fallocate(fd, start, end - start)
+						for hole, stop in _holes(fd, start, end):
+							reserved.append((hole, stop))  # before the call: a failing one may have allocated a part
+							os.posix_fallocate(fd, hole, stop - hole)
 				except OSError as e:
 					if e.errno not in _NO_FALLOCATE:
+						for hole, stop in reserved:
+							_punch(fd, hole, stop)  # each was a hole: it reads zeros either way. Where it cannot, the room stays
 						raise _KeptOld(f"no room for the source's data where the old copy has holes ({_why(e)})")
 				finally:
-					# fallocate moves the mtime (XFS; ext4 on EL8's kernel and later): put back, target reads as it did until the
-					# first write, so a short disk or a stop before then leaves it (_cp_in_place removes only a copy whose state
-					# changed).
+					# fallocate and the punch move the mtime (XFS; ext4 on EL8's kernel and later): put back, target reads as it
+					# did until the first write, so a short disk or a stop before then leaves it (_cp_in_place removes only a
+					# copy whose state changed).
 					try:
 						os.utime(fd, ns=(old.st_atime_ns, old.st_mtime_ns))
 					except (OSError, NotImplementedError):
@@ -3688,7 +3695,8 @@ def _write_over(src_path, target):
 			length, done = size, 0
 			for start, end in extents + [(size, size)]:
 				for data, hole in _data_extents(fd, done, start):
-					_write_range(fd, data, hole, lambda offset, n: bytes(n))
+					if not _punch(fd, data, hole):
+						_write_range(fd, data, hole, lambda offset, n: bytes(n))
 				reached = _write_range(fd, start, end, lambda offset, n: os.pread(src, n, offset))
 				if reached < end:
 					length = reached  # the source ended early: cut there, as cp would
@@ -3715,6 +3723,41 @@ def _data_extents(fd, start, end):
 			return
 		yield data, min(hole, end)
 		start = hole
+
+def _holes(fd, start, end):
+	"""The ranges of [start, end) where fd holds no data: what _data_extents leaves."""
+	for data, hole in _data_extents(fd, start, end):
+		if data > start:
+			yield start, data
+		start = hole
+	if start < end:
+		yield start, end
+
+_FALLOCATE = []  # libc's fallocate, looked up once in a worker: [function], or [None] where there is none
+
+def _punch(fd, start, end):
+	"""Make fd's [start, end) a hole, its size unchanged (fallocate(2) with FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,
+	through ctypes: Python has no os.fallocate): True when it is one now. False where it cannot be punched (not Linux, no
+	libc fallocate, a filesystem without it: ext4 without extents, NFS before 4.2, or no room to split an extent), and the
+	range is as it was."""
+	if not _FALLOCATE:
+		function = None
+		try:
+			import ctypes
+			libc = ctypes.CDLL(None, use_errno=True)
+			if sys.platform.startswith('linux'):
+				if hasattr(libc, 'fallocate64'):
+					function, offset = libc.fallocate64, ctypes.c_int64  # off64_t whatever the build's off_t
+				else:
+					function, offset = libc.fallocate, ctypes.c_long  # off_t
+				function.argtypes = [ctypes.c_int, ctypes.c_int, offset, offset]
+				function.restype = ctypes.c_int
+		except (OSError, AttributeError, ImportError):
+			function = None
+		_FALLOCATE.append(function)
+	if _FALLOCATE[0] is None or end <= start:
+		return False
+	return _FALLOCATE[0](fd, 3, start, end - start) == 0  # 3: FALLOC_FL_KEEP_SIZE (1) | FALLOC_FL_PUNCH_HOLE (2)
 
 def _write_range(fd, start, end, read):
 	"""Write read(offset, count) over fd's [start, end), a piece at a time; the offset it reached (short where read gave

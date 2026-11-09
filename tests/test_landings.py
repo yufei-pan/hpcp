@@ -957,6 +957,58 @@ def test_a_stop_right_after_the_reservation_keeps_the_old_copy(hpcp_mod, monkeyp
 	assert old.exists() and old.read_bytes() == before and os.stat(str(old)).st_mtime_ns == 10 ** 18
 
 
+def _can_punch(hpcp_mod, tmp_path):
+	"""Skip where the filesystem under tmp_path cannot punch a hole (or has no GNU cp): the tests below need one."""
+	probe = tmp_path / 'probe'
+	write(probe, b'p' * (1 << 20))
+	if not (hpcp_mod.cp_supports_sparse() and hasattr(os, 'posix_fallocate')):
+		pytest.skip('no GNU cp, or no posix_fallocate')
+	with open(str(probe), 'r+b') as f:
+		if not hpcp_mod._punch(f.fileno(), 0, 1 << 20) or os.fstat(f.fileno()).st_blocks * 512 >= 1 << 19:
+			pytest.skip('this filesystem does not punch holes')
+	os.remove(str(probe))
+
+
+def _blocks(path):
+	with open(str(path), 'rb') as f:
+		os.fsync(f.fileno())  # delayed allocation settled: the count below is what stays
+	return os.stat(str(path)).st_blocks
+
+
+def test_a_failed_reservation_gives_back_the_room_it_took(hpcp_mod, monkeypatch, tmp_path):
+	# The disk runs short part way through the reservation: the ranges already allocated stayed allocated on ext4 and XFS,
+	# so the old copy read as before but the disk (or the user's quota) was left fuller than it was.
+	_can_punch(hpcp_mod, tmp_path)
+	source, old = tmp_path / 's', tmp_path / 'o'
+	_sparse(source, {mib << 20: b'n' * (256 << 10) for mib in (0, 2, 4, 6)}, 8 << 20)
+	_sparse(old, {0: b'o' * _PAGE}, 8 << 20)
+	monkeypatch.setattr(hpcp_mod, '_copies_on_write', lambda path, dev: False, raising=False)
+	os.utime(str(old), ns=(10 ** 18, 10 ** 18))
+	before, blocks = old.read_bytes(), _blocks(old)
+	real, asked = os.posix_fallocate, []
+	def runs_out(fd, offset, length):
+		asked.append((offset, length))
+		if len(asked) > 2:
+			raise OSError(errno.ENOSPC, os.strerror(errno.ENOSPC))
+		real(fd, offset, length)
+	monkeypatch.setattr(hpcp_mod.os, 'posix_fallocate', runs_out)
+	with pytest.raises(hpcp_mod._KeptOld, match='no room'):
+		hpcp_mod._write_over(str(source), str(old))
+	assert len(asked) == 3 and old.read_bytes() == before
+	assert _blocks(old) == blocks and os.stat(str(old)).st_mtime_ns == 10 ** 18
+
+
+def test_a_sparse_source_rewritten_over_a_dense_old_copy_ends_sparse(hpcp_mod, tmp_path):
+	# Zeros over every source hole made the old copy's dense 8 MiB stay dense (a 1 TB image with 10 GB of data wrote 990 GB
+	# of zeros); cp, as in 9.84, leaves the holes. Where the source has a hole the old copy's data is punched out.
+	_can_punch(hpcp_mod, tmp_path)
+	source, old = tmp_path / 's', tmp_path / 'o'
+	_sparse(source, {0: b'n' * _PAGE, 7 << 20: b'N' * _PAGE}, 8 << 20)
+	write(old, b'o' * (8 << 20))
+	assert hpcp_mod._write_over(str(source), str(old)) is True
+	assert old.read_bytes() == source.read_bytes() and _blocks(old) * 512 < 1 << 20
+
+
 def test_a_copy_on_write_filesystem_is_left_to_cp(hpcp_mod, monkeypatch, tmp_path):
 	# On a nearly full btrfs an overwrite takes new room before the old blocks go: written over, the old copy was torn where
 	# cp, truncating it first, wrote it whole (VM 901, Debian 12, 48 MiB with 24 MiB free).
