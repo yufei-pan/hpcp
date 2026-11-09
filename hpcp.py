@@ -12234,20 +12234,6 @@ def _fsync_file(path):
 	finally:
 		os.close(fd)
 
-def _fsync_device(path):
-	"""Write a block device that a move's copy was written to (named by -d: cp wrote through it), to disk. Opened following
-	links, as /dev/disk/by-id names are links. Raises OSError as _fsync_file does."""
-	if os.name != 'posix':
-		return
-	fd = os.open(path, os.O_RDONLY | getattr(os, 'O_CLOEXEC', 0))
-	try:
-		os.fsync(fd)
-	except OSError as e:
-		if e.errno not in _NO_FSYNC:
-			raise
-	finally:
-		os.close(fd)
-
 class _NotOnDisk(Exception):
 	"""A move's copy that the filesystem failed to write to disk (_sync_landing): a failed copy, so no source is removed."""
 
@@ -12257,13 +12243,11 @@ def _sync_landing(dest_path):
 	descriptor of the copy's own file while its data is still dirty (a writeback error is kept only on the in-memory inode,
 	and one evicted under memory pressure takes it along; syncfs before Linux 5.8 reports none). Raises _NotOnDisk, naming the
 	landing and why, after removing the regular file there: its content cannot be trusted, and a rerun would take it for the
-	finished copy (same size and time)."""
+	finished copy (same size and time). A block device named by -d is not fsynced (_fsync_file passes it): a move onto one writes it
+	and keeps every source (213: a landing that is another kind of entry holds no source), so nothing can be lost."""
 	target = _landing_of(dest_path)[0]
 	try:
-		if stat.S_ISBLK(os.stat(target).st_mode):
-			_fsync_device(target)
-		else:
-			_fsync_file(target)
+		_fsync_file(target)
 	except OSError as e:
 		try:
 			if stat.S_ISREG(os.lstat(target).st_mode):

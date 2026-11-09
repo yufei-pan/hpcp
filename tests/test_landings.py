@@ -1334,29 +1334,18 @@ def _losetup(path):
 
 
 @root_only
-@pytest.mark.skipif(not sys.platform.startswith('linux'), reason='loop devices and mounts are Linux')
-def test_a_move_onto_a_block_device_fsyncs_the_device_before_the_source_goes(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
-	# A block device named by -d is written through, and hpcp fsyncs it, opened following links (/dev/disk/by-id names are
-	# links). Root and a loop device: the VMs.
+@pytest.mark.skipif(not sys.platform.startswith('linux'), reason='loop devices are Linux')
+def test_a_move_onto_a_block_device_writes_it_and_keeps_every_source(tmp_path, hpcp_mod, reset_hpcp_globals):
+	# A block device named by -d is written through, as cp does; a device is another kind of entry than the file it holds,
+	# so the move's check finds no landing for the source and keeps it (213). Nothing to fsync before a removal that never
+	# comes, which is why the device is not fsynced.
 	with open(str(tmp_path / 'disk.img'), 'wb') as f:
 		f.truncate(8 << 20)
 	device = _losetup(tmp_path / 'disk.img')
-	link = str(tmp_path / 'by-id-disk')
-	os.symlink(device, link)
 	try:
 		write(tmp_path / 'a/x', 'device content')
-		fsynced = []
-		real_fsync, real_remove = os.fsync, hpcp_mod.remove_moved_sources
-		def fsync(fd):
-			fsynced.append(os.readlink('/proc/self/fd/%d' % fd))
-			return real_fsync(fd)
-		def remove(*args, **kwargs):
-			assert device in fsynced, fsynced
-			return real_remove(*args, **kwargs)
-		monkeypatch.setattr(hpcp_mod.os, 'fsync', fsync)
-		monkeypatch.setattr(hpcp_mod, 'remove_moved_sources', remove)
-		rc = hpcp_mod.hpcp([str(tmp_path / 'a/x')], dest_paths=[link], single_thread=True, remove=True, remove_force=True)
-		assert rc == 0 and device in fsynced and not os.path.exists(str(tmp_path / 'a/x'))
+		rc = hpcp_mod.hpcp([str(tmp_path / 'a/x')], dest_paths=[device], single_thread=True, remove=True, remove_force=True)
+		assert rc == 213 and read(tmp_path / 'a/x') == 'device content'
 		with open(device, 'rb') as d:
 			assert d.read(14) == b'device content'
 	finally:
