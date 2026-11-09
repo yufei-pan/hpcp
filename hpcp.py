@@ -3646,7 +3646,7 @@ def _write_over(src_path, target):
 	as cp makes it; zeros are written over it only where the filesystem cannot punch. A dense old copy needs no room. Where
 	the source's data lands in target's holes, that room is reserved first (posix_fallocate on those holes only, which leaves
 	what target reads as it was): a disk or quota short of it gives back what was reserved (punched to holes again, where the
-	filesystem punches) and raises _KeptOld before anything is written. An XFS
+	filesystem punches) and raises _KeptOld before anything is written; a stop there gives it back too. An XFS
 	extent shared by a reflink needs room for its overwrite, which nothing reserves."""
 	try:
 		source, old = os.lstat(src_path), os.lstat(target)
@@ -3682,14 +3682,20 @@ def _write_over(src_path, target):
 								# Where the old copy's hole goes on past stop, the punch back goes on with it: a block cut by stop (the
 								# source's end) is freed only by a punch that covers it, which may run past the end of the file.
 								after = os.lseek(fd, stop, os.SEEK_DATA)
-							except OSError:  # ENXIO: no data from stop on
-								after = old.st_size + _MAX_BLOCK
+							except OSError as e:
+								# ENXIO: no data from stop on. Any other error (an NFS soft timeout) cannot tell where the old copy's
+								# data starts: no further than stop, or the punch back would take that data.
+								after = old.st_size + _MAX_BLOCK if e.errno == errno.ENXIO else stop
 							reserved.append((hole, after))  # before the call: a failing one may have allocated a part
 							os.posix_fallocate(fd, hole, stop - hole)
-				except OSError as e:
-					if e.errno not in _NO_FALLOCATE:
+				except BaseException as e:
+					if not (isinstance(e, OSError) and e.errno in _NO_FALLOCATE):
+						# A short disk, or a stop: what was reserved goes back. Each was a hole: it reads zeros either way. Where it
+						# cannot be punched, the room stays.
 						for hole, after in reserved:
-							_punch(fd, hole, after)  # each was a hole: it reads zeros either way. Where it cannot, the room stays
+							_punch(fd, hole, after)
+						if not isinstance(e, OSError):
+							raise  # the stop goes on: nothing was written, so _cp_in_place keeps the old copy (its times below)
 						raise _KeptOld(f"no room for the source's data where the old copy has holes ({_why(e)})")
 				finally:
 					# fallocate and the punch move the mtime (XFS; ext4 on EL8's kernel and later): put back, target reads as it
@@ -3751,13 +3757,12 @@ def _punch(fd, start, end):
 		function = None
 		try:
 			import ctypes
-			libc = ctypes.CDLL(None, use_errno=True)
+			libc = ctypes.CDLL(None)
 			if sys.platform.startswith('linux'):
-				if hasattr(libc, 'fallocate64'):
-					function, offset = libc.fallocate64, ctypes.c_int64  # off64_t whatever the build's off_t
-				else:
-					function, offset = libc.fallocate, ctypes.c_long  # off_t
-				function.argtypes = [ctypes.c_int, ctypes.c_int, offset, offset]
+				# 64-bit offsets either way: glibc's fallocate64 takes off64_t whatever the build's off_t; musl has only fallocate,
+				# and its off_t is 64 bits on every architecture (a c_long there passed the wrong arguments on 32-bit Alpine).
+				function = getattr(libc, 'fallocate64', None) or libc.fallocate
+				function.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int64, ctypes.c_int64]
 				function.restype = ctypes.c_int
 		except (OSError, AttributeError, ImportError):
 			function = None

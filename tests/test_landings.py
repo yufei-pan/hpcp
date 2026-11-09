@@ -1020,6 +1020,70 @@ def test_a_sparse_source_rewritten_over_a_dense_old_copy_ends_sparse(hpcp_mod, t
 	assert old.read_bytes() == source.read_bytes() and _blocks(old) * 512 < 1 << 20
 
 
+def test_where_nothing_punches_zeros_go_over_the_old_copys_data(hpcp_mod, monkeypatch, tmp_path):
+	# Not Linux, ext4 without extents, NFS before 4.2: the source's holes are written as zeros over the old copy's data.
+	if not hpcp_mod.cp_supports_sparse():
+		pytest.skip('no GNU cp')
+	source, old = tmp_path / 's', tmp_path / 'o'
+	_sparse(source, {0: b'n' * _PAGE, 7 << 20: b'N' * _PAGE}, 8 << 20)
+	write(old, b'o' * (8 << 20))
+	monkeypatch.setattr(hpcp_mod, '_copies_on_write', lambda path, dev: False, raising=False)
+	monkeypatch.setattr(hpcp_mod, '_punch', lambda fd, start, end: False)
+	assert hpcp_mod._write_over(str(source), str(old)) is True
+	assert old.read_bytes() == source.read_bytes()
+
+
+def test_a_stop_in_the_reservation_gives_back_the_room_it_took(hpcp_mod, monkeypatch, tmp_path):
+	# A stop (_stop raises KeyboardInterrupt in a worker) after the second range was reserved: the old copy stayed, as it read,
+	# but the 512 KiB reserved for the source's data stayed allocated in it (Docker 3.6 and 3.14, tmpfs and XFS).
+	_can_punch(hpcp_mod, tmp_path)
+	source, old = tmp_path / 's', tmp_path / 'o'
+	_sparse(source, {0: b'n' * _PAGE, 1 << 20: b'N' * (256 << 10), 3 << 20: b'N' * (256 << 10)}, 4 << 20)
+	_sparse(old, {0: b'o' * _PAGE}, 4 << 20)
+	monkeypatch.setattr(hpcp_mod, '_copies_on_write', lambda path, dev: False, raising=False)
+	os.utime(str(old), ns=(10 ** 18, 10 ** 18))
+	before, blocks = old.read_bytes(), _blocks(old)
+	real, asked = os.posix_fallocate, []
+	def then_stop(fd, offset, length):
+		asked.append((offset, length))
+		real(fd, offset, length)
+		if len(asked) == 2:
+			raise KeyboardInterrupt
+	monkeypatch.setattr(hpcp_mod.os, 'posix_fallocate', then_stop)
+	with pytest.raises(KeyboardInterrupt):
+		hpcp_mod._cp_in_place(['cp', '-af'], str(source), str(old))
+	assert len(asked) == 2 and old.read_bytes() == before
+	assert _blocks(old) == blocks and os.stat(str(old)).st_mtime_ns == 10 ** 18
+
+
+def test_a_seek_that_fails_keeps_the_give_back_off_the_old_copys_data(hpcp_mod, monkeypatch, tmp_path):
+	# The SEEK_DATA that finds where a reserved hole ends failed (EIO: an NFS soft timeout), then the disk ran short: the punch
+	# back ran from that hole past the end of the file, and the old copy, kept (exit 190, 'leaving DEST as it is'), read zeros
+	# where its data was (Docker 3.6 and 3.14, tmpfs and XFS).
+	_can_punch(hpcp_mod, tmp_path)
+	source, old = tmp_path / 's', tmp_path / 'o'
+	_sparse(source, {0: b'n' * (512 << 10), 2 << 20: b'N' * (512 << 10)}, 4 << 20)
+	_sparse(old, {1 << 20: b'o' * (1 << 20), 3 << 20: b'O' * (1 << 20)}, 4 << 20)
+	monkeypatch.setattr(hpcp_mod, '_copies_on_write', lambda path, dev: False, raising=False)
+	before, ino = old.read_bytes(), os.stat(str(old)).st_ino
+	lseek, fallocate, asked = os.lseek, os.posix_fallocate, []
+	def fails_there(fd, offset, whence):
+		if whence == os.SEEK_DATA and offset == 512 << 10 and os.fstat(fd).st_ino == ino:
+			raise OSError(errno.EIO, os.strerror(errno.EIO))
+		return lseek(fd, offset, whence)
+	def runs_out(fd, offset, length):
+		asked.append(offset)
+		if len(asked) == 2:
+			raise OSError(errno.ENOSPC, os.strerror(errno.ENOSPC))
+		fallocate(fd, offset, length)
+	monkeypatch.setattr(hpcp_mod.os, 'lseek', fails_there)
+	monkeypatch.setattr(hpcp_mod.os, 'posix_fallocate', runs_out)
+	with pytest.raises(hpcp_mod._KeptOld, match='no room'):
+		hpcp_mod._write_over(str(source), str(old))
+	kept = old.read_bytes() == before  # not in the assert: pytest 7's diff of 4 MiB of bytes takes minutes on 3.6
+	assert len(asked) == 2 and kept
+
+
 def test_a_copy_on_write_filesystem_is_left_to_cp(hpcp_mod, monkeypatch, tmp_path):
 	# On a nearly full btrfs an overwrite takes new room before the old blocks go: written over, the old copy was torn where
 	# cp, truncating it first, wrote it whole (VM 901, Debian 12, 48 MiB with 24 MiB free).
