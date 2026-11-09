@@ -19,6 +19,7 @@ import itertools
 import locale
 import math
 import multiprocessing
+import multiprocessing.util
 import os
 import pathlib
 import platform
@@ -793,14 +794,20 @@ _STOPPED = None
 _STOPPED_PID = None
 # True in a worker while it runs a task (_run_task): a stop then ends the task by its cleanup path, else the worker at once.
 _IN_TASK = False
-# The process that put _stop in place for itself (_install_stops). A pool worker forked from it (Python before 3.14 forks
-# them) has _stop too before its first task, with nothing to clean up.
-_STOPS_PID = None
+# The process that runs main(): a stop there runs the cleanup path; any other process with _stop is a pool worker (forked
+# with it, or set up with it, _init_worker), where a stop outside a task ends the worker.
+_MAIN_PID = None
+# True once this process is ending (_end_by): a stop then changes nothing.
+_ENDING = False
 # Twice multiCMD's longest stop of a command (0.01 s, up to 1 s, SIGKILL, up to 1 s more): the watch's grace before os._exit.
 _WATCH_GRACE = 4
 
 def _end_by(signum):
-	"""End this process by signum with its default action, as a process that never handled it would end."""
+	"""End this process by signum with its default action, as a process that never handled it would end. From its first
+	line every stop is ignored (_ENDING): in a worker, one landing in the flush would raise SystemExit out of its ending
+	(_stop), and the pool's worker loop would keep it (a Ctrl-C, its pass-on and the pool's own SIGTERM come close together)."""
+	global _ENDING
+	_ENDING = True
 	try:
 		sys.stdout.flush()
 		sys.stderr.flush()
@@ -818,14 +825,19 @@ def _stop(signum, frame):
 	process's pool workers, which a signal to this process alone (kill PID, timeout) never reaches. A pool worker between
 	tasks has nothing to clean up and ends at once."""
 	global _STOPPED, _STOPPED_PID
-	if not _IN_TASK and (_worker_initialized or os.getpid() != _STOPS_PID):
-		# A worker between tasks, or one that has run none yet (forked with this handler, and with the parent's _STOPPED when
-		# forked after its stop): nothing to clean up, and any stop ends it. Kept, it would wait in the pool's queue for good,
-		# and the pool's shutdown with it. SystemExit unwinds through the queue's locks, letting go of the one it holds
-		# while it waits (killed holding it, the other workers could never read the pool's shutdown), and multiprocessing
-		# ends a worker on it without a traceback.
+	if _ENDING:
+		return
+	if not _IN_TASK and os.getpid() != _MAIN_PID:
+		# A pool worker outside a task (idle, starting, between tasks): nothing to clean up, and any stop ends it. Kept, it
+		# would wait in the pool's queue for good, and the pool's shutdown with it. SystemExit unwinds through the queue's
+		# locks, letting go of the one it holds while it waits (killed holding it, the other workers could never read the
+		# pool's shutdown), and multiprocessing ends a worker on it without a traceback. At a task's start or end, _run_task
+		# ends the worker on it (_STOPPED). Every such stop raises: the pool's worker loop can take one for a task's error,
+		# or (3.14) a result's.
+		if _STOPPED_PID != os.getpid():
+			_STOPPED, _STOPPED_PID = signum, os.getpid()
 		raise SystemExit(128 + signum)
-	if _STOPPED is not None and _STOPPED_PID == os.getpid():
+	if _STOPPED_PID == os.getpid():
 		return
 	_STOPPED, _STOPPED_PID = signum, os.getpid()
 	_pass_stop_on(signum)
@@ -843,8 +855,6 @@ def _install_stops(signals=_STOP_NAMES):
 	"""_stop for each of signals that this process was not started ignoring: nohup starts a run with SIGHUP ignored, a
 	background job of a non-interactive sh with SIGINT ignored, and both must stay so, as Python itself keeps an ignored
 	SIGINT. Only from the main thread (signal.signal)."""
-	global _STOPS_PID
-	_STOPS_PID = os.getpid()
 	for name in signals:
 		signum = getattr(signal, name, None)
 		if signum is not None and signal.getsignal(signum) is not signal.SIG_IGN:
@@ -854,7 +864,9 @@ def _on_worker_start():
 	# The process that started the pool: under forkserver (Python 3.14's default) and spawn the worker's own parent is the
 	# fork server, which outlives it, so the main process is watched by its sentinel (Python 3.8+); else by getppid.
 	main = getattr(multiprocessing, 'parent_process', lambda: None)()
-	parent = os.getppid()
+	# The process that forked this worker (its _MAIN_PID, under fork): getppid now could already be init's, its parent gone
+	# before it ran.
+	parent = _MAIN_PID or os.getppid()
 	def parent_alive():
 		return main.is_alive() if main is not None else os.getppid() == parent
 	_install_stops()
@@ -886,6 +898,19 @@ def _init_worker():
 		# A worker that did not fork from the parent (forkserver, the default from Python 3.14) has a new stdout.
 		_escape_unencodable_stdout()
 		_worker_initialized = True
+
+class _WorkerStart:
+	"""multiprocessing runs its after-fork hooks in each child it starts, before the child's work (a pool worker's loop):
+	the worker sets itself up there (_init_worker), not at its first task, so one that never runs a task, or that its pool
+	never counted (a stop landing as it was forked), still has its watch and ends when its parent does."""
+# Held here: multiprocessing's registry holds a hook's object weakly. main() registers it (not an import: a program that
+# imports hpcp must not get hpcp's stops and parent watch in its own multiprocessing children). Under fork the registry is
+# inherited, so every pool worker of the run sets up at its start; forkserver and spawn workers, which start from a new
+# interpreter, set up at their first task (_run_task).
+_WORKER_START = _WorkerStart()
+
+def _register_worker_start():
+	multiprocessing.util.register_after_fork(_WORKER_START, lambda _: _init_worker())
 
 # The run settings hpcp() keeps in module globals. A pool worker that did not fork from the parent
 # (spawn, forkserver) would otherwise run with the import-time defaults.
@@ -920,12 +945,15 @@ def _run_task(settings, func, *args, **kwargs):
 		finally:
 			_IN_TASK = False
 			del ERRORS[error_start:]
-	except KeyboardInterrupt:
-		if _STOPPED is None:
+			if _STOPPED_PID == os.getpid():
+				# A stop came during the task: its cleanup has run, or the KeyboardInterrupt never got here (Python reports and
+				# drops one raised in a weakref callback or a __del__, and the task went on). Either way the worker ends.
+				_end_by(_STOPPED)
+	except (KeyboardInterrupt, SystemExit):
+		if _STOPPED_PID != os.getpid():
 			raise
-		# A stop (_stop), wherever in the task it came (its setup, its cleanup): the task's cleanup has run on the way here,
-		# and the worker ends as the signal asked. Let through, the pool would take it for the task's error and keep the
-		# worker, which then ignores every later stop.
+		# A stop (_stop) at the task's start or end: the worker ends as the signal asked. Let through, the pool's worker loop
+		# would take it for the task's error and keep the worker (except BaseException, Python 3.6 to 3.14).
 		_end_by(_STOPPED)
 
 def _task_result(future, default, crash_prefix):
@@ -13039,7 +13067,7 @@ def _escape_unencodable_stdout():
 	_STRICT_STDOUT = stdout
 
 def main():
-	global RANDOM_DESTINATION_SELECTION
+	global RANDOM_DESTINATION_SELECTION, _MAIN_PID
 	_escape_unencodable_stdout()
 	args = get_args()
 	# after get_args: -h and -V print only what they are asked for
@@ -13049,6 +13077,8 @@ def main():
 		hpcp_gui()
 	else:
 		# A stop runs Ctrl-C's cleanup here too: a serial run copies in this process, and hpcp() cleans up mounts in a finally.
+		_MAIN_PID = os.getpid()
+		_register_worker_start()
 		_install_stops()
 		rtnCode = hpcp(args.src_path, dest_paths = args.dest_path, single_thread = args.single_thread, max_workers = args.max_workers, verbose = args.verbose,
 			 directory_only =  args.directory_only, no_directory_sync = args.no_directory_sync,full_hash = args.full_hash, files_per_job = args.files_per_job,

@@ -880,10 +880,131 @@ def test_a_stop_in_a_task_s_setup_ends_the_worker(hpcp_mod, monkeypatch):
 	def interrupted():
 		raise KeyboardInterrupt
 	monkeypatch.setattr(hpcp_mod, '_STOPPED', signal.SIGTERM)
+	monkeypatch.setattr(hpcp_mod, '_STOPPED_PID', os.getpid())
 	monkeypatch.setattr(hpcp_mod, '_init_worker', interrupted)
 	monkeypatch.setattr(hpcp_mod, '_end_by', ended.append)
 	hpcp_mod._run_task({}, lambda: None)
 	assert ended == [signal.SIGTERM] and not hpcp_mod._IN_TASK
+
+
+@pytest.mark.parametrize('where', ['start', 'end'])
+def test_a_stop_at_a_task_s_start_or_end_ends_the_worker(hpcp_mod, monkeypatch, where):
+	# Between tasks _stop raises SystemExit, which the pool's worker loop takes for the task's error (except BaseException,
+	# Python 3.6 to 3.14) and goes on: the worker outlived its stop, and the parent's _task_result raised SystemExit.
+	ended = []
+	monkeypatch.setattr(hpcp_mod, '_STOPPED', None)
+	monkeypatch.setattr(hpcp_mod, '_STOPPED_PID', None)
+	monkeypatch.setattr(hpcp_mod, '_MAIN_PID', os.getpid() + 1)
+	monkeypatch.setattr(hpcp_mod, '_worker_initialized', True)
+	monkeypatch.setattr(hpcp_mod, '_IN_TASK', False)
+	monkeypatch.setattr(hpcp_mod, '_end_by', ended.append)
+	stop = lambda *args: hpcp_mod._stop(signal.SIGTERM, None)
+	if where == 'start':
+		monkeypatch.setattr(hpcp_mod, '_init_worker', stop)
+		hpcp_mod._run_task({}, lambda: None)
+	else:
+		class Errors(list):
+			def __delitem__(self, key):
+				list.__delitem__(self, key)
+				stop()
+		monkeypatch.setattr(hpcp_mod, 'ERRORS', Errors())
+		hpcp_mod._run_task({}, lambda: None)
+	assert ended == [signal.SIGTERM] and not hpcp_mod._IN_TASK
+
+
+# Python reports the dropped KeyboardInterrupt, as it would in the worker; pytest turns that report into a warning.
+@pytest.mark.filterwarnings('ignore::pytest.PytestUnraisableExceptionWarning')
+def test_a_stop_whose_keyboardinterrupt_python_drops_still_ends_the_worker(hpcp_mod, monkeypatch):
+	# Python 3.14, 6da5ecf: the pool's SIGTERM reached a worker's _stop inside a weakref callback (WeakSet._remove), where
+	# Python reports the KeyboardInterrupt and drops it; the task went on, the pool's second SIGTERM was ignored as a later
+	# stop, and the pool waited for the worker for good.
+	import weakref
+	ended = []
+	monkeypatch.setattr(hpcp_mod, '_STOPPED', None)
+	monkeypatch.setattr(hpcp_mod, '_STOPPED_PID', None)
+	monkeypatch.setattr(hpcp_mod, '_MAIN_PID', os.getpid() + 1)
+	monkeypatch.setattr(hpcp_mod, '_worker_initialized', True)
+	monkeypatch.setattr(hpcp_mod, '_end_by', ended.append)
+	monkeypatch.setattr(hpcp_mod, '_pass_stop_on', lambda signum: None)
+	class Thing:
+		pass
+	def task():
+		thing = Thing()
+		keep = weakref.ref(thing, lambda ref: hpcp_mod._stop(signal.SIGTERM, None))
+		del thing  # the callback runs here; its KeyboardInterrupt is reported and dropped
+		return 'went on'
+	hpcp_mod._run_task({}, task)
+	assert ended == [signal.SIGTERM] and not hpcp_mod._IN_TASK
+
+
+def test_a_stop_while_a_worker_ends_does_not_keep_it(hpcp_mod, monkeypatch):
+	# 6da5ecf on EL8: a worker stopped in its task was flushing in _end_by when the pool's SIGTERM came; _stop raised
+	# SystemExit out of the ending, the pool's worker loop kept the worker, and the pool waited for it for good.
+	monkeypatch.setattr(hpcp_mod, '_ENDING', False)
+	monkeypatch.setattr(hpcp_mod, '_STOPPED', None)
+	monkeypatch.setattr(hpcp_mod, '_STOPPED_PID', None)
+	monkeypatch.setattr(hpcp_mod, '_MAIN_PID', os.getpid() + 1)
+	monkeypatch.setattr(hpcp_mod, '_IN_TASK', False)
+	seen = []
+	def flush():
+		seen.append(hpcp_mod._stop(signal.SIGTERM, None))
+	monkeypatch.setattr(hpcp_mod.sys.stdout, 'flush', flush)
+	monkeypatch.setattr(hpcp_mod.signal, 'signal', lambda signum, handler: None)
+	monkeypatch.setattr(hpcp_mod.os, 'kill', lambda pid, signum: None)
+	monkeypatch.setattr(hpcp_mod.os, '_exit', lambda code: None)
+	hpcp_mod._end_by(signal.SIGINT)
+	assert seen == [None]
+
+
+def test_a_second_stop_after_a_task_s_cleanup_ends_the_worker(hpcp_mod, monkeypatch):
+	# The first stop (SIGTERM) runs the task's cleanup; a second one (SIGINT) landing after _IN_TASK = False raised SystemExit
+	# out of _run_task in 6da5ecf, in place of the KeyboardInterrupt, and the pool kept the worker.
+	ended = []
+	monkeypatch.setattr(hpcp_mod, '_STOPPED', None)
+	monkeypatch.setattr(hpcp_mod, '_STOPPED_PID', None)
+	monkeypatch.setattr(hpcp_mod, '_MAIN_PID', os.getpid() + 1)
+	monkeypatch.setattr(hpcp_mod, '_worker_initialized', True)
+	monkeypatch.setattr(hpcp_mod, '_IN_TASK', False)
+	monkeypatch.setattr(hpcp_mod, '_end_by', ended.append)
+	monkeypatch.setattr(hpcp_mod, '_pass_stop_on', lambda signum: None)
+	class Errors(list):
+		def __delitem__(self, key):
+			list.__delitem__(self, key)
+			hpcp_mod._stop(signal.SIGINT, None)
+	monkeypatch.setattr(hpcp_mod, 'ERRORS', Errors())
+	def task():
+		hpcp_mod._stop(signal.SIGTERM, None)
+	hpcp_mod._run_task({}, task)
+	assert ended == [signal.SIGTERM] and not hpcp_mod._IN_TASK
+
+
+def test_a_forked_worker_sets_itself_up_at_its_start_only_in_a_run(tmp_path):
+	# 9.85's worker setup runs at a worker's start, from multiprocessing's after-fork hook that main() registers: a worker
+	# that never ran a task (or that its pool never counted) still had no parent watch, and outlived the run. An import of
+	# hpcp alone must not register it: another program's multiprocessing children would get hpcp's stop handlers.
+	if 'fork' not in __import__('multiprocessing').get_all_start_methods():
+		pytest.skip('no fork start method')
+	script = tmp_path / 'probe.py'
+	script.write_text('''
+import multiprocessing, sys
+sys.path.insert(0, %r)
+import hpcp
+def child(queue):
+	queue.put(hpcp._worker_initialized)
+def run():
+	context = multiprocessing.get_context('fork')
+	queue = context.Queue()
+	process = context.Process(target=child, args=(queue,))
+	process.start()
+	got = queue.get(timeout=60)
+	process.join()
+	return got
+before = run()
+hpcp._register_worker_start()
+print(before, run())
+''' % os.path.dirname(HPCP))
+	task = subprocess.run([sys.executable, str(script)], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=120)
+	assert task.stdout.decode().split()[-2:] == ['False', 'True'], task.stdout
 
 
 @pytest.mark.parametrize('initialized', [False, True], ids=['no-task-yet', 'between-tasks'])
@@ -892,7 +1013,7 @@ def test_an_idle_worker_ends_on_its_own_stop_after_its_parent_s(hpcp_mod, monkey
 	other = os.getpid() + 1
 	monkeypatch.setattr(hpcp_mod, '_STOPPED', signal.SIGINT)
 	monkeypatch.setattr(hpcp_mod, '_STOPPED_PID', other)
-	monkeypatch.setattr(hpcp_mod, '_STOPS_PID', os.getpid() if initialized else other)
+	monkeypatch.setattr(hpcp_mod, '_MAIN_PID', other)
 	monkeypatch.setattr(hpcp_mod, '_worker_initialized', initialized)
 	monkeypatch.setattr(hpcp_mod, '_IN_TASK', False)
 	with pytest.raises(SystemExit):
