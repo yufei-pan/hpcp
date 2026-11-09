@@ -12174,12 +12174,14 @@ def _syncfs(path):
 _NO_FSYNC = frozenset(getattr(errno, name) for name in ('EINVAL', 'ENOTSUP', 'EOPNOTSUPP', 'ENOSYS') if hasattr(errno, name))
 
 def _fsync_file(path):
-	"""Write the data of path, a file this run made (a temporary copy about to be renamed over a landing), to disk: renamed
+	"""Write the data of path, a regular file this run made (a temporary copy about to be renamed over a landing), to disk: renamed
 	unsynced, a power cut can leave the landing empty where the old copy was (XFS does not flush on such a rename, and no
 	filesystem orders the data before the rename). Raises OSError when the filesystem fails it; returns when it cannot fsync
 	at all (_NO_FSYNC), or when the file's own mode lets its owner neither read nor write it (a copy of a source readable by
 	group or others only), which a filesystem then writes when it does."""
-	flags = getattr(os, 'O_CLOEXEC', 0) | getattr(os, 'O_NOFOLLOW', 0)
+	if not stat.S_ISREG(os.lstat(path).st_mode):
+		return  # a FIFO or node made in its place (cp -a of one) has no data, and opening a FIFO waits for a writer
+	flags = getattr(os, 'O_CLOEXEC', 0) | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NONBLOCK', 0)
 	try:
 		fd = os.open(path, os.O_RDONLY | flags)
 	except PermissionError:
