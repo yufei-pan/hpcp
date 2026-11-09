@@ -655,6 +655,22 @@ def cp_supports_sparse():
 	except Exception:
 		return False
 
+@functools.lru_cache(maxsize=None)
+def cp_clones_by_default():
+	"""
+	Whether the cp the copy runs (as cp_supports_sparse) is GNU coreutils 9.0 or later, whose default --reflink=auto clones a
+	source on the same filesystem (XFS with reflink, btrfs) and needs no room. False for an older cp, one that is not GNU,
+	and a version line that cannot be read.
+	"""
+	if os.name != 'posix':
+		return False
+	try:
+		task = multiCMD.run_commands([[_bin('cp'), '--version']], timeout=10, quiet=True, return_object=True, extra_env=_C_LOCALE)[0]
+		found = re.search(r'\(GNU coreutils\)\s+(\d+)\.(\d+)', '\n'.join(task.stdout)) if task.returncode == 0 else None
+		return found is not None and (int(found.group(1)), int(found.group(2))) >= (9, 0)
+	except Exception:
+		return False
+
 def get_file_size(path):
 	"""
 	Get the on-disk (allocated) size of a file, falling back to the apparent size.
@@ -3634,11 +3650,13 @@ _FS_TYPES = {}  # st_dev: df -PT's type, once per device in a worker
 
 def _writes_in_place(path, dev, src_dev):
 	"""Whether a file at path, on device dev, is to be written over: its filesystem is one of _WRITES_IN_PLACE, and it is not
-	XFS with the source on the same device (src_dev), where coreutils 9.0 or later clones the source and needs no room (9.84)."""
+	XFS with the source on the same device (src_dev) where cp is coreutils 9.0 or later (cp_clones_by_default): that cp
+	clones the source and needs no room (9.84). An older cp, or one whose version cannot be read, truncates the old copy
+	first there, so it is written over, as in 9.85."""
 	if dev not in _FS_TYPES:
 		_FS_TYPES[dev] = get_fs_type_from_path(path)
 	fs_type = _FS_TYPES[dev]
-	return fs_type in _WRITES_IN_PLACE and not (fs_type == 'xfs' and src_dev == dev)
+	return fs_type in _WRITES_IN_PLACE and not (fs_type == 'xfs' and src_dev == dev and cp_clones_by_default())
 
 def _write_over(src_path, target):
 	"""Write src_path's bytes over target and cut it to their length: True. False, with nothing written, where cp is to do
@@ -3647,8 +3665,9 @@ def _write_over(src_path, target):
 	--attributes-only), target is sparse but its filesystem shows no hole (NFS before 4.2 says data everywhere: written
 	over, every hole would be filled; cp keeps them), or its filesystem is not one known to overwrite in place
 	(_WRITES_IN_PLACE: on one that copies on write, written over, the old copy needs room for all of it; cp frees it first,
-	or clones a source on the same filesystem), or is XFS with the source on the same device (cp clones it, coreutils 9.0 or
-	later: written over, the shared extents need room), or room cannot be reserved there (_NO_FALLOCATE).
+	or clones a source on the same filesystem), or is XFS with the source on the same device and a cp of coreutils 9.0 or
+	later (it clones: written over, the shared extents need room; an older cp truncates, so it is written over there), or room
+	cannot be reserved there (_NO_FALLOCATE).
 
 	Only the source's data is read and written (its data extents, SEEK_DATA/SEEK_HOLE; all of it where that cannot tell).
 	Where the source has a hole, target's data there is punched to a hole (_punch), so the result is as sparse as the source,
@@ -3665,8 +3684,8 @@ def _write_over(src_path, target):
 		if not _writes_in_place(target, old.st_dev, source.st_dev):
 			# An overwrite there may take new room before the old blocks go: on a nearly full btrfs, written over, the old copy
 			# was torn where cp, truncating it first (or cloning a source on the same filesystem), wrote it whole. On XFS with
-			# the source on the same filesystem, coreutils 9.0 or later clones it, and the old copy's shared extents, written
-			# over, need room. cp, as 9.84.
+			# the source on the same filesystem and a cp of coreutils 9.0 or later, cp clones it, and the old copy's shared
+			# extents, written over, need room. cp, as 9.84.
 			return False
 		# Read and write: where the filesystem has no fallocate, glibc's posix_fallocate reads each block before it writes one
 		# (EBADF on a write-only descriptor: checked on EL8, ext4 without extents).
