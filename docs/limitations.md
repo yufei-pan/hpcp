@@ -215,13 +215,29 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - **Revisit when:** 9.86.
 - **Noted:** 2026-11-09, found in the 9.85 re-review; the main session's decision, not asked (a deferral).
 
-### On Python 3.6 a stopped or broken run can still hang, rarely
+### A stopped or broken run can still hang, rarely
 - **Kind:** deferred (9.86).
-- **What the operator sees:** on Python 3.6 (EL7, EL8), a run stopped early with Ctrl-C, or one whose copy worker dies, can wait for good instead of ending, and needs a `kill -9`. Measured on EL8 with 9.85: 1 of 150 early Ctrl-Cs, and 1 of 240 runs with a copy worker killed; 9.84 hung in 1 of 240 such runs too. Sources stay: a stopped or broken copy removes nothing.
-- **Why:** the waits are in Python 3.6's process pool, not in hpcp's own code: once the parent's pool thread was blocked on a future's lock (a Ctrl-C landing inside `concurrent.futures.wait` while it takes those locks, by reading, not verified), and once two workers that had run no task did not act on the pool's SIGTERM (cause not found). 9.85 first made this worse (5 of 100 early Ctrl-Cs): fixed in 9.85 itself, which brought it back to about 9.84's rate.
-- **Plan (9.86):** after a stopped or broken pool, kill any worker still alive after a grace period, and bound the parent's own wait.
+- **What the operator sees:** on Python 3.6 (EL7, EL8) and 3.14, a run stopped early with Ctrl-C or SIGTERM (`kill`, `timeout`, a systemd stop), or one whose copy worker dies, can wait for good instead of ending. A second Ctrl-C does nothing there (9.85's parent ignores later stops); Ctrl-\ (SIGQUIT) or `kill -9` ends it. Measured with the reviewer's probe (early stops, 20 directories of 20 small files, `-j 8`, across EL7, EL8 and Docker 3.6 and 3.14): 9 hangs in 3300 runs with 9.85, against 22 of 3300 at the commit before the last fixes; EL8 early Ctrl-C alone, 4 of 300. 9.84 hung about as often (EL8: 3 of 150 Ctrl-Cs, 4 of 150 SIGTERMs). Sources stay: a stopped or broken copy removes nothing.
+- **Why:** the waits are in Python's process pool, not in hpcp's own code. A stop raised inside CPython's own lock handling strands a lock: the parent inside `concurrent.futures.wait`'s `_AcquireFutures` (verified by injection), or a worker on the pool's call-queue lock (inferred from the hang dumps, not injected). A stop that lands between the two writes of a result over 16 KiB also hangs (verified by injection).
+- **Plan (9.86):** kill workers still alive after a grace period, bound the parent's join and end with `os._exit`; consider polling the stop flag in the pool loops instead of raising in the parent; let a second Ctrl-C end a stuck parent.
 - **Revisit when:** 9.86.
-- **Noted:** 2026-11-09, found in the 9.85 re-review; the main session's decision, not asked (a deferral).
+- **Noted:** 2026-11-09, found in the 9.85 re-reviews; the main session's decision, not asked (a deferral).
+
+### On Python 3.14 a stop can end with exit 191 instead of 130
+- **Kind:** deferred (9.86).
+- **What the operator sees:** on Python 3.14, a stop whose `KeyboardInterrupt` Python drops in the parent (it was raised where Python reports and discards it) ends the run with `Copy process crashed: BrokenProcessPool`, exit 191, instead of 130 or 143. Once in 200 natural runs. Nothing is lost: the workers' cleanup ran, and no source is removed.
+- **Why:** Python 3.14 reports and drops a `KeyboardInterrupt` raised in a weakref callback or a `__del__`; the parent's stop is then spent, its workers end on theirs, and the pool reads as broken (not traced further).
+- **Plan (9.86):** where the parent has a stop of its own (`_STOPPED`) and the pool breaks, end as that stop asked.
+- **Revisit when:** 9.86.
+- **Noted:** 2026-11-09, found in the 9.85 last review round; the main session's decision, not asked (a deferral).
+
+### On Python 3.14 an early Ctrl-C often prints a traceback
+- **Kind:** deferred (9.86).
+- **What the operator sees:** on Python 3.14, about one early Ctrl-C in three prints a traceback (a `KeyboardInterrupt`) before the run ends with 130. As in 9.84. Nothing is lost.
+- **Why:** under 3.14's default forkserver a worker imports hpcp afresh and a Ctrl-C landing before hpcp installs its handlers prints Python's own traceback; and a second stop landing in an exit path does the same.
+- **Plan (9.86):** a worker ignores the stop signals until its handlers are in place, and the exit paths end on the first stop (as `_end_by` now does in a worker).
+- **Revisit when:** 9.86.
+- **Noted:** 2026-11-09, found in the 9.85 last review round; the main session's decision, not asked (a deferral).
 
 ### A destination given through `link/..` also makes an empty directory where the link leads
 - **Kind:** deferred (9.86).
