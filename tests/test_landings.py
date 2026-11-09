@@ -1384,3 +1384,95 @@ def test_a_move_into_an_image_fsyncs_each_landing_in_it_before_the_source_goes(t
 	monkeypatch.setattr(hpcp_mod, 'remove_moved_sources', remove)
 	rc = hpcp_mod.hpcp([str(tmp_path / 'a') + os.sep], dest_image=image, single_thread=True, remove=True, remove_force=True)
 	assert rc == 0 and not os.path.exists(str(tmp_path / 'a'))
+
+
+@posix_only
+def test_a_move_fsyncs_the_directories_of_its_links_before_a_source_goes(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	# A link has no data to fsync and is made after every file: across filesystems a power cut could otherwise find the
+	# source link removed and the new one not yet on disk.
+	write(tmp_path / 'a/x', 'X')
+	os.makedirs(str(tmp_path / 'a/links'))
+	os.symlink('../x', str(tmp_path / 'a/links/l'))
+	events = []
+	real_fsync, real_remove = os.fsync, hpcp_mod.remove_moved_sources
+	def fsync(fd):
+		events.append(('fsync', os.fstat(fd).st_ino))
+		return real_fsync(fd)
+	def remove(*args, **kwargs):
+		events.append(('remove',))
+		return real_remove(*args, **kwargs)
+	monkeypatch.setattr(hpcp_mod.os, 'fsync', fsync)
+	monkeypatch.setattr(hpcp_mod, 'remove_moved_sources', remove)
+	assert _move(hpcp_mod, tmp_path) == 0 and not os.path.exists(str(tmp_path / 'a'))
+	assert os.readlink(str(tmp_path / 'out/links/l')) == '../x'
+	before = {event[1] for event in events[:events.index(('remove',))]}
+	assert os.lstat(str(tmp_path / 'out/links')).st_ino in before
+
+
+@posix_only
+def test_a_move_whose_link_directory_fails_to_reach_the_disk_removes_no_source(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch, capsys):
+	write(tmp_path / 'a/x', 'X')
+	os.symlink('x', str(tmp_path / 'a/l'))
+	real_fsync = os.fsync
+	def fsync(fd):
+		if stat.S_ISDIR(os.fstat(fd).st_mode) and os.readlink('/proc/self/fd/%d' % fd) == str(tmp_path / 'out'):
+			raise OSError(errno.EIO, os.strerror(errno.EIO))
+		return real_fsync(fd)
+	monkeypatch.setattr(hpcp_mod.os, 'fsync', fsync)
+	assert _move(hpcp_mod, tmp_path) != 0
+	assert read(tmp_path / 'a/x') == 'X' and os.path.islink(str(tmp_path / 'a/l'))
+	err = capsys.readouterr().err
+	assert 'cannot be written to disk (Input/output error)' in err and 'Remove skipped' in err, err
+
+
+@not_root
+def test_a_directory_its_owner_cannot_read_is_fsynced_and_keeps_its_mode(tmp_path, hpcp_mod, monkeypatch):
+	os.makedirs(str(tmp_path / 'd'))
+	os.chmod(str(tmp_path / 'd'), 0o333)
+	seen = []
+	real_fsync = os.fsync
+	monkeypatch.setattr(hpcp_mod.os, 'fsync', lambda fd: seen.append(stat.S_IMODE(os.fstat(fd).st_mode)) or real_fsync(fd))
+	try:
+		hpcp_mod._fsync_file(str(tmp_path / 'd'))
+		assert seen == [0o333] and stat.S_IMODE(os.lstat(str(tmp_path / 'd')).st_mode) == 0o333
+	finally:
+		os.chmod(str(tmp_path / 'd'), 0o755)
+
+
+@not_root
+def test_a_link_moved_into_a_write_only_directory_still_moves(tmp_path):
+	# 0333: the directory cannot be listed, only written; the owner is given read for the fsync's open.
+	write(tmp_path / 'a/x', 'X')
+	os.symlink('x', str(tmp_path / 'a/l'))
+	os.mkdir(str(tmp_path / 'out'))
+	os.chmod(str(tmp_path / 'out'), 0o333)
+	try:
+		rc, output = run(['a/x', 'a/l', '-d', 'out/', '-rf'], tmp_path)
+		assert stat.S_IMODE(os.lstat(str(tmp_path / 'out')).st_mode) == 0o333
+	finally:
+		os.chmod(str(tmp_path / 'out'), 0o755)
+	assert rc == 0, output[-2000:]
+	assert os.readlink(str(tmp_path / 'out/l')) == 'x' and not os.path.lexists(str(tmp_path / 'a/l'))
+
+
+@posix_only
+def test_a_move_fsyncs_the_directory_a_link_to_a_directory_named_by_d_leads_to(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	# -d out/ where out is a link to a directory: the links are made in the directory behind it, and that is what is fsynced.
+	write(tmp_path / 'a/x', 'X')
+	os.symlink('x', str(tmp_path / 'a/l'))
+	os.makedirs(str(tmp_path / 'real'))
+	os.symlink('real', str(tmp_path / 'out'))
+	events = []
+	real_fsync, real_remove = os.fsync, hpcp_mod.remove_moved_sources
+	def fsync(fd):
+		events.append(('fsync', os.fstat(fd).st_ino))
+		return real_fsync(fd)
+	def remove(*args, **kwargs):
+		events.append(('remove',))
+		return real_remove(*args, **kwargs)
+	monkeypatch.setattr(hpcp_mod.os, 'fsync', fsync)
+	monkeypatch.setattr(hpcp_mod, 'remove_moved_sources', remove)
+	assert _move(hpcp_mod, tmp_path) == 0 and not os.path.exists(str(tmp_path / 'a'))
+	assert os.readlink(str(tmp_path / 'real/l')) == 'x'
+	before = {event[1] for event in events[:events.index(('remove',))]}
+	assert os.lstat(str(tmp_path / 'real')).st_ino in before

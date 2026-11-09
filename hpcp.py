@@ -2415,6 +2415,9 @@ def create_sym_links(symLinks,exclude=None,link_tracking=False):
 	tracked_targets = set()
 	if len(symLinks) == 0:
 		return tracked_targets
+	# A move's link directories, fsynced once after the last link: a link has no data to fsync, and is made after every file, so
+	# no file's fsync commits it. On ext4 and XFS that fsync also commits every earlier change on its filesystem.
+	link_dirs = set()
 	nestedSymLinks = {}
 	counter = 0
 	print(f"\nFound Symbolic Links:   {len(symLinks)}")
@@ -2503,6 +2506,8 @@ def create_sym_links(symLinks,exclude=None,link_tracking=False):
 					_dest_directory(os.path.dirname(dest), make=not NO_CREATE_DIR, source=os.path.dirname(os.path.abspath(src)))
 					# A relative target is resolved from the link's directory (Windows makes directory and file links apart).
 					os.symlink(linkedTargetFile, dest, target_is_directory=os.path.isdir(os.path.join(os.path.dirname(src), linkedTargetFile)))
+					if SYNC_COPIES:
+						link_dirs.add(os.path.dirname(os.path.abspath(dest)))
 					if keep_target:
 						tracked_targets.add((os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(dest)), linkedTargetFile)),
 							sourceLinkedFile, os.path.abspath(dest)))
@@ -2541,6 +2546,12 @@ Skipping...""")
 
 	endTime = time.monotonic()
 	print(f"Time taken:             {endTime-start_time:0.4f} seconds")
+	# The directory the links went into, with any link on the way to it followed (-d named a link to a directory): _fsync_file passes a link.
+	for directory in sorted({os.path.realpath(directory) for directory in link_dirs}):
+		try:
+			_fsync_file(directory)
+		except OSError as e:
+			eprint(f'Copy failed: the links made in {directory} cannot be written to disk ({_why(e)})')
 	if len(nestedSymLinks) > 0:
 		print(f"\nNested Symbolic Links:   {len(nestedSymLinks)}")
 		tracked_targets |= create_sym_links(nestedSymLinks,exclude=exclude,link_tracking=link_tracking)
@@ -12184,8 +12195,9 @@ def _fsync_file(path):
 	such a rename, and no filesystem orders the data before the rename); and a move's source, removed after an unsynced copy,
 	is gone with it. On ext4 and XFS it also commits the transaction that made the file's name, and every earlier one (its
 	directories), so no directory is fsynced. Raises OSError when the filesystem fails it, or the file cannot be opened; returns
-	when the filesystem cannot fsync at all (_NO_FSYNC). Anything but a regular file returns at once: a FIFO or node made in its
-	place (cp -a of one) has no data, and opening a FIFO waits for a writer.
+	when the filesystem cannot fsync at all (_NO_FSYNC). A directory is fsynced as a file is (the directories a move made
+	links in: create_sym_links). Anything else returns at once: a FIFO or node made in its place (cp -a of one)
+	has no data, and opening a FIFO waits for a writer.
 
 	A file whose mode lets its owner neither read nor write it (a copy of another user's file readable by group or others
 	only, mode 0044) cannot be opened as it is: the owner (this run's effective uid) is given read for the open, and the exact
@@ -12194,16 +12206,22 @@ def _fsync_file(path):
 	if os.name != 'posix':
 		return  # Windows' fsync wants a descriptor open for writing, and nothing here has been run there
 	st = os.lstat(path)
-	if not stat.S_ISREG(st.st_mode):
+	directory = stat.S_ISDIR(st.st_mode)
+	if not (directory or stat.S_ISREG(st.st_mode)):
 		return
 	flags = getattr(os, 'O_CLOEXEC', 0) | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NONBLOCK', 0)
 	try:
 		fd = os.open(path, os.O_RDONLY | flags)
 	except PermissionError as first:
 		try:
+			if directory:
+				raise first  # a directory opens for reading only
 			fd = os.open(path, os.O_WRONLY | flags)
 		except PermissionError:
 			if st.st_uid != os.geteuid():
+				if directory:
+					# Another user's directory this run may not read (a write-only drop box): not this run's to open.
+					return
 				raise first
 			mode = stat.S_IMODE(st.st_mode)
 			os.chmod(path, mode | stat.S_IRUSR)
