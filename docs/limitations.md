@@ -159,6 +159,14 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - **Revisit when:** 9.86.
 - **Noted:** 2026-11-08, the user's standing rule that deferrals are noted, not asked.
 
+### A stop right after a rewrite in place reserves room can remove another user's old copy
+- **Kind:** deferred (9.86).
+- **What the operator sees:** a non-root run rewriting in place a sparse old copy that another user owns but the runner may write (group-writable, or an ACL): the room for the source's data is reserved first (`posix_fallocate`), which moves the old copy's mtime, and only the owner (or root) may set it back. A stop (Ctrl-C, SIGTERM) landing after the reservation and before the first write then finds the old copy's time changed, takes it for a torn copy and removes it, though it still reads as it did; a reservation that falls short (exit 190) keeps the old copy but with a new mtime.
+- **Why:** `_cp_in_place` tells a copy it wrote from the old one by inode, size and mtime, and the time cannot be put back without owning the file. The window is the reservation's own few calls; a sparse old copy of another user's, in a directory that refuses new names or on a nearly full disk, is rare.
+- **Plan:** remove a failed in-place copy only once its first byte was written (the rewrite reports how far it got), not by its times; with the stop backstop of 9.86.
+- **Revisit when:** 9.86.
+- **Noted:** 2026-11-09, from the second opinion on 9.85's last review; the main session's decision, not asked (a deferral).
+
 ### A rewrite in place on a copy-on-write filesystem or a reflinked XFS file near a full disk can lose the old copy
 - **Kind:** deferred (9.86).
 - **What the operator sees:** a rewrite written in place (a 0555 directory, a sticky directory, a bind-mounted file, or a temporary file beside it that ran out of room) on a nearly full disk:
