@@ -182,3 +182,35 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - **Plan:** read each landing directory once (`scandir`), take each name's file from the listing where the listing gives one, and `lstat` only the names missing from it (an 8.3 alias is not listed under its short name) or where the listing's numbers cannot be trusted (vfat makes up a number for an uncached inode, FUSE exFAT one for each spelling). And when two fingerprints meet, the second pass now stats every landing again (about 0.45 s per 100,000 files, paid by any merge whose sources share a file, or a source named twice): keep each landing's entry index beside its fingerprint, so it stats only the entries met twice.
 - **Revisit when:** 9.86.
 - **Noted:** 2026-11-08, the user's standing rule that deferrals are noted, not asked.
+
+### A move's directories are not fsynced
+- **Kind:** deferred (9.86).
+- **What the operator sees:** in a move across filesystems, each file is fsynced by its worker and each link's directory once after the last link, but a directory is fsynced only through those. After a power cut within the journal interval (ext4 5 s, XFS up to 30 s), an empty directory the move made, or the mode, owner, xattrs or times of a directory with no file or link made after it on that filesystem, can be missing at the destination while the source is already gone. On ext4 and XFS the fsync of a file or link also commits every earlier change on its filesystem (the directories made before it), so only the last directories of a tree with nothing after them are open: a tree of only empty directories, or the last sources of an `-nb` run that hold only directories. A file's content and name are never at risk by this.
+- **Why:** fsyncing each directory as the folder sync makes it costs 2.6 to 7.8 ms a directory, found in the 9.85 re-review (2,040 empty directories moved in 11.8 to 16.2 s on ext4 and 5.4 to 6.6 s on XFS, on EL7 and EL8, against about 0.4 to 0.6 s). Fsynced once each after all are made it is nearly free (1,000 directories and their 40 parents: 0.02 s on ext4 and 0.07 to 0.23 s on XFS, EL7). The cheap way needs plumbing through `sync_directories_*_batch`, `copy_scheduler` and `process_copy`.
+- **Plan (9.86):** the folder sync returns the destination directories it made or set in a move, as it returns links; after `create_sym_links` the parent fsyncs them and the link directories together, once each, and a failure is a Copy failed that stops the removal.
+- **Revisit when:** 9.86.
+- **Noted:** 2026-11-09, found in the 9.85 re-review; the main session's decision, not asked (a deferral).
+
+### On macOS a move's fsync does not flush the drive's cache
+- **Kind:** deferred (9.86).
+- **What the operator sees:** `os.fsync` on macOS returns once the data is in the drive's own write cache (Apple documents `fcntl(F_FULLFSYNC)` for the flush), so after a move a power cut can lose both the copy and the already removed source. Linux's fsync flushes the cache where the filesystem uses barriers (ext4 and XFS by default). Read from Apple's documentation; hpcp 9.85 has not been run on a Mac and the flush has not been measured.
+- **Why:** `F_FULLFSYNC` is slow on a Mac (it waits for the drive), so adding it blind could cost a move a lot, and there is no Mac here to measure.
+- **Plan (9.86):** use `fcntl(fd, F_FULLFSYNC)` where `fcntl` has it, measured on a Mac before it ships.
+- **Revisit when:** 9.86, or when a Mac run is possible.
+- **Noted:** 2026-11-09, found in the 9.85 re-review; the main session's decision, not asked (a deferral).
+
+### A move's fsync waits are serial in each worker
+- **Kind:** deferred (9.86).
+- **What the operator sees:** a move of many small files onto a slow disk takes about 1.6 to 1.9 times as long as without the sync (10,000 files of 4 KiB on an EL7 VM: 79 to 92 s on ext4 and 72 to 82 s on XFS, against 47 to 54 s and 43 to 47 s), because each worker waits for its own fsync before it copies the next file. A higher `-j` hides the wait: 2,000 files of 4 KiB with the default (one worker per CPU: 2 on the EL7 VM, 4 on the EL8 VM) against `-j 16`: 18.6 to 22.9 s against 10.3 to 11.7 s (EL7 ext4), 17.9 to 21.2 s against 10.1 to 11.7 s (EL7 XFS), 11.9 to 14.0 s against 9.3 to 11.8 s (EL8 ext4), 14.2 to 15.8 s against 8.2 to 10.5 s (EL8 XFS), 3 runs each. That the gain is overlapped waits and not CPU is an inference: the VMs have 2 and 4 vCPUs.
+- **Why:** more fsyncs in flight are batched by the filesystem into fewer journal commits, but a worker has one fsync in flight at a time; overlapping them (a few fsync threads per worker, or the parent's loop) is its own change, and an earlier try of fsyncing in the parent measured slower on EL7.
+- **Plan (9.86):** overlap a worker's fsyncs, measured against `-j 16` on the same trees; until then the README says to raise `-j`.
+- **Revisit when:** 9.86.
+- **Noted:** 2026-11-09, found in the 9.85 re-review; the main session's decision, not asked (a deferral).
+
+### Worker error lines glue onto the progress bar in a log
+- **Kind:** deferred (9.86).
+- **What the operator sees:** with output redirected to a file, an error a worker prints (`Copy failed: ...`) can land after the progress bar on the bar's line, so `grep '^Copy failed'` misses it; `grep 'Copy failed'` finds it. Errors the main process prints start their own line (fixed in 9.85). Checked in 9.85 in Docker (Python 3.14 and 3.6): 12 files that cannot be read gave 9 to 11 lines that start with `Copy failed` in each of 6 runs, and the same count in 9.84's code (13dcfa8, measured in the re-review). Nothing is lost: the error is also in the end summary and the exit code is right.
+- **Why:** a worker is its own process, so the parent cannot flush stdout before the worker's write; the bar is redrawn by the parent with a carriage return and no newline.
+- **Plan (9.86):** have a worker's error text go back to the parent with the task's results and print there, or end the bar's line before an error is printed.
+- **Revisit when:** 9.86.
+- **Noted:** 2026-11-09, found in the 9.85 re-review; the main session's decision, not asked (a deferral).
