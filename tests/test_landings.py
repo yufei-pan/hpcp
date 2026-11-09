@@ -20,7 +20,21 @@ root_only = pytest.mark.skipif(not hasattr(os, 'geteuid') or os.geteuid() != 0, 
 # A small filesystem of its own, for the space cases: HPCP_TEST_SMALL_FS names a writable mount of 5 MiB (a Docker run
 # gives one with --tmpfs /small:size=5m,mode=1777). Each test uses a directory of its own in it, and empties it.
 SMALL_FS = os.environ.get('HPCP_TEST_SMALL_FS')
-small_fs = pytest.mark.skipif(not SMALL_FS, reason='HPCP_TEST_SMALL_FS: a 5 MiB filesystem of its own')
+
+
+@pytest.fixture
+def _small_fs_alone():
+	"""One test at a time on the small filesystem, across pytest-xdist's workers: each fills it to leave a set room, which a
+	test running beside it would take (two of them failed in each of two -n 8 runs)."""
+	import fcntl
+	with open(os.path.join(SMALL_FS, '.lock'), 'a') as lock:
+		fcntl.flock(lock, fcntl.LOCK_EX)
+		yield
+
+
+def small_fs(test):
+	return pytest.mark.skipif(not SMALL_FS, reason='HPCP_TEST_SMALL_FS: a 5 MiB filesystem of its own')(
+		pytest.mark.usefixtures('_small_fs_alone')(test))
 
 
 def run(args, cwd, stdin=b'', env=None, timeout=120, unset=()):
@@ -816,7 +830,7 @@ def _rewrite_in_place(tmp_path, old_maker, free):
 		expected = bytearray(size)
 		for offset, data in pieces.items():
 			expected[offset:offset + len(data)] = data
-		return rc, output, content == bytes(expected), os.stat(os.path.join(out, 'x')), temporaries(out)
+		return rc, output, content == bytes(expected), os.stat(os.path.join(out, 'x')), temporaries(out), content
 	finally:
 		subprocess.run(['rm', '-rf', out])
 
@@ -828,7 +842,7 @@ def test_a_sparse_rewrite_in_place_keeps_its_holes_and_needs_no_room_for_them(tm
 	# fills the old copy's holes with zeros, runs out of room, and the old copy is torn and removed. The holes stay holes.
 	def same_layout(path, size):
 		_sparse(path, {0: b'o' * _PAGE, size - 3 * _PAGE: b'O' * (2 * _PAGE)}, size)
-	rc, output, same, st, temps = _rewrite_in_place(tmp_path, same_layout, 1 << 20)
+	rc, output, same, st, temps, _ = _rewrite_in_place(tmp_path, same_layout, 1 << 20)
 	assert rc == 0 and same and temps == [], output[-2000:]
 	assert st.st_size == 4 << 20 and st.st_blocks * 512 < 1 << 18, st
 
@@ -839,8 +853,101 @@ def test_a_sparse_source_rewritten_over_a_dense_old_copy_has_the_right_content(t
 	# The zeros of the source's holes are written over the old copy's data: no hole to keep there.
 	def dense(path, size):
 		write(path, b'd' * size)
-	rc, output, same, st, temps = _rewrite_in_place(tmp_path, dense, 3 << 20)
+	rc, output, same, st, temps, _ = _rewrite_in_place(tmp_path, dense, 3 << 20)
 	assert rc == 0 and same and temps == [] and st.st_size == 4 << 20, output[-2000:]
+
+
+@posix_only
+@small_fs
+def test_a_sparser_rewrite_in_place_writes_zeros_only_where_the_old_copy_has_data(tmp_path):
+	# The old copy holds 4 KiB at each MiB's start; the source's middle MiBs are a hole. 1c92290 wrote each such MiB of zeros
+	# whole over the old copy, filling the holes around its 4 KiB: 2 MiB of room with 1 MiB free, so the old copy was torn,
+	# exit 190 (9.84's cp, truncating first, needed none). Zeros go only over the old copy's data, so they take no room.
+	def scattered(path, size):
+		_sparse(path, {mib << 20: b'o' * _PAGE for mib in range(size >> 20)}, size)
+	rc, output, same, st, temps, _ = _rewrite_in_place(tmp_path, scattered, 1 << 20)
+	assert rc == 0 and same and temps == [], output[-2000:]
+
+
+@posix_only
+@small_fs
+def test_a_rewrite_in_place_without_room_for_its_data_keeps_the_old_copy(tmp_path):
+	# The source's last 12 KiB of data land where the old copy has a hole, and the disk has no room for them: the old copy
+	# stays as it was, exit 190. 1c92290 wrote the zeros over the old copy's data first, then ran out of room: torn.
+	old = {0: b'o' * (1 << 20)}
+	def first_mib(path, size):
+		_sparse(path, old, size)
+	rc, output, same, st, temps, content = _rewrite_in_place(tmp_path, first_mib, 0)
+	expected = bytearray(4 << 20)
+	expected[:1 << 20] = old[0]
+	assert rc == 190 and content == bytes(expected) and temps == [], output[-2000:]
+	assert b'leaving' in output and b'no room' in output, output[-2000:]
+
+
+def test_a_sparse_old_copy_where_no_hole_shows_goes_to_cp(hpcp_mod, monkeypatch, tmp_path):
+	# NFS before 4.2 says data everywhere (SEEK_DATA, SEEK_HOLE): written over, a sparse old copy's every hole was filled with
+	# zeros (64 MiB for 8 KiB of data on NFSv4.1, EL8), where cp keeps the holes.
+	source, old = tmp_path / 's', tmp_path / 'o'
+	_sparse(source, {0: b'n' * _PAGE}, 4 << 20)
+	_sparse(old, {0: b'o' * _PAGE}, 4 << 20)
+	if os.stat(str(old)).st_blocks * 512 >= 4 << 20 or not hpcp_mod.cp_supports_sparse():
+		pytest.skip('no sparse files here, or no GNU cp')
+	lseek = os.lseek
+	def data_everywhere(fd, offset, whence):
+		if whence == os.SEEK_HOLE:
+			return os.fstat(fd).st_size
+		return offset if whence == os.SEEK_DATA else lseek(fd, offset, whence)
+	monkeypatch.setattr(hpcp_mod.os, 'lseek', data_everywhere)
+	assert hpcp_mod._write_over(str(source), str(old)) is False
+	assert read(old)[:4] == 'oooo' and os.stat(str(old)).st_blocks * 512 < 1 << 20
+
+
+@pytest.mark.parametrize('old_layout', ['dense', 'sparse'])
+def test_a_write_over_reserves_room_only_over_holes_and_keeps_the_old_copy_without_it(hpcp_mod, monkeypatch, tmp_path, old_layout):
+	# Room is reserved (posix_fallocate) only where the old copy shows a hole: a dense one needs none, so it is never asked.
+	# Over a sparse one a disk short of room raises _KeptOld before anything is written, the old copy as it was, times too.
+	source, old = tmp_path / 's', tmp_path / 'o'
+	_sparse(source, {0: b'n' * _PAGE, 3 << 20: b'N' * _PAGE}, 4 << 20)
+	if old_layout == 'dense':
+		write(old, b'o' * (4 << 20))
+	else:
+		_sparse(old, {0: b'o' * _PAGE}, 4 << 20)
+		with open(str(old), 'rb') as f:
+			if os.lseek(f.fileno(), 0, os.SEEK_HOLE) >= 4 << 20:
+				pytest.skip('no hole shows here')
+	if not (hpcp_mod.cp_supports_sparse() and hasattr(os, 'posix_fallocate')):
+		pytest.skip('no GNU cp, or no posix_fallocate')
+	os.utime(str(old), ns=(10 ** 18, 10 ** 18))
+	asked = []
+	def no_room(fd, offset, length):
+		asked.append((offset, length))
+		raise OSError(errno.ENOSPC, os.strerror(errno.ENOSPC))
+	monkeypatch.setattr(hpcp_mod.os, 'posix_fallocate', no_room)
+	before = (tmp_path / 'o').read_bytes()
+	if old_layout == 'dense':
+		assert hpcp_mod._write_over(str(source), str(old)) is True
+		assert asked == [] and (tmp_path / 'o').read_bytes() == source.read_bytes()
+	else:
+		with pytest.raises(hpcp_mod._KeptOld, match='no room'):
+			hpcp_mod._write_over(str(source), str(old))
+		assert asked and (tmp_path / 'o').read_bytes() == before and os.stat(str(old)).st_mtime_ns == 10 ** 18
+
+
+def test_a_source_that_ends_early_is_cut_where_it_ended(hpcp_mod, monkeypatch, tmp_path):
+	# The source is mapped once; one cut short after that (a writer truncating it) ends the copy at its new end, as cp would.
+	source, old = tmp_path / 's', tmp_path / 'o'
+	write(source, b'n' * (3 << 20))
+	write(old, b'o' * (4 << 20))
+	if not hpcp_mod.cp_supports_sparse():
+		pytest.skip('no GNU cp')
+	extents = hpcp_mod._data_extents
+	def then_cut(fd, start, end):
+		yield from extents(fd, start, end)
+		if end == 3 << 20:
+			os.truncate(str(source), (1 << 20) + 5)
+	monkeypatch.setattr(hpcp_mod, '_data_extents', then_cut)
+	assert hpcp_mod._write_over(str(source), str(old)) is True
+	assert (tmp_path / 'o').read_bytes() == b'n' * ((1 << 20) + 5)
 
 
 # ---- rule 9: a stop is a cleanup ----
@@ -992,13 +1099,32 @@ def test_a_stop_in_a_task_s_setup_ends_the_worker(hpcp_mod, monkeypatch):
 	# (an early Ctrl-C hung about 1 run in 20 on EL8, Python 3.6).
 	ended = []
 	def interrupted():
+		hpcp_mod._STOPPED, hpcp_mod._STOPPED_PID = signal.SIGTERM, os.getpid()  # what _stop records
 		raise KeyboardInterrupt
-	monkeypatch.setattr(hpcp_mod, '_STOPPED', signal.SIGTERM)
-	monkeypatch.setattr(hpcp_mod, '_STOPPED_PID', os.getpid())
+	monkeypatch.setattr(hpcp_mod, '_STOPPED', None)
+	monkeypatch.setattr(hpcp_mod, '_STOPPED_PID', None)
 	monkeypatch.setattr(hpcp_mod, '_init_worker', interrupted)
 	monkeypatch.setattr(hpcp_mod, '_end_by', ended.append)
 	hpcp_mod._run_task({}, lambda: None)
 	assert ended == [signal.SIGTERM] and not hpcp_mod._IN_TASK
+
+
+def test_a_worker_the_pool_kept_after_its_stop_ends_at_its_next_task(hpcp_mod, monkeypatch):
+	# Python 3.7+: a stop landing while the pool's worker loop sends a task's result back (_sendback_result) raises SystemExit
+	# there, which the loop sends back as that task's error and keeps the worker. Its next task ran whole, every stop during it
+	# ignored as already handled (the pass-on, the pool's terminate), and only then did the worker end.
+	ended, ran = [], []
+	class Ended(Exception):
+		pass
+	def end_by(signum):
+		ended.append(signum)
+		raise Ended
+	monkeypatch.setattr(hpcp_mod, '_STOPPED', signal.SIGTERM)
+	monkeypatch.setattr(hpcp_mod, '_STOPPED_PID', os.getpid())
+	monkeypatch.setattr(hpcp_mod, '_end_by', end_by)
+	with pytest.raises(Ended):
+		hpcp_mod._run_task({}, lambda: ran.append(True))
+	assert ended == [signal.SIGTERM] and ran == [] and not hpcp_mod._IN_TASK
 
 
 @pytest.mark.parametrize('where', ['start', 'end'])
