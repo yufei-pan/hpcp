@@ -1139,19 +1139,62 @@ def test_a_filesystem_known_to_overwrite_in_place_is_written_over(hpcp_mod, monk
 	assert old.read_bytes() == source.read_bytes() and os.stat(str(old)).st_ino == ino
 
 
-def test_xfs_with_the_source_on_the_same_device_is_left_to_cp(hpcp_mod, monkeypatch, tmp_path):
+def test_xfs_with_the_source_on_the_same_device_is_left_to_cp_where_cp_clones(hpcp_mod, monkeypatch, tmp_path):
 	# On XFS with reflink, coreutils 9.0 or later clones a source on the same filesystem (9.84's cp, Debian 12, coreutils
 	# 9.1): no room needed. Written over, the old copy's shared extents need room, and on a nearly full disk it was torn.
 	source, old = tmp_path / 's', tmp_path / 'o'
 	write(source, b'n' * (1 << 20))
 	write(old, b'o' * (1 << 20))
-	assert os.stat(str(source)).st_dev == os.stat(str(old)).st_dev
+	dev = os.stat(str(old)).st_dev
+	assert os.stat(str(source)).st_dev == dev
 	monkeypatch.setattr(hpcp_mod, '_FS_TYPES', {})
 	monkeypatch.setattr(hpcp_mod, 'get_fs_type_from_path', lambda path: 'xfs')
+	monkeypatch.setattr(hpcp_mod, 'cp_clones_by_default', lambda: True)
 	assert hpcp_mod._write_over(str(source), str(old)) is False and old.read_bytes() == b'o' * (1 << 20)
-	# the same type, another device for the source: written over (nothing to clone)
-	assert hpcp_mod._writes_in_place(str(old), os.stat(str(old)).st_dev, os.stat(str(old)).st_dev + 1) is True
-	assert hpcp_mod._writes_in_place(str(old), os.stat(str(old)).st_dev, os.stat(str(old)).st_dev) is False
+	assert hpcp_mod._writes_in_place(str(old), dev, dev) is False
+	# the source on another device: nothing to clone, written over
+	assert hpcp_mod._writes_in_place(str(old), dev, dev + 1) is True
+
+
+def test_xfs_with_the_source_on_the_same_device_is_written_over_where_cp_does_not_clone(hpcp_mod, monkeypatch, tmp_path):
+	# coreutils before 9.0 (EL7, EL8: 8.x) never clones: cp truncates the old copy first, so the room it frees can be taken
+	# by another writer. Sent to cp as well, 9.86 would bring that back where 9.85 wrote over the old copy.
+	if not hpcp_mod.cp_supports_sparse():
+		pytest.skip('no GNU cp')
+	source, old = tmp_path / 's', tmp_path / 'o'
+	write(source, b'n' * (1 << 20))
+	write(old, b'o' * (1 << 20))
+	ino, dev = os.stat(str(old)).st_ino, os.stat(str(old)).st_dev
+	assert os.stat(str(source)).st_dev == dev
+	monkeypatch.setattr(hpcp_mod, '_FS_TYPES', {})
+	monkeypatch.setattr(hpcp_mod, 'get_fs_type_from_path', lambda path: 'xfs')
+	monkeypatch.setattr(hpcp_mod, 'cp_clones_by_default', lambda: False)
+	assert hpcp_mod._writes_in_place(str(old), dev, dev) is True
+	assert hpcp_mod._write_over(str(source), str(old)) is True
+	assert old.read_bytes() == source.read_bytes() and os.stat(str(old)).st_ino == ino
+
+
+@pytest.mark.parametrize('first_line, clones', [
+	('cp (GNU coreutils) 9.1', True), ('cp (GNU coreutils) 9.0', True), ('cp (GNU coreutils) 9.4.1-abc', True),
+	('cp (GNU coreutils) 10.2', True), ('cp (GNU coreutils) 8.32', False), ('cp (GNU coreutils) 8.30', False),
+	('cp (GNU coreutils) 8.4', False), ('cp (uutils coreutils) 0.0.28', False), ('cp (GNU coreutils)', False),
+	('some other cp', False), ('', False)])
+def test_cp_clones_by_default_reads_the_version_line(hpcp_mod, monkeypatch, tmp_path, first_line, clones):
+	fake = tmp_path / 'cp'
+	fake.write_text('#!/bin/sh\ncat <<\'EOF\'\n%s\nEOF\n' % first_line)  # --version prints the line, whatever its arguments
+	fake.chmod(0o755)
+	monkeypatch.setattr(hpcp_mod, '_bin', lambda name: str(fake))
+	assert hpcp_mod.cp_clones_by_default.__wrapped__() is clones
+
+
+def test_cp_clones_by_default_is_false_where_cp_fails(hpcp_mod, monkeypatch, tmp_path):
+	fake = tmp_path / 'cp'
+	fake.write_text('#!/bin/sh\necho "cp (GNU coreutils) 9.1"\nexit 3\n')
+	fake.chmod(0o755)
+	monkeypatch.setattr(hpcp_mod, '_bin', lambda name: str(tmp_path / 'missing'))
+	assert hpcp_mod.cp_clones_by_default.__wrapped__() is False
+	monkeypatch.setattr(hpcp_mod, '_bin', lambda name: str(fake))
+	assert hpcp_mod.cp_clones_by_default.__wrapped__() is False
 
 
 @pytest.mark.parametrize('error', ['EOPNOTSUPP', 'EINVAL', 'ENOSYS'])
