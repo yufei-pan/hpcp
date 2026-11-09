@@ -159,13 +159,15 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - **Revisit when:** 9.86.
 - **Noted:** 2026-11-08, the user's standing rule that deferrals are noted, not asked.
 
-### A rewrite in place on a copy-on-write filesystem near a full disk can lose the old copy
+### A rewrite in place on a copy-on-write filesystem or a reflinked XFS file near a full disk can lose the old copy
 - **Kind:** deferred (9.86).
-- **What the operator sees:** on btrfs, or for an XFS file whose extents a reflink shares, a rewrite written in place (a 0555 directory, a sticky directory, a bind-mounted file) on a nearly full disk can run out of room part way: the old copy is torn (and removed where its directory lets it go), exit 190, as in 9.84.
-- **Why:** there an overwrite allocates new blocks, so writing over the old copy needs room as a new file does; the room reserved first (`posix_fallocate`) covers only the source's data landing in the old copy's holes, and on these filesystems it does not cover an overwrite.
-- **Plan:** on such a filesystem, write in place only when the free room holds the source's data; otherwise keep the old copy (exit 190).
+- **What the operator sees:** a rewrite written in place (a 0555 directory, a sticky directory, a bind-mounted file, or a temporary file beside it that ran out of room) on a nearly full disk:
+  - on btrfs, ZFS or bcachefs it goes to `cp`, as in 9.84: `cp` truncates the old copy first (or clones a source on the same filesystem), so another writer, such as another worker's temporary file, can take the freed room, and the old copy is torn and removed, exit 190, as in 9.84. Written over instead, the old copy needed room for all of it: on Debian 12 btrfs (48 MiB rewritten with 4 or 24 MiB free, found in the 9.85 last review) the overwrite tore it in all 19 direct runs and in 5 of 30 runs of hpcp 3dee92d (exit 190, the old copy removed), where `cp` wrote it whole every time (16 runs of `cp` alone, 16 of hpcp 9.84);
+  - for an XFS file whose extents a reflink shares (a `cp --reflink` copy, or one an earlier `cp` of coreutils 9.0 or later cloned from a source on the same filesystem), the overwrite can run out of room part way: the old copy is torn (and removed where its directory lets it go), exit 190. As in 9.84 with coreutils before 9.0 (EL8: both tore); with coreutils 9.0 or later and the source on the same filesystem, 9.84's `cp` cloned it and needed no room (Debian 12, coreutils 9.1).
+- **Why:** there an overwrite allocates new blocks, so writing over the old copy needs room as a new file does; the room reserved first (`posix_fallocate`) covers only the source's data landing in the old copy's holes, and on these filesystems it does not cover an overwrite. Telling a shared XFS extent needs FIEMAP.
+- **Plan:** on such a filesystem or file, write in place only when the free room holds the source's data, otherwise keep the old copy (exit 190); for a source on the same filesystem, clone it (`FICLONE`), which needs no room.
 - **Revisit when:** 9.86.
-- **Noted:** 2026-11-09, found building 9.85's in-place rewrite; the main session's decision, not asked (a deferral).
+- **Noted:** 2026-11-09, found building 9.85's in-place rewrite; amended the same day after the last review sent btrfs, ZFS and bcachefs to `cp`; the main session's decision, not asked (a deferral).
 
 ### Each rewrite makes a new inode, with no way to write in place instead
 - **Kind:** deferred (9.86).
