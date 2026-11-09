@@ -3620,6 +3620,7 @@ def _cp_in_place(command, src_path, target):
 		run_command_in_multicmd_with_path_check(command + ['--attributes-only', src_path, target], quiet=True, strict=True)
 	return get_file_size(target)
 
+_MAX_BLOCK = 1 << 16  # the largest block or page size of any filesystem hpcp meets (64 KiB, as on some ARM and POWER kernels)
 _WRITE_OVER_CHUNK = 1 << 20  # one read or write at a time: big enough that a call's cost is lost in its bytes
 # posix_fallocate's errors that say the filesystem cannot allocate this way, not that it is short of room: nothing is reserved.
 _NO_FALLOCATE = frozenset(getattr(errno, name) for name in ('EINVAL', 'EOPNOTSUPP', 'ENOTSUP', 'ENOSYS', 'ENODEV') if hasattr(errno, name))
@@ -3677,12 +3678,18 @@ def _write_over(src_path, target):
 				try:
 					for start, end in extents:
 						for hole, stop in _holes(fd, start, end):
-							reserved.append((hole, stop))  # before the call: a failing one may have allocated a part
+							try:
+								# Where the old copy's hole goes on past stop, the punch back goes on with it: a block cut by stop (the
+								# source's end) is freed only by a punch that covers it, which may run past the end of the file.
+								after = os.lseek(fd, stop, os.SEEK_DATA)
+							except OSError:  # ENXIO: no data from stop on
+								after = old.st_size + _MAX_BLOCK
+							reserved.append((hole, after))  # before the call: a failing one may have allocated a part
 							os.posix_fallocate(fd, hole, stop - hole)
 				except OSError as e:
 					if e.errno not in _NO_FALLOCATE:
-						for hole, stop in reserved:
-							_punch(fd, hole, stop)  # each was a hole: it reads zeros either way. Where it cannot, the room stays
+						for hole, after in reserved:
+							_punch(fd, hole, after)  # each was a hole: it reads zeros either way. Where it cannot, the room stays
 						raise _KeptOld(f"no room for the source's data where the old copy has holes ({_why(e)})")
 				finally:
 					# fallocate and the punch move the mtime (XFS; ext4 on EL8's kernel and later): put back, target reads as it

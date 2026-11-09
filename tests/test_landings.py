@@ -958,15 +958,22 @@ def test_a_stop_right_after_the_reservation_keeps_the_old_copy(hpcp_mod, monkeyp
 
 
 def _can_punch(hpcp_mod, tmp_path):
-	"""Skip where the filesystem under tmp_path cannot punch a hole (or has no GNU cp): the tests below need one."""
-	probe = tmp_path / 'probe'
-	write(probe, b'p' * (1 << 20))
+	"""Skip where the filesystem under tmp_path cannot punch a hole, or does not take back what a reservation allocated (ext4
+	without extents has no fallocate: glibc writes the blocks, and the indirect block stays), or has no GNU cp."""
 	if not (hpcp_mod.cp_supports_sparse() and hasattr(os, 'posix_fallocate')):
 		pytest.skip('no GNU cp, or no posix_fallocate')
-	with open(str(probe), 'r+b') as f:
-		if not hpcp_mod._punch(f.fileno(), 0, 1 << 20) or os.fstat(f.fileno()).st_blocks * 512 >= 1 << 19:
-			pytest.skip('this filesystem does not punch holes')
-	os.remove(str(probe))
+	probe = tmp_path / 'probe'
+	fd = os.open(str(probe), os.O_RDWR | os.O_CREAT | os.O_TRUNC)
+	try:
+		os.ftruncate(fd, 4 << 20)
+		os.fsync(fd)
+		empty = os.fstat(fd).st_blocks
+		os.posix_fallocate(fd, 1 << 20, 1 << 20)
+		if not hpcp_mod._punch(fd, 1 << 20, 2 << 20) or os.fstat(fd).st_blocks != empty:
+			pytest.skip('this filesystem does not punch holes, or does not free what a reservation took')
+	finally:
+		os.close(fd)
+		os.remove(str(probe))
 
 
 def _blocks(path):
@@ -976,21 +983,25 @@ def _blocks(path):
 
 
 def test_a_failed_reservation_gives_back_the_room_it_took(hpcp_mod, monkeypatch, tmp_path):
-	# The disk runs short part way through the reservation: the ranges already allocated stayed allocated on ext4 and XFS,
-	# so the old copy read as before but the disk (or the user's quota) was left fuller than it was.
+	# The disk runs short part way through the reservation (the last call allocates, then fails: a part of a range can be
+	# allocated when one fails): the ranges already allocated stayed allocated on ext4 and XFS, so the old copy read as before
+	# but the disk (or the user's quota) was left fuller than it was. The last range ends at the source's end, 5000 bytes
+	# into a block: ext4 frees that block only for a punch that goes past the end of the file. Four extents at most: a fifth
+	# takes an extent tree block of ext4's, which stays when the extent goes.
 	_can_punch(hpcp_mod, tmp_path)
 	source, old = tmp_path / 's', tmp_path / 'o'
-	_sparse(source, {mib << 20: b'n' * (256 << 10) for mib in (0, 2, 4, 6)}, 8 << 20)
-	_sparse(old, {0: b'o' * _PAGE}, 8 << 20)
+	size = (8 << 20) + 5000
+	_sparse(source, dict([(mib << 20, b'n' * (256 << 10)) for mib in (0, 4)] + [(8 << 20, b'N' * 5000)]), size)
+	_sparse(old, {0: b'o' * _PAGE}, size)
 	monkeypatch.setattr(hpcp_mod, '_copies_on_write', lambda path, dev: False, raising=False)
 	os.utime(str(old), ns=(10 ** 18, 10 ** 18))
 	before, blocks = old.read_bytes(), _blocks(old)
 	real, asked = os.posix_fallocate, []
 	def runs_out(fd, offset, length):
 		asked.append((offset, length))
-		if len(asked) > 2:
-			raise OSError(errno.ENOSPC, os.strerror(errno.ENOSPC))
 		real(fd, offset, length)
+		if len(asked) == 3:
+			raise OSError(errno.ENOSPC, os.strerror(errno.ENOSPC))
 	monkeypatch.setattr(hpcp_mod.os, 'posix_fallocate', runs_out)
 	with pytest.raises(hpcp_mod._KeptOld, match='no room'):
 		hpcp_mod._write_over(str(source), str(old))
