@@ -3623,24 +3623,36 @@ def _cp_in_place(command, src_path, target):
 _WRITE_OVER_CHUNK = 1 << 20  # one read or write at a time: big enough that a call's cost is lost in its bytes
 # posix_fallocate's errors that say the filesystem cannot allocate this way, not that it is short of room: nothing is reserved.
 _NO_FALLOCATE = frozenset(getattr(errno, name) for name in ('EINVAL', 'EOPNOTSUPP', 'ENOTSUP', 'ENOSYS', 'ENODEV') if hasattr(errno, name))
+# Filesystems that write every overwrite to new blocks (df -PT's names). An XFS extent shared by a reflink does too, per extent.
+_COPY_ON_WRITE = frozenset(('btrfs', 'zfs', 'bcachefs'))
+_FS_TYPES = {}  # st_dev: df -PT's type, once per device in a worker
+
+def _copies_on_write(path, dev):
+	if dev not in _FS_TYPES:
+		_FS_TYPES[dev] = get_fs_type_from_path(path)
+	return _FS_TYPES[dev] in _COPY_ON_WRITE
 
 def _write_over(src_path, target):
 	"""Write src_path's bytes over target and cut it to their length: True. False, with nothing written, where cp is to do
 	it: either side is not a regular file, they are one file, target is smaller than the source (it grows: room is needed
 	anyway), it cannot be opened for reading and writing as it is (cp -f then writes or replaces it), cp is not GNU cp (no
-	--attributes-only), or target is sparse but its filesystem shows no hole (NFS before 4.2 says data everywhere: written
-	over, every hole would be filled; cp keeps them).
+	--attributes-only), target is sparse but its filesystem shows no hole (NFS before 4.2 says data everywhere: written
+	over, every hole would be filled; cp keeps them), or its filesystem copies on write (_COPY_ON_WRITE: written over, the
+	old copy needs room for all of it; cp frees it first, or clones a source on the same filesystem).
 
 	Only the source's data is read and written (its data extents, SEEK_DATA/SEEK_HOLE; all of it where that cannot tell);
 	where the source has a hole, zeros are written only over target's data, so target's holes stay holes. A dense old copy
 	needs no room. Where the source's data lands in target's holes, that room is reserved first (posix_fallocate, which
-	leaves what target reads as it was): a disk or quota short of it raises _KeptOld before anything is written. A
-	filesystem that copies on write (btrfs, an XFS extent shared by a reflink) needs room for any overwrite, which nothing
-	reserves."""
+	leaves what target reads as it was): a disk or quota short of it raises _KeptOld before anything is written. An XFS
+	extent shared by a reflink needs room for its overwrite, which nothing reserves."""
 	try:
 		source, old = os.lstat(src_path), os.lstat(target)
 		if not (stat.S_ISREG(source.st_mode) and stat.S_ISREG(old.st_mode) and old.st_size >= source.st_size
 			and (source.st_dev, source.st_ino) != (old.st_dev, old.st_ino) and cp_supports_sparse()):
+			return False
+		if _copies_on_write(target, old.st_dev):
+			# Every overwrite there takes new room before the old blocks go: on a nearly full btrfs, written over, the old copy
+			# was torn where cp, truncating it first (or cloning a source on the same filesystem), wrote it whole. cp, as 9.84.
 			return False
 		# Read and write: where the filesystem has no fallocate, glibc's posix_fallocate reads each block before it writes one
 		# (EBADF on a write-only descriptor: checked on EL8, ext4 without extents).

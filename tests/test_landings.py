@@ -957,6 +957,17 @@ def test_a_stop_right_after_the_reservation_keeps_the_old_copy(hpcp_mod, monkeyp
 	assert old.exists() and old.read_bytes() == before and os.stat(str(old)).st_mtime_ns == 10 ** 18
 
 
+def test_a_copy_on_write_filesystem_is_left_to_cp(hpcp_mod, monkeypatch, tmp_path):
+	# On a nearly full btrfs an overwrite takes new room before the old blocks go: written over, the old copy was torn where
+	# cp, truncating it first, wrote it whole (VM 901, Debian 12, 48 MiB with 24 MiB free).
+	source, old = tmp_path / 's', tmp_path / 'o'
+	write(source, b'n' * (1 << 20))
+	write(old, b'o' * (1 << 20))
+	monkeypatch.setattr(hpcp_mod, '_FS_TYPES', {})
+	monkeypatch.setattr(hpcp_mod, 'get_fs_type_from_path', lambda path: 'btrfs')
+	assert hpcp_mod._write_over(str(source), str(old)) is False and old.read_bytes() == b'o' * (1 << 20)
+
+
 def test_a_source_that_ends_early_is_cut_where_it_ended(hpcp_mod, monkeypatch, tmp_path):
 	# The source is mapped once; one cut short after that (a writer truncating it) ends the copy at its new end, as cp would.
 	source, old = tmp_path / 's', tmp_path / 'o'
