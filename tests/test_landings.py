@@ -933,6 +933,30 @@ def test_a_write_over_reserves_room_only_over_holes_and_keeps_the_old_copy_witho
 		assert asked and (tmp_path / 'o').read_bytes() == before and os.stat(str(old)).st_mtime_ns == 10 ** 18
 
 
+def test_a_stop_right_after_the_reservation_keeps_the_old_copy(hpcp_mod, monkeypatch, tmp_path):
+	# fallocate moves the old copy's mtime (XFS; ext4 on EL8): a stop landing after it, before any write, made _cp_in_place
+	# take the old copy, which still read as it did, for a torn one and remove it (Docker 3.6 and 3.14 on XFS, EL7 and EL8 XFS,
+	# EL8 ext4).
+	source, old = tmp_path / 's', tmp_path / 'o'
+	_sparse(source, {0: b'n' * _PAGE, 3 << 20: b'N' * _PAGE}, 4 << 20)
+	_sparse(old, {0: b'o' * _PAGE}, 4 << 20)
+	with open(str(old), 'rb') as f:
+		if os.lseek(f.fileno(), 0, os.SEEK_HOLE) >= 4 << 20:
+			pytest.skip('no hole shows here')
+	if not (hpcp_mod.cp_supports_sparse() and hasattr(os, 'posix_fallocate')):
+		pytest.skip('no GNU cp, or no posix_fallocate')
+	monkeypatch.setattr(hpcp_mod, '_copies_on_write', lambda path, dev: False, raising=False)
+	os.utime(str(old), ns=(10 ** 18, 10 ** 18))
+	before = old.read_bytes()
+	def moved_then_stopped(fd, offset, length):
+		os.utime(fd)  # what XFS's fallocate does to the mtime
+		raise KeyboardInterrupt
+	monkeypatch.setattr(hpcp_mod.os, 'posix_fallocate', moved_then_stopped)
+	with pytest.raises(KeyboardInterrupt):
+		hpcp_mod._cp_in_place(['cp', '-af'], str(source), str(old))
+	assert old.exists() and old.read_bytes() == before and os.stat(str(old)).st_mtime_ns == 10 ** 18
+
+
 def test_a_source_that_ends_early_is_cut_where_it_ended(hpcp_mod, monkeypatch, tmp_path):
 	# The source is mapped once; one cut short after that (a writer truncating it) ends the copy at its new end, as cp would.
 	source, old = tmp_path / 's', tmp_path / 'o'

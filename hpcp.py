@@ -3664,11 +3664,15 @@ def _write_over(src_path, target):
 						os.posix_fallocate(fd, start, end - start)
 				except OSError as e:
 					if e.errno not in _NO_FALLOCATE:
-						try:
-							os.utime(fd, ns=(old.st_atime_ns, old.st_mtime_ns))
-						except (OSError, NotImplementedError):
-							pass
 						raise _KeptOld(f"no room for the source's data where the old copy has holes ({_why(e)})")
+				finally:
+					# fallocate moves the mtime (XFS; ext4 on EL8's kernel and later): put back, target reads as it did until the
+					# first write, so a short disk or a stop before then leaves it (_cp_in_place removes only a copy whose state
+					# changed).
+					try:
+						os.utime(fd, ns=(old.st_atime_ns, old.st_mtime_ns))
+					except (OSError, NotImplementedError):
+						pass
 			length, done = size, 0
 			for start, end in extents + [(size, size)]:
 				for data, hole in _data_extents(fd, done, start):
