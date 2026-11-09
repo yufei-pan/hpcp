@@ -70,12 +70,12 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - **Revisit when:** an operator reports finding one.
 - **Approved:** 2026-11-06, the user chose "Known limitation (Recommended)".
 
-### A temporary file left by SIGKILL
+### A temporary file left by SIGKILL or Ctrl-\ (SIGQUIT)
 - **Kind:** known limitation.
-- **What the operator sees:** hpcp killed with SIGKILL (or a power cut) while it rewrites a file leaves a hidden `.hpcp_tmp_` file (16 hex digits after the prefix) beside it, in the destination; the file it was rewriting is untouched, its old copy whole. A rerun leaves the temporary file there; `-rme` removes it as an extra. SIGINT, SIGTERM and SIGHUP remove it (rule 9).
-- **Why:** SIGKILL cannot be handled, and a rewrite that keeps the old copy whole needs the new one under another name until it is.
+- **What the operator sees:** hpcp killed with SIGKILL, ended with Ctrl-\ (SIGQUIT), or cut by a power cut while it rewrites a file leaves a hidden `.hpcp_tmp_` file (16 hex digits after the prefix) beside it, in the destination; the file it was rewriting is untouched, its old copy whole. A rerun leaves the temporary file there; `-rme` removes it as an extra. SIGINT, SIGTERM and SIGHUP remove it (rule 9).
+- **Why:** SIGKILL cannot be handled, and a rewrite that keeps the old copy whole needs the new one under another name until it is. Ctrl-\ is left without a handler on purpose: it is the way out of a run that is stuck (see "A stopped or broken run can still hang, rarely"), so it must not wait for a cleanup.
 - **Revisit when:** an operator reports finding one.
-- **Approved:** 2026-11-08, the user chose "Approve (Recommended)".
+- **Approved:** 2026-11-08, the user chose "Approve (Recommended)"; widened to Ctrl-\ (SIGQUIT) 2026-11-09, the user chose "Approve (Recommended)" ("Ctrl-\ stays an instant exit").
 
 ### A growing rewrite near a full disk or at quota keeps the old copy, exit 190
 - **Kind:** known limitation.
@@ -83,6 +83,27 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - **Why:** written in place, a source that grows past the room left would truncate the old copy first and then fail, losing both; the partial temporary file shows the room is short.
 - **Revisit when:** a portable space reservation (`fallocate` of the temporary file to the source's size) proves out on EL7's filesystems, so the room is known before anything is written.
 - **Approved:** 2026-11-08, the user chose "Exit 190, keep old (Recommended)".
+
+### A sparse rewrite in place without room for its new data keeps the old copy, exit 190
+- **Kind:** known limitation.
+- **What the operator sees:** a sparse file (a VM image, say) written in place over its older copy (the temporary file beside it could not be made or renamed, or ran out of room) on a nearly full disk or at quota, where the source's data lands in the old copy's holes and there is no room for it: `Copy failed: cannot copy SRC to DEST, leaving DEST as it is: no room for the source's data where the old copy has holes`, exit 190, the old copy as it was. Where that reservation fell short part way, part of the old copy's own preallocated room (fallocated, never written) can be released too; its content stays exact. 9.84 freed the old copy first and wrote the file: in the 9.85 review's runs it would have finished in about a quarter to a half of these cases (21 of 85 on tmpfs, 16 of 65 on EL8 ext4, 22 of 37 on EL8 XFS) and torn and lost the old copy in the rest.
+- **Why:** the room is reserved before anything is written so that a short disk can never tear the old copy; telling the old copy's own preallocated room from a real hole needs FIEMAP, which SEEK_DATA cannot do.
+- **Revisit when:** an operator reports a sparse rewrite that 9.84 finished and 9.85 refuses, or a preallocated file thinned after an exit 190.
+- **Approved:** 2026-11-09, the user chose "Approve (Recommended)" ("The old copy is never lost. Free some room and rerun to finish the rewrite.").
+
+### Windows: nothing is fsynced
+- **Kind:** known limitation.
+- **What the operator sees:** on Windows hpcp fsyncs no copy, so a move there can lose both the copy (still in memory) and the source (its removal already on disk) to a power cut, as with 9.84.
+- **Why:** Windows' fsync wants a descriptor open for writing, and there is no Windows machine here to build and test it on.
+- **Revisit when:** a Windows machine is available, or an operator runs hpcp moves on Windows.
+- **Approved:** 2026-11-09, the user chose "Approve (Recommended)".
+
+### A move's links in another user's unreadable directory are not fsynced
+- **Kind:** known limitation.
+- **What the operator sees:** a non-root move that makes links in a directory another user owns and the runner may not read (a write-only drop box) does not fsync that directory: a power cut soon after the move can lose those links while their sources are already gone.
+- **Why:** a directory is fsynced through a descriptor, and one the runner may not read cannot be opened; the alternative, `os.sync()` of every filesystem, can take seconds on a busy host, for a rare case.
+- **Revisit when:** an operator reports moving links into such a directory.
+- **Approved:** 2026-11-09, the user chose "Approve (Recommended)".
 
 ### `-co` writes in place where the old file's metadata cannot be carried
 - **Kind:** known limitation.
