@@ -4441,8 +4441,16 @@ def _remove_what_failed(path, before):
 
 def _known_identical(src_path, dest_path, src_size, full_hash):
 	"""is_file_identical, where a side that may not be read is not known to be the same: the copy then goes on, and a source
-	stops at _can_open, its old copy kept. Only that: any other read error stays a crash, because cp would truncate first."""
+	stops at _can_open, its old copy kept. Only that: any other read error stays a crash, because cp would truncate first.
+
+	Under -co, which carries no times, a regular landing of the source's size is the same when it reads the same to the end
+	(_same_contents), whatever its time: the time test never matched there, so every rerun rewrote every file, and the hash
+	reads only the last HASH_SIZE bytes, missing a change before them. Under -hs 0 ("file attributes only") it is rewritten."""
 	try:
+		if CONTENT_ONLY and HASH_SIZE > 0:
+			src_st, dest_st = os.stat(src_path), os.stat(dest_path)
+			if stat.S_ISREG(src_st.st_mode) and stat.S_ISREG(dest_st.st_mode):
+				return src_st.st_size == dest_st.st_size and _same_contents(src_path, dest_path)
 		return is_file_identical(src_path, dest_path, src_size, full_hash)
 	except PermissionError:
 		return False

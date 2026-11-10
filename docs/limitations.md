@@ -126,14 +126,6 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - **Revisit when:** 9.87.
 - **Noted:** 2026-11-08, the user's standing rule that deferrals are noted, not asked; the skip branch's metadata, the landing removed before the open and the beside route's stale xattrs added 2026-11-09 (found by the 9.86 reviews, the main session's decision, not asked).
 
-### `-co` reruns rewrite every unchanged file
-- **Kind:** deferred (9.87).
-- **What the operator sees:** a second `hpcp -co a/ -d out/` with nothing changed copies every file again ("Total files copied" counts them all, and each landing's mtime moves on each run). The cost is the whole copy on every rerun.
-- **Why:** `-co` carries no times, so the landing's mtime is that of the last copy and the skip check (size and mtime) never matches.
-- **Plan:** under `-co`, where the size matches and only the time differs, compare the full contents (`_same_contents`, as the move's backstop does) and skip a file that reads the same. Not `is_file_identical`'s hash: with the default `-hs 65536` it reads only the last 64 KiB, and a same-size change before that would be skipped on every rerun.
-- **Revisit when:** 9.87.
-- **Noted:** 2026-11-08, the user's standing rule that deferrals are noted, not asked.
-
 ### `-rme` keeps an extra directory named like one beside a source
 - **Kind:** deferred (9.87).
 - **What the operator sees:** `hpcp a/ b -d out/ -rme`, run where a directory `zzz` exists beside `b` (in the working directory), keeps an extra `out/zzz` that no source has, exit 0 (checked in Docker at 9.85). A directory is judged extra by whether its path below the destination exists below each source's parent (`dirname(src)`), and `b`'s parent is the working directory, which holds `zzz`. Only a kept extra, never a loss: what a source is or holds is guarded by identity.

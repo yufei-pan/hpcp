@@ -254,3 +254,36 @@ def test_enes_counts_only_what_the_copy_will_write(tmp_path, small_dir):
 	(tmp_path / 'b' / 'y').write_bytes(os.urandom(3000000))
 	rc, output = run(['b/', '-d', out, '-enes'], tmp_path)
 	assert rc == 228 and 'Not enough space' in output and not os.path.exists(os.path.join(small_dir, 'y')), output[-2000:]
+
+
+# ---- A7: -co reruns compare contents (entry 6)
+
+def _mtimes(root):
+	return {name: os.stat(os.path.join(str(root), name)).st_mtime_ns for name in sorted(os.listdir(str(root)))}
+
+
+@posix_only
+def test_a_content_only_rerun_copies_only_what_changed(tmp_path):
+	# -co carries no times: 9.86's skip check (size and time) never matched, so every rerun rewrote every file.
+	import re
+	import time
+	src = tmp_path / 'a'
+	src.mkdir()
+	for i in range(5):
+		(src / ('f%d' % i)).write_bytes(os.urandom(1 << 20))
+	rc, output = run(['-co', 'a/', '-d', 'out/'], tmp_path)
+	assert rc == 0, output[-2000:]
+	first = _mtimes(tmp_path / 'out')
+	time.sleep(0.05)
+	rc, output = run(['-co', 'a/', '-d', 'out/'], tmp_path)
+	assert rc == 0 and re.search(r'Total size copied:\s+0(\.0+)?\s*B', output), output[-2000:]
+	assert _mtimes(tmp_path / 'out') == first
+	# A change in the first byte, the size kept: copied (the default hash reads only the tail).
+	data = bytearray((src / 'f2').read_bytes())
+	data[0] ^= 0xff
+	(src / 'f2').write_bytes(bytes(data))
+	rc, output = run(['-co', 'a/', '-d', 'out/'], tmp_path)
+	assert rc == 0, output[-2000:]
+	assert (tmp_path / 'out' / 'f2').read_bytes() == bytes(data)
+	again = _mtimes(tmp_path / 'out')
+	assert again['f2'] != first['f2'] and {k: v for k, v in again.items() if k != 'f2'} == {k: v for k, v in first.items() if k != 'f2'}
