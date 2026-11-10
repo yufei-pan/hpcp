@@ -158,14 +158,6 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - **Revisit when:** 9.87.
 - **Noted:** 2026-11-09, found in the 9.85 re-review; the main session's decision, not asked (a deferral).
 
-### Worker error lines glue onto the progress bar in a log
-- **Kind:** deferred (9.87).
-- **What the operator sees:** with output redirected to a file, an error a worker prints (`Copy failed: ...`) can land after the progress bar on the bar's line, so `grep '^Copy failed'` misses it; `grep 'Copy failed'` finds it. Errors the main process prints start their own line (fixed in 9.85). Checked in 9.85 in Docker (Python 3.14 and 3.6): 12 files that cannot be read gave 9 to 11 lines that start with `Copy failed` in each of 6 runs, and the re-review counted the same on 13dcfa8, a commit earlier in 9.85's work, so it is not new in this round (9.84 itself was not run). Nothing is lost: the error is also in the end summary and the exit code is right.
-- **Why:** not traced yet. The bar ends its line with a carriage return and no newline, and a worker's error is written from another process, where the parent's flush-first (`eprint`) cannot order it; that is a reading, not a finding.
-- **Plan (9.87):** have a worker's error text go back to the parent with the task's results and print there, or end the bar's line before an error is printed.
-- **Revisit when:** 9.87.
-- **Noted:** 2026-11-09, found in the 9.85 re-review; the main session's decision, not asked (a deferral).
-
 ### On Python 3.6 an early stop can rarely hang the run in a pool's submit
 - **Kind:** deferred (9.88).
 - **What the operator sees:** on Python 3.6 (EL7, EL8), a Ctrl-C or SIGTERM in the first second of a copy, while its pool takes its first jobs, can leave hpcp waiting for good: every worker has ended, and a second Ctrl-C prints nothing (not even `Stopping: cleaning up first`) and SIGTERM does nothing; Ctrl-\ or `kill -9` ends it. About 3 in 2,000 early Ctrl-Cs in the 9.87 review's probe (9.86: 4 in 716). Other Pythons are not affected.

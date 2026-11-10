@@ -376,8 +376,39 @@ REMOVE_FILES_WHILE_LISTING = True
 SINGLE_PASS_FILE_LIMIT = 1_000_000
 
 #%% ---- Helper Functions ----
+# Whether this run shows a progress bar (not under -v, which turns it off): a pool task's error line may then land on the
+# bar's line (_bar_line_start). A run setting, handed to the workers (_TASK_SETTINGS).
+_BAR = False
+# Whether the parent's progress bar drew a frame since its line last ended (Adaptive_Progress_Bar sets it, stop() clears it).
+_BAR_DRAWN = False
+_LINE_START = [None, '']  # (pid, _line_start's answer)
+
+def _line_start():
+	"""What starts an error line that may land on a progress bar's line, once per process: '\\033[2K\\r' when stderr is a
+	terminal (it clears the bar's line and starts there, also where the bar reaches the terminal through | tee); '\\n' when
+	stdout and stderr are one file (> log 2>&1), which ends the bar's line; else nothing (no bar is in stderr's file)."""
+	pid = os.getpid()
+	if _LINE_START[0] != pid:
+		start = ''
+		with contextlib.suppress(Exception):
+			if sys.stderr.isatty():
+				start = '\033[2K\r'
+			else:
+				out, err = os.fstat(sys.stdout.fileno()), os.fstat(sys.stderr.fileno())
+				if (out.st_dev, out.st_ino, out.st_rdev) == (err.st_dev, err.st_ino, err.st_rdev):
+					start = '\n'
+		_LINE_START[:] = [pid, start]
+	return _LINE_START[1]
+
+def _bar_line_start():
+	"""_line_start where a progress bar may hold the line: in a pool task of a run that shows one, or in the parent while its
+	bar has drawn a frame since its line last ended; else nothing."""
+	return _line_start() if (_IN_TASK and _BAR) or _BAR_DRAWN else ''
+
 def eprint(*args, **kwargs):
 	global ERRORS
+	out = kwargs.get('file', sys.stderr)
+	start = _bar_line_start() if out is sys.stderr else ''
 	# What stdout holds goes first: a redirected stdout is buffered, and an error printed past it lands mid-line (after a
 	# progress bar's carriage return).
 	try:
@@ -385,10 +416,10 @@ def eprint(*args, **kwargs):
 	except Exception:
 		pass
 	try:
-		if 'file' in kwargs:
-			print(*args, **kwargs)
-		else:
-			print(*args, file=sys.stderr, **kwargs)
+		# One write, flushed: the line start and the line land together, and at once. 3.6 to 3.8 buffer a redirected stderr,
+		# and a line left in its buffer lands later, after the bar frames drawn meanwhile and on the last one's line.
+		out.write(start + kwargs.get('sep', ' ').join(map(str, args)) + kwargs.get('end', '\n'))
+		out.flush()
 	except Exception as e:
 		print(f"Error: Cannot print to stderr: {e}")
 		print(*args, **kwargs)
@@ -507,10 +538,16 @@ class Adaptive_Progress_Bar:
 			suffix += f' {format_time(remaining_time)}'
 		callArgs = (self.item_counter, self.total_count, prefix, suffix)
 		if callArgs != self.last_call_args:
+			global _BAR_DRAWN
 			self.last_call_args = callArgs
 			multiCMD.print_progress_bar(*callArgs)
+			# The frame leaves its line open for the next error line to start off, but the frame at the total ends it
+			# (print_progress_bar's newline).
+			_BAR_DRAWN = not (self.total_count > 0 and self.item_counter == self.total_count)
 	def stop(self):
+		global _BAR_DRAWN
 		self.stop_flag = True
+		_BAR_DRAWN = False
 	def update(self, num_files, cpSize, cpTime= 0 , files_per_job=1):
 		self.item_counter += num_files
 		self.size_counter += cpSize
@@ -1117,7 +1154,7 @@ def _register_worker_start():
 NAMED_DESTS = frozenset()
 RUN_ID = None
 _TASK_SETTINGS = ('NAMED_DESTS', 'RUN_ID', 'CONTENT_ONLY', 'WRITE_BESIDE', 'READ_FIRST', 'NO_CREATE_DIR', 'SYNC_COPIES', 'RANDOM_DESTINATION_SELECTION', 'HASH_SIZE', 'COMMAND_TIMEOUT',
-	'BYTES_RATE_LIMIT', 'FILES_RATE_LIMIT', 'MIRROR_FS_PARAMS', 'REMOVE_FILES_WHILE_LISTING')
+	'BYTES_RATE_LIMIT', 'FILES_RATE_LIMIT', 'MIRROR_FS_PARAMS', 'REMOVE_FILES_WHILE_LISTING', '_BAR')
 
 def _submit_task(executor, func, *args, **kwargs):
 	"""Submit func to a process pool (a _pool) with this process's run settings; collect it with _task_result."""
@@ -4117,10 +4154,11 @@ def _space_warning(target, src_path, free, need, old):
 	else:
 		lost = "a rewrite's old copy stays (-wb)" if WRITE_BESIDE else "a rewrite's old copy is lost"
 		text = f'{start}, so it may not fit; if the disk runs out the copy fails, and {lost} (the source is kept). {end}'
-	# One write, flushed before cp: its newline ends the bar's line, and no other output lands in it (3.6 to 3.8 buffer stderr).
+	# One write, flushed before cp: its start leaves the bar's line (_line_start), and no other output lands in it (3.6 to 3.8
+	# buffer stderr).
 	with contextlib.suppress(Exception):
 		sys.stdout.flush()
-		sys.stderr.write('\n' + text + '\n')
+		sys.stderr.write(_line_start() + text + '\n')
 		sys.stderr.flush()
 	ERRORS.append(text)
 
@@ -13849,9 +13887,11 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = None,
 			pinned_dest_roots = _destination_roots(dests) if remove_extra else None
 			copy_error_start = len(ERRORS)
 			# What the operator named is followed and written through, as cp follows its destination; below it nothing is.
-			global NAMED_DESTS, RUN_ID, SYNC_COPIES
+			global NAMED_DESTS, RUN_ID, SYNC_COPIES, _BAR
 			NAMED_DESTS, RUN_ID = frozenset(os.path.abspath(dest) for dest in dests), uuid.uuid4().hex
 			SYNC_COPIES = bool(remove)
+			# -v turns the progress bars off (suppress_all_output)
+			_BAR = not verbose
 			# Refuses a clash before anything is copied or removed.
 			dropped, replaced, in_place = _settle_destinations(src_paths, dests, dest_image, directory_only, copy_exclude, 1 if single_thread else max_workers,
 				parallel_file_listing, remove=remove, places=places)
@@ -13976,7 +14016,7 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = None,
 		track = traceback.format_exc()
 		eprint(f"General Exception: {e} \n{track}")
 	finally:
-		NAMED_DESTS, RUN_ID, SYNC_COPIES = frozenset(), None, False
+		NAMED_DESTS, RUN_ID, SYNC_COPIES, _BAR = frozenset(), None, False, False
 		_SPACE_WARNED = outer_space
 		clean_up(mount_points,loop_devices,delayed_commands)
 		get_partition_details.cache_clear()

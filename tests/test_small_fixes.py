@@ -129,3 +129,79 @@ def test_the_replaced_link_note_s_command_writes_through_the_link(tmp_path, loca
 	assert done.returncode == 0, (command, done.stdout[-2000:])
 	with open(os.path.join(root, b'elsewhere', b'f'), 'rb') as f:
 		assert f.read() == b'f'
+
+
+# ---- A5: worker error lines start their own line (entry 15)
+
+not_root = pytest.mark.skipif(not hasattr(os, 'geteuid') or os.geteuid() == 0, reason='root reads every file')
+
+
+def _unreadable(tmp_path, count=12):
+	src = tmp_path / 'src'
+	src.mkdir()
+	for i in range(count):
+		(src / ('f%02d' % i)).write_text('x' * 100)
+		os.chmod(str(src / ('f%02d' % i)), 0)
+	# readable ones too, so the bar draws frames between the failures
+	for i in range(40):
+		(src / ('ok%02d' % i)).write_text('x' * 100)
+	return src
+
+
+@posix_only
+@not_root
+@pytest.mark.parametrize('workers', [['-j', '4'], ['-s']], ids=['pool', 'serial'])
+def test_error_lines_start_their_own_line_in_a_log(tmp_path, workers):
+	# 9.86: with stdout and stderr in one file, 9 to 11 of 12 'Copy failed' lines started a line, the rest glued to the bar's
+	# line. Under -s on Python 3.6 to 3.8 the first build of the fix still lost one in about one run of four: an error printed
+	# before the bar's first frame (files come in set order) stayed in stderr's buffer and landed later, on a frame's line.
+	_unreadable(tmp_path)
+	for run in range(6):
+		log = tmp_path / 'log'
+		with open(str(log), 'wb') as out:
+			subprocess.run([sys.executable, HPCP, 'src/', '-d', 'out%d/' % run] + workers, cwd=str(tmp_path),
+				stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT, timeout=120)
+		lines = log.read_bytes().split(b'\n')
+		assert sum(line.startswith(b'Copy failed') for line in lines) == 12, (run, log.read_bytes()[-3000:])
+
+
+@posix_only
+@not_root
+def test_a_separate_error_log_has_no_empty_lines(tmp_path):
+	_unreadable(tmp_path)
+	with open(str(tmp_path / 'out.log'), 'wb') as out, open(str(tmp_path / 'err.log'), 'wb') as err:
+		subprocess.run([sys.executable, HPCP, 'src/', '-d', 'out/', '-j', '4'], cwd=str(tmp_path), stdin=subprocess.DEVNULL,
+			stdout=out, stderr=err, timeout=120)
+	errors = (tmp_path / 'err.log').read_bytes().split(b'\n')[:-1]
+	assert errors and b'' not in errors and sum(line.startswith(b'Copy failed') for line in errors) == 12
+
+
+@posix_only
+@not_root
+@pytest.mark.parametrize('workers', [['-j', '4'], ['-s']], ids=['pool', 'serial'])
+def test_on_a_terminal_an_error_line_clears_the_bar_first(tmp_path, workers):
+	import pty
+	_unreadable(tmp_path)
+	pid, fd = pty.fork()
+	if pid == 0:
+		# a terminal of 120 columns: a new pty has none, and the bar then prints whole lines
+		import fcntl, struct, termios
+		fcntl.ioctl(0, termios.TIOCSWINSZ, struct.pack('HHHH', 24, 120, 0, 0))
+		os.chdir(str(tmp_path))
+		os.execv(sys.executable, [sys.executable, HPCP, 'src/', '-d', 'out/'] + workers)
+	chunks = []
+	while True:
+		try:
+			chunk = os.read(fd, 65536)
+		except OSError:
+			break
+		if not chunk:
+			break
+		chunks.append(chunk)
+	os.waitpid(pid, 0)
+	output = b''.join(chunks).replace(b'\r\n', b'\n')
+	# (the run's last line, 'Error occurred: [...]', quotes them)
+	failed = [line for line in output.split(b'\n') if b'Copy failed' in line and not line.startswith(b'Error occurred')]
+	assert len(failed) == 12, output[-3000:]
+	# what the terminal shows of each: from its last carriage return, after the line clear
+	assert all(line.rsplit(b'\r', 1)[-1].startswith(b'Copy failed') for line in failed), failed
