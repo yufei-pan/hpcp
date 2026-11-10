@@ -691,7 +691,9 @@ def run_commands_in_multicmd_with_path_check(commands, timeout=...,max_threads=1
 def get_free_space_bytes(path):
 	try:
 		st = os.statvfs(path)
-	except FileNotFoundError:
+	except OSError:
+		# missing, or below a directory the runner cannot search (EACCES) or a file (ENOTDIR): the nearest parent that
+		# answers, as 9.86 asked; the copy then meets the real error and reports it as a failed copy
 		st = os.statvfs(get_last_existing_parent(path))
 	return st.f_bavail * st.f_frsize  # available blocks * fragment size
 
@@ -4694,6 +4696,12 @@ def _settle_identical(src_path, src_st, dest, look):
 			path, how = '/proc/self/fd/%d' % fd, {}  # leads to the descriptor's file, and no further
 		else:
 			path, how = fd, {}
+		owner_kept = group_kept = True
+		chowned = os.name == 'posix' and (now.st_uid, now.st_gid) != (src_st.st_uid, src_st.st_gid)
+		if chowned:
+			owner_kept, group_kept = _chown_like_cp(path, src_st)
+		# xattrs after the owner, as cp -a: a chown clears a file capability (security.capability), and before the mode, which
+		# may make the file read-only
 		if hasattr(os, 'listxattr'):
 			try:
 				src_names = os.listxattr(src_path, follow_symlinks=False)
@@ -4717,10 +4725,6 @@ def _settle_identical(src_path, src_st, dest, look):
 				except OSError as e:
 					if e.errno not in _XATTR_SKIPPED:
 						raise
-		owner_kept = group_kept = True
-		chowned = os.name == 'posix' and (now.st_uid, now.st_gid) != (src_st.st_uid, src_st.st_gid)
-		if chowned:
-			owner_kept, group_kept = _chown_like_cp(path, src_st)
 		# As cp -a: no set-user-ID / set-group-ID bit for an owner / group not kept. A chown may have cleared them: set again.
 		mode = stat.S_IMODE(src_st.st_mode) & ~((0 if owner_kept else stat.S_ISUID) | (0 if group_kept else stat.S_ISGID))
 		if chowned or stat.S_IMODE(now.st_mode) != mode:
@@ -4849,7 +4853,8 @@ def copy_file(src_path, dest_paths, full_hash=False, verbose=False, concurrent_p
 				endTime = time.monotonic()
 				return 0, endTime - start_time , symLinks #, task_to_run
 			else:
-				raise OSError(errno.EAGAIN, 'it kept changing while it was looked at', target)
+				_copy_failed(src_path, f'Copy failed: ERROR copying {src_path} to {target}: it kept changing while it was looked at')
+				return 0, time.monotonic() - start_time, symLinks
 		bak_dest_paths = dest_paths.copy()
 		using_bak_paths = False
 		if src_is_link:
@@ -4959,7 +4964,8 @@ def copy_file(src_path, dest_paths, full_hash=False, verbose=False, concurrent_p
 				print(f'Copied {src_path} to {dest_path}')
 				print(f'Estimated remaining size: {format_bytes(dest_free_space - copiedSize)}B')
 	except Exception as e:
-		eprint(f'Copy process crashed: Fatal Error copying {src_path} to {inDests}: {e}')
+		# recorded as this source's failure (_CopyFailure): the copy check then leaves it out, as it does a failed copy
+		_copy_failed(src_path, f'Copy process crashed: Fatal Error copying {src_path} to {inDests}: {e}')
 		if verbose or not isinstance(e, OSError):
 			# a file that cannot be read or reached says so in one line; anything else is a bug and keeps its traceback
 			import traceback
@@ -6284,40 +6290,25 @@ def _check_key(key):
 	if any(part in ('', '.', '..') for part in key.rstrip('/').split('/')):
 		raise ValueError(f'unsafe path {key!r}')
 
+def _open_names(path, mode):
+	"""A list of file names (changes.tsv, the manifest) opened as text that holds each name's own bytes (os.fsencode's: the
+	filesystem encoding and its error handler), under any locale, so a name read back is the name written and the file it names
+	is found. UTF-8 held other bytes than the file's under Latin-1, EUC-JP or KOI8-R, and an apply read them as names that are
+	no file's. disk.tsv holds tool output (labels, GPT names, which multiCMD decodes as UTF-8) and stays UTF-8."""
+	return open(path, mode, encoding=sys.getfilesystemencoding(), errors=sys.getfilesystemencodeerrors(), newline='\n')
+
 def write_changes(target, rows):
 	"""Write rows to target in changes.tsv format (also the -dfl output format)."""
-	with open(target, 'w', encoding='utf-8', errors='surrogateescape', newline='\n') as f:
+	with _open_names(target, 'w') as f:
 		f.write(f'{CHANGES_HEADER}\t{CHANGES_VERSION}\n')
 		f.write('#op\tpath\told\tnew\n')
 		for row in sort_change_rows(rows):
 			f.write(f'{row.op}\t{_escape_field(row.path)}\t{row.old}\t{row.new}\n')
 
-class _NameLines:
-	"""A list a patch tool wrote (changes.tsv, the manifest, disk.tsv), read as bytes, each line (split at '\\n' only) decoded
-	as the filesystem's names are (os.fsdecode). Their writers put each name's own bytes there (UTF-8 with surrogateescape,
-	the bytes os.fsencode gives, under any locale), so a name read back is the one written. 9.86 decoded them as UTF-8:
-	under Python 3.6's C locale (LANG unset: EL7's cron, some ssh sessions) a non-ASCII name could then not be encoded back,
-	and the apply stopped with a UnicodeEncodeError."""
-	def __init__(self, source):
-		self._file = open(source, 'rb')
-
-	def __enter__(self):
-		return self
-
-	def __exit__(self, *exc):
-		self._file.close()
-
-	def readline(self):
-		return os.fsdecode(self._file.readline())
-
-	def __iter__(self):
-		for line in self._file:
-			yield os.fsdecode(line)
-
 def read_changes(source):
 	"""Read a changes.tsv file into ChangeRows. Raises RuntimeError('Patch format error: ...')."""
 	rows = []
-	with _NameLines(source) as f:
+	with _open_names(source, 'r') as f:
 		header = f.readline().rstrip('\n').split('\t')
 		if len(header) != 2 or header[0] != CHANGES_HEADER:
 			raise RuntimeError(f'Patch format error: {source} is not an hpcp change list')
@@ -6355,7 +6346,7 @@ def write_manifest(target, meta):
 	'sections' is a list of (name, payload_dir, changes_file) and 'raws' a list of
 	(name, file, old_sha256, new_sha256, size); both are written as repeatable lines.
 	"""
-	with open(target, 'w', encoding='utf-8', errors='surrogateescape', newline='\n') as f:
+	with _open_names(target, 'w') as f:
 		for key, value in meta.items():
 			if key not in ('sections', 'raws'):
 				f.write(f'{key}\t{_escape_field(str(value))}\n')
@@ -6386,7 +6377,7 @@ def read_manifest(source):
 	"""
 	meta = {'sections': [], 'raws': []}
 	seen_keys = set()
-	with _NameLines(source) as f:
+	with _open_names(source, 'r') as f:
 		for line in f:
 			line = line.rstrip('\n')
 			if not line or line.startswith('#'):
@@ -6463,7 +6454,8 @@ def write_disk_tsv(target, rows):
 def read_disk_tsv(source):
 	"""Read disk.tsv into DiskRows. Raises RuntimeError('Patch format error: ...')."""
 	rows = []
-	with _NameLines(source) as f:
+	# Tool output (labels, GPT names) that multiCMD decoded as UTF-8, written as UTF-8: read the same way, not as names.
+	with open(source, 'r', encoding='utf-8', errors='surrogateescape', newline='\n') as f:
 		header = f.readline().rstrip('\n').split('\t')
 		if len(header) != 2 or header[0] != DISK_HEADER or not _ASCII_DIGITS_RE.fullmatch(header[1]):
 			raise RuntimeError(f'Patch format error: {source} is not an hpcp disk table')
@@ -6730,7 +6722,7 @@ def report_changes(rows, diff_file_list=None, tar_diff_file_list=False):
 	"""
 	if diff_file_list:
 		if tar_diff_file_list:
-			with open(diff_file_list, 'w', encoding='utf-8', errors='surrogateescape', newline='\n') as f:
+			with _open_names(diff_file_list, 'w') as f:
 				for row in rows:
 					if (row.op == 'A' and row.path != './') or (row.op == 'M' and not row.path.endswith('/')):
 						f.write(row.path + '\n')
@@ -10184,7 +10176,8 @@ def _covered_directories(src_paths, dests, dest_image=False, exclude=None, max_w
 	for src in src_paths:
 		if not src or os.path.islink(src) or not os.path.isdir(src) or (exclude and is_excluded(_listed_root(os.path.abspath(src)), exclude)):
 			continue
-		folders = get_file_list(src, max_workers=max_workers, exclude=exclude, parallel_file_listing=parallel_file_listing)[3]
+		# Spelled as the copy's job lists it (_copy_job: absolute, 'path/'), so a run's cached listing answers: no second walk.
+		folders = get_file_list(os.path.abspath(src) + os.sep, max_workers=max_workers, exclude=exclude, parallel_file_listing=parallel_file_listing)[3]
 		for folder in folders:
 			covered.update(_landings(os.path.abspath(folder), by_source))
 	return covered
@@ -12700,11 +12693,13 @@ def get_dests(dest_paths,dest_image,mount_points: list,loop_devices: list,src_pa
 				expanded_dests = [os.path.expanduser(dest)]
 			for path in expanded_dests:
 				# Folded once, lexically, as the copy itself takes it (abspath): l/../out is out, whatever l leads to, so no
-				# directory is made where a link before '..' leads. A trailing separator (copy into) is kept.
-				trailing = path.endswith(os.sep) or bool(os.altsep) and path.endswith(os.altsep)
-				path = os.path.normpath(path)
-				if trailing and not path.endswith(os.sep):
-					path += os.sep
+				# directory is made where a link before '..' leads. A trailing separator (copy into) is kept. An empty one stays
+				# empty: no destination given (normpath would make it '.').
+				if path:
+					trailing = path.endswith(os.sep) or bool(os.altsep) and path.endswith(os.altsep)
+					path = os.path.normpath(path)
+					if trailing and not path.endswith(os.sep):
+						path += os.sep
 				pathDest = get_dest_from_path(path,src_paths,src_path,can_be_none=can_be_none)
 				if pathDest:
 					dests.append(pathDest)

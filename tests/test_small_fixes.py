@@ -306,3 +306,153 @@ def test_rme_removes_an_extra_directory_named_like_one_beside_a_source(tmp_path,
 	assert rc == 0, output[-3000:]
 	assert not (tmp_path / 'out' / 'zzz').exists() and not (tmp_path / 'out' / 'b' / 'gone').exists(), output[-3000:]
 	assert (tmp_path / 'out' / 'sub' / 'f').read_text() == 'f' and (tmp_path / 'out' / 'b' / 'inner' / 'g').read_text() == 'g'
+
+
+# ---- review C: F1 (lists hold each name's own bytes), F2 and F2b (a crash is the source's failure), F3 (-rme's listing), F4
+# (-d ''), F5 (a landing that keeps changing)
+
+@posix_only
+def test_a_patch_list_holds_each_name_s_own_bytes_under_any_filesystem_encoding(tmp_path, monkeypatch):
+	# Under a Latin-1 locale 'caf\xe9' (what listdir gives for the name caf<e9>) went into changes.tsv and the manifest as
+	# UTF-8, c3 a9: an apply decoded that as the filesystem does ('cafÃ©'), and found no payload under that name. The file
+	# holds the name's own bytes (os.fsencode's), so what is read back is the name written.
+	import hpcp
+	monkeypatch.setattr(sys, 'getfilesystemencoding', lambda: 'latin-1')
+	monkeypatch.setattr(sys, 'getfilesystemencodeerrors', lambda: 'surrogateescape')
+	changes = str(tmp_path / 'changes.tsv')
+	hpcp.write_changes(changes, [hpcp.ChangeRow('A', 'caf\xe9', '-', 'l:target')])
+	with open(changes, 'rb') as f:
+		assert b'A\tcaf\xe9\t' in f.read()
+	assert [row.path for row in hpcp.read_changes(changes)] == ['caf\xe9']
+	manifest = str(tmp_path / 'manifest.tsv')
+	hpcp.write_manifest(manifest, {'format': 'hpcp-diff', 'format_version': '1', 'sections': [('root', 'p\xe9', 'changes.tsv')], 'raws': []})
+	with open(manifest, 'rb') as f:
+		assert b'\tp\xe9\t' in f.read()
+	assert hpcp.read_manifest(manifest)['sections'] == [('root', 'p\xe9', 'changes.tsv')]
+
+
+@posix_only
+def test_disk_tsv_stays_utf_8_under_the_c_locale(tmp_path):
+	# disk.tsv holds tool output (labels, GPT names), which multiCMD decodes as UTF-8; read as file names, a label 'röot'
+	# came back as 'r\udcc3\udcb6ot' under the C locale, and the apply planned a relabel to the same bytes.
+	script = tmp_path / 'disk.py'
+	script.write_text('import sys\nsys.path.insert(0, %r)\nimport hpcp\nrows = [hpcp.DiskRow("part", "1", "fs_label", "", "r\\xf6ot")]\n'
+		'hpcp.write_disk_tsv(sys.argv[1], rows)\nprint(ascii(hpcp.read_disk_tsv(sys.argv[1])[0].new))\n' % os.path.dirname(HPCP))
+	done = subprocess.run([sys.executable, str(script), str(tmp_path / 'disk.tsv')], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+		env=dict(os.environ, **_C), timeout=120)
+	assert done.returncode == 0 and done.stdout.strip() == b"'r\\xf6ot'", done.stdout
+
+
+def _latin_1_locale():
+	'''The name of an installed locale whose filesystem encoding is Latin-1 (EL7 and EL8 have en_US.iso88591), or None.'''
+	for name in ('en_US.iso88591', 'en_US.ISO-8859-1', 'en_GB.iso88591', 'de_DE.iso88591', 'C.iso88591'):
+		done = subprocess.run([sys.executable, '-c', 'import sys; print(sys.getfilesystemencoding())'], stdout=subprocess.PIPE,
+			stderr=subprocess.DEVNULL, env=dict(os.environ, LC_ALL=name, LANG=name, PYTHONUTF8='0', PYTHONCOERCECLOCALE='0'), timeout=60)
+		if done.stdout.strip().lower().replace(b'-', b'') in (b'iso88591', b'latin1'):
+			return name
+	return None
+
+
+@posix_only
+def test_a_patch_applies_under_a_latin_1_locale(tmp_path):
+	name = b'caf\xe9'
+	locale_name = _latin_1_locale()
+	if locale_name is None:
+		pytest.skip('no Latin-1 locale installed (the unit test above holds the encoding choice)')
+	env = dict(os.environ, LC_ALL=locale_name, LANG=locale_name, PYTHONUTF8='0', PYTHONCOERCECLOCALE='0')
+	new, base, vol, target = (tmp_path / part for part in ('new', 'base', 'vol', 'target'))
+	for directory in (new, base, vol, target):
+		directory.mkdir()
+	with open(os.path.join(os.fsencode(str(new)), name), 'wb') as f:
+		f.write(b'content')
+	script = tmp_path / 'patch.py'
+	script.write_text(_PATCH % {'root': os.path.dirname(HPCP)})
+	def step(what):
+		done = subprocess.run([sys.executable, str(script), what, str(new), str(base), str(vol), str(target)],
+			stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env, timeout=120)
+		assert done.returncode == 0, done.stdout.decode(errors='replace')[-3000:]
+		return done.stdout.decode(errors='replace')
+	step('make')
+	assert 'failed 0' in step('apply')
+	with open(os.path.join(os.fsencode(str(target)), name), 'rb') as f:
+		assert f.read() == b'content'
+
+
+@posix_only
+@not_root
+def test_a_free_space_question_below_a_directory_the_runner_cannot_search_is_answered(tmp_path):
+	# 9.86 asked the nearest parent that answers; EACCES escaped, and the copy of a landing there crashed
+	import hpcp
+	shut = tmp_path / 'shut'
+	(shut / 'x').mkdir(parents=True)
+	os.chmod(str(shut), 0)
+	try:
+		assert hpcp.get_free_space_bytes(str(shut / 'x' / 'y')) > 0
+	finally:
+		os.chmod(str(shut), 0o755)
+
+
+def _crashing_copy(tmp_path, monkeypatch):
+	import hpcp
+	(tmp_path / 'a').mkdir()
+	(tmp_path / 'a' / 'f').write_text('f')
+	def boom(*args, **kwargs):
+		raise OSError(13, 'Permission denied')
+	monkeypatch.setattr(hpcp, '_allocated_size', boom)
+	return hpcp
+
+
+@posix_only
+def test_a_copy_that_crashes_is_that_source_s_failure_not_a_clash(tmp_path, monkeypatch, reset_hpcp_globals, capsys):
+	# the crash was printed but not recorded as the source's failure, so the copy check then said the source was copied but
+	# at none of its landings: a false Destination clash (213) beside the crash (191)
+	hpcp = _crashing_copy(tmp_path, monkeypatch)
+	rc = hpcp.hpcp([str(tmp_path / 'a') + os.sep], dest_paths=[str(tmp_path / 'out') + os.sep], single_thread=True, max_workers=1)
+	output = capsys.readouterr().out + capsys.readouterr().err
+	assert 'Copy process crashed' in output and 'Destination clash' not in output, output[-2000:]
+	assert rc == 191, rc
+
+
+@posix_only
+def test_a_landing_that_keeps_changing_is_a_failed_copy(tmp_path, reset_hpcp_globals, monkeypatch, capsys):
+	# README: 'a failed copy (... it kept changing while it was looked at)'; it was a crash (191) and a false clash (213)
+	import hpcp
+	(tmp_path / 'a').mkdir()
+	(tmp_path / 'a' / 'f').write_text('same')
+	args = ([str(tmp_path / 'a') + os.sep],)
+	kwargs = dict(dest_paths=[str(tmp_path / 'out') + os.sep], single_thread=True, max_workers=1)
+	assert hpcp.hpcp(*args, **kwargs) == 0
+	capsys.readouterr()
+	monkeypatch.setattr(hpcp, '_settle_identical', lambda *a, **k: False)
+	rc = hpcp.hpcp(*args, **kwargs)
+	output = capsys.readouterr().out
+	assert 'Copy failed' in output and 'it kept changing while it was looked at' in output, output[-2000:]
+	assert 'crashed' not in output and 'Destination clash' not in output, output[-2000:]
+	assert rc == 190, rc
+
+
+@posix_only
+def test_rme_lists_each_source_once(tmp_path):
+	# the listing the copy took answers -rme: it was asked again under another spelling (the operator's), a second walk of
+	# every source, a getattr a file on a network filesystem
+	for path in ('a/s1/s2/f', 'b/i/g'):
+		(tmp_path / path).parent.mkdir(parents=True)
+		(tmp_path / path).write_text('x')
+	(tmp_path / 'out' / 's1' / 'extra').mkdir(parents=True)
+	rc, output = run(['a/', 'b', '-d', 'out/', '-rme'], tmp_path)
+	assert rc == 0, output[-2000:]
+	assert output.count('Getting file list for') == 3, output[-3000:]
+	assert not (tmp_path / 'out' / 's1' / 'extra').exists()
+
+
+@posix_only
+@pytest.mark.parametrize('sources', [['a'], ['a', 'b']], ids=['one', 'two'])
+def test_an_empty_destination_is_no_destination(tmp_path, sources):
+	# 9.86: -d '' is no destination given ('Destination path not specified, using ...'); folded as a path it became '.', and
+	# a script's unset variable spilled the source into the working directory
+	for name in sources:
+		(tmp_path / name).mkdir()
+		(tmp_path / name / ('f' + name)).write_text(name)
+	rc, output = run(sources + ['-d', ''], tmp_path)
+	assert 'Destination path not specified, using' in output, output[-2000:]
+	assert not (tmp_path / 'fa').exists()

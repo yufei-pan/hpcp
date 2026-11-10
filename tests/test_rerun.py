@@ -280,6 +280,27 @@ def test_the_identical_file_s_metadata_matches_9_86(tmp_path, reset_hpcp_globals
 	assert _metadata(ours, atime=case == 'times') == _metadata(theirs, atime=case == 'times')
 
 
+@root_only
+@linux_only
+def test_an_identical_file_keeps_its_capability_though_its_owner_is_set(tmp_path, reset_hpcp_globals):
+	# The kernel clears security.capability on every chown. 9.86 ran copystat and then the chown on every rerun, so every
+	# identical file lost its capability (a copy of ping its cap_net_raw); the xattrs go after the owner, as cp -a gives them.
+	src, landing = str(tmp_path / 'src'), str(tmp_path / 'landing')
+	with open(src, 'w') as handle:
+		handle.write('same')
+	capability = struct.pack('<IIIII', 0x02000001, 1 << 13, 0, 0, 0)
+	if not _can_set(src, 'security.capability', capability):
+		pytest.skip('no file capabilities here')
+	now = _now_ns()
+	os.utime(src, ns=(now, now - 50 * 10 ** 9))
+	shutil.copyfile(src, landing)
+	os.utime(landing, ns=(now, now - 50 * 10 ** 9))
+	os.chown(landing, 1000, 1000)  # another owner: the settle must chown it back
+	os.setxattr(landing, 'security.capability', capability)  # after the chown, which cleared it
+	assert hpcp._settle_identical(src, os.lstat(src), landing, os.lstat(landing)) is True
+	assert os.lstat(landing).st_uid == 0 and _xattrs(landing).get('security.capability') == capability
+
+
 @posix_only
 def test_an_identical_file_whose_metadata_cannot_be_set_is_a_failed_copy(copied, monkeypatch):
 	# A read-only mount, another user's file: what the skip gives an identical landing cannot be set. A failed copy (190)
