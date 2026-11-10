@@ -141,6 +141,38 @@ def test_a_clean_rerun_sets_no_metadata(copied, monkeypatch):
 	assert [os.stat(landing).st_ctime_ns for landing in landings] == ctimes
 
 
+@posix_only
+def test_reruns_set_nothing_though_their_own_reads_move_the_read_times(tmp_path, reset_hpcp_globals, monkeypatch):
+	# Read times in the past, as a real tree's: under relatime a read moves a read time that is not after the change time,
+	# which any metadata set makes it. Chasing the read time alone, a rerun set it on every identical file (its own skip
+	# check's read had moved it), a SETATTR a file on every rerun on NFS (EL8: 10,000 a rerun of 10,000 files).
+	probe = str(tmp_path / 'probe')
+	with open(probe, 'w') as handle:
+		handle.write('x')
+	old = _now_ns() - 3600 * 10 ** 9
+	os.utime(probe, ns=(old, old))
+	os.chmod(probe, 0o644)  # its change time is now, after its read time
+	with open(probe) as handle:
+		handle.read()
+	if os.stat(probe).st_atime_ns == old:
+		pytest.skip('a read moves no read time here (noatime)')
+	src, out = str(tmp_path / 'src'), str(tmp_path / 'out')
+	files = []
+	for f in range(10):
+		path = os.path.join(src, 'd', 'f%d' % f)
+		os.makedirs(os.path.dirname(path), exist_ok=True)
+		with open(path, 'w') as handle:
+			handle.write('x' * 100)
+		os.utime(path, ns=(old, old))
+		files.append(path)
+	_first_copy(src, out)
+	_copy_each(files, src, out, 'rerun-1')
+	for rerun in (2, 3):
+		with _counting(monkeypatch, _SETS) as counts:
+			_copy_each(files, src, out, 'rerun-%d' % rerun)
+		assert not counts, (rerun, counts)
+
+
 def _xattrs(path):
 	if not hasattr(os, 'listxattr'):
 		return {}
@@ -171,9 +203,9 @@ def _skip_986(src, dest):
 	os.utime(dest, ns=(st.st_atime_ns, st.st_mtime_ns), follow_symlinks=False)
 
 
-def _metadata(path):
+def _metadata(path, atime=True):
 	st = os.lstat(path)
-	return stat.S_IMODE(st.st_mode), st.st_uid, st.st_gid, st.st_atime_ns, st.st_mtime_ns, _xattrs(path)
+	return stat.S_IMODE(st.st_mode), st.st_uid, st.st_gid, st.st_atime_ns if atime else None, st.st_mtime_ns, _xattrs(path)
 
 
 _CASES = ['mode', 'setuid', 'times', 'xattr-added', 'xattr-changed', 'xattr-removed', 'owner', 'acl-added', 'acl-removed',
@@ -243,7 +275,8 @@ def test_the_identical_file_s_metadata_matches_9_86(tmp_path, reset_hpcp_globals
 	src_st = os.lstat(src)
 	_skip_986(src, theirs)
 	assert hpcp._settle_identical(src, src_st, ours, os.lstat(ours)) is True
-	assert _metadata(ours) == _metadata(theirs)
+	# 9.86 set the read time on every rerun; 9.87 sets it with the modification time only (a read moves it, relatime)
+	assert _metadata(ours, atime=case == 'times') == _metadata(theirs, atime=case == 'times')
 
 
 @posix_only
@@ -252,11 +285,10 @@ def test_an_identical_file_whose_metadata_cannot_be_set_is_a_failed_copy(copied,
 	# that names the landing, not a crash (191) naming the descriptor's /proc/self/fd/N.
 	src, out, files = copied
 	path, landing = files[0], os.path.join(out, os.path.relpath(files[0], src))
-	st = os.stat(landing)
-	os.utime(landing, ns=(st.st_atime_ns - 10 ** 9, st.st_mtime_ns))  # only its read time differs
+	os.chmod(landing, 0o600)  # only its mode differs
 	def read_only(*args, **kwargs):
 		raise OSError(errno.EROFS, os.strerror(errno.EROFS), args[0])
-	monkeypatch.setattr(hpcp.os, 'utime', read_only)
+	monkeypatch.setattr(hpcp.os, 'chmod', read_only)
 	_copy_each([path], src, out, 'read-only')
 	monkeypatch.undo()
 	failed = [error for error in hpcp.ERRORS if error.startswith('Copy failed')]

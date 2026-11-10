@@ -4631,8 +4631,9 @@ def _settle_identical(src_path, src_st, dest, look):
 	"""Give dest, a landing the skip check found identical to src_path (look: its lstat then; src_st: the source's, taken before
 	the check read it), what the skip has always given it (9.86's _remove_stale_xattrs, copystat, _chown_like_cp, chmod and
 	utime): stale portable xattrs removed and the source's set, owner and group as cp -a keeps them, the mode less set-user-ID
-	or set-group-ID where the owner or group is not kept, the times, BSD flags last. Each only where it differs, all through
-	one descriptor checked against the look. False, with nothing set, when dest is no longer the file looked at (a link, or
+	or set-group-ID where the owner or group is not kept, the times where the modification time differs (a read time alone
+	is left: reads move it), BSD flags last. Each only where it differs, all through one descriptor checked against the
+	look. False, with nothing set, when dest is no longer the file looked at (a link, or
 	another file's name, put there since: neither gets the source's owner or mode), for the caller to look again.
 
 	On Linux an O_PATH descriptor, reached by its /proc/self/fd name (as _carry_over); elsewhere a regular file opened for
@@ -4688,7 +4689,9 @@ def _settle_identical(src_path, src_st, dest, look):
 		mode = stat.S_IMODE(src_st.st_mode) & ~((0 if owner_kept else stat.S_ISUID) | (0 if group_kept else stat.S_ISGID))
 		if chowned or stat.S_IMODE(now.st_mode) != mode:
 			os.chmod(path, mode)
-		if (now.st_atime_ns, now.st_mtime_ns) != (src_st.st_atime_ns, src_st.st_mtime_ns):
+		if now.st_mtime_ns != src_st.st_mtime_ns:
+			# The read time goes with it, as cp -a gives it; alone it is not chased: a read moves it (relatime moves one older
+			# than the change time, which setting it makes it), so the skip check's own read would have it set on every rerun.
 			os.utime(path, ns=(src_st.st_atime_ns, src_st.st_mtime_ns), **how)
 		if getattr(src_st, 'st_flags', 0) != getattr(now, 'st_flags', 0):
 			try:
