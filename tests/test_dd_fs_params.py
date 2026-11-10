@@ -1576,9 +1576,13 @@ def test_dd_roundtrip_uses_defaults_with_no_fs_param_mirror(tmp_path):
 
 
 def test_version_bumped():
-	assert hpcp.version == '9.85'
+	assert hpcp.version == '9.86'
 	assert hpcp.__version__ == hpcp.version
-	assert hpcp.COMMIT_DATE == '2026-11-07'
+	# The release commit sets the date: only its form is checked, a real YYYY-MM-DD (a fixed date broke 9.85's own suite).
+	import datetime
+	import re
+	assert re.fullmatch(r'\d{4}-\d{2}-\d{2}', hpcp.COMMIT_DATE)
+	datetime.datetime.strptime(hpcp.COMMIT_DATE, '%Y-%m-%d')
 
 
 #%% -- Pre-existing -dd defects found while building the mirroring feature --

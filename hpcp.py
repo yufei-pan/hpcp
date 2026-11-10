@@ -240,7 +240,7 @@ except ImportError:
 	hasher = hashlib.blake2b()
 	xxhash_available = False
 
-version = '9.85'
+version = '9.86'
 __version__ = version
 COMMIT_DATE = '2026-11-09'
 
