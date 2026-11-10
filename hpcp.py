@@ -3975,7 +3975,7 @@ def _dest_directory(path, make=True, source=None):
 			above = source
 			for _ in range(len(parts) - 1 - index):
 				above = above and os.path.dirname(above.rstrip(os.sep))
-			named_form = f'name it with -d {current}{os.sep} to write through it' if link is not None else f'remove {current}'
+			named_form = f'name it with -d {_shell_word(current + os.sep)} to write through it' if link is not None else f'remove {current}'
 			if NO_CREATE_DIR:
 				raise _Refused(f'{current} is a {kind}' + (f' to {link}' if link is not None else '') +
 					' and -ncd makes no directory in its place: not copying ', f' below it; {named_form}')
@@ -3993,7 +3993,8 @@ def _dest_directory(path, make=True, source=None):
 				continue
 			if link is not None:
 				print(f'Note: {current} was a link to {link} and is now a directory; nothing was written to {link}. To write through '
-					f'a link, name it as the destination: hpcp {(above or "SRC").rstrip(os.sep)}{os.sep} -d {current}{os.sep}')
+					f'a link, name it as the destination: hpcp {_shell_word(above.rstrip(os.sep) + os.sep) if above else "SRC/"} -d '
+					f'{_shell_word(current + os.sep)}')
 			break
 		else:
 			raise OSError(errno.EAGAIN, 'it kept changing while it was made a directory', current)
@@ -10595,6 +10596,40 @@ def _without_covered_sources(src_paths):
 		kept.append(src)
 	return kept
 
+# shlex.quote's safe set: a word of only these needs no quotes
+_SHELL_SAFE = re.compile(r'[\w@%+=:,./-]', re.ASCII)
+
+def _shell_word(path):
+	"""path as one word a POSIX shell (bash, sh, zsh) reads back as path, for a hint's command that an operator pastes: as it
+	is when every character is shlex's safe set or a non-ASCII one the output's encoding shows; in single quotes (' as '\\'')
+	when nothing in it is a control character or a character the output cannot show; else in $'...' with each byte outside
+	printable ASCII as a three-digit octal escape (coreutils' shell-escape form; bash, ksh and zsh read it, dash 0.5.12 does
+	not). A name that is not UTF-8 is spelled by its own bytes, never by Python's \\udcXX escapes."""
+	encoding = getattr(sys.stdout, 'encoding', None) or 'ascii'
+	def shows(character):
+		if not character.isprintable():
+			return False
+		try:
+			character.encode(encoding)
+		except (UnicodeError, LookupError):
+			return False
+		return True
+	if path and all(_SHELL_SAFE.match(character) or (ord(character) > 127 and shows(character)) for character in path):
+		return path
+	if all(shows(character) for character in path):
+		return "'" + path.replace("'", "'\\''") + "'"
+	spelled = []
+	for byte in os.fsencode(path):
+		if byte == 0x27:
+			spelled.append("\\'")
+		elif byte == 0x5c:
+			spelled.append('\\\\')
+		elif 0x20 <= byte < 0x7f:
+			spelled.append(chr(byte))
+		else:
+			spelled.append('\\%03o' % byte)
+	return "$'" + ''.join(spelled) + "'"
+
 class _CannotSearch(RuntimeError):
 	"""A refusal: directory cannot be searched. link: the last link on the path that was asked about. It is named when the
 	directory is on the way to where it leads: the operator's way out is then the link, as the directory can belong to anyone."""
@@ -10605,9 +10640,9 @@ class _CannotSearch(RuntimeError):
 		if self.link and _same_or_below(os.path.realpath(self.link), self.directory):
 			return (f'Destination clash: {self.link} leads to {os.path.realpath(self.link)}, and {self.directory} on the way cannot be '
 				f'searched ({self.reason}), so a clash could hide there; nothing is copied or removed. '
-				f'To let it through: rm {self.link}, or, as its owner, chmod u+rx {self.directory}')
+				f'To let it through: rm {_shell_word(self.link)}, or, as its owner, chmod u+rx {_shell_word(self.directory)}')
 		return (f'Destination clash: {self.directory} cannot be searched ({self.reason}), so a link in it could hide a clash; '
-			f'nothing is copied or removed. To let it through: chmod u+rx {self.directory}')
+			f'nothing is copied or removed. To let it through: chmod u+rx {_shell_word(self.directory)}')
 
 def _last_link(path):
 	"""The last symlink on the way down the absolute path, as far as it can be followed, or None."""

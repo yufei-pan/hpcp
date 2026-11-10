@@ -101,6 +101,7 @@ entries go last, in the same commit as the change:
 - Why we had to change: `out/l -> /root/secret/f` said `/root cannot be searched` and offered a `chmod` a user cannot run.
 - Original design was wrong because: `_RealPlaces` raised from the walk, which no longer knew the path it was asked about. The public calls now add the link on the way out, so the walk stays as it was.
 - Lesson: a refusal states what would let it pass, in terms of what its reader controls. Add that where the question was asked, not where the walk stopped.
+- Sharpened 2026-11-10 (9.87, entry 8): the commands a hint gives (the replaced-link Note, the `-ncd` refusal, `rm` and `chmod` of a place that cannot be searched) printed paths as Python holds them: a space split the command, and a name the locale cannot show came out as `\udcXX`, which no shell reads back. They now go through `_shell_word`: as is when safe, else single-quoted, else `$'...'` with octal bytes. Lesson: give the command in a form its shell runs; quote names for the shell, not as the program holds them.
 
 ## 2026-11-06 The reason travels with the error
 - Changed: a `Task return code error` carries the last three lines of what the tool printed to stderr, after the return code, so `Copy failed` says `No space left on device`. A tool that says nothing keeps the old sentence. The prefix, and so the exit code, stays.

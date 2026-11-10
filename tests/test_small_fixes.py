@@ -73,3 +73,59 @@ def test_a_patch_with_a_non_ascii_name_applies_under_the_c_locale(tmp_path, made
 	assert 'failed 0' in step('apply', _C)
 	with open(os.path.join(os.fsencode(str(target)), name), 'rb') as f:
 		assert f.read() == b'content'
+
+
+# ---- A4: hints shell-quoted (entry 8)
+
+_NAMES = [b'plain', b'a b', b"it's", b'$HOME', b'x\xff', b'tab\there', 'café'.encode(), b'back\\slash']
+
+
+@posix_only
+@pytest.mark.parametrize('encoding', ['ascii', 'utf-8'])
+@pytest.mark.parametrize('name', _NAMES, ids=lambda name: name.decode('ascii', 'backslashreplace'))
+def test_a_shell_word_reads_back_as_the_name(monkeypatch, name, encoding):
+	# 9.86 printed hints' paths as Python holds them: a space split the command, and a non-UTF-8 byte showed as \udcff
+	import hpcp
+	class Out:
+		pass
+	out = Out()
+	out.encoding = encoding
+	monkeypatch.setattr(sys, 'stdout', out)
+	word = hpcp._shell_word(os.fsdecode(name))
+	monkeypatch.undo()
+	word.encode(encoding)  # the output can show it
+	done = subprocess.run([b'bash', b'-c', b'printf %s ' + os.fsencode(word)], stdout=subprocess.PIPE, check=True)
+	assert done.stdout == name
+
+
+@posix_only
+@pytest.mark.parametrize('locale', ['C', 'C.UTF-8'])
+def test_the_replaced_link_note_s_command_writes_through_the_link(tmp_path, locale):
+	# the Note's command, pasted into bash, copies through the link it names
+	weird = b"s p'$\xff"
+	root = os.fsencode(str(tmp_path))
+	src = os.path.join(root, weird)
+	os.makedirs(os.path.join(src, b'd'))
+	with open(os.path.join(src, b'd', b'f'), 'wb') as f:
+		f.write(b'f')
+	os.makedirs(os.path.join(root, b'elsewhere'))
+	os.makedirs(os.path.join(root, b'out'))
+	os.symlink(b'../elsewhere', os.path.join(root, b'out', b'd'))
+	env = {'LC_ALL': locale, 'LANG': locale, 'PYTHONUTF8': '0', 'PYTHONCOERCECLOCALE': '0'}
+	task = subprocess.run([sys.executable, HPCP, os.fsdecode(src + b'/'), '-d', 'out/'], cwd=str(tmp_path), stdin=subprocess.DEVNULL,
+		stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=dict(os.environ, **env), timeout=120)
+	assert task.returncode == 0, task.stdout[-2000:]
+	assert not os.path.exists(os.path.join(root, b'elsewhere', b'f'))
+	marker = b'name it as the destination: hpcp '
+	line = next(line for line in task.stdout.splitlines() if marker in line)
+	command = line.split(marker, 1)[1]
+	# the operator puts the link back, and runs the command the Note gave
+	import shutil
+	shutil.rmtree(os.path.join(root, b'out', b'd'))
+	os.symlink(b'../elsewhere', os.path.join(root, b'out', b'd'))
+	done = subprocess.run([b'bash', b'-c', b'"$0" "$1" ' + command, os.fsencode(sys.executable), os.fsencode(HPCP)],
+		cwd=str(tmp_path), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=dict(os.environ, **env),
+		timeout=120)
+	assert done.returncode == 0, (command, done.stdout[-2000:])
+	with open(os.path.join(root, b'elsewhere', b'f'), 'rb') as f:
+		assert f.read() == b'f'
