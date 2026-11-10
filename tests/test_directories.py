@@ -4,10 +4,12 @@ import collections
 import errno
 import functools
 import os
+import pathlib
 import signal
 import stat
 import subprocess
 import sys
+import threading
 import time
 import uuid
 
@@ -252,6 +254,8 @@ def _calls_per_directory(tmp_path, monkeypatch, label):
 	names = ['lstat', 'stat', 'open', 'close', 'chmod', 'chown', 'utime', 'listxattr', 'getxattr', 'setxattr', 'removexattr',
 		'statvfs', 'readlink', 'access', 'scandir', 'mkdir', 'unlink', 'rename', 'fstat', 'fchmod', 'fchown']
 	counts = collections.Counter()
+	# this thread's calls only: under pytest-xdist the worker's I/O thread calls os too (the rerun's count wandered by 0.25)
+	me = threading.get_ident()
 	with monkeypatch.context() as patch:
 		for name in names:
 			real = getattr(os, name, None)
@@ -259,7 +263,8 @@ def _calls_per_directory(tmp_path, monkeypatch, label):
 				continue
 			@functools.wraps(real)
 			def counted(*args, _name=name, _real=real, **kwargs):
-				counts[_name] += 1
+				if threading.get_ident() == me:
+					counts[_name] += 1
 				return _real(*args, **kwargs)
 			patch.setattr(os, name, counted)
 		for folder in folders:
@@ -268,16 +273,23 @@ def _calls_per_directory(tmp_path, monkeypatch, label):
 
 
 @posix_only
-def test_directory_calls_stay_within_9_86_s(tmp_path, monkeypatch, reset_hpcp_globals):
-	# 9.86 (the plan's probe p3): 17.1 os calls per directory on a first copy, 18.1 on a rerun (23.0 on Python 3.6)
-	src = tmp_path / 'src'
-	for d in range(4):
-		for e in range(5):
-			(src / ('d%d' % d) / ('e%d' % e)).mkdir(parents=True)
-	(tmp_path / 'out').mkdir()
-	monkeypatch.setattr(hpcp, 'NAMED_DESTS', frozenset([str(tmp_path / 'out')]))
-	assert _calls_per_directory(tmp_path, monkeypatch, 'first') <= 17.1
-	assert _calls_per_directory(tmp_path, monkeypatch, 'rerun') <= (23.0 if sys.version_info < (3, 7) else 18.1)
+def test_directory_calls_stay_within_9_86_s(monkeypatch, reset_hpcp_globals):
+	# 9.86 (the plan's probe p3): 17.1 os calls per directory on a first copy, 18.1 on a rerun (23.0 on Python 3.6). Counted
+	# where p3 counted, in a directory of the temporary directory: a rerun's count grows with the path's depth (one more
+	# lstat a directory for each level, as in 9.86), and pytest's tmp_path is deeper.
+	import shutil, tempfile
+	base = pathlib.Path(tempfile.mkdtemp(prefix='p3-'))
+	try:
+		src = base / 'src'
+		for d in range(4):
+			for e in range(5):
+				(src / ('d%d' % d) / ('e%d' % e)).mkdir(parents=True)
+		(base / 'out').mkdir()
+		monkeypatch.setattr(hpcp, 'NAMED_DESTS', frozenset([str(base / 'out')]))
+		assert _calls_per_directory(base, monkeypatch, 'first') <= 17.1
+		assert _calls_per_directory(base, monkeypatch, 'rerun') <= (23.0 if sys.version_info < (3, 7) else 18.1)
+	finally:
+		shutil.rmtree(str(base))
 
 
 # ---- M2: a move fsyncs its directories
@@ -334,6 +346,14 @@ def test_a_move_fsyncs_each_directory_once(tmp_path, monkeypatch, reset_hpcp_glo
 	_move_tree(src)
 	events = []
 	_log_fsyncs(monkeypatch, events, src)
+	# each directory's times set at the finish: every fsync comes after the last of them (one journal commit, not one each)
+	real_utime, real_fstat = os.utime, os.fstat
+	def utime(target, *args, **kwargs):
+		# by path: patched, os.utime is no longer in os.supports_fd
+		if not isinstance(target, int) and os.path.isdir(target):
+			events.append(('set', str(target)))
+		return real_utime(target, *args, **kwargs)
+	monkeypatch.setattr(hpcp.os, 'utime', utime)
 	out = tmp_path / 'out'
 	rc = hpcp.hpcp([str(src) + os.sep], dest_paths=[str(out) + os.sep], single_thread=True, max_workers=1, remove=True, remove_force=True,
 		no_directory_sync=nds)
@@ -344,6 +364,8 @@ def test_a_move_fsyncs_each_directory_once(tmp_path, monkeypatch, reset_hpcp_glo
 	assert sorted(synced) == sorted(os.path.realpath(path) for path in expected)
 	removals = [i for i, (kind, _) in enumerate(events) if kind == 'remove']
 	assert removals and all(i < removals[0] for i, (kind, _) in enumerate(events) if kind == 'fsync')
+	sets = [i for i, (kind, _) in enumerate(events) if kind == 'set']
+	assert bool(sets) != nds and all(i > max(sets or [-1]) for i, (kind, _) in enumerate(events) if kind == 'fsync')
 	if not nds:
 		assert stat.S_IMODE(os.lstat(str(out / 'm')).st_mode) == 0o700
 
@@ -372,7 +394,8 @@ def test_the_finish_fsyncs_a_directory_through_the_descriptor_it_opened_before_c
 	_log_fsyncs(monkeypatch, events, tmp_path / 'src')
 	try:
 		hpcp.finish_directories([(str(tmp_path / 'src'), str(dest), 0o333, 10**18, 10**18, None)], 1, sync=True)
-		assert events == [('fsync', str(dest))] and stat.S_IMODE(os.lstat(str(dest)).st_mode) == 0o333
+		# root opens it again whatever its mode: the move's pass fsyncs it with the others (_sync_moved_directories)
+		assert events == ([('fsync', str(dest))] if os.geteuid() != 0 else []) and stat.S_IMODE(os.lstat(str(dest)).st_mode) == 0o333
 		assert os.lstat(str(dest)).st_mtime_ns == 10**18
 	finally:
 		os.chmod(str(dest), 0o755)

@@ -5225,19 +5225,23 @@ def sync_directory_metadata(src_path, dest_paths):
 		_finish_directory(record)
 	return count, seconds, links
 
+def _shut_to_its_owner(mode):
+	"""Whether a non-root runner could not open a directory of this final mode again (no owner read): a move fsyncs it at the
+	finish, through the descriptor that set the mode (_finish_directory), and every other directory once they all are
+	finished (_sync_moved_directories)."""
+	return mode is not None and os.geteuid() != 0 and not mode & stat.S_IRUSR
+
 def _finish_directory(record, sync=False):
 	"""The rest of a synced directory's metadata, once what goes in it is in (_start_directory's record): its exact mode, its
 	times and its BSD flags, each set only where the directory differs, through one descriptor opened without following a
-	link (a link the operator named with -d is followed, as everywhere). sync (a move): that descriptor is fsynced last; it
-	was opened while the sync's mode still let its owner in. A failure is a Directory sync error, or the move's copy failure
-	when only the fsync failed."""
+	link (a link the operator named with -d is followed, as everywhere). sync (a move): a directory its mode now shuts to its
+	owner (_shut_to_its_owner) is fsynced through that descriptor, opened while the sync's mode still let its owner in; the
+	others are fsynced after the whole finish, once each (an fsync right after each change would commit the journal once per
+	directory). A failure is a Directory sync error, or the move's copy failure when only the fsync failed."""
 	src_path, dest_path, mode, atime_ns, mtime_ns, flags = record
-	if mode is None and not sync:
-		return
+	if mode is None:
+		return  # -co: no directory metadata
 	if os.name != 'posix':
-		# Nothing is fsynced there (README): only the metadata, which -co does not set.
-		if mode is None:
-			return
 		try:
 			os.chmod(dest_path, mode)
 			os.utime(dest_path, ns=(atime_ns, mtime_ns))
@@ -5250,24 +5254,20 @@ def _finish_directory(record, sync=False):
 	try:
 		fd = os.open(dest_path, how)
 	except OSError as e:
-		if sync and mode is None and isinstance(e, PermissionError):
-			# -co in a move: another user's directory this run may not read (a write-only drop box) is not fsynced, as M2 passes over one.
-			return
 		eprint(f'Directory sync error: {src_path} to {dest_path}: {e}')
 		return
 	try:
-		if mode is not None:
-			try:
-				now = os.fstat(fd)
-				if stat.S_IMODE(now.st_mode) != mode:
-					os.fchmod(fd, mode)
-				if (now.st_atime_ns, now.st_mtime_ns) != (atime_ns, mtime_ns):
-					os.utime(fd if os.utime in os.supports_fd else dest_path, ns=(atime_ns, mtime_ns))
-				if flags is not None and hasattr(os, 'chflags') and getattr(now, 'st_flags', flags) != flags:
-					os.chflags(dest_path, flags, follow_symlinks=False)
-			except OSError as e:
-				eprint(f'Directory sync error: {src_path} to {dest_path}: {e}')
-		if sync:
+		try:
+			now = os.fstat(fd)
+			if stat.S_IMODE(now.st_mode) != mode:
+				os.fchmod(fd, mode)
+			if (now.st_atime_ns, now.st_mtime_ns) != (atime_ns, mtime_ns):
+				os.utime(fd if os.utime in os.supports_fd else dest_path, ns=(atime_ns, mtime_ns))
+			if flags is not None and hasattr(os, 'chflags') and getattr(now, 'st_flags', flags) != flags:
+				os.chflags(dest_path, flags, follow_symlinks=False)
+		except OSError as e:
+			eprint(f'Directory sync error: {src_path} to {dest_path}: {e}')
+		if sync and _shut_to_its_owner(mode):
 			try:
 				os.fsync(fd)
 			except OSError as e:
@@ -5291,8 +5291,9 @@ def finish_directories(records, max_workers, sync=False):
 	(its files, links, subdirectories and -rme's removals) is in: a directory written into after its times were set keeps the
 	write's time, and a 0555 one would refuse its files. One pool for the whole pass, each depth done before the next starts,
 	so a child's times are set through its parent while the parent's own mode still lets its owner search it; in the parent
-	under -s or for one job's worth. sync (a move, M2): each directory is fsynced through the same descriptor."""
-	records = [record for record in records if record[2] is not None or sync]
+	under -s or for one job's worth. sync (a move, M2): a directory its mode shuts to its owner is fsynced through the
+	descriptor that set it (_finish_directory); _sync_moved_directories fsyncs the rest."""
+	records = [record for record in records if record[2] is not None]
 	if not records:
 		return
 	by_depth = {}
@@ -5315,17 +5316,21 @@ def finish_directories(records, max_workers, sync=False):
 					futures.discard(future)
 					_task_result(future, (0, 0, {}), 'Copy process crashed')
 
-def _sync_moved_directories(files, link_dirs, src_paths, dests, dest_image, finished, max_workers):
-	"""A move's directory fsyncs, past those the finish fsynced (finished: their absolute paths): the directory of every file
-	landing (files: the copy's source paths, one directory map per source directory, so a -nds move is covered), those a link
-	was made in (link_dirs), and the parent of each source's landing, once each. fsync(2) promises a new name only with its
-	directory's fsync: on ext4 and XFS a file's own fsync commits it, elsewhere not. In max_workers threads: an fsync waits on
-	the disk, not the CPU. A directory that is not there (a -nds landing directory in a destination its files did not go to)
+def _sync_moved_directories(files, link_dirs, src_paths, dests, dest_image, records, max_workers):
+	"""A move's directory fsyncs, once the finish (finish_directories) is done: each directory the copy synced (records), but
+	those the finish fsynced (_shut_to_its_owner), the directory of every file landing (files: the copy's source paths, one
+	directory map per source directory, so a -nds move is covered), those a link was made in (link_dirs), and the parent of
+	each source's landing, once each. fsync(2) promises a new name only with its directory's fsync: on ext4 and XFS a file's
+	own fsync commits it, elsewhere not; there the first fsync here commits every change before it, so the rest cost little
+	(2,040 directories fsynced each right after its own change took 1.4 to 3.1 s on EL7 and EL8, against 9.86's 0.4 to 0.7 s
+	for the move). In max_workers threads: an fsync waits on the disk, not the CPU. A directory that is not there (a -nds landing directory in a destination its files did not go to)
 	has nothing to write, and another user's that this run may not read (a write-only drop box) is passed over (_fsync_file).
 	A failure is a failed copy: Copy failed: the directory DIR cannot be written to disk (why), and the move removes nothing.
 	Returns the directories it fsynced (or tried to)."""
 	by_source = _by_source(_src_to_dest_map(src_paths, dests, dest_image))
 	directories = set(link_dirs or ())
+	directories.update(record[1] for record in records)
+	finished = {os.path.abspath(record[1]) for record in records if _shut_to_its_owner(record[2])}
 	for parent in {os.path.dirname(path) for path in files}:
 		directories.update(_landings(parent, by_source))
 	for _, landings in _src_to_dest_map(src_paths, dests, dest_image):
@@ -13809,11 +13814,11 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = multipr
 			finish_directories(dir_records, 1 if single_thread else max_workers, sync=SYNC_COPIES)
 			if SYNC_COPIES:
 				_check_stop()
-				finished = {os.path.abspath(record[1]) for record in dir_records}
-				synced = _sync_moved_directories(total_file_list, link_dirs, src_paths, dests, bool(dest_image), finished,
+				synced = _sync_moved_directories(total_file_list, link_dirs, src_paths, dests, bool(dest_image), dir_records,
 					1 if single_thread else max_workers)
 				_check_stop()
-				_flush_drives(total_file_list, finished.union(synced), src_paths, dests, bool(dest_image))
+				_flush_drives(total_file_list, set(synced).union(os.path.abspath(record[1]) for record in dir_records), src_paths,
+					dests, bool(dest_image))
 			copy_failures += [error for error in ERRORS[finish_start:] if _is_failure(error)]
 			_check_stop()
 			print('-'*80)
