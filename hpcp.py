@@ -4790,7 +4790,14 @@ def copy_file(src_path, dest_paths, full_hash=False, verbose=False, concurrent_p
 					break
 				if not _known_identical(src_path, target, src_st.st_size, full_hash, src_st=src_st, dest_st=dest_st):
 					break
-				if not (CONTENT_ONLY or _settle_identical(src_path, src_st, target, dest_st)):
+				try:
+					settled = CONTENT_ONLY or _settle_identical(src_path, src_st, target, dest_st)
+				except OSError as e:
+					# Identical, but what the skip gives it cannot be set (a read-only mount, another user's file): a failed
+					# copy that names the landing.
+					_copy_failed(src_path, f'Copy failed: ERROR copying {src_path} to {target}: it holds the source\'s content, but its owner, mode, times or xattrs cannot be set ({_why(e)})')
+					return 0, time.monotonic() - start_time, symLinks
+				if not settled:
 					looks[dest] = _landing_of(dest)
 					continue
 				if SYNC_COPIES:

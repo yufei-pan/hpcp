@@ -2889,7 +2889,9 @@ def test_a_move_into_an_image_fsyncs_each_landing_in_it_before_the_source_goes(t
 		fsynced.append(os.readlink('/proc/self/fd/%d' % fd))
 		return real_fsync(fd)
 	def remove(*args, **kwargs):
-		assert sorted(os.path.basename(path) for path in fsynced) == ['x', 'y'] and os.path.exists(str(tmp_path / 'a/x')), fsynced
+		# each file landed in it (its directories are fsynced too, since 9.87's M2)
+		files = sorted(os.path.basename(path) for path in fsynced if os.path.isfile(path))
+		assert files == ['x', 'y'] and os.path.exists(str(tmp_path / 'a/x')), fsynced
 		return real_remove(*args, **kwargs)
 	monkeypatch.setattr(hpcp_mod.os, 'fsync', fsync)
 	monkeypatch.setattr(hpcp_mod, 'remove_moved_sources', remove)

@@ -246,6 +246,24 @@ def test_the_identical_file_s_metadata_matches_9_86(tmp_path, reset_hpcp_globals
 	assert _metadata(ours) == _metadata(theirs)
 
 
+@posix_only
+def test_an_identical_file_whose_metadata_cannot_be_set_is_a_failed_copy(copied, monkeypatch):
+	# A read-only mount, another user's file: what the skip gives an identical landing cannot be set. A failed copy (190)
+	# that names the landing, not a crash (191) naming the descriptor's /proc/self/fd/N.
+	src, out, files = copied
+	path, landing = files[0], os.path.join(out, os.path.relpath(files[0], src))
+	st = os.stat(landing)
+	os.utime(landing, ns=(st.st_atime_ns - 10 ** 9, st.st_mtime_ns))  # only its read time differs
+	def read_only(*args, **kwargs):
+		raise OSError(errno.EROFS, os.strerror(errno.EROFS), args[0])
+	monkeypatch.setattr(hpcp.os, 'utime', read_only)
+	_copy_each([path], src, out, 'read-only')
+	monkeypatch.undo()
+	failed = [error for error in hpcp.ERRORS if error.startswith('Copy failed')]
+	assert len(failed) == 1 and landing in failed[0] and '/proc/' not in failed[0], hpcp.ERRORS
+	assert failed[0].endswith('cannot be set (%s)' % os.strerror(errno.EROFS)), failed
+
+
 @root_only
 @linux_only
 @pytest.mark.parametrize('swap', ['link', 'second-name'])
