@@ -5648,7 +5648,10 @@ def _finish_directory(record, sync=False):
 			now = os.fstat(fd)
 			if stat.S_IMODE(now.st_mode) != mode:
 				os.fchmod(fd, mode)
-			if (now.st_atime_ns, now.st_mtime_ns) != (atime_ns, mtime_ns):
+			# The read time with the modification time, as cp -a gives both; one that alone differs is left, as a file's
+			# (_settle_identical): a read moves it where it is not after the change time, which any set makes now, so a rerun
+			# chasing it would set it and move the change time on every run (EL8, relatime: the rerun's own listing did).
+			if now.st_mtime_ns != mtime_ns:
 				os.utime(fd if os.utime in os.supports_fd else dest_path, ns=(atime_ns, mtime_ns))
 			if flags is not None and hasattr(os, 'chflags') and getattr(now, 'st_flags', flags) != flags:
 				os.chflags(dest_path, flags, follow_symlinks=False)

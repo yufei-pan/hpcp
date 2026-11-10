@@ -229,6 +229,30 @@ def test_a_rerun_sets_no_directory_metadata(tmp_path, monkeypatch, reset_hpcp_gl
 
 
 @posix_only
+def test_a_rerun_leaves_a_directory_read_time_that_alone_differs(tmp_path, monkeypatch, reset_hpcp_globals):
+	# EL8 (relatime): test_a_rerun_sets_no_directory_metadata's rerun set 2 directories' times. A read moves a read time that
+	# is not after the change time, and the finish's own set makes the change time now: chasing the read time alone, every
+	# rerun set it again (R2's files did the same, 6d96a27). Here the landings' read times are moved as such a read moves them.
+	src = tmp_path / 'src'
+	src.mkdir()
+	_tree(src, links=False)
+	(tmp_path / 'dst').mkdir()
+	_set_times(src, 30 * DAY)
+	srcs = [str(src) + os.sep]
+	opts = dict(dest_paths=[str(tmp_path / 'dst') + os.sep], single_thread=True, max_workers=1, verbose=False, batch=True)
+	assert hpcp.hpcp(srcs, **opts) == 0
+	read = time.time_ns() if hasattr(time, 'time_ns') else int(time.time() * 10**9)
+	landings = [r for r, _, _ in os.walk(str(tmp_path / 'dst'))]
+	for landing in landings:
+		os.utime(landing, ns=(read, os.lstat(landing).st_mtime_ns))
+	counts = collections.Counter()
+	_count_setters(monkeypatch, counts)
+	assert hpcp.hpcp(srcs, **opts) == 0
+	assert dict(counts) == {}
+	assert _dir_times(tmp_path / 'dst') == _dir_times(src)
+
+
+@posix_only
 def test_a_move_keeps_its_sources_when_a_directory_cannot_be_finished(tmp_path, monkeypatch, reset_hpcp_globals):
 	# 9.86 set a directory's metadata before the copy's failures were counted, so one it could not set kept the sources; the
 	# finish comes later, and its failures still stop the move's removal
