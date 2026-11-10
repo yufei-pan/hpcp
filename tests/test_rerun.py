@@ -1,4 +1,4 @@
-'''9.87 group 4: a rerun's looks (R1), the identical file's metadata (R2), the copy check by directory (R3). In process, as the
+'''9.87 group 4: a rerun's looks (R1), the identical file's metadata (R2), the copy check's second pass (R3). In process, as the
 plan's probes count (probe/p1_rerun_calls.py, p3_first_and_dirs.py).'''
 import collections
 import contextlib
@@ -261,7 +261,7 @@ def test_a_landing_swapped_after_the_look_gets_no_metadata(tmp_path, reset_hpcp_
 		assert handle.read() == 'same'
 
 
-# ---- R3: the copy check by directory, its second pass by index
+# ---- R3: the copy check's second pass by index
 
 def _random_trees(root, seed):
 	'''Two sources merged into one destination, with clashes planted: a landing missing, one with other content, one that is
@@ -304,14 +304,15 @@ def _random_trees(root, seed):
 @posix_only
 @pytest.mark.parametrize('move', [False, True], ids=['copy', 'move'])
 @pytest.mark.parametrize('seed', range(12))
-def test_the_copy_check_by_directory_matches_a_look_by_path(tmp_path, reset_hpcp_globals, monkeypatch, seed, move):
-	# The same {path: why} as a lstat of each landing by its path (9.86's look).
+def test_the_second_pass_by_index_matches_a_second_pass_over_every_entry(tmp_path, reset_hpcp_globals, monkeypatch, seed, move):
+	# The same {path: why} as 9.86's second pass, which looked at every entry again: with every fingerprint made to meet
+	# every other, every entry is looked at again.
 	entries, src_paths, dests = _random_trees(str(tmp_path), seed)
-	grouped = hpcp._not_held(list(entries), src_paths, dests, max_workers=1, move=move)
-	monkeypatch.setattr(hpcp, '_lstat_below', lambda path, opened: os.lstat(path))
-	by_path = hpcp._not_held(list(entries), src_paths, dests, max_workers=1, move=move)
-	assert grouped == by_path
-	assert grouped or seed is None  # the planted clashes are found
+	indexed = hpcp._not_held(list(entries), src_paths, dests, max_workers=1, move=move)
+	monkeypatch.setattr(hpcp, 'hash', lambda value: 0, raising=False)
+	every = hpcp._not_held(list(entries), src_paths, dests, max_workers=1, move=move)
+	assert indexed == every
+	assert indexed  # the planted clashes are found
 
 
 @posix_only
@@ -329,11 +330,13 @@ def test_the_second_pass_stats_only_the_entries_met_twice(tmp_path, reset_hpcp_g
 	os.symlink('d7', str(out / 'd3'))
 	entries = sorted(str(path) for path in src.rglob('f*'))
 	looked = []
-	real = hpcp._lstat_below
-	def counted(path, opened):
-		looked.append(path)
-		return real(path, opened)
-	monkeypatch.setattr(hpcp, '_lstat_below', counted)
+	real = os.lstat
+	def counted(path, *args, **kwargs):
+		if str(path).startswith(str(out) + os.sep):
+			looked.append(path)
+		return real(path, *args, **kwargs)
+	monkeypatch.setattr(hpcp.os, 'lstat', counted)
 	not_held = hpcp._not_held(entries, [str(src) + os.sep], [str(out) + os.sep], max_workers=1, move=False)
-	assert len(looked) == 200 + 40
+	monkeypatch.setattr(hpcp.os, 'lstat', real)
+	assert len(looked) == 200 + 40, len(looked)
 	assert set(not_held) == {str(src / d / ('f%d' % f)) for d in ('d3', 'd7') for f in range(20)}, not_held
