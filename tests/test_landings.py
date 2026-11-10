@@ -1287,8 +1287,8 @@ def test_a_doomed_new_file_is_warned_about_and_still_tried(tmp_path):
 @posix_only
 @small_fs
 def test_no_space_warning_where_the_estimate_does_not_hold(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
-	# btrfs (compression, shared blocks) and a source on the landing's own filesystem (XFS may clone it) get no line; the copy
-	# is tried as ever.
+	# btrfs (compression, shared blocks) and a source on an XFS's own filesystem (cp may clone it) get no line; the copy is
+	# tried as ever.
 	with _on_small('scope') as out:
 		write(os.path.join(out, 'x'), b'o' * _MIB)
 		write(tmp_path / 'a/x', os.urandom(_MIB))
@@ -1301,8 +1301,24 @@ def test_no_space_warning_where_the_estimate_does_not_hold(tmp_path, hpcp_mod, r
 		write(os.path.join(out, 'src/y'), os.urandom(_MIB))
 		write(os.path.join(out, 'dst/y'), b'o' * _MIB)
 		_fill(out, _MIB // 2)
+		monkeypatch.setattr(hpcp_mod, '_mount_type', lambda dev: 'xfs')
+		assert hpcp_mod.copy_file(os.path.join(out, 'src/y'), [os.path.join(out, 'dst/y')])[0] > 0
+		assert not hpcp_mod.ERRORS and read_bytes(os.path.join(out, 'dst/y')) == read_bytes(os.path.join(out, 'src/y'))
+
+
+@posix_only
+@small_fs
+def test_the_space_warning_is_printed_for_a_source_on_the_same_tmpfs(tmp_path):
+	# ext2/3/4 and tmpfs never clone, so the source on the landing's own filesystem gets the warning as any other (9.86 as
+	# built skipped every same-device copy): 1 MiB over a 1 MiB old copy with 0.5 MiB free fits only by reusing its room.
+	with _on_small('same') as out:
+		write(os.path.join(out, 'src/y'), os.urandom(_MIB))
+		write(os.path.join(out, 'dst/y'), b'o' * _MIB)
+		_fill(out, _MIB // 2)
 		rc, output = run([os.path.join(out, 'src/y'), '-d', os.path.join(out, 'dst') + '/'], tmp_path)
-		assert rc == 0 and b'Space warning' not in output and read_bytes(os.path.join(out, 'dst/y')) == read_bytes(os.path.join(out, 'src/y')), output[-3000:]
+		assert rc == 0 and read_bytes(os.path.join(out, 'dst/y')) == read_bytes(os.path.join(out, 'src/y')), output[-3000:]
+		live, repeated = _warnings(output, os.path.join(out, 'dst'))
+		assert len(live) == 1 and repeated == live, output[-3000:]
 
 
 @posix_only

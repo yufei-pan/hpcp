@@ -3681,12 +3681,13 @@ def _claim_space(dev):
 def _space_warning(target, src_path, free, need, old):
 	"""Before cp writes target, whose directory has free bytes, less than need (src_path's allocated size): one line per
 	filesystem in a run, then cp tries, as GNU cp does; nothing is refused, and the exit code is the copy's. old: the room an
-	old copy that cp frees first holds (in place), else 0. Only for _SPACE_TYPES, and a source on another device (XFS may
-	clone one on its own). A 'Space warning' (code 0) in ERRORS too, which a task hands back, repeated at the run's end."""
+	old copy that cp frees first holds (in place), else 0. Only for _SPACE_TYPES, and not on an XFS the source is on too (cp may
+	clone it: GNU cp 9 does by default; ext and tmpfs never clone). A 'Space warning' (code 0) in ERRORS too, which a task hands back, repeated at the run's end."""
 	directory = os.path.dirname(os.path.abspath(target))
 	try:
 		dev = os.stat(directory).st_dev
-		if dev == os.lstat(src_path).st_dev or _mount_type(dev) not in _SPACE_TYPES or not _claim_space(dev):
+		kind = _mount_type(dev)
+		if kind not in _SPACE_TYPES or (kind == 'xfs' and dev == os.lstat(src_path).st_dev) or not _claim_space(dev):
 			return
 	except OSError:
 		return
