@@ -205,3 +205,52 @@ def test_on_a_terminal_an_error_line_clears_the_bar_first(tmp_path, workers):
 	assert len(failed) == 12, output[-3000:]
 	# what the terminal shows of each: from its last carriage return, after the line clear
 	assert all(line.rsplit(b'\r', 1)[-1].startswith(b'Copy failed') for line in failed), failed
+
+
+# ---- A6: -enes counts what the copy will write (entry 20)
+
+SMALL_FS = os.environ.get('HPCP_TEST_SMALL_FS')
+
+
+@pytest.fixture
+def small_dir():
+	'''A directory of its own on the 5 MiB filesystem HPCP_TEST_SMALL_FS, emptied after; one test at a time there, across
+	pytest-xdist's workers (test_landings.py takes the same lock).'''
+	if not SMALL_FS:
+		pytest.skip('HPCP_TEST_SMALL_FS: a 5 MiB filesystem of its own')
+	import fcntl
+	import shutil
+	with open(os.path.join(SMALL_FS, '.lock'), 'a') as lock:
+		fcntl.flock(lock, fcntl.LOCK_EX)
+		out = os.path.join(SMALL_FS, 'enes-%d' % os.getpid())
+		shutil.rmtree(out, ignore_errors=True)
+		os.makedirs(out)
+		try:
+			yield out
+		finally:
+			shutil.rmtree(out, ignore_errors=True)
+
+
+@posix_only
+def test_enes_counts_only_what_the_copy_will_write(tmp_path, small_dir):
+	# 3 MB copied onto 5 MiB leaves about 2.2 MB free. 9.86 summed the source's 3 MB against that and skipped the rerun (228).
+	(tmp_path / 'a').mkdir()
+	(tmp_path / 'a' / 'x').write_bytes(os.urandom(3000000))
+	out = small_dir + '/'
+	rc, output = run(['a/', '-d', out], tmp_path)
+	assert rc == 0, output[-2000:]
+	rc, output = run(['a/', '-d', out, '-enes'], tmp_path)
+	assert rc == 0 and 'Not enough space' not in output, output[-2000:]
+	# A rewrite in place of a file of the same size takes nothing more; beside it (-wb) it takes the whole file.
+	(tmp_path / 'a' / 'x').write_bytes(os.urandom(3000000))
+	rc, output = run(['a/', '-d', out, '-enes', '-wb'], tmp_path)
+	assert rc == 228 and 'Not enough space' in output, output[-2000:]
+	rc, output = run(['a/', '-d', out, '-enes'], tmp_path)
+	assert rc == 0 and 'Not enough space' not in output, output[-2000:]
+	with open(os.path.join(small_dir, 'x'), 'rb') as landed:
+		assert landed.read() == (tmp_path / 'a' / 'x').read_bytes()
+	# A new source that does not fit is still skipped.
+	(tmp_path / 'b').mkdir()
+	(tmp_path / 'b' / 'y').write_bytes(os.urandom(3000000))
+	rc, output = run(['b/', '-d', out, '-enes'], tmp_path)
+	assert rc == 228 and 'Not enough space' in output and not os.path.exists(os.path.join(small_dir, 'y')), output[-2000:]

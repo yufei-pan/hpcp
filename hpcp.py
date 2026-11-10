@@ -717,20 +717,22 @@ def cp_supports_sparse():
 		_SPARSE[:] = [pid, task.returncode == 0 and 'GNU' in '\n'.join(task.stdout)]
 	return _SPARSE[1]
 
+def _allocated_size(st):
+	"""The bytes a file takes on its disk, from its stat: its apparent size where the platform gives no other."""
+	# stat_result is a tuple: `'st_blocks' in st` would compare against field values, not names
+	if hasattr(st, 'st_rsize'):
+		return st.st_rsize
+	if hasattr(st, 'st_blocks'):
+		return st.st_blocks * 512
+	return st.st_size
+
 def get_file_size(path):
 	"""
 	Get the on-disk (allocated) size of a file, falling back to the apparent size.
 	Use os.path.getsize() where the apparent size is needed, e.g. for content comparison.
 	"""
 	try:
-		st = os.stat(path,follow_symlinks=False)
-		# stat_result is a tuple: `'st_blocks' in st` would compare against field values, not names
-		if hasattr(st, 'st_rsize'):
-			realSize = st.st_rsize
-		elif hasattr(st, 'st_blocks'):
-			realSize = st.st_blocks * 512
-		else:
-			realSize = st.st_size
+		realSize = _allocated_size(os.stat(path,follow_symlinks=False))
 	except Exception:
 		try:
 			realSize = os.path.getsize(path)
@@ -4953,6 +4955,53 @@ def copy_files_parallel(src_path, dest_paths, max_workers, full_hash=False, verb
 	print(f"Estimated size: {format_bytes(init_size)}B")
 	return copy_file_list_parallel(file_list=file_list,links=links,src_path=src_path, dest_paths=dest_paths, max_workers=max_workers, full_hash=full_hash, verbose=verbose,files_per_job=files_per_job,estimated_size = init_size)
 
+def _space_needed(file_list, src_path, dest_paths, max_workers):
+	"""The bytes a copy of file_list (src_path's files) into dest_paths will take, as -enes counts it: one lstat of each source
+	and of its landing at the first destination holding one. No landing: the source's allocated size; a regular file of the
+	same size whose time agrees (any time under -co): nothing, the copy skips it; one rewritten in place (a regular file with one
+	name, not under -wb): what the source takes beyond it; any other landing (a rewrite beside it, under -wb or for a file of
+	several names, or not a regular file): the source's allocated size. A source gone since the listing takes nothing."""
+	def look(chunk):
+		need = 0
+		for file in chunk:
+			try:
+				st = os.lstat(file)
+			except OSError:
+				continue
+			relative = os.path.relpath(file, src_path)
+			for dest_path in dest_paths:
+				try:
+					landing = os.lstat(dest_path if relative == '.' else os.path.join(dest_path, relative))
+					break
+				except OSError:
+					pass
+			else:
+				need += _allocated_size(st)
+				continue
+			regular = stat.S_ISREG(landing.st_mode)
+			if regular and landing.st_size == st.st_size and (CONTENT_ONLY or _mtimes_agree(st.st_mtime_ns, landing.st_mtime_ns)):
+				continue
+			if regular and landing.st_nlink == 1 and not WRITE_BESIDE:
+				need += max(0, _allocated_size(st) - _allocated_size(landing))
+			else:
+				need += _allocated_size(st)
+		return need
+	it = iter(file_list)
+	return sum(_looked_at(iter(lambda: list(itertools.islice(it, 1024)), []), look, max_workers))
+
+def _not_enough_space(file_list, src_path, dest_paths, listed_size, max_workers):
+	"""-enes: whether to skip src_path, whose copy into dest_paths does not fit their free space. Only where its listed size does
+	not fit is what the copy will write counted (_space_needed): a rerun that has little or nothing to copy goes on."""
+	free = sum(get_free_space_bytes(dest_path) for dest_path in dest_paths)
+	if free >= listed_size:
+		return False
+	need = _space_needed(file_list, src_path, dest_paths, max_workers)
+	if free >= need:
+		return False
+	eprint(f'Not enough space: free space on {dest_paths} too small, skipping copy {src_path}')
+	print(f'Free space: {format_bytes(free)}B, Required: {format_bytes(need)}B')
+	return True
+
 def copy_files_parallel_batch(jobs, max_workers, full_hash=False, verbose=False,files_per_job=1,parallel_file_listing=False,exclude=None,
 							  exit_not_enough_space=False,dropped=None):
 	newJobs = []
@@ -4970,15 +5019,10 @@ def copy_files_parallel_batch(jobs, max_workers, full_hash=False, verbose=False,
 		if exclude and is_excluded(src_path,exclude):
 			continue
 		file_list , links,init_size,folders  = get_file_list(src_path, max_workers=max_workers,exclude=exclude,parallel_file_listing=parallel_file_listing)
-		if exit_not_enough_space:
-			# check if there is enough space on all dest paths
-			dest_free_space = sum(get_free_space_bytes(dest_path) for dest_path in dest_paths)
-			if dest_free_space < init_size:
-				eprint(f'Not enough space: free space on {dest_paths} too small, skipping copy {src_path}')
-				print(f'Free space: {format_bytes(dest_free_space)}B, Required: {format_bytes(init_size)}B')
-				continue
 		if lost:
 			file_list, links = file_list - lost, links - lost
+		if exit_not_enough_space and _not_enough_space(file_list, src_path, dest_paths, init_size, max_workers):
+			continue
 		newJobs.append((src_path, dest_paths, file_list))
 		total_item_count += len(file_list)
 		total_size_count += init_size
@@ -5062,15 +5106,10 @@ def copy_files_serial_batch(jobs, full_hash=False, verbose=False,exclude=None,ex
 			total_files.append(src_path)
 			continue
 		file_list,links,init_size,_ = get_file_list(src_path,exclude=exclude,parallel_file_listing=False)
-		if exit_not_enough_space:
-			# check if there is enough space on all dest paths
-			dest_free_space = sum(get_free_space_bytes(dest_path) for dest_path in dest_paths)
-			if dest_free_space < init_size:
-				eprint(f'Not enough space: free space on {dest_paths} too small, skipping copy {src_path}')
-				print(f'Free space: {format_bytes(dest_free_space)}B, Required: {format_bytes(init_size)}B')
-				continue
 		if lost:
 			file_list, links = file_list - lost, links - lost
+		if exit_not_enough_space and _not_enough_space(file_list, src_path, dest_paths, init_size, 1):
+			continue
 		newJobs.append((src_path, dest_paths, file_list, set(links), init_size))
 		total_item_count += len(file_list)
 		total_size_count += init_size
@@ -13503,7 +13542,7 @@ def get_args(args = None):
 	parser.add_argument('-wb', '--write_beside', '--write-beside', action='store_true', help='Write every rewrite to a new file beside the old one, write it to disk and rename it over the old one once whole: a source that fails, a full disk or a stop leave the old copy as it was. The file gets a new inode (a per-file Lustre or GPFS layout, chattr flags and a project id are not kept; NFS readers holding it open may get ESTALE). Needs a new name in the file\'s directory and room for a second copy: without either the old copy stays (exit 190). By default a rewrite is written in place, and only a file with other names, one that cannot be opened for writing, or a FIFO, device or link goes beside.')
 	parser.add_argument('-rbw', '--read_before_write', '--read-before-write', action='store_true', help='Before a file at the destination is written in place, read its source to the end: a source that fails on read leaves the old copy as it is (exit 190). Costs a second read of each rewritten file. Does nothing with -wb, which writes nothing in place.')
 	parser.add_argument('-ctl','--command_timeout_limit', type=int, default=0, help='Set the command timeout limit in seconds for external commands ( ex. cp / dd ). Default is 0: no timeout.')
-	parser.add_argument('-enes','--exit_not_enough_space', action='store_true', help='Exit if there is not enough space on the destination instead of continuing (Note: Default is continue as in compressed fs copy can be down even if source is bigger than free space; without it, a copy that may not fit is tried, with a warning on ext2/3/4, XFS and tmpfs).')
+	parser.add_argument('-enes','--exit_not_enough_space', action='store_true', help='Skip a source whose copy does not fit the destinations\' free space, counting only what the copy will write (files already there and the same are not counted, a rewrite only what it adds); the run exits 228. Without it, a copy that may not fit is tried, with a warning on ext2/3/4, XFS and tmpfs (a compressing filesystem can fit more than its free space).')
 	try:
 		args = parser.parse_intermixed_args(args)
 	except Exception:

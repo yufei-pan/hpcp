@@ -33,6 +33,7 @@ Nothing needs doing to upgrade. What changed:
 - **`-d` is folded once:** `hpcp a/ -d l/../out/`, with `l` a link to `deep/inner`, copies into `out/` as before and no longer also makes an empty `deep/out/` (one step made the directory by the path as given, where the kernel follows `l` before `..`). A link before `..` in `-d` is not followed: the path is read as written.
 - **A `-siff` apply reads its lists' names as bytes:** with LANG unset (Python 3.6 on EL7, cron), an apply stopped at the first non-ASCII name with a UnicodeEncodeError; it reads the change list, manifest and disk table as the filesystem's bytes now, so a patch made under any locale applies under any other.
 - **Hints give commands a shell runs as pasted:** the commands a hint gives (the replaced-link Note's `hpcp SRC/ -d DIR/`, the `-ncd` refusal's `-d DIR/`, and `rm LINK` / `chmod u+rx DIR` for a place that cannot be searched) quote each path for a POSIX shell: as is when safe, in single quotes, or as `$'...'` with octal bytes for a control character or a name the locale cannot show (bash, ksh and zsh read that form; dash 0.5.12 does not). 9.86 printed them as Python holds them (`d\udcc3\udca9`), which no shell reads back, and a space split the command. Messages that only name a path are unchanged.
+- **`-enes` counts only what the copy will write:** where a source's listed size does not fit the destinations' free space, hpcp now counts what the copy will write before it skips the source, with one `lstat` of each file and of its landing (at the first destination holding one): nothing for a landing of the same size and time (any time under `-co`), which the copy skips; what the source takes beyond the old copy for a rewrite in place; and the whole file for a new file, or for a rewrite beside the old copy (`-wb`, or a landing with several names). 9.86 compared the listed size, so a rerun with nothing to copy onto a nearly full destination skipped the source (`Not enough space: ...`, exit 228; a 3 MB file on a 5 MiB tmpfs); it now exits 0. A source whose listed size fits is not looked at, as before, and `Required:` gives the counted size.
 - **Error lines start their own line in a log:** with stdout and stderr in one file (`> log 2>&1`), an error a worker printed (`Copy failed: ...`) could follow the progress bar on the bar's line, so `grep -c '^Copy failed'` counted 9 to 11 of 12 failures in 9.86; and on Python 3.6 to 3.8, which hold a redirected stderr's output until a flush, an error the main process printed (under `-s`, for instance) could land later, on a bar frame's line. An error line that may land on the bar's line now starts with a newline, or on a terminal (also through `| tee`) clears the bar's line first (`ESC[2K` and a carriage return); with stderr in a file of its own nothing is added; and each error line is written and flushed at once. 12 files that cannot be read now give 12 lines starting with `Copy failed` in every run (6 runs each, with `-j 4` and with `-s`, on Python 3.6 and 3.14). The text of each error is unchanged.
 - **Known: a stopped run waits for a worker whose file operation never returns** (a write or fsync to a dead hard-mounted NFS server, a disk in an uninterruptible wait): hpcp prints `Waiting for N worker(s) still finishing a file (pids ...)`, and Ctrl-\ ends it at once, which can leave that worker's temporary or torn file (see [docs/limitations.md](docs/limitations.md)).
 
@@ -347,8 +348,10 @@ options:
   -s, --single_thread   Use serial processing
   -j, -m, -t, --max_workers MAX_WORKERS
                         Max workers for parallel processing. Default is 1 *
-                        CPU count. Use negative numbers to indicate {n} * CPU
-                        count, 0 means 1/2 CPU count.
+                        CPU count, and 4 * CPU count for a move (-rm, -rf),
+                        whose workers wait on their fsyncs. Use negative
+                        numbers to indicate {n} * CPU count, 0 means 1/2 CPU
+                        count.
   -b, --batch           Batch mode, process all files in one go
   -nb, --no_batch, --sequential
                         Do not use batch mode
@@ -516,10 +519,12 @@ options:
                         Set the command timeout limit in seconds for external
                         commands ( ex. cp / dd ). Default is 0: no timeout.
   -enes, --exit_not_enough_space
-                        Exit if there is not enough space on the destination
-                        instead of continuing (Note: Default is continue as in
-                        compressed fs copy can be down even if source is
-                        bigger than free space; without it, a copy that may
-                        not fit is tried, with a warning on ext2/3/4, XFS and
-                        tmpfs).
+                        Skip a source whose copy does not fit the
+                        destinations' free space, counting only what the copy
+                        will write (files already there and the same are not
+                        counted, a rewrite only what it adds); the run exits
+                        228. Without it, a copy that may not fit is tried,
+                        with a warning on ext2/3/4, XFS and tmpfs (a
+                        compressing filesystem can fit more than its free
+                        space).
 ```
