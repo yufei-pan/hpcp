@@ -3817,9 +3817,10 @@ def _cp_once(src_path, dest_path, cp_flags, sparse, space=None):
 	"""One attempt at copying src_path to dest_path (copy_file); the size copied. Raises _Refused for what this run will not
 	write, _KeptOld for a rewrite that kept what is there. space: (free, need) when the room is short (_space_warning). By
 	what is at the landing (_landing_of): nothing, or a FIFO or device the operator named: cp writes the name (_cp_to). A
-	regular file with one name that opens for writing: in place, through the held file (_cp_held). Anything else (other
-	names, not writable, a running program; a FIFO, socket, device or link below a destination, never opened), and every
-	rewrite under -wb: beside it, renamed over it once whole (_cp_beside)."""
+	regular file with one name that opens for writing, of a regular source: in place, through the held file (_cp_held).
+	Anything else (other names, not writable, a running program, a source cp makes anew; a FIFO, socket, device or link below
+	a destination, never opened), anything the open finds changed since the look, and every rewrite under -wb: beside it,
+	renamed over it once whole (_cp_beside); never to cp by name."""
 	target, st, named = _landing_of(dest_path)
 	if named and st is None and os.path.islink(dest_path):
 		# cp writes through no dangling link, nor does hpcp: a planted one would have it make directories and a file anywhere.
@@ -3828,38 +3829,44 @@ def _cp_once(src_path, dest_path, cp_flags, sparse, space=None):
 	command = ["cp", cp_flags] + (["--sparse=always"] if sparse and cp_supports_sparse() else [])
 	held = _claim_device(target, st, named, src_path)
 	try:
-		if _written_beside(st, named) and not WRITE_BESIDE and stat.S_ISREG(st.st_mode) and st.st_nlink == 1:
+		if not _written_beside(st, named):
+			return _cp_to(command, src_path, target, space if st is None else None)
+		if not WRITE_BESIDE and stat.S_ISREG(st.st_mode) and st.st_nlink == 1 and _regular_source(src_path):
 			try:
 				fd = os.open(target, _LANDING_FLAGS)
 			except FileNotFoundError:
-				st = None  # gone since the lstat: a first copy
+				return _cp_to(command, src_path, target, space)  # gone since the lstat: a first copy
 			except OSError as e:
 				return _cp_beside(command, src_path, target, st, f'it cannot be opened for writing ({_why(e)})', space)
-			else:
-				try:
-					st = os.fstat(fd)  # what the descriptor holds decides from here on
-					if stat.S_ISREG(st.st_mode) and st.st_nlink == 1:
-						return _cp_held(command, src_path, target, fd, st, space, target != dest_path)
-				finally:
-					os.close(fd)
-		if not _written_beside(st, named):
-			return _cp_to(command, src_path, target, space if st is None else None)
+			try:
+				st = os.fstat(fd)  # what the descriptor holds decides from here on
+				if stat.S_ISREG(st.st_mode) and st.st_nlink == 1:
+					return _cp_held(command, src_path, target, fd, st, space, target != dest_path)
+			finally:
+				os.close(fd)
+			# Changed since the lstat (another name, a FIFO someone holds open): beside, never cp by name.
 		# Why it goes beside: the start of the reason a failure gives.
-		why = '-wb writes beside it' if WRITE_BESIDE else 'it has other names, which a write in place would change' if stat.S_ISREG(st.st_mode) else None
+		why = ('-wb writes beside it' if WRITE_BESIDE else None if not stat.S_ISREG(st.st_mode) else
+			'it has other names, which a write in place would change' if st.st_nlink > 1 else
+			f'{src_path} is no regular file, which cp makes anew')
 		return _cp_beside(command, src_path, target, st, why, space)
 	finally:
 		if held is not None:
 			os.close(held)
 
+def _regular_source(src_path):
+	"""False for a source that cp -a makes anew (a FIFO, socket or device node: it unlinks what is at the landing, and cannot
+	unlink a held file's /proc name); a source that is gone is cp's to answer."""
+	try:
+		return stat.S_ISREG(os.lstat(src_path).st_mode)
+	except OSError:
+		return True
+
 def _cp_flags(src_path):
 	"""How cp copies src_path. Under -co cp -f reads what it is given and writes through what is there, so only a regular file
 	goes that way: cp -a makes a new node for anything else and never opens it, so a device is not read to its end and a FIFO
 	does not wait for a writer. A source that is gone is cp's to answer."""
-	try:
-		regular = stat.S_ISREG(os.lstat(src_path).st_mode)
-	except OSError:
-		regular = True
-	return "-f" if CONTENT_ONLY and regular else "-af"
+	return "-f" if CONTENT_ONLY and _regular_source(src_path) else "-af"
 
 def _can_open(path):
 	"""False when cp could not read the regular file path. Asked by opening, with the ids cp runs with: access() answers for
