@@ -378,6 +378,83 @@ def test_a_patch_applies_under_a_latin_1_locale(tmp_path):
 		assert f.read() == b'content'
 
 
+def _as_9_86_wrote_it(vol, encoding):
+	"""Turn the patch in vol, made by this hpcp under a locale of that filesystem encoding, into the one 9.86 made there: its
+	change list as UTF-8 whatever the locale, and 9.86 as the maker."""
+	diff = os.path.join(str(vol), '.hpcp_diff')
+	with open(os.path.join(diff, 'changes.tsv'), 'rb') as f:
+		data = f.read()
+	with open(os.path.join(diff, 'changes.tsv'), 'wb') as f:
+		f.write(data.decode(encoding, 'surrogateescape').encode('utf-8', 'surrogateescape'))
+	with open(os.path.join(diff, 'manifest'), 'rb') as f:
+		lines = f.read().split(b'\n')
+	assert any(line.startswith(b'hpcp_version\t') for line in lines)
+	with open(os.path.join(diff, 'manifest'), 'wb') as f:
+		f.write(b'\n'.join(b'hpcp_version\t9.86' if line.startswith(b'hpcp_version\t') else line for line in lines))
+
+
+@posix_only
+@pytest.mark.parametrize('payload', [True, False], ids=['with-payload', 'delete-only'])
+def test_a_patch_9_86_made_under_a_latin_1_locale_still_applies_there(tmp_path, payload):
+	# 9.86 wrote its change list as UTF-8 under every locale and read it back the same way; 9.87's reader took a 9.86 list's
+	# c3 a9 for the Latin-1 name 'cafÃ©': a payload was 'missing' (refused), and a deletion with no payload row was skipped as
+	# already done, the file left there with exit 0 (delete-only: `skipped 1`, `failed 0`).
+	locale_name = _latin_1_locale()
+	if locale_name is None:
+		pytest.skip('no Latin-1 locale installed')
+	env = dict(os.environ, LC_ALL=locale_name, LANG=locale_name, PYTHONUTF8='0', PYTHONCOERCECLOCALE='0')
+	new, base, vol, target = (tmp_path / part for part in ('new', 'base', 'vol', 'target'))
+	for directory in (new, base, vol, target):
+		directory.mkdir()
+	def put(root, name, data):
+		with open(os.path.join(os.fsencode(str(root)), name), 'wb') as f:
+			f.write(data)
+		os.utime(os.path.join(os.fsencode(str(root)), name), ns=(1700000000 * 10 ** 9, 1700000000 * 10 ** 9))
+	if payload:
+		put(new, b'caf\xe9', b'content')
+	for root in (new, base, target):
+		put(root, b'keep', b'kept')
+	for root in (base, target):
+		put(root, b'del\xe9', b'to delete')
+	script = tmp_path / 'patch.py'
+	script.write_text(_PATCH % {'root': os.path.dirname(HPCP)})
+	def step(what):
+		done = subprocess.run([sys.executable, str(script), what, str(new), str(base), str(vol), str(target)],
+			stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env, timeout=120)
+		assert done.returncode == 0, done.stdout.decode(errors='replace')[-3000:]
+		return done.stdout.decode(errors='replace')
+	step('make')
+	_as_9_86_wrote_it(vol, 'latin-1')
+	assert 'failed 0' in step('apply')
+	assert sorted(os.listdir(os.fsencode(str(target)))) == ([b'caf\xe9'] if payload else []) + [b'keep']
+	if payload:
+		with open(os.path.join(os.fsencode(str(target)), b'caf\xe9'), 'rb') as f:
+			assert f.read() == b'content'
+
+
+@posix_only
+def test_an_old_change_list_is_read_as_9_86_read_it_and_by_its_bytes_where_the_locale_cannot_spell_it(tmp_path, monkeypatch):
+	import hpcp
+	changes = str(tmp_path / 'changes.tsv')
+	with open(changes, 'wb') as f:
+		f.write(b'#hpcp-changes\t1\n#op\tpath\told\tnew\nD\tdel\xc3\xa9\tl:t\t-\n')
+	assert hpcp._wrote_utf8_names({'hpcp_version': '9.86'}) and hpcp._wrote_utf8_names({'hpcp_version': '9.9'})
+	assert not hpcp._wrote_utf8_names({'hpcp_version': '9.87'}) and not hpcp._wrote_utf8_names({'hpcp_version': '10.01'})
+	assert not hpcp._wrote_utf8_names({})
+	# Latin-1: the name 9.86 wrote and applied there, del<e9>, as a listing spells it
+	monkeypatch.setattr(sys, 'getfilesystemencoding', lambda: 'latin-1')
+	monkeypatch.setattr(sys, 'getfilesystemencodeerrors', lambda: 'surrogateescape')
+	monkeypatch.setattr(os, 'fsencode', lambda name: name.encode('latin-1', 'surrogateescape'))
+	monkeypatch.setattr(os, 'fsdecode', lambda name: name.decode('latin-1', 'surrogateescape'))
+	assert [row.path for row in hpcp.read_changes(changes, True)] == ['del\xe9']
+	assert [row.path for row in hpcp.read_changes(changes)] == ['del\xc3\xa9']
+	# ASCII (LANG unset on Python 3.6), where 9.86 stopped with a UnicodeEncodeError: the line's own bytes (entry 9)
+	monkeypatch.setattr(sys, 'getfilesystemencoding', lambda: 'ascii')
+	monkeypatch.setattr(os, 'fsencode', lambda name: name.encode('ascii', 'surrogateescape'))
+	monkeypatch.setattr(os, 'fsdecode', lambda name: name.decode('ascii', 'surrogateescape'))
+	assert [row.path for row in hpcp.read_changes(changes, True)] == ['del\udcc3\udca9']
+
+
 @posix_only
 @not_root
 def test_a_free_space_question_below_a_directory_the_runner_cannot_search_is_answered(tmp_path):

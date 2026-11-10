@@ -273,3 +273,8 @@ entries go last, in the same commit as the change:
 - Original design was wrong because: failure was two things, a printed line and a recorded fact, and the catch-all handler did only the first.
 - Lesson: every way out of a per-file step records the failure for that file in the one place the later checks read (a catch-all handler too), so no later check reports on a file that never got its answer.
 
+## 2026-11-10 A reader keeps reading what earlier releases wrote
+- Changed: a change list of a patch whose manifest names an hpcp before 9.87 (`hpcp_version`) is read as that release read it: its bytes as UTF-8, spelled by this locale (`_utf8_name_line`); where this locale cannot spell that (LANG unset on Python 3.6), the line's own bytes. A list 9.87 wrote is read with the filesystem's encoding, as it was written.
+- Why we had to change: 9.87 wrote each name's own bytes and read every list that way. A patch 9.86 made under a Latin-1 locale holds `c3 a9` for the name `e9`; 9.87 read it as two characters, so a row with a payload was refused (`Incomplete patch`), and a deletion was skipped as already done: `skipped 1`, exit 0, the file left on the target, where 9.86 deleted it. Found by the 9.87 final review on CentOS 7 (`en_US.iso88591`).
+- Original design was wrong because: it changed the writer and the reader together and tested only pairs made and applied by one build; patches are kept (increments of a backup), so the reader meets files of every earlier writer.
+- Lesson: when a file format's writer changes, the reader decides by who wrote the file (a version the file already carries), and reads each as its writer wrote it; test a file made by the release before against the new reader, under a locale that is neither UTF-8 nor ASCII.

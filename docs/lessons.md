@@ -51,3 +51,4 @@ same commit as the change. Keep this file under 20 KB: at the cap, merge lines b
 - **2026-11-10 An empty argument is a question, not a path**: `normpath('')` is `.`, so `-d "$UNSET"` spilled a source into the working directory without the question 9.86 asked; a path normaliser skips the empty value.
 - **2026-11-10 A crash is the failure of the source it crashed on**: a catch-all handler that only printed left a later check to report the source as copied but at none of its landings (213); record the failure for that file in the one place later checks read.
 
+- **2026-11-10 A reader keeps reading what earlier releases wrote**: 9.87 changed how a patch's change list spells names and read every list the new way, so a 9.86 patch under Latin-1 was refused, or its deletions skipped with exit 0; when a writer changes, the reader asks who wrote the file (the manifest's `hpcp_version`) and reads each as its writer wrote it.

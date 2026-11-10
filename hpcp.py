@@ -6327,6 +6327,25 @@ def _open_names(path, mode):
 	no file's. disk.tsv holds tool output (labels, GPT names, which multiCMD decodes as UTF-8) and stays UTF-8."""
 	return open(path, mode, encoding=sys.getfilesystemencoding(), errors=sys.getfilesystemencodeerrors(), newline='\n')
 
+def _wrote_utf8_names(meta):
+	"""Whether the hpcp that made a patch (its manifest's hpcp_version) wrote its change list as UTF-8 whatever the locale:
+	every one before 9.87. A manifest without a version it can read is taken as written now."""
+	try:
+		return tuple(int(part) for part in str(meta.get('hpcp_version', '')).split('.')[:2]) < (9, 87)
+	except ValueError:
+		return False
+
+def _utf8_name_line(line):
+	"""A line of a change list hpcp wrote before 9.87 (UTF-8 whatever the locale), given as its bytes read by this locale
+	(_open_names): read as 9.86 read it (UTF-8, then spelled by this locale: under Latin-1, the name 9.86 applied), and where
+	this locale cannot spell that (LANG unset, where 9.86 stopped with a UnicodeEncodeError), as it stands: the line's own
+	bytes."""
+	try:
+		# through the name's bytes and back: the spelling a listing gives that name here
+		return os.fsdecode(os.fsencode(os.fsencode(line).decode('utf-8', 'surrogateescape')))
+	except UnicodeError:
+		return line
+
 def write_changes(target, rows):
 	"""Write rows to target in changes.tsv format (also the -dfl output format)."""
 	with _open_names(target, 'w') as f:
@@ -6335,8 +6354,9 @@ def write_changes(target, rows):
 		for row in sort_change_rows(rows):
 			f.write(f'{row.op}\t{_escape_field(row.path)}\t{row.old}\t{row.new}\n')
 
-def read_changes(source):
-	"""Read a changes.tsv file into ChangeRows. Raises RuntimeError('Patch format error: ...')."""
+def read_changes(source, utf8_names=False):
+	"""Read a changes.tsv file into ChangeRows. Raises RuntimeError('Patch format error: ...'). utf8_names: written by an hpcp
+	before 9.87 (_wrote_utf8_names), whose names are read as it read them (_utf8_name_line)."""
 	rows = []
 	with _open_names(source, 'r') as f:
 		header = f.readline().rstrip('\n').split('\t')
@@ -6352,6 +6372,8 @@ def read_changes(source):
 			line = line.rstrip('\n')
 			if not line or line.startswith('#'):
 				continue
+			if utf8_names:
+				line = _utf8_name_line(line)
 			fields = line.split('\t')
 			if len(fields) != 4 or fields[0] not in _OP_ORDER:
 				raise RuntimeError(f'Patch format error: {source} line {line_number} is malformed')
@@ -7374,7 +7396,7 @@ def _load_patch(volume_roots, volume_names=None):
 	meta = ordered[0][2]
 	sections = []
 	for name, payload_dir, changes_file in meta['sections']:
-		rows = read_changes(os.path.join(ordered[0][0], DIFF_DIR_NAME, changes_file))
+		rows = read_changes(os.path.join(ordered[0][0], DIFF_DIR_NAME, changes_file), _wrote_utf8_names(meta))
 		_validate_patch_rows(rows)
 		sections.append((name, payload_dir, rows))
 	return meta, sections, [entry[0] for entry in ordered]
