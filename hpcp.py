@@ -14180,9 +14180,15 @@ def _end_now(rc):
 		# approved limitations leave one 'running until kill_all() or the program's exit stops it').
 		multiCMD.kill_all()
 	with contextlib.suppress(Exception):
-		# Finalizers of exit priority 0 and above: the semaphores' unlink and the queues' close, neither of which waits on a
-		# thread (a queue's join is -5, not run).
-		multiprocessing.util._run_finalizers(0)
+		# The finalizers of exit priority 0: the semaphores' unlink. Not a queue's close (10): a pool's manager thread may be
+		# closing that queue itself (from 3.9 it is told to end at the pool's exit), and the two raced to close one pipe (EBADF,
+		# a traceback from the queue's feeder thread: 6 of 389 stops with a stuck worker on 3.14, 0 of 240 without the close).
+		# os._exit closes every descriptor anyway.
+		registry = multiprocessing.util._finalizer_registry
+		for key in sorted((key for key in list(registry) if key[0] == 0), reverse=True):
+			finalizer = registry.get(key)
+			if finalizer is not None:
+				finalizer()
 	with contextlib.suppress(Exception):
 		tempdir = multiprocessing.current_process()._config.get('tempdir')
 		if tempdir:
