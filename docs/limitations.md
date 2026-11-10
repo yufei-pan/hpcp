@@ -34,14 +34,6 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - **Revisit when:** someone hits it.
 - **Approved:** 2026-11-05, the user chose "Known limitation (Recommended)".
 
-### A rerun scans the destination directories one by one
-- **Kind:** deferred.
-- **What the operator sees:** a copy onto an existing tree reads each directory it lands in, on one worker, before the first file is copied: about 1 us per file on a local disk, longer on network storage.
-- **Why:** correct and bounded as it is; a parallel scan is its own change.
-- **Measured (9.85, 2026-11-08):** 9.85 has no serial scan (`_link_targets` is gone; the directory checks run in the workers), but a rerun is not faster for it: 100,000 files in 10,000 directories, nothing to copy, NFSv4.1 loopback `actimeo=0` on EL7 (2 vCPUs): 9.84 1764, 2301, 2212 s, 9.85 1871, 1878, 3044 s. On a local disk (Docker, a loaded host): 9.84 9.3 to 19.8 s, 9.85 6.5 to 15.7 s. The time goes to the per-file checks over NFS (about 60 to 80 GETATTRs per file rewritten, 9.84 as 9.85), not to a scan.
-- **Plan (9.87):** cut the per-file checks that ask again what is known. One is new in 9.85: copy_file's look-only pass through the door calls `_landing_of(dest)` only for its path, an lstat per destination per file, a round trip each on NFS `actimeo=0`; the path needs no lstat there.
-- **Revisit when:** 9.87, with the copy check's second pass (stat only the entries met twice).
-
 ### Rerunning an overlapping form is refused
 - **Kind:** known limitation.
 - **What the operator sees:** `hpcp p/q/ -d p/` and `hpcp a out/a/s -d out/` copy on the first run and exit 213 on every run after it, because the first run's output has become a source file. Nothing is lost.
@@ -128,12 +120,11 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 
 ### The copy check stats each landing by name
 - **Kind:** deferred (9.87).
-- **What the operator sees:** the check at the end of a copy, and the move's before its removal, `lstat`s each landing on its own: on a cached local disk about 0.3 s per 100,000 files idle, and more under load (a cached 100,000-file rerun at load 110 took 1.32-1.73 s in 9.84 and 1.81-2.01 s in 9.85), and on NFS mounted `actimeo=0` a round trip each, about 0.3 ms a file in 4 threads.
-- **Why:** correct as it is; reading each landing directory once is its own change.
-- **Plan:** read each landing directory once (`scandir`), take each name's file from the listing where the listing gives one, and `lstat` only the names missing from it (an 8.3 alias is not listed under its short name) or where the listing's numbers cannot be trusted (vfat makes up a number for an uncached inode, FUSE exFAT one for each spelling). And when two fingerprints meet, the second pass now stats every landing again (about 0.45 s per 100,000 files, paid by any merge whose sources share a file, or a source named twice): keep each landing's entry index beside its fingerprint, so it stats only the entries met twice.
-- **Revisit when:** 9.87.
-- **Noted:** 2026-11-08, the user's standing rule that deferrals are noted, not asked.
-
+- **What the operator sees:** the check at the end of a copy, and the move's before its removal, `lstat`s each landing by its path: on a cached local disk about 0.3 s per 100,000 files idle, and more under load (a cached 100,000-file rerun at load 110 took 1.32-1.73 s in 9.84 and 1.81-2.01 s in 9.85), and on NFS mounted `actimeo=0` a round trip for each part of each path: 900,000 GETATTRs for 100,000 landings, 21.5 to 114.8 s in 4 threads on an EL8 VM (the host busy). Since 9.87 a second look, where two landings may be one file, is taken only for the entries whose fingerprint met another's.
+- **Why:** correct as it is. Reading each landing directory once (`scandir`) gives no size, time or link count, and made-up inode numbers on vfat and FUSE exFAT. An `lstat` relative to each landing directory, opened once (9.87's first build), cut NFS to 360,000 GETATTRs and 9.2 to 53.8 s, but was slower on a local disk (0.66 to 1.03 s per 100,000 landings against 9.86's 0.57 to 0.66 s, Docker at load 336), so it missed the plan's bar (faster on NFS, not slower locally) and was dropped.
+- **Plan:** none yet; the main session asks the user (the 9.87 plan: a missed bar is a question of a known limitation). One option measured here: the directory-relative look on network filesystems only.
+- **Revisit when:** 9.87, with the user's answer.
+- **Noted:** 2026-11-08, the user's standing rule that deferrals are noted, not asked; measured and narrowed 2026-11-10 (9.87's R3).
 ### On Python 3.6 an early stop can rarely hang the run in a pool's submit
 - **Kind:** deferred (9.88).
 - **What the operator sees:** on Python 3.6 (EL7, EL8), a Ctrl-C or SIGTERM in the first second of a copy, while its pool takes its first jobs, can leave hpcp waiting for good: every worker has ended, and a second Ctrl-C prints nothing (not even `Stopping: cleaning up first`) and SIGTERM does nothing; Ctrl-\ or `kill -9` ends it. About 3 in 2,000 early Ctrl-Cs in the 9.87 review's probe (9.86: 4 in 716). Other Pythons are not affected.
