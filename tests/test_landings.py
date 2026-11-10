@@ -1,7 +1,8 @@
-"""9.85: nothing at a landing is written into or followed. A file goes to a new name beside its landing and is renamed
-over it once whole; what is there (an old copy, a FIFO, a device node, a link) is replaced, never opened or written
-through; only what the operator named (-d) is followed. One fallback writes in place, and only a regular file whose
-source just read whole. A stop runs the cleanup, so no temporary file is left."""
+"""What is at a landing. 9.86: a regular file with one name that opens for writing is written in place by cp, through the
+file hpcp holds open (on Linux cp gets /proc/PID/fd/N), so its inode stays and a link put at its name is never written
+through; anything else there (a file with other names, one that does not open for writing, a FIFO, device node or link) is
+replaced by a new file renamed over it once whole, never opened or written through, as every rewrite is under -wb. Only
+what the operator named (-d) is followed. A stop runs the cleanup."""
 import errno
 import os
 import signal
@@ -71,96 +72,160 @@ def read(path):
 		return f.read().decode()
 
 
+def read_bytes(path):
+	with open(str(path), 'rb') as f:
+		return f.read()
+
+
 def temporaries(root):
 	"""Every .hpcp_tmp_ name below root."""
 	return [os.path.join(path, name) for path, dirs, names in os.walk(str(root)) for name in names + dirs if name.startswith('.hpcp_tmp_')]
 
 
-# ---- entry 1: a source that fails on read keeps the old copy ----
+# ---- entry 1: a source that fails part way; what goes beside, and what in place ----
 
 def _cp_writing_a_part(hpcp_mod, monkeypatch):
-	"""Every cp writes a part to the name it is given and fails, as a source failing on read in the middle does."""
+	"""Every cp writes a part to the name it is given and fails, as a source failing on read in the middle does. A rewrite in
+	place gives cp /proc/PID/fd/N, which opening writes the held file."""
+	calls = []
 	def cp(command, *args, **kwargs):
+		calls.append(command[-1])
 		with open(command[-1], 'w') as target:
 			target.write('par')
 		raise RuntimeError('cp: error reading: Input/output error')
 	monkeypatch.setattr(hpcp_mod, 'run_command_in_multicmd_with_path_check', cp)
+	return calls
+
+
+def _source_fails_on_read(hpcp_mod, monkeypatch):
+	"""-rbw's read of the source fails (EIO), as a bad sector does."""
+	read = []
+	def fails(path):
+		read.append(path)
+		return OSError(errno.EIO, os.strerror(errno.EIO), path)
+	monkeypatch.setattr(hpcp_mod, '_read_through', fails)
+	return read
 
 
 @posix_only
+@pytest.mark.parametrize('mode', ['default', 'rbw', 'wb'])
 @pytest.mark.parametrize('content_only', [False, True], ids=['plain', 'content-only'])
-def test_a_source_that_fails_on_read_keeps_the_old_copy_and_its_inode(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch, content_only):
-	# 9.84: cp truncated the old copy, and its part was removed: the last good copy gone, exit 190.
+def test_a_source_that_fails_on_read_during_a_rewrite(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch, content_only, mode):
+	# Default: written in place as in 9.84, so the old copy, truncated first, goes with the torn file (the approved known
+	# limitation), 190, the source kept. -rbw reads the source first and keeps the old copy and its inode; -wb writes beside
+	# it and keeps it, with no temporary file left.
 	write(tmp_path / 'a/x', 'the new and longer content')
 	write(tmp_path / 'out/x', 'the last good copy')
 	inode = os.stat(str(tmp_path / 'out/x')).st_ino
 	monkeypatch.setattr(hpcp_mod, 'CONTENT_ONLY', content_only)
+	monkeypatch.setattr(hpcp_mod, 'READ_FIRST', mode == 'rbw')
+	monkeypatch.setattr(hpcp_mod, 'WRITE_BESIDE', mode == 'wb')
 	monkeypatch.setattr(hpcp_mod, 'NAMED_DESTS', frozenset([str(tmp_path / 'out')]))
-	# The source reads whole when asked first (a source that fails only on the second read), and the temporary file failed
-	# partway: in place only when the old copy is at least the source's size, which it is not.
-	_cp_writing_a_part(hpcp_mod, monkeypatch)
+	calls = _cp_writing_a_part(hpcp_mod, monkeypatch)
+	reads = _source_fails_on_read(hpcp_mod, monkeypatch) if mode == 'rbw' else None
 	assert hpcp_mod.copy_file(str(tmp_path / 'a/x'), [str(tmp_path / 'out/x')])[0] == 0
-	assert read(tmp_path / 'out/x') == 'the last good copy' and os.stat(str(tmp_path / 'out/x')).st_ino == inode
-	assert temporaries(tmp_path / 'out') == []
-	assert any(error.startswith('Copy failed') and 'leaving' in error for error in hpcp_mod.ERRORS)
+	assert read_bytes(tmp_path / 'a/x') == b'the new and longer content'
+	failed = [error for error in hpcp_mod.ERRORS if error.startswith('Copy failed')]
+	assert len(failed) == 1 and hpcp_mod.get_rc_from_error() == 190
+	if mode == 'default':
+		assert not os.path.lexists(str(tmp_path / 'out/x')) and temporaries(tmp_path / 'out') == []
+		assert 'Input/output error' in failed[0] and '/proc/' not in failed[0], failed
+	else:
+		assert read(tmp_path / 'out/x') == 'the last good copy' and os.stat(str(tmp_path / 'out/x')).st_ino == inode
+		assert temporaries(tmp_path / 'out') == [] and 'leaving ' in failed[0], failed
+	if mode == 'rbw':
+		# Read before cp ran, once per attempt: cp never ran, so nothing was truncated.
+		assert calls == [] and reads and set(reads) == {str(tmp_path / 'a/x')} and 'failed on read (Input/output error)' in failed[0]
 
 
 @posix_only
 @not_root
 @pytest.mark.skipif(not os.path.exists('/proc/self/mem'), reason='/proc/self/mem: a file that opens and fails on read')
+@pytest.mark.parametrize('mode', [[], ['-rbw'], ['-wb']], ids=['default', 'rbw', 'wb'])
 @pytest.mark.parametrize('flags', [[], ['-co']], ids=['plain', 'content-only'])
-def test_a_source_that_fails_on_read_in_a_directory_that_takes_no_new_name_keeps_the_old_copy(tmp_path, flags):
-	# The review's A3: out 0555 with a writable out/mem. 9.84 (191) and v1's fallback left out/mem at 0 bytes.
+def test_a_source_that_fails_on_read_in_a_directory_that_takes_no_new_name(tmp_path, flags, mode):
+	# The review's A3: out 0555 with a writable out/mem. Default: cp truncated it and failed, and the directory keeps the
+	# name, so out/mem is left empty (9.84's loss, 190). -rbw reads first and keeps it; -wb cannot make a new name there and
+	# keeps it, saying that without -wb it would be written in place.
 	write(tmp_path / 'out/mem', 'the last good copy')
 	os.chmod(str(tmp_path / 'out/mem'), 0o666)
 	os.chmod(str(tmp_path / 'out'), 0o555)
 	try:
-		rc, output = run(['/proc/self/mem', '-d', 'out/'] + flags, tmp_path)
+		rc, output = run(['/proc/self/mem', '-d', 'out/'] + flags + mode, tmp_path)
 	finally:
 		os.chmod(str(tmp_path / 'out'), 0o755)
-	assert rc == 190 and read(tmp_path / 'out/mem') == 'the last good copy', output[-2000:]
-	assert b'leaving ' in output and b'failed on read' in output
+	assert rc == 190, output[-2000:]
+	if not mode:
+		assert read(tmp_path / 'out/mem') == '' and b'/proc/self/mem' in output, output[-2000:]
+		return
+	assert read(tmp_path / 'out/mem') == 'the last good copy' and b'leaving ' in output, output[-2000:]
+	if mode == ['-rbw']:
+		assert b'failed on read' in output
+	else:
+		assert b'-wb writes beside it; ' in output and b'; without -wb it would be written in place' in output, output[-2000:]
 
 
 @posix_only
 @not_root
 @pytest.mark.parametrize('flags', [[], ['-co']], ids=['plain', 'content-only'])
-def test_a_growing_rewrite_in_a_directory_that_takes_no_new_name_goes_in_place(tmp_path, flags):
-	# Rule 3's clause: no temporary file could be made, nothing was written, and the free space holds the source.
+def test_a_growing_rewrite_in_a_directory_that_takes_no_new_name(tmp_path, flags):
+	# Written in place, it needs no new name: exit 0. -wb needs one: 190, the old copy kept (the approved "beside route never
+	# falls back").
 	write(tmp_path / 'a/x', 'a longer new content')
 	write(tmp_path / 'out/x', 'old')
 	os.chmod(str(tmp_path / 'out/x'), 0o666)
+	inode = os.stat(str(tmp_path / 'out/x')).st_ino
 	os.chmod(str(tmp_path / 'out'), 0o555)
 	try:
 		rc, output = run(['a/x', '-d', 'out/'] + flags, tmp_path)
+		assert rc == 0 and read(tmp_path / 'out/x') == 'a longer new content', output[-2000:]
+		assert os.stat(str(tmp_path / 'out/x')).st_ino == inode
+		write(tmp_path / 'a/x', 'an even longer new content')
+		rc, output = run(['a/x', '-d', 'out/', '-wb'] + flags, tmp_path)
 	finally:
 		os.chmod(str(tmp_path / 'out'), 0o755)
-	assert rc == 0 and read(tmp_path / 'out/x') == 'a longer new content', output[-2000:]
+	assert rc == 190 and read(tmp_path / 'out/x') == 'a longer new content', output[-2000:]
+	assert b'; without -wb it would be written in place' in output
 
 
 @posix_only
 @pytest.mark.skipif(not hasattr(os, 'link'), reason='hard links')
-def test_a_landing_with_other_names_is_never_written_in_place(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
-	# Beside failed: a write in place would change every name of it. Both names keep the old content, 190.
+@pytest.mark.parametrize('content_only', [False, True], ids=['plain', 'content-only'])
+def test_a_landing_with_other_names_is_never_written_in_place(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch, content_only):
+	# A write in place would change every name of it: it goes beside, and the other names keep the old content. Beside
+	# failed: both names keep the old content, 190, and the message says why it went beside.
 	write(tmp_path / 'a/x', 'new')
 	write(tmp_path / 'out/x', 'old')
 	os.link(str(tmp_path / 'out/x'), str(tmp_path / 'out/other'))
+	monkeypatch.setattr(hpcp_mod, 'CONTENT_ONLY', content_only)
 	real = hpcp_mod.run_command_in_multicmd_with_path_check
+	refuse = []
 	def cp(command, *args, **kwargs):
-		if os.path.basename(command[-1]).startswith('.hpcp_tmp_'):
+		assert not command[-1].startswith('/proc/'), command
+		if refuse and os.path.basename(command[-1]).startswith('.hpcp_tmp_'):
 			raise RuntimeError('cp: cannot create regular file: Permission denied')
 		return real(command, *args, **kwargs)
 	monkeypatch.setattr(hpcp_mod, 'run_command_in_multicmd_with_path_check', cp)
+	refuse.append(True)
 	hpcp_mod.copy_file(str(tmp_path / 'a/x'), [str(tmp_path / 'out/x')])
-	assert read(tmp_path / 'out/x') == 'old' and read(tmp_path / 'out/other') == 'old'
-	assert any(error.startswith('Copy failed') and 'other names' in error for error in hpcp_mod.ERRORS)
+	assert read(tmp_path / 'out/x') == 'old' and read(tmp_path / 'out/other') == 'old' and temporaries(tmp_path) == []
+	failed = [error for error in hpcp_mod.ERRORS if error.startswith('Copy failed')]
+	assert failed and ('leaving %s as it is: it has other names, which a write in place would change; the new copy beside it '
+		'failed: ' % (tmp_path / 'out/x')) in failed[-1], failed
+	hpcp_mod.ERRORS.clear()
+	refuse.clear()
+	hpcp_mod.copy_file(str(tmp_path / 'a/x'), [str(tmp_path / 'out/x')])
+	assert read(tmp_path / 'out/x') == 'new' and read(tmp_path / 'out/other') == 'old' and not hpcp_mod.ERRORS
+	assert os.stat(str(tmp_path / 'out/x')).st_nlink == 1 and temporaries(tmp_path) == []
 
 
 @posix_only
-def test_a_rename_that_is_refused_goes_in_place_at_once(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
-	# The temporary file was whole: one cp beside, then the write in place (a sticky directory, a bind-mounted file).
+def test_a_refused_rename_on_the_beside_route_keeps_the_old_copy(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	# -wb: the temporary file was whole and the rename was refused (a sticky directory, a bind-mounted file): no write in
+	# place follows (9.85 wrote it in place at once), 190, the old copy kept, nothing left beside it.
 	write(tmp_path / 'a/x', 'a longer new content')
 	write(tmp_path / 'out/x', 'old')
+	monkeypatch.setattr(hpcp_mod, 'WRITE_BESIDE', True)
 	cps = []
 	real = hpcp_mod.run_command_in_multicmd_with_path_check
 	monkeypatch.setattr(hpcp_mod, 'run_command_in_multicmd_with_path_check', lambda command, *a, **k: cps.append(command[-1]) or real(command, *a, **k))
@@ -170,16 +235,21 @@ def test_a_rename_that_is_refused_goes_in_place_at_once(tmp_path, hpcp_mod, rese
 			raise PermissionError(errno.EPERM, 'Operation not permitted', target)
 		return real_rename(source, target, **kwargs)
 	monkeypatch.setattr(hpcp_mod.os, 'rename', rename)
-	assert hpcp_mod.copy_file(str(tmp_path / 'a/x'), [str(tmp_path / 'out/x')])[0] > 0
-	assert read(tmp_path / 'out/x') == 'a longer new content' and temporaries(tmp_path / 'out') == []
-	assert [os.path.basename(path).startswith('.hpcp_tmp_') for path in cps if path.startswith(str(tmp_path / 'out'))] == [True, False]
+	assert hpcp_mod.copy_file(str(tmp_path / 'a/x'), [str(tmp_path / 'out/x')])[0] == 0
+	assert read(tmp_path / 'out/x') == 'old' and temporaries(tmp_path / 'out') == []
+	landings = [path for path in cps if not os.path.basename(path).startswith('.hpcp_tmp_')]
+	assert landings == [] and cps and all(os.path.dirname(path) == str(tmp_path / 'out') for path in cps), cps
+	failed = [error for error in hpcp_mod.ERRORS if error.startswith('Copy failed')]
+	assert ('-wb writes beside it; it could not be replaced by the new copy (Operation not permitted); without -wb it would be '
+		'written in place') in failed[-1], failed
 
 
 @posix_only
 @root_only
 def test_a_sticky_directory_keeps_9_84_s_outcome_for_another_user_s_file(tmp_path, tmp_path_factory):
 	# The re-review's stickyprobe: a root-owned sticky directory, another user's 0666 file, a growing source, run as nobody.
-	# The rename over it is refused (EPERM): written in place, as 9.84 did; the content is new and the owner kept.
+	# It opens for writing, so it is written in place, as 9.84 did: the content is new and the owner kept. Under -wb the rename
+	# over it is refused (EPERM): 190, the file as it was.
 	base, above = str(tmp_path_factory.getbasetemp()), str(tmp_path)
 	while above.startswith(base):
 		os.chmod(above, 0o755)  # pytest makes its own temporary directories 0700
@@ -196,26 +266,310 @@ def test_a_sticky_directory_keeps_9_84_s_outcome_for_another_user_s_file(tmp_pat
 	write(tmp_path / 'a/x', 'a longer new content')
 	os.chmod(str(tmp_path / 'a'), 0o755)
 	os.chmod(str(tmp_path / 'a/x'), 0o644)
-	write(tmp_path / 'out/x', 'old')
-	os.chown(str(tmp_path / 'out/x'), 1000, 1000)
-	os.chmod(str(tmp_path / 'out/x'), 0o666)
-	for flags in ([], ['-co']):
-		task = subprocess.run([os.path.realpath(sys.executable), HPCP, 'a/x', '-d', 'out/'] + flags, cwd=str(tmp_path), stdout=subprocess.PIPE,
+	def as_nobody(flags):
+		return subprocess.run([os.path.realpath(sys.executable), HPCP, 'a/x', '-d', 'out/'] + flags, cwd=str(tmp_path), stdout=subprocess.PIPE,
 			stderr=subprocess.STDOUT, timeout=120, preexec_fn=lambda: (os.setgid(65534), os.setuid(65534)))
-		assert read(tmp_path / 'out/x') == 'a longer new content' and os.stat(str(tmp_path / 'out/x')).st_uid == 1000, task.stdout[-2000:]
+	for flags in ([], ['-co']):
 		write(tmp_path / 'out/x', 'old')
+		os.chown(str(tmp_path / 'out/x'), 1000, 1000)
+		os.chmod(str(tmp_path / 'out/x'), 0o666)
+		inode = os.stat(str(tmp_path / 'out/x')).st_ino
+		task = as_nobody(flags)
+		assert read(tmp_path / 'out/x') == 'a longer new content' and os.stat(str(tmp_path / 'out/x')).st_uid == 1000, task.stdout[-2000:]
+		assert os.stat(str(tmp_path / 'out/x')).st_ino == inode
+		write(tmp_path / 'out/x', 'old')
+		task = as_nobody(flags + ['-wb'])
+		assert task.returncode == 190 and read(tmp_path / 'out/x') == 'old' and temporaries(tmp_path / 'out') == [], task.stdout[-2000:]
+
+
+# ---- 9.86: a rewrite in place through the file the worker holds open ----
+
+@posix_only
+@pytest.mark.parametrize('size', [1, 3 << 20], ids=['1-byte', '3-MiB'])
+@pytest.mark.parametrize('flags', [['-s'], ['-j', '4'], ['-s', '-co'], ['-j', '4', '-co']], ids=['serial', 'parallel', 'serial-co', 'parallel-co'])
+def test_a_rewrite_keeps_the_inode(tmp_path, size, flags):
+	# The inode, and what lives on it, stays (9.85 made a new one each rewrite). Plain: the source's mode and times, as cp -a
+	# gives them; -co: the old mode.
+	for name in 'abcd':
+		write(tmp_path / 'a' / name, os.urandom(size))
+		os.chmod(str(tmp_path / 'a' / name), 0o640)
+		write(tmp_path / 'out' / name, b'o' * size)
+		os.chmod(str(tmp_path / 'out' / name), 0o606)
+	inodes = {name: os.stat(str(tmp_path / 'out' / name)).st_ino for name in 'abcd'}
+	rc, output = run(['a/', '-d', 'out/'] + flags, tmp_path)
+	assert rc == 0 and temporaries(tmp_path / 'out') == [], output[-2000:]
+	for name in 'abcd':
+		source, landing = os.stat(str(tmp_path / 'a' / name)), os.stat(str(tmp_path / 'out' / name))
+		assert read_bytes(tmp_path / 'out' / name) == read_bytes(tmp_path / 'a' / name) and landing.st_ino == inodes[name]
+		if '-co' in flags:
+			assert stat.S_IMODE(landing.st_mode) == 0o606
+		else:
+			assert stat.S_IMODE(landing.st_mode) == 0o640 and landing.st_mtime_ns == source.st_mtime_ns
+
+
+@posix_only
+@pytest.mark.skipif(not sys.platform.startswith('linux'), reason='cp gets the held file through /proc only on Linux')
+@pytest.mark.parametrize('content_only', [False, True], ids=['plain', 'content-only'])
+def test_a_link_swapped_in_after_the_open_is_not_written_through(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch, content_only):
+	# The race the landing had: between hpcp's look and cp's open, the name is renamed away and a link to another file put
+	# there. cp writes the file hpcp holds open, not the name: the link's target is untouched.
+	write(tmp_path / 'a/x', 'new content')
+	write(tmp_path / 'out/x', 'old')
+	write(tmp_path / 't/f', 'not yours')
+	inode = os.stat(str(tmp_path / 'out/x')).st_ino
+	monkeypatch.setattr(hpcp_mod, 'CONTENT_ONLY', content_only)
+	monkeypatch.setattr(hpcp_mod, 'NAMED_DESTS', frozenset([str(tmp_path / 'out')]))
+	real = hpcp_mod.run_command_in_multicmd_with_path_check
+	seen = []
+	def swap_then_cp(command, *args, **kwargs):
+		seen.append(command[-1])
+		os.rename(str(tmp_path / 'out/x'), str(tmp_path / 'out/x.held'))
+		os.symlink('../t/f', str(tmp_path / 'out/x'))
+		return real(command, *args, **kwargs)
+	monkeypatch.setattr(hpcp_mod, 'run_command_in_multicmd_with_path_check', swap_then_cp)
+	assert hpcp_mod.copy_file(str(tmp_path / 'a/x'), [str(tmp_path / 'out/x')])[0] > 0 and not hpcp_mod.ERRORS
+	assert len(seen) == 1 and seen[0].startswith('/proc/%d/fd/' % os.getpid()), seen
+	assert read(tmp_path / 't/f') == 'not yours' and os.path.islink(str(tmp_path / 'out/x'))
+	assert read(tmp_path / 'out/x.held') == 'new content' and os.stat(str(tmp_path / 'out/x.held')).st_ino == inode
+
+
+@posix_only
+def test_write_beside_gives_a_new_inode_and_leaves_no_temporary_file(tmp_path):
+	write(tmp_path / 'a/x', 'new content')
+	write(tmp_path / 'out/x', 'old')
+	inode = os.stat(str(tmp_path / 'out/x')).st_ino
+	rc, output = run(['a/', '-d', 'out/', '-wb'], tmp_path)
+	assert rc == 0 and read(tmp_path / 'out/x') == 'new content' and temporaries(tmp_path) == [], output[-2000:]
+	assert os.stat(str(tmp_path / 'out/x')).st_ino != inode
+
+
+@posix_only
+@pytest.mark.skipif(not hasattr(os, 'link'), reason='hard links')
+@pytest.mark.parametrize('case', ['in-place', 'first-copy', 'other-names', 'write-beside'])
+def test_read_before_write_reads_before_cp_only_on_the_in_place_route(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch, case):
+	# -rbw guards only a write into an old copy: a first copy has none, and the beside route writes a new file.
+	write(tmp_path / 'a/x', 'new content')
+	if case != 'first-copy':
+		write(tmp_path / 'out/x', 'old')
+	if case == 'other-names':
+		os.link(str(tmp_path / 'out/x'), str(tmp_path / 'other'))
+	monkeypatch.setattr(hpcp_mod, 'READ_FIRST', True)
+	monkeypatch.setattr(hpcp_mod, 'WRITE_BESIDE', case == 'write-beside')
+	events = []
+	real_read, real_cp = hpcp_mod._read_through, hpcp_mod.run_command_in_multicmd_with_path_check
+	monkeypatch.setattr(hpcp_mod, '_read_through', lambda path: events.append('read') or real_read(path))
+	monkeypatch.setattr(hpcp_mod, 'run_command_in_multicmd_with_path_check', lambda command, *a, **k: events.append('cp') or real_cp(command, *a, **k))
+	hpcp_mod.copy_file(str(tmp_path / 'a/x'), [str(tmp_path / 'out/x')])
+	assert read(tmp_path / 'out/x') == 'new content' and not hpcp_mod.ERRORS
+	assert events == (['read', 'cp'] if case == 'in-place' else ['cp']), events
+
+
+@posix_only
+@pytest.mark.parametrize('content_only', [False, True], ids=['plain', 'content-only'])
+def test_off_linux_the_landing_is_written_by_path(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch, content_only):
+	# Where cp cannot be given the held file (no /proc/self/fd: macOS, the BSDs), cp gets the name, as in 9.84 (the approved
+	# known limitation: a link swapped in mid-run is written through). The open still sorts what is there: a link at the
+	# landing goes beside, its target untouched.
+	write(tmp_path / 'a/x', 'new content')
+	write(tmp_path / 'a/y', 'new y')
+	write(tmp_path / 'out/x', 'old')
+	write(tmp_path / 't/f', 'not yours')
+	os.symlink('../t/f', str(tmp_path / 'out/y'))
+	inode = os.stat(str(tmp_path / 'out/x')).st_ino
+	monkeypatch.setattr(hpcp_mod, 'CONTENT_ONLY', content_only)
+	monkeypatch.setattr(hpcp_mod, 'NAMED_DESTS', frozenset([str(tmp_path / 'out')]))
+	monkeypatch.setattr(hpcp_mod, '_reaches_held', lambda: False)
+	real = hpcp_mod.run_command_in_multicmd_with_path_check
+	seen = []
+	monkeypatch.setattr(hpcp_mod, 'run_command_in_multicmd_with_path_check', lambda command, *a, **k: seen.append(command[-1]) or real(command, *a, **k))
+	for name in 'xy':
+		hpcp_mod.copy_file(str(tmp_path / 'a' / name), [str(tmp_path / 'out' / name)])
+	assert not hpcp_mod.ERRORS and seen[0] == str(tmp_path / 'out/x') and os.path.basename(seen[1]).startswith('.hpcp_tmp_'), seen
+	assert read(tmp_path / 'out/x') == 'new content' and os.stat(str(tmp_path / 'out/x')).st_ino == inode
+	assert read(tmp_path / 'out/y') == 'new y' and not os.path.islink(str(tmp_path / 'out/y')) and read(tmp_path / 't/f') == 'not yours'
+
+
+_NO_PROC_CP = '''#!/bin/sh
+# cp that may not open another process's /proc/PID/fd/N (hidepid, a worker that is not dumpable, an LSM): it fails, writing
+# nothing, as GNU cp fails its stat of the destination ("cannot stat ...: Permission denied"). PROBE=pass lets the held-file
+# probe (cp /dev/null onto a descriptor of /dev/zero) through, as if the refusal came only later.
+case "$1" in --version) exec cp "$@";; esac
+for last; do :; done
+case "$last" in
+/proc/*)
+	if [ "$1" = /dev/null ] && [ "$PROBE" = pass ]; then exec cp "$@"; fi
+	echo "cp: cannot stat '$last': Permission denied" >&2; exit 1;;
+esac
+exec cp "$@"
+'''
+
+
+@posix_only
+@pytest.mark.skipif(not sys.platform.startswith('linux'), reason='the held-file route is Linux only')
+@pytest.mark.parametrize('flags', [[], ['-co']], ids=['plain', 'content-only'])
+def test_a_cp_that_cannot_open_the_held_file_is_given_the_name(tmp_path, flags):
+	# The probe at a worker's first rewrite in place finds that cp cannot reach /proc/PID/fd/N: cp gets the name, as in 9.84,
+	# and the rewrite works, the inode kept.
+	cp = tmp_path / 'noproccp'
+	cp.write_text(_NO_PROC_CP)
+	os.chmod(str(cp), 0o755)
+	for name in 'abcd':
+		write(tmp_path / 'a' / name, 'new ' + name)
+		write(tmp_path / 'out' / name, 'old')
+	inodes = {name: os.stat(str(tmp_path / 'out' / name)).st_ino for name in 'abcd'}
+	for mode, content in ((['-s'], 'new '), (['-j', '4'], 'newer ')):
+		for name in 'abcd':
+			write(tmp_path / 'a' / name, content + name)
+		rc, output = run(['a/', '-d', 'out/'] + mode + flags, tmp_path, env={'CP_PATH': str(cp)})
+		assert rc == 0, output[-2000:]
+		assert all(read(tmp_path / 'out' / name) == content + name and os.stat(str(tmp_path / 'out' / name)).st_ino == inodes[name] for name in 'abcd')
+
+
+@posix_only
+@pytest.mark.skipif(not sys.platform.startswith('linux'), reason='the held-file route is Linux only')
+def test_a_cp_refused_the_held_file_after_the_probe_keeps_the_old_copy(tmp_path):
+	# cp passed the probe but cannot open the held file now (an LSM rule that only some files meet): cp fails before it opens
+	# anything, so nothing was truncated: the old copy and its inode stay, 190, and the message names the landing, not
+	# /proc. Never a silent success, never a torn file.
+	cp = tmp_path / 'noproccp'
+	cp.write_text(_NO_PROC_CP)
+	os.chmod(str(cp), 0o755)
+	write(tmp_path / 'a/x', 'new content')
+	write(tmp_path / 'out/x', 'the last good copy')
+	inode = os.stat(str(tmp_path / 'out/x')).st_ino
+	rc, output = run(['a/x', '-d', 'out/', '-s'], tmp_path, env={'CP_PATH': str(cp), 'PROBE': 'pass'})
+	assert rc == 190 and read(tmp_path / 'out/x') == 'the last good copy' and os.stat(str(tmp_path / 'out/x')).st_ino == inode, output[-2000:]
+	assert ("cp: cannot stat '%s': Permission denied" % (tmp_path / 'out/x')).encode() in output and b'/proc/' not in output, output[-2000:]
+
+
+@posix_only
+@pytest.mark.skipif(not sys.platform.startswith('linux'), reason='the held-file route is Linux only')
+def test_a_proc_of_another_pid_namespace_is_never_written_through(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	# unshare -p without a /proc of its own: /proc/PID there is another process, whose descriptor N could be any file. The
+	# held route is off (cp gets the name), and the probe is never run, so nothing is written through it.
+	monkeypatch.setattr(hpcp_mod, '_HELD', [None, False])
+	hpcp_mod.cp_supports_sparse()  # cp --version, asked once per process, is no probe
+	real = os.readlink
+	monkeypatch.setattr(hpcp_mod.os, 'readlink', lambda path, *a, **k: str(os.getpid() + 1) if path == '/proc/self' else real(path, *a, **k))
+	ran = []
+	monkeypatch.setattr(hpcp_mod.multiCMD, 'run_commands', lambda *a, **k: ran.append(a) or [])
+	assert hpcp_mod._reaches_held() is False and ran == []
+
+
+@posix_only
+@pytest.mark.skipif(not sys.platform.startswith('linux'), reason='the held-file route is Linux only')
+def test_the_held_file_probe_runs_once_per_process(hpcp_mod, monkeypatch):
+	# One probe however many rewrites in place; a forked worker (another pid) asks for itself.
+	monkeypatch.setattr(hpcp_mod, '_HELD', [None, False])
+	probes = []
+	real_run = hpcp_mod.multiCMD.run_commands
+	def run_commands(commands, *args, **kwargs):
+		if commands[0][1:2] == [os.devnull]:
+			probes.append(commands[0])
+		return real_run(commands, *args, **kwargs)
+	monkeypatch.setattr(hpcp_mod.multiCMD, 'run_commands', run_commands)
+	answers = [hpcp_mod._reaches_held() for _ in range(3)]
+	assert answers == [answers[0]] * 3 and len(probes) == 1, probes
+	assert probes[0][2].startswith('/proc/%d/fd/' % os.getpid())
+	monkeypatch.setattr(hpcp_mod, '_HELD', [os.getpid() + 1, not answers[0]])
+	assert hpcp_mod._reaches_held() == answers[0] and len(probes) == 2
+
+
+@posix_only
+@pytest.mark.skipif(not hasattr(os, 'link'), reason='hard links')
+@pytest.mark.parametrize('flags', [[], ['-co']], ids=['plain', 'content-only'])
+def test_a_hard_linked_landing_goes_beside_and_its_other_names_keep_the_old_content(tmp_path, flags):
+	write(tmp_path / 'a/x', 'new content')
+	write(tmp_path / 'out/x', 'old')
+	os.chmod(str(tmp_path / 'out/x'), 0o604)
+	os.link(str(tmp_path / 'out/x'), str(tmp_path / 'elsewhere'))
+	xattrs = True
+	try:
+		os.setxattr(str(tmp_path / 'out/x'), 'user.mine', b'kept')
+	except OSError:
+		xattrs = False
+	inode = os.stat(str(tmp_path / 'out/x')).st_ino
+	rc, output = run(['a/', '-d', 'out/'] + flags, tmp_path)
+	assert rc == 0 and read(tmp_path / 'out/x') == 'new content' and read(tmp_path / 'elsewhere') == 'old', output[-2000:]
+	st = os.stat(str(tmp_path / 'out/x'))
+	assert st.st_ino != inode and st.st_nlink == 1 and os.stat(str(tmp_path / 'elsewhere')).st_ino == inode
+	if flags:
+		assert stat.S_IMODE(st.st_mode) == 0o604 and (not xattrs or _user_xattrs(tmp_path / 'out/x') == ['user.mine'])
+	else:
+		assert stat.S_IMODE(st.st_mode) == stat.S_IMODE(os.stat(str(tmp_path / 'a/x')).st_mode)
+
+
+@posix_only
+@not_root
+@pytest.mark.parametrize('flags', [[], ['-co']], ids=['plain', 'content-only'])
+def test_an_own_read_only_file_goes_beside(tmp_path, flags):
+	# 0444: it does not open for writing (root's would), so it is replaced by a new file renamed over it. Plain gets the
+	# source's mode, as cp -a gives it; -co keeps 0444 (_carry_over).
+	write(tmp_path / 'a/x', 'new content')
+	os.chmod(str(tmp_path / 'a/x'), 0o640)
+	write(tmp_path / 'out/x', 'old')
+	os.chmod(str(tmp_path / 'out/x'), 0o444)
+	inode = os.stat(str(tmp_path / 'out/x')).st_ino
+	rc, output = run(['a/', '-d', 'out/'] + flags, tmp_path)
+	assert rc == 0 and read(tmp_path / 'out/x') == 'new content' and temporaries(tmp_path) == [], output[-2000:]
+	st = os.stat(str(tmp_path / 'out/x'))
+	assert st.st_ino != inode and stat.S_IMODE(st.st_mode) == (0o444 if flags else 0o640)
+
+
+@posix_only
+@pytest.mark.skipif(not os.path.exists('/bin/sleep'), reason='/bin/sleep')
+def test_a_running_executable_at_the_landing_goes_beside(tmp_path):
+	# A running program does not open for writing (ETXTBSY): its new copy is renamed over it, and the running process keeps its
+	# old inode, untouched.
+	import shutil
+	os.makedirs(str(tmp_path / 'a'))
+	os.makedirs(str(tmp_path / 'out'))
+	shutil.copy2('/bin/sleep', str(tmp_path / 'out/exe'))
+	write(tmp_path / 'a/exe', '#!/bin/sh\necho new\n')
+	os.chmod(str(tmp_path / 'a/exe'), 0o755)
+	inode = os.stat(str(tmp_path / 'out/exe')).st_ino
+	process = subprocess.Popen([str(tmp_path / 'out/exe'), '60'])
+	try:
+		time.sleep(0.2)
+		assert process.poll() is None
+		rc, output = run(['a/', '-d', 'out/'], tmp_path)
+		assert rc == 0 and read(tmp_path / 'out/exe') == '#!/bin/sh\necho new\n' and temporaries(tmp_path) == [], output[-2000:]
+		assert os.stat(str(tmp_path / 'out/exe')).st_ino != inode and process.poll() is None
+	finally:
+		process.kill()
+		process.wait()
+
+
+@posix_only
+@not_root
+@pytest.mark.skipif(not hasattr(os, 'link'), reason='hard links')
+def test_a_file_with_other_names_in_a_directory_that_takes_no_new_name_keeps_the_old_content(tmp_path):
+	write(tmp_path / 'a/x', 'new content')
+	write(tmp_path / 'out/x', 'old')
+	os.chmod(str(tmp_path / 'out/x'), 0o666)
+	os.link(str(tmp_path / 'out/x'), str(tmp_path / 'elsewhere'))
+	os.chmod(str(tmp_path / 'out'), 0o555)
+	try:
+		# A file source: a directory source would sync out's mode (0755) before its files.
+		rc, output = run(['a/x', '-d', 'out/'], tmp_path)
+	finally:
+		os.chmod(str(tmp_path / 'out'), 0o755)
+	assert rc == 190 and read(tmp_path / 'out/x') == 'old' and read(tmp_path / 'elsewhere') == 'old', output[-2000:]
+	assert ('leaving %s as it is: it has other names, which a write in place would change; the new copy beside it failed: '
+		% (tmp_path / 'out/x')).encode() in output, output[-2000:]
 
 
 # ---- what is at a landing: replaced, never opened or followed ----
 
 @posix_only
+@pytest.mark.parametrize('route', [[], ['-wb']], ids=['default', 'write-beside'])
 @pytest.mark.parametrize('flags', [[], ['-co']], ids=['plain', 'content-only'])
-def test_a_lone_fifo_at_a_landing_is_replaced_and_never_opened(tmp_path, flags):
+def test_a_lone_fifo_at_a_landing_is_replaced_and_never_opened(tmp_path, flags, route):
 	# 9.84 opened it for writing and waited for a reader: the run never ended.
 	write(tmp_path / 'a/x', 'A')
 	os.makedirs(str(tmp_path / 'out'))
 	os.mkfifo(str(tmp_path / 'out/x'))
-	rc, output = run(['a/', '-d', 'out/'] + flags, tmp_path, timeout=60)
+	rc, output = run(['a/', '-d', 'out/'] + flags + route, tmp_path, timeout=60)
 	assert rc == 0 and stat.S_ISREG(os.lstat(str(tmp_path / 'out/x')).st_mode) and read(tmp_path / 'out/x') == 'A', output[-2000:]
 
 
@@ -232,8 +586,9 @@ def test_a_fifo_named_by_d_is_written_through(tmp_path):
 
 @posix_only
 @not_root
+@pytest.mark.parametrize('route', [[], ['-wb']], ids=['default', 'write-beside'])
 @pytest.mark.parametrize('kind', ['fifo', 'link'])
-def test_what_cannot_be_replaced_is_refused_and_never_opened(tmp_path, kind):
+def test_what_cannot_be_replaced_is_refused_and_never_opened(tmp_path, kind, route):
 	# The review's A1 (a lone FIFO in a 0555 directory hung) and A2 (a link there was written through): a 213 naming the
 	# directory and the fix, at once, and the FIFO is unopened (no writer ever shows at its other end).
 	write(tmp_path / 'a/x', 'A')
@@ -246,7 +601,7 @@ def test_what_cannot_be_replaced_is_refused_and_never_opened(tmp_path, kind):
 	os.chmod(str(tmp_path / 'out'), 0o555)
 	started = time.monotonic()
 	try:
-		rc, output = run(['a/x', '-d', 'out/'], tmp_path, timeout=60)
+		rc, output = run(['a/x', '-d', 'out/'] + route, tmp_path, timeout=60)
 	finally:
 		os.chmod(str(tmp_path / 'out'), 0o755)
 	assert rc == 213 and time.monotonic() - started < 30, output[-2000:]
@@ -265,51 +620,58 @@ def test_what_cannot_be_replaced_is_refused_and_never_opened(tmp_path, kind):
 
 @posix_only
 @pytest.mark.skipif(not os.path.exists('/dev/null'), reason='/dev/null')
+@pytest.mark.parametrize('route', [[], ['-wb']], ids=['default', 'write-beside'])
 @pytest.mark.parametrize('flags', [[], ['-co']], ids=['plain', 'content-only'])
-def test_a_link_to_a_device_at_a_landing_is_replaced(tmp_path, flags):
+def test_a_link_to_a_device_at_a_landing_is_replaced(tmp_path, flags, route):
 	# 9.84 wrote into /dev/null through it and failed on its times, 190, on every run.
 	write(tmp_path / 'a/x', 'A')
 	os.makedirs(str(tmp_path / 'out'))
 	os.symlink('/dev/null', str(tmp_path / 'out/x'))
 	for _ in range(2):
-		rc, output = run(['a/', '-d', 'out/'] + flags, tmp_path)
+		rc, output = run(['a/', '-d', 'out/'] + flags + route, tmp_path)
 		assert rc == 0 and not os.path.islink(str(tmp_path / 'out/x')) and read(tmp_path / 'out/x') == 'A', output[-2000:]
 
 
 @posix_only
 @root_only
+@pytest.mark.parametrize('route', [[], ['-wb']], ids=['default', 'write-beside'])
 @pytest.mark.parametrize('flags', [[], ['-co']], ids=['plain', 'content-only'])
-def test_a_device_node_at_a_landing_is_replaced_never_written(tmp_path, flags):
+def test_a_device_node_at_a_landing_is_replaced_never_written(tmp_path, flags, route):
 	# A character node of /dev/null's numbers in the tree: 9.84 wrote the file into the device.
 	write(tmp_path / 'a/x', 'A')
 	os.makedirs(str(tmp_path / 'out'))
 	os.mknod(str(tmp_path / 'out/x'), 0o666 | stat.S_IFCHR, os.stat('/dev/null').st_rdev)
-	rc, output = run(['a/', '-d', 'out/'] + flags, tmp_path)
+	rc, output = run(['a/', '-d', 'out/'] + flags + route, tmp_path)
 	assert rc == 0 and stat.S_ISREG(os.lstat(str(tmp_path / 'out/x')).st_mode) and read(tmp_path / 'out/x') == 'A', output[-2000:]
 
 
 @posix_only
-def test_a_link_at_a_file_s_landing_is_replaced_with_its_target_left_alone(tmp_path):
+@pytest.mark.parametrize('route', [[], ['-wb']], ids=['default', 'write-beside'])
+def test_a_link_at_a_file_s_landing_is_replaced_with_its_target_left_alone(tmp_path, route):
 	write(tmp_path / 'a/x', 'A')
 	write(tmp_path / 't/f', 'kept')
 	os.chmod(str(tmp_path / 't/f'), 0o640)
 	os.makedirs(str(tmp_path / 'out'))
 	os.symlink('../t/f', str(tmp_path / 'out/x'))
 	os.chmod(str(tmp_path / 'a/x'), 0o600)
-	rc, output = run(['a/', '-d', 'out/'], tmp_path)
+	rc, output = run(['a/', '-d', 'out/'] + route, tmp_path)
 	assert rc == 0 and read(tmp_path / 'out/x') == 'A' and not os.path.islink(str(tmp_path / 'out/x')), output[-2000:]
 	assert read(tmp_path / 't/f') == 'kept' and stat.S_IMODE(os.stat(str(tmp_path / 't/f')).st_mode) == 0o640
 
 
 @posix_only
-def test_a_named_link_is_followed_and_its_target_rewritten_beside_itself(tmp_path):
+@pytest.mark.parametrize('route', [[], ['-wb']], ids=['default', 'write-beside'])
+def test_a_named_link_is_followed_and_its_target_rewritten(tmp_path, route):
+	# What -d names is followed, as cp follows its destination: its target is written in place (its inode kept), or under -wb
+	# beside itself and renamed over itself; the link stays.
 	write(tmp_path / 'a/x', 'A')
 	write(tmp_path / 't/f', 'old')
+	inode = os.stat(str(tmp_path / 't/f')).st_ino
 	os.makedirs(str(tmp_path / 'out'))
 	os.symlink('../t/f', str(tmp_path / 'out/x'))
-	rc, output = run(['a/x', '-d', 'out/x'], tmp_path)
+	rc, output = run(['a/x', '-d', 'out/x'] + route, tmp_path)
 	assert rc == 0 and os.path.islink(str(tmp_path / 'out/x')) and read(tmp_path / 't/f') == 'A', output[-2000:]
-	assert temporaries(tmp_path) == []
+	assert temporaries(tmp_path) == [] and (os.stat(str(tmp_path / 't/f')).st_ino == inode) == (route == [])
 
 
 @posix_only
@@ -504,8 +866,10 @@ def test_rme_mirrors_a_directory_the_destination_held_as_a_link_into_the_source(
 
 
 @posix_only
-def test_a_rewrite_carries_the_source_s_xattrs_only(tmp_path):
-	# A new file beside the old one: a stale user.* xattr of the old copy does not survive (in place it did).
+@pytest.mark.parametrize('route', [[], ['-wb']], ids=['default', 'write-beside'])
+def test_a_stale_user_xattr_goes_after_a_rewrite(tmp_path, route):
+	# cp -a sets the source's xattrs and never removes one: written in place, the old copy's stale user.* xattr is removed
+	# through the held file's descriptor; beside, the new file never had it.
 	write(tmp_path / 'a/x', 'new')
 	write(tmp_path / 'out/x', 'old')
 	try:
@@ -513,15 +877,19 @@ def test_a_rewrite_carries_the_source_s_xattrs_only(tmp_path):
 		os.setxattr(str(tmp_path / 'a/x'), 'user.kept', b'2')
 	except OSError:
 		pytest.skip('no user xattrs here')
-	rc, output = run(['a/', '-d', 'out/'], tmp_path)
+	inode = os.stat(str(tmp_path / 'out/x')).st_ino
+	rc, output = run(['a/', '-d', 'out/'] + route, tmp_path)
 	assert rc == 0, output[-2000:]
-	assert _user_xattrs(tmp_path / 'out/x') == ['user.kept']
+	assert _user_xattrs(tmp_path / 'out/x') == ['user.kept'] and (os.stat(str(tmp_path / 'out/x')).st_ino == inode) == (route == [])
 
 
 # ---- -co, option A': decide first, then carry exactly what was there ----
 
 @posix_only
-def test_content_only_carries_the_old_file_s_mode_and_xattrs_to_a_new_inode(tmp_path):
+@pytest.mark.parametrize('route', ['default', 'write-beside', 'other-names'])
+def test_content_only_keeps_the_old_file_s_mode_and_xattrs(tmp_path, route):
+	# By default the inode is written in place and keeps all of it; beside (-wb, or a file with other names by default) the
+	# new inode is given the old one's mode and carried xattrs (_carry_over), and the other names keep the old content.
 	write(tmp_path / 'a/x', 'new and longer')
 	write(tmp_path / 'out/x', 'old')
 	os.chmod(str(tmp_path / 'out/x'), 0o604)
@@ -530,12 +898,16 @@ def test_content_only_carries_the_old_file_s_mode_and_xattrs_to_a_new_inode(tmp_
 		os.setxattr(str(tmp_path / 'a/x'), 'user.source', b'not carried')
 	except OSError:
 		pytest.skip('no user xattrs here')
+	if route == 'other-names':
+		os.link(str(tmp_path / 'out/x'), str(tmp_path / 'other'))
 	inode = os.stat(str(tmp_path / 'out/x')).st_ino
-	rc, output = run(['a/', '-d', 'out/', '-co'], tmp_path)
+	rc, output = run(['a/', '-d', 'out/', '-co'] + (['-wb'] if route == 'write-beside' else []), tmp_path)
 	assert rc == 0 and read(tmp_path / 'out/x') == 'new and longer', output[-2000:]
 	st = os.stat(str(tmp_path / 'out/x'))
-	assert st.st_ino != inode and stat.S_IMODE(st.st_mode) == 0o604
+	assert (st.st_ino == inode) == (route == 'default') and stat.S_IMODE(st.st_mode) == 0o604 and st.st_nlink == 1
 	assert _user_xattrs(tmp_path / 'out/x') == ['user.mine'] and os.getxattr(str(tmp_path / 'out/x'), 'user.mine') == b'kept'
+	if route == 'other-names':
+		assert read(tmp_path / 'other') == 'old' and os.stat(str(tmp_path / 'other')).st_ino == inode
 
 
 def _acl(*entries):
@@ -548,7 +920,8 @@ _NO_ID = 0xffffffff
 
 
 @posix_only
-def test_content_only_carries_the_old_acl_and_drops_one_the_directory_gave(tmp_path):
+@pytest.mark.parametrize('route', [[], ['-wb']], ids=['default', 'write-beside'])
+def test_content_only_carries_the_old_acl_and_drops_one_the_directory_gave(tmp_path, route):
 	# out has a default ACL, which a new file in it takes as its access ACL: removed, as the old file had none. A file
 	# that had an access ACL keeps exactly it.
 	write(tmp_path / 'a/x', 'new')
@@ -563,7 +936,7 @@ def test_content_only_carries_the_old_acl_and_drops_one_the_directory_gave(tmp_p
 	except OSError:
 		pytest.skip('no ACLs here')
 	before = os.getxattr(str(tmp_path / 'out/y'), 'system.posix_acl_access')
-	rc, output = run(['a/', '-d', 'out/', '-co'], tmp_path)
+	rc, output = run(['a/', '-d', 'out/', '-co'] + route, tmp_path)
 	assert rc == 0 and read(tmp_path / 'out/x') == 'new' and read(tmp_path / 'out/y') == 'new', output[-2000:]
 	assert 'system.posix_acl_access' not in os.listxattr(str(tmp_path / 'out/x'))
 	assert os.getxattr(str(tmp_path / 'out/y'), 'system.posix_acl_access') == before
@@ -576,7 +949,8 @@ def shutil_which(name):
 
 @posix_only
 @root_only
-def test_content_only_drops_a_file_capability_as_a_write_in_place_does(tmp_path):
+@pytest.mark.parametrize('route', [[], ['-wb']], ids=['default', 'write-beside'])
+def test_content_only_drops_a_file_capability_as_a_write_in_place_does(tmp_path, route):
 	# VM 902: a write in place strips security.capability (setuid kept); carrying it would give new content a capability.
 	if not shutil_which('setcap'):
 		pytest.skip('setcap')
@@ -585,7 +959,7 @@ def test_content_only_drops_a_file_capability_as_a_write_in_place_does(tmp_path)
 	os.chmod(str(tmp_path / 'out/x'), 0o4755)
 	if subprocess.run(['setcap', 'cap_net_raw+ep', str(tmp_path / 'out/x')]).returncode:
 		pytest.skip('no file capabilities here')
-	rc, output = run(['a/', '-d', 'out/', '-co'], tmp_path)
+	rc, output = run(['a/', '-d', 'out/', '-co'] + route, tmp_path)
 	assert rc == 0 and read(tmp_path / 'out/x') == 'new', output[-2000:]
 	assert 'security.capability' not in os.listxattr(str(tmp_path / 'out/x'))
 	assert stat.S_IMODE(os.stat(str(tmp_path / 'out/x')).st_mode) == 0o4755
@@ -593,31 +967,40 @@ def test_content_only_drops_a_file_capability_as_a_write_in_place_does(tmp_path)
 
 @posix_only
 @not_root
-def test_content_only_drops_setuid_for_a_non_root_owner_as_the_kernel_does(tmp_path):
+@pytest.mark.parametrize('route', [[], ['-wb']], ids=['default', 'write-beside'])
+def test_content_only_drops_setuid_for_a_non_root_owner_as_the_kernel_does(tmp_path, route):
 	# suidprobe: the owner writing in place lost 4700 -> 700 and 6755 -> 755, kept 2745.
 	for name, mode, kept in (('u', 0o4700, 0o700), ('ug', 0o6755, 0o755), ('g', 0o2745, 0o2745)):
 		write(tmp_path / 'a' / name, 'new')
 		write(tmp_path / 'out' / name, 'old')
 		os.chmod(str(tmp_path / 'out' / name), mode)
-	rc, output = run(['a/', '-d', 'out/', '-co'], tmp_path)
+	rc, output = run(['a/', '-d', 'out/', '-co'] + route, tmp_path)
 	assert rc == 0, output[-2000:]
 	for name, mode, kept in (('u', 0o4700, 0o700), ('ug', 0o6755, 0o755), ('g', 0o2745, 0o2745)):
 		assert stat.S_IMODE(os.stat(str(tmp_path / 'out' / name)).st_mode) == kept and read(tmp_path / 'out' / name) == 'new'
 
 
 @posix_only
-def test_content_only_writes_in_place_where_an_xattr_cannot_be_carried(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
-	# trusted.*, security.ima, a filesystem's own: no new file can carry it, so the old inode is written, after the source
-	# read whole.
+@pytest.mark.parametrize('route', ['default', 'write-beside'])
+def test_content_only_where_an_xattr_cannot_be_carried(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch, route):
+	# trusted.*, security.ima, a filesystem's own: no new file can carry it. By default the file opens for writing and is
+	# written in place, keeping it; under -wb the old copy stays, 190, naming the cause.
 	write(tmp_path / 'a/x', 'new')
 	write(tmp_path / 'out/x', 'old')
 	inode = os.stat(str(tmp_path / 'out/x')).st_ino
 	monkeypatch.setattr(hpcp_mod, 'CONTENT_ONLY', True)
+	monkeypatch.setattr(hpcp_mod, 'WRITE_BESIDE', route == 'write-beside')
 	real = os.listxattr
 	monkeypatch.setattr(hpcp_mod.os, 'listxattr', lambda path, **kwargs: ['trusted.overlay'] if str(path).endswith('out/x') else real(path, **kwargs))
 	assert hpcp_mod._co_carry(str(tmp_path / 'out/x'), os.lstat(str(tmp_path / 'out/x'))) is None
 	hpcp_mod.copy_file(str(tmp_path / 'a/x'), [str(tmp_path / 'out/x')])
-	assert read(tmp_path / 'out/x') == 'new' and os.stat(str(tmp_path / 'out/x')).st_ino == inode
+	assert os.stat(str(tmp_path / 'out/x')).st_ino == inode and temporaries(tmp_path) == []
+	if route == 'default':
+		assert read(tmp_path / 'out/x') == 'new' and not hpcp_mod.ERRORS
+	else:
+		assert read(tmp_path / 'out/x') == 'old'
+		assert any(error.startswith('Copy failed') and error.endswith('-wb writes beside it; its owner, group or an xattr cannot be '
+			'given to a new file; without -wb it would be written in place') for error in hpcp_mod.ERRORS), hpcp_mod.ERRORS
 
 
 @posix_only
@@ -647,7 +1030,7 @@ def test_content_only_skips_a_label_the_filesystem_gives_itself(tmp_path, hpcp_m
 
 @posix_only
 @not_root
-def test_content_only_writes_another_user_s_file_in_place(tmp_path, hpcp_mod, monkeypatch):
+def test_content_only_cannot_carry_another_user_s_file(tmp_path, hpcp_mod, monkeypatch):
 	write(tmp_path / 'out/x', 'old')
 	st = os.lstat(str(tmp_path / 'out/x'))
 	other = os.stat_result((st.st_mode, st.st_ino, st.st_dev, st.st_nlink, st.st_uid + 1, st.st_gid) + tuple(st)[6:])
@@ -655,6 +1038,34 @@ def test_content_only_writes_another_user_s_file_in_place(tmp_path, hpcp_mod, mo
 	foreign_group = os.stat_result((st.st_mode, st.st_ino, st.st_dev, st.st_nlink, st.st_uid, 4242) + tuple(st)[6:])
 	if 4242 not in os.getgroups() and os.getegid() != 4242:
 		assert hpcp_mod._co_carry(str(tmp_path / 'out/x'), foreign_group) is None
+
+
+@posix_only
+@not_root
+@pytest.mark.parametrize('mode', [0o666, 0o444], ids=['opens', 'read-only'])
+def test_content_only_rewrites_another_user_s_file_only_in_place(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch, mode):
+	# Another user's file (_co_carry: None, as no new file can have its owner): written in place when it opens for writing,
+	# so it keeps its owner and mode; one that does not open for writing would need a new file, which -co cannot give its
+	# metadata: 190, the old copy kept (9.84's cp -f unlinked it and made a file the runner owns).
+	write(tmp_path / 'a/x', 'new')
+	write(tmp_path / 'out/x', 'old')
+	os.chmod(str(tmp_path / 'out/x'), mode)
+	inode = os.stat(str(tmp_path / 'out/x')).st_ino
+	monkeypatch.setattr(hpcp_mod, 'CONTENT_ONLY', True)
+	asked = []
+	monkeypatch.setattr(hpcp_mod, '_co_carry', lambda target, st: asked.append(target))
+	try:
+		hpcp_mod.copy_file(str(tmp_path / 'a/x'), [str(tmp_path / 'out/x')])
+		st = os.stat(str(tmp_path / 'out/x'))
+		assert st.st_ino == inode and stat.S_IMODE(st.st_mode) == mode and temporaries(tmp_path) == []
+		if mode == 0o666:
+			assert read(tmp_path / 'out/x') == 'new' and asked == [] and not hpcp_mod.ERRORS
+		else:
+			assert read(tmp_path / 'out/x') == 'old' and asked
+			assert any(error.endswith('leaving %s as it is: it cannot be opened for writing (Permission denied); its owner, group '
+				'or an xattr cannot be given to a new file' % (tmp_path / 'out/x')) for error in hpcp_mod.ERRORS), hpcp_mod.ERRORS
+	finally:
+		os.chmod(str(tmp_path / 'out/x'), 0o644)
 
 
 # ---- rule 8: a block device named by -d ----
@@ -697,7 +1108,7 @@ def test_a_path_through_a_link_another_source_puts_there_is_a_clash(tmp_path, fl
 		assert read(root / 'b/x') == 'X' and os.path.islink(str(root / 'lb'))
 
 
-# ---- rule 3's space cases, on a small filesystem of its own ----
+# ---- a small filesystem of its own ----
 
 def _fill(out, free):
 	"""Fill out's filesystem so that free bytes are left."""
@@ -706,410 +1117,6 @@ def _fill(out, free):
 		os.unlink(fill)
 	vfs = os.statvfs(out)
 	write(fill, b'f' * (vfs.f_bavail * vfs.f_frsize - free))
-
-
-@posix_only
-@small_fs
-def test_the_space_cases_keep_every_old_copy(tmp_path):
-	# One test, as they share the one small filesystem. Scaled from the review's cases to 5 MiB:
-	# C1: old 1 MiB, source 3 MiB, 2 MiB free. 9.84 truncated the old copy and lost it. The temporary file runs out of room,
-	#     and growing in place could too: 190, the old copy kept.
-	# C2: old 2 MiB, source 3 MiB, 1.5 MiB free. 9.84 grew it in place (0); the lossless form keeps it, 190 (proposed known
-	#     limitation 13).
-	# C3: four 1 MiB rewrites at once with 1.5 MiB free, -j 4, twenty runs. 9.84 landed all four; one that finds no room
-	#     beside goes in place in the forced pass, the old copy being as large as the source.
-	out = os.path.join(SMALL_FS, 'cases-%d' % os.getpid())
-	subprocess.run(['rm', '-rf', out])
-	os.makedirs(out)
-	try:
-		for old, new, free in ((1 << 20, 3 << 20, 2 << 20), (2 << 20, 3 << 20, 3 << 19)):
-			subprocess.run(['rm', '-f', os.path.join(out, 'fill'), os.path.join(out, 'x')])
-			write(os.path.join(out, 'x'), b'o' * old)
-			_fill(out, free)
-			write(tmp_path / 'a/x', b'n' * new)
-			rc, output = run([str(tmp_path / 'a/x'), '-d', out + '/'], tmp_path)
-			assert rc == 190 and read(os.path.join(out, 'x')) == 'o' * old and temporaries(out) == [], output[-2000:]
-		os.unlink(os.path.join(out, 'x'))
-		for run_number in range(20):
-			os.unlink(os.path.join(out, 'fill'))
-			for name in 'abcd':
-				write(os.path.join(out, name), b'o' * (1 << 20))
-				write(tmp_path / 'src' / name, (name * (1 << 20)).encode())
-			_fill(out, 3 << 19)
-			rc, output = run([str(tmp_path / 'src') + '/', '-d', out + '/', '-j', '4'], tmp_path)
-			assert rc == 0 and all(read(os.path.join(out, name)) == name * (1 << 20) for name in 'abcd'), (run_number, output[-2000:])
-			assert temporaries(out) == []
-	finally:
-		subprocess.run(['rm', '-rf', out])
-
-
-_ROOM_TAKEN_CP = '''#!/bin/sh
-# cp, on a disk where another writer takes any room a rewrite frees: a copy beside its landing runs out of room part way;
-# a copy to the landing itself (cp truncates it first) finds the room it freed taken (the disk filled) before it writes.
-case "$1" in --version) exec cp "$@";; esac
-for last; do :; done
-case "$*" in *--attributes-only*) exec cp "$@";; esac
-case "$(basename "$last")" in
-.hpcp_tmp_*) head -c 1000 /dev/zero > "$last"; echo "cp: error writing '$last': No space left on device" >&2; exit 1;;
-esac
-: > "$last"
-head -c 100000000 /dev/zero > "$FILL" 2>/dev/null
-exec cp "$@"
-'''
-
-
-@posix_only
-@small_fs
-def test_a_rewrite_in_place_needs_no_room_it_frees(tmp_path):
-	# The forced pass's fallback writes a regular file in place when the old copy is at least the source's size. cp truncates
-	# it first, and with -j 4 on a nearly full disk another worker's temporary file took that room before cp wrote: the old
-	# copy was gone, exit 190 (the space test's C3, about 1 run in 250). Written over, the rewrite needs no room.
-	out = os.path.join(SMALL_FS, 'room-%d' % os.getpid())
-	subprocess.run(['rm', '-rf', out])
-	os.makedirs(out)
-	try:
-		write(os.path.join(out, 'x'), b'o' * (1 << 20))
-		write(tmp_path / 'a/x', b'n' * (1 << 20))
-		cp = tmp_path / 'roomcp'
-		cp.write_text(_ROOM_TAKEN_CP)
-		os.chmod(str(cp), 0o755)
-		rc, output = run([str(tmp_path / 'a/x'), '-d', out + '/'], tmp_path, env={'CP_PATH': str(cp), 'FILL': os.path.join(out, 'fill')})
-		assert rc == 0 and read(os.path.join(out, 'x')) == 'n' * (1 << 20) and temporaries(out) == [], output[-2000:]
-	finally:
-		subprocess.run(['rm', '-rf', out])
-
-
-_NO_ROOM_FOR_A_TEMPORARY_CP = '''#!/bin/sh
-# cp, on a disk too full for a copy beside its landing: that fails; a copy to the landing itself is not cp's job here (the
-# rewrite is written over the old copy), so it fails the test loudly.
-case "$1" in --version) exec cp "$@";; esac
-for last; do :; done
-case "$*" in *--attributes-only*) exec cp "$@";; esac
-case "$(basename "$last")" in
-.hpcp_tmp_*) echo "cp: error writing '$last': No space left on device" >&2; exit 1;;
-esac
-echo "cp ran on the landing itself" >&2
-exit 1
-'''
-
-_PAGE = 4096
-
-
-def _sparse(path, pieces, size):
-	"""A file of size bytes holding only pieces ({offset: bytes}); the rest is a hole."""
-	os.makedirs(os.path.dirname(str(path)), exist_ok=True)
-	with open(str(path), 'wb') as f:
-		for offset, data in pieces.items():
-			f.seek(offset)
-			f.write(data)
-		f.truncate(size)
-
-
-def _rewrite_in_place(tmp_path, old_maker, free):
-	"""Run hpcp over a source holding two pieces of data in 4 MiB, onto the small filesystem where old_maker made an old copy
-	and only free bytes are left; the pieces and the file as it ends."""
-	out = os.path.join(SMALL_FS, 'sparse-%d' % os.getpid())
-	subprocess.run(['rm', '-rf', out])
-	os.makedirs(out)
-	try:
-		size = 4 << 20
-		pieces = {0: b'n' * _PAGE, size - 3 * _PAGE: b'N' * (2 * _PAGE)}
-		_sparse(tmp_path / 'a/x', pieces, size)
-		old_maker(os.path.join(out, 'x'), size)
-		cp = tmp_path / 'noroomcp'
-		cp.write_text(_NO_ROOM_FOR_A_TEMPORARY_CP)
-		os.chmod(str(cp), 0o755)
-		left = os.statvfs(out).f_bavail * os.statvfs(out).f_frsize
-		if left > free:
-			with open(os.path.join(out, 'fill'), 'wb') as f:
-				f.write(b'f' * (left - free))
-		rc, output = run([str(tmp_path / 'a/x'), '-d', out + '/'], tmp_path, env={'CP_PATH': str(cp)})
-		assert os.path.exists(os.path.join(out, 'x')), (rc, output.decode(errors='replace'))
-		with open(os.path.join(out, 'x'), 'rb') as f:
-			content = f.read()
-		expected = bytearray(size)
-		for offset, data in pieces.items():
-			expected[offset:offset + len(data)] = data
-		return rc, output, content == bytes(expected), os.stat(os.path.join(out, 'x')), temporaries(out), content
-	finally:
-		subprocess.run(['rm', '-rf', out])
-
-
-@posix_only
-@small_fs
-def test_a_sparse_rewrite_in_place_keeps_its_holes_and_needs_no_room_for_them(tmp_path):
-	# A 4 MiB source holding 12 KiB of data, over an old copy of the same layout, with 1 MiB free: written byte by byte it
-	# fills the old copy's holes with zeros, runs out of room, and the old copy is torn and removed. The holes stay holes.
-	def same_layout(path, size):
-		_sparse(path, {0: b'o' * _PAGE, size - 3 * _PAGE: b'O' * (2 * _PAGE)}, size)
-	rc, output, same, st, temps, _ = _rewrite_in_place(tmp_path, same_layout, 1 << 20)
-	assert rc == 0 and same and temps == [], output[-2000:]
-	assert st.st_size == 4 << 20 and st.st_blocks * 512 < 1 << 18, st
-
-
-@posix_only
-@small_fs
-def test_a_sparse_source_rewritten_over_a_dense_old_copy_has_the_right_content(tmp_path):
-	# The zeros of the source's holes are written over the old copy's data: no hole to keep there.
-	def dense(path, size):
-		write(path, b'd' * size)
-	rc, output, same, st, temps, _ = _rewrite_in_place(tmp_path, dense, 3 << 20)
-	assert rc == 0 and same and temps == [] and st.st_size == 4 << 20, output[-2000:]
-
-
-@posix_only
-@small_fs
-def test_a_sparser_rewrite_in_place_writes_zeros_only_where_the_old_copy_has_data(tmp_path):
-	# The old copy holds 4 KiB at each MiB's start; the source's middle MiBs are a hole. 1c92290 wrote each such MiB of zeros
-	# whole over the old copy, filling the holes around its 4 KiB: 2 MiB of room with 1 MiB free, so the old copy was torn,
-	# exit 190 (9.84's cp, truncating first, needed none). Zeros go only over the old copy's data, so they take no room.
-	def scattered(path, size):
-		_sparse(path, {mib << 20: b'o' * _PAGE for mib in range(size >> 20)}, size)
-	rc, output, same, st, temps, _ = _rewrite_in_place(tmp_path, scattered, 1 << 20)
-	assert rc == 0 and same and temps == [], output[-2000:]
-
-
-@posix_only
-@small_fs
-def test_a_rewrite_in_place_without_room_for_its_data_keeps_the_old_copy(tmp_path):
-	# The source's last 12 KiB of data land where the old copy has a hole, and the disk has no room for them: the old copy
-	# stays as it was, exit 190. 1c92290 wrote the zeros over the old copy's data first, then ran out of room: torn.
-	old = {0: b'o' * (1 << 20)}
-	def first_mib(path, size):
-		_sparse(path, old, size)
-	rc, output, same, st, temps, content = _rewrite_in_place(tmp_path, first_mib, 0)
-	expected = bytearray(4 << 20)
-	expected[:1 << 20] = old[0]
-	assert rc == 190 and content == bytes(expected) and temps == [], output[-2000:]
-	assert b'leaving' in output and b'no room' in output, output[-2000:]
-
-
-def test_a_sparse_old_copy_where_no_hole_shows_goes_to_cp(hpcp_mod, monkeypatch, tmp_path):
-	# NFS before 4.2 says data everywhere (SEEK_DATA, SEEK_HOLE): written over, a sparse old copy's every hole was filled with
-	# zeros (64 MiB for 8 KiB of data on NFSv4.1, EL8), where cp keeps the holes.
-	source, old = tmp_path / 's', tmp_path / 'o'
-	_sparse(source, {0: b'n' * _PAGE}, 4 << 20)
-	_sparse(old, {0: b'o' * _PAGE}, 4 << 20)
-	if os.stat(str(old)).st_blocks * 512 >= 4 << 20 or not hpcp_mod.cp_supports_sparse():
-		pytest.skip('no sparse files here, or no GNU cp')
-	lseek = os.lseek
-	def data_everywhere(fd, offset, whence):
-		if whence == os.SEEK_HOLE:
-			return os.fstat(fd).st_size
-		return offset if whence == os.SEEK_DATA else lseek(fd, offset, whence)
-	monkeypatch.setattr(hpcp_mod.os, 'lseek', data_everywhere)
-	assert hpcp_mod._write_over(str(source), str(old)) is False
-	assert read(old)[:4] == 'oooo' and os.stat(str(old)).st_blocks * 512 < 1 << 20
-
-
-@pytest.mark.parametrize('old_layout', ['dense', 'sparse'])
-def test_a_write_over_reserves_room_only_over_holes_and_keeps_the_old_copy_without_it(hpcp_mod, monkeypatch, tmp_path, old_layout):
-	# Room is reserved (posix_fallocate) only where the old copy shows a hole: a dense one needs none, so it is never asked.
-	# Over a sparse one a disk short of room raises _KeptOld before anything is written, the old copy as it was, times too.
-	source, old = tmp_path / 's', tmp_path / 'o'
-	_sparse(source, {0: b'n' * _PAGE, 3 << 20: b'N' * _PAGE}, 4 << 20)
-	if old_layout == 'dense':
-		write(old, b'o' * (4 << 20))
-	else:
-		_sparse(old, {0: b'o' * _PAGE}, 4 << 20)
-		with open(str(old), 'rb') as f:
-			if os.lseek(f.fileno(), 0, os.SEEK_HOLE) >= 4 << 20:
-				pytest.skip('no hole shows here')
-	if not (hpcp_mod.cp_supports_sparse() and hasattr(os, 'posix_fallocate')):
-		pytest.skip('no GNU cp, or no posix_fallocate')
-	os.utime(str(old), ns=(10 ** 18, 10 ** 18))
-	asked = []
-	def no_room(fd, offset, length):
-		asked.append((offset, length))
-		raise OSError(errno.ENOSPC, os.strerror(errno.ENOSPC))
-	monkeypatch.setattr(hpcp_mod.os, 'posix_fallocate', no_room)
-	before = (tmp_path / 'o').read_bytes()
-	if old_layout == 'dense':
-		assert hpcp_mod._write_over(str(source), str(old)) is True
-		assert asked == [] and (tmp_path / 'o').read_bytes() == source.read_bytes()
-	else:
-		with pytest.raises(hpcp_mod._KeptOld, match='no room'):
-			hpcp_mod._write_over(str(source), str(old))
-		assert asked and (tmp_path / 'o').read_bytes() == before and os.stat(str(old)).st_mtime_ns == 10 ** 18
-
-
-def test_a_stop_right_after_the_reservation_keeps_the_old_copy(hpcp_mod, monkeypatch, tmp_path):
-	# fallocate moves the old copy's mtime (XFS; ext4 on EL8): a stop landing after it, before any write, made _cp_in_place
-	# take the old copy, which still read as it did, for a torn one and remove it (Docker 3.6 and 3.14 on XFS, EL7 and EL8 XFS,
-	# EL8 ext4).
-	source, old = tmp_path / 's', tmp_path / 'o'
-	_sparse(source, {0: b'n' * _PAGE, 3 << 20: b'N' * _PAGE}, 4 << 20)
-	_sparse(old, {0: b'o' * _PAGE}, 4 << 20)
-	with open(str(old), 'rb') as f:
-		if os.lseek(f.fileno(), 0, os.SEEK_HOLE) >= 4 << 20:
-			pytest.skip('no hole shows here')
-	if not (hpcp_mod.cp_supports_sparse() and hasattr(os, 'posix_fallocate')):
-		pytest.skip('no GNU cp, or no posix_fallocate')
-	monkeypatch.setattr(hpcp_mod, '_copies_on_write', lambda path, dev: False, raising=False)
-	os.utime(str(old), ns=(10 ** 18, 10 ** 18))
-	before = old.read_bytes()
-	def moved_then_stopped(fd, offset, length):
-		os.utime(fd)  # what XFS's fallocate does to the mtime
-		raise KeyboardInterrupt
-	monkeypatch.setattr(hpcp_mod.os, 'posix_fallocate', moved_then_stopped)
-	with pytest.raises(KeyboardInterrupt):
-		hpcp_mod._cp_in_place(['cp', '-af'], str(source), str(old))
-	assert old.exists() and old.read_bytes() == before and os.stat(str(old)).st_mtime_ns == 10 ** 18
-
-
-def _can_punch(hpcp_mod, tmp_path):
-	"""Skip where the filesystem under tmp_path cannot punch a hole, or does not take back what a reservation allocated (ext4
-	without extents has no fallocate: glibc writes the blocks, and the indirect block stays), or has no GNU cp."""
-	if not (hpcp_mod.cp_supports_sparse() and hasattr(os, 'posix_fallocate')):
-		pytest.skip('no GNU cp, or no posix_fallocate')
-	probe = tmp_path / 'probe'
-	fd = os.open(str(probe), os.O_RDWR | os.O_CREAT | os.O_TRUNC)
-	try:
-		os.ftruncate(fd, 4 << 20)
-		os.fsync(fd)
-		empty = os.fstat(fd).st_blocks
-		os.posix_fallocate(fd, 1 << 20, 1 << 20)
-		if not hpcp_mod._punch(fd, 1 << 20, 2 << 20) or os.fstat(fd).st_blocks != empty:
-			pytest.skip('this filesystem does not punch holes, or does not free what a reservation took')
-	finally:
-		os.close(fd)
-		os.remove(str(probe))
-
-
-def _blocks(path):
-	with open(str(path), 'rb') as f:
-		os.fsync(f.fileno())  # delayed allocation settled: the count below is what stays
-	return os.stat(str(path)).st_blocks
-
-
-def test_a_failed_reservation_gives_back_the_room_it_took(hpcp_mod, monkeypatch, tmp_path):
-	# The disk runs short part way through the reservation (the last call allocates, then fails: a part of a range can be
-	# allocated when one fails): the ranges already allocated stayed allocated on ext4 and XFS, so the old copy read as before
-	# but the disk (or the user's quota) was left fuller than it was. The last range ends at the source's end, 5000 bytes
-	# into a block: ext4 frees that block only for a punch that goes past the end of the file. Four extents at most: a fifth
-	# takes an extent tree block of ext4's, which stays when the extent goes.
-	_can_punch(hpcp_mod, tmp_path)
-	source, old = tmp_path / 's', tmp_path / 'o'
-	size = (8 << 20) + 5000
-	_sparse(source, dict([(mib << 20, b'n' * (256 << 10)) for mib in (0, 4)] + [(8 << 20, b'N' * 5000)]), size)
-	_sparse(old, {0: b'o' * _PAGE}, size)
-	monkeypatch.setattr(hpcp_mod, '_copies_on_write', lambda path, dev: False, raising=False)
-	os.utime(str(old), ns=(10 ** 18, 10 ** 18))
-	before, blocks = old.read_bytes(), _blocks(old)
-	real, asked = os.posix_fallocate, []
-	def runs_out(fd, offset, length):
-		asked.append((offset, length))
-		real(fd, offset, length)
-		if len(asked) == 3:
-			raise OSError(errno.ENOSPC, os.strerror(errno.ENOSPC))
-	monkeypatch.setattr(hpcp_mod.os, 'posix_fallocate', runs_out)
-	with pytest.raises(hpcp_mod._KeptOld, match='no room'):
-		hpcp_mod._write_over(str(source), str(old))
-	assert len(asked) == 3 and old.read_bytes() == before
-	assert _blocks(old) == blocks and os.stat(str(old)).st_mtime_ns == 10 ** 18
-
-
-def test_a_sparse_source_rewritten_over_a_dense_old_copy_ends_sparse(hpcp_mod, tmp_path):
-	# Zeros over every source hole made the old copy's dense 8 MiB stay dense (a 1 TB image with 10 GB of data wrote 990 GB
-	# of zeros); cp, as in 9.84, leaves the holes. Where the source has a hole the old copy's data is punched out.
-	_can_punch(hpcp_mod, tmp_path)
-	source, old = tmp_path / 's', tmp_path / 'o'
-	_sparse(source, {0: b'n' * _PAGE, 7 << 20: b'N' * _PAGE}, 8 << 20)
-	write(old, b'o' * (8 << 20))
-	assert hpcp_mod._write_over(str(source), str(old)) is True
-	assert old.read_bytes() == source.read_bytes() and _blocks(old) * 512 < 1 << 20
-
-
-def test_where_nothing_punches_zeros_go_over_the_old_copys_data(hpcp_mod, monkeypatch, tmp_path):
-	# Not Linux, ext4 without extents, NFS before 4.2: the source's holes are written as zeros over the old copy's data.
-	if not hpcp_mod.cp_supports_sparse():
-		pytest.skip('no GNU cp')
-	source, old = tmp_path / 's', tmp_path / 'o'
-	_sparse(source, {0: b'n' * _PAGE, 7 << 20: b'N' * _PAGE}, 8 << 20)
-	write(old, b'o' * (8 << 20))
-	monkeypatch.setattr(hpcp_mod, '_copies_on_write', lambda path, dev: False, raising=False)
-	monkeypatch.setattr(hpcp_mod, '_punch', lambda fd, start, end: False)
-	assert hpcp_mod._write_over(str(source), str(old)) is True
-	assert old.read_bytes() == source.read_bytes()
-
-
-def test_a_stop_in_the_reservation_gives_back_the_room_it_took(hpcp_mod, monkeypatch, tmp_path):
-	# A stop (_stop raises KeyboardInterrupt in a worker) after the second range was reserved: the old copy stayed, as it read,
-	# but the 512 KiB reserved for the source's data stayed allocated in it (Docker 3.6 and 3.14, tmpfs and XFS).
-	_can_punch(hpcp_mod, tmp_path)
-	source, old = tmp_path / 's', tmp_path / 'o'
-	_sparse(source, {0: b'n' * _PAGE, 1 << 20: b'N' * (256 << 10), 3 << 20: b'N' * (256 << 10)}, 4 << 20)
-	_sparse(old, {0: b'o' * _PAGE}, 4 << 20)
-	monkeypatch.setattr(hpcp_mod, '_copies_on_write', lambda path, dev: False, raising=False)
-	os.utime(str(old), ns=(10 ** 18, 10 ** 18))
-	before, blocks = old.read_bytes(), _blocks(old)
-	real, asked = os.posix_fallocate, []
-	def then_stop(fd, offset, length):
-		asked.append((offset, length))
-		real(fd, offset, length)
-		if len(asked) == 2:
-			raise KeyboardInterrupt
-	monkeypatch.setattr(hpcp_mod.os, 'posix_fallocate', then_stop)
-	with pytest.raises(KeyboardInterrupt):
-		hpcp_mod._cp_in_place(['cp', '-af'], str(source), str(old))
-	assert len(asked) == 2 and old.read_bytes() == before
-	assert _blocks(old) == blocks and os.stat(str(old)).st_mtime_ns == 10 ** 18
-
-
-def test_a_seek_that_fails_keeps_the_give_back_off_the_old_copys_data(hpcp_mod, monkeypatch, tmp_path):
-	# The SEEK_DATA that finds where a reserved hole ends failed (EIO: an NFS soft timeout), then the disk ran short: the punch
-	# back ran from that hole past the end of the file, and the old copy, kept (exit 190, 'leaving DEST as it is'), read zeros
-	# where its data was (Docker 3.6 and 3.14, tmpfs and XFS).
-	_can_punch(hpcp_mod, tmp_path)
-	source, old = tmp_path / 's', tmp_path / 'o'
-	_sparse(source, {0: b'n' * (512 << 10), 2 << 20: b'N' * (512 << 10)}, 4 << 20)
-	_sparse(old, {1 << 20: b'o' * (1 << 20), 3 << 20: b'O' * (1 << 20)}, 4 << 20)
-	monkeypatch.setattr(hpcp_mod, '_copies_on_write', lambda path, dev: False, raising=False)
-	before, ino = old.read_bytes(), os.stat(str(old)).st_ino
-	lseek, fallocate, asked = os.lseek, os.posix_fallocate, []
-	def fails_there(fd, offset, whence):
-		if whence == os.SEEK_DATA and offset == 512 << 10 and os.fstat(fd).st_ino == ino:
-			raise OSError(errno.EIO, os.strerror(errno.EIO))
-		return lseek(fd, offset, whence)
-	def runs_out(fd, offset, length):
-		asked.append(offset)
-		if len(asked) == 2:
-			raise OSError(errno.ENOSPC, os.strerror(errno.ENOSPC))
-		fallocate(fd, offset, length)
-	monkeypatch.setattr(hpcp_mod.os, 'lseek', fails_there)
-	monkeypatch.setattr(hpcp_mod.os, 'posix_fallocate', runs_out)
-	with pytest.raises(hpcp_mod._KeptOld, match='no room'):
-		hpcp_mod._write_over(str(source), str(old))
-	kept = old.read_bytes() == before  # not in the assert: pytest 7's diff of 4 MiB of bytes takes minutes on 3.6
-	assert len(asked) == 2 and kept
-
-
-def test_a_copy_on_write_filesystem_is_left_to_cp(hpcp_mod, monkeypatch, tmp_path):
-	# On a nearly full btrfs an overwrite takes new room before the old blocks go: written over, the old copy was torn where
-	# cp, truncating it first, wrote it whole (VM 901, Debian 12, 48 MiB with 24 MiB free).
-	source, old = tmp_path / 's', tmp_path / 'o'
-	write(source, b'n' * (1 << 20))
-	write(old, b'o' * (1 << 20))
-	monkeypatch.setattr(hpcp_mod, '_FS_TYPES', {})
-	monkeypatch.setattr(hpcp_mod, 'get_fs_type_from_path', lambda path: 'btrfs')
-	assert hpcp_mod._write_over(str(source), str(old)) is False and old.read_bytes() == b'o' * (1 << 20)
-
-
-def test_a_source_that_ends_early_is_cut_where_it_ended(hpcp_mod, monkeypatch, tmp_path):
-	# The source is mapped once; one cut short after that (a writer truncating it) ends the copy at its new end, as cp would.
-	source, old = tmp_path / 's', tmp_path / 'o'
-	write(source, b'n' * (3 << 20))
-	write(old, b'o' * (4 << 20))
-	if not hpcp_mod.cp_supports_sparse():
-		pytest.skip('no GNU cp')
-	extents = hpcp_mod._data_extents
-	def then_cut(fd, start, end):
-		yield from extents(fd, start, end)
-		if end == 3 << 20:
-			os.truncate(str(source), (1 << 20) + 5)
-	monkeypatch.setattr(hpcp_mod, '_data_extents', then_cut)
-	assert hpcp_mod._write_over(str(source), str(old)) is True
-	assert (tmp_path / 'o').read_bytes() == b'n' * ((1 << 20) + 5)
 
 
 # ---- rule 9: a stop is a cleanup ----
@@ -1129,10 +1136,25 @@ exec cp "$@"
 '''
 
 
-def _slow_run(tmp_path, args, preexec=None):
-	"""hpcp copying four files over old copies, each cp holding a part beside its landing until tmp_path/go exists."""
+_SLOW_CP_IN_PLACE = '''#!/bin/sh
+# cp, slowed, for a rewrite in place: write a part of the copy into what it is given (the held file, /proc/PID/fd/N), say
+# so, and wait for the go file (or 60 s) before the real cp. --version and the held-file probe (cp /dev/null onto a
+# descriptor of /dev/zero) go straight to cp.
+case "$1" in --version|/dev/null) exec cp "$@";; esac
+for last; do :; done
+head -c 100 /etc/passwd > "$last"
+touch "$MARKS/$$"
+waited=0
+while [ ! -e "$GO" ] && [ $waited -lt 600 ]; do sleep 0.1; waited=$((waited + 1)); done
+exec cp "$@"
+'''
+
+
+def _slow_run(tmp_path, args, preexec=None, script=_SLOW_CP):
+	"""hpcp copying four files over old copies, each cp holding a part (beside its landing, or in it with _SLOW_CP_IN_PLACE)
+	until tmp_path/go exists."""
 	cp = tmp_path / 'slowcp'
-	cp.write_text(_SLOW_CP)
+	cp.write_text(script)
 	os.chmod(str(cp), 0o755)
 	marks = tmp_path / 'marks'
 	os.makedirs(str(marks))
@@ -1179,8 +1201,8 @@ def test_a_stop_leaves_no_temporary_file_and_ends_as_the_signal_asked(tmp_path, 
 	# verify/g.py: 9.84's prototype left complete or partial .hpcp_tmp_ files on SIGTERM and SIGINT. A SIGKILL of the main
 	# process is cleaned up by the workers' watch (SIGUSR2); a serial run killed so has nobody left to clean up.
 	if serial and signum == signal.SIGKILL:
-		pytest.skip('a serial run killed with SIGKILL leaves its temporary file: the proposed known limitation')
-	task, marks = _slow_run(tmp_path, ['-s'] if serial else ['-j', '4'])
+		pytest.skip('a serial run killed with SIGKILL leaves its temporary file: the approved known limitation')
+	task, marks = _slow_run(tmp_path, (['-s'] if serial else ['-j', '4']) + ['-wb'])
 	try:
 		_wait_for(lambda: len(os.listdir(str(marks))) >= (1 if serial else 4))
 		if how == 'group':
@@ -1197,9 +1219,44 @@ def test_a_stop_leaves_no_temporary_file_and_ends_as_the_signal_asked(tmp_path, 
 
 
 @posix_only
+@pytest.mark.parametrize('how, signum, code', [
+	('group', signal.SIGTERM, -signal.SIGTERM),
+	('main', signal.SIGTERM, -signal.SIGTERM),
+	('group', signal.SIGHUP, -signal.SIGHUP),
+	('group', signal.SIGINT, 130),
+	('main', signal.SIGKILL, -signal.SIGKILL),
+], ids=['term-group', 'term-main', 'hup-group', 'int-group', 'kill-main'])
+@pytest.mark.parametrize('serial', [False, True], ids=['parallel', 'serial'])
+def test_a_stop_during_a_rewrite_in_place_leaves_no_landing_torn(tmp_path, how, signum, code, serial):
+	# A stop while cp writes into the held file: cp is stopped, and the torn file goes with its name (_remove_torn), so each
+	# landing is old (not reached yet), new, or gone, never a part; the old copies being written are lost (the approved known
+	# limitation), the sources kept. A SIGKILL of a parallel run's main process is handled by the workers' watch; a serial run
+	# killed so leaves its landing torn (the same known limitation).
+	if serial and signum == signal.SIGKILL:
+		pytest.skip('a serial run killed with SIGKILL leaves its landing torn: the approved known limitation')
+	task, marks = _slow_run(tmp_path, ['-s'] if serial else ['-j', '4'], script=_SLOW_CP_IN_PLACE)
+	try:
+		_wait_for(lambda: len(os.listdir(str(marks))) >= (1 if serial else 4))
+		if how == 'group':
+			os.killpg(task.pid, signum)
+		else:
+			os.kill(task.pid, signum)
+		output = task.communicate(timeout=60)[0]
+		_wait_for(lambda: _group_gone(task.pid), timeout=30)
+	finally:
+		if task.poll() is None:
+			os.killpg(task.pid, signal.SIGKILL)
+	assert task.returncode == code, output[-2000:]
+	gone = [name for name in 'abcd' if not os.path.lexists(str(tmp_path / 'out' / name))]
+	assert len(gone) == (1 if serial else 4), (gone, output[-2000:])
+	assert all(read(tmp_path / 'out' / name) in ('old ' + name, 'new ' + name) for name in 'abcd' if name not in gone)
+	assert all(read(tmp_path / 'src' / name) == 'new ' + name for name in 'abcd') and temporaries(tmp_path / 'out') == []
+
+
+@posix_only
 def test_a_nohup_run_keeps_going_on_a_hangup(tmp_path):
 	# nohup starts the run with SIGHUP ignored: it stays ignored, in the workers too, as in 9.84.
-	task, marks = _slow_run(tmp_path, ['-j', '4'], preexec=lambda: signal.signal(signal.SIGHUP, signal.SIG_IGN))
+	task, marks = _slow_run(tmp_path, ['-j', '4', '-wb'], preexec=lambda: signal.signal(signal.SIGHUP, signal.SIG_IGN))
 	try:
 		_wait_for(lambda: len(os.listdir(str(marks))) >= 4)
 		os.killpg(task.pid, signal.SIGHUP)
@@ -1218,7 +1275,7 @@ def test_a_nohup_run_keeps_going_on_a_hangup(tmp_path):
 def test_a_run_started_with_sigint_ignored_cleans_up_when_its_parent_is_killed(tmp_path):
 	# A background job of a non-interactive sh on EL7 starts with SIGINT ignored. Only the watch's SIGUSR2 can stop the
 	# workers' cp once the main process is gone: _thread.interrupt_main would run SIG_IGN and raise TypeError on 3.6.
-	task, marks = _slow_run(tmp_path, ['-j', '4'], preexec=lambda: signal.signal(signal.SIGINT, signal.SIG_IGN))
+	task, marks = _slow_run(tmp_path, ['-j', '4', '-wb'], preexec=lambda: signal.signal(signal.SIGINT, signal.SIG_IGN))
 	try:
 		_wait_for(lambda: len(os.listdir(str(marks))) >= 4)
 		os.kill(task.pid, signal.SIGKILL)
@@ -1242,7 +1299,7 @@ def test_stop_handlers_keep_an_ignored_signal_ignored(hpcp_mod, monkeypatch):
 def test_a_stop_prints_no_traceback_from_workers_that_ran_no_task(tmp_path):
 	# Python 3.6 to 3.13 fork the pool's workers, and a worker has _stop before its first task: each idle one printed a
 	# KeyboardInterrupt traceback from the pool's queue (four here: four files, eight workers).
-	task, marks = _slow_run(tmp_path, ['-j', '8'])
+	task, marks = _slow_run(tmp_path, ['-j', '8', '-wb'])
 	try:
 		_wait_for(lambda: len(os.listdir(str(marks))) >= 4)
 		os.kill(task.pid, signal.SIGTERM)
@@ -1639,6 +1696,7 @@ def test_a_rewrite_is_on_disk_before_it_is_renamed_over_the_old_copy(tmp_path, h
 	# cut can leave the landing empty and the old copy gone.
 	write(tmp_path / 'a/x', 'new content')
 	write(tmp_path / 'out/x', 'old')
+	monkeypatch.setattr(hpcp_mod, 'WRITE_BESIDE', True)
 	monkeypatch.setattr(hpcp_mod, 'NAMED_DESTS', frozenset([str(tmp_path / 'out')]))
 	events = _spy_fsync_and_renames(hpcp_mod, monkeypatch)
 	hpcp_mod.copy_file(str(tmp_path / 'a/x'), [str(tmp_path / 'out/x')])
@@ -1654,6 +1712,7 @@ def test_a_rewrite_whose_new_copy_fails_to_reach_the_disk_keeps_the_old_copy(tmp
 	# it, where the same disk would fail it too), Copy failed.
 	write(tmp_path / 'a/x', 'new content, longer')
 	write(tmp_path / 'out/x', 'old')
+	monkeypatch.setattr(hpcp_mod, 'WRITE_BESIDE', True)
 	monkeypatch.setattr(hpcp_mod, 'NAMED_DESTS', frozenset([str(tmp_path / 'out')]))
 	_spy_fsync_and_renames(hpcp_mod, monkeypatch, errno.EIO)
 	hpcp_mod.copy_file(str(tmp_path / 'a/x'), [str(tmp_path / 'out/x')])
@@ -1667,10 +1726,27 @@ def test_a_filesystem_that_cannot_fsync_still_rewrites(tmp_path, hpcp_mod, reset
 	# Some FUSE filesystems answer fsync with these: the copy goes on as before 9.85.
 	write(tmp_path / 'a/x', 'new content')
 	write(tmp_path / 'out/x', 'old')
+	monkeypatch.setattr(hpcp_mod, 'WRITE_BESIDE', True)
 	monkeypatch.setattr(hpcp_mod, 'NAMED_DESTS', frozenset([str(tmp_path / 'out')]))
 	_spy_fsync_and_renames(hpcp_mod, monkeypatch, getattr(errno, error))
 	hpcp_mod.copy_file(str(tmp_path / 'a/x'), [str(tmp_path / 'out/x')])
 	assert read(tmp_path / 'out/x') == 'new content' and temporaries(tmp_path) == [] and not hpcp_mod.ERRORS
+
+
+@posix_only
+def test_a_rewrite_in_place_outside_a_move_is_not_fsynced(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	# As 9.84: a plain copy keeps its source, and an fsync per rewrite cost about 1 to 1.5 ms a file on EL7 (the approved
+	# known limitation: a power cut soon after can leave it partial or empty). A move fsyncs it (_sync_landing).
+	write(tmp_path / 'a/x', 'new content')
+	write(tmp_path / 'out/x', 'old')
+	inode = os.stat(str(tmp_path / 'out/x')).st_ino
+	monkeypatch.setattr(hpcp_mod, 'NAMED_DESTS', frozenset([str(tmp_path / 'out')]))
+	events = _spy_fsync_and_renames(hpcp_mod, monkeypatch)
+	synced = []
+	monkeypatch.setattr(hpcp_mod, '_fsync_file', synced.append)
+	hpcp_mod.copy_file(str(tmp_path / 'a/x'), [str(tmp_path / 'out/x')])
+	assert read(tmp_path / 'out/x') == 'new content' and os.stat(str(tmp_path / 'out/x')).st_ino == inode
+	assert synced == [] and events == [] and not hpcp_mod.ERRORS
 
 
 def _patch_row(hpcp_mod, monkeypatch, path, size):
