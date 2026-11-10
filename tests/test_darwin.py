@@ -285,8 +285,11 @@ def test_a_move_asks_each_destination_filesystem_once_for_a_full_flush(root, fre
 		dests = [os.path.join(root, 'out')] + ([os.path.join(volume, 'out')] if volume else [])
 		print('destinations:', dests)
 		src = os.path.join(root, 'a')
-		write(os.path.join(src, 'x'), 'one')
-		write(os.path.join(src, 'd/y'), 'two')
+		# Several -d spill: each file goes to one destination. Picked at random (-rds), 40 files land on both filesystems
+		# (all on one: 2 in 2^40).
+		files = {os.path.join('d%d' % (i % 4), 'f%d' % i): 'content %d' % i for i in range(40)}
+		for name, text in files.items():
+			write(os.path.join(src, name), text)
 		events = []
 		real_fsync, real_fcntl, real_remove = os.fsync, fcntl.fcntl, hpcp.remove_moved_sources
 		def fsync(fd):
@@ -307,7 +310,7 @@ def test_a_move_asks_each_destination_filesystem_once_for_a_full_flush(root, fre
 		monkeypatch.setattr(hpcp, 'remove_moved_sources', remove)
 		with contextlib.redirect_stdout(io.StringIO()):
 			rc = hpcp.hpcp([src + os.sep], dest_paths=[dest + os.sep for dest in dests], single_thread=True, remove=True,
-				remove_force=True)
+				remove_force=True, random_destination_selection=True)
 		monkeypatch.setattr(fcntl, 'fcntl', real_fcntl)
 		monkeypatch.setattr(hpcp.os, 'fsync', real_fsync)
 		fulls = [event for event in events if event[0] == 'full']
@@ -315,7 +318,9 @@ def test_a_move_asks_each_destination_filesystem_once_for_a_full_flush(root, fre
 			print('F_FULLFSYNC on st_dev %d: returned %r in %.6f s' % (dev, result, seconds))
 		kinds = [event[0] for event in events]
 		assert rc == 0 and not os.path.exists(src), (rc, hpcp.ERRORS)
-		assert all(read(os.path.join(dest, 'd/y')) == 'two' for dest in dests)
+		landed = {name: [dest for dest in dests if os.path.exists(os.path.join(dest, name))] for name in files}
+		assert all(len(where) == 1 and read(os.path.join(where[0], name)) == files[name] for name, where in landed.items()), landed
+		assert len({where[0] for where in landed.values()}) == len(dests), landed
 		assert sorted(dev for _, dev, _, _ in fulls) == sorted({os.stat(dest).st_dev for dest in dests}), events
 		assert all(result == 0 for _, _, result, _ in fulls), fulls
 		last_fsync = max(i for i, kind in enumerate(kinds) if kind == 'fsync')
