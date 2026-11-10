@@ -943,6 +943,23 @@ def test_content_only_carries_the_old_acl_and_drops_one_the_directory_gave(tmp_p
 	assert os.getxattr(str(tmp_path / 'out/y'), 'system.posix_acl_access') == before
 
 
+
+@pytest.mark.skipif(not hasattr(os, 'listxattr'), reason='xattrs')
+def test_content_only_carries_an_acl_that_xfs_also_lists_by_its_own_name(tmp_path, hpcp_mod, monkeypatch):
+	# Root on EL7's XFS (kernel 3.10) lists an ACL twice: system.posix_acl_access and XFS's own trusted.SGI_ACL_FILE (a default
+	# ACL: SGI_ACL_DEFAULT). The system.* name carries it; taken for an xattr hpcp cannot carry, -co -wb exited 190 for
+	# every such file. Without its system.* twin a trusted.* name still keeps the file from being carried.
+	write(tmp_path / 'f', 'x')
+	names = {'security.selinux': b'l', 'system.posix_acl_access': b'a', 'trusted.SGI_ACL_FILE': b'A',
+		'system.posix_acl_default': b'd', 'trusted.SGI_ACL_DEFAULT': b'D'}
+	monkeypatch.setattr(hpcp_mod.os, 'listxattr', lambda path, **kwargs: list(names))
+	monkeypatch.setattr(hpcp_mod.os, 'getxattr', lambda path, name, **kwargs: names[name])
+	st = os.lstat(str(tmp_path / 'f'))
+	assert hpcp_mod._co_carry(str(tmp_path / 'f'), st) == {'security.selinux': b'l', 'system.posix_acl_access': b'a',
+		'system.posix_acl_default': b'd'}
+	del names['system.posix_acl_access']
+	assert hpcp_mod._co_carry(str(tmp_path / 'f'), st) is None
+
 def shutil_which(name):
 	import shutil
 	return shutil.which(name)

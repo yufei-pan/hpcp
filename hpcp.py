@@ -3400,12 +3400,13 @@ def _written_beside(st, named):
 # What a -co rewrite carries from the old file to the new one besides user.*: the POSIX ACLs and the SELinux label.
 # security.capability is not carried: a write in place drops it (the kernel does), so the new content never gets one.
 _CO_CARRIED = ('system.posix_acl_access', 'system.posix_acl_default', 'security.selinux')
+_XFS_ACL_NAMES = {'trusted.SGI_ACL_FILE': _CO_CARRIED[0], 'trusted.SGI_ACL_DEFAULT': _CO_CARRIED[1]}  # root sees them on EL7
 
 def _co_carry(target, st):
 	"""-co: {name: value} of the xattrs a new file must get for it to stand where target (st: its lstat) is, or None when its
 	metadata cannot be carried to a new file (_cp_beside): the runner is not root and does not own it, or
-	cannot give a new file its group, or it holds an xattr hpcp cannot carry (trusted.*, security.ima, a filesystem's own).
-	listxattr failing with ENOTSUP means it has none."""
+	cannot give a new file its group, or it holds an xattr hpcp cannot carry (trusted.*, security.ima, a filesystem's own; not
+	XFS's own name for an ACL that its system.* name carries). listxattr failing with ENOTSUP means it has none."""
 	if os.name != 'posix':
 		return None
 	euid = os.geteuid()
@@ -3419,7 +3420,7 @@ def _co_carry(target, st):
 		return {} if e.errno in (errno.ENOTSUP, errno.EOPNOTSUPP) else None
 	carried = {}
 	for name in names:
-		if name == 'security.capability':
+		if name == 'security.capability' or _XFS_ACL_NAMES.get(name) in names:
 			continue
 		if not (name.startswith('user.') or name in _CO_CARRIED):
 			return None
@@ -3760,9 +3761,6 @@ def _cp_held(command, src_path, target, fd, fst, space, through_link):
 		_remove_stale_xattrs(src_path, fd)
 	return os.fstat(fd).st_blocks * 512
 
-# Why a rewrite goes beside (_cp_once): the start of its reason when the beside route fails.
-_OTHER_NAMES = 'it has other names, which a write in place would change'
-_BESIDE_ASKED = '-wb writes beside it'
 
 def _in_place_hint(target, st):
 	"""Under -wb, the end of a failed rewrite's reason where the default would have written it in place (one name, and it
@@ -3846,7 +3844,8 @@ def _cp_once(src_path, dest_path, cp_flags, sparse, space=None):
 					os.close(fd)
 		if not _written_beside(st, named):
 			return _cp_to(command, src_path, target, space if st is None else None)
-		why = _BESIDE_ASKED if WRITE_BESIDE else _OTHER_NAMES if stat.S_ISREG(st.st_mode) else None
+		# Why it goes beside: the start of the reason a failure gives.
+		why = '-wb writes beside it' if WRITE_BESIDE else 'it has other names, which a write in place would change' if stat.S_ISREG(st.st_mode) else None
 		return _cp_beside(command, src_path, target, st, why, space)
 	finally:
 		if held is not None:
