@@ -2628,3 +2628,17 @@ def test_a_named_link_the_kernel_refuses_to_follow_is_kept(tmp_path):
 	rc, output = run(['a/x', '-d', 'out/drop'], tmp_path)
 	assert rc == 190 and read(tmp_path / 'victim') == 'victim' and os.path.islink(str(tmp_path / 'out/drop')), output[-3000:]
 	assert b'cannot be followed (Permission denied)' in output, output[-3000:]
+
+
+@posix_only
+@pytest.mark.skipif(not sys.platform.startswith('linux'), reason='the probe is Linux-only')
+@pytest.mark.parametrize('answers, asked, left', [([124, 0, 1], [False, True, True], [1]), ([1, 0], [False, False], [0]), ([127, 1], [False, False], [])],
+	ids=['timeout-then-yes', 'cp-refuses', 'could-not-start-then-no'])
+def test_the_held_file_probe_keeps_only_cp_s_own_answer(hpcp_mod, monkeypatch, answers, asked, left):
+	# A probe that timed out (124) or could not start cp (127) is no answer: the next rewrite asks again. cp's own exit (0: it
+	# can open /proc/PID/fd/N, 1: it cannot) is kept for the worker's life.
+	hpcp_mod.cp_supports_sparse()  # the real cp is asked before the stub stands in for the probe's
+	monkeypatch.setattr(hpcp_mod, '_HELD', [None, False])
+	answers = list(answers)
+	monkeypatch.setattr(hpcp_mod.multiCMD, 'run_commands', lambda *args, **kwargs: [type('Task', (), {'returncode': answers.pop(0)})()])
+	assert [hpcp_mod._reaches_held() for _ in asked] == asked and answers == left

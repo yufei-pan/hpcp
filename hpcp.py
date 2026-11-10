@@ -3753,8 +3753,11 @@ def _reaches_held():
 			if sys.platform.startswith('linux') and cp_supports_sparse() and os.readlink('/proc/self') == str(pid):
 				with open('/dev/zero', 'wb') as probe:
 					# 10 s, as cp_supports_sparse waits: an empty copy takes milliseconds, and a cp that hangs so long gets no held file.
-					_HELD[1] = multiCMD.run_commands([[_bin('cp'), os.devnull, '/proc/%d/fd/%d' % (pid, probe.fileno())]], timeout=10,
-						quiet=True, return_object=True)[0].returncode == 0
+					code = multiCMD.run_commands([[_bin('cp'), os.devnull, '/proc/%d/fd/%d' % (pid, probe.fileno())]], timeout=10,
+						quiet=True, return_object=True)[0].returncode
+				_HELD[1] = code == 0
+				if code not in (0, 1):
+					_HELD[0] = None  # no answer (a timeout, a cp that could not start): asked again at the next rewrite
 	return _HELD[1]
 
 def _cp_held(command, src_path, target, fd, fst, space, through_link):
