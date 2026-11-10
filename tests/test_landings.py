@@ -1607,13 +1607,28 @@ def _wait_for(condition, timeout=60):
 
 
 def _group_gone(pgid):
+	'''No live process left in group pgid. One that ended and that nothing reaped (a zombie) counts as gone: a container whose
+	PID 1 reaps no orphan keeps a killed run's ended workers so (GitHub's job container runs `tail -f /dev/null`).'''
 	try:
 		os.killpg(pgid, 0)
 	except ProcessLookupError:
 		return True
 	except PermissionError:
 		return False
-	return False
+	if not os.path.isdir('/proc/self'):
+		return False
+	for entry in os.listdir('/proc'):
+		if not entry.isdigit():
+			continue
+		try:
+			with open('/proc/%s/stat' % entry) as handle:
+				# after the command's closing parenthesis: state, ppid, pgrp
+				state, _, group = handle.read().rsplit(')', 1)[1].split()[:3]
+		except (OSError, IndexError, ValueError):
+			continue
+		if int(group) == pgid and state != 'Z':
+			return False
+	return True
 
 
 def _each_old_or_new(tmp_path):
