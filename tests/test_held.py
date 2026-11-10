@@ -395,7 +395,9 @@ def test_a_first_copy_ends_as_cp_by_name_makes_it(tmp_path, fresh, monkeypatch, 
 			_copy_file(monkeypatch, path, tmp_path / 'named' / os.path.basename(path))
 	finally:
 		os.umask(old)
-	assert any(target.startswith(_HELD_PREFIX) for target, _, _ in seen), seen
+	if not (acl and not content_only and os.geteuid() == 0):
+		# (a root run's plain first copy of another user's file into a default-ACL directory is cp's by name, as in 9.86)
+		assert any(target.startswith(_HELD_PREFIX) for target, _, _ in seen), seen
 	cells = {os.path.basename(path): (_outcome(str(tmp_path / 'held' / os.path.basename(path))),
 		_outcome(str(tmp_path / 'named' / os.path.basename(path)))) for path in sources}
 	assert all(held == named for held, named in cells.values()), {name: cell for name, cell in cells.items() if cell[0] != cell[1]}
@@ -418,6 +420,29 @@ def test_a_root_first_copy_is_given_its_owner_only_once_written(tmp_path, fresh,
 	monkeypatch.setattr(hpcp, 'run_command_in_multicmd_with_path_check', cp)
 	_copy_file(monkeypatch, src, tmp_path / 'out/f')
 	assert owners == [0] and os.stat(str(tmp_path / 'out/f')).st_uid == 1234, owners
+
+
+@linux_only
+@root_only
+def test_a_root_first_copy_into_a_default_acl_directory_is_written_as_root_too(tmp_path, fresh, monkeypatch):
+	# There hpcp gave the new file its owner first (cp -a narrows the ACL of a file it did not make before it gives it another
+	# owner), so root's write was charged to that owner's quota, as review A's finding 4 showed without an ACL. cp makes the
+	# file by name there, as in 9.86: written as root, the owner given at the end, the directory's entries kept as cp keeps them.
+	_held_or_skip()
+	out = tmp_path / 'out'
+	out.mkdir()
+	if not _default_acl(str(out)):
+		pytest.skip('no POSIX ACLs here')
+	src = write(tmp_path / 'src/f', 'owned by someone else')
+	os.chown(src, 1234, 1234)
+	seen = []
+	real = hpcp.run_command_in_multicmd_with_path_check
+	def cp(command, *args, **kwargs):
+		seen.append((command[-1], os.stat(command[-1]).st_uid if os.path.lexists(command[-1]) else None))
+		return real(command, *args, **kwargs)
+	monkeypatch.setattr(hpcp, 'run_command_in_multicmd_with_path_check', cp)
+	_copy_file(monkeypatch, src, out / 'f')
+	assert seen == [(str(out / 'f'), None)] and os.stat(str(out / 'f')).st_uid == 1234, seen
 
 
 @linux_only

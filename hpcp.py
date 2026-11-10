@@ -4371,7 +4371,8 @@ def _cp_made(command, src_path, target, src_st, space):
 	A plain run gives the new file the source's SELinux label (_label_like) before cp writes it, and its owner and group too
 	where a default ACL gave it entries beyond its mode: cp -a gives a file it did not make another owner only after
 	narrowing its mode and ACL to the owner's (the entries go), where a file it makes keeps them. Where they cannot be given
-	(not root) and the file has such entries: None, the file removed, for cp by name as in 9.86. Without such entries cp -a
+	(not root) and the file has such entries: None, the file removed, for cp by name as in 9.86; and so for a root run of
+	another user's file, where giving it first charges root's write to that user's quota (below). Without such entries cp -a
 	gives the owner once it has written, as by name: given first, the data would be charged to the owner while it is written
 	(XFS enforces an owner's quota on a root write, not on root's chown: a user at the hard limit got Disk quota exceeded where
 	9.86 completed). A mode its owner cannot write (-co's 0444 source, a umask taking owner write) has owner write while cp
@@ -4394,12 +4395,17 @@ def _cp_made(command, src_path, target, src_st, space):
 		if not CONTENT_ONLY:
 			_label_like(src_path, fd)
 			if _has_acl(fd):
-				# Only where a default ACL gave the file entries, which cp -a would narrow away: elsewhere cp -a gives the owner
-				# once it has written, as by name, so the data is charged to the runner while it is written (XFS enforces the
-				# owner's quota on a root write, not on root's chown).
-				try:
-					os.fchown(fd, src_st.st_uid, src_st.st_gid)
-				except PermissionError:
+				# Only where a default ACL gave the file entries, which cp -a would narrow away once it gives a file it did not
+				# make another owner. Elsewhere cp -a gives the owner once it has written, as by name. A root run does not give
+				# another user the file first: the data would be charged to that owner while root writes it (XFS enforces an
+				# owner's quota on a root write, not on root's chown), so there cp makes the file by name, as in 9.86.
+				by_name = os.geteuid() == 0 and made.st_uid != src_st.st_uid
+				if not by_name:
+					try:
+						os.fchown(fd, src_st.st_uid, src_st.st_gid)
+					except PermissionError:
+						by_name = True
+				if by_name:
 					_drop_made(target, made)
 					os.close(fd)
 					return None
