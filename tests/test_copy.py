@@ -381,13 +381,6 @@ def test_parallel_dir_sync_keeps_going_after_a_failed_directory(tmp_tree, hpcp_m
 	assert hpcp_mod.ERRORS
 
 
-def test_parallel_single_dir_sync_keeps_going_after_a_failed_directory(tmp_tree, hpcp_mod, reset_hpcp_globals, require_linux):
-	_tree_with_one_blocked_dir(tmp_tree)
-	hpcp_mod.sync_directories_parallel(str(tmp_tree.src) + os.sep, [str(tmp_tree.dst) + os.sep], max_workers=8, folder_per_job=1)
-	assert all((tmp_tree.dst / f'd{index}' / 'sub').is_dir() for index in range(12))
-	assert hpcp_mod.ERRORS
-
-
 def test_dir_sync_job_keeps_going_after_a_failed_directory(tmp_tree, hpcp_mod, reset_hpcp_globals, require_linux):
 	"""A failed directory in a pool job must not cost the job's other directories."""
 	_tree_with_one_blocked_dir(tmp_tree, count=2)

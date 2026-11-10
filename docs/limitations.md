@@ -125,6 +125,30 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - **Plan:** 9.88: on macOS, each destination's type from `statfs`'s `f_fstypename`, once a destination; then `nfs`, `smbfs` and `afpfs` take the directory route.
 - **Revisit when:** 9.88.
 - **Noted:** 2026-11-08, the user's standing rule that deferrals are noted, not asked; narrowed 2026-11-10 (9.87's R3: the directory route on network filesystems, the main session's call).
+### A move's `-d` path: the parent of a new top directory is not fsynced
+- **Kind:** deferred (9.88).
+- **What the operator sees:** `hpcp src/ -d new1/new2/ -rf` with `new1` missing makes `new1` in the working directory, and the move fsyncs `new1/new2` and everything below it but not the working directory, which holds the new name `new1`. On ext4, XFS and btrfs a file's own fsync commits that name; on vfat a directory entry is written only by its directory's fsync, so a power cut soon after the move can lose the path to the moved files while their sources are gone. 9.86 fsynced none of these.
+- **Why:** the fsyncs between a destination and each landing's directory are known from the landings (9.87's review B, P4); the parent of a directory the run made is known only to the code that made it, which does not report it.
+- **Plan (9.88):** `_dest_directory` returns the first missing ancestor it made, and the move fsyncs that ancestor's parent once, with the rest.
+- **Revisit when:** 9.88.
+- **Noted:** 2026-11-10, 9.87 review B (F4, the half P4 leaves); not a regression; the main session's decision, not asked (a deferral).
+
+### A move of a directory whose mode shuts its owner out fails 212 with a misleading reason
+- **Kind:** deferred (9.88).
+- **What the operator sees:** a non-root move of a tree holding another user's directory of mode 0607 (owner `rw-`, other `rwx`: no search for its owner, the runner) with a subdirectory in it copies everything, then prints `Copy failed: the directory OUT/d/sub cannot be written to disk (Permission denied)` and exits 212, every source kept. The copy is right and nothing is lost; the reason names a write failure that did not happen. 9.86 failed the copy itself (190 or 193) and kept its sources too.
+- **Why:** the finish gives `OUT/d` mode 0607, which takes search from the runner; the move's directory fsync then reaches `d/sub` by path, and `lstat` fails with EACCES, which the fsync reports as a disk failure.
+- **Plan (9.88):** fsync at the finish, through its descriptor, every directory below one whose final mode lacks owner search: the finish goes deepest first, so the child is finished while its parent is still open (the idea of `_shut_to_its_owner` for owner read).
+- **Revisit when:** 9.88.
+- **Noted:** 2026-11-10, 9.87 review B (F5); not a regression; the main session's decision, not asked (a deferral).
+
+### A directory shared by merged sources has its times set twice, and every rerun sets them again on a coarse-time filesystem
+- **Kind:** deferred (9.88).
+- **What the operator sees:** with `hpcp a/ b/ -d out/`, each destination directory that both sources have gets two finish records: every rerun sets its times twice (and its mode twice where the sources differ), so its ctime moves each run, and in a pooled finish which source's metadata wins is not fixed. On a filesystem with coarse times (vfat 2 s, exFAT 10 ms, HFS+ 1 s) the finish compares mtime exactly, so a rerun sets every directory's times again. 9.86 set them on every run everywhere; no data is affected.
+- **Why:** the finish keeps one record per source directory, not per destination, and its mtime compare has no tolerance (a file's has, R2).
+- **Plan (9.88):** `finish_directories` keeps the last record per destination, and compares times within the filesystem's granularity as the file rule does.
+- **Revisit when:** 9.88.
+- **Noted:** 2026-11-10, 9.87 review B (F6); not a regression; the main session's decision, not asked (a deferral).
+
 ### On Python 3.6 an early stop can rarely hang the run in a pool's submit
 - **Kind:** deferred (9.88).
 - **What the operator sees:** on Python 3.6 (EL7, EL8), a Ctrl-C or SIGTERM in the first second of a copy, while its pool takes its first jobs, can leave hpcp waiting for good: every worker has ended, and a second Ctrl-C prints nothing (not even `Stopping: cleaning up first`) and SIGTERM does nothing; Ctrl-\ or `kill -9` ends it. About 3 in 2,000 early Ctrl-Cs in the 9.87 review's probe (9.86: 4 in 716). Other Pythons are not affected.

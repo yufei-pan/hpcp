@@ -585,7 +585,7 @@ def test_a_plain_copy_and_wb_make_no_full_flush(tmp_path, monkeypatch, reset_hpc
 # ---- M3: a move's fsync waits overlap (more workers by default), and a failed fsync removes only its own landing
 
 @posix_only
-def test_a_move_runs_4_workers_a_cpu_by_default(tmp_path, monkeypatch, reset_hpcp_globals):
+def test_a_move_runs_at_least_16_workers_by_default(tmp_path, monkeypatch, reset_hpcp_globals):
 	# each worker waits on its files' fsyncs: the 9.85 review's -j 16 on 4 vCPUs took 8.2 to 11.8 s against 11.9 to 15.8 s
 	seen = []
 	real = hpcp.process_copy
@@ -602,7 +602,7 @@ def test_a_move_runs_4_workers_a_cpu_by_default(tmp_path, monkeypatch, reset_hpc
 	assert hpcp.hpcp([str(tmp_path / 'out') + os.sep], dest_paths=[str(tmp_path / 'again') + os.sep], remove=True,
 		remove_force=True, max_workers=3) == 0
 	cpus = __import__('multiprocessing').cpu_count()
-	assert seen == [cpus, 4 * cpus, 3]
+	assert seen == [cpus, max(16, cpus), 3]
 
 
 @posix_only
@@ -624,3 +624,69 @@ def test_a_failed_fsync_removes_only_the_landing_it_wrote(tmp_path, monkeypatch,
 	assert rc != 0
 	assert (tmp_path / 'src' / 'f').read_text() == 'source'
 	assert (tmp_path / 'out' / 'f').read_text() == 'someone else'
+
+
+@posix_only
+@proc_fd
+def test_an_nds_move_fsyncs_the_directories_on_the_way_to_a_landing(tmp_path, monkeypatch, reset_hpcp_globals):
+	# under -nds no folder sync makes out/a and out/a/b records: each holds a new name all the same
+	src = tmp_path / 'src'
+	(src / 'a' / 'b' / 'c').mkdir(parents=True)
+	(src / 'a' / 'b' / 'c' / 'f').write_text('f')
+	events = []
+	_log_fsyncs(monkeypatch, events, src)
+	out = tmp_path / 'out'
+	rc = hpcp.hpcp([str(src) + os.sep], dest_paths=[str(out) + os.sep], single_thread=True, max_workers=1, remove=True,
+		remove_force=True, no_directory_sync=True)
+	assert rc == 0 and (out / 'a' / 'b' / 'c' / 'f').read_text() == 'f'
+	synced = sorted(path for kind, path in events if kind == 'fsync')
+	assert synced == sorted(os.path.realpath(str(path)) for path in (tmp_path, out, out / 'a', out / 'a' / 'b', out / 'a' / 'b' / 'c'))
+
+
+@posix_only
+@proc_fd
+def test_a_landing_its_owner_may_not_read_is_flushed_through_its_directory(tmp_path, monkeypatch, reset_hpcp_globals):
+	# a copy of another user's 0044 file is the runner's own and unreadable to it: 9.87's first build failed the move (212)
+	src, out = tmp_path / 'src', tmp_path / 'out'
+	(src / 'a').mkdir(parents=True)
+	(src / 'a' / 'f').write_text('f')
+	(out / 'a').mkdir(parents=True)
+	(out / 'a' / 'f').write_text('f')
+	os.chmod(str(out / 'a' / 'f'), 0o044)
+	events = []
+	_log_all(monkeypatch, events)
+	try:
+		hpcp._flush_drives([str(src / 'a' / 'f')], set(), [str(src) + os.sep], [str(out) + os.sep], False)
+	finally:
+		os.chmod(str(out / 'a' / 'f'), 0o644)
+	flushes = [event[2] for event in events if event[0] == 'flush']
+	# root opens the landing itself; anyone else its directory, on the same filesystem
+	assert flushes == [str(out / 'a' / 'f') if os.geteuid() == 0 else str(out / 'a')]
+	assert not [error for error in hpcp.ERRORS if hpcp._is_failure(error)]
+
+
+@posix_only
+@not_root
+def test_a_rerun_gives_a_restrictive_directory_its_source_s_changed_xattr(tmp_path):
+	src = tmp_path / 'src'
+	(src / 'ro').mkdir(parents=True)
+	(src / 'ro' / 'f').write_text('f')
+	try:
+		os.setxattr(str(src / 'ro'), 'user.tag', b'one')
+	except (AttributeError, OSError):
+		pytest.skip('no user xattrs here')
+	os.chmod(str(src / 'ro'), 0o555)
+	try:
+		assert run(['src/', '-d', 'out/', '-s'], tmp_path)[0] == 0
+		assert os.getxattr(str(tmp_path / 'out' / 'ro'), 'user.tag') == b'one'
+		os.chmod(str(src / 'ro'), 0o755)
+		os.setxattr(str(src / 'ro'), 'user.tag', b'two')
+		os.chmod(str(src / 'ro'), 0o555)
+		rc, output = run(['src/', '-d', 'out/', '-s'], tmp_path)
+		assert rc == 0, output[-2000:]
+		assert os.getxattr(str(tmp_path / 'out' / 'ro'), 'user.tag') == b'two'
+		assert stat.S_IMODE(os.lstat(str(tmp_path / 'out' / 'ro')).st_mode) == 0o555
+	finally:
+		for root in (src, tmp_path / 'out'):
+			if os.path.isdir(str(root / 'ro')):
+				os.chmod(str(root / 'ro'), 0o755)

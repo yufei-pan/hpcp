@@ -5547,20 +5547,23 @@ def _make_dest_directory(src_path, dest_path):
 def _sync_xattrs(src_path, dest):
 	"""Give the directory dest src_path's xattrs: stale portable ones removed (_remove_stale_xattrs' rule), and each of the
 	source's set where dest lacks it or holds another value, so a rerun sets none. The errors copystat ignores are ignored
-	(Python 3.14's set: a name the destination's filesystem or the runner may not have)."""
+	(Python 3.14's set: a name the destination's filesystem or the runner may not have). Returns whether it tried to change
+	any (an ACL is an xattr, and setting one sets the mode's group bits)."""
 	if not hasattr(os, 'listxattr'):
-		return
+		return False
 	try:
 		src_names = os.listxattr(src_path)
 		dest_names = set(os.listxattr(dest))
 	except OSError as e:
 		if e.errno not in (errno.ENOTSUP, errno.ENODATA, errno.EINVAL):
 			raise
-		return
+		return False
+	changed = False
 	wanted = set(src_names)
 	for name in dest_names:
 		if name in wanted or not _is_portable_xattr(name):
 			continue
+		changed = True
 		try:
 			os.removexattr(dest, name)
 		except OSError as e:
@@ -5571,10 +5574,12 @@ def _sync_xattrs(src_path, dest):
 			value = os.getxattr(src_path, name)
 			if name in dest_names and os.getxattr(dest, name) == value:
 				continue
+			changed = True
 			os.setxattr(dest, name, value)
 		except OSError as e:
 			if e.errno not in (errno.EPERM, errno.ENOTSUP, errno.ENODATA, errno.EINVAL, errno.EACCES):
 				raise
+	return changed
 
 def _start_directory(src_path, dest_path, st):
 	"""The directory sync's part of dest_path's metadata (src_path's lstat st): what does not stop the copy writing into it,
@@ -5585,19 +5590,29 @@ def _start_directory(src_path, dest_path, st):
 	mode, atime_ns, mtime_ns, BSD flags or None); the mode is None under -co, which sets no directory metadata."""
 	if CONTENT_ONLY:
 		return (src_path, dest_path, None, None, None, None)
-	_sync_xattrs(src_path, dest_path)
 	mode = stat.S_IMODE(st.st_mode)
 	now = os.stat(dest_path)
+	current = stat.S_IMODE(now.st_mode)
+	runner = os.geteuid() if hasattr(os, 'geteuid') else 0
+	if runner and now.st_uid == runner and current & stat.S_IRWXU != stat.S_IRWXU:
+		# A rerun meets the restrictive mode the finish gave it: opened before its xattrs, or its owner may not set them
+		# (EACCES, which copystat's rule ignores) and a source's changed xattr would never come.
+		current |= stat.S_IRWXU
+		os.chmod(dest_path, current)
+	if _sync_xattrs(src_path, dest_path):
+		now = os.stat(dest_path)
+		current = stat.S_IMODE(now.st_mode)
 	if os.name == 'posix':
 		if (now.st_uid, now.st_gid) != (st.st_uid, st.st_gid):
 			owner_kept, group_kept = _chown_like_cp(dest_path, st)
 			# chmod after chown: no set-user-ID / set-group-ID bit for an owner / group not kept (9.86's rule).
 			mode &= ~((0 if owner_kept else stat.S_ISUID) | (0 if group_kept else stat.S_ISGID))
 			now = os.stat(dest_path)
+			current = stat.S_IMODE(now.st_mode)
 		opened = mode
-		if os.geteuid() != 0 and now.st_uid == os.geteuid():
+		if runner and now.st_uid == runner:
 			opened |= stat.S_IRWXU
-		if stat.S_IMODE(now.st_mode) != opened:
+		if current != opened:
 			os.chmod(dest_path, opened)
 	return (src_path, dest_path, mode, st.st_atime_ns, st.st_mtime_ns, getattr(st, 'st_flags', None))
 
@@ -5754,8 +5769,18 @@ def _sync_moved_directories(files, link_dirs, src_paths, dests, dest_image, reco
 		directories.update(_landings(parent, by_source))
 	for _, landings in _src_to_dest_map(src_paths, dests, dest_image):
 		directories.update(os.path.dirname(os.path.normpath(landing)) for landing in landings)
+	directories = {os.path.abspath(directory) for directory in directories}
+	# The directories between a destination and each landing directory: under -nds no folder sync made them records, and a
+	# name made in one is promised to disk only by its own fsync. With the folder sync each parent is a record already: one
+	# look each.
+	roots = [os.path.abspath(dest).rstrip(os.sep) + os.sep for dest in dests]
+	for directory in sorted(directories):
+		parent = os.path.dirname(directory)
+		while parent != directory and parent not in directories and any((parent + os.sep).startswith(root) for root in roots):
+			directories.add(parent)
+			directory, parent = parent, os.path.dirname(parent)
 	# One spelling each; a destination named as a link to a directory is fsynced where it leads (_fsync_file passes a link).
-	directories = {os.path.abspath(directory) for directory in directories} - finished
+	directories -= finished
 	directories = sorted({os.path.realpath(directory) if directory in NAMED_DESTS else directory for directory in directories})
 	def sync(directory):
 		if _STOPPED_PID is not None:
@@ -5814,13 +5839,22 @@ def _flush_drives(files, directories, src_paths, dests, dest_image):
 		_check_stop()
 		where = path if os.path.isdir(path) else os.path.dirname(path)
 		try:
-			fd = os.open(path, os.O_RDONLY | getattr(os, 'O_CLOEXEC', 0))
+			try:
+				fd = os.open(path, os.O_RDONLY | getattr(os, 'O_CLOEXEC', 0))
+			except PermissionError:
+				if where == path:
+					raise
+				# A landing its owner may not read (a copy of another user's file of mode 0044, which _fsync_file opens by a
+				# chmod): its directory is on the same filesystem, and the flush is the whole device's.
+				fd = os.open(where, os.O_RDONLY | getattr(os, 'O_CLOEXEC', 0))
 			try:
 				fcntl.fcntl(fd, command)
 			finally:
 				os.close(fd)
 		except OSError as e:
-			if e.errno in _NO_FULL_FLUSH:
+			# PermissionError: neither that landing nor its directory opens for this run (another user's write-only drop box),
+			# so the drive cannot be asked through it, as the approved drop-box entry passes over its fsync.
+			if e.errno in _NO_FULL_FLUSH or isinstance(e, PermissionError):
 				print(f'Note: the drive under {where} could not be asked to flush its cache ({_why(e)}): a power cut soon after '
 					'this move can lose files whose sources are removed', file=sys.stderr)
 			else:
@@ -5858,96 +5892,6 @@ def sync_directory_metadata_bulk_batch(jobs):
 		symLinks.update(rtnSymLinks)
 		records += done
 	return total_count, total_time, symLinks, records
-
-def sync_directories_parallel(src, dests, max_workers, verbose=False,folder_per_job=64,exclude=None,parallel_file_listing=False):
-	global FILES_RATE_LIMIT
-	global BYTES_RATE_LIMIT
-	if FILES_RATE_LIMIT or BYTES_RATE_LIMIT:
-		max_scheduled_jobs = max_workers
-	else:
-		max_scheduled_jobs = max_workers * 1.1
-	dests = _validate_paths(src, dests)
-	if dests is None:
-		return 0, 0, set(), frozenset()
-	symLinks = {}
-	if exclude and is_excluded(src,exclude):
-		return 0, 0 , set(), frozenset()
-	# 
-	if not os.path.isdir(src):
-		_, _ , symLinks = copy_file(src, dests)
-		return symLinks
-	records = _sync_directory(src, dests)[3]
-	_,_,_,folders  = get_file_list(src, max_workers=max_workers,exclude=exclude,parallel_file_listing=parallel_file_listing)
-	folder_list_iterator = iter(folders)
-	futures = {}
-	start_time = time.monotonic()
-	last_refresh_time = start_time
-	max_workers = max(2,int(max_workers / 4))
-	folder_per_job = max(1,folder_per_job)
-	num_folders_copied_this_job = 0
-
-	print(f"Syncing Dir from {src} to {dests} with {max_workers} workers")
-	apb = Adaptive_Progress_Bar(total_count=len(folders),total_size=len(folders),suppress_all_output=verbose,process_word='Synced',bytes_rate_limit=BYTES_RATE_LIMIT,files_rate_limit=FILES_RATE_LIMIT)
-	with _copy_pool(max_workers) as executor:
-		while folder_list_iterator or futures:
-			# counter = 0
-			while folder_list_iterator and len(futures) <  max_scheduled_jobs and apb.under_rate_limit():
-				src_folders = []
-				try:
-					for _ in range(folder_per_job):
-						src_folder = next(folder_list_iterator)
-						src_folders.append(src_folder)
-					future = _submit_task(executor, sync_directory_metadata_bulk, src_folders, dests,src)
-					futures[future] = src_folders
-					# counter += 1
-				except StopIteration:
-					if src_folders:
-						future = _submit_task(executor, sync_directory_metadata_bulk, src_folders, dests,src)
-						futures[future] = src_folders
-					folder_list_iterator = None
-
-			done = _wait(futures, executor)
-			time_spent_this_iter = 0
-			for future in done:
-				src_folders = futures.pop(future)
-				num_folders_copied_this_job = len(src_folders)
-				cpSize, cpTime, rtnSymLinks, done_records = _task_result(future, (0, 0, {}, []), 'Copy process crashed')
-				time_spent_this_iter += cpTime
-				apb.update(num_files=num_folders_copied_this_job, cpSize=cpSize, cpTime=cpTime , files_per_job=folder_per_job)
-				symLinks.update(rtnSymLinks)
-				records += done_records
-			apb.scheduled_jobs = len(futures)
-			apb.print_progress()
-			if done:
-				if verbose:
-						print(f'\nAverage cptime is {time_spent_this_iter / len(done):0.2f} for {len(done)} jobs with {num_folders_copied_this_job} folders each')
-
-				if folder_list_iterator and num_folders_copied_this_job == folder_per_job and (time_spent_this_iter / len(done) > 5 or time.monotonic() - last_refresh_time > 5):
-					folder_per_job //= MAGIC_NUMBER
-					folder_per_job = round(folder_per_job)
-					if verbose:
-						print(f'\nCompletion time is long, changing folders per job to {folder_per_job}')
-				elif folder_list_iterator and num_folders_copied_this_job == folder_per_job and time_spent_this_iter / len(done) < 1:
-					folder_per_job *= MAGIC_NUMBER
-					folder_per_job = round(folder_per_job)
-					if verbose:
-						print(f'\nCompletion time is short, changing folders per job to {folder_per_job}')
-				if folder_per_job < 1:
-					folder_per_job = 1
-			else:
-				if not apb.under_rate_limit():
-					if verbose:
-						print('\nWe had hit the rate limit and no job is running currently, setting folders per job to 1')
-					folder_per_job = 1
-				time.sleep(apb.refresh_interval)
-			last_refresh_time = time.monotonic()
-
-	endTime = time.monotonic()
-	apb.stop()
-	_print_operation_summary(apb, endTime - start_time, unit='folder', show_bandwidth=True)
-	# A sync on its own puts nothing in the directories: they are finished at once.
-	finish_directories(records, max_workers)
-	return symLinks
 
 def sync_directories_parallel_batch(jobs, max_workers, verbose=False,folder_per_job=64,exclude=None,parallel_file_listing=False):
 	global FILES_RATE_LIMIT
@@ -6038,54 +5982,6 @@ def sync_directories_parallel_batch(jobs, max_workers, verbose=False,folder_per_
 	apb.stop()
 	_print_operation_summary(apb, endTime - start_time, unit='folder', show_bandwidth=True)
 	return symLinks, records
-
-def sync_directories_serial(src, dests,exclude=None):
-	"""
-	Synchronizes directories from source to destination in a single thread.
-
-	Args:
-		src (str): The source directory path.
-		dest (str): The destination directory path.
-		exclude (list, optional): A list of patterns to exclude from synchronization.
-
-	Returns:
-		tuple: A tuple containing:
-			- int: Number of directories synced (always 0 in this implementation).
-			- int: Total size of directories synced in bytes (always 0 in this implementation).
-			- set: Set of synchronized directories (always empty in this implementation).
-			- frozenset: Set of symbolic links (always empty in this implementation).
-
-	Notes:
-		- If the source or destination path length exceeds 4096 characters, the function will skip synchronization.
-		- If the source path is excluded based on the exclude patterns, the function will skip synchronization.
-		- The function prints progress information to the terminal, including the number of directories synced and the speed of synchronization.
-	"""
-	global FILES_RATE_LIMIT
-	global BYTES_RATE_LIMIT
-	dests = _validate_paths(src, dests)
-	if dests is None:
-		return 0, 0, set(), frozenset()
-	if exclude and is_excluded(src,exclude):
-		return 0, 0 , set(), frozenset()
-	symLinks = {}
-	if not os.path.isdir(src):
-		_, _ , symLinks = copy_file(src, dests)
-		return symLinks
-	#sync_directory_metadata(src, dest)
-	_,_,_,folders = get_file_list(src,exclude=exclude,parallel_file_listing=False)
-	print(f"Syncing Dir from {src} to {dests} in single thread")
-	apb = Adaptive_Progress_Bar(total_count=len(folders),total_size=len(folders),process_word='Synced',bytes_rate_limit=BYTES_RATE_LIMIT,files_rate_limit=FILES_RATE_LIMIT)
-	records = []
-	for folder in folders:
-		source_relative_path = os.path.relpath(folder, src)
-		count, cpTime, _, done = _sync_directory(folder, [_below(dest, source_relative_path) for dest in dests])
-		records += done
-		apb.update(num_files=1, cpSize=count, cpTime=cpTime , files_per_job=1)
-		apb.rate_limit()
-	apb.stop()
-	# A sync on its own puts nothing in the directories: they are finished at once.
-	finish_directories(records, 1)
-	return symLinks
 
 def sync_directories_serial_batch(jobs,exclude=None):
 	global FILES_RATE_LIMIT
@@ -13859,7 +13755,7 @@ def get_args(args = None):
 	parser = argparse.ArgumentParser(description='Copy files from source to destination',
 								  epilog=f'Found bins: {list(_binPaths.values())}\n Missing bins: {_binCalled - set(_binPaths.keys())}')
 	parser.add_argument('-s', '--single_thread', action='store_true', help='Use serial processing')
-	parser.add_argument('-j','-m','-t','--max_workers', type=int, default=None, help='Max workers for parallel processing. Default is 1 * CPU count, and 4 * CPU count for a move (-rm, -rf), whose workers wait on their fsyncs. Use negative numbers to indicate {n} * CPU count, 0 means 1/2 CPU count.')
+	parser.add_argument('-j','-m','-t','--max_workers', type=int, default=None, help='Max workers for parallel processing. Default is 1 * CPU count, and at least 16 for a move (-rm, -rf), whose workers wait on their fsyncs. Use negative numbers to indicate {n} * CPU count, 0 means 1/2 CPU count.')
 	batch_group = parser.add_mutually_exclusive_group()
 	batch_group.add_argument('-b','--batch',action='store_true', help='Batch mode, process all files in one go',default=True)
 	batch_group.add_argument('-nb','--no_batch','--sequential',action='store_false', dest='batch', help='Do not use batch mode', default=False)
@@ -13962,9 +13858,11 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = None,
 	MIRROR_FS_PARAMS = not no_fs_param_mirror
 	remove = remove or remove_force
 	if max_workers is None:
-		# A move's worker waits on each file's fsync before its next copy: 4 workers a CPU keep the disk busy (the 9.85 review's
-		# -j 16 on a 4-vCPU EL8 VM: 2,000 files of 4 KiB in 8.2 to 11.8 s against 11.9 to 15.8 s with -j 4).
-		max_workers = (4 if remove else 1) * multiprocessing.cpu_count()
+		# A move's worker waits on each file's fsync before its next copy: at least 16 workers keep the disk busy (the 9.85
+		# review's -j 16 on 2- and 4-vCPU VMs: 2,000 files of 4 KiB in about half the time of -j 2 or 4). The fsyncs in flight are
+		# the disk's need, not the CPUs': on 32 CPUs and a fast disk, 4 a CPU (128 workers) made a 2,000-file move 20% (3.14) to
+		# 45% (3.6) slower than 32, and 3.6 to 3.8 start every worker of a pool at once (a 100-file move: 0.60 s against 0.32 s).
+		max_workers = max(16, multiprocessing.cpu_count()) if remove else multiprocessing.cpu_count()
 	if random_destination_selection:
 		RANDOM_DESTINATION_SELECTION = True
 		print("Random destination selection enabled.")
