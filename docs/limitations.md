@@ -166,6 +166,14 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - **Revisit when:** 9.87.
 - **Noted:** 2026-11-09, found in the 9.85 re-review; the main session's decision, not asked (a deferral).
 
+### On Python 3.6 an early stop can rarely hang the run in a pool's submit
+- **Kind:** deferred (9.88).
+- **What the operator sees:** on Python 3.6 (EL7, EL8), a Ctrl-C or SIGTERM in the first second of a copy, while its pool takes its first jobs, can leave hpcp waiting for good: every worker has ended, and a second Ctrl-C prints nothing (not even `Stopping: cleaning up first`) and SIGTERM does nothing; Ctrl-\ or `kill -9` ends it. About 3 in 2,000 early Ctrl-Cs in the 9.87 review's probe (9.86: 4 in 716). Other Pythons are not affected.
+- **Why:** 3.6's `ProcessPoolExecutor.submit` wakes its manager thread through the result queue, under that queue's write lock, which the workers share. A worker that the same Ctrl-C ended can leave that lock held (its stop raised in `SemLock.__enter__`, after it took the semaphore and before `with` armed its exit), and the parent then waits on it with its stops blocked (`_pool.submit`'s mask, which keeps a 3.6 worker's start closed to stops). The review tried letting the parent's stop raise inside 3.6's `submit` (it cut multiprocessing's own bookkeeping and printed new tracebacks) and raising only from the lock wait (it still hung): each made something else worse.
+- **Plan (9.88):** hpcp owns the 3.6 wakeup: on 3.6 only, its own `submit` takes the result queue's write lock with a timed acquire in a loop, the stops staying blocked as now, and each pass reads `signal.sigpending()`; a pending stop raises before anything is taken.
+- **Revisit when:** 9.88.
+- **Noted:** 2026-11-10, found by the 9.87 group 1 review (F1); not a regression (9.86 hung more often); the main session's decision, not asked (a deferral).
+
 ### A stopped run waits for a worker whose file operation never returns
 - **Kind:** known limitation.
 - **What the operator sees:** after Ctrl-C, SIGTERM or SIGHUP, a worker inside a write or fsync that never returns holds the run (for example a dead hard-mounted NFS server, or a disk in an uninterruptible wait). hpcp prints `Waiting for N worker(s) still finishing a file (pids ...): Ctrl-\ ends hpcp now, which may leave a temporary file or a torn file there`. Ctrl-\ ends it at once, and can leave that worker's temporary file or a torn file. Nothing is removed from the sources.
