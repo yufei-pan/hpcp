@@ -875,6 +875,9 @@ _IN_TASK = False
 _MAIN_PID = None
 # True once this process is ending (_end_by): a stop then changes nothing.
 _ENDING = False
+# True while a call makes a file that nothing yet holds the name of (_cp_made's landing, the test file of tempfile.gettempdir in
+# _held_route): a stop is then only recorded (_stop), and raised there once the file is known or removed.
+_MAKING = False
 # Twice multiCMD's longest stop of a command (0.01 s, up to 1 s, SIGKILL, up to 1 s more): the watch's grace before os._exit;
 # after a stop, how long a pool's worker between tasks may take to end before it is killed (_pool); and how long a pool may
 # stay silent after one of its workers died before the run ends (_pool.watch).
@@ -930,7 +933,8 @@ def _stop(signum, frame):
 	cleaned up); later ones return, so a second Ctrl-C cannot cut the cleanup halfway (the parent says so once, naming
 	Ctrl-\\). The stop is passed on to this process's pool workers, which a signal to this process alone (kill PID, timeout)
 	never reaches. A pool worker between tasks has nothing to clean up and ends at once. In the parent inside a pool region
-	(_DEFER) the first stop is only recorded: the region's loop raises it (_check_stop)."""
+	(_DEFER) the first stop is only recorded: the region's loop raises it (_check_stop). So it is while a call makes a file that
+	nothing holds the name of yet (_MAKING): the call raises it once the file is known or removed."""
 	global _STOPPED, _STOPPED_PID, _STOP_NOTED
 	if _ENDING:
 		return
@@ -963,6 +967,10 @@ def _stop(signum, frame):
 	_STOPPED, _STOPPED_PID = signum, os.getpid()
 	_pass_stop_on(signum)
 	if _DEFER and os.getpid() == _MAIN_PID:
+		return
+	if _MAKING:
+		# Raised as os.open returns, it would leave the file just made with nothing holding its name: the caller (_cp_made,
+		# _held_route) raises it.
 		return
 	if _DROPPING and _in_dropping_call(frame):
 		# Python would drop the raise, and 3.6 and 3.7 print it as 'Exception ignored' with its traceback. Recorded, it is acted
@@ -4235,6 +4243,7 @@ def _held_route():
 	keeps no answer (asked again at the next copy, as cp_supports_sparse); a cp that fails or writes elsewhere, or no
 	temporary file (tempfile's TMPDIR, /tmp, /var/tmp, /usr/tmp and the working directory), is None. Both temporary files
 	go whatever happens."""
+	global _MAKING
 	pid = os.getpid()
 	if _HELD[0] == pid:
 		return _HELD[1]
@@ -4252,9 +4261,19 @@ def _held_route():
 		return None
 	source = None
 	try:
+		# The first call makes and removes a test file in the directory it tries (CPython: 8 characters, 4 bytes), which a stop in
+		# between leaves (14 of 9,900 early stops of the final review's probe; 9.86 made no file): it is only recorded while
+		# the call runs (_MAKING, as for the file _cp_made makes) and raised after it.
+		_MAKING = True
+		try:
+			directory = tempfile.gettempdir()
+		finally:
+			_MAKING = False
+			if _STOPPED_PID == os.getpid():
+				raise KeyboardInterrupt
 		# Named before it is made, so the finally removes whatever a stop leaves: mkstemp gives the name only after making the
 		# file, and a stop in between left it (about 3% of early Ctrl-Cs on Python 3.6 and 3.7, one file per worker hit).
-		source = os.path.join(tempfile.gettempdir(), 'hpcp-held-probe-%d-%s' % (os.getpid(), uuid.uuid4().hex[:16]))
+		source = os.path.join(directory, 'hpcp-held-probe-%d-%s' % (os.getpid(), uuid.uuid4().hex[:16]))
 		handle = os.open(source, _NEW_FILE_FLAGS, 0o600)
 		try:
 			os.write(handle, b'c')
@@ -4357,11 +4376,21 @@ def _cp_made(command, src_path, target, src_st, space):
 	(XFS enforces an owner's quota on a root write, not on root's chown: a user at the hard limit got Disk quota exceeded where
 	9.86 completed). A mode its owner cannot write (-co's 0444 source, a umask taking owner write) has owner write while cp
 	writes, which cp's reopen needs; -co puts the mode back."""
+	global _MAKING
 	src_st = src_st or os.lstat(src_path)
-	fd = os.open(target, _NEW_FILE_FLAGS, _new_file_mode(src_st))
-	made = None
+	fd = made = None
 	try:
-		made = os.fstat(fd)
+		# A stop is only recorded while the file is made (_stop) and raised here once it is known, or the create has failed: one
+		# raised as os.open returned left the file, empty, at the landing, with nothing to say it was this run's (1 early stop
+		# in 20 on a busy host, 1 in 240 on a quiet one, on every Python; 9.86's cp by name left none).
+		_MAKING = True
+		try:
+			fd = os.open(target, _NEW_FILE_FLAGS, _new_file_mode(src_st))
+			made = os.fstat(fd)
+		finally:
+			_MAKING = False
+			if _STOPPED_PID == os.getpid():
+				raise KeyboardInterrupt
 		if not CONTENT_ONLY:
 			_label_like(src_path, fd)
 			if _has_acl(fd):
@@ -4384,7 +4413,8 @@ def _cp_made(command, src_path, target, src_st, space):
 	except BaseException:
 		if made is not None:
 			_drop_made(target, made)
-		os.close(fd)
+		if fd is not None:
+			os.close(fd)
 		raise
 
 def _cp_new(command, src_path, target, src_st, space):

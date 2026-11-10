@@ -637,6 +637,84 @@ def test_a_stop_as_the_probe_makes_its_file_leaves_nothing(tmp_path, fresh, monk
 	assert os.listdir(probes) == []
 
 
+def _as_the_main_process(monkeypatch):
+	'''hpcp's stop handler as the main process's, with no stop recorded yet and no pool worker to pass it on to.'''
+	for name, value in (('_MAIN_PID', os.getpid()), ('_STOPPED', None), ('_STOPPED_PID', None), ('_STOP_ACTED', False), ('_DEFER', 0),
+			('_pass_stop_on', lambda signum: None)):
+		monkeypatch.setattr(hpcp, name, value)
+
+
+@linux_only
+def test_a_stop_as_tempfile_makes_its_test_file_leaves_nothing(tmp_path, fresh, monkeypatch):
+	# tempfile.gettempdir, which the probe calls once a run, makes a 4-byte file in the directory it tries and removes it. A stop
+	# whose handler raised as that create returned left the file (8 random characters, in TMPDIR): 14 of 9,900 early stops of
+	# the final review's probe, none of 9.86's, which made no temporary file. The stop is recorded there, and raised after.
+	import signal
+	_gnu_cp_or_skip()
+	directory = tmp_path / 'tmp'
+	directory.mkdir()
+	monkeypatch.setenv('TMPDIR', str(directory))
+	monkeypatch.setattr(tempfile, 'tempdir', None)
+	_as_the_main_process(monkeypatch)
+	real = os.open
+	def stopped(path, flags, *args, **kwargs):
+		fd = real(path, flags, *args, **kwargs)
+		if os.path.dirname(str(path)) == str(directory) and flags & os.O_CREAT:
+			try:
+				hpcp._stop(signal.SIGINT, None)
+			except BaseException:
+				os.close(fd)  # the descriptor a raise here loses
+				raise
+		return fd
+	monkeypatch.setattr(os, 'open', stopped)
+	with pytest.raises(KeyboardInterrupt):
+		hpcp._held_route()
+	monkeypatch.setattr(os, 'open', real)
+	assert os.listdir(str(directory)) == [] and not hpcp._MAKING
+
+
+@posix_only
+@pytest.mark.parametrize('content_only', [False, True], ids=['plain', 'content-only'])
+def test_a_stop_as_a_first_copy_s_file_is_made_leaves_no_empty_file(tmp_path, monkeypatch, reset_hpcp_globals, content_only):
+	# A stop's handler runs as os.open returns: raising there, it took the descriptor with it before _cp_made knew the file,
+	# and the landing stayed, empty and mode 0600 (final review: 100 of 2,100 early stops on a busy host, 3.6, 3.7 and 3.14;
+	# 9.86, whose cp made the file, none of 2,100). The stop is recorded while the file is made, and raised once it is known.
+	import signal
+	source = write(tmp_path / 'a' / 'x', 'data')
+	(tmp_path / 'out').mkdir()
+	target = str(tmp_path / 'out' / 'x')
+	hpcp.CONTENT_ONLY = content_only
+	_as_the_main_process(monkeypatch)
+	real = os.open
+	def stopped(path, flags, *args, **kwargs):
+		fd = real(path, flags, *args, **kwargs)
+		if path == target:
+			try:
+				hpcp._stop(signal.SIGINT, None)
+			except BaseException:
+				os.close(fd)  # the descriptor a raise here loses
+				raise
+		return fd
+	monkeypatch.setattr(os, 'open', stopped)
+	with pytest.raises(KeyboardInterrupt):
+		hpcp._cp_made(['cp', '-f' if content_only else '-af'], source, target, None, None)
+	monkeypatch.setattr(os, 'open', real)
+	assert not os.path.lexists(target) and not hpcp._MAKING
+	# A create that fails (a name is there) while a stop is recorded: the stop is raised, not kept for the task's end.
+	write(target, 'put there since')
+	for name, value in (('_STOPPED', None), ('_STOPPED_PID', None), ('_STOP_ACTED', False)):
+		monkeypatch.setattr(hpcp, name, value)
+	def taken(path, flags, *args, **kwargs):
+		if path == target:
+			hpcp._stop(signal.SIGINT, None)
+		return real(path, flags, *args, **kwargs)
+	monkeypatch.setattr(os, 'open', taken)
+	with pytest.raises(KeyboardInterrupt):
+		hpcp._cp_made(['cp', '-f' if content_only else '-af'], source, target, None, None)
+	monkeypatch.setattr(os, 'open', real)
+	assert read(target) == 'put there since' and not hpcp._MAKING
+
+
 class _CapturingExecutor:
 	def __init__(self):
 		self.submitted = []
