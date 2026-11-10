@@ -287,3 +287,19 @@ def test_a_content_only_rerun_copies_only_what_changed(tmp_path):
 	assert (tmp_path / 'out' / 'f2').read_bytes() == bytes(data)
 	again = _mtimes(tmp_path / 'out')
 	assert again['f2'] != first['f2'] and {k: v for k, v in again.items() if k != 'f2'} == {k: v for k, v in first.items() if k != 'f2'}
+
+
+# ---- A8: -rme judges directories by the copy's folders (entry 10)
+
+@posix_only
+@pytest.mark.parametrize('flags', [[], ['-nds']], ids=['synced', 'no-directory-sync'])
+def test_rme_removes_an_extra_directory_named_like_one_beside_a_source(tmp_path, flags):
+	# 9.86 judged a directory by its path below each source's parent: zzz beside b (in the working directory) kept out/zzz.
+	for path in ('a/sub', 'b/inner', 'zzz', 'out/zzz', 'out/b/gone'):
+		(tmp_path / path).mkdir(parents=True)
+	(tmp_path / 'a' / 'sub' / 'f').write_text('f')
+	(tmp_path / 'b' / 'inner' / 'g').write_text('g')
+	rc, output = run(['a/', 'b', '-d', 'out/', '-rme'] + flags, tmp_path)
+	assert rc == 0, output[-3000:]
+	assert not (tmp_path / 'out' / 'zzz').exists() and not (tmp_path / 'out' / 'b' / 'gone').exists(), output[-3000:]
+	assert (tmp_path / 'out' / 'sub' / 'f').read_text() == 'f' and (tmp_path / 'out' / 'b' / 'inner' / 'g').read_text() == 'g'

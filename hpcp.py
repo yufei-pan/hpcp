@@ -9974,13 +9974,32 @@ def _in_root_lost_and_found(path, dest_root):
 		path = os.path.dirname(path)
 	return False
 
-def remove_extra_dirs(src_paths, dests,exclude=None,dest_image=False,keep=(),dest_roots=None,listed=None,named=None):
+def _covered_directories(src_paths, dests, dest_image=False, exclude=None, max_workers=56, parallel_file_listing=True):
+	"""The destination directories a copy of src_paths into dests covers, as absolute paths, judged as -rme judges a file (by
+	where the copy put it, _landings): where each directory of a directory source landed (from the source's listing, which a
+	run's copy has cached), and each source's landing with every directory on the way to it (-di's parents, a list's)."""
+	mapping = _src_to_dest_map(src_paths, dests, dest_image)
+	by_source = _by_source(mapping)
+	covered = set()
+	for _, actual_dests in mapping:
+		for actual_dest in actual_dests:
+			covered.update(_path_and_parents(actual_dest))
+	for src in src_paths:
+		if not src or os.path.islink(src) or not os.path.isdir(src) or (exclude and is_excluded(_listed_root(os.path.abspath(src)), exclude)):
+			continue
+		folders = get_file_list(src, max_workers=max_workers, exclude=exclude, parallel_file_listing=parallel_file_listing)[3]
+		for folder in folders:
+			covered.update(_landings(os.path.abspath(folder), by_source))
+	return covered
+
+def remove_extra_dirs(src_paths, dests,exclude=None,dest_image=False,keep=(),dest_roots=None,named=None,covered=None):
 	"""
 	Removes extra directories in destination that are not present in the source paths.
 
-	A destination directory is kept when its source counterpart exists: dirname(src) + its path below dest, or with
-	dest_image (process_copy's -di layout: each source at dest + its absolute path) when '/' + its path below dest is
-	a source, a parent of one, or below one and still there.
+	A destination directory is the copy's when the copy covers it (covered: _covered_directories, which hpcp() takes from
+	the copy's listings before -rme's file removal clears them; else listed here): where a directory of a directory source
+	landed, or on the way to a source's landing. One under another spelling (case, normal form) is the copy's too, where
+	the destination reads both as one name. Judged only below where a directory source lands (all of a -di image).
 	Excluded directories, mount points and a filesystem's own lost+found, with everything below them, are left alone,
 	and so are symlinks and the link targets create_sym_links tracked (keep, see _kept_paths); a directory that still
 	holds entries (excluded files, say) is kept.
@@ -10006,23 +10025,14 @@ def remove_extra_dirs(src_paths, dests,exclude=None,dest_image=False,keep=(),des
 			eprint(f'All destination paths are too long: Skipping {src_paths}')
 		return 0, 0, set(), frozenset()
 	mapping = _src_to_dest_map(src_paths, dests, dest_image)
-	# With a list, only what its directories cover is judged (see remove_extra_files).
-	listed_scope = None
-	if _has_listed(src_paths) if listed is None else listed:
-		mapping = _directory_sources(mapping)
-		listed_scope = {}
-		for src_abs, actual_dests in mapping:
-			for actual_dest in actual_dests:
-				listed_scope.setdefault(actual_dest, []).append(src_abs)
-	# Positional sources too: only below where a directory source lands (see remove_extra_files); -di is judged whole.
-	scope = None if listed_scope is not None or dest_image else {actual_dest for _, actual_dests in _directory_sources(mapping) for actual_dest in actual_dests}
+	if covered is None:
+		covered = _covered_directories(src_paths, dests, dest_image, exclude)
+	# Only below where a directory source lands (a list's directories, as remove_extra_files); -di is judged whole.
+	scope = None if dest_image else {actual_dest for _, actual_dests in _directory_sources(mapping) for actual_dest in actual_dests}
 	guarded = _source_guard(src_paths if named is None else named)
 	kept = _kept_paths(keep, mapping)
 	copied_roots = {actual_dest for _, actual_dests in mapping for actual_dest in actual_dests}
 	excluded_roots = _excluded_roots(mapping, exclude)
-	# leave out excluded source paths (a filtered copy: the caller's list is not touched)
-	src_paths = [src_path for src_path in src_paths if not (exclude and is_excluded(src_path,exclude))]
-	source_roots = [os.path.abspath(src_path) for src_path in src_paths]
 	# {extra directory: (the destination root it lies below, its name as the walk spells it)}; each destination's
 	# identity before the walk (pinned before the copy when hpcp() runs it, see remove_extra_files): one that now leads
 	# elsewhere is not cleaned.
@@ -10031,8 +10041,6 @@ def remove_extra_dirs(src_paths, dests,exclude=None,dest_image=False,keep=(),des
 		dest_roots = _destination_roots(dests)
 	dests = [dest for dest in dests if os.path.abspath(dest) in dest_roots]
 	visible_mounts = _visible_mount_points()
-	source_listings = {}
-	places = _RealPlaces()
 	print(pformat(dests))
 	for dest in dests:
 		# Another filesystem below it (a mount or bind mount, another device), as remove_extra_files' listing.
@@ -10073,27 +10081,33 @@ def remove_extra_dirs(src_paths, dests,exclude=None,dest_image=False,keep=(),des
 					print(f"Skipping lost+found: {dest_dir_path}")
 					continue
 				walk_into.append(dirname)
-				relative_path = os.path.relpath(dest_dir_path, dest)
-				# Check if the directory exists in the source paths
-				if listed_scope is not None:
-					in_source = _in_listed_source(os.path.abspath(dest_dir_path), listed_scope)
-				elif dest_image:
-					# The image mirrors this run's sources at their absolute paths: a directory is theirs when it lies on
-					# the way to one (a parent process_copy created) or below one and still exists there.
-					live_path = os.path.join(os.path.sep, relative_path)
-					in_source = any(source == live_path or source.startswith(live_path.rstrip(os.sep) + os.sep)
-						or (live_path.startswith(source.rstrip(os.sep) + os.sep) and os.path.exists(live_path)) for source in source_roots)
-				else:
-					in_source = any(os.path.exists(os.path.join(os.path.dirname(src_path), relative_path)) or
-						_landing_in_other_spelling(os.path.dirname(src_path) or os.curdir, dest, relative_path, source_listings, places) for src_path in src_paths)
-				if (not in_source and not _is_kept(os.path.abspath(dest_dir_path), kept, os.path.abspath(dest), copied_roots)
-						and (scope is None or any(part in scope for part in _path_and_parents(os.path.abspath(dest_dir_path))))):
-					if guarded(dest_dir_path, 'dir'):
-						print(f"Not removing {dest_dir_path}: it is a source or lies in one")
-					else:
-						extraDirs[os.path.abspath(dest_dir_path)] = (os.path.abspath(dest), dest_dir_path)
+				path = os.path.abspath(dest_dir_path)
+				if (path not in covered and not _is_kept(path, kept, os.path.abspath(dest), copied_roots)
+						and (scope is None or any(part in scope for part in _path_and_parents(path)))):
+					extraDirs[path] = (os.path.abspath(dest), dest_dir_path)
 			# Excluded trees and other filesystems are never walked into.
 			dirnames[:] = walk_into
+	# A destination may read two spellings of a name (case, normal form) as one: a covered directory is then listed under the
+	# spelling that was there first. Asked of the destination (_RealPlaces: one probe a directory, for all its spellings); one
+	# that cannot be asked keeps it.
+	if extraDirs:
+		folds = {_folded(path): [] for path in extraDirs}
+		roots = tuple(os.path.abspath(dest).rstrip(os.sep) + os.sep for dest in dests)
+		for path in covered:
+			if path.startswith(roots):
+				kin = folds.get(_folded(path))
+				if kin is not None:
+					kin.append(path)
+		pairs = [(path, other) for path in extraDirs for other in folds[_folded(path)] if other != path]
+		if pairs:
+			places = _RealPlaces()
+			places.expect(itertools.chain.from_iterable(pairs))
+			for path in {path for path, other in pairs if places.same_place(path, other) is not False}:
+				del extraDirs[path]
+	for path, (_, name) in list(extraDirs.items()):
+		if guarded(name, 'dir'):
+			print(f"Not removing {name}: it is a source or lies in one")
+			del extraDirs[path]
 	# Once the walks have entered them all (one on another device then is no longer here).
 	for _, name in extraDirs.values():
 		print(f"Deleting extra directory: {name}")
@@ -10101,30 +10115,6 @@ def remove_extra_dirs(src_paths, dests,exclude=None,dest_image=False,keep=(),des
 	ordered = sorted(extraDirs, key=lambda path: (-len(pathlib.Path(path).parts), path))
 	_remove_listed_files(_items_below(((directory, extraDirs[directory][0]) for directory in ordered), dest_roots, sort=False), rmdir=True,
 		one_filesystem=True)
-
-def _landing_in_other_spelling(source, dest, relative, listings, places):
-	"""Does a directory below source land at dest/relative under another spelling of its name (case, normal form)? A destination
-	that reads both as one name has the one directory, and the source's own spelling is not extra. Asked of the destination
-	directory (places, a _RealPlaces), part by part, for the names that fold alike, all at once; one that cannot be asked
-	keeps it. Each directory the source has of that name is tried, as two that the destination merges both land there.
-	listings: {a source directory: its names by folded name}, read once."""
-	part, _, rest = relative.partition(os.sep)
-	if source not in listings:
-		listings[source] = {}
-		try:
-			for name in os.listdir(source):
-				listings[source].setdefault(_folded(name), []).append(name)
-		except OSError:
-			pass
-	names = listings[source].get(_folded(part), ())
-	landing = os.path.join(dest, part)
-	if names != [part]:
-		places.expect(os.path.join(dest, name) for name in itertools.chain(names, (part,)))
-	for name in names:
-		if os.path.isdir(os.path.join(source, name)) and (name == part or places.same_place(os.path.join(dest, name), landing) is not False):
-			if not rest or _landing_in_other_spelling(os.path.join(source, name), landing, rest, listings, places):
-				return True
-	return False
 
 def _source_guard(src_paths):
 	"""-rme's last word on a path it found extra: guarded(path, kind) is True when path (as the destination's walk spells
@@ -10206,17 +10196,6 @@ def _source_guard(src_paths):
 def _directory_sources(mapping):
 	"""The directory sources of _src_to_dest_map's mapping: what -rme cleans below when a source came from a list."""
 	return [(src_abs, actual_dests) for src_abs, actual_dests in mapping if os.path.isdir(src_abs) and not os.path.islink(src_abs)]
-
-def _in_listed_source(path, scope):
-	"""-rme with a list: False only when destination directory path lies below a listed directory's copy (scope:
-	{its destination: [its source]}) and no such source holds its counterpart. Anything else is not the list's to judge."""
-	judged = False
-	for part in _path_and_parents(path):
-		for src_abs in scope.get(part, ()):
-			judged = True
-			if os.path.lexists(os.path.normpath(os.path.join(src_abs, os.path.relpath(path, part)))):
-				return True
-	return not judged
 
 def _source_dest(src, dest, dest_image=False):
 	"""Where source src lands for destination dest, as an absolute path: the one rule the copy and -rme share.
@@ -14001,11 +13980,13 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = None,
 			elif remove_extra:
 				print('-'*80)
 				dest_roots = _checked_destination_roots(dests, pinned_dest_roots)
+				# The directories the copy covers, from its listings, before remove_extra_files clears them.
+				covered = _covered_directories(src_paths, dests, bool(dest_image), exclude, max_workers, parallel_file_listing)
 				remove_extra_files(total_file_list, dests,max_workers,verbose,files_per_job,single_thread,exclude=exclude,parallel_file_listing=parallel_file_listing,src_paths=src_paths,sym_links=total_sym_links,
 					dest_image=bool(dest_image),keep=link_targets,dest_roots=dest_roots,listed=listed,named=named_sources)
 				print('-'*80)
 				print("Removing extra directories...")
-				remove_extra_dirs(src_paths, dests,exclude=exclude,dest_image=bool(dest_image),keep=link_targets,dest_roots=dest_roots,listed=listed,named=named_sources)
+				remove_extra_dirs(src_paths, dests,exclude=exclude,dest_image=bool(dest_image),keep=link_targets,dest_roots=dest_roots,named=named_sources,covered=covered)
 			# Each synced directory's times, exact mode and flags, once what goes in it is in: its files, its links and -rme's
 			# removals (ran or skipped); in a move, each fsynced through the same descriptor, and then every other directory the
 			# move wrote into. Before a move's removal, which a directory either could not set or write to disk stops, as a
