@@ -120,11 +120,19 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 
 ### A user who can write the destination can race a check by path
 - **Kind:** deferred (9.87).
-- **What the operator sees:** a user who can write a destination directory can swap a directory on the way to a landing for a link between hpcp's look (`_dest_directory`) and `cp`'s open, and a root run then writes where the link leads; the same holds for a first copy's name (nothing there at the look, a link there when `cp` opens it). The landing of a rewrite no longer races on Linux since 9.86: a rewrite in place goes through the file hpcp holds open (`/proc/PID/fd/N`), and the beside route renames a new file over the name, never writing through it. Off Linux a rewrite in place still gives `cp` the name (see "Off Linux, a rewrite in place can be swapped for a link mid-run"). The static plant (a link left there before the run) is replaced since 9.85; only the race in that moment remains. The rerun's skip branch (a file identical to its source is left as it is) sets that landing's owner and mode by name (`_chown_like_cp`, `os.chmod`), and both follow a link, so a landing swapped for one between hpcp's look and those calls passes them on to what it leads to (9.84, 9.85 and 9.86 alike; found by the 9.86 review).
+- **What the operator sees:** a user who can write a destination directory can swap a directory on the way to a landing for a link between hpcp's look (`_dest_directory`) and `cp`'s open, and a root run then writes where the link leads; the same holds for a first copy's name (nothing there at the look, a link there when `cp` opens it), and for a landing removed between hpcp's look and its open, which is then a first copy. The landing of a rewrite no longer races on Linux since 9.86: a rewrite in place goes through the file hpcp holds open (`/proc/PID/fd/N`), and the beside route renames a new file over the name, never writing through it. Off Linux a rewrite in place still gives `cp` the name (see "Off Linux, a rewrite in place can be swapped for a link mid-run"). The static plant (a link left there before the run) is replaced since 9.85; only the race in that moment remains. The rerun's skip branch (a file identical to its source is left as it is) sets that landing's owner and mode by name (`_chown_like_cp`, `os.chmod`), and both follow a link, so a landing swapped for one between hpcp's look and those calls passes them on to what it leads to (9.84, 9.85 and 9.86 alike; found by the 9.86 review). On the beside route a plain (not `-co`) rewrite removes stale xattrs from the new copy, and fsyncs it, by its temporary name: a second name of another file put there at that moment (the kernel lets a user link only a file they own or may read and write, `fs.protected_hardlinks`) loses the `user.*` xattrs, ACL and file capability that the source lacks (9.85 on every rewrite, 9.86 on the beside route; found by the 9.86 final review).
 - **Why:** closing it needs each landing's directory opened by descriptors from the destination root with `O_NOFOLLOW`, as the removal does (`_descend`), and `cp` run in that directory: its own change.
-- **Plan:** open each landing directory from the root by descriptors (`O_NOFOLLOW` at each step), `fchdir` to it in the worker and give `cp` relative names; make a first copy's file in hpcp (`O_CREAT|O_EXCL|O_NOFOLLOW`) and hand it to `cp` as a rewrite in place is handed, with `-co`'s mode set to the source's mode less the umask. Do the skip branch's owner and mode through one `O_PATH|O_NOFOLLOW` descriptor checked against the look's inode, as `_carry_over` does since 9.86 for `-co` on the beside route.
+- **Plan:** open each landing directory from the root by descriptors (`O_NOFOLLOW` at each step), `fchdir` to it in the worker and give `cp` relative names; make a first copy's file in hpcp (`O_CREAT|O_EXCL|O_NOFOLLOW`) and hand it to `cp` as a rewrite in place is handed, with `-co`'s mode set to the source's mode less the umask. Do the skip branch's owner and mode through one `O_PATH|O_NOFOLLOW` descriptor checked against the look's inode, as `_carry_over` does since 9.86 for `-co` on the beside route. Remove the beside route's stale xattrs through that same descriptor.
 - **Revisit when:** 9.87.
-- **Noted:** 2026-11-08, the user's standing rule that deferrals are noted, not asked; the skip branch's metadata added 2026-11-09 (found by the 9.86 review, the main session's decision, not asked).
+- **Noted:** 2026-11-08, the user's standing rule that deferrals are noted, not asked; the skip branch's metadata, the landing removed before the open and the beside route's stale xattrs added 2026-11-09 (found by the 9.86 reviews, the main session's decision, not asked).
+
+### A timed-out `cp --version` is kept for the worker's life
+- **Kind:** deferred (9.87).
+- **What the operator sees:** on a host so loaded that `cp --version` takes more than 10 s in a worker (a thrashing machine), `cp_supports_sparse` answers no and keeps that answer for the worker's life, whatever `cp` is. That worker copies without `--sparse=always` (as before 9.86) and, since 9.86, gives `cp` a rewrite's landing by name instead of the held file (the route "Off Linux, a rewrite in place can be swapped for a link mid-run" describes), with no message. Nothing is lost; found by the 9.86 final review, read from the code, not run (it needs a stalled `cp`).
+- **Why:** `cp_supports_sparse` is cached whatever its answer; `_reaches_held` already keeps only a real answer (a timeout asks again at the next rewrite).
+- **Plan (9.87):** cache only an answer (a clean exit, or a non-zero exit), not a timeout or a `cp` that could not start, as `_reaches_held` does since the 9.86 fix round.
+- **Revisit when:** 9.87.
+- **Noted:** 2026-11-09, found by the 9.86 fixer and assessed in the 9.86 final review; the main session's decision, not asked (a deferral).
 
 ### `-co` reruns rewrite every unchanged file
 - **Kind:** deferred (9.87).
@@ -252,6 +260,13 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - **Why:** a write in place truncates first; `-wb` keeps the old copy until the new one is whole.
 - **Revisit when:** an operator needs stops to keep old copies without `-wb`.
 - **Approved:** 2026-11-09, the user chose "Approve (Recommended)".
+
+### Another program reading a file while it is rewritten in place sees it empty or partly written
+- **Kind:** known limitation.
+- **What the operator sees:** while hpcp rewrites a file in place (the default since 9.86), `cp` truncates it and then writes it, so another program reading that file meanwhile sees it empty or partly written, as with plain `cp` and in 9.84. 9.85 wrote beside and renamed, so readers saw the whole old or the whole new file.
+- **Why:** it comes with writing in place, which the user chose so the inode stays (a layout, `chattr` flags, a project id, NFS readers); `-wb` gives readers the whole-file view when asked.
+- **Revisit when:** an operator needs readers to see whole files without `-wb`.
+- **Approved:** 2026-11-09, the user picked "Approve (Recommended)". The user did not ask for it explicitly; the 9.86 final review found it undocumented.
 
 ### A power cut during or soon after a rewrite outside a move can leave the file partial or empty
 - **Kind:** known limitation.
