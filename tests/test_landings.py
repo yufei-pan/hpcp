@@ -1841,10 +1841,38 @@ def test_a_stop_while_a_worker_ends_does_not_keep_it(hpcp_mod, monkeypatch):
 		seen.append(hpcp_mod._stop(signal.SIGTERM, None))
 	monkeypatch.setattr(hpcp_mod.sys.stdout, 'flush', flush)
 	monkeypatch.setattr(hpcp_mod.signal, 'signal', lambda signum, handler: None)
+	monkeypatch.setattr(hpcp_mod, '_block_stops', lambda: None)
 	monkeypatch.setattr(hpcp_mod.os, 'kill', lambda pid, signum: None)
 	monkeypatch.setattr(hpcp_mod.os, '_exit', lambda code: None)
 	hpcp_mod._end_by(signal.SIGINT)
 	assert seen == [None]
+
+
+_END_BY = '''
+import os, signal, sys
+sys.path.insert(0, %(root)r)
+import hpcp
+hpcp._install_stops()
+real = signal.signal
+def switch(signum, handler):
+	if handler is signal.SIG_DFL:
+		with open(%(seen)r, 'w') as f:
+			f.write(repr(signum in signal.pthread_sigmask(signal.SIG_BLOCK, [])))
+	return real(signum, handler)
+signal.signal = switch
+hpcp._end_by(signal.SIGINT)
+'''
+
+
+@posix_only
+def test_a_stop_cannot_land_while_the_ending_switches_to_the_default_action(tmp_path):
+	# test_an_early_stop_prints_no_traceback, about one run in 150 on 3.14: a worker in _end_by got the pool's pass-on of the
+	# Ctrl-C inside signal.signal(SIG_DFL), after Python's check for pending stops; Python then found it pending with the
+	# default action set and printed 'Exception ignored ... Signal 2 ignored due to race condition' with a traceback. The
+	# window is inside Python's C code, so this checks the stop is blocked there, and that the process still ends by it.
+	seen = tmp_path / 'seen'
+	code = subprocess.run([sys.executable, '-c', _END_BY % {'root': os.path.dirname(HPCP), 'seen': str(seen)}], timeout=60).returncode
+	assert (code, seen.read_text()) == (-signal.SIGINT, 'True')
 
 
 def test_a_second_stop_after_a_task_s_cleanup_ends_the_worker(hpcp_mod, monkeypatch):

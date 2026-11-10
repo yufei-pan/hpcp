@@ -910,8 +910,15 @@ def _end_by(signum):
 		sys.stderr.flush()
 	except Exception:
 		pass
+	# Blocked here while the action changes: a stop landing inside signal.signal, between Python's check for pending ones and
+	# the switch (a worker gets a Ctrl-C twice, from the terminal and passed on by the pool), would find the default action
+	# already Python's, which prints 'Signal 2 ignored due to race condition' with a traceback (3.10+; 3.6 to 3.9 raise
+	# TypeError out of here). Blocked, it waits, and the default action ends the process once it is let in.
+	held = _block_stops()
 	signal.signal(signum, signal.SIG_DFL)
 	os.kill(os.getpid(), signum)
+	if held is not None:
+		signal.pthread_sigmask(signal.SIG_UNBLOCK, [signum])
 	# A default action that does not end the process (none of ours): end anyway.
 	os._exit(128 + signum)
 
