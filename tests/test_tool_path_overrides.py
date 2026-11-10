@@ -145,9 +145,11 @@ def test_a_cp_version_that_gives_no_answer_is_asked_again(exec_dir, monkeypatch)
 	# entry 5: 9.86 kept a timed-out `cp --version` (False) for the process's life: that worker's copies lost --sparse, and its
 	# rewrites went to cp by name. A fake cp silent past the timeout once, then answering.
 	marker = exec_dir / 'asked'
-	fake = _fake_tool(exec_dir, 'slow-cp', 'if [ ! -e "%s" ]; then : > "%s"; sleep 3; fi\necho "cp (GNU coreutils) 9.4"\n' % (marker, marker))
+	fake = _fake_tool(exec_dir, 'slow-cp', 'if [ ! -e "%s" ]; then : > "%s"; sleep 30; fi\necho "cp (GNU coreutils) 9.4"\n' % (marker, marker))
 	monkeypatch.setenv('CP_PATH', fake)
-	monkeypatch.setattr(hpcp, '_CP_ASK_TIMEOUT', 0.2)
+	# 3 s for the second ask to answer: with 0.2 s, a command's start on Python 3.6 (through the exec wrapper, a second
+	# interpreter) outlasted it on a busy host, and the test failed 8 of 40 times beside 96 busy loops (final review)
+	monkeypatch.setattr(hpcp, '_CP_ASK_TIMEOUT', 3)
 	monkeypatch.setattr(hpcp, '_SPARSE', [None, False])
 	monkeypatch.setattr(hpcp, '_HELD', [None, None])
 	# the held-file route, the first to ask: no answer, so it is asked again at the next rewrite
