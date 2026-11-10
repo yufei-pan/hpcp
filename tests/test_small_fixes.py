@@ -39,6 +39,9 @@ import os, sys
 sys.path.insert(0, %(root)r)
 import hpcp
 if __name__ == '__main__':  # a pool's forkserver or spawn worker imports this file
+	# as main() does: under the C locale Python 3.6's stdout is ASCII, and a progress frame (an infinity sign for an ETA
+	# not known yet) raised UnicodeEncodeError out of the step whenever the progress thread drew one (7%% of runs on 3.6)
+	hpcp._escape_unencodable_stdout()
 	hpcp.HASH_SIZE = 65536
 	step, new, base, vol, target = sys.argv[1:6]
 	if step == 'make':
