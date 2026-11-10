@@ -8,6 +8,7 @@ import os
 import random
 import shutil
 import stat
+import struct
 import subprocess
 import sys
 import threading
@@ -175,7 +176,26 @@ def _metadata(path):
 	return stat.S_IMODE(st.st_mode), st.st_uid, st.st_gid, st.st_atime_ns, st.st_mtime_ns, _xattrs(path)
 
 
-_CASES = ['mode', 'setuid', 'times', 'xattr-added', 'xattr-changed', 'xattr-removed', 'owner']
+_CASES = ['mode', 'setuid', 'times', 'xattr-added', 'xattr-changed', 'xattr-removed', 'owner', 'acl-added', 'acl-removed',
+	'label']
+
+
+def _acl(entries):
+	'''A system.posix_acl_access value: (tag, perm, id) entries, as setfacl writes them.'''
+	return struct.pack('<I', 2) + b''.join(struct.pack('<HHI', *entry) for entry in entries)
+
+
+# user::rw- user:1000:rwx group::r-- mask::rwx other::r--
+_ACL = _acl([(0x01, 6, 0xffffffff), (0x02, 7, 1000), (0x04, 4, 0xffffffff), (0x10, 7, 0xffffffff), (0x20, 4, 0xffffffff)])
+_LABEL = b'system_u:object_r:user_home_t:s0\x00'
+
+
+def _can_set(path, name, value):
+	try:
+		os.setxattr(path, name, value, follow_symlinks=False)
+		return True
+	except OSError:
+		return False
 
 
 @posix_only
@@ -189,6 +209,12 @@ def test_the_identical_file_s_metadata_matches_9_86(tmp_path, reset_hpcp_globals
 		pytest.skip('no user xattrs here')
 	if case == 'owner' and os.geteuid() != 0:
 		pytest.skip('only root gives a file another owner')
+	if case.startswith('acl') and not _can_set(src, 'system.posix_acl_access', _ACL):
+		pytest.skip('no POSIX ACLs here')
+	if case == 'label' and not (os.path.exists('/sys/fs/selinux/enforce') and _can_set(src, 'security.selinux', _LABEL)):
+		pytest.skip('no SELinux label that can be set here')
+	if case.startswith('acl'):
+		os.removexattr(src, 'system.posix_acl_access')
 	now = _now_ns()
 	os.utime(src, ns=(now, now - 50 * 10 ** 9))
 	for landing in (ours, theirs):
@@ -204,10 +230,16 @@ def test_the_identical_file_s_metadata_matches_9_86(tmp_path, reset_hpcp_globals
 			os.setxattr(landing, 'user.gone', b'1')
 		elif case == 'owner':
 			os.chown(landing, 1000, 1000)
+		elif case == 'acl-removed':
+			os.setxattr(landing, 'system.posix_acl_access', _ACL)
 	if case == 'setuid':
 		os.chmod(src, 0o4755)
 	elif case in ('xattr-added', 'xattr-changed'):
 		os.setxattr(src, 'user.a', b'new')
+	elif case == 'acl-added':
+		os.setxattr(src, 'system.posix_acl_access', _ACL)
+	elif case == 'label':
+		os.setxattr(src, 'security.selinux', _LABEL)
 	src_st = os.lstat(src)
 	_skip_986(src, theirs)
 	assert hpcp._settle_identical(src, src_st, ours, os.lstat(ours)) is True
