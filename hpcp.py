@@ -3374,7 +3374,16 @@ def _landing_of(dest_path):
 	name of the tree and never followed: a link, FIFO, socket or device node there is replaced, never opened (_cp_once)."""
 	root = _named_root(os.path.abspath(dest_path))
 	named = root is None or root == os.path.abspath(dest_path)
-	target = os.path.realpath(dest_path) if named and os.path.islink(dest_path) else dest_path
+	target = dest_path
+	if named and os.path.islink(dest_path):
+		try:
+			os.stat(dest_path)  # through the link, as cp's open goes: the kernel's own rules for following it apply
+		except PermissionError:
+			pass  # the kernel refuses it (fs.protected_symlinks), so it is not followed here: _cp_once keeps it
+		except OSError:
+			target = os.path.realpath(dest_path)  # dangling or a loop
+		else:
+			target = os.path.realpath(dest_path)
 	try:
 		return target, os.lstat(target), named
 	except OSError:
@@ -3842,6 +3851,15 @@ def _cp_once(src_path, dest_path, cp_flags, sparse, space=None):
 	if named and st is None and os.path.islink(dest_path):
 		# cp writes through no dangling link, nor does hpcp: a planted one would have it make directories and a file anywhere.
 		raise _KeptOld(f'{dest_path} is a link to {os.readlink(dest_path)}, which does not exist (cp writes through no dangling link)')
+	if named and st is not None and stat.S_ISLNK(st.st_mode):
+		# _landing_of left it: the kernel will not follow it for this run (another user's link in a sticky directory:
+		# fs.protected_symlinks), as cp's open meets it; a loop is replaced, as in 9.85.
+		try:
+			os.stat(dest_path)
+		except PermissionError as e:
+			raise _KeptOld(f'{dest_path} is a link to {os.readlink(dest_path)}, which cannot be followed ({_why(e)})')
+		except OSError:
+			pass
 	_dest_directory(os.path.dirname(target), make=not NO_CREATE_DIR, source=os.path.dirname(os.path.abspath(src_path)))
 	command = ["cp", cp_flags] + (["--sparse=always"] if sparse and cp_supports_sparse() else [])
 	held = _claim_device(target, st, named, src_path)

@@ -2603,3 +2603,28 @@ def test_content_only_carries_nothing_through_what_is_put_at_the_temporary_name(
 	hpcp_mod.copy_file(str(tmp_path / 'a/f'), [str(tmp_path / 'out/f')])
 	assert stat.S_IMODE(os.stat(str(tmp_path / 'victim')).st_mode) == 0o600 and read(tmp_path / 'out/f') == 'old'
 	assert any('cannot be given to the new copy' in error for error in hpcp_mod.ERRORS), hpcp_mod.ERRORS
+
+
+def _protected_symlinks():
+	try:
+		with open('/proc/sys/fs/protected_symlinks') as f:
+			return f.read().strip() == '1'
+	except OSError:
+		return False
+
+
+@posix_only
+@root_only
+@pytest.mark.skipif(not _protected_symlinks(), reason='fs.protected_symlinks is off here')
+def test_a_named_link_the_kernel_refuses_to_follow_is_kept(tmp_path):
+	# Another user's link in a sticky world-writable directory is refused to the follower (fs.protected_symlinks): 9.84's cp
+	# got EACCES (190, nothing written); 9.85 resolved the link itself and wrote through. A root run keeps it, exit 190.
+	write(tmp_path / 'a/x', 'SECRET')
+	write(tmp_path / 'victim', 'victim')
+	os.makedirs(str(tmp_path / 'out'))
+	os.chmod(str(tmp_path / 'out'), 0o1777)
+	os.symlink(str(tmp_path / 'victim'), str(tmp_path / 'out/drop'))
+	os.lchown(str(tmp_path / 'out/drop'), 65534, 65534)
+	rc, output = run(['a/x', '-d', 'out/drop'], tmp_path)
+	assert rc == 190 and read(tmp_path / 'victim') == 'victim' and os.path.islink(str(tmp_path / 'out/drop')), output[-3000:]
+	assert b'cannot be followed (Permission denied)' in output, output[-3000:]
