@@ -118,13 +118,13 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - **Revisit when:** 9.88, started as soon as 9.87 ships.
 - **Noted:** 2026-11-10, the main session's decision (a deferral, not asked).
 
-### The copy check stats each landing by name
-- **Kind:** deferred (9.87).
-- **What the operator sees:** the check at the end of a copy, and the move's before its removal, `lstat`s each landing by its path: on a cached local disk about 0.3 s per 100,000 files idle, and more under load (a cached 100,000-file rerun at load 110 took 1.32-1.73 s in 9.84 and 1.81-2.01 s in 9.85), and on NFS mounted `actimeo=0` a round trip for each part of each path: 900,000 GETATTRs for 100,000 landings, 21.5 to 114.8 s in 4 threads on an EL8 VM (the host busy). Since 9.87 a second look, where two landings may be one file, is taken only for the entries whose fingerprint met another's.
-- **Why:** correct as it is. Reading each landing directory once (`scandir`) gives no size, time or link count, and made-up inode numbers on vfat and FUSE exFAT. An `lstat` relative to each landing directory, opened once (9.87's first build), cut NFS to 360,000 GETATTRs and 9.2 to 53.8 s, but was slower on a local disk (0.66 to 1.03 s per 100,000 landings against 9.86's 0.57 to 0.66 s, Docker at load 336), so it missed the plan's bar (faster on NFS, not slower locally) and was dropped.
-- **Plan:** none yet; the main session asks the user (the 9.87 plan: a missed bar is a question of a known limitation). One option measured here: the directory-relative look on network filesystems only.
-- **Revisit when:** 9.87, with the user's answer.
-- **Noted:** 2026-11-08, the user's standing rule that deferrals are noted, not asked; measured and narrowed 2026-11-10 (9.87's R3).
+### Off Linux, the copy check stats each landing on a network filesystem by name
+- **Kind:** deferred (9.88).
+- **What the operator sees:** on macOS (and wherever Linux's mount table is not there to read), the check at the end of a copy, and the move's before its removal, `lstat`s each landing by its path on a network destination too: on NFS mounted `actimeo=0` a round trip for each part of each path. On Linux, where a destination is on NFS, Lustre, GPFS, CIFS/SMB3, CephFS or BeeGFS, each landing is looked at relative to its directory, opened once: on an EL8 NFSv4.1 loopback the check of 100,000 landings took 9.5 to 21.5 s against 23.1 to 47.5 s by path, and a rerun 4.06 million GETATTRs against 4.61 million (9.87, fa5fb6b). Only NFS was measured; the other five take the route because their clients walk a path through the server the same way.
+- **Why:** hpcp reads a filesystem's type from Linux's mount table (`/proc/self/mountinfo`, which the space warning reads too); Python's `statvfs` gives no type, and macOS has no such table. Local filesystems keep the look by path on purpose: there the opens cost more than they save.
+- **Plan:** 9.88: on macOS, each destination's type from `statfs`'s `f_fstypename`, once a destination; then `nfs`, `smbfs` and `afpfs` take the directory route.
+- **Revisit when:** 9.88.
+- **Noted:** 2026-11-08, the user's standing rule that deferrals are noted, not asked; narrowed 2026-11-10 (9.87's R3: the directory route on network filesystems, the main session's call).
 ### On Python 3.6 an early stop can rarely hang the run in a pool's submit
 - **Kind:** deferred (9.88).
 - **What the operator sees:** on Python 3.6 (EL7, EL8), a Ctrl-C or SIGTERM in the first second of a copy, while its pool takes its first jobs, can leave hpcp waiting for good: every worker has ended, and a second Ctrl-C prints nothing (not even `Stopping: cleaning up first`) and SIGTERM does nothing; Ctrl-\ or `kill -9` ends it. About 3 in 2,000 early Ctrl-Cs in the 9.87 review's probe (9.86: 4 in 716). Other Pythons are not affected.
