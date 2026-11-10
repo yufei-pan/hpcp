@@ -185,3 +185,43 @@ def test_a_stdout_wrapper_without_reconfigure_is_left_alone(hpcp_mod, monkeypatc
 	monkeypatch.setattr(sys, 'stdout', tee)
 	hpcp_mod._escape_unencodable_stdout()
 	assert sys.stdout is tee
+
+
+@pytest.mark.parametrize('spelling', ['-wb', '--write_beside', '--write-beside'])
+def test_write_beside_parses_in_every_spelling(hpcp_mod, restore_argv, reset_hpcp_globals, spelling):
+	args = _parse(hpcp_mod, ['hpcp', spelling, '/tmp/src', '-d', '/tmp/out'])
+	assert args.write_beside is True and args.read_before_write is False and args.src_path == ['/tmp/src']
+
+
+@pytest.mark.parametrize('spelling', ['-rbw', '--read_before_write', '--read-before-write'])
+def test_read_before_write_parses_in_every_spelling(hpcp_mod, restore_argv, reset_hpcp_globals, spelling):
+	args = _parse(hpcp_mod, ['hpcp', spelling, '/tmp/src', '-d', '/tmp/out'])
+	assert args.read_before_write is True and args.write_beside is False and args.src_path == ['/tmp/src']
+
+
+def test_the_new_flags_change_no_existing_option(hpcp_mod, restore_argv, reset_hpcp_globals):
+	# -wb and -rbw are new names: the options they sit next to (-rf, -rm, -rme, -rds, -rwloff) keep their meaning, and
+	# neither flag is on by default.
+	args = _parse(hpcp_mod, ['hpcp', '-rf', '-rme', '-rds', '-rwloff', '/tmp/src', '-d', '/tmp/out'])
+	assert (args.remove_force, args.remove_extra, args.random_dest_selection, args.do_not_remove_files_while_listing) == (True,) * 4
+	assert args.write_beside is False and args.read_before_write is False
+	both = _parse(hpcp_mod, ['hpcp', '-wb', '-rbw', '-rf', '/tmp/src', '-d', '/tmp/out'])
+	assert both.write_beside and both.read_before_write and both.remove_force and not both.remove
+
+
+def test_help_lists_the_new_flags(hpcp_mod, restore_argv, reset_hpcp_globals, capsys):
+	with pytest.raises(SystemExit):
+		_parse(hpcp_mod, ['hpcp', '-h'])
+	text = ' '.join(capsys.readouterr().out.split())
+	for name in ('-wb', '--write_beside', '--write-beside', '-rbw', '--read_before_write', '--read-before-write'):
+		assert name in text
+	assert 'Does nothing with -wb' in text
+
+
+@pytest.mark.parametrize('flags, expected', [([], (False, False)), (['-wb'], (True, False)), (['-rbw'], (False, True))])
+def test_main_passes_the_rewrite_flags(hpcp_mod, restore_argv, reset_hpcp_globals, monkeypatch, flags, expected):
+	seen = {}
+	monkeypatch.setattr(sys, 'argv', ['hpcp', *flags, '/nonexistent-src', '-d', '/nonexistent-dest'])
+	monkeypatch.setattr(hpcp_mod, 'hpcp', lambda *args, **kwargs: seen.update(kwargs) or 0)
+	hpcp_mod.main()
+	assert (seen['write_beside'], seen['read_before_write']) == expected

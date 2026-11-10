@@ -98,6 +98,8 @@ def reset_hpcp_globals():
 	"""Snapshot and restore module globals tests commonly mutate."""
 	snap = {
 		'CONTENT_ONLY': hpcp.CONTENT_ONLY,
+		'WRITE_BESIDE': hpcp.WRITE_BESIDE,
+		'READ_FIRST': hpcp.READ_FIRST,
 		'NO_CREATE_DIR': hpcp.NO_CREATE_DIR,
 		'HASH_SIZE': hpcp.HASH_SIZE,
 		'BYTES_RATE_LIMIT': hpcp.BYTES_RATE_LIMIT,

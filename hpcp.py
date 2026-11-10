@@ -253,6 +253,10 @@ FILES_RATE_LIMIT = 0
 COMMAND_TIMEOUT = 0
 NO_CREATE_DIR = False
 CONTENT_ONLY = False
+# -wb: every rewrite goes to a new file beside the old one, renamed over it once whole (_cp_beside).
+WRITE_BESIDE = False
+# -rbw: before a rewrite in place, the source is read to its end (_read_through).
+READ_FIRST = False
 # True in a move (-rm with a destination): a copy is on disk before it is reported copied (_sync_landing), so no source goes
 # while its copy may be only in memory.
 SYNC_COPIES = False
@@ -916,7 +920,7 @@ def _register_worker_start():
 # (_dest_directory) never outlives it.
 NAMED_DESTS = frozenset()
 RUN_ID = None
-_TASK_SETTINGS = ('NAMED_DESTS', 'RUN_ID', 'CONTENT_ONLY', 'NO_CREATE_DIR', 'SYNC_COPIES', 'RANDOM_DESTINATION_SELECTION', 'HASH_SIZE', 'COMMAND_TIMEOUT',
+_TASK_SETTINGS = ('NAMED_DESTS', 'RUN_ID', 'CONTENT_ONLY', 'WRITE_BESIDE', 'READ_FIRST', 'NO_CREATE_DIR', 'SYNC_COPIES', 'RANDOM_DESTINATION_SELECTION', 'HASH_SIZE', 'COMMAND_TIMEOUT',
 	'BYTES_RATE_LIMIT', 'FILES_RATE_LIMIT', 'MIRROR_FS_PARAMS', 'REMOVE_FILES_WHILE_LISTING')
 
 def _submit_task(executor, func, *args, **kwargs):
@@ -12629,6 +12633,15 @@ def get_args(args = None):
 	parser.add_argument('-tfs','--target_file_system', type=str, default=None, help='Specify the target file system type. Will abort if the target file system type does not match. Example: ext4, xfs, f2fs, ntfs, fat32, exfat. Default is None: do not check target file system type.')
 	parser.add_argument('-ncd','--no_create_dir', action='store_true', help='Ignore any destination folder that does not already exist. ( Will still copy if dest is a file )')
 	parser.add_argument('-co','--content_only', action='store_true', help='Content-only copy: do not sync mode, owner, or timestamps on files or directories. A destination file with other hard links is replaced, not written through. A FIFO, socket or device node is made as cp -a makes it, never read. Still create missing destination directories using filesystem-default permissions (so parent ACL/setgid/setuid inherit).')
+	parser.add_argument('-wb', '--write_beside', '--write-beside', action='store_true', help='Write every rewrite to a new '
+		'file beside the old one, write it to disk and rename it over the old one once whole: a source that fails, a full disk '
+		'or a stop leave the old copy as it was. The file gets a new inode (a per-file Lustre or GPFS layout, chattr flags and '
+		'a project id are not kept; NFS readers holding it open may get ESTALE). Needs a new name in the file\'s directory and '
+		'room for a second copy: without either the old copy stays (exit 190). By default a rewrite is written in place, and '
+		'only a file with other names, one that cannot be opened for writing, or a FIFO, device or link goes beside.')
+	parser.add_argument('-rbw', '--read_before_write', '--read-before-write', action='store_true', help='Before a file at '
+		'the destination is written in place, read its source to the end: a source that fails on read leaves the old copy as '
+		'it is (exit 190). Costs a second read of each rewritten file. Does nothing with -wb, which writes nothing in place.')
 	parser.add_argument('-ctl','--command_timeout_limit', type=int, default=0, help='Set the command timeout limit in seconds for external commands ( ex. cp / dd ). Default is 0: no timeout.')
 	parser.add_argument('-enes','--exit_not_enough_space', action='store_true', help='Exit if there is not enough space on the destination instead of continuing (Note: Default is continue as in compressed fs copy can be down even if source is bigger than free space).')
 	try:
@@ -12667,7 +12680,7 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = multipr
 			batch = False, append_hash_to_file_list = True, hash_size = ..., source_file_list = None, random_destination_selection = False, 
 			bytes_rate_limit = None, files_rate_limit = None,target_file_system = None, no_create_dir = False, content_only = False, command_timeout_limit = 0,
 			exit_not_enough_space = False,do_not_remove_files_while_listing = False,no_fs_param_mirror = False,
-			get_diff_image = None, load_diff_image = None, force_apply = False):
+			get_diff_image = None, load_diff_image = None, force_apply = False, write_beside = False, read_before_write = False):
 	global HASH_SIZE
 	global RANDOM_DESTINATION_SELECTION
 	global BYTES_RATE_LIMIT
@@ -12675,10 +12688,14 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = multipr
 	global COMMAND_TIMEOUT
 	global NO_CREATE_DIR
 	global CONTENT_ONLY
+	global WRITE_BESIDE
+	global READ_FIRST
 	global MIRROR_FS_PARAMS
 	global REMOVE_FILES_WHILE_LISTING
 	NO_CREATE_DIR = no_create_dir
 	CONTENT_ONLY = content_only
+	WRITE_BESIDE = write_beside
+	READ_FIRST = read_before_write
 	MIRROR_FS_PARAMS = not no_fs_param_mirror
 	remove = remove or remove_force
 	if random_destination_selection:
@@ -12852,7 +12869,7 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = multipr
 						batch=batch,append_hash_to_file_list = append_hash_to_file_list, hash_size = hash_size, source_file_list = source_file_list,
 						random_destination_selection = random_destination_selection, bytes_rate_limit = bytes_rate_limit, files_rate_limit = files_rate_limit,
 						target_file_system = target_file_system, no_create_dir = no_create_dir, content_only = content_only, command_timeout_limit = command_timeout_limit,
-						exit_not_enough_space = exit_not_enough_space)
+						exit_not_enough_space = exit_not_enough_space, write_beside = write_beside, read_before_write = read_before_write)
 				finally:
 					ERRORS[:0] = outer_errors
 				if copy_rc:
@@ -13271,7 +13288,8 @@ def main():
 			 target_file_system = args.target_file_system, no_create_dir = args.no_create_dir, content_only = args.content_only, command_timeout_limit = args.command_timeout_limit,
 			 exit_not_enough_space = args.exit_not_enough_space,do_not_remove_files_while_listing = args.do_not_remove_files_while_listing,
 			 no_fs_param_mirror = args.no_fs_param_mirror, get_diff_image = args.get_diff_image,
-			 load_diff_image = args.load_diff_image, force_apply = args.force_apply)
+			 load_diff_image = args.load_diff_image, force_apply = args.force_apply, write_beside = args.write_beside,
+			 read_before_write = args.read_before_write)
 		if _STOPPED is not None:
 			# A worker forked after the stop was passed on (a stop while the pool was starting) would hold the exit.
 			_pass_stop_on(_STOPPED)
