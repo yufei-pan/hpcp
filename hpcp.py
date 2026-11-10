@@ -3436,30 +3436,46 @@ def _carry_over(st, temp, carried):
 	(each set, and any such name temp gained, as an ACL inherited from a default ACL, removed), owner and group, and mode, less
 	set-user-ID, and set-group-ID where group-execute is set, when the runner is not root: the kernel clears those on a write
 	by such a user, so the write in place lost them too. A label the filesystem gives itself (setting security.selinux fails
-	with EOPNOTSUPP: vfat, a context= mount) is skipped. Anything else that fails raises."""
-	if hasattr(os, 'listxattr'):
-		try:
-			gained = os.listxattr(temp, follow_symlinks=False)
-		except OSError as e:
-			if e.errno not in (errno.ENOTSUP, errno.EOPNOTSUPP):
-				raise
-			gained = []
-		for name in gained:
-			if name not in carried and (name.startswith('user.') or name in _CO_CARRIED[:2]):
-				os.removexattr(temp, name, follow_symlinks=False)
-		for name, value in carried.items():
+	with EOPNOTSUPP: vfat, a context= mount) is skipped. Anything else that fails raises. On Linux each step reaches what cp
+	made through an O_PATH descriptor of it (never opened: a node made of a device is not acted on): a link or another file
+	put at its name since (a user who can write the directory) is refused, so no chown or chmod goes through a link."""
+	fd = os.open(temp, os.O_PATH | os.O_NOFOLLOW | getattr(os, 'O_CLOEXEC', 0)) if _PATH_FDS else None
+	try:
+		if fd is not None:
+			now = os.fstat(fd)
+			if stat.S_ISLNK(now.st_mode) or now.st_nlink != 1:
+				raise OSError(errno.EEXIST, 'it was replaced since cp made it', temp)
+			temp = '/proc/self/fd/%d' % fd  # leads to the descriptor's file, and no further
+		how = {} if fd is not None else {'follow_symlinks': False}
+		if hasattr(os, 'listxattr'):
 			try:
-				os.setxattr(temp, name, value, follow_symlinks=False)
+				gained = os.listxattr(temp, **how)
 			except OSError as e:
-				if not (name == 'security.selinux' and e.errno in (errno.ENOTSUP, errno.EOPNOTSUPP)):
+				if e.errno not in (errno.ENOTSUP, errno.EOPNOTSUPP):
 					raise
-	os.chown(temp, st.st_uid, st.st_gid)
-	mode = stat.S_IMODE(st.st_mode)
-	if os.geteuid() != 0:
-		mode &= ~stat.S_ISUID
-		if mode & stat.S_IXGRP:
-			mode &= ~stat.S_ISGID
-	os.chmod(temp, mode)
+				gained = []
+			for name in gained:
+				if name not in carried and (name.startswith('user.') or name in _CO_CARRIED[:2]):
+					os.removexattr(temp, name, **how)
+			for name, value in carried.items():
+				try:
+					os.setxattr(temp, name, value, **how)
+				except OSError as e:
+					if not (name == 'security.selinux' and e.errno in (errno.ENOTSUP, errno.EOPNOTSUPP)):
+						raise
+		os.chown(temp, st.st_uid, st.st_gid)
+		mode = stat.S_IMODE(st.st_mode)
+		if os.geteuid() != 0:
+			mode &= ~stat.S_ISUID
+			if mode & stat.S_IXGRP:
+				mode &= ~stat.S_ISGID
+		os.chmod(temp, mode)
+	finally:
+		if fd is not None:
+			os.close(fd)
+
+# Linux: a file reached through an O_PATH descriptor's /proc/self/fd/N name, never through a link at its own name.
+_PATH_FDS = hasattr(os, 'O_PATH') and os.path.isdir('/proc/self/fd')
 
 class _Refused(Exception):
 	"""A landing this run will not write, for each file it would hold: a 'Destination clash' (213) naming what is there and
