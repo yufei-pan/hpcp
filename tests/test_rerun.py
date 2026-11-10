@@ -99,7 +99,8 @@ def test_an_identical_file_costs_few_calls(copied, monkeypatch):
 	src, out, files = copied
 	with _counting(monkeypatch) as counts:
 		_copy_each(files, src, out, 'skip')
-	assert sum(counts.values()) / len(files) <= 8, counts
+	# and a read on both sides of each extended attribute the file carries (SELinux labels every file: EL8 8.5, Docker 6.5)
+	assert sum(counts.values()) / len(files) <= 8 + 2 * len(_xattrs(files[0])), counts
 
 
 @posix_only

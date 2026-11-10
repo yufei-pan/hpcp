@@ -271,6 +271,14 @@ def test_a_move_keeps_its_sources_when_a_directory_cannot_be_finished(tmp_path, 
 	assert (src / 'd0' / 'e0' / 'f0').exists() and (tmp_path / 'out' / 'd0' / 'e0' / 'f0').exists()
 
 
+def _attribute_count(path):
+	'''The extended attributes path carries (none where the filesystem has none)'''
+	try:
+		return len(os.listxattr(path, follow_symlinks=False))
+	except (AttributeError, OSError):
+		return 0
+
+
 def _calls_per_directory(tmp_path, monkeypatch, label):
 	'''os calls per directory of sync_directory_metadata (the sync and its finish at once), as the plan's probe counts 9.86's'''
 	src, out = tmp_path / 'src', tmp_path / 'out'
@@ -310,8 +318,11 @@ def test_directory_calls_stay_within_9_86_s(monkeypatch, reset_hpcp_globals):
 				(src / ('d%d' % d) / ('e%d' % e)).mkdir(parents=True)
 		(base / 'out').mkdir()
 		monkeypatch.setattr(hpcp, 'NAMED_DESTS', frozenset([str(base / 'out')]))
-		assert _calls_per_directory(base, monkeypatch, 'first') <= 17.1
-		assert _calls_per_directory(base, monkeypatch, 'rerun') <= (23.0 if sys.version_info < (3, 7) else 18.1)
+		# p3's tree carried no extended attributes; each one a directory carries is read on both sides, in 9.86 too (SELinux
+		# labels every directory: EL8 counts 18.1 a first copy, the 2 reads of the label over Docker's 16.1)
+		labels = 2 * _attribute_count(str(src / 'd0'))
+		assert _calls_per_directory(base, monkeypatch, 'first') <= 17.1 + labels
+		assert _calls_per_directory(base, monkeypatch, 'rerun') <= (23.0 if sys.version_info < (3, 7) else 18.1) + labels
 	finally:
 		shutil.rmtree(str(base))
 

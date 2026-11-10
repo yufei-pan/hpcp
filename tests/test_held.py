@@ -519,7 +519,9 @@ def _swap_run(prefix=(), preexec=None, owner=None):
 		if owner is not None:
 			for path in made:
 				os.chown(path, owner, owner)
-		task = subprocess.run(list(prefix) + [sys.executable, '-I', root + '/swap.py', root + '/lib', work], stdout=subprocess.PIPE,
+		# The interpreter itself: a virtual environment's link to it can sit where owner cannot reach (EL8: /home/cas, 0700).
+		python = os.path.realpath(sys.executable)
+		task = subprocess.run(list(prefix) + [python, '-I', root + '/swap.py', root + '/lib', work], stdout=subprocess.PIPE,
 			stderr=subprocess.PIPE, preexec_fn=preexec, cwd=root, timeout=120)
 		assert task.returncode == 0, task.stderr.decode(errors='replace')[-3000:]
 		return json.loads(task.stdout.decode().strip().splitlines()[-1])
