@@ -240,7 +240,7 @@ except ImportError:
 	hasher = hashlib.blake2b()
 	xxhash_available = False
 
-version = '9.85'
+version = '9.86'
 __version__ = version
 COMMIT_DATE = '2026-11-09'
 
@@ -253,6 +253,8 @@ FILES_RATE_LIMIT = 0
 COMMAND_TIMEOUT = 0
 NO_CREATE_DIR = False
 CONTENT_ONLY = False
+WRITE_BESIDE = False  # -wb: every rewrite goes beside the old file, renamed over it once whole (_cp_beside)
+READ_FIRST = False  # -rbw: the source is read to its end before a rewrite in place (_read_through)
 # True in a move (-rm with a destination): a copy is on disk before it is reported copied (_sync_landing), so no source goes
 # while its copy may be only in memory.
 SYNC_COPIES = False
@@ -352,6 +354,8 @@ ERROR_TO_RETURNCODE_TABLE = {
 	'FS param probe warning': 0,
 	# A FIFO, socket or device node: not copied (a note, rc 0); a move (-rm) leaves it in place.
 	'Special file skipped': 0,
+	# A copy that may not fit, tried anyway as cp tries (_space_warning): the copy's own result decides the exit code.
+	'Space warning': 0,
 	# -rme met another filesystem below the destination while removing (one mountinfo did not list): left alone.
 	'Other filesystem left': 0,
 	# A move left source entries the copy did not list (written during the move, special files): a note, rc 0.
@@ -916,7 +920,7 @@ def _register_worker_start():
 # (_dest_directory) never outlives it.
 NAMED_DESTS = frozenset()
 RUN_ID = None
-_TASK_SETTINGS = ('NAMED_DESTS', 'RUN_ID', 'CONTENT_ONLY', 'NO_CREATE_DIR', 'SYNC_COPIES', 'RANDOM_DESTINATION_SELECTION', 'HASH_SIZE', 'COMMAND_TIMEOUT',
+_TASK_SETTINGS = ('NAMED_DESTS', 'RUN_ID', 'CONTENT_ONLY', 'WRITE_BESIDE', 'READ_FIRST', 'NO_CREATE_DIR', 'SYNC_COPIES', 'RANDOM_DESTINATION_SELECTION', 'HASH_SIZE', 'COMMAND_TIMEOUT',
 	'BYTES_RATE_LIMIT', 'FILES_RATE_LIMIT', 'MIRROR_FS_PARAMS', 'REMOVE_FILES_WHILE_LISTING')
 
 def _submit_task(executor, func, *args, **kwargs):
@@ -3367,10 +3371,19 @@ def _named_root(path):
 def _landing_of(dest_path):
 	"""(where a copy to dest_path writes, its lstat or None, named). A destination the operator named (-d) is followed when it
 	is a link, as cp follows its destination argument (outside a run, every path counts as named); a landing below one is a
-	name of the tree and never followed: what is there is replaced (_written_beside)."""
+	name of the tree and never followed: a link, FIFO, socket or device node there is replaced, never opened (_cp_once)."""
 	root = _named_root(os.path.abspath(dest_path))
 	named = root is None or root == os.path.abspath(dest_path)
-	target = os.path.realpath(dest_path) if named and os.path.islink(dest_path) else dest_path
+	target = dest_path
+	if named and os.path.islink(dest_path):
+		try:
+			os.stat(dest_path)  # through the link, as cp's open goes: the kernel's own rules for following it apply
+		except PermissionError:
+			pass  # the kernel refuses it (fs.protected_symlinks), so it is not followed here: _cp_once keeps it
+		except OSError:
+			target = os.path.realpath(dest_path)  # dangling or a loop
+		else:
+			target = os.path.realpath(dest_path)
 	try:
 		return target, os.lstat(target), named
 	except OSError:
@@ -3386,9 +3399,9 @@ def _kind_of(st):
 	return 'file'
 
 def _written_beside(st, named):
-	"""True when a copy onto what st (an lstat, or None) describes goes to a new name beside it (_temp_sibling) and is renamed
-	over it once whole: whatever is there and is not a directory, except a FIFO or device the operator named (a pipe feed, an
-	image written to a disk). -co asks _co_carry for a regular file with one name."""
+	"""True when what st (an lstat, or None) describes is a landing a copy replaces or writes in place (_cp_once): whatever is
+	there and is not a directory, except a FIFO or device the operator named (a pipe feed, an image written to a disk), which
+	cp writes through. False: cp writes the name."""
 	if st is None or stat.S_ISDIR(st.st_mode):
 		return False
 	return not (named and (stat.S_ISFIFO(st.st_mode) or stat.S_ISCHR(st.st_mode) or stat.S_ISBLK(st.st_mode)))
@@ -3396,12 +3409,13 @@ def _written_beside(st, named):
 # What a -co rewrite carries from the old file to the new one besides user.*: the POSIX ACLs and the SELinux label.
 # security.capability is not carried: a write in place drops it (the kernel does), so the new content never gets one.
 _CO_CARRIED = ('system.posix_acl_access', 'system.posix_acl_default', 'security.selinux')
+_XFS_ACL_NAMES = {'trusted.SGI_ACL_FILE': _CO_CARRIED[0], 'trusted.SGI_ACL_DEFAULT': _CO_CARRIED[1]}  # root sees them on EL7
 
 def _co_carry(target, st):
 	"""-co: {name: value} of the xattrs a new file must get for it to stand where target (st: its lstat) is, or None when its
-	metadata cannot be carried to a new file and the rewrite goes in place: the runner is not root and does not own it, or
-	cannot give a new file its group, or it holds an xattr hpcp cannot carry (trusted.*, security.ima, a filesystem's own).
-	listxattr failing with ENOTSUP means it has none."""
+	metadata cannot be carried to a new file (_cp_beside): the runner is not root and does not own it, or
+	cannot give a new file its group, or it holds an xattr hpcp cannot carry (trusted.*, security.ima, a filesystem's own; not
+	XFS's own name for an ACL that its system.* name carries). listxattr failing with ENOTSUP means it has none."""
 	if os.name != 'posix':
 		return None
 	euid = os.geteuid()
@@ -3415,7 +3429,7 @@ def _co_carry(target, st):
 		return {} if e.errno in (errno.ENOTSUP, errno.EOPNOTSUPP) else None
 	carried = {}
 	for name in names:
-		if name == 'security.capability':
+		if name == 'security.capability' or _XFS_ACL_NAMES.get(name) in names:
 			continue
 		if not (name.startswith('user.') or name in _CO_CARRIED):
 			return None
@@ -3431,30 +3445,46 @@ def _carry_over(st, temp, carried):
 	(each set, and any such name temp gained, as an ACL inherited from a default ACL, removed), owner and group, and mode, less
 	set-user-ID, and set-group-ID where group-execute is set, when the runner is not root: the kernel clears those on a write
 	by such a user, so the write in place lost them too. A label the filesystem gives itself (setting security.selinux fails
-	with EOPNOTSUPP: vfat, a context= mount) is skipped. Anything else that fails raises."""
-	if hasattr(os, 'listxattr'):
-		try:
-			gained = os.listxattr(temp, follow_symlinks=False)
-		except OSError as e:
-			if e.errno not in (errno.ENOTSUP, errno.EOPNOTSUPP):
-				raise
-			gained = []
-		for name in gained:
-			if name not in carried and (name.startswith('user.') or name in _CO_CARRIED[:2]):
-				os.removexattr(temp, name, follow_symlinks=False)
-		for name, value in carried.items():
+	with EOPNOTSUPP: vfat, a context= mount) is skipped. Anything else that fails raises. On Linux each step reaches what cp
+	made through an O_PATH descriptor of it (never opened: a node made of a device is not acted on): a link or another file
+	put at its name since (a user who can write the directory) is refused, so no chown or chmod goes through a link."""
+	fd = os.open(temp, os.O_PATH | os.O_NOFOLLOW | getattr(os, 'O_CLOEXEC', 0)) if _PATH_FDS else None
+	try:
+		if fd is not None:
+			now = os.fstat(fd)
+			if stat.S_ISLNK(now.st_mode) or now.st_nlink != 1:
+				raise OSError(errno.EEXIST, 'it was replaced since cp made it', temp)
+			temp = '/proc/self/fd/%d' % fd  # leads to the descriptor's file, and no further
+		how = {} if fd is not None else {'follow_symlinks': False}
+		if hasattr(os, 'listxattr'):
 			try:
-				os.setxattr(temp, name, value, follow_symlinks=False)
+				gained = os.listxattr(temp, **how)
 			except OSError as e:
-				if not (name == 'security.selinux' and e.errno in (errno.ENOTSUP, errno.EOPNOTSUPP)):
+				if e.errno not in (errno.ENOTSUP, errno.EOPNOTSUPP):
 					raise
-	os.chown(temp, st.st_uid, st.st_gid)
-	mode = stat.S_IMODE(st.st_mode)
-	if os.geteuid() != 0:
-		mode &= ~stat.S_ISUID
-		if mode & stat.S_IXGRP:
-			mode &= ~stat.S_ISGID
-	os.chmod(temp, mode)
+				gained = []
+			for name in gained:
+				if name not in carried and (name.startswith('user.') or name in _CO_CARRIED[:2]):
+					os.removexattr(temp, name, **how)
+			for name, value in carried.items():
+				try:
+					os.setxattr(temp, name, value, **how)
+				except OSError as e:
+					if not (name == 'security.selinux' and e.errno in (errno.ENOTSUP, errno.EOPNOTSUPP)):
+						raise
+		os.chown(temp, st.st_uid, st.st_gid)
+		mode = stat.S_IMODE(st.st_mode)
+		if os.geteuid() != 0:
+			mode &= ~stat.S_ISUID
+			if mode & stat.S_IXGRP:
+				mode &= ~stat.S_ISGID
+		os.chmod(temp, mode)
+	finally:
+		if fd is not None:
+			os.close(fd)
+
+# Linux: a file reached through an O_PATH descriptor's /proc/self/fd/N name, never through a link at its own name.
+_PATH_FDS = hasattr(os, 'O_PATH') and os.path.isdir('/proc/self/fd')
 
 class _Refused(Exception):
 	"""A landing this run will not write, for each file it would hold: a 'Destination clash' (213) naming what is there and
@@ -3466,7 +3496,8 @@ class _Refused(Exception):
 		return f'Destination clash: {self.before}{path}{self.after}'
 
 class _KeptOld(Exception):
-	"""A rewrite that the beside route could not make and the in-place fallback may not (rule 3 of _cp_once): the old copy stays."""
+	"""A copy that left what is at its landing as it was (a rewrite beside whose new copy could not be made, filled, written to
+	disk or renamed over it; -rbw's source failing on read; a named link that leads nowhere): 'leaving DEST as it is', 190."""
 
 def _why(e):
 	"""What failed, in a few words: an OSError's strerror, or what cp said (multiCMD's error ends with its last lines)."""
@@ -3572,9 +3603,9 @@ def _dest_directory(path, make=True, source=None):
 		_DOORS[current] = True
 
 def _read_through(path):
-	"""None when path, a regular file, reads to its end now (1 MiB reads, discarded), else the error: a source that fails on
-	read keeps the old copy when the rewrite would go in place. Anything but a regular file is never read (cp -a makes a new
-	node of it)."""
+	"""None when path, a regular file, reads to its end now (1 MiB reads, discarded), else the error: under -rbw a source that
+	fails on read keeps the old copy a rewrite in place would truncate. Anything but a regular file is never read (cp -a makes
+	a new node of it)."""
 	try:
 		if not stat.S_ISREG(os.stat(path).st_mode):
 			return None
@@ -3598,285 +3629,294 @@ def _claim_device(target, st, named, src_path):
 			raise _Refused(f'{target} is in use (mounted, swap, or held by device-mapper, md or LVM): not writing ', ' over it')
 		raise
 
-def _cp_in_place(command, src_path, target):
-	"""Copy src_path to target itself: a part it leaves over an old file goes (_remove_what_failed). Its size.
+# The full-disk warning (_space_warning), where statvfs's free room is what a copy can take: btrfs, ZFS and bcachefs compress
+# or share blocks, NFS, SMB, Lustre and GPFS report pooled space, overlay hides what is below it.
+_SPACE_TYPES = frozenset(('ext2', 'ext3', 'ext4', 'xfs', 'tmpfs'))
+# One slot per destination filesystem that warns in a run; past them one warns once per file: it bounds extra lines only.
+_SPACE_SLOTS = 64
+# A run's slots, shared by its copy workers (lock, slots, the Array for a pool's initializer or None); None outside a run.
+_SPACE_WARNED = None
+_MOUNT_TYPES = {}  # (major, minor): its type, per process (_mount_type)
 
-	An old regular file at least the source's size is written over and only then cut to the source's length (_write_over):
-	cp opens it with O_TRUNC, freeing its room before it writes, and on a nearly full disk another writer (another worker's
-	temporary file beside its landing) can take that room first, so the write runs short and the old copy is gone. Anything
-	else is cp's, as before."""
+def _space_share():
+	"""New slots for a run, or None where nothing can be shared. Forked workers (Python 3.6 to 3.13 on Linux) inherit an
+	anonymous shared mapping and its lock, which leave no file (an Array on 3.6 and 3.7 leaves a pymp- directory when stopped,
+	and 3.6's takes no 'Q'); others (forkserver, 3.14's default; spawn) get an Array through the initializer (_copy_pool)."""
+	with contextlib.suppress(OSError, ImportError, ValueError, TypeError):
+		if multiprocessing.get_start_method() == 'fork':
+			import mmap
+			return multiprocessing.Lock(), memoryview(mmap.mmap(-1, 8 * _SPACE_SLOTS)).cast('Q'), None
+		if sys.version_info >= (3, 7):
+			array = multiprocessing.Array('Q', _SPACE_SLOTS)
+			return array.get_lock(), array.get_obj(), array
+	return None
+
+def _init_space_share(array):
+	global _SPACE_WARNED
+	_SPACE_WARNED = (array.get_lock(), array.get_obj(), array)
+
+def _copy_pool(max_workers):
+	"""The pool for jobs that may run copy_file, its workers sharing the run's slots (forked ones inherit them)."""
+	share = _SPACE_WARNED
+	hand = {} if share is None or share[2] is None else {'initializer': _init_space_share, 'initargs': (share[2],)}
+	return ProcessPoolExecutor(max_workers=max_workers, **hand)
+
+def _mount_type(dev):
+	"""dev's filesystem type (_mountinfo_entries), None where no mount lists it (off Linux, a btrfs subvolume's st_dev): read
+	once per process and again at a miss (a mount made since), and the miss is kept."""
+	key = (os.major(dev), os.minor(dev))
+	if key not in _MOUNT_TYPES:
+		_MOUNT_TYPES.update((entry['devnum'], entry['fstype']) for entry in _mountinfo_entries())
+		_MOUNT_TYPES.setdefault(key, None)
+	return _MOUNT_TYPES[key]
+
+def _claim_space(dev):
+	"""True when this process prints dev's warning: the run's first claim of it, across its workers. Without slots, with all
+	taken, or without the lock within 1 s (far longer than a scan of them takes: a holder died, and printing again beats
+	hanging the copy), it prints each time."""
+	share = _SPACE_WARNED
+	if share is None or not share[0].acquire(timeout=1):
+		return True
+	try:
+		slots, mark = share[1], dev + 1  # 0 is an empty slot
+		for index in range(len(slots)):
+			if slots[index] in (0, mark):
+				claimed, slots[index] = slots[index] == 0, mark
+				return claimed
+		return True
+	finally:
+		share[0].release()
+
+def _space_warning(target, src_path, free, need, old):
+	"""Before cp writes target, whose directory has free bytes, less than need (src_path's allocated size): one line per
+	filesystem in a run, then cp tries, as GNU cp does; nothing is refused, and the exit code is the copy's. old: the room an
+	old copy that cp frees first holds (in place), else 0. Only for _SPACE_TYPES, and not on an XFS the source is on too (cp may
+	clone it: GNU cp 9 does by default; ext and tmpfs never clone). A 'Space warning' (code 0) in ERRORS too, which a task hands back, repeated at the run's end."""
+	directory = os.path.dirname(os.path.abspath(target))
+	try:
+		dev = os.stat(directory).st_dev
+		kind = _mount_type(dev)
+		if kind not in _SPACE_TYPES or (kind == 'xfs' and dev == os.lstat(src_path).st_dev) or not _claim_space(dev):
+			return
+	except OSError:
+		return
+	start = f'Space warning: {directory} has {format_bytes(free)}B free, less than the {format_bytes(need)}B that {src_path} needs'
+	end = 'hpcp copies anyway, as cp does; other files short of room on this filesystem are not warned about again.'
+	if old > 0 and need <= free + old:
+		text = (f"{start}; it fits only by reusing its old copy's room, which cp frees first, so if another writer takes that "
+			f'room the copy fails and the old copy is lost (the source is kept). {end}')
+	else:
+		lost = "a rewrite's old copy stays (-wb)" if WRITE_BESIDE else "a rewrite's old copy is lost"
+		text = f'{start}, so it may not fit; if the disk runs out the copy fails, and {lost} (the source is kept). {end}'
+	# One write, flushed before cp: its newline ends the bar's line, and no other output lands in it (3.6 to 3.8 buffer stderr).
+	with contextlib.suppress(Exception):
+		sys.stdout.flush()
+		sys.stderr.write('\n' + text + '\n')
+		sys.stderr.flush()
+	ERRORS.append(text)
+
+def _repeat_space_warnings():
+	"""At a run's end: its space warnings again, each once, then out of ERRORS, so a run with nothing else ends 'Done.'."""
+	warnings = list(dict.fromkeys(error for error in ERRORS if error.startswith('Space warning:')))
+	if warnings:
+		ERRORS[:] = [error for error in ERRORS if not error.startswith('Space warning:')]
+		sys.stdout.flush()
+		print('\n'.join(['', 'Space warnings in this run (repeated from above):'] + warnings), file=sys.stderr)
+
+def _cp_to(command, src_path, target, space=None):
+	"""cp src_path to target by name (a first copy; a FIFO or device the operator named, written through); its size. A part it
+	leaves goes (_remove_what_failed)."""
+	if space is not None:
+		_space_warning(target, src_path, space[0], space[1], 0)
 	before = _copy_state(target)
 	try:
-		written = _write_over(src_path, target)
-		if not written:
-			run_command_in_multicmd_with_path_check(command + [src_path, target], quiet=True, strict=True)
-	except _KeptOld:
-		raise  # nothing was written: the old copy reads as it did
+		run_command_in_multicmd_with_path_check(command + [src_path, target], quiet=True, strict=True)
 	except BaseException:
 		_remove_what_failed(target, before)
 		raise
-	if written and not CONTENT_ONLY:
-		# What cp's -a carries (-co carries nothing). The new bytes are whole: a failure here is reported, and they stay.
-		run_command_in_multicmd_with_path_check(command + ['--attributes-only', src_path, target], quiet=True, strict=True)
 	return get_file_size(target)
 
-_MAX_BLOCK = 1 << 16  # the largest block or page size of any filesystem hpcp meets (64 KiB, as on some ARM and POWER kernels)
-_WRITE_OVER_CHUNK = 1 << 20  # one read or write at a time: big enough that a call's cost is lost in its bytes
-# posix_fallocate's errors that say the filesystem cannot allocate this way, not that it is short of room: nothing is reserved.
-_NO_FALLOCATE = frozenset(getattr(errno, name) for name in ('EINVAL', 'EOPNOTSUPP', 'ENOTSUP', 'ENOSYS', 'ENODEV') if hasattr(errno, name))
-# Filesystems that write every overwrite to new blocks (df -PT's names). An XFS extent shared by a reflink does too, per extent.
-_COPY_ON_WRITE = frozenset(('btrfs', 'zfs', 'bcachefs'))
-_FS_TYPES = {}  # st_dev: df -PT's type, once per device in a worker
+# A landing opened to be written in place: never through a link put there (ELOOP), never waiting on a FIFO (ENXIO) or a
+# lease (EAGAIN), not inherited by cp; no O_TRUNC (cp truncates it).
+_LANDING_FLAGS = os.O_WRONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NONBLOCK', 0) | getattr(os, 'O_CLOEXEC', 0)
+_HELD = [None, False]  # (pid, _reaches_held's answer): asked once per process, so a forked worker asks for itself
 
-def _copies_on_write(path, dev):
-	if dev not in _FS_TYPES:
-		_FS_TYPES[dev] = get_fs_type_from_path(path)
-	return _FS_TYPES[dev] in _COPY_ON_WRITE
+def _reaches_held():
+	"""True when cp can open this process's descriptors through /proc/PID/fd/N, the held file of a rewrite in place. False off
+	Linux, without /proc, where /proc is another PID namespace's (/proc/PID is another process), for a cp that is not GNU cp
+	(the one checked), and where cp is refused (hidepid, a worker not dumpable, an LSM): asked by doing it, cp copying
+	/dev/null onto a descriptor of /dev/zero. cp then gets the name, as in 9.84."""
+	pid = os.getpid()
+	if _HELD[0] != pid:
+		_HELD[:] = [pid, False]
+		with contextlib.suppress(Exception):
+			if sys.platform.startswith('linux') and cp_supports_sparse() and os.readlink('/proc/self') == str(pid):
+				with open('/dev/zero', 'wb') as probe:
+					# 10 s, as cp_supports_sparse waits: an empty copy takes milliseconds, and a cp that hangs so long gets no held file.
+					code = multiCMD.run_commands([[_bin('cp'), os.devnull, '/proc/%d/fd/%d' % (pid, probe.fileno())]], timeout=10,
+						quiet=True, return_object=True)[0].returncode
+				_HELD[1] = code == 0
+				if code not in (0, 1):
+					_HELD[0] = None  # no answer (a timeout, a cp that could not start): asked again at the next rewrite
+	return _HELD[1]
 
-def _write_over(src_path, target):
-	"""Write src_path's bytes over target and cut it to their length: True. False, with nothing written, where cp is to do
-	it: either side is not a regular file, they are one file, target is smaller than the source (it grows: room is needed
-	anyway), it cannot be opened for reading and writing as it is (cp -f then writes or replaces it), cp is not GNU cp (no
-	--attributes-only), target is sparse but its filesystem shows no hole (NFS before 4.2 says data everywhere: written
-	over, every hole would be filled; cp keeps them), or its filesystem copies on write (_COPY_ON_WRITE: written over, the
-	old copy needs room for all of it; cp frees it first, or clones a source on the same filesystem).
-
-	Only the source's data is read and written (its data extents, SEEK_DATA/SEEK_HOLE; all of it where that cannot tell).
-	Where the source has a hole, target's data there is punched to a hole (_punch), so the result is as sparse as the source,
-	as cp makes it; zeros are written over it only where the filesystem cannot punch. A dense old copy needs no room. Where
-	the source's data lands in target's holes, that room is reserved first (posix_fallocate on those holes only, which leaves
-	what target reads as it was): a disk or quota short of it gives back what was reserved (punched to holes again, where the
-	filesystem punches) and raises _KeptOld before anything is written; a stop there gives it back too. An XFS
-	extent shared by a reflink needs room for its overwrite, which nothing reserves."""
+def _cp_held(command, src_path, target, fd, fst, space, through_link):
+	"""cp src_path into target, the regular file with one name this process holds open (fd, fst its fstat); its size. cp
+	writes the held file (/proc/PID/fd/N, _reaches_held), so a link put at the name since the open is never written through;
+	else the name, as in 9.84. The inode stays. A cp that fails or is stopped after it changed the file takes the torn name
+	if it is still this file, as 9.84 did, except where a link the operator named led there (through_link: kept for the
+	retry, 9.84). -rbw reads the source first; its failure keeps the file (_KeptOld). Errors name target, not /proc."""
+	if READ_FIRST:
+		failed = _read_through(src_path)
+		if failed is not None:
+			raise _KeptOld(f'{src_path} failed on read ({_why(failed)})')
+	if space is not None:
+		_space_warning(target, src_path, space[0], space[1], fst.st_blocks * 512)
+	held = '/proc/%d/fd/%d' % (os.getpid(), fd) if _reaches_held() else None
 	try:
-		source, old = os.lstat(src_path), os.lstat(target)
-		if not (stat.S_ISREG(source.st_mode) and stat.S_ISREG(old.st_mode) and old.st_size >= source.st_size
-			and (source.st_dev, source.st_ino) != (old.st_dev, old.st_ino) and cp_supports_sparse()):
-			return False
-		if _copies_on_write(target, old.st_dev):
-			# Every overwrite there takes new room before the old blocks go: on a nearly full btrfs, written over, the old copy
-			# was torn where cp, truncating it first (or cloning a source on the same filesystem), wrote it whole. cp, as 9.84.
-			return False
-		# Read and write: where the filesystem has no fallocate, glibc's posix_fallocate reads each block before it writes one
-		# (EBADF on a write-only descriptor: checked on EL8, ext4 without extents).
-		fd = os.open(target, os.O_RDWR | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_CLOEXEC', 0))
-	except OSError:
-		return False
+		run_command_in_multicmd_with_path_check(command + [src_path, held or target], quiet=True, strict=True)
+	except BaseException as e:
+		with contextlib.suppress(OSError):
+			now, named = os.fstat(fd), os.lstat(target)
+			if (not through_link and (now.st_size, now.st_mtime_ns, now.st_ctime_ns) != (fst.st_size, fst.st_mtime_ns, fst.st_ctime_ns)
+					and (named.st_dev, named.st_ino) == (fst.st_dev, fst.st_ino)):
+				os.unlink(target)
+		if held is not None and ERRORS and held in ERRORS[-1]:
+			ERRORS[-1] = ERRORS[-1].replace(held, target)  # cp's return-code error, as the runner recorded it
+		if held is None or not isinstance(e, Exception):
+			raise
+		raise RuntimeError(str(e).replace(held, target)) from e
+	if not CONTENT_ONLY:
+		_remove_stale_xattrs(src_path, fd)
+		if held is not None:
+			_label_like(src_path, fd)
+	return os.fstat(fd).st_blocks * 512
+
+def _label_like(src_path, fd):
+	"""After cp -a wrote the held file fd through its /proc name: the source's SELinux label on it. cp -a gives an existing
+	destination the source's label by name (lsetfilecon, coreutils 8.22 on), which through /proc/PID/fd/N reaches the /proc
+	link, not the file, and it says nothing when that fails; by name (9.84) and on a new file (9.85) the label came along.
+	Set through the descriptor, only where it differs, and as cp -a does it: silently where it cannot be (no label, not
+	permitted, a filesystem that labels itself)."""
+	with contextlib.suppress(OSError, AttributeError):
+		label = os.getxattr(src_path, 'security.selinux', follow_symlinks=False)
+		if os.getxattr(fd, 'security.selinux') != label:
+			os.setxattr(fd, 'security.selinux', label)
+
+def _in_place_hint(target, st, src_path):
+	"""Under -wb, the end of a failed rewrite's reason where the default would have written it in place (one name, and it
+	opens for writing: asked by opening it, nothing written; and a regular source, as cp -a makes the rest anew)."""
+	if WRITE_BESIDE and stat.S_ISREG(st.st_mode) and st.st_nlink == 1 and _regular_source(src_path):
+		with contextlib.suppress(OSError):
+			os.close(os.open(target, _LANDING_FLAGS))
+			return '; without -wb it would be written in place'
+	return ''
+
+def _cp_beside(command, src_path, target, st, why, space):
+	"""cp src_path to a new name beside target, write it to disk and rename it over target once whole; its size. st: what is
+	at target (lstat, or the held file's fstat); why: why it goes beside (None for a non-file). Never in place: a failure
+	keeps what is there, a file as _KeptOld (190) naming why and what failed, a FIFO, socket, device or link as _Refused
+	(213). Under -co the new file gets the old one's owner, group, mode, carried xattrs and FAT bits (where they cannot be
+	carried: one name keeps its old copy, 190; other names get a file the runner owns, and keep the old content)."""
+	regular = stat.S_ISREG(st.st_mode)
+	carried = _co_carry(target, st) if CONTENT_ONLY and regular else None
+	if CONTENT_ONLY and regular and carried is None and st.st_nlink < 2:
+		raise _KeptOld(f'{why}; its owner, group or an xattr cannot be given to a new file{_in_place_hint(target, st, src_path)}')
+	if space is not None:
+		_space_warning(target, src_path, space[0], space[1], 0)
+	temp, renamed, what = _temp_sibling(target), False, 'the new copy beside it failed: %s'
 	try:
-		size = source.st_size
-		try:
-			first_hole = os.lseek(fd, 0, os.SEEK_HOLE)
-		except (OSError, AttributeError):
-			first_hole = old.st_size  # no hole shows
-		if getattr(old, 'st_blocks', old.st_size) * 512 < old.st_size and first_hole >= old.st_size:
-			return False
-		src = os.open(src_path, os.O_RDONLY | getattr(os, 'O_CLOEXEC', 0))
-		try:
-			extents = list(_data_extents(src, 0, size))
-			if first_hole < size and hasattr(os, 'posix_fallocate'):
-				reserved = []
-				try:
-					for start, end in extents:
-						for hole, stop in _holes(fd, start, end):
-							try:
-								# Where the old copy's hole goes on past stop, the punch back goes on with it to the end of the block cut
-								# by stop (the source's end), which only a punch that covers it frees, and which may lie past the end of
-								# the file; no further, where the old copy may hold room of its own (fallocated, read as a hole).
-								after = min(os.lseek(fd, stop, os.SEEK_DATA), -(-stop // _MAX_BLOCK) * _MAX_BLOCK)
-							except OSError as e:
-								# ENXIO: no data from stop on. Any other error (an NFS soft timeout) cannot tell where the old copy's
-								# data starts: no further than stop, or the punch back would take that data.
-								after = -(-stop // _MAX_BLOCK) * _MAX_BLOCK if e.errno == errno.ENXIO else stop
-							reserved.append((hole, after))  # before the call: a failing one may have allocated a part
-							os.posix_fallocate(fd, hole, stop - hole)
-				except BaseException as e:
-					if not (isinstance(e, OSError) and e.errno in _NO_FALLOCATE):
-						# A short disk, or a stop: what was reserved goes back. Each was a hole: it reads zeros either way. Where it
-						# cannot be punched, the room stays.
-						for hole, after in reserved:
-							_punch(fd, hole, after)
-						if not isinstance(e, OSError):
-							raise  # the stop goes on: nothing was written, so _cp_in_place keeps the old copy (its times below)
-						raise _KeptOld(f"no room for the source's data where the old copy has holes ({_why(e)})")
-				finally:
-					# fallocate and the punch move the mtime (XFS; ext4 on EL8's kernel and later): put back, target reads as it
-					# did until the first write, so a short disk or a stop before then leaves it (_cp_in_place removes only a
-					# copy whose state changed).
-					try:
-						os.utime(fd, ns=(old.st_atime_ns, old.st_mtime_ns))
-					except (OSError, NotImplementedError):
-						pass
-			length, done = size, 0
-			for start, end in extents + [(size, size)]:
-				for data, hole in _data_extents(fd, done, start):
-					if not _punch(fd, data, hole):
-						_write_range(fd, data, hole, lambda offset, n: bytes(n))
-				reached = _write_range(fd, start, end, lambda offset, n: os.pread(src, n, offset))
-				if reached < end:
-					length = reached  # the source ended early: cut there, as cp would
-					break
-				done = end
-		finally:
-			os.close(src)
-		os.ftruncate(fd, length)
-	finally:
-		os.close(fd)
-	return True
-
-def _data_extents(fd, start, end):
-	"""The ranges of [start, end) where fd holds data (SEEK_DATA, SEEK_HOLE); all of the rest where that cannot tell."""
-	while start < end:
-		try:
-			data = os.lseek(fd, start, os.SEEK_DATA)
-			hole = os.lseek(fd, data, os.SEEK_HOLE) if data < end else end
-		except (OSError, AttributeError) as e:
-			if getattr(e, 'errno', None) != errno.ENXIO:  # ENXIO: no data from start on
-				yield start, end
-			return
-		if data >= end:
-			return
-		yield data, min(hole, end)
-		start = hole
-
-def _holes(fd, start, end):
-	"""The ranges of [start, end) where fd holds no data: what _data_extents leaves."""
-	for data, hole in _data_extents(fd, start, end):
-		if data > start:
-			yield start, data
-		start = hole
-	if start < end:
-		yield start, end
-
-_FALLOCATE = []  # libc's fallocate, looked up once in a worker: [function], or [None] where there is none
-
-def _punch(fd, start, end):
-	"""Make fd's [start, end) a hole, its size unchanged (fallocate(2) with FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,
-	through ctypes: Python has no os.fallocate): True when it is one now. False where it cannot be punched (not Linux, no
-	libc fallocate, a filesystem without it: ext4 without extents, NFS before 4.2, or no room to split an extent), and the
-	range is as it was."""
-	if not _FALLOCATE:
-		function = None
-		try:
-			import ctypes
-			libc = ctypes.CDLL(None)
-			if sys.platform.startswith('linux'):
-				# 64-bit offsets either way: glibc's fallocate64 takes off64_t whatever the build's off_t; musl has only fallocate,
-				# and its off_t is 64 bits on every architecture (a c_long there passed the wrong arguments on 32-bit Alpine).
-				function = getattr(libc, 'fallocate64', None) or libc.fallocate
-				function.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int64, ctypes.c_int64]
-				function.restype = ctypes.c_int
-		except (OSError, AttributeError, ImportError):
-			function = None
-		_FALLOCATE.append(function)
-	if _FALLOCATE[0] is None or end <= start:
-		return False
-	return _FALLOCATE[0](fd, 3, start, end - start) == 0  # 3: FALLOC_FL_KEEP_SIZE (1) | FALLOC_FL_PUNCH_HOLE (2)
-
-def _write_range(fd, start, end, read):
-	"""Write read(offset, count) over fd's [start, end), a piece at a time; the offset it reached (short where read gave
-	nothing: the source ended)."""
-	while start < end:
-		piece = read(start, min(_WRITE_OVER_CHUNK, end - start))
-		if not piece:
-			return start
-		view = memoryview(piece)
-		while view:
-			written = os.pwrite(fd, view, start)
-			view, start = view[written:], start + written
-	return end
-
-def _cp_once(src_path, dest_path, cp_flags, sparse, forced):
-	"""One attempt at copying src_path to dest_path (copy_file); the size copied. Nothing at the landing is written into or
-	followed (_landing_of): what is there goes to a new name beside it, renamed over it once whole, so a source that fails on
-	read, a full disk or a stop leave the old copy as it was, a FIFO is never opened, and a device node or a link in the tree
-	is replaced, never written through. Raises when the attempt fails; _Refused for what this run will not write.
-
-	The fallback, when any step beside fails (no new name, cp, the -co carry-over, the rename): the temporary file is
-	discarded, and in the first pass that is all (the file passes on to the next destination). In the forced pass, and at
-	once when only the rename or the carry-over was refused (the temporary file was whole: another cp beside would do the
-	same), a landing that is not a regular file is _Refused; a regular file with one name is written in place only when the
-	source has just been read to its end (the temporary file got all of it, or _read_through) and the old file is at least
-	the source's size (written over it, _write_over, which keeps it where it lacks room), or, where the temporary file was
-	never made or was whole, the destination's free space is at least the source's size; otherwise, and for a file with
-	other names (a write would change them), _KeptOld."""
-	target, st, named = _landing_of(dest_path)
-	if named and st is None and os.path.islink(dest_path):
-		# cp writes through no dangling link, and nor does hpcp: a planted link would have it make directories and a file
-		# wherever the link points.
-		raise _KeptOld(f'{dest_path} is a link to {os.readlink(dest_path)}, which does not exist (cp writes through no dangling link)')
-	_dest_directory(os.path.dirname(target), make=not NO_CREATE_DIR, source=os.path.dirname(os.path.abspath(src_path)))
-	command = ["cp", cp_flags] + (["--sparse=always"] if sparse and cp_supports_sparse() else [])
-	held = _claim_device(target, st, named, src_path)
-	try:
-		carried = None
-		beside = _written_beside(st, named)
-		if beside and CONTENT_ONLY and stat.S_ISREG(st.st_mode):
-			carried = _co_carry(target, st)
-			if carried is None and st.st_nlink < 2:
-				# Its owner, group or an xattr cannot be carried to a new file: written in place, after the source has read whole.
-				beside = False
-				failed = _read_through(src_path)
-				if failed is not None:
-					raise _KeptOld(f'{src_path} failed on read ({_why(failed)})')
-		if not beside:
-			return _cp_in_place(command, src_path, target)
-		temp = _temp_sibling(target)
-		whole = renamed = False
 		try:
 			run_command_in_multicmd_with_path_check(command + [src_path, temp], quiet=True, strict=True)
-			whole = True
 			attributes = None
-			if CONTENT_ONLY and carried is not None:
+			if carried is not None:
+				what = 'its owner, group or an xattr cannot be given to the new copy (%s)'
 				_carry_over(st, temp, carried)
 				attributes = _fat_attributes(target)
 			elif not CONTENT_ONLY:
 				_remove_stale_xattrs(src_path, temp)
-			try:
-				_fsync_file(temp)
-			except OSError as e:
-				# The new copy may not reach the disk: renamed, a power cut could leave nothing where the old copy was.
-				raise _KeptOld(f'the new copy cannot be written to disk ({_why(e)})')
+			# Renamed unsynced, a power cut could leave nothing where the old copy was.
+			what = 'the new copy cannot be written to disk (%s)'
+			_fsync_file(temp)
+			what = 'it could not be replaced by the new copy (%s)'
 			os.rename(temp, target)
 			renamed = True  # nothing left to discard: an unlink of the gone name costs a round trip on NFS
-			if attributes is not None and attributes != _fat_attributes(target):
-				_set_fat_attributes(target, attributes, target)
-			return get_file_size(target)
 		except Exception as e:
-			if isinstance(e, _KeptOld):
-				raise  # the destination failed the new copy's write: in place would fail it too, over the old one
-			made = os.path.lexists(temp)
-			if not (forced or whole):
-				raise
-			failure = e
-		finally:
-			if not renamed:
-				_discard_temp(temp)
-		if not stat.S_ISREG(st.st_mode):
-			parent = os.path.dirname(target)
-			raise _Refused(f'cannot replace the {_kind_of(st)} {target} ({parent}: {_why(failure)}): not writing ',
-				f' into it; make {parent} writable, or remove {target}')
-		if st.st_nlink > 1:
-			raise _KeptOld(f'{_why(failure)}; it has other names, which a write in place would change')
-		failed = None if whole else _read_through(src_path)
-		if failed is not None:
-			raise _KeptOld(f'{_why(failure)}, and {src_path} failed on read ({_why(failed)})')
-		size = os.path.getsize(src_path)
-		if st.st_size < size and not ((whole or not made) and get_free_space_bytes(os.path.dirname(target)) >= size):
-			raise _KeptOld(f'{_why(failure)}, and growing it in place could cost the old copy ({st.st_size} bytes, the source {size})')
-		return _cp_in_place(command, src_path, target)
+			if not regular:
+				parent = os.path.dirname(target)
+				raise _Refused(f'cannot replace the {_kind_of(st)} {target} ({parent}: {_why(e)}): not writing ',
+					f' into it; make {parent} writable, or remove {target}')
+			raise _KeptOld(f'{why}; {what % _why(e)}{_in_place_hint(target, st, src_path)}')
+		if attributes is not None and attributes != _fat_attributes(target):
+			_set_fat_attributes(target, attributes, target)
+		return get_file_size(target)
+	finally:
+		if not renamed:
+			_discard_temp(temp)
+
+def _cp_once(src_path, dest_path, cp_flags, sparse, space=None):
+	"""One attempt at copying src_path to dest_path (copy_file); the size copied. Raises _Refused for what this run will not
+	write, _KeptOld for a rewrite that kept what is there. space: (free, need) when the room is short (_space_warning). By
+	what is at the landing (_landing_of): nothing, or a FIFO or device the operator named: cp writes the name (_cp_to). A
+	regular file with one name that opens for writing, of a regular source: in place, through the held file (_cp_held).
+	Anything else (other names, not writable, a running program, a source cp makes anew; a FIFO, socket, device or link below
+	a destination, never opened), anything the open finds changed since the look, and every rewrite under -wb: beside it,
+	renamed over it once whole (_cp_beside); never to cp by name."""
+	target, st, named = _landing_of(dest_path)
+	if named and st is None and os.path.islink(dest_path):
+		# cp writes through no dangling link, nor does hpcp: a planted one would have it make directories and a file anywhere.
+		raise _KeptOld(f'{dest_path} is a link to {os.readlink(dest_path)}, which does not exist (cp writes through no dangling link)')
+	if named and st is not None and stat.S_ISLNK(st.st_mode):
+		# _landing_of left it: the kernel will not follow it for this run (another user's link in a sticky directory:
+		# fs.protected_symlinks), as cp's open meets it; a loop is replaced, as in 9.85.
+		try:
+			os.stat(dest_path)
+		except PermissionError as e:
+			raise _KeptOld(f'{dest_path} is a link to {os.readlink(dest_path)}, which cannot be followed ({_why(e)})')
+		except OSError:
+			pass
+	_dest_directory(os.path.dirname(target), make=not NO_CREATE_DIR, source=os.path.dirname(os.path.abspath(src_path)))
+	command = ["cp", cp_flags] + (["--sparse=always"] if sparse and cp_supports_sparse() else [])
+	held = _claim_device(target, st, named, src_path)
+	try:
+		if not _written_beside(st, named):
+			return _cp_to(command, src_path, target, space if st is None else None)
+		if not WRITE_BESIDE and stat.S_ISREG(st.st_mode) and st.st_nlink == 1 and _regular_source(src_path):
+			try:
+				fd = os.open(target, _LANDING_FLAGS)
+			except FileNotFoundError:
+				return _cp_to(command, src_path, target, space)  # gone since the lstat: a first copy
+			except OSError as e:
+				return _cp_beside(command, src_path, target, st, f'it cannot be opened for writing ({_why(e)})', space)
+			try:
+				st = os.fstat(fd)  # what the descriptor holds decides from here on
+				if stat.S_ISREG(st.st_mode) and st.st_nlink == 1:
+					return _cp_held(command, src_path, target, fd, st, space, target != dest_path)
+			finally:
+				os.close(fd)
+			# Changed since the lstat (another name, a FIFO someone holds open): beside, never cp by name.
+		# Why it goes beside: the start of the reason a failure gives.
+		why = ('-wb writes beside it' if WRITE_BESIDE else None if not stat.S_ISREG(st.st_mode) else
+			'it has other names, which a write in place would change' if st.st_nlink > 1 else
+			f'{src_path} is no regular file, which cp makes anew')
+		return _cp_beside(command, src_path, target, st, why, space)
 	finally:
 		if held is not None:
 			os.close(held)
+
+def _regular_source(src_path):
+	"""False for a source that cp -a makes anew (a FIFO, socket or device node: it unlinks what is at the landing, and cannot
+	unlink a held file's /proc name); a source that is gone is cp's to answer."""
+	try:
+		return stat.S_ISREG(os.lstat(src_path).st_mode)
+	except OSError:
+		return True
 
 def _cp_flags(src_path):
 	"""How cp copies src_path. Under -co cp -f reads what it is given and writes through what is there, so only a regular file
 	goes that way: cp -a makes a new node for anything else and never opens it, so a device is not read to its end and a FIFO
 	does not wait for a writer. A source that is gone is cp's to answer."""
-	try:
-		regular = stat.S_ISREG(os.lstat(src_path).st_mode)
-	except OSError:
-		regular = True
-	return "-f" if CONTENT_ONLY and regular else "-af"
+	return "-f" if CONTENT_ONLY and _regular_source(src_path) else "-af"
 
 def _can_open(path):
 	"""False when cp could not read the regular file path. Asked by opening, with the ids cp runs with: access() answers for
@@ -4104,11 +4144,13 @@ def copy_file(src_path, dest_paths, full_hash=False, verbose=False, concurrent_p
 						continue
 				if verbose:
 					print(f'\nTrying to copy from {src_path} to {dest_path}')
-				# The forced pass tries once more without --sparse, and only that last attempt may fall back in place (_cp_once).
-				for sparse, forced in [(True, False)] + ([(False, True)] if using_bak_paths else []):
+				# The forced pass tries once more without --sparse. Its attempts may run short of room: the warning (_space_warning)
+				# comes before cp, and cp still tries, as GNU cp does.
+				space = (dest_free_space, src_size) if dest_free_space < src_size else None
+				for sparse in [True] + ([False] if using_bak_paths else []):
 					try:
 						if os.name == 'posix':
-							copiedSize = _cp_once(src_path, dest_path, cp_flags, sparse, forced)
+							copiedSize = _cp_once(src_path, dest_path, cp_flags, sparse, space)
 						elif CONTENT_ONLY:
 							shutil.copy(src_path, dest_path, follow_symlinks=False)
 						else:
@@ -4125,7 +4167,7 @@ def copy_file(src_path, dest_paths, full_hash=False, verbose=False, concurrent_p
 						failures[dest_path] = e
 						if os.name != 'posix':
 							break
-						if not forced and using_bak_paths and not dest_paths and not verbose:
+						if sparse and using_bak_paths and not dest_paths and not verbose:
 							print(f'Error copying {src_path} to {dest_path}, {e}')
 							print(f'Trying to copy from {src_path} to {dest_path} without sparse')
 						elif verbose:
@@ -4152,9 +4194,9 @@ def copy_file(src_path, dest_paths, full_hash=False, verbose=False, concurrent_p
 			if not copied:
 				_copy_failed(src_path, f'Copy failed: FAILED to copy {src_path} to {dest_paths}')
 				return 0, time.monotonic() - start_time, symLinks
-			# A successful retry resolves this file's failed attempts. Preserve
-			# errors from earlier files and from path validation above.
-			del ERRORS[copy_error_start:]
+			# A successful retry resolves this file's failed attempts; a space warning stays (it is repeated at the run's end).
+			# Preserve errors from earlier files and from path validation above.
+			ERRORS[copy_error_start:] = [error for error in ERRORS[copy_error_start:] if error.startswith('Space warning:')]
 			if verbose:
 				print(f'Copied {src_path} to {dest_path}')
 				print(f'Estimated remaining size: {format_bytes(dest_free_space - copiedSize)}B')
@@ -4259,7 +4301,7 @@ def copy_file_list_parallel(file_list, links, src_path, dest_paths, max_workers,
 	apb = Adaptive_Progress_Bar(total_count=total_files,total_size=estimated_size,last_num_job_for_stats=max(1,max_workers//10),process_word='Copied',suppress_all_output=verbose,bytes_rate_limit=BYTES_RATE_LIMIT,files_rate_limit=FILES_RATE_LIMIT)
 	last_transition_time = time.monotonic()
 	last_under_limit = True
-	with ProcessPoolExecutor(max_workers=max_workers) as executor:
+	with _copy_pool(max_workers) as executor:
 		while file_list_iterator or futures:
 			# counter = 0
 			under_limit = apb.under_rate_limit()
@@ -4363,7 +4405,7 @@ def copy_file_list_parallel_batch(jobs, max_workers, full_hash=False, verbose=Fa
 	apb = Adaptive_Progress_Bar(total_count=total_item_count,total_size=total_size_count,last_num_job_for_stats=max(1,max_workers//10),process_word='Copied',suppress_all_output=verbose,bytes_rate_limit=BYTES_RATE_LIMIT,files_rate_limit=FILES_RATE_LIMIT)
 	last_transition_time = time.monotonic()
 	last_under_limit = True
-	with ProcessPoolExecutor(max_workers=max_workers) as executor:
+	with _copy_pool(max_workers) as executor:
 		while job_list_iterator or futures:
 			# counter = 0
 			under_limit = apb.under_rate_limit()
@@ -4795,7 +4837,7 @@ def sync_directories_parallel(src, dests, max_workers, verbose=False,folder_per_
 
 	print(f"Syncing Dir from {src} to {dests} with {max_workers} workers")
 	apb = Adaptive_Progress_Bar(total_count=len(folders),total_size=len(folders),suppress_all_output=verbose,process_word='Synced',bytes_rate_limit=BYTES_RATE_LIMIT,files_rate_limit=FILES_RATE_LIMIT)
-	with ProcessPoolExecutor(max_workers=max_workers) as executor:
+	with _copy_pool(max_workers) as executor:
 		while folder_list_iterator or futures:
 			# counter = 0
 			while folder_list_iterator and len(futures) <  max_scheduled_jobs and apb.under_rate_limit():
@@ -4887,7 +4929,7 @@ def sync_directories_parallel_batch(jobs, max_workers, verbose=False,folder_per_
 	folder_per_job = max(1,folder_per_job)
 	num_folders_copied_this_job = 0
 	
-	with ProcessPoolExecutor(max_workers=max_workers) as executor:
+	with _copy_pool(max_workers) as executor:
 		while job_iterator or futures:
 			while job_iterator and len(futures) <  max_scheduled_jobs and apb.under_rate_limit():
 				currentJobs = []
@@ -5248,22 +5290,23 @@ def get_entry_state(path, full_hash=False, read_xattrs=True, mark_full=False, st
 def _remove_stale_xattrs(src, dest):
 	"""Remove portable xattrs (user.*, POSIX ACLs, capabilities) that dest has and src does not.
 
-	shutil.copystat() copies and overwrites xattrs but never removes one. Non-portable,
-	filesystem-internal names are never removed. Skipped under CONTENT_ONLY; unsupported,
-	forbidden or already-gone removals are ignored.
+	shutil.copystat() and cp -a copy and overwrite xattrs but never remove one. dest: a path (never followed), or
+	a descriptor (a rewrite in place). Non-portable, filesystem-internal names are never removed. Skipped under
+	CONTENT_ONLY; unsupported, forbidden or already-gone removals are ignored.
 	"""
 	if CONTENT_ONLY or not hasattr(os, 'listxattr'):
 		return
+	how = {} if isinstance(dest, int) else {'follow_symlinks': False}  # Python refuses follow_symlinks with a descriptor
 	try:
 		src_names = set(os.listxattr(src, follow_symlinks=False))
-		dest_names = os.listxattr(dest, follow_symlinks=False)
+		dest_names = os.listxattr(dest, **how)
 	except OSError:
 		return
 	for name in dest_names:
 		if name in src_names or not _is_portable_xattr(name):
 			continue
 		try:
-			os.removexattr(dest, name, follow_symlinks=False)
+			os.removexattr(dest, name, **how)
 		except OSError as e:
 			if e.errno not in (errno.ENOTSUP, errno.EPERM, errno.ENODATA, errno.EACCES, errno.EINVAL, errno.ENOENT):
 				raise
@@ -12629,8 +12672,10 @@ def get_args(args = None):
 	parser.add_argument('-tfs','--target_file_system', type=str, default=None, help='Specify the target file system type. Will abort if the target file system type does not match. Example: ext4, xfs, f2fs, ntfs, fat32, exfat. Default is None: do not check target file system type.')
 	parser.add_argument('-ncd','--no_create_dir', action='store_true', help='Ignore any destination folder that does not already exist. ( Will still copy if dest is a file )')
 	parser.add_argument('-co','--content_only', action='store_true', help='Content-only copy: do not sync mode, owner, or timestamps on files or directories. A destination file with other hard links is replaced, not written through. A FIFO, socket or device node is made as cp -a makes it, never read. Still create missing destination directories using filesystem-default permissions (so parent ACL/setgid/setuid inherit).')
+	parser.add_argument('-wb', '--write_beside', '--write-beside', action='store_true', help='Write every rewrite to a new file beside the old one, write it to disk and rename it over the old one once whole: a source that fails, a full disk or a stop leave the old copy as it was. The file gets a new inode (a per-file Lustre or GPFS layout, chattr flags and a project id are not kept; NFS readers holding it open may get ESTALE). Needs a new name in the file\'s directory and room for a second copy: without either the old copy stays (exit 190). By default a rewrite is written in place, and only a file with other names, one that cannot be opened for writing, or a FIFO, device or link goes beside.')
+	parser.add_argument('-rbw', '--read_before_write', '--read-before-write', action='store_true', help='Before a file at the destination is written in place, read its source to the end: a source that fails on read leaves the old copy as it is (exit 190). Costs a second read of each rewritten file. Does nothing with -wb, which writes nothing in place.')
 	parser.add_argument('-ctl','--command_timeout_limit', type=int, default=0, help='Set the command timeout limit in seconds for external commands ( ex. cp / dd ). Default is 0: no timeout.')
-	parser.add_argument('-enes','--exit_not_enough_space', action='store_true', help='Exit if there is not enough space on the destination instead of continuing (Note: Default is continue as in compressed fs copy can be down even if source is bigger than free space).')
+	parser.add_argument('-enes','--exit_not_enough_space', action='store_true', help='Exit if there is not enough space on the destination instead of continuing (Note: Default is continue as in compressed fs copy can be down even if source is bigger than free space; without it, a copy that may not fit is tried, with a warning on ext2/3/4, XFS and tmpfs).')
 	try:
 		args = parser.parse_intermixed_args(args)
 	except Exception:
@@ -12667,7 +12712,7 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = multipr
 			batch = False, append_hash_to_file_list = True, hash_size = ..., source_file_list = None, random_destination_selection = False, 
 			bytes_rate_limit = None, files_rate_limit = None,target_file_system = None, no_create_dir = False, content_only = False, command_timeout_limit = 0,
 			exit_not_enough_space = False,do_not_remove_files_while_listing = False,no_fs_param_mirror = False,
-			get_diff_image = None, load_diff_image = None, force_apply = False):
+			get_diff_image = None, load_diff_image = None, force_apply = False, write_beside = False, read_before_write = False):
 	global HASH_SIZE
 	global RANDOM_DESTINATION_SELECTION
 	global BYTES_RATE_LIMIT
@@ -12675,10 +12720,14 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = multipr
 	global COMMAND_TIMEOUT
 	global NO_CREATE_DIR
 	global CONTENT_ONLY
+	global WRITE_BESIDE
+	global READ_FIRST
 	global MIRROR_FS_PARAMS
 	global REMOVE_FILES_WHILE_LISTING
 	NO_CREATE_DIR = no_create_dir
 	CONTENT_ONLY = content_only
+	WRITE_BESIDE = write_beside
+	READ_FIRST = read_before_write
 	MIRROR_FS_PARAMS = not no_fs_param_mirror
 	remove = remove or remove_force
 	if random_destination_selection:
@@ -12723,6 +12772,9 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = multipr
 		max_workers = round(0.5 * multiprocessing.cpu_count())
 	elif max_workers < 0:
 		max_workers = round(- max_workers * multiprocessing.cpu_count())
+	# This run's space-warning slots (_space_warning); a nested run (-dd) has its own, and gives the outer one its back.
+	global _SPACE_WARNED
+	outer_space, _SPACE_WARNED = _SPACE_WARNED, (_space_share() if os.name == 'posix' else None)
 	try:
 		if get_diff_image or load_diff_image or force_apply:
 			if os.name == 'nt':
@@ -12852,7 +12904,7 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = multipr
 						batch=batch,append_hash_to_file_list = append_hash_to_file_list, hash_size = hash_size, source_file_list = source_file_list,
 						random_destination_selection = random_destination_selection, bytes_rate_limit = bytes_rate_limit, files_rate_limit = files_rate_limit,
 						target_file_system = target_file_system, no_create_dir = no_create_dir, content_only = content_only, command_timeout_limit = command_timeout_limit,
-						exit_not_enough_space = exit_not_enough_space)
+						exit_not_enough_space = exit_not_enough_space, write_beside = write_beside, read_before_write = read_before_write)
 				finally:
 					ERRORS[:0] = outer_errors
 				if copy_rc:
@@ -13101,11 +13153,13 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = multipr
 		eprint(f"General Exception: {e} \n{track}")
 	finally:
 		NAMED_DESTS, RUN_ID, SYNC_COPIES = frozenset(), None, False
+		_SPACE_WARNED = outer_space
 		clean_up(mount_points,loop_devices,delayed_commands)
 		get_partition_details.cache_clear()
 		get_partition_infos.cache_clear()
 		hash_file.cache_clear()
 		_get_file_list_cache.clear()
+	_repeat_space_warnings()
 	return get_rc_from_error()
 		
 def hpcp_gui():
@@ -13271,7 +13325,8 @@ def main():
 			 target_file_system = args.target_file_system, no_create_dir = args.no_create_dir, content_only = args.content_only, command_timeout_limit = args.command_timeout_limit,
 			 exit_not_enough_space = args.exit_not_enough_space,do_not_remove_files_while_listing = args.do_not_remove_files_while_listing,
 			 no_fs_param_mirror = args.no_fs_param_mirror, get_diff_image = args.get_diff_image,
-			 load_diff_image = args.load_diff_image, force_apply = args.force_apply)
+			 load_diff_image = args.load_diff_image, force_apply = args.force_apply, write_beside = args.write_beside,
+			 read_before_write = args.read_before_write)
 		if _STOPPED is not None:
 			# A worker forked after the stop was passed on (a stop while the pool was starting) would hold the exit.
 			_pass_stop_on(_STOPPED)

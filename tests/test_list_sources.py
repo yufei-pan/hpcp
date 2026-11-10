@@ -2831,17 +2831,19 @@ def test_a_content_only_move_keeps_every_file_through_a_hard_link(tmp_path, sour
 		assert wanted <= set(files(root).values()), (rc, output[-2000:])
 
 
-def test_safe_content_only_keeps_a_plain_destination_s_mode_on_a_new_file(tmp_path):
-	# 9.85: -co writes a new file beside the old one and gives it the old one's mode, owner and xattrs (a new inode).
+@pytest.mark.parametrize('route', [[], ['-wb']], ids=['default', 'write-beside'])
+def test_safe_content_only_keeps_a_plain_destination_s_mode(tmp_path, route):
+	# By default -co writes the file in place, as 9.84 did: the inode, and its mode, stay. Under -wb a new file beside the old
+	# one gets the old one's mode, owner and xattrs (a new inode), as in 9.85.
 	write(tmp_path / 'a/x', 'new')
 	write(tmp_path / 'a/y', 'made')
 	write(tmp_path / 'out/x', 'old')
 	os.chmod(tmp_path / 'out/x', 0o640)
 	inode = os.stat(tmp_path / 'out/x').st_ino
-	rc, output = run(['a/', '-d', 'out/', '-co'], tmp_path)
+	rc, output = run(['a/', '-d', 'out/', '-co'] + route, tmp_path)
 	assert rc == 0, output[-2000:]
 	assert (tmp_path / 'out/x').read_text() == 'new' and (tmp_path / 'out/y').read_text() == 'made'
-	assert os.stat(tmp_path / 'out/x').st_ino != inode and stat.S_IMODE(os.stat(tmp_path / 'out/x').st_mode) == 0o640
+	assert (os.stat(tmp_path / 'out/x').st_ino == inode) == (route == []) and stat.S_IMODE(os.stat(tmp_path / 'out/x').st_mode) == 0o640
 
 
 @pytest.mark.parametrize('sources, dest, nested', [
@@ -3158,12 +3160,14 @@ def test_a_source_that_cannot_be_read_leaves_a_hard_linked_destination_alone(tmp
 
 
 def _cp_writing_a_part(hpcp_mod, monkeypatch, fails):
-	"""A cp that dies part way through its write to each path in fails, or to a temporary name beside one, and works
-	elsewhere."""
+	"""A cp that dies part way through its write to each path in fails, to the file held open at one (a rewrite in place
+	gives cp /proc/PID/fd/N: os.readlink names it), or to a temporary name beside one, and works elsewhere."""
 	real = hpcp_mod.run_command_in_multicmd_with_path_check
 	beside = {os.path.dirname(path) for path in fails}
+	def named(path):
+		return os.readlink(path) if path.startswith('/proc/') else path
 	def cp(command, *args, **kwargs):
-		if command[-1] in fails or (os.path.basename(command[-1]).startswith('.hpcp_tmp_') and os.path.dirname(command[-1]) in beside):
+		if named(command[-1]) in fails or (os.path.basename(command[-1]).startswith('.hpcp_tmp_') and os.path.dirname(command[-1]) in beside):
 			with open(command[-1], 'w') as target:
 				target.write('par')
 			raise RuntimeError('cp: write error: No space left on device')
@@ -3181,17 +3185,21 @@ def test_a_cp_that_wrote_nothing_leaves_the_destination_alone(tmp_path, hpcp_mod
 	assert (tmp_path / 'out/x').read_text() == 'good'
 
 
+@pytest.mark.parametrize('route', ['default', 'write-beside'])
 @pytest.mark.parametrize('there', [None, 'old content'], ids=['new', 'over-a-file'])
-def test_a_part_of_a_copy_goes_before_the_next_destination(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch, there):
+def test_a_part_of_a_copy_goes_before_the_next_destination(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch, there, route):
 	write(tmp_path / 'a/x', 'the whole file')
 	first, second = str(tmp_path / 'one/x'), str(tmp_path / 'two/x')
 	os.makedirs(tmp_path / 'two')
 	if there:
 		write(tmp_path / 'one/x', there)
+	monkeypatch.setattr(hpcp_mod, 'WRITE_BESIDE', route == 'write-beside')
 	_cp_writing_a_part(hpcp_mod, monkeypatch, [first])
 	hpcp_mod.copy_file(str(tmp_path / 'a/x'), [first, second])
-	# 9.85: an old file is never written into; its copy went beside it and that part is gone (9.84 removed the old file).
-	assert (open(first).read() == there if there else not os.path.exists(first)) and (tmp_path / 'two/x').read_text() == 'the whole file'
+	# Written in place (9.84, and 9.86 by default), the part goes with the old file it tore; under -wb the old file is never
+	# written into: its copy went beside it, and that part is gone.
+	kept = there and route == 'write-beside'
+	assert (open(first).read() == there if kept else not os.path.exists(first)) and (tmp_path / 'two/x').read_text() == 'the whole file'
 	assert not [name for name in os.listdir(str(tmp_path / 'one')) if name.startswith('.hpcp_tmp_')] if there else True
 
 

@@ -534,15 +534,18 @@ def test_a_folding_mount_below_a_plain_destination_is_asked(tmp_path):
 		assert task.returncode == 213 and os.listdir(tmp_path / 'top/usb') == ['X'], task.stdout[-2000:]
 
 
-def test_a_link_in_another_case_that_leads_onto_a_source_is_refused(tmp_path):
-	"""out/X -> ../src/y with src/x: the copy of x writes through X, onto src/y. The same in one case was always 213."""
+def test_a_link_in_another_case_that_leads_onto_a_source_is_replaced(tmp_path):
+	"""out/X -> ../src/y with src/x: x lands at X, which is the link. 9.83 refused it (213) so as not to write through X onto
+	src/y; since 9.85 a link below a destination is replaced, never written through, so the copy goes on (9.85 and 9.86 alike,
+	checked on Debian 12's casefold ext4)."""
 	with _folding_directory(tmp_path, 'ext4') as fold:
 		_filled(fold / 'src/x', 'x')
 		_filled(fold / 'src/y', 'y')
 		(fold / 'out').mkdir()
 		os.symlink('../src/y', fold / 'out/X')
 		task = _hpcp(['src/', '-d', 'out/'], fold)
-		assert task.returncode == 213 and (fold / 'src/y').read_text() == 'y', task.stdout[-2000:]
+		assert task.returncode == 0 and (fold / 'src/y').read_text() == 'y', task.stdout[-2000:]
+		assert not os.path.islink(str(fold / 'out/x')) and (fold / 'out/x').read_text() == 'x' and (fold / 'out/y').read_text() == 'y'
 
 
 def _mirror(hpcp_mod, monkeypatch, sources, out, **kwargs):

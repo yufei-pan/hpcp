@@ -88,6 +88,9 @@ def _clear_hpcp_transient_state():
 		hpcp._EXT_MKFS_FEATURE_KNOWN.clear()
 	# Reading a list from stdin sets it and only hpcp() clears it: a test calling further in would ask /dev/tty.
 	hpcp._STDIN_HELD_LIST = False
+	# The door's per-process cache (_DOORS, by RUN_ID: None outside hpcp()) would remember a directory pytest has removed.
+	if hasattr(hpcp, '_DOORS'):
+		hpcp._DOORS.clear()
 	hash_file = getattr(hpcp, 'hash_file', None)
 	if hash_file is not None and hasattr(hash_file, 'cache_clear'):
 		hash_file.cache_clear()
@@ -98,6 +101,8 @@ def reset_hpcp_globals():
 	"""Snapshot and restore module globals tests commonly mutate."""
 	snap = {
 		'CONTENT_ONLY': hpcp.CONTENT_ONLY,
+		'WRITE_BESIDE': hpcp.WRITE_BESIDE,
+		'READ_FIRST': hpcp.READ_FIRST,
 		'NO_CREATE_DIR': hpcp.NO_CREATE_DIR,
 		'HASH_SIZE': hpcp.HASH_SIZE,
 		'BYTES_RATE_LIMIT': hpcp.BYTES_RATE_LIMIT,
