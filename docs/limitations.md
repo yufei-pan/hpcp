@@ -175,14 +175,6 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - **Revisit when:** 9.87.
 - **Noted:** 2026-11-08, the user's standing rule that deferrals are noted, not asked.
 
-### On macOS a move's fsync does not flush the drive's cache
-- **Kind:** deferred (9.87).
-- **What the operator sees:** `os.fsync` on macOS returns once the data is in the drive's own write cache (Apple documents `fcntl(F_FULLFSYNC)` for the flush), so after a move a power cut can lose both the copy and the already removed source. Read from Apple's documentation; hpcp 9.85 has not been run on a Mac and the flush has not been measured.
-- **Why:** `F_FULLFSYNC` is slow on a Mac (it waits for the drive), so adding it blind could cost a move a lot, and there is no Mac here to measure.
-- **Plan (9.87):** use `fcntl(fd, F_FULLFSYNC)` where `fcntl` has it, measured on a Mac before it ships.
-- **Revisit when:** 9.87, or when a Mac run is possible.
-- **Noted:** 2026-11-09, found in the 9.85 re-review; the main session's decision, not asked (a deferral).
-
 ### A move's fsync waits are serial in each worker
 - **Kind:** deferred (9.87).
 - **What the operator sees:** a move of many small files onto a slow disk takes about 1.6 to 1.9 times as long as without the sync (10,000 files of 4 KiB on an EL7 VM: 79 to 92 s on ext4 and 72 to 82 s on XFS, against 47 to 54 s and 43 to 47 s), because each worker waits for its own fsync before it copies the next file. A higher `-j` hides the wait: 2,000 files of 4 KiB with the default (one worker per CPU: 2 on the EL7 VM, 4 on the EL8 VM) against `-j 16`: 18.6 to 22.9 s against 10.3 to 11.7 s (EL7 ext4), 17.9 to 21.2 s against 10.1 to 11.7 s (EL7 XFS), 11.9 to 14.0 s against 9.3 to 11.8 s (EL8 ext4), 14.2 to 15.8 s against 8.2 to 10.5 s (EL8 XFS), 3 runs each. That the gain is overlapped waits and not CPU is an inference: the VMs have 2 and 4 vCPUs.

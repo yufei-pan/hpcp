@@ -411,3 +411,111 @@ def test_a_move_into_another_users_write_only_directory_passes_it_over(tmp_path,
 		shutil.rmtree(os.path.join(box, name), ignore_errors=True)
 		with __import__('contextlib').suppress(OSError):
 			os.unlink(os.path.join(box, name + '.note'))
+
+
+# ---- M4: one full flush per destination filesystem in a move (macOS's F_FULLFSYNC, a fake here)
+
+SMALL_FS = os.environ.get('HPCP_TEST_SMALL_FS')
+
+
+class _FakeFcntl:
+	'''fcntl with F_FULLFSYNC (macOS's 51): each call logged as ('flush', st_dev, path); fail: the errno it raises.'''
+	F_FULLFSYNC = 51
+
+	def __init__(self, real, events, fail=None):
+		self._real, self.events, self.fail = real, events, fail
+
+	def __getattr__(self, name):
+		return getattr(self._real, name)
+
+	def fcntl(self, fd, command, *args):
+		if command != self.F_FULLFSYNC:
+			return self._real.fcntl(fd, command, *args)
+		self.events.append(('flush', os.fstat(fd).st_dev, os.readlink('/proc/self/fd/%d' % fd)))
+		if self.fail:
+			raise OSError(self.fail, os.strerror(self.fail))
+		return 0
+
+
+def _log_all(monkeypatch, events, fail=None):
+	'''events gets ('fsync', path) for every fsync and ('remove', path) for every removal; F_FULLFSYNC is faked (_FakeFcntl).'''
+	import fcntl
+	real_fsync = os.fsync
+	def fsync(fd):
+		events.append(('fsync', os.readlink('/proc/self/fd/%d' % fd)))
+		return real_fsync(fd)
+	monkeypatch.setattr(hpcp.os, 'fsync', fsync)
+	for name in ('remove', 'unlink', 'rmdir'):
+		real = getattr(os, name)
+		def removing(path, *args, _real=real, **kwargs):
+			where = str(path)
+			if kwargs.get('dir_fd') is not None:
+				where = os.path.join(os.readlink('/proc/self/fd/%d' % kwargs['dir_fd']), where)
+			events.append(('remove', where))
+			return _real(path, *args, **kwargs)
+		monkeypatch.setattr(hpcp.os, name, removing)
+	monkeypatch.setitem(sys.modules, 'fcntl', _FakeFcntl(fcntl, events, fail))
+
+
+@posix_only
+@proc_fd
+@pytest.mark.skipif(not SMALL_FS, reason='HPCP_TEST_SMALL_FS: a second filesystem')
+def test_a_move_asks_each_destination_filesystem_once_for_a_full_flush(tmp_path, monkeypatch, reset_hpcp_globals):
+	src = tmp_path / 'src'
+	_move_tree(src)
+	second = os.path.join(SMALL_FS, 'm4-' + uuid.uuid4().hex)
+	events = []
+	_log_all(monkeypatch, events)
+	try:
+		rc = hpcp.hpcp([str(src) + os.sep], dest_paths=[str(tmp_path / 'out') + os.sep, second + os.sep], single_thread=True,
+			max_workers=1, remove=True, remove_force=True)
+		assert rc == 0
+		flushes = [event for event in events if event[0] == 'flush']
+		# the files all land in the first destination (no -rds): a landing file there, a directory on the second filesystem
+		assert sorted(dev for _, dev, _ in flushes) == sorted({os.stat(str(tmp_path)).st_dev, os.stat(SMALL_FS).st_dev})
+		assert any(os.path.isfile(path) for _, _, path in flushes) and any(os.path.isdir(path) for _, _, path in flushes)
+		kinds = [event[0] for event in events]
+		last_fsync = max(i for i, kind in enumerate(kinds) if kind == 'fsync')
+		first_flush = kinds.index('flush')
+		removals = [i for i, kind in enumerate(kinds) if kind == 'remove' and events[i][1].startswith(str(src))]
+		assert last_fsync < first_flush and removals and max(i for i, kind in enumerate(kinds) if kind == 'flush') < removals[0]
+	finally:
+		import shutil
+		shutil.rmtree(second, ignore_errors=True)
+
+
+@posix_only
+@proc_fd
+@pytest.mark.parametrize('fail', [errno.ENOTSUP, errno.EIO], ids=['ENOTSUP', 'EIO'])
+def test_a_drive_that_cannot_be_asked_is_noted_and_one_that_fails_keeps_every_source(tmp_path, monkeypatch, capsys,
+		reset_hpcp_globals, fail):
+	src = tmp_path / 'src'
+	_move_tree(src)
+	events = []
+	_log_all(monkeypatch, events, fail=fail)
+	rc = hpcp.hpcp([str(src) + os.sep], dest_paths=[str(tmp_path / 'out') + os.sep], single_thread=True, max_workers=1,
+		remove=True, remove_force=True)
+	err = capsys.readouterr().err
+	assert len([event for event in events if event[0] == 'flush']) == 1
+	if fail == errno.ENOTSUP:
+		assert rc == 0 and not (src / 'm' / 'f').exists()
+		assert 'Note: the drive under %s' % (tmp_path / 'out') in err and 'could not be asked to flush its cache' in err
+	else:
+		assert rc == 212 and (src / 'm' / 'f').exists() and (src / 'top').exists()
+		assert 'Copy failed: the drive under %s' % (tmp_path / 'out') in err and 'could not flush its cache' in err
+
+
+@posix_only
+@proc_fd
+@pytest.mark.parametrize('beside', [False, True], ids=['copy', 'wb'])
+def test_a_plain_copy_and_wb_make_no_full_flush(tmp_path, monkeypatch, reset_hpcp_globals, beside):
+	src = tmp_path / 'src'
+	_move_tree(src)
+	opts = dict(dest_paths=[str(tmp_path / 'out') + os.sep], single_thread=True, max_workers=1, write_beside=beside)
+	assert hpcp.hpcp([str(src) + os.sep], **opts) == 0
+	(src / 'm' / 'f').write_text('changed')
+	events = []
+	_log_all(monkeypatch, events)
+	assert hpcp.hpcp([str(src) + os.sep], **opts) == 0
+	assert (tmp_path / 'out' / 'm' / 'f').read_text() == 'changed'
+	assert not [event for event in events if event[0] == 'flush']

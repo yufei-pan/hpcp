@@ -5351,6 +5351,57 @@ def _sync_moved_directories(files, link_dirs, src_paths, dests, dest_image, fini
 				pass
 	return directories
 
+# fcntl(F_FULLFSYNC)'s errors that say the drive cannot be asked (a filesystem without it, such as SMB or FUSE), not that the
+# flush failed
+_NO_FULL_FLUSH = frozenset(getattr(errno, name) for name in ('ENOTSUP', 'EOPNOTSUPP', 'EINVAL', 'ENOTTY', 'EBADF') if hasattr(errno, name))
+
+def _flush_drives(files, directories, src_paths, dests, dest_image):
+	"""A move's last write before its removal, where fcntl has F_FULLFSYNC (macOS): fsync there returns once the data is in
+	the drive's own cache, and F_FULLFSYNC "drains the entire queue of the device and acts as a barrier" (xnu's fcntl(2)), so
+	one call per destination filesystem the move wrote to (st_dev; one per filesystem is at least one per device) makes every
+	earlier fsync there durable. On one landing file there (SQLite's call), or on a directory the move fsynced (directories)
+	where no file landed. A drive that cannot be asked (_NO_FULL_FLUSH) gets a Note and the move goes on, as 9.86 never asked;
+	a failed flush is a failed copy (Copy failed: the drive under DIR could not flush its cache), and the move removes nothing."""
+	try:
+		import fcntl
+	except ImportError:
+		return
+	command = getattr(fcntl, 'F_FULLFSYNC', None)
+	if command is None:
+		return
+	by_source = _by_source(_src_to_dest_map(src_paths, dests, dest_image))
+	targets = {}
+	seen = set()
+	# One landing file per source directory: a directory's files are on its filesystem.
+	for path in files:
+		parent = os.path.dirname(path)
+		if parent in seen:
+			continue
+		seen.add(parent)
+		for landing in _landings(path, by_source):
+			with contextlib.suppress(OSError):
+				st = os.stat(landing)
+				if stat.S_ISREG(st.st_mode):
+					targets.setdefault(st.st_dev, landing)
+	for directory in sorted(directories):
+		with contextlib.suppress(OSError):
+			targets.setdefault(os.stat(directory).st_dev, directory)
+	for path in targets.values():
+		_check_stop()
+		where = path if os.path.isdir(path) else os.path.dirname(path)
+		try:
+			fd = os.open(path, os.O_RDONLY | getattr(os, 'O_CLOEXEC', 0))
+			try:
+				fcntl.fcntl(fd, command)
+			finally:
+				os.close(fd)
+		except OSError as e:
+			if e.errno in _NO_FULL_FLUSH:
+				print(f'Note: the drive under {where} could not be asked to flush its cache ({_why(e)}): a power cut soon after '
+					'this move can lose files whose sources are removed', file=sys.stderr)
+			else:
+				eprint(f'Copy failed: the drive under {where} could not flush its cache ({_why(e)})')
+
 def sync_directory_metadata_bulk(src_paths, dest_paths,src_path):
 	"""_sync_directory for each of src_paths (below src_path) onto its place below each of dest_paths: (count, seconds,
 	{link: dests}, the finish's records)."""
@@ -13759,8 +13810,10 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = multipr
 			if SYNC_COPIES:
 				_check_stop()
 				finished = {os.path.abspath(record[1]) for record in dir_records}
-				_sync_moved_directories(total_file_list, link_dirs, src_paths, dests, bool(dest_image), finished,
+				synced = _sync_moved_directories(total_file_list, link_dirs, src_paths, dests, bool(dest_image), finished,
 					1 if single_thread else max_workers)
+				_check_stop()
+				_flush_drives(total_file_list, finished.union(synced), src_paths, dests, bool(dest_image))
 			copy_failures += [error for error in ERRORS[finish_start:] if _is_failure(error)]
 			_check_stop()
 			print('-'*80)
