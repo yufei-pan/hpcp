@@ -683,10 +683,11 @@ def run_commands_in_multicmd_with_path_check(commands, timeout=...,max_threads=1
 	return [task.stdout for task in tasks]
 
 def get_free_space_bytes(path):
-	if not os.path.exists(path):
-		path = get_last_existing_parent(path)
-	stat = os.statvfs(path)
-	return stat.f_bavail * stat.f_frsize  # available blocks * fragment size
+	try:
+		st = os.statvfs(path)
+	except FileNotFoundError:
+		st = os.statvfs(get_last_existing_parent(path))
+	return st.f_bavail * st.f_frsize  # available blocks * fragment size
 
 # How long `cp --version` (and the held-file probe, _reaches_held) may stay silent: it answers in milliseconds, and one that
 # hangs this long under a host's load gets asked again at the next call (cp_supports_sparse).
@@ -3170,12 +3171,13 @@ def hash_file(path,size = ...,full_hash=False):
 			hasher.update(chunk)
 	return hasher.hexdigest()
 
-def is_file_identical(src_path, dest_path,src_size,full_hash=False,compare_metadata=False):
-	dst_size = os.path.getsize(dest_path)
+def is_file_identical(src_path, dest_path,src_size,full_hash=False,compare_metadata=False,src_st=None,dest_st=None):
+	"""src_st, dest_st: their stats, when the caller has them (copy_file's looks): nothing is stat'ed again."""
+	dst_size = dest_st.st_size if dest_st is not None else os.path.getsize(dest_path)
 	# try to find the mtime are different
 	if src_size != dst_size:
 		return False
-	src_st, dst_st = os.stat(src_path), os.stat(dest_path)
+	src_st, dst_st = src_st or os.stat(src_path), dest_st or os.stat(dest_path)
 	# A landing at a time its filesystem could not keep (a source from before 1980, on vfat at or after it) says nothing of its
 	# contents: both are read in full, as the move's backstop does, for those files only. Two reads instead of a copy on
 	# every rerun; reading on every other time that differs would read a changed file twice before copying it anyway.
@@ -3821,6 +3823,15 @@ def _landing_of(dest_path):
 	"""(where a copy to dest_path writes, its lstat or None, named). A destination the operator named (-d) is followed when it
 	is a link, as cp follows its destination argument (outside a run, every path counts as named); a landing below one is a
 	name of the tree and never followed: a link, FIFO, socket or device node there is replaced, never opened (_cp_once)."""
+	target, named = _landing_path(dest_path)
+	try:
+		return target, os.lstat(target), named
+	except OSError:
+		return target, None, named
+
+def _landing_path(dest_path):
+	"""(where a copy to dest_path writes, named), as _landing_of gives them, without its lstat of the landing: below a named
+	destination nothing is looked at."""
 	root = _named_root(os.path.abspath(dest_path))
 	named = root is None or root == os.path.abspath(dest_path)
 	target = dest_path
@@ -3833,10 +3844,7 @@ def _landing_of(dest_path):
 			target = os.path.realpath(dest_path)  # dangling or a loop
 		else:
 			target = os.path.realpath(dest_path)
-	try:
-		return target, os.lstat(target), named
-	except OSError:
-		return target, None, named
+	return target, named
 
 def _kind_of(st):
 	"""What st (an lstat) is, in a message."""
@@ -4306,15 +4314,16 @@ def _cp_beside(command, src_path, target, st, why, space):
 		if not renamed:
 			_discard_temp(temp)
 
-def _cp_once(src_path, dest_path, cp_flags, sparse, space=None):
+def _cp_once(src_path, dest_path, cp_flags, sparse, space=None, look=None, src_st=None):
 	"""One attempt at copying src_path to dest_path (copy_file); the size copied. Raises _Refused for what this run will not
 	write, _KeptOld for a rewrite that kept what is there. space: (free, need) when the room is short (_space_warning). By
 	what is at the landing (_landing_of): nothing, or a FIFO or device the operator named: cp writes the name (_cp_to). A
 	regular file with one name that opens for writing, of a regular source: in place, through the held file (_cp_held).
 	Anything else (other names, not writable, a running program, a source cp makes anew; a FIFO, socket, device or link below
 	a destination, never opened), anything the open finds changed since the look, and every rewrite under -wb: beside it,
-	renamed over it once whole (_cp_beside); never to cp by name."""
-	target, st, named = _landing_of(dest_path)
+	renamed over it once whole (_cp_beside); never to cp by name. look: _landing_of(dest_path) when the caller just took it
+	(copy_file's first attempt); src_st: the source's lstat."""
+	target, st, named = look or _landing_of(dest_path)
 	if named and st is None and os.path.islink(dest_path):
 		# cp writes through no dangling link, nor does hpcp: a planted one would have it make directories and a file anywhere.
 		raise _KeptOld(f'{dest_path} is a link to {os.readlink(dest_path)}, which does not exist (cp writes through no dangling link)')
@@ -4333,7 +4342,7 @@ def _cp_once(src_path, dest_path, cp_flags, sparse, space=None):
 	try:
 		if not _written_beside(st, named):
 			return _cp_to(command, src_path, target, space if st is None else None)
-		if not WRITE_BESIDE and stat.S_ISREG(st.st_mode) and st.st_nlink == 1 and _regular_source(src_path):
+		if not WRITE_BESIDE and stat.S_ISREG(st.st_mode) and st.st_nlink == 1 and _regular_source(src_path, src_st):
 			try:
 				fd = os.open(target, _LANDING_FLAGS)
 			except FileNotFoundError:
@@ -4356,27 +4365,28 @@ def _cp_once(src_path, dest_path, cp_flags, sparse, space=None):
 		if held is not None:
 			os.close(held)
 
-def _regular_source(src_path):
+def _regular_source(src_path, src_st=None):
 	"""False for a source that cp -a makes anew (a FIFO, socket or device node: it unlinks what is at the landing, and cannot
-	unlink a held file's /proc name); a source that is gone is cp's to answer."""
+	unlink a held file's /proc name); a source that is gone is cp's to answer. src_st: its lstat, when the caller has it."""
 	try:
-		return stat.S_ISREG(os.lstat(src_path).st_mode)
+		return stat.S_ISREG((src_st or os.lstat(src_path)).st_mode)
 	except OSError:
 		return True
 
-def _cp_flags(src_path):
+def _cp_flags(src_path, src_st=None):
 	"""How cp copies src_path. Under -co cp -f reads what it is given and writes through what is there, so only a regular file
 	goes that way: cp -a makes a new node for anything else and never opens it, so a device is not read to its end and a FIFO
 	does not wait for a writer. A source that is gone is cp's to answer."""
-	return "-f" if CONTENT_ONLY and _regular_source(src_path) else "-af"
+	return "-f" if CONTENT_ONLY and _regular_source(src_path, src_st) else "-af"
 
-def _can_open(path):
+def _can_open(path, st=None):
 	"""False when cp could not read the regular file path. Asked by opening, with the ids cp runs with: access() answers for
 	the real uid, and a service with a read capability or a setuid wrapper can open more. Only a regular file: cp -a makes a
 	new node for the rest, and opening one is an act of its own (a FIFO's writer wakes, a watchdog arms). No search
 	permission on the way answers as a file does."""
 	try:
-		if stat.S_ISREG(os.stat(path).st_mode):
+		# st: the caller's lstat (its source is no link), else a stat: a link to a file is read as cp -a's caller reads it.
+		if stat.S_ISREG((st or os.stat(path)).st_mode):
 			os.close(os.open(path, os.O_RDONLY))
 	except PermissionError:
 		return False
@@ -4384,7 +4394,7 @@ def _can_open(path):
 		pass
 	return True
 
-def _can_make_node(src_path, dest_paths):
+def _can_make_node(src_path, dest_paths, src_st=None):
 	"""False when src_path is a device node that this user cannot make, and a destination holds something. cp -a unlinks
 	what is there before its mknod, so a user who may not make nodes (not root) would lose the old file and get nothing.
 	Asked by doing it: a node of src_path's kind and number is made under a name of its own beside a destination that
@@ -4392,11 +4402,13 @@ def _can_make_node(src_path, dest_paths):
 	destination is asked, and when none answers it is cp's to answer. Nothing is made for a
 	source that is no device, or when no destination exists (cp then has nothing to lose)."""
 	try:
-		st = os.lstat(src_path)
+		st = src_st or os.lstat(src_path)
 	except OSError:
 		return True
+	if not (stat.S_ISBLK(st.st_mode) or stat.S_ISCHR(st.st_mode)):
+		return True
 	existing = [dest for dest in dest_paths if os.path.lexists(dest)]
-	if not existing or not (stat.S_ISBLK(st.st_mode) or stat.S_ISCHR(st.st_mode)):
+	if not existing:
 		return True
 	for dest in existing:
 		name = '.hpcp-node-probe-%d-%s' % (os.getpid(), uuid.uuid4().hex)
@@ -4439,7 +4451,7 @@ def _remove_what_failed(path, before):
 		except OSError:
 			pass  # its directory will not let it go (0555, sticky, a bind mount): the copy's own error is the one to report
 
-def _known_identical(src_path, dest_path, src_size, full_hash):
+def _known_identical(src_path, dest_path, src_size, full_hash, src_st=None, dest_st=None):
 	"""is_file_identical, where a side that may not be read is not known to be the same: the copy then goes on, and a source
 	stops at _can_open, its old copy kept. Only that: any other read error stays a crash, because cp would truncate first.
 
@@ -4448,12 +4460,89 @@ def _known_identical(src_path, dest_path, src_size, full_hash):
 	reads only the last HASH_SIZE bytes, missing a change before them. Under -hs 0 ("file attributes only") it is rewritten."""
 	try:
 		if CONTENT_ONLY and HASH_SIZE > 0:
-			src_st, dest_st = os.stat(src_path), os.stat(dest_path)
+			src_st, dest_st = src_st or os.stat(src_path), dest_st or os.stat(dest_path)
 			if stat.S_ISREG(src_st.st_mode) and stat.S_ISREG(dest_st.st_mode):
 				return src_st.st_size == dest_st.st_size and _same_contents(src_path, dest_path)
-		return is_file_identical(src_path, dest_path, src_size, full_hash)
+		return is_file_identical(src_path, dest_path, src_size, full_hash, src_st=src_st, dest_st=dest_st)
 	except PermissionError:
 		return False
+
+# The errors shutil.copystat's xattr copy ignores (3.6 to 3.14, together): a name the destination or the runner cannot have.
+_XATTR_SKIPPED = frozenset((errno.EPERM, errno.ENOTSUP, errno.EOPNOTSUPP, errno.ENODATA, errno.EINVAL, errno.EACCES))
+
+def _settle_identical(src_path, src_st, dest, look):
+	"""Give dest, a landing the skip check found identical to src_path (look: its lstat then; src_st: the source's, taken before
+	the check read it), what the skip has always given it (9.86's _remove_stale_xattrs, copystat, _chown_like_cp, chmod and
+	utime): stale portable xattrs removed and the source's set, owner and group as cp -a keeps them, the mode less set-user-ID
+	or set-group-ID where the owner or group is not kept, the times, BSD flags last. Each only where it differs, all through
+	one descriptor checked against the look. False, with nothing set, when dest is no longer the file looked at (a link, or
+	another file's name, put there since: neither gets the source's owner or mode), for the caller to look again.
+
+	On Linux an O_PATH descriptor, reached by its /proc/self/fd name (as _carry_over); elsewhere a regular file opened for
+	reading without following a link (the check just read it), and a node by name."""
+	fd = None
+	try:
+		if _PATH_FDS:
+			fd = os.open(dest, os.O_PATH | os.O_NOFOLLOW | getattr(os, 'O_CLOEXEC', 0))
+		elif stat.S_ISREG(look.st_mode):
+			fd = os.open(dest, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NONBLOCK', 0) | getattr(os, 'O_CLOEXEC', 0))
+	except OSError as e:
+		if e.errno in (errno.ENOENT, errno.ELOOP):
+			return False  # gone, or a link put there (O_NOFOLLOW)
+		raise
+	try:
+		now = os.fstat(fd) if fd is not None else os.lstat(dest)
+		if (now.st_dev, now.st_ino, stat.S_IFMT(now.st_mode)) != (look.st_dev, look.st_ino, stat.S_IFMT(look.st_mode)):
+			return False
+		if fd is None:
+			path, how = dest, {'follow_symlinks': False}
+		elif _PATH_FDS:
+			path, how = '/proc/self/fd/%d' % fd, {}  # leads to the descriptor's file, and no further
+		else:
+			path, how = fd, {}
+		if hasattr(os, 'listxattr'):
+			try:
+				src_names = os.listxattr(src_path, follow_symlinks=False)
+				dest_names = os.listxattr(path, **how)
+			except OSError as e:
+				if e.errno not in (errno.ENOTSUP, errno.EOPNOTSUPP):
+					raise
+				src_names = dest_names = ()
+			for name in dest_names:
+				if name not in src_names and _is_portable_xattr(name):
+					try:
+						os.removexattr(path, name, **how)
+					except OSError as e:
+						if e.errno not in (errno.ENOTSUP, errno.EPERM, errno.ENODATA, errno.EACCES, errno.EINVAL, errno.ENOENT):
+							raise
+			for name in src_names:
+				try:
+					value = os.getxattr(src_path, name, follow_symlinks=False)
+					if name not in dest_names or os.getxattr(path, name, **how) != value:
+						os.setxattr(path, name, value, **how)
+				except OSError as e:
+					if e.errno not in _XATTR_SKIPPED:
+						raise
+		owner_kept = group_kept = True
+		chowned = os.name == 'posix' and (now.st_uid, now.st_gid) != (src_st.st_uid, src_st.st_gid)
+		if chowned:
+			owner_kept, group_kept = _chown_like_cp(path, src_st)
+		# As cp -a: no set-user-ID / set-group-ID bit for an owner / group not kept. A chown may have cleared them: set again.
+		mode = stat.S_IMODE(src_st.st_mode) & ~((0 if owner_kept else stat.S_ISUID) | (0 if group_kept else stat.S_ISGID))
+		if chowned or stat.S_IMODE(now.st_mode) != mode:
+			os.chmod(path, mode)
+		if (now.st_atime_ns, now.st_mtime_ns) != (src_st.st_atime_ns, src_st.st_mtime_ns):
+			os.utime(path, ns=(src_st.st_atime_ns, src_st.st_mtime_ns), **how)
+		if getattr(src_st, 'st_flags', 0) != getattr(now, 'st_flags', 0):
+			try:
+				os.chflags(dest, src_st.st_flags, follow_symlinks=False)
+			except OSError as e:
+				if e.errno not in (errno.ENOTSUP, errno.EOPNOTSUPP):
+					raise
+		return True
+	finally:
+		if fd is not None:
+			os.close(fd)
 
 class _CopyFailure(str):
 	"""A 'Copy failed' error in ERRORS that names its source (.source): the copy's check (_not_held) asks which sources
@@ -4495,13 +4584,20 @@ def copy_file(src_path, dest_paths, full_hash=False, verbose=False, concurrent_p
 	if dest_paths is None:
 		return 0, 0, symLinks
 	start_time = time.monotonic()
+	# The source is looked at once (its kind, size, times), and each landing once (_landing_of): what the skip check and the
+	# first attempt act on. A later attempt looks again.
+	try:
+		src_st = os.lstat(src_path)
+	except OSError:
+		src_st = None  # gone: cp says so
+	src_is_link = src_st is not None and stat.S_ISLNK(src_st.st_mode)
 	# Each destination's directories go through the door first (_dest_directory, nothing made: the file lands on one of
 	# them), so a link there is replaced before anything looks below it: the skip check's metadata sync, the space and the
 	# node probes would otherwise go through it. A destination the door refuses is left out, its refusal kept.
 	refused = {}
 	for dest in dest_paths:
 		try:
-			_dest_directory(os.path.dirname(_landing_of(dest)[0]), make=False, source=os.path.dirname(os.path.abspath(src_path)))
+			_dest_directory(os.path.dirname(_landing_path(dest)[0]), make=False, source=os.path.dirname(os.path.abspath(src_path)))
 		except _Refused as e:
 			refused[dest] = e
 		except OSError:
@@ -4512,62 +4608,60 @@ def copy_file(src_path, dest_paths, full_hash=False, verbose=False, concurrent_p
 			for refusal in refused.values():
 				_copy_failed(src_path, refusal.text(src_path))
 			return 0, time.monotonic() - start_time, symLinks
-	if not os.path.islink(src_path):
+	looks = {dest: _landing_of(dest) for dest in dest_paths}
+	if not src_is_link:
 		# cp would put the file inside a directory at its place (dest/x/x), and a move would then lose the source. A link there
 		# is a name of the tree, replaced, unless the operator named it (_landing_of).
-		usable = [dest for dest in dest_paths if not (lambda st: st is not None and stat.S_ISDIR(st.st_mode))(_landing_of(dest)[1])]
+		usable = [dest for dest in dest_paths if not (looks[dest][1] is not None and stat.S_ISDIR(looks[dest][1].st_mode))]
 		if not usable:
 			eprint(f'Destination clash: {dest_paths[0]} is a directory, not copying {src_path} over it')
 			return 0, 0, symLinks
 		dest_paths = usable
 	try:
-		src_size = get_file_size(src_path)
+		src_size = _allocated_size(src_st) if src_st is not None else get_file_size(src_path)
 		copiedSize = 0
-		try:
-			src_kind = stat.S_IFMT(os.lstat(src_path).st_mode)
-		except OSError:
-			src_kind = None
+		src_kind = stat.S_IFMT(src_st.st_mode) if src_st is not None else None
 		for dest in dest_paths:
-			dest, dest_st, _ = _landing_of(dest)
-			# Only a regular file, or a node of the source's own kind, can be the same: a link is never identical, and its
-			# target's mode and owner are never touched.
-			if dest_st is None or not (stat.S_ISREG(dest_st.st_mode) or (not stat.S_ISDIR(dest_st.st_mode) and
-					stat.S_IFMT(dest_st.st_mode) == src_kind)):
-				continue
-			if (not os.path.islink(src_path)) and _known_identical(src_path, dest,os.path.getsize(src_path),full_hash):
-				if not CONTENT_ONLY:
-					st = os.stat(src_path,follow_symlinks=False)
-					_remove_stale_xattrs(src_path, dest)
-					shutil.copystat(src_path, dest,follow_symlinks=False)
-					if os.name == 'posix':
-						owner_kept, group_kept = _chown_like_cp(dest, st)
-						#also copy the modes (as cp -a: no set-user-ID / set-group-ID bit for an owner / group not kept)
-						os.chmod(dest, st.st_mode & ~((0 if owner_kept else stat.S_ISUID) | (0 if group_kept else stat.S_ISGID)))
-					os.utime(dest, ns=(st.st_atime_ns, st.st_mtime_ns),follow_symlinks=False)
+			# A landing that changed between the skip check's look and its settling is looked at and judged again, as the door
+			# bounds its own race.
+			for _ in range(3):
+				target, dest_st, _ = looks[dest]
+				# Only a regular file, or a node of the source's own kind, can be the same: a link is never identical, and its
+				# target's mode and owner are never touched.
+				if src_st is None or src_is_link or dest_st is None or not (stat.S_ISREG(dest_st.st_mode) or
+						(not stat.S_ISDIR(dest_st.st_mode) and stat.S_IFMT(dest_st.st_mode) == src_kind)):
+					break
+				if not _known_identical(src_path, target, src_st.st_size, full_hash, src_st=src_st, dest_st=dest_st):
+					break
+				if not (CONTENT_ONLY or _settle_identical(src_path, src_st, target, dest_st)):
+					looks[dest] = _landing_of(dest)
+					continue
 				if SYNC_COPIES:
 					# A copy an earlier run left (or a plain copy before this move) may still be in memory.
 					try:
-						_sync_landing(dest)
+						_sync_landing(target)
 					except _NotOnDisk as e:
-						_copy_failed(src_path, f'Copy failed: ERROR copying {src_path} to {dest}: {e}')
+						_copy_failed(src_path, f'Copy failed: ERROR copying {src_path} to {target}: {e}')
 						return 0, time.monotonic() - start_time, symLinks
 				endTime = time.monotonic()
 				return 0, endTime - start_time , symLinks #, task_to_run
+			else:
+				raise OSError(errno.EAGAIN, 'it kept changing while it was looked at', target)
 		bak_dest_paths = dest_paths.copy()
 		using_bak_paths = False
-		if os.path.islink(src_path):
+		if src_is_link:
 			symLinks[src_path] = dest_paths
 		else:
-			if not _can_open(src_path):
+			if not _can_open(src_path, src_st):
 				# No cp at all: cp -a takes away a destination with other names before it finds it cannot read.
 				_copy_failed(src_path, f'Copy failed: cannot open {src_path}, leaving {dest_paths} as they are')
 				return 0, time.monotonic() - start_time, symLinks
-			if not _can_make_node(src_path, dest_paths):
+			if not _can_make_node(src_path, dest_paths, src_st):
 				_copy_failed(src_path, f'Copy failed: cannot make a device node like {src_path} here, leaving {dest_paths} as they are')
 				return 0, time.monotonic() - start_time, symLinks
 			copied = False
 			copy_error_start = len(ERRORS)
-			cp_flags = _cp_flags(src_path)
+			cp_flags = _cp_flags(src_path, src_st)
 			# Why each destination failed, the last attempt's (the door's refusals first).
 			failures = dict(refused)
 			while (not copied) and dest_paths:
@@ -4610,7 +4704,8 @@ def copy_file(src_path, dest_paths, full_hash=False, verbose=False, concurrent_p
 				for sparse in [True] + ([False] if using_bak_paths else []):
 					try:
 						if os.name == 'posix':
-							copiedSize = _cp_once(src_path, dest_path, cp_flags, sparse, space)
+							# The first attempt at a destination acts on its look; a later one looks again.
+							copiedSize = _cp_once(src_path, dest_path, cp_flags, sparse, space, look=looks.pop(dest_path, None), src_st=src_st)
 						elif CONTENT_ONLY:
 							shutil.copy(src_path, dest_path, follow_symlinks=False)
 						else:
