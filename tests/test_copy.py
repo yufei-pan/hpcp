@@ -411,6 +411,7 @@ def test_dir_sync_ignores_chown_permission_error_without_privileges(tmp_tree, hp
 		raise PermissionError(1, 'Operation not permitted')
 	monkeypatch.setattr(hpcp_mod.os, 'chown', chown)
 	monkeypatch.setattr(hpcp_mod.os, 'geteuid', lambda: 1000)
+	_owned_by_another(monkeypatch, hpcp_mod, src)
 	hpcp_mod.sync_directory_metadata(src, [str(tmp_tree.dst / 'd')])
 	assert (tmp_tree.dst / 'd').is_dir()
 	assert hpcp_mod.ERRORS == []
@@ -549,10 +550,28 @@ def test_non_root_ownership_falls_back_to_the_group_like_cp(tmp_tree, hpcp_mod, 
 			raise PermissionError(1, 'Operation not permitted')
 	monkeypatch.setattr(hpcp_mod.os, 'chown', chown)
 	monkeypatch.setattr(hpcp_mod.os, 'geteuid', lambda: 1000)
+	# 9.87: the sync chowns only a directory whose owner or group differs from the source's (here, as a source of another user's)
+	st = _owned_by_another(monkeypatch, hpcp_mod, src)
 	hpcp_mod.sync_directory_metadata(src, [str(tmp_tree.dst / 'd')])
-	st = os.stat(src)
 	assert calls == [(st.st_uid, st.st_gid), (-1, st.st_gid)]
 	assert hpcp_mod.ERRORS == []
+
+
+def _owned_by_another(monkeypatch, hpcp_mod, path):
+	"""Make hpcp's os.stat show path owned by the next uid: the source of another user, which a non-root sync cannot give its
+	destination. Returns the stat it shows."""
+	real = os.stat
+	class Other:
+		def __init__(self, st):
+			self._st = st
+			self.st_uid = st.st_uid + 1
+		def __getattr__(self, name):
+			return getattr(self._st, name)
+	def fake(target, *args, **kwargs):
+		st = real(target, *args, **kwargs)
+		return Other(st) if target == path else st
+	monkeypatch.setattr(hpcp_mod.os, 'stat', fake)
+	return Other(real(path))
 
 
 @pytest.mark.skipif(os.name == 'nt' or os.geteuid() != 0, reason='needs root to give the destination another owner')

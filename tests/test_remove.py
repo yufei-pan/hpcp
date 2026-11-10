@@ -187,7 +187,7 @@ def test_remove_extra_after_dest_image_layout_copy_keeps_the_copies(tmp_path, hp
 	(src / 'sub' / 'deep.txt').write_text('deep')
 	dest = str(tmp_path / 'mnt') + os.sep
 	os.makedirs(dest)
-	files, links = hpcp_mod.process_copy([str(src)], [dest], single_thread=True, max_workers=1, dest_image='stand-in.img', batch=True)
+	files, links, _ = hpcp_mod.process_copy([str(src)], [dest], single_thread=True, max_workers=1, dest_image='stand-in.img', batch=True)
 	mirrored = tmp_path / 'mnt' / os.path.relpath(str(src), '/')
 	assert (mirrored / 'sub' / 'deep.txt').read_text() == 'deep'
 	(mirrored / 'old.txt').write_text('extra')
@@ -522,7 +522,7 @@ def test_tracked_directory_holding_another_sources_copy_keeps_its_own_contents(t
 	mnt = str(tmp_path / 'mnt') + os.sep
 	os.makedirs(mnt)
 	srcs = [str(s / 'a'), str(s / 'c' / 'sub')]
-	files, links = hpcp_mod.process_copy(srcs, [mnt], single_thread=True, max_workers=1, dest_image='stand-in.img', batch=True)
+	files, links, _ = hpcp_mod.process_copy(srcs, [mnt], single_thread=True, max_workers=1, dest_image='stand-in.img', batch=True)
 	keep = hpcp_mod.create_sym_links(links, link_tracking=True)
 	image_c = tmp_path / 'mnt' / os.path.relpath(str(s / 'c'), '/')
 	# img/s/c exists (sub's parent), so tracking found its target there; other is from an earlier run.

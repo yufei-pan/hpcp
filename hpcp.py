@@ -5054,6 +5054,8 @@ class copy_scheduler:
 		self.copy_size_counter = 0
 		self.total_sym_links = {}
 		self.total_file_list = []
+		# The directory sync's records, for the finish (finish_directories)
+		self.dir_records = []
 		self.exit_not_enough_space = exit_not_enough_space
 		# See _settle_destinations.
 		self.dropped = dropped
@@ -5065,9 +5067,11 @@ class copy_scheduler:
 		if self.dir_sync_job:
 			start_time = time.monotonic()
 			if self.max_workers == 1:
-				self.total_sym_links.update(sync_directories_serial_batch(self.dir_sync_job,exclude=self.exclude))
+				links, records = sync_directories_serial_batch(self.dir_sync_job,exclude=self.exclude)
 			else:
-				self.total_sym_links.update(sync_directories_parallel_batch(self.dir_sync_job, max_workers=self.max_workers,verbose=self.verbose,exclude=self.exclude,parallel_file_listing=self.parallel_file_listing))
+				links, records = sync_directories_parallel_batch(self.dir_sync_job, max_workers=self.max_workers,verbose=self.verbose,exclude=self.exclude,parallel_file_listing=self.parallel_file_listing)
+			self.total_sym_links.update(links)
+			self.dir_records += records
 			endTime = time.monotonic()
 			print(f"\nTime taken to sync directory: {endTime-start_time:0.4f} seconds")
 			self.dir_sync_job = []
@@ -5095,12 +5099,13 @@ class copy_scheduler:
 			self.total_sym_links.update(rtnSymLinks)
 			self.total_file_list.extend(file_list)
 			self.copy_job = []
-		return self.total_file_list, self.total_sym_links
+		return self.total_file_list, self.total_sym_links, self.dir_records
 	def clear(self,clear_pending_jobs=False):
 		self.copy_counter = 0
 		self.copy_size_counter = 0
 		self.total_sym_links = {}
 		self.total_file_list = []
+		self.dir_records = []
 		if clear_pending_jobs:
 			self.dir_sync_job = []
 			self.copy_job = []
@@ -5131,72 +5136,225 @@ def _make_dest_directory(src_path, dest_path):
 		print(f"Destination path {dest_path} maybe a mounted dir, known issue with os.path.exists\nContinuing without creating dest folder...", file=sys.stderr)
 	return True
 
-def sync_directory_metadata(src_path, dest_paths):
-	global CONTENT_ONLY
+def _sync_xattrs(src_path, dest):
+	"""Give the directory dest src_path's xattrs: stale portable ones removed (_remove_stale_xattrs' rule), and each of the
+	source's set where dest lacks it or holds another value, so a rerun sets none. The errors copystat ignores are ignored
+	(Python 3.14's set: a name the destination's filesystem or the runner may not have)."""
+	if not hasattr(os, 'listxattr'):
+		return
+	try:
+		src_names = os.listxattr(src_path)
+		dest_names = set(os.listxattr(dest))
+	except OSError as e:
+		if e.errno not in (errno.ENOTSUP, errno.ENODATA, errno.EINVAL):
+			raise
+		return
+	wanted = set(src_names)
+	for name in dest_names:
+		if name in wanted or not _is_portable_xattr(name):
+			continue
+		try:
+			os.removexattr(dest, name)
+		except OSError as e:
+			if e.errno not in (errno.ENOTSUP, errno.EPERM, errno.ENODATA, errno.EACCES, errno.EINVAL, errno.ENOENT):
+				raise
+	for name in src_names:
+		try:
+			value = os.getxattr(src_path, name)
+			if name in dest_names and os.getxattr(dest, name) == value:
+				continue
+			os.setxattr(dest, name, value)
+		except OSError as e:
+			if e.errno not in (errno.EPERM, errno.ENOTSUP, errno.ENODATA, errno.EINVAL, errno.EACCES):
+				raise
+
+def _start_directory(src_path, dest_path, st):
+	"""The directory sync's part of dest_path's metadata (src_path's lstat st): what does not stop the copy writing into it,
+	each made only where dest_path differs. Its xattrs, its owner and group (_chown_like_cp), and its mode, plus read, write
+	and search for its owner when the runner is not root and owns it (rsync's rule; root needs none): a 0555 source
+	directory still takes its files. Its times and BSD flags, and the exact mode, wait for the finish, after what goes in it
+	(finish_directories), as cp -a and rsync set a directory's last. Returns the finish's record: (src_path, dest_path, the
+	mode, atime_ns, mtime_ns, BSD flags or None); the mode is None under -co, which sets no directory metadata."""
+	if CONTENT_ONLY:
+		return (src_path, dest_path, None, None, None, None)
+	_sync_xattrs(src_path, dest_path)
+	mode = stat.S_IMODE(st.st_mode)
+	now = os.stat(dest_path)
+	if os.name == 'posix':
+		if (now.st_uid, now.st_gid) != (st.st_uid, st.st_gid):
+			owner_kept, group_kept = _chown_like_cp(dest_path, st)
+			# chmod after chown: no set-user-ID / set-group-ID bit for an owner / group not kept (9.86's rule).
+			mode &= ~((0 if owner_kept else stat.S_ISUID) | (0 if group_kept else stat.S_ISGID))
+			now = os.stat(dest_path)
+		opened = mode
+		if os.geteuid() != 0 and now.st_uid == os.geteuid():
+			opened |= stat.S_IRWXU
+		if stat.S_IMODE(now.st_mode) != opened:
+			os.chmod(dest_path, opened)
+	return (src_path, dest_path, mode, st.st_atime_ns, st.st_mtime_ns, getattr(st, 'st_flags', None))
+
+def _sync_directory(src_path, dest_paths):
+	"""The directory sync of src_path onto dest_paths: each made (_make_dest_directory) and given its start
+	(_start_directory). (count, seconds, {link: dests} for a source that is a link, the finish's records); a source that is
+	no directory is copied as a file (copy_file), with no records."""
+	start_time = time.monotonic()
 	dest_paths = _validate_paths(src_path, dest_paths)
 	if dest_paths is None:
-		return 0, 0 , set(), frozenset()
-	start_time = time.monotonic()
+		return 0, 0, {}, []
 	if os.path.islink(src_path):
-		return 0,time.monotonic()-start_time,{src_path: dest_paths}
+		return 0, time.monotonic() - start_time, {src_path: dest_paths}, []
 	if not os.path.lexists(src_path):
 		# A live tree: the directory went away after it was listed. The destination keeps what it has.
 		eprint(f'Directory sync error: {src_path} no longer exists')
-		return 1,time.monotonic()-start_time,frozenset()
+		return 1, time.monotonic() - start_time, {}, []
 	if not os.path.isdir(src_path):
-		return copy_file(src_path, dest_paths)
-	# Create the directory if it does not exist
+		return copy_file(src_path, dest_paths) + ([],)
 	try:
 		st = os.stat(src_path)
 	except OSError as e:
 		# A live tree: the directory went away (or became unreadable) after it was listed.
 		eprint(f'Directory sync error: {src_path}: {e}')
-		return 1,time.monotonic()-start_time,frozenset()
+		return 1, time.monotonic() - start_time, {}, []
+	records = []
 	for dest_path in dest_paths:
 		# One directory that cannot be created or synced is recorded; the others (and the other dests) go on.
 		try:
-			if not _make_dest_directory(src_path, dest_path):
-				continue
-			# Sync the metadata
-			if not CONTENT_ONLY:
-				_remove_stale_xattrs(src_path, dest_path)
-				shutil.copystat(src_path, dest_path)
-				if os.name == 'posix':
-					owner_kept, group_kept = _chown_like_cp(dest_path, st)
-					# copystat set the mode before the chown: no set-user-ID / set-group-ID bit for an owner / group not kept.
-					lost = (0 if owner_kept else stat.S_ISUID) | (0 if group_kept else stat.S_ISGID)
-					if st.st_mode & lost:
-						os.chmod(dest_path, stat.S_IMODE(st.st_mode) & ~lost)
-				os.utime(dest_path, ns=(st.st_atime_ns, st.st_mtime_ns))
+			if _make_dest_directory(src_path, dest_path):
+				records.append(_start_directory(src_path, dest_path, st))
 		except OSError as e:
 			eprint(f'Directory sync error: {src_path} to {dest_path}: {e}')
-	return 1,time.monotonic()-start_time,frozenset()
+	return 1, time.monotonic() - start_time, {}, records
+
+def sync_directory_metadata(src_path, dest_paths):
+	"""src_path's directory onto each of dest_paths, its metadata whole now: the sync and its finish at once, for a directory
+	whose contents are in place already (a patch's, an image's parents). (count, seconds, {link: dests})."""
+	count, seconds, links, records = _sync_directory(src_path, dest_paths)
+	for record in records:
+		_finish_directory(record)
+	return count, seconds, links
+
+def _finish_directory(record, sync=False):
+	"""The rest of a synced directory's metadata, once what goes in it is in (_start_directory's record): its exact mode, its
+	times and its BSD flags, each set only where the directory differs, through one descriptor opened without following a
+	link (a link the operator named with -d is followed, as everywhere). sync (a move): that descriptor is fsynced last; it
+	was opened while the sync's mode still let its owner in. A failure is a Directory sync error, or the move's copy failure
+	when only the fsync failed."""
+	src_path, dest_path, mode, atime_ns, mtime_ns, flags = record
+	if mode is None and not sync:
+		return
+	if os.name != 'posix':
+		# Nothing is fsynced there (README): only the metadata, which -co does not set.
+		if mode is None:
+			return
+		try:
+			os.chmod(dest_path, mode)
+			os.utime(dest_path, ns=(atime_ns, mtime_ns))
+		except OSError as e:
+			eprint(f'Directory sync error: {src_path} to {dest_path}: {e}')
+		return
+	how = os.O_RDONLY | getattr(os, 'O_CLOEXEC', 0) | getattr(os, 'O_DIRECTORY', 0)
+	if os.path.abspath(dest_path) not in NAMED_DESTS:
+		how |= getattr(os, 'O_NOFOLLOW', 0)
+	try:
+		fd = os.open(dest_path, how)
+	except OSError as e:
+		if sync and mode is None and isinstance(e, PermissionError):
+			# -co in a move: another user's directory this run may not read (a write-only drop box) is not fsynced, as M2 passes over one.
+			return
+		eprint(f'Directory sync error: {src_path} to {dest_path}: {e}')
+		return
+	try:
+		if mode is not None:
+			try:
+				now = os.fstat(fd)
+				if stat.S_IMODE(now.st_mode) != mode:
+					os.fchmod(fd, mode)
+				if (now.st_atime_ns, now.st_mtime_ns) != (atime_ns, mtime_ns):
+					os.utime(fd if os.utime in os.supports_fd else dest_path, ns=(atime_ns, mtime_ns))
+				if flags is not None and hasattr(os, 'chflags') and getattr(now, 'st_flags', flags) != flags:
+					os.chflags(dest_path, flags, follow_symlinks=False)
+			except OSError as e:
+				eprint(f'Directory sync error: {src_path} to {dest_path}: {e}')
+		if sync:
+			try:
+				os.fsync(fd)
+			except OSError as e:
+				if e.errno not in _NO_FSYNC:
+					eprint(f'Copy failed: the directory {dest_path} cannot be written to disk ({_why(e)})')
+	finally:
+		os.close(fd)
+
+def _finish_directories_job(records, sync):
+	"""A finish job in a pool worker: finish each record (_finish_directory). (count, 0, {})."""
+	for record in records:
+		_finish_directory(record, sync)
+	return len(records), 0, {}
+
+# A finish job's directories: the folder sync's folder_per_job default, for the same per-job overhead. A pass of at most one
+# job's directories runs in the parent: a pool would run it in one worker, after a pool start (about 23 ms).
+_FINISH_PER_JOB = 64
+
+def finish_directories(records, max_workers, sync=False):
+	"""Give each directory the copy synced the rest of its metadata (_finish_directory), deepest first, once what goes in it
+	(its files, links, subdirectories and -rme's removals) is in: a directory written into after its times were set keeps the
+	write's time, and a 0555 one would refuse its files. One pool for the whole pass, each depth done before the next starts,
+	so a child's times are set through its parent while the parent's own mode still lets its owner search it; in the parent
+	under -s or for one job's worth. sync (a move, M2): each directory is fsynced through the same descriptor."""
+	records = [record for record in records if record[2] is not None or sync]
+	if not records:
+		return
+	by_depth = {}
+	for record in records:
+		by_depth.setdefault(os.path.abspath(record[1]).count(os.sep), []).append(record)
+	depths = sorted(by_depth, reverse=True)
+	if max_workers <= 1 or len(records) <= _FINISH_PER_JOB:
+		for depth in depths:
+			for record in by_depth[depth]:
+				_check_stop()
+				_finish_directory(record, sync)
+		return
+	with _pool(max(1, min(max_workers, -(-len(records) // _FINISH_PER_JOB)))) as executor:
+		for depth in depths:
+			level = by_depth[depth]
+			futures = {_submit_task(executor, _finish_directories_job, level[i:i + _FINISH_PER_JOB], sync)
+				for i in range(0, len(level), _FINISH_PER_JOB)}
+			while futures:
+				for future in _wait(futures, executor):
+					futures.discard(future)
+					_task_result(future, (0, 0, {}), 'Copy process crashed')
 
 def sync_directory_metadata_bulk(src_paths, dest_paths,src_path):
+	"""_sync_directory for each of src_paths (below src_path) onto its place below each of dest_paths: (count, seconds,
+	{link: dests}, the finish's records)."""
 	total_count = 0
 	total_time = 0
 	symLinks = {}
+	records = []
 	for src in src_paths:
 		source_relative_path = os.path.relpath(src, src_path)
 		dests = [_below(dest_path, source_relative_path) for dest_path in dest_paths]
-		count , cpTime , rtnSymLinks = sync_directory_metadata(src, dests)
+		count, cpTime, rtnSymLinks, done = _sync_directory(src, dests)
 		total_count += count
 		total_time += cpTime
 		symLinks.update(rtnSymLinks)
-	return total_count , total_time, symLinks
+		records += done
+	return total_count, total_time, symLinks, records
 
 def sync_directory_metadata_bulk_batch(jobs):
+	"""sync_directory_metadata_bulk for (src_path, folder, dest_paths) jobs."""
 	total_count = 0
 	total_time = 0
 	symLinks = {}
+	records = []
 	for (src_path,folder,dest_paths) in jobs:
 		source_relative_path = os.path.relpath(folder, src_path)
 		dests = [_below(dest_path, source_relative_path) for dest_path in dest_paths]
-		count , cpTime , rtnSymLinks = sync_directory_metadata(folder, dests)
+		count, cpTime, rtnSymLinks, done = _sync_directory(folder, dests)
 		total_count += count
 		total_time += cpTime
 		symLinks.update(rtnSymLinks)
-	return total_count , total_time, symLinks
+		records += done
+	return total_count, total_time, symLinks, records
 
 def sync_directories_parallel(src, dests, max_workers, verbose=False,folder_per_job=64,exclude=None,parallel_file_listing=False):
 	global FILES_RATE_LIMIT
@@ -5215,7 +5373,7 @@ def sync_directories_parallel(src, dests, max_workers, verbose=False,folder_per_
 	if not os.path.isdir(src):
 		_, _ , symLinks = copy_file(src, dests)
 		return symLinks
-	sync_directory_metadata(src, dests)
+	records = _sync_directory(src, dests)[3]
 	_,_,_,folders  = get_file_list(src, max_workers=max_workers,exclude=exclude,parallel_file_listing=parallel_file_listing)
 	folder_list_iterator = iter(folders)
 	futures = {}
@@ -5250,10 +5408,11 @@ def sync_directories_parallel(src, dests, max_workers, verbose=False,folder_per_
 			for future in done:
 				src_folders = futures.pop(future)
 				num_folders_copied_this_job = len(src_folders)
-				cpSize, cpTime, rtnSymLinks = _task_result(future, (0, 0, {}), 'Copy process crashed')
+				cpSize, cpTime, rtnSymLinks, done_records = _task_result(future, (0, 0, {}, []), 'Copy process crashed')
 				time_spent_this_iter += cpTime
 				apb.update(num_files=num_folders_copied_this_job, cpSize=cpSize, cpTime=cpTime , files_per_job=folder_per_job)
 				symLinks.update(rtnSymLinks)
+				records += done_records
 			apb.scheduled_jobs = len(futures)
 			apb.print_progress()
 			if done:
@@ -5283,6 +5442,8 @@ def sync_directories_parallel(src, dests, max_workers, verbose=False,folder_per_
 	endTime = time.monotonic()
 	apb.stop()
 	_print_operation_summary(apb, endTime - start_time, unit='folder', show_bandwidth=True)
+	# A sync on its own puts nothing in the directories: they are finished at once.
+	finish_directories(records, max_workers)
 	return symLinks
 
 def sync_directories_parallel_batch(jobs, max_workers, verbose=False,folder_per_job=64,exclude=None,parallel_file_listing=False):
@@ -5293,6 +5454,7 @@ def sync_directories_parallel_batch(jobs, max_workers, verbose=False,folder_per_
 	else:
 		max_scheduled_jobs = max_workers * 1.1
 	symLinks = {}
+	records = []
 	allFolderToSync = []
 	for src, dests in jobs:
 		dests = _validate_paths(src, dests)
@@ -5304,11 +5466,11 @@ def sync_directories_parallel_batch(jobs, max_workers, verbose=False,folder_per_
 			_, _ , sl = copy_file(src, dests)
 			symLinks.update(sl)
 			continue
-		sync_directory_metadata(src, dests)
+		records += _sync_directory(src, dests)[3]
 		_,_,_,folders  = get_file_list(src, max_workers=max_workers,exclude=exclude,parallel_file_listing=parallel_file_listing)
 		allFolderToSync.extend([(src,folder,dests) for folder in folders])
 	if not allFolderToSync:
-		return symLinks
+		return symLinks, records
 	print(f"Syncing Dir for {len(allFolderToSync)} folders with {max_workers} workers")
 	apb = Adaptive_Progress_Bar(total_count=len(allFolderToSync),total_size=len(allFolderToSync),suppress_all_output=verbose,process_word='Synced',bytes_rate_limit=BYTES_RATE_LIMIT,files_rate_limit=FILES_RATE_LIMIT)
 	job_iterator = iter(allFolderToSync)
@@ -5339,10 +5501,11 @@ def sync_directories_parallel_batch(jobs, max_workers, verbose=False,folder_per_
 			for future in done:
 				currentJobs = futures.pop(future)
 				num_folders_copied_this_job = len(currentJobs)
-				cpSize, cpTime, rtnSymLinks = _task_result(future, (0, 0, {}), 'Copy process crashed')
+				cpSize, cpTime, rtnSymLinks, done_records = _task_result(future, (0, 0, {}, []), 'Copy process crashed')
 				time_spent_this_iter += cpTime
 				apb.update(num_files=num_folders_copied_this_job, cpSize=cpSize, cpTime=cpTime , files_per_job=folder_per_job)
 				symLinks.update(rtnSymLinks)
+				records += done_records
 			apb.scheduled_jobs = len(futures)
 			apb.print_progress()
 			if done:
@@ -5371,7 +5534,7 @@ def sync_directories_parallel_batch(jobs, max_workers, verbose=False,folder_per_
 	endTime = time.monotonic()
 	apb.stop()
 	_print_operation_summary(apb, endTime - start_time, unit='folder', show_bandwidth=True)
-	return symLinks
+	return symLinks, records
 
 def sync_directories_serial(src, dests,exclude=None):
 	"""
@@ -5409,12 +5572,16 @@ def sync_directories_serial(src, dests,exclude=None):
 	_,_,_,folders = get_file_list(src,exclude=exclude,parallel_file_listing=False)
 	print(f"Syncing Dir from {src} to {dests} in single thread")
 	apb = Adaptive_Progress_Bar(total_count=len(folders),total_size=len(folders),process_word='Synced',bytes_rate_limit=BYTES_RATE_LIMIT,files_rate_limit=FILES_RATE_LIMIT)
+	records = []
 	for folder in folders:
 		source_relative_path = os.path.relpath(folder, src)
-		count , cpTime , _ = sync_directory_metadata(folder, [_below(dest, source_relative_path) for dest in dests])
+		count, cpTime, _, done = _sync_directory(folder, [_below(dest, source_relative_path) for dest in dests])
+		records += done
 		apb.update(num_files=1, cpSize=count, cpTime=cpTime , files_per_job=1)
 		apb.rate_limit()
 	apb.stop()
+	# A sync on its own puts nothing in the directories: they are finished at once.
+	finish_directories(records, 1)
 	return symLinks
 
 def sync_directories_serial_batch(jobs,exclude=None):
@@ -5423,6 +5590,7 @@ def sync_directories_serial_batch(jobs,exclude=None):
 	newJobs = []
 	# skip if src path or dest path is longer than 4096 characters
 	symLinks = {}
+	records = []
 	totalFolderCount = 0
 	srcFolders = []
 	for src,dests in jobs:
@@ -5440,17 +5608,18 @@ def sync_directories_serial_batch(jobs,exclude=None):
 		srcFolders.append(folders)
 		totalFolderCount += len(folders)
 	if totalFolderCount == 0:
-		return symLinks
+		return symLinks, records
 	print(f"Syncing Dir from {len(newJobs)} in single thread")
 	apb = Adaptive_Progress_Bar(total_count=totalFolderCount,total_size=totalFolderCount,process_word='Synced',bytes_rate_limit=BYTES_RATE_LIMIT,files_rate_limit=FILES_RATE_LIMIT)
 	for (src, dests), folders in zip(newJobs, srcFolders):
 		for folder in folders:
 			source_relative_path = os.path.relpath(folder, src)
-			count , cpTime , _ = sync_directory_metadata(folder, [_below(dest, source_relative_path) for dest in dests])
+			count, cpTime, _, done = _sync_directory(folder, [_below(dest, source_relative_path) for dest in dests])
+			records += done
 			apb.update(num_files=1, cpSize=count, cpTime=cpTime , files_per_job=1)
 			apb.rate_limit()
 	apb.stop()
-	return symLinks
+	return symLinks, records
 
 #%% ---- Compare Files ----
 def _compare_file_lists(file_list, file_list2, diff_file_list=None, tar_diff_file_list = False):
@@ -12123,8 +12292,9 @@ def _sync_implied_parents(src, dests, synced):
 	"""Make the directories above a _ListedSource's landing in each of dests that are missing, top first, with their
 	sources' metadata, and those where a link, FIFO or node is (_dest_directory replaces it). A directory or a file that
 	exists is left as it is: it is not this run's to change.
-	synced: the landings looked at so far in this run (one look each)."""
+	synced: the landings looked at so far in this run (one look each). Returns the finish's records (finish_directories)."""
 	parents = []
+	records = []
 	for source, landing in _implied_parents(src):
 		if landing in synced:
 			break
@@ -12136,7 +12306,8 @@ def _sync_implied_parents(src, dests, synced):
 		missing = [path for path in missing if not (os.path.lexists(path) and stat.S_ISREG(os.lstat(path).st_mode))]
 		if missing:
 			# A link to a directory (lnk/f) is made from the directory it leads to: the link itself has no mode to keep.
-			sync_directory_metadata(os.path.realpath(source) if os.path.islink(source) and os.path.isdir(source) else source, missing)
+			records += _sync_directory(os.path.realpath(source) if os.path.islink(source) and os.path.isdir(source) else source, missing)[3]
+	return records
 
 def _copy_job(source, dests, dest_image=None):
 	"""(src, its destinations, the destinations it must not take) as a copy job names them: 'path/' for a directory, as is
@@ -12669,9 +12840,11 @@ def _settle_destinations(src_paths, dests, dest_image=None, directory_only=False
 def process_copy(src_paths: list, dests:list = [], single_thread = False, max_workers = multiprocessing.cpu_count(),verbose = False, 
 				directory_only = False,no_directory_sync = False, full_hash = False, files_per_job = 1, parallel_file_listing = False,
 				exclude=None,dest_image = None,batch = False, exit_not_enough_space = False, dropped = None, in_place = ()):
-	"""dropped, in_place: what _settle_destinations decided (hpcp() settles them first)."""
+	"""dropped, in_place: what _settle_destinations decided (hpcp() settles them first). Returns (the files, {link: dests},
+	the directory sync's records for the finish: finish_directories)."""
 	total_file_list = set()
 	total_sym_links = {}
+	dir_records = []
 	taskCtr = 0
 	argDest = dests.copy()
 	if batch:
@@ -12708,12 +12881,12 @@ def process_copy(src_paths: list, dests:list = [], single_thread = False, max_wo
 			srcParentDirs.reverse()
 			# create the parent dirs in dest
 			#destParentDirs = [ os.path.abspath(dest + srcParentDir + os.path.sep) for srcParentDir in srcParentDirs]
-			sync_directory_metadata_bulk(srcParentDirs,argDest,src_path='/')
+			dir_records += sync_directory_metadata_bulk(srcParentDirs,argDest,src_path='/')[3]
 		if isinstance(source, _ListedSource):
 			# The directories its path implies that are missing take its sources' mode and owner, so a private one stays
 			# private. (With dest_image, above.) Its parents may not exist yet, so nothing to check for being writable.
 			if not (dest_image or no_directory_sync or NO_CREATE_DIR or (exclude and is_excluded(src, exclude))):
-				_sync_implied_parents(source, argDest, synced_parents)
+				dir_records += _sync_implied_parents(source, argDest, synced_parents)
 		else:
 			# verify dest is writable
 			for dest in dests:
@@ -12745,19 +12918,21 @@ def process_copy(src_paths: list, dests:list = [], single_thread = False, max_wo
 			if not directory_only:
 				cs.add_copy(src, dests)
 		if not batch:
-			fl, sl = cs.process()
+			fl, sl, dr = cs.process()
 			total_file_list.update(fl)
 			total_sym_links.update(sl)
+			dir_records += dr
 			cs.clear()
 			print('-'*80)
 	if batch:
-		fl, sl = cs.process()
+		fl, sl, dr = cs.process()
 		total_file_list.update(fl)
 		total_sym_links.update(sl)
+		dir_records += dr
 		cs.clear()
 		print(f"Processed {len(total_file_list)} files and {len(total_sym_links)} symlinks in total")
 		print('-'*80)
-	return total_file_list, total_sym_links
+	return total_file_list, total_sym_links, dir_records
 
 def validate_dd_source_path(src_path,loop_devices = None):
 	# `is None`, not `if not loop_devices`: an empty list is falsy, so the old
@@ -13488,7 +13663,7 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = multipr
 			_check_stop()
 			if replaced:
 				print(f"Merged directories: {replaced} file(s) replaced by a later source")
-			total_file_list, total_sym_links = process_copy(src_paths, dests, single_thread=single_thread, max_workers=max_workers,
+			total_file_list, total_sym_links, dir_records = process_copy(src_paths, dests, single_thread=single_thread, max_workers=max_workers,
 																			verbose=verbose, directory_only=directory_only,no_directory_sync=no_directory_sync,
 																			full_hash=full_hash, files_per_job=files_per_job, parallel_file_listing=parallel_file_listing,
 																			exclude=copy_exclude,dest_image=dest_image,batch = batch,exit_not_enough_space = exit_not_enough_space,dropped = dropped,in_place = in_place)
@@ -13544,6 +13719,14 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = multipr
 				print('-'*80)
 				print("Removing extra directories...")
 				remove_extra_dirs(src_paths, dests,exclude=exclude,dest_image=bool(dest_image),keep=link_targets,dest_roots=dest_roots,listed=listed,named=named_sources)
+			# Each synced directory's times, exact mode and flags, once what goes in it is in: its files, its links and -rme's
+			# removals (ran or skipped). Before a move's removal, which a directory it could not set stops, as a failed copy does
+			# (9.86 counted a directory it could not set the same way).
+			_check_stop()
+			finish_start = len(ERRORS)
+			finish_directories(dir_records, 1 if single_thread else max_workers)
+			copy_failures += [error for error in ERRORS[finish_start:] if _is_failure(error)]
+			_check_stop()
 			print('-'*80)
 			if len(src_paths) > 1:
 				print("Overall Summary:")
