@@ -174,7 +174,9 @@ def test_copy_file_reports_size_when_sparse_cp_fails(tmp_tree, hpcp_mod, reset_h
 	assert open(dst, 'rb').read() == open(src, 'rb').read()
 	assert size == hpcp_mod.get_file_size(dst) > 0
 	assert any('--sparse=always' in c for c in calls)
-	assert calls[-1][-2:] == [src, dst] and '--sparse=always' not in calls[-1]
+	# a first copy goes through the held landing (/proc/self/fd/N) where cp can write there, else by name
+	assert calls[-1][-2] == src and calls[-1][-1] in (dst, '/proc/self/fd/%s' % calls[-1][-1].rpartition('/')[2])
+	assert '--sparse=always' not in calls[-1]
 
 
 def test_copy_file_sparse_fallback_writes_only_one_dest(tmp_tree, hpcp_mod, reset_hpcp_globals, require_linux, monkeypatch):

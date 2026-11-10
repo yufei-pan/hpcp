@@ -149,7 +149,7 @@ def test_a_cp_version_that_gives_no_answer_is_asked_again(exec_dir, monkeypatch)
 	monkeypatch.setenv('CP_PATH', fake)
 	monkeypatch.setattr(hpcp, '_CP_ASK_TIMEOUT', 0.2)
 	monkeypatch.setattr(hpcp, '_SPARSE', [None, False])
-	monkeypatch.setattr(hpcp, '_HELD', [None, False])
+	monkeypatch.setattr(hpcp, '_HELD', [None, None])
 	# the held-file route, the first to ask: no answer, so it is asked again at the next rewrite
-	assert hpcp._reaches_held() is False and hpcp._HELD[0] is None
+	assert hpcp._held_route() is None and hpcp._HELD[0] is None
 	assert hpcp.cp_supports_sparse() is True and hpcp._SPARSE[1] is True

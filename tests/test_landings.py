@@ -204,8 +204,10 @@ def test_a_landing_with_other_names_is_never_written_in_place(tmp_path, hpcp_mod
 	real = hpcp_mod.run_command_in_multicmd_with_path_check
 	refuse = []
 	def cp(command, *args, **kwargs):
-		assert not command[-1].startswith('/proc/'), command
-		if refuse and os.path.basename(command[-1]).startswith('.hpcp_tmp_'):
+		# cp writes the new file hpcp made beside the landing (/proc/self/fd/N, which names it), never the landing
+		target = os.readlink(command[-1]) if command[-1].startswith('/proc/self/fd/') else command[-1]
+		assert os.path.basename(target).startswith('.hpcp_tmp_'), command
+		if refuse:
 			raise RuntimeError('cp: cannot create regular file: Permission denied')
 		return real(command, *args, **kwargs)
 	monkeypatch.setattr(hpcp_mod, 'run_command_in_multicmd_with_path_check', cp)
@@ -231,7 +233,11 @@ def test_a_refused_rename_on_the_beside_route_keeps_the_old_copy(tmp_path, hpcp_
 	monkeypatch.setattr(hpcp_mod, 'WRITE_BESIDE', True)
 	cps = []
 	real = hpcp_mod.run_command_in_multicmd_with_path_check
-	monkeypatch.setattr(hpcp_mod, 'run_command_in_multicmd_with_path_check', lambda command, *a, **k: cps.append(command[-1]) or real(command, *a, **k))
+	def cp(command, *args, **kwargs):
+		# the beside route's new file, held by hpcp, is named by cp's /proc/self/fd/N
+		cps.append(os.readlink(command[-1]) if command[-1].startswith('/proc/self/fd/') else command[-1])
+		return real(command, *args, **kwargs)
+	monkeypatch.setattr(hpcp_mod, 'run_command_in_multicmd_with_path_check', cp)
 	real_rename = os.rename
 	def rename(source, target, **kwargs):
 		if os.path.basename(str(source)).startswith('.hpcp_tmp_'):
@@ -331,7 +337,7 @@ def test_a_link_swapped_in_after_the_open_is_not_written_through(tmp_path, hpcp_
 		return real(command, *args, **kwargs)
 	monkeypatch.setattr(hpcp_mod, 'run_command_in_multicmd_with_path_check', swap_then_cp)
 	assert hpcp_mod.copy_file(str(tmp_path / 'a/x'), [str(tmp_path / 'out/x')])[0] > 0 and not hpcp_mod.ERRORS
-	assert len(seen) == 1 and seen[0].startswith('/proc/%d/fd/' % os.getpid()), seen
+	assert len(seen) == 1 and seen[0].startswith('/proc/self/fd/'), seen
 	assert read(tmp_path / 't/f') == 'not yours' and os.path.islink(str(tmp_path / 'out/x'))
 	assert read(tmp_path / 'out/x.held') == 'new content' and os.stat(str(tmp_path / 'out/x.held')).st_ino == inode
 
@@ -381,7 +387,7 @@ def test_off_linux_the_landing_is_written_by_path(tmp_path, hpcp_mod, reset_hpcp
 	inode = os.stat(str(tmp_path / 'out/x')).st_ino
 	monkeypatch.setattr(hpcp_mod, 'CONTENT_ONLY', content_only)
 	monkeypatch.setattr(hpcp_mod, 'NAMED_DESTS', frozenset([str(tmp_path / 'out')]))
-	monkeypatch.setattr(hpcp_mod, '_reaches_held', lambda: False)
+	monkeypatch.setattr(hpcp_mod, '_held_route', lambda: None)
 	real = hpcp_mod.run_command_in_multicmd_with_path_check
 	seen = []
 	monkeypatch.setattr(hpcp_mod, 'run_command_in_multicmd_with_path_check', lambda command, *a, **k: seen.append(command[-1]) or real(command, *a, **k))
@@ -393,14 +399,14 @@ def test_off_linux_the_landing_is_written_by_path(tmp_path, hpcp_mod, reset_hpcp
 
 
 _NO_PROC_CP = '''#!/bin/sh
-# cp that may not open another process's /proc/PID/fd/N (hidepid, a worker that is not dumpable, an LSM): it fails, writing
-# nothing, as GNU cp fails its stat of the destination ("cannot stat ...: Permission denied"). PROBE=pass lets the held-file
-# probe (cp /dev/null onto a descriptor of /dev/zero) through, as if the refusal came only later.
+# cp that may not open the held file's /proc/self/fd/N (an LSM rule): it fails, writing nothing, as GNU cp fails its stat of
+# the destination ("cannot stat ...: Permission denied"). PROBE=pass lets the held-file probe (cp of a temporary file named
+# hpcp-held-probe-*) through, as if the refusal came only later.
 case "$1" in --version) exec cp "$@";; esac
 for last; do :; done
 case "$last" in
 /proc/*)
-	if [ "$1" = /dev/null ] && [ "$PROBE" = pass ]; then exec cp "$@"; fi
+	case "$2" in */hpcp-held-probe-*) if [ "$PROBE" = pass ]; then exec cp "$@"; fi;; esac
 	echo "cp: cannot stat '$last': Permission denied" >&2; exit 1;;
 esac
 exec cp "$@"
@@ -447,35 +453,25 @@ def test_a_cp_refused_the_held_file_after_the_probe_keeps_the_old_copy(tmp_path)
 
 @posix_only
 @pytest.mark.skipif(not sys.platform.startswith('linux'), reason='the held-file route is Linux only')
-def test_a_proc_of_another_pid_namespace_is_never_written_through(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
-	# unshare -p without a /proc of its own: /proc/PID there is another process, whose descriptor N could be any file. The
-	# held route is off (cp gets the name), and the probe is never run, so nothing is written through it.
-	monkeypatch.setattr(hpcp_mod, '_HELD', [None, False])
-	hpcp_mod.cp_supports_sparse()  # cp --version, asked once per process, is no probe
-	real = os.readlink
-	monkeypatch.setattr(hpcp_mod.os, 'readlink', lambda path, *a, **k: str(os.getpid() + 1) if path == '/proc/self' else real(path, *a, **k))
-	ran = []
-	monkeypatch.setattr(hpcp_mod.multiCMD, 'run_commands', lambda *a, **k: ran.append(a) or [])
-	assert hpcp_mod._reaches_held() is False and ran == []
-
-
-@posix_only
-@pytest.mark.skipif(not sys.platform.startswith('linux'), reason='the held-file route is Linux only')
 def test_the_held_file_probe_runs_once_per_process(hpcp_mod, monkeypatch):
-	# One probe however many rewrites in place; a forked worker (another pid) asks for itself.
-	monkeypatch.setattr(hpcp_mod, '_HELD', [None, False])
+	# One probe however many rewrites in place; a forked worker (another pid) asks for itself. cp gets the descriptor it
+	# inherits under its own process's name (/proc/self/fd/N): 9.86 named this process's (/proc/PID/fd/N), which hidepid, a
+	# worker /proc refuses and another PID namespace's /proc did not show to cp.
+	monkeypatch.setattr(hpcp_mod, '_HELD', [None, None])
 	probes = []
 	real_run = hpcp_mod.multiCMD.run_commands
 	def run_commands(commands, *args, **kwargs):
-		if commands[0][1:2] == [os.devnull]:
-			probes.append(commands[0])
+		if os.path.basename(str(commands[0][-2])).startswith('hpcp-held-probe-'):
+			probes.append((commands[0], kwargs.get('pass_fds')))
 		return real_run(commands, *args, **kwargs)
 	monkeypatch.setattr(hpcp_mod.multiCMD, 'run_commands', run_commands)
-	answers = [hpcp_mod._reaches_held() for _ in range(3)]
+	answers = [hpcp_mod._held_route() for _ in range(3)]
 	assert answers == [answers[0]] * 3 and len(probes) == 1, probes
-	assert probes[0][2].startswith('/proc/%d/fd/' % os.getpid())
-	monkeypatch.setattr(hpcp_mod, '_HELD', [os.getpid() + 1, not answers[0]])
-	assert hpcp_mod._reaches_held() == answers[0] and len(probes) == 2
+	command, pass_fds = probes[0]
+	assert command[-1] == '/proc/self/fd/%d' % pass_fds[0], probes
+	assert not os.path.exists(command[-2])  # the probe's source is gone
+	monkeypatch.setattr(hpcp_mod, '_HELD', [os.getpid() + 1, None])
+	assert hpcp_mod._held_route() == answers[0] and len(probes) == 2
 
 
 @posix_only
@@ -943,7 +939,7 @@ def test_a_rewrite_through_the_held_file_asks_for_the_source_s_label_only_on_a_p
 		reset_hpcp_globals, monkeypatch, content_only):
 	# Runs without SELinux too: a plain rewrite through the held file gives it the source's label (_label_like), and -co,
 	# which keeps the old label in every version, does not.
-	if not hpcp_mod._reaches_held():
+	if not hpcp_mod._held_route():
 		pytest.skip('cp cannot reach the held file here')
 	write(tmp_path / 'a/x', 'new content')
 	write(tmp_path / 'out/x', 'old')
@@ -1238,8 +1234,8 @@ def _warnings(output, where):
 
 _LOGGING_CP = '''#!/bin/sh
 # cp that notes each copy it starts in $LOG, then (after $PAUSE seconds, when set) runs the real cp. --version and the
-# held-file probe (cp /dev/null onto a descriptor of /dev/zero) are not copies.
-case "$1" in --version|/dev/null) exec cp "$@";; esac
+# held-file probe (cp of a temporary file named hpcp-held-probe-*) are not copies.
+case "$1 $2" in --version*|*/hpcp-held-probe-*) exec cp "$@";; esac
 echo CP-STARTED >> "$LOG"
 if [ -n "$PAUSE" ]; then sleep "$PAUSE"; fi
 exec cp "$@"
@@ -1556,13 +1552,15 @@ def test_a_root_copy_onto_an_ext4_full_for_users_gets_one_needless_warning(tmp_p
 # ---- rule 9: a stop is a cleanup ----
 
 _SLOW_CP = '''#!/bin/sh
-# cp, slowed: write a part of each copy into a temporary name, say so, and wait for the go file (or 60 s) before the real cp.
-case "$1" in --version) exec cp "$@";; esac
+# cp, slowed: write a part of each copy into a temporary name (by its name, or the held file hpcp made there, through
+# /proc/self/fd/N), say so, and wait for the go file (or 60 s) before the real cp.
+case "$1 $2" in --version*|*/hpcp-held-probe-*) exec cp "$@";; esac
 for last; do :; done
-case "$(basename "$last")" in
+name=$(basename "$(readlink "$last" 2>/dev/null || echo "$last")")
+case "$name" in
 .hpcp_tmp_*)
 	head -c 100 /etc/passwd > "$last"
-	touch "$MARKS/$(basename "$last")"
+	touch "$MARKS/$name"
 	waited=0
 	while [ ! -e "$GO" ] && [ $waited -lt 600 ]; do sleep 0.1; waited=$((waited + 1)); done;;
 esac
@@ -1571,10 +1569,10 @@ exec cp "$@"
 
 
 _SLOW_CP_IN_PLACE = '''#!/bin/sh
-# cp, slowed, for a rewrite in place: write a part of the copy into what it is given (the held file, /proc/PID/fd/N), say
-# so, and wait for the go file (or 60 s) before the real cp. --version and the held-file probe (cp /dev/null onto a
-# descriptor of /dev/zero) go straight to cp.
-case "$1" in --version|/dev/null) exec cp "$@";; esac
+# cp, slowed, for a rewrite in place: write a part of the copy into what it is given (the held file, /proc/self/fd/N), say
+# so, and wait for the go file (or 60 s) before the real cp. --version and the held-file probe (cp of a temporary file
+# named hpcp-held-probe-*) go straight to cp.
+case "$1 $2" in --version*|*/hpcp-held-probe-*) exec cp "$@";; esac
 for last; do :; done
 head -c 100 /etc/passwd > "$last"
 touch "$MARKS/$$"
@@ -2050,16 +2048,22 @@ def test_a_worker_in_a_long_cleanup_is_waited_for_not_killed(tmp_path):
 	write(tmp_path / 'src' / 'a', 'new')
 	write(tmp_path / 'out' / 'a', 'old')
 	inject = '''
-real_fsync = hpcp._fsync_file
-def fsync_file(path):
+def slow(path):
 	if os.path.basename(path).startswith('.hpcp_tmp_'):
 		mask = signal.pthread_sigmask(signal.SIG_BLOCK, hpcp._STOPS)
 		open(os.environ['MARK'], 'w').close()
 		time.sleep(8)
 		open(os.environ['MARK'] + '.done', 'w').close()
 		signal.pthread_sigmask(signal.SIG_SETMASK, mask)
+real_fsync, real_os_fsync = hpcp._fsync_file, os.fsync
+def fsync_file(path):
+	slow(path)
 	return real_fsync(path)
-hpcp._fsync_file = fsync_file
+def os_fsync(fd):
+	# the beside route's new file, made and held by hpcp, is fsynced through its descriptor
+	slow(os.readlink('/proc/self/fd/%d' % fd) if os.path.isdir('/proc/self/fd') else '')
+	return real_os_fsync(fd)
+hpcp._fsync_file, os.fsync = fsync_file, os_fsync
 '''
 	mark = tmp_path / 'mark'
 	task = _wrapped(tmp_path, ['src/', '-d', 'out/', '-j', '2', '-wb'], inject, env={'MARK': str(mark)})
@@ -3087,8 +3091,9 @@ def test_a_named_landing_that_turns_into_a_fifo_after_the_look_is_never_written_
 @pytest.mark.skipif(not sys.platform.startswith('linux'), reason='O_PATH and /proc/self/fd')
 @pytest.mark.parametrize('swap', ['link', 'hard link'])
 def test_content_only_carries_nothing_through_what_is_put_at_the_temporary_name(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch, swap):
-	# -co -wb: once cp has made the temporary file, a user who can write the directory puts a link (or another file's second
-	# name) there; the carry-over refuses it (190, the old copy kept), and the victim keeps its mode.
+	# -co -wb: once cp has written the temporary file, a user who can write the directory puts a link (or another file's
+	# second name) there. 9.86's carry-over refused it; 9.87's goes through the file hpcp made and holds, and the rename finds
+	# the name no longer leads to it: 190, the old copy kept, and the victim keeps its mode.
 	write(tmp_path / 'a/f', 'new')
 	write(tmp_path / 'out/f', 'old')
 	write(tmp_path / 'victim', 'victim')
@@ -3096,16 +3101,18 @@ def test_content_only_carries_nothing_through_what_is_put_at_the_temporary_name(
 	os.chmod(str(tmp_path / 'victim'), 0o600)
 	runner = hpcp_mod.run_command_in_multicmd_with_path_check
 	def swap_in(command, *args, **kwargs):
+		temp = os.readlink(command[-1]) if command[-1].startswith('/proc/self/fd/') else command[-1]
 		result = runner(command, *args, **kwargs)
-		if '.hpcp_tmp_' in command[-1]:
-			os.unlink(command[-1])
-			(os.symlink if swap == 'link' else os.link)(str(tmp_path / 'victim'), command[-1])
+		if '.hpcp_tmp_' in temp:
+			os.unlink(temp)
+			(os.symlink if swap == 'link' else os.link)(str(tmp_path / 'victim'), temp)
 		return result
 	monkeypatch.setattr(hpcp_mod, 'run_command_in_multicmd_with_path_check', swap_in)
 	hpcp_mod.CONTENT_ONLY = hpcp_mod.WRITE_BESIDE = True
 	hpcp_mod.copy_file(str(tmp_path / 'a/f'), [str(tmp_path / 'out/f')])
 	assert stat.S_IMODE(os.stat(str(tmp_path / 'victim')).st_mode) == 0o600 and read(tmp_path / 'out/f') == 'old'
-	assert any('cannot be given to the new copy' in error for error in hpcp_mod.ERRORS), hpcp_mod.ERRORS
+	assert any('cannot be given to the new copy' in error or 'something else was put at its name' in error
+		for error in hpcp_mod.ERRORS), hpcp_mod.ERRORS
 
 
 def _protected_symlinks():
@@ -3135,16 +3142,23 @@ def test_a_named_link_the_kernel_refuses_to_follow_is_kept(tmp_path):
 
 @posix_only
 @pytest.mark.skipif(not sys.platform.startswith('linux'), reason='the probe is Linux-only')
-@pytest.mark.parametrize('answers, asked, left', [([124, 0, 1], [False, True, True], [1]), ([1, 0], [False, False], [0]), ([127, 1], [False, False], [])],
+@pytest.mark.parametrize('answers, asked, left', [([124, 0, 1], [None, 'c', 'c'], [1]), ([1, 0], [None, None], [0]), ([127, 1], [None, None], [])],
 	ids=['timeout-then-yes', 'cp-refuses', 'could-not-start-then-no'])
 def test_the_held_file_probe_keeps_only_cp_s_own_answer(hpcp_mod, monkeypatch, answers, asked, left):
-	# A probe that timed out (124) or could not start cp (127) is no answer: the next rewrite asks again. cp's own exit (0: it
-	# can open /proc/PID/fd/N, 1: it cannot) is kept for the worker's life.
+	# A probe that timed out (124) or could not start cp (127) is no answer: the next rewrite asks again. cp's own answer (0, the
+	# held file then holding the source's byte: the route; 1: no route) is kept for the worker's life.
 	hpcp_mod.cp_supports_sparse()  # the real cp is asked before the stub stands in for the probe's
-	monkeypatch.setattr(hpcp_mod, '_HELD', [None, False])
+	monkeypatch.setattr(hpcp_mod, '_HELD', [None, None])
 	answers = list(answers)
-	monkeypatch.setattr(hpcp_mod.multiCMD, 'run_commands', lambda *args, **kwargs: [type('Task', (), {'returncode': answers.pop(0)})()])
-	assert [hpcp_mod._reaches_held() for _ in asked] == asked and answers == left
+	def run_commands(*args, **kwargs):
+		code = answers.pop(0)
+		if code == 0:
+			fd = kwargs['pass_fds'][0]
+			os.pwrite(fd, b'c', 0)
+			os.ftruncate(fd, 1)
+		return [type('Task', (), {'returncode': code})()]
+	monkeypatch.setattr(hpcp_mod.multiCMD, 'run_commands', run_commands)
+	assert [hpcp_mod._held_route() for _ in asked] == asked and answers == left
 
 
 @posix_only

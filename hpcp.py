@@ -695,7 +695,7 @@ def get_free_space_bytes(path):
 		st = os.statvfs(get_last_existing_parent(path))
 	return st.f_bavail * st.f_frsize  # available blocks * fragment size
 
-# How long `cp --version` (and the held-file probe, _reaches_held) may stay silent: it answers in milliseconds, and one that
+# How long `cp --version` (and the held-file probe, _held_route) may stay silent: it answers in milliseconds, and one that
 # hangs this long under a host's load gets asked again at the next call (cp_supports_sparse).
 _CP_ASK_TIMEOUT = 10
 
@@ -3903,22 +3903,25 @@ def _co_carry(target, st):
 				return None
 	return carried
 
-def _carry_over(st, temp, carried):
+def _carry_over(st, temp, carried, held=None):
 	"""Give temp, the new file of a -co rewrite, exactly what the old file (st, carried: _co_carry) had: its carried xattrs
 	(each set, and any such name temp gained, as an ACL inherited from a default ACL, removed), owner and group, and mode, less
 	set-user-ID, and set-group-ID where group-execute is set, when the runner is not root: the kernel clears those on a write
 	by such a user, so the write in place lost them too. A label the filesystem gives itself (setting security.selinux fails
 	with EOPNOTSUPP: vfat, a context= mount) is skipped. Anything else that fails raises. On Linux each step reaches what cp
 	made through an O_PATH descriptor of it (never opened: a node made of a device is not acted on): a link or another file
-	put at its name since (a user who can write the directory) is refused, so no chown or chmod goes through a link."""
-	fd = os.open(temp, os.O_PATH | os.O_NOFOLLOW | getattr(os, 'O_CLOEXEC', 0)) if _PATH_FDS else None
+	put at its name since (a user who can write the directory) is refused, so no chown or chmod goes through a link. held: the
+	descriptor hpcp made temp by (_cp_beside), which every step goes through instead."""
+	fd = os.open(temp, os.O_PATH | os.O_NOFOLLOW | getattr(os, 'O_CLOEXEC', 0)) if _PATH_FDS and held is None else None
 	try:
 		if fd is not None:
 			now = os.fstat(fd)
 			if stat.S_ISLNK(now.st_mode) or now.st_nlink != 1:
 				raise OSError(errno.EEXIST, 'it was replaced since cp made it', temp)
 			temp = '/proc/self/fd/%d' % fd  # leads to the descriptor's file, and no further
-		how = {} if fd is not None else {'follow_symlinks': False}
+		elif held is not None:
+			temp = held
+		how = {} if fd is not None or held is not None else {'follow_symlinks': False}
 		if hasattr(os, 'listxattr'):
 			try:
 				gained = os.listxattr(temp, **how)
@@ -4202,49 +4205,84 @@ def _cp_to(command, src_path, target, space=None):
 # A landing opened to be written in place: never through a link put there (ELOOP), never waiting on a FIFO (ENXIO) or a
 # lease (EAGAIN), not inherited by cp; no O_TRUNC (cp truncates it).
 _LANDING_FLAGS = os.O_WRONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NONBLOCK', 0) | getattr(os, 'O_CLOEXEC', 0)
-_HELD = [None, False]  # (pid, _reaches_held's answer): asked once per process, so a forked worker asks for itself
+_HELD = [None, None]  # (pid, _held_route's answer): asked once per process, so a forked worker asks for itself
+# The name under which cp opens a descriptor it inherited (pass_fds): its own process's, so no other process's /proc is asked.
+_HELD_NAME = '/dev/fd/%d' if sys.platform == 'darwin' else '/proc/self/fd/%d'
 
-def _reaches_held():
-	"""True when cp can open this process's descriptors through /proc/PID/fd/N, the held file of a rewrite in place. False off
-	Linux, without /proc, where /proc is another PID namespace's (/proc/PID is another process), for a cp that is not GNU cp
-	(the one checked), and where cp is refused (hidepid, a worker not dumpable, an LSM): asked by doing it, cp copying
-	/dev/null onto a descriptor of /dev/zero. cp then gets the name, as in 9.84."""
+def _held_route():
+	"""How cp writes a file this process holds open, through the descriptor it inherits (_HELD_NAME): 'c' when its write leaves
+	the file at the source's size (Linux reopens /proc/self/fd/N and truncates; macOS's copyfile truncates after its copy),
+	'cb' when it writes through it but leaves an old tail (a dup opened without truncating: hpcp empties the held file before
+	each cp), None when it does not: cp then gets the name, as 9.84 gave it. Asked once per process by doing it: cp, with the
+	run's flags, copies a 1-byte source holding c onto a held temporary file holding ab, which is read back. Only on Linux
+	with GNU cp (BusyBox's makes every destination anew) and on macOS; elsewhere None. A cp that times out or cannot start
+	keeps no answer (asked again at the next copy, as cp_supports_sparse); a cp that fails or writes elsewhere, or no
+	temporary file (tempfile's TMPDIR, /tmp, /var/tmp, /usr/tmp and the working directory), is None. Both temporary files
+	go whatever happens."""
 	pid = os.getpid()
-	if _HELD[0] != pid:
-		_HELD[:] = [pid, False]
-		with contextlib.suppress(Exception):
-			gnu = cp_supports_sparse()
-			if gnu is None:
-				_HELD[0] = None  # cp gave no answer: asked again at the next rewrite
-			elif sys.platform.startswith('linux') and gnu and os.readlink('/proc/self') == str(pid):
-				with open('/dev/zero', 'wb') as probe:
-					# an empty copy takes milliseconds; a cp that hangs this long gets no held file (_CP_ASK_TIMEOUT)
-					code = multiCMD.run_commands([[_bin('cp'), os.devnull, '/proc/%d/fd/%d' % (pid, probe.fileno())]],
-						timeout=_CP_ASK_TIMEOUT, quiet=True, return_object=True)[0].returncode
-				_HELD[1] = code == 0
-				if code not in (0, 1):
-					_HELD[0] = None  # no answer (a timeout, a cp that could not start): asked again at the next rewrite
+	if _HELD[0] == pid:
+		return _HELD[1]
+	_HELD[:] = [pid, None]
+	if sys.platform.startswith('linux'):
+		gnu = cp_supports_sparse()
+		if gnu is None:
+			_HELD[0] = None  # cp gave no answer: asked again at the next copy
+			return None
+		if not gnu or not os.path.isdir('/proc/self/fd'):
+			return None
+	elif sys.platform != 'darwin':
+		return None
+	source = None
+	try:
+		handle, source = tempfile.mkstemp(prefix='hpcp-held-probe-')
+		try:
+			os.write(handle, b'c')
+		finally:
+			os.close(handle)
+		with tempfile.TemporaryFile() as held:
+			fd = held.fileno()
+			os.write(fd, b'ab')
+			os.lseek(fd, 0, os.SEEK_SET)  # as a landing's fresh descriptor: macOS's /dev/fd/N shares its offset
+			# an empty copy takes milliseconds; a cp that hangs this long gets no route (_CP_ASK_TIMEOUT)
+			task = multiCMD.run_commands([[_bin('cp'), '-f' if CONTENT_ONLY else '-af', source, _HELD_NAME % fd]],
+				timeout=_CP_ASK_TIMEOUT, quiet=True, return_object=True, pass_fds=(fd,))[0]
+			if task.returncode in _NO_ANSWER:
+				_HELD[0] = None
+			elif task.returncode == 0:
+				_HELD[1] = {b'c': 'c', b'cb': 'cb'}.get(os.pread(fd, 8, 0))
+	except Exception:
+		pass  # no temporary file: no route
+	finally:
+		if source is not None:
+			with contextlib.suppress(OSError):
+				os.unlink(source)
 	return _HELD[1]
 
-def _cp_held(command, src_path, target, fd, fst, space, through_link):
+def _cp_held(command, src_path, target, fd, fst, space, through_link, new=False):
 	"""cp src_path into target, the regular file with one name this process holds open (fd, fst its fstat); its size. cp
-	writes the held file (/proc/PID/fd/N, _reaches_held), so a link put at the name since the open is never written through;
-	else the name, as in 9.84. The inode stays. A cp that fails or is stopped after it changed the file takes the torn name
-	if it is still this file, as 9.84 did, except where a link the operator named led there (through_link: kept for the
-	retry, 9.84). -rbw reads the source first; its failure keeps the file (_KeptOld). Errors name target, not /proc."""
-	if READ_FIRST:
+	writes the held file through the descriptor it inherits (_held_route), so a link put at the name since the open is never
+	written through; with no route, the name, as in 9.84. The inode stays. A cp that fails or is stopped after it changed the
+	file takes the torn name if it is still this file, as 9.84 did, except where a link the operator named led there
+	(through_link: kept for the retry, 9.84). -rbw reads the source first; its failure keeps the file (_KeptOld). new: the
+	file is one hpcp just made (_cp_made): no -rbw read, no old copy, and a failure takes the name while it leads to
+	it. Errors name target, not the descriptor's name."""
+	if READ_FIRST and not new:
 		failed = _read_through(src_path)
 		if failed is not None:
 			raise _KeptOld(f'{src_path} failed on read ({_why(failed)})')
 	if space is not None:
-		_space_warning(target, src_path, space[0], space[1], fst.st_blocks * 512)
-	held = '/proc/%d/fd/%d' % (os.getpid(), fd) if _reaches_held() else None
+		_space_warning(target, src_path, space[0], space[1], 0 if new else fst.st_blocks * 512)
+	route = _held_route()
+	held = _HELD_NAME % fd if route else None
+	if route == 'cb' and not new:
+		os.ftruncate(fd, 0)  # cp's open will not truncate it, and a shorter source would leave the old tail
 	try:
-		run_command_in_multicmd_with_path_check(command + [src_path, held or target], quiet=True, strict=True)
+		run_command_in_multicmd_with_path_check(command + [src_path, held or target], quiet=True, strict=True,
+			pass_fds=(fd,) if held else ())
 	except BaseException as e:
 		with contextlib.suppress(OSError):
 			now, named = os.fstat(fd), os.lstat(target)
-			if (not through_link and (now.st_size, now.st_mtime_ns, now.st_ctime_ns) != (fst.st_size, fst.st_mtime_ns, fst.st_ctime_ns)
+			if (not through_link and (new or (now.st_size, now.st_mtime_ns, now.st_ctime_ns) != (fst.st_size, fst.st_mtime_ns, fst.st_ctime_ns))
 					and (named.st_dev, named.st_ino) == (fst.st_dev, fst.st_ino)):
 				os.unlink(target)
 		if held is not None and ERRORS and held in ERRORS[-1]:
@@ -4252,16 +4290,88 @@ def _cp_held(command, src_path, target, fd, fst, space, through_link):
 		if held is None or not isinstance(e, Exception):
 			raise
 		raise RuntimeError(str(e).replace(held, target)) from e
-	if not CONTENT_ONLY:
+	if not CONTENT_ONLY and not new:
 		_remove_stale_xattrs(src_path, fd)
 		if held is not None:
 			_label_like(src_path, fd)
 	return os.fstat(fd).st_blocks * 512
 
+# A file hpcp makes for cp to write (_cp_made: a first copy, the beside route's new file): never through a link or onto a
+# name there.
+_NEW_FILE_FLAGS = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_CLOEXEC', 0)
+
+def _new_file_mode(src_st):
+	"""The mode a file hpcp makes for cp starts with (_cp_made): 0600 for cp -a, which gives it the source's mode through the
+	descriptor when it ends (no reader sees it wider than the source); under -co (cp -f, which keeps an existing file's mode)
+	the source's permission bits, which the umask and a default ACL then make what cp -f makes."""
+	return stat.S_IMODE(src_st.st_mode) & 0o777 if CONTENT_ONLY and src_st is not None else 0o600
+
+def _drop_made(target, made):
+	"""Remove target while its name still leads to made, the file hpcp made there (its fstat): never what was put there since."""
+	with contextlib.suppress(OSError):
+		named = os.lstat(target)
+		if (named.st_dev, named.st_ino) == (made.st_dev, made.st_ino):
+			os.unlink(target)
+
+def _has_acl(fd):
+	"""Whether the file fd is open on carries POSIX ACL entries beyond its mode (Linux; False where it cannot be asked)."""
+	try:
+		return 'system.posix_acl_access' in os.listxattr(fd)
+	except (OSError, AttributeError, TypeError):
+		return False
+
+def _cp_made(command, src_path, target, src_st, space):
+	"""cp src_path, a regular file, into target, a new file hpcp makes for it (O_EXCL: never through a link put at the name;
+	FileExistsError when a name is there) and cp writes through its own descriptor (_cp_held): (that descriptor, still open
+	for the caller to close, the made file's fstat, the size); None where cp has to make it by name (below). A failure
+	removes the made file while its name still leads to it.
+	A plain run gives the new file the source's SELinux label (_label_like), owner and group before cp writes it: cp -a gives
+	a file it did not make another owner only after narrowing its mode and ACL to the owner's (the entries a default ACL gave
+	it go), where a file it makes keeps them. Where they cannot be given (not root) and the file has such entries: None, the
+	file removed, for cp by name as in 9.86. A mode its owner cannot write (-co's 0444 source, a umask taking owner write)
+	has owner write while cp writes, which cp's reopen needs; -co puts the mode back."""
+	src_st = src_st or os.lstat(src_path)
+	fd = os.open(target, _NEW_FILE_FLAGS, _new_file_mode(src_st))
+	made = None
+	try:
+		made = os.fstat(fd)
+		if not CONTENT_ONLY:
+			_label_like(src_path, fd)
+			try:
+				os.fchown(fd, src_st.st_uid, src_st.st_gid)
+			except PermissionError:
+				if _has_acl(fd):
+					_drop_made(target, made)
+					os.close(fd)
+					return None
+		narrow = not made.st_mode & stat.S_IWUSR
+		if narrow:
+			os.fchmod(fd, stat.S_IMODE(made.st_mode) | stat.S_IWUSR)
+		size = _cp_held(command, src_path, target, fd, made, space, False, new=True)
+		if narrow and CONTENT_ONLY:
+			os.fchmod(fd, stat.S_IMODE(made.st_mode))
+		return fd, made, size
+	except BaseException:
+		if made is not None:
+			_drop_made(target, made)
+		os.close(fd)
+		raise
+
+def _cp_new(command, src_path, target, src_st, space):
+	"""A first copy (nothing at target) of a regular source, where cp writes a held file (_held_route): made by hpcp and
+	written through cp's own descriptor (_cp_made), else by name (_cp_to). FileExistsError when a name appeared there since
+	the look, for the caller to look again."""
+	made = _cp_made(command, src_path, target, src_st, space)
+	if made is None:
+		return _cp_to(command, src_path, target, space)
+	os.close(made[0])
+	return made[2]
+
 def _label_like(src_path, fd):
-	"""After cp -a wrote the held file fd through its /proc name: the source's SELinux label on it. cp -a gives an existing
-	destination the source's label by name (lsetfilecon, coreutils 8.22 on), which through /proc/PID/fd/N reaches the /proc
-	link, not the file, and it says nothing when that fails; by name (9.84) and on a new file (9.85) the label came along.
+	"""The source's SELinux label on fd, a held file cp -a writes through its descriptor's name (after a rewrite, before a first
+	copy). cp -a gives an existing destination the source's label by name (lsetfilecon, coreutils 8.22 on), which through
+	/proc/self/fd/N reaches the /proc link, not the file, and it says nothing when that fails; by name (9.84) and on a new file
+	(9.85) the label came along.
 	Set through the descriptor, only where it differs, and as cp -a does it: silently where it cannot be (no label, not
 	permitted, a filesystem that labels itself)."""
 	with contextlib.suppress(OSError, AttributeError):
@@ -4278,7 +4388,7 @@ def _in_place_hint(target, st, src_path):
 			return '; without -wb it would be written in place'
 	return ''
 
-def _cp_beside(command, src_path, target, st, why, space):
+def _cp_beside(command, src_path, target, st, why, space, src_st=None):
 	"""cp src_path to a new name beside target, write it to disk and rename it over target once whole; its size. st: what is
 	at target (lstat, or the held file's fstat); why: why it goes beside (None for a non-file). Never in place: a failure
 	keeps what is there, a file as _KeptOld (190) naming why and what failed, a FIFO, socket, device or link as _Refused
@@ -4291,20 +4401,42 @@ def _cp_beside(command, src_path, target, st, why, space):
 	if space is not None:
 		_space_warning(target, src_path, space[0], space[1], 0)
 	temp, renamed, what = _temp_sibling(target), False, 'the new copy beside it failed: %s'
+	# A regular source's new file is made by hpcp and written by cp through its descriptor (_held_route), and what follows goes
+	# through that descriptor too: a second name of another file put at the temporary name is never what hpcp holds. A node
+	# source is made by cp -a (mknod), by name.
+	fd = None
 	try:
 		try:
-			run_command_in_multicmd_with_path_check(command + [src_path, temp], quiet=True, strict=True)
+			if _regular_source(src_path, src_st) and _held_route():
+				made = _cp_made(command, src_path, temp, src_st, None)
+				if made is not None:
+					fd, made = made[:2]
+			if fd is None:
+				run_command_in_multicmd_with_path_check(command + [src_path, temp], quiet=True, strict=True)
 			attributes = None
 			if carried is not None:
 				what = 'its owner, group or an xattr cannot be given to the new copy (%s)'
-				_carry_over(st, temp, carried)
+				_carry_over(st, temp, carried, fd)
 				attributes = _fat_attributes(target)
 			elif not CONTENT_ONLY:
-				_remove_stale_xattrs(src_path, temp)
+				_remove_stale_xattrs(src_path, temp if fd is None else fd)
 			# Renamed unsynced, a power cut could leave nothing where the old copy was.
 			what = 'the new copy cannot be written to disk (%s)'
-			_fsync_file(temp)
+			if fd is None:
+				_fsync_file(temp)
+			else:
+				try:
+					os.fsync(fd)
+				except OSError as e:
+					if e.errno not in _NO_FSYNC:
+						raise
 			what = 'it could not be replaced by the new copy (%s)'
+			if fd is not None:
+				# the rename is by name: something put there since (a user who can write the directory) is not renamed over
+				# the old copy
+				now = os.lstat(temp)
+				if (now.st_dev, now.st_ino) != (made.st_dev, made.st_ino):
+					raise OSError(errno.EEXIST, 'something else was put at its name', temp)
 			os.rename(temp, target)
 			renamed = True  # nothing left to discard: an unlink of the gone name costs a round trip on NFS
 		except Exception as e:
@@ -4317,6 +4449,8 @@ def _cp_beside(command, src_path, target, st, why, space):
 			_set_fat_attributes(target, attributes, target)
 		return get_file_size(target)
 	finally:
+		if fd is not None:
+			os.close(fd)
 		if not renamed:
 			_discard_temp(temp)
 
@@ -4344,17 +4478,34 @@ def _cp_once(src_path, dest_path, cp_flags, sparse, space=None, look=None, src_s
 			pass
 	_dest_directory(os.path.dirname(target), make=not NO_CREATE_DIR, source=os.path.dirname(os.path.abspath(src_path)))
 	command = ["cp", cp_flags] + (["--sparse=always"] if sparse and cp_supports_sparse() else [])
+	# A name that appears at a first copy's landing between the look and hpcp's create is looked at again, and the route that
+	# fits it taken; 3 times, the door's bound for the same race.
+	for _ in range(3):
+		try:
+			return _cp_landing(command, src_path, dest_path, target, st, named, space, src_st)
+		except FileExistsError:
+			target, st, named = _landing_of(dest_path)
+	raise OSError(errno.EAGAIN, 'it kept changing while it was copied', target)
+
+def _cp_landing(command, src_path, dest_path, target, st, named, space, src_st):
+	"""_cp_once's copy onto target, dest_path's landing, by what its look found there (st, named). FileExistsError: a first
+	copy's name taken since."""
 	held = _claim_device(target, st, named, src_path)
 	try:
 		if not _written_beside(st, named):
+			if st is None and _regular_source(src_path, src_st) and _held_route():
+				return _cp_new(command, src_path, target, src_st, space)
 			return _cp_to(command, src_path, target, space if st is None else None)
 		if not WRITE_BESIDE and stat.S_ISREG(st.st_mode) and st.st_nlink == 1 and _regular_source(src_path, src_st):
 			try:
 				fd = os.open(target, _LANDING_FLAGS)
 			except FileNotFoundError:
-				return _cp_to(command, src_path, target, space)  # gone since the lstat: a first copy
+				# gone since the lstat: a first copy
+				if _held_route():
+					return _cp_new(command, src_path, target, src_st, space)
+				return _cp_to(command, src_path, target, space)
 			except OSError as e:
-				return _cp_beside(command, src_path, target, st, f'it cannot be opened for writing ({_why(e)})', space)
+				return _cp_beside(command, src_path, target, st, f'it cannot be opened for writing ({_why(e)})', space, src_st)
 			try:
 				st = os.fstat(fd)  # what the descriptor holds decides from here on
 				if stat.S_ISREG(st.st_mode) and st.st_nlink == 1:
@@ -4366,7 +4517,7 @@ def _cp_once(src_path, dest_path, cp_flags, sparse, space=None, look=None, src_s
 		why = ('-wb writes beside it' if WRITE_BESIDE else None if not stat.S_ISREG(st.st_mode) else
 			'it has other names, which a write in place would change' if st.st_nlink > 1 else
 			f'{src_path} is no regular file, which cp makes anew')
-		return _cp_beside(command, src_path, target, st, why, space)
+		return _cp_beside(command, src_path, target, st, why, space, src_st)
 	finally:
 		if held is not None:
 			os.close(held)
