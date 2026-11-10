@@ -150,14 +150,6 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - **Revisit when:** 9.87.
 - **Noted:** 2026-11-08, the user's standing rule that deferrals are noted, not asked.
 
-### A move's fsync waits are serial in each worker
-- **Kind:** deferred (9.87).
-- **What the operator sees:** a move of many small files onto a slow disk takes about 1.6 to 1.9 times as long as without the sync (10,000 files of 4 KiB on an EL7 VM: 79 to 92 s on ext4 and 72 to 82 s on XFS, against 47 to 54 s and 43 to 47 s), because each worker waits for its own fsync before it copies the next file. A higher `-j` hides the wait: 2,000 files of 4 KiB with the default (one worker per CPU: 2 on the EL7 VM, 4 on the EL8 VM) against `-j 16`: 18.6 to 22.9 s against 10.3 to 11.7 s (EL7 ext4), 17.9 to 21.2 s against 10.1 to 11.7 s (EL7 XFS), 11.9 to 14.0 s against 9.3 to 11.8 s (EL8 ext4), 14.2 to 15.8 s against 8.2 to 10.5 s (EL8 XFS), 3 runs each. That the gain is overlapped waits and not CPU is an inference: the VMs have 2 and 4 vCPUs.
-- **Why:** more fsyncs in flight are batched by the filesystem into fewer journal commits, but a worker has one fsync in flight at a time; overlapping them (a few fsync threads per worker, or the parent's loop) is its own change.
-- **Plan (9.87):** overlap a worker's fsyncs, measured against `-j 16` on the same trees; until then the README says to raise `-j`.
-- **Revisit when:** 9.87.
-- **Noted:** 2026-11-09, found in the 9.85 re-review; the main session's decision, not asked (a deferral).
-
 ### On Python 3.6 an early stop can rarely hang the run in a pool's submit
 - **Kind:** deferred (9.88).
 - **What the operator sees:** on Python 3.6 (EL7, EL8), a Ctrl-C or SIGTERM in the first second of a copy, while its pool takes its first jobs, can leave hpcp waiting for good: every worker has ended, and a second Ctrl-C prints nothing (not even `Stopping: cleaning up first`) and SIGTERM does nothing; Ctrl-\ or `kill -9` ends it. About 3 in 2,000 early Ctrl-Cs in the 9.87 review's probe (9.86: 4 in 716). Other Pythons are not affected.
