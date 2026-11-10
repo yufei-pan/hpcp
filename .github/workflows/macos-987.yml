@@ -1,0 +1,44 @@
+name: macos-987
+# Temporary, for hpcp 9.87: runs tests/test_darwin.py on GitHub's macOS runners, for the route by which cp writes the file
+# hpcp holds (/dev/fd/N) and a move's F_FULLFSYNC. It lives only on the ci/macos-987 branch, which is deleted before 9.87
+# merges. A runner is a VM: this checks the calls and their results, not a real drive's cache.
+on:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  darwin:
+    runs-on: ${{ matrix.os }}
+    # test.yml's: the darwin tests take about a minute, and a hang ends here
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        # the arm64 images GitHub offers (macOS 14 was retired on 2026-11-02)
+        os: [macos-15, macos-26]
+        # 3.10 runs multiCMD's exec wrapper (before 3.11), 3.14 Popen(process_group=)
+        python-version: ["3.10", "3.14"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: sw_vers; uname -m; command -v cp; mount
+      - run: python -m pip install "pytest<9"
+      - run: python -c "import hpcp; print('held route:', hpcp._held_route())"
+      - name: one F_FULLFSYNC on the runner's disk
+        run: |
+          python - <<'PY'
+          import fcntl, os, tempfile, time
+          with tempfile.NamedTemporaryFile(dir='.') as f:
+              f.write(b'x' * 4096)
+              f.flush()
+              os.fsync(f.fileno())
+              start = time.monotonic()
+              result = fcntl.fcntl(f.fileno(), fcntl.F_FULLFSYNC)
+              print('F_FULLFSYNC returned', result, 'in %.6f s' % (time.monotonic() - start))
+          PY
+      - run: python -m pytest -v -rsP -p no:cacheprovider tests/test_darwin.py
