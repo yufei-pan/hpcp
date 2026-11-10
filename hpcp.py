@@ -13203,14 +13203,21 @@ def _sync_landing(dest_path):
 	descriptor of the copy's own file while its data is still dirty (a writeback error is kept only on the in-memory inode,
 	and one evicted under memory pressure takes it along; syncfs before Linux 5.8 reports none). Raises _NotOnDisk, naming the
 	landing and why, after removing the regular file there: its content cannot be trusted, and a rerun would take it for the
-	finished copy (same size and time). A block device named by -d is not fsynced (_fsync_file passes it): a move onto one writes it
-	and keeps every source (213: a landing that is another kind of entry holds no source), so nothing can be lost."""
+	finished copy (same size and time). Only the file the copy wrote is removed: the one at the name when the fsync began (one
+	lstat right after the copy); a file put at the name since is someone else's. A block device named by -d is not fsynced
+	(_fsync_file passes it): a move onto one writes it and keeps every source (213: a landing that is another kind of entry holds
+	no source), so nothing can be lost."""
 	target = _landing_of(dest_path)[0]
+	try:
+		written = os.lstat(target)
+	except OSError:
+		written = None
 	try:
 		_fsync_file(target)
 	except OSError as e:
 		try:
-			if stat.S_ISREG(os.lstat(target).st_mode):
+			now = os.lstat(target)
+			if written is not None and stat.S_ISREG(now.st_mode) and (now.st_dev, now.st_ino) == (written.st_dev, written.st_ino):
 				os.remove(target)
 		except OSError:
 			pass
@@ -13309,7 +13316,7 @@ def get_args(args = None):
 	parser = argparse.ArgumentParser(description='Copy files from source to destination',
 								  epilog=f'Found bins: {list(_binPaths.values())}\n Missing bins: {_binCalled - set(_binPaths.keys())}')
 	parser.add_argument('-s', '--single_thread', action='store_true', help='Use serial processing')
-	parser.add_argument('-j','-m','-t','--max_workers', type=int, default=multiprocessing.cpu_count(), help='Max workers for parallel processing. Default is 1 * CPU count. Use negative numbers to indicate {n} * CPU count, 0 means 1/2 CPU count.')
+	parser.add_argument('-j','-m','-t','--max_workers', type=int, default=None, help='Max workers for parallel processing. Default is 1 * CPU count, and 4 * CPU count for a move (-rm, -rf), whose workers wait on their fsyncs. Use negative numbers to indicate {n} * CPU count, 0 means 1/2 CPU count.')
 	batch_group = parser.add_mutually_exclusive_group()
 	batch_group.add_argument('-b','--batch',action='store_true', help='Batch mode, process all files in one go',default=True)
 	batch_group.add_argument('-nb','--no_batch','--sequential',action='store_false', dest='batch', help='Do not use batch mode', default=False)
@@ -13386,7 +13393,7 @@ def get_args(args = None):
 	return args
 
 #%% ---- Main Function ----
-def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = multiprocessing.cpu_count(),
+def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = None,
 			verbose = False, directory_only = False,no_directory_sync = False, full_hash = False, files_per_job = 1, target_file_list = "",
 			compare_file_list = False, diff_file_list = None, tar_diff_file_list = False, remove = False,remove_force = False, remove_extra = False, parallel_file_listing = False,
 			exclude=None,exclude_file = None,dest_image = None,dest_image_size = '0', no_link_tracking = False,link_tracking = False,src_image = None,dd = False,dd_resize = 0,
@@ -13411,6 +13418,10 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = multipr
 	READ_FIRST = read_before_write
 	MIRROR_FS_PARAMS = not no_fs_param_mirror
 	remove = remove or remove_force
+	if max_workers is None:
+		# A move's worker waits on each file's fsync before its next copy: 4 workers a CPU keep the disk busy (the 9.85 review's
+		# -j 16 on a 4-vCPU EL8 VM: 2,000 files of 4 KiB in 8.2 to 11.8 s against 11.9 to 15.8 s with -j 4).
+		max_workers = (4 if remove else 1) * multiprocessing.cpu_count()
 	if random_destination_selection:
 		RANDOM_DESTINATION_SELECTION = True
 		print("Random destination selection enabled.")

@@ -542,3 +542,47 @@ def test_a_plain_copy_and_wb_make_no_full_flush(tmp_path, monkeypatch, reset_hpc
 	assert hpcp.hpcp([str(src) + os.sep], **opts) == 0
 	assert (tmp_path / 'out' / 'm' / 'f').read_text() == 'changed'
 	assert not [event for event in events if event[0] == 'flush']
+
+
+# ---- M3: a move's fsync waits overlap (more workers by default), and a failed fsync removes only its own landing
+
+@posix_only
+def test_a_move_runs_4_workers_a_cpu_by_default(tmp_path, monkeypatch, reset_hpcp_globals):
+	# each worker waits on its files' fsyncs: the 9.85 review's -j 16 on 4 vCPUs took 8.2 to 11.8 s against 11.9 to 15.8 s
+	seen = []
+	real = hpcp.process_copy
+	def process_copy(*args, **kwargs):
+		seen.append(kwargs['max_workers'])
+		return real(*args, **kwargs)
+	monkeypatch.setattr(hpcp, 'process_copy', process_copy)
+	(tmp_path / 'a').mkdir()
+	(tmp_path / 'a' / 'f').write_text('f')
+	(tmp_path / 'b').mkdir()
+	(tmp_path / 'b' / 'f').write_text('f')
+	assert hpcp.hpcp([str(tmp_path / 'a') + os.sep], dest_paths=[str(tmp_path / 'out') + os.sep]) == 0
+	assert hpcp.hpcp([str(tmp_path / 'b') + os.sep], dest_paths=[str(tmp_path / 'moved') + os.sep], remove=True, remove_force=True) == 0
+	assert hpcp.hpcp([str(tmp_path / 'out') + os.sep], dest_paths=[str(tmp_path / 'again') + os.sep], remove=True,
+		remove_force=True, max_workers=3) == 0
+	cpus = __import__('multiprocessing').cpu_count()
+	assert seen == [cpus, 4 * cpus, 3]
+
+
+@posix_only
+def test_a_failed_fsync_removes_only_the_landing_it_wrote(tmp_path, monkeypatch, reset_hpcp_globals):
+	# the landing renamed away between the copy and its failed fsync, another file put at its name: that file is kept
+	(tmp_path / 'src').mkdir()
+	(tmp_path / 'src' / 'f').write_text('source')
+	real = hpcp._fsync_file
+	def fsync_file(path):
+		if os.path.basename(path) == 'f' and os.path.isfile(path):
+			os.rename(path, path + '.away')
+			with open(path, 'w') as other:
+				other.write('someone else')
+			raise OSError(errno.EIO, os.strerror(errno.EIO))
+		return real(path)
+	monkeypatch.setattr(hpcp, '_fsync_file', fsync_file)
+	rc = hpcp.hpcp([str(tmp_path / 'src') + os.sep], dest_paths=[str(tmp_path / 'out') + os.sep], single_thread=True,
+		max_workers=1, remove=True, remove_force=True)
+	assert rc != 0
+	assert (tmp_path / 'src' / 'f').read_text() == 'source'
+	assert (tmp_path / 'out' / 'f').read_text() == 'someone else'
