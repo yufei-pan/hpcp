@@ -5996,10 +5996,32 @@ def write_changes(target, rows):
 		for row in sort_change_rows(rows):
 			f.write(f'{row.op}\t{_escape_field(row.path)}\t{row.old}\t{row.new}\n')
 
+class _NameLines:
+	"""A list a patch tool wrote (changes.tsv, the manifest, disk.tsv), read as bytes, each line (split at '\\n' only) decoded
+	as the filesystem's names are (os.fsdecode). Their writers put each name's own bytes there (UTF-8 with surrogateescape,
+	the bytes os.fsencode gives, under any locale), so a name read back is the one written. 9.86 decoded them as UTF-8:
+	under Python 3.6's C locale (LANG unset: EL7's cron, some ssh sessions) a non-ASCII name could then not be encoded back,
+	and the apply stopped with a UnicodeEncodeError."""
+	def __init__(self, source):
+		self._file = open(source, 'rb')
+
+	def __enter__(self):
+		return self
+
+	def __exit__(self, *exc):
+		self._file.close()
+
+	def readline(self):
+		return os.fsdecode(self._file.readline())
+
+	def __iter__(self):
+		for line in self._file:
+			yield os.fsdecode(line)
+
 def read_changes(source):
 	"""Read a changes.tsv file into ChangeRows. Raises RuntimeError('Patch format error: ...')."""
 	rows = []
-	with open(source, 'r', encoding='utf-8', errors='surrogateescape', newline='\n') as f:
+	with _NameLines(source) as f:
 		header = f.readline().rstrip('\n').split('\t')
 		if len(header) != 2 or header[0] != CHANGES_HEADER:
 			raise RuntimeError(f'Patch format error: {source} is not an hpcp change list')
@@ -6068,7 +6090,7 @@ def read_manifest(source):
 	"""
 	meta = {'sections': [], 'raws': []}
 	seen_keys = set()
-	with open(source, 'r', encoding='utf-8', errors='surrogateescape', newline='\n') as f:
+	with _NameLines(source) as f:
 		for line in f:
 			line = line.rstrip('\n')
 			if not line or line.startswith('#'):
@@ -6145,7 +6167,7 @@ def write_disk_tsv(target, rows):
 def read_disk_tsv(source):
 	"""Read disk.tsv into DiskRows. Raises RuntimeError('Patch format error: ...')."""
 	rows = []
-	with open(source, 'r', encoding='utf-8', errors='surrogateescape', newline='\n') as f:
+	with _NameLines(source) as f:
 		header = f.readline().rstrip('\n').split('\t')
 		if len(header) != 2 or header[0] != DISK_HEADER or not _ASCII_DIGITS_RE.fullmatch(header[1]):
 			raise RuntimeError(f'Patch format error: {source} is not an hpcp disk table')
