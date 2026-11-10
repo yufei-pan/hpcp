@@ -126,14 +126,6 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - **Revisit when:** 9.87.
 - **Noted:** 2026-11-08, the user's standing rule that deferrals are noted, not asked; the skip branch's metadata, the landing removed before the open and the beside route's stale xattrs added 2026-11-09 (found by the 9.86 reviews, the main session's decision, not asked).
 
-### A timed-out `cp --version` is kept for the worker's life
-- **Kind:** deferred (9.87).
-- **What the operator sees:** on a host so loaded that `cp --version` takes more than 10 s in a worker (a thrashing machine), `cp_supports_sparse` answers no and keeps that answer for the worker's life, whatever `cp` is. That worker copies without `--sparse=always` (as before 9.86) and, since 9.86, gives `cp` a rewrite's landing by name instead of the held file (the route "Off Linux, a rewrite in place can be swapped for a link mid-run" describes), with no message. Nothing is lost; found by the 9.86 final review, read from the code, not run (it needs a stalled `cp`).
-- **Why:** `cp_supports_sparse` is cached whatever its answer; `_reaches_held` already keeps only a real answer (a timeout asks again at the next rewrite).
-- **Plan (9.87):** cache only an answer (a clean exit, or a non-zero exit), not a timeout or a `cp` that could not start, as `_reaches_held` does since the 9.86 fix round.
-- **Revisit when:** 9.87.
-- **Noted:** 2026-11-09, found by the 9.86 fixer and assessed in the 9.86 final review; the main session's decision, not asked (a deferral).
-
 ### `-co` reruns rewrite every unchanged file
 - **Kind:** deferred (9.87).
 - **What the operator sees:** a second `hpcp -co a/ -d out/` with nothing changed copies every file again ("Total files copied" counts them all, and each landing's mtime moves on each run). The cost is the whole copy on every rerun.

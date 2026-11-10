@@ -651,18 +651,34 @@ def get_free_space_bytes(path):
 	stat = os.statvfs(path)
 	return stat.f_bavail * stat.f_frsize  # available blocks * fragment size
 
-@functools.lru_cache(maxsize=None)
+# How long `cp --version` (and the held-file probe, _reaches_held) may stay silent: it answers in milliseconds, and one that
+# hangs this long under a host's load gets asked again at the next call (cp_supports_sparse).
+_CP_ASK_TIMEOUT = 10
+
+# multiCMD's codes for a command that did not end by itself: timed out (124), handed nothing to run (125), could not start
+# (126, 127), killed (137, -1). cp gave no answer then.
+_NO_ANSWER = frozenset((124, 125, 126, 127, 137, -1))
+
+_SPARSE = [None, False]  # (pid, cp_supports_sparse's answer): kept once cp answered, per process, as _HELD
+
 def cp_supports_sparse():
-	"""
-	Whether the cp the copy runs (CP_PATH, else `cp` from PATH) accepts --sparse (GNU coreutils does, BSD / macOS cp does not).
-	"""
+	"""Whether the cp the copy runs (CP_PATH, else `cp` from PATH) accepts --sparse (GNU coreutils does, BSD / macOS cp does
+	not): True or False once `cp --version` ended by itself (exit 0: by its text; any other exit: not GNU), kept for the
+	process; None when it gave no answer (it timed out or could not start), and the next call asks again. 9.86 kept a
+	timeout's False for the process's life (an lru_cache, which a forked worker also inherited)."""
 	if os.name != 'posix':
 		return False
-	try:
-		task = multiCMD.run_commands([[_bin('cp'), '--version']], timeout=10, quiet=True, return_object=True, extra_env=_C_LOCALE)[0]
-		return task.returncode == 0 and 'GNU' in '\n'.join(task.stdout)
-	except Exception:
-		return False
+	pid = os.getpid()
+	if _SPARSE[0] != pid:
+		try:
+			task = multiCMD.run_commands([[_bin('cp'), '--version']], timeout=_CP_ASK_TIMEOUT, quiet=True, return_object=True,
+				extra_env=_C_LOCALE)[0]
+		except Exception:
+			return None
+		if task.returncode in _NO_ANSWER:
+			return None
+		_SPARSE[:] = [pid, task.returncode == 0 and 'GNU' in '\n'.join(task.stdout)]
+	return _SPARSE[1]
 
 def get_file_size(path):
 	"""
@@ -4129,11 +4145,14 @@ def _reaches_held():
 	if _HELD[0] != pid:
 		_HELD[:] = [pid, False]
 		with contextlib.suppress(Exception):
-			if sys.platform.startswith('linux') and cp_supports_sparse() and os.readlink('/proc/self') == str(pid):
+			gnu = cp_supports_sparse()
+			if gnu is None:
+				_HELD[0] = None  # cp gave no answer: asked again at the next rewrite
+			elif sys.platform.startswith('linux') and gnu and os.readlink('/proc/self') == str(pid):
 				with open('/dev/zero', 'wb') as probe:
-					# 10 s, as cp_supports_sparse waits: an empty copy takes milliseconds, and a cp that hangs so long gets no held file.
-					code = multiCMD.run_commands([[_bin('cp'), os.devnull, '/proc/%d/fd/%d' % (pid, probe.fileno())]], timeout=10,
-						quiet=True, return_object=True)[0].returncode
+					# an empty copy takes milliseconds; a cp that hangs this long gets no held file (_CP_ASK_TIMEOUT)
+					code = multiCMD.run_commands([[_bin('cp'), os.devnull, '/proc/%d/fd/%d' % (pid, probe.fileno())]],
+						timeout=_CP_ASK_TIMEOUT, quiet=True, return_object=True)[0].returncode
 				_HELD[1] = code == 0
 				if code not in (0, 1):
 					_HELD[0] = None  # no answer (a timeout, a cp that could not start): asked again at the next rewrite
