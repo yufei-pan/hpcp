@@ -312,7 +312,7 @@ usage: hpcp.py [-h] [-s] [-j MAX_WORKERS] [-b | -nb] [-v] [-do] [-nds] [-fh]
                [-siff LOAD_DIFF_IMAGE] [-d DEST_PATH] [-rds] [-di DEST_IMAGE]
                [-dis DEST_IMAGE_SIZE] [-diff [GET_DIFF_IMAGE]] [-fa] [-dd]
                [-ddr DD_RESIZE] [-nfp] [-L RATE_LIMIT] [-F FILE_RATE_LIMIT]
-               [-tfs TARGET_FILE_SYSTEM] [-ncd] [-co]
+               [-tfs TARGET_FILE_SYSTEM] [-ncd] [-co] [-wb] [-rbw]
                [-ctl COMMAND_TIMEOUT_LIMIT] [-enes]
                [src_path ...]
 
@@ -466,13 +466,31 @@ options:
                         Ignore any destination folder that does not already
                         exist. ( Will still copy if dest is a file )
   -co, --content_only   Content-only copy: do not sync mode, owner, or
-                        timestamps on files or directories. A destination
-                        file with other hard links is replaced, not written
+                        timestamps on files or directories. A destination file
+                        with other hard links is replaced, not written
                         through. A FIFO, socket or device node is made as cp
-                        -a makes it, never read. Still create
-                        missing destination directories using filesystem-
-                        default permissions (so parent ACL/setgid/setuid
-                        inherit).
+                        -a makes it, never read. Still create missing
+                        destination directories using filesystem-default
+                        permissions (so parent ACL/setgid/setuid inherit).
+  -wb, --write_beside, --write-beside
+                        Write every rewrite to a new file beside the old one,
+                        write it to disk and rename it over the old one once
+                        whole: a source that fails, a full disk or a stop
+                        leave the old copy as it was. The file gets a new
+                        inode (a per-file Lustre or GPFS layout, chattr flags
+                        and a project id are not kept; NFS readers holding it
+                        open may get ESTALE). Needs a new name in the file's
+                        directory and room for a second copy: without either
+                        the old copy stays (exit 190). By default a rewrite is
+                        written in place, and only a file with other names,
+                        one that cannot be opened for writing, or a FIFO,
+                        device or link goes beside.
+  -rbw, --read_before_write, --read-before-write
+                        Before a file at the destination is written in place,
+                        read its source to the end: a source that fails on
+                        read leaves the old copy as it is (exit 190). Costs a
+                        second read of each rewritten file. Does nothing with
+                        -wb, which writes nothing in place.
   -ctl, --command_timeout_limit COMMAND_TIMEOUT_LIMIT
                         Set the command timeout limit in seconds for external
                         commands ( ex. cp / dd ). Default is 0: no timeout.
@@ -480,5 +498,7 @@ options:
                         Exit if there is not enough space on the destination
                         instead of continuing (Note: Default is continue as in
                         compressed fs copy can be down even if source is
-                        bigger than free space).
+                        bigger than free space; without it, a copy that may
+                        not fit is tried, with a warning on ext2/3/4, XFS and
+                        tmpfs).
 ```
