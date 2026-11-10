@@ -1378,24 +1378,29 @@ def test_every_slot_taken_prints_each_time(hpcp_mod, monkeypatch):
 	assert hpcp_mod._claim_space(10 ** 6) is True and hpcp_mod._claim_space(10 ** 6) is True and hpcp_mod._claim_space(3) is False
 
 
-def test_mountinfo_is_parsed_by_its_own_fields(hpcp_mod):
-	sample = (b'22 1 259:2 / / rw,relatime shared:1 - xfs /dev/nvme0n1p2 rw,attr2\n'
+@pytest.mark.skipif(not hasattr(os, 'makedev'), reason='os.makedev')
+def test_a_mount_type_is_read_from_mountinfo_s_own_fields(tmp_path, hpcp_mod, monkeypatch):
+	sample = tmp_path / 'mountinfo'
+	sample.write_bytes(b'22 1 259:2 / / rw,relatime shared:1 - xfs /dev/nvme0n1p2 rw,attr2\n'
 		b'61 22 0:52 / /mnt/with\\040space rw,nosuid shared:30 master:2 - tmpfs tmpfs rw,size=5120k\n'
 		b'62 22 0:53 / /mnt/- rw - ext4 /dev/loop0 rw\n'
 		b'63 22 0:54 / /odd rw\n'
 		b'garbage\n')
-	assert hpcp_mod._parse_mountinfo(sample) == {(259, 2): 'xfs', (0, 52): 'tmpfs', (0, 53): 'ext4'}
+	real_entries = hpcp_mod._mountinfo_entries
+	monkeypatch.setattr(hpcp_mod, '_mountinfo_entries', lambda: real_entries(str(sample)))
+	monkeypatch.setattr(hpcp_mod, '_MOUNT_TYPES', {})
+	assert [hpcp_mod._mount_type(os.makedev(*key)) for key in ((259, 2), (0, 52), (0, 53), (0, 54))] == ['xfs', 'tmpfs', 'ext4', None]
 
 
 @pytest.mark.skipif(not hasattr(os, 'makedev'), reason='os.makedev')
 def test_a_mount_type_miss_reads_mountinfo_once_more_then_is_kept(hpcp_mod, monkeypatch):
 	reads = []
 	tables = [{(8, 1): 'ext4'}, {(8, 1): 'ext4', (8, 2): 'xfs'}, {(8, 1): 'ext4', (8, 2): 'xfs', (8, 3): 'btrfs'}]
-	def read_types():
+	def read_entries():
 		reads.append(1)
-		return dict(tables[min(len(reads), len(tables)) - 1])
+		return [{'devnum': key, 'fstype': kind} for key, kind in tables[min(len(reads), len(tables)) - 1].items()]
 	monkeypatch.setattr(hpcp_mod, '_MOUNT_TYPES', {})
-	monkeypatch.setattr(hpcp_mod, '_read_mount_types', read_types)
+	monkeypatch.setattr(hpcp_mod, '_mountinfo_entries', read_entries)
 	assert hpcp_mod._mount_type(os.makedev(8, 1)) == 'ext4' and len(reads) == 1
 	assert hpcp_mod._mount_type(os.makedev(8, 1)) == 'ext4' and len(reads) == 1
 	assert hpcp_mod._mount_type(os.makedev(8, 2)) == 'xfs' and len(reads) == 2  # mounted since: found on the reread

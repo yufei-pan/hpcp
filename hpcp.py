@@ -253,10 +253,8 @@ FILES_RATE_LIMIT = 0
 COMMAND_TIMEOUT = 0
 NO_CREATE_DIR = False
 CONTENT_ONLY = False
-# -wb: every rewrite goes to a new file beside the old one, renamed over it once whole (_cp_beside).
-WRITE_BESIDE = False
-# -rbw: before a rewrite in place, the source is read to its end (_read_through).
-READ_FIRST = False
+WRITE_BESIDE = False  # -wb: every rewrite goes beside the old file, renamed over it once whole (_cp_beside)
+READ_FIRST = False  # -rbw: the source is read to its end before a rewrite in place (_read_through)
 # True in a move (-rm with a destination): a copy is on disk before it is reported copied (_sync_landing), so no source goes
 # while its copy may be only in memory.
 SYNC_COPIES = False
@@ -667,7 +665,14 @@ def get_file_size(path):
 	Use os.path.getsize() where the apparent size is needed, e.g. for content comparison.
 	"""
 	try:
-		realSize = _allocated(os.stat(path,follow_symlinks=False))
+		st = os.stat(path,follow_symlinks=False)
+		# stat_result is a tuple: `'st_blocks' in st` would compare against field values, not names
+		if hasattr(st, 'st_rsize'):
+			realSize = st.st_rsize
+		elif hasattr(st, 'st_blocks'):
+			realSize = st.st_blocks * 512
+		else:
+			realSize = st.st_size
 	except Exception:
 		try:
 			realSize = os.path.getsize(path)
@@ -3398,7 +3403,7 @@ _CO_CARRIED = ('system.posix_acl_access', 'system.posix_acl_default', 'security.
 
 def _co_carry(target, st):
 	"""-co: {name: value} of the xattrs a new file must get for it to stand where target (st: its lstat) is, or None when its
-	metadata cannot be carried to a new file and the rewrite goes in place: the runner is not root and does not own it, or
+	metadata cannot be carried to a new file (_cp_beside): the runner is not root and does not own it, or
 	cannot give a new file its group, or it holds an xattr hpcp cannot carry (trusted.*, security.ima, a filesystem's own).
 	listxattr failing with ENOTSUP means it has none."""
 	if os.name != 'posix':
@@ -3572,9 +3577,9 @@ def _dest_directory(path, make=True, source=None):
 		_DOORS[current] = True
 
 def _read_through(path):
-	"""None when path, a regular file, reads to its end now (1 MiB reads, discarded), else the error: a source that fails on
-	read keeps the old copy when the rewrite would go in place. Anything but a regular file is never read (cp -a makes a new
-	node of it)."""
+	"""None when path, a regular file, reads to its end now (1 MiB reads, discarded), else the error: under -rbw a source that
+	fails on read keeps the old copy a rewrite in place would truncate. Anything but a regular file is never read (cp -a makes
+	a new node of it)."""
 	try:
 		if not stat.S_ISREG(os.stat(path).st_mode):
 			return None
@@ -3598,121 +3603,75 @@ def _claim_device(target, st, named, src_path):
 			raise _Refused(f'{target} is in use (mounted, swap, or held by device-mapper, md or LVM): not writing ', ' over it')
 		raise
 
-# ---- the full-disk warning: warn before cp, then let cp try and fail, as GNU cp does (_space_warning) ----
-# The filesystems where statvfs's free room is what a copy can take, and a copy takes what it writes. Elsewhere it is not:
-# btrfs, ZFS and bcachefs compress or share blocks; NFS, SMB, Lustre and GPFS report pooled space; overlay hides what is
-# below it. XFS on the source's own device may clone, which needs no room, so the source's device is left out for all five.
+# The full-disk warning (_space_warning), where statvfs's free room is what a copy can take: btrfs, ZFS and bcachefs compress
+# or share blocks, NFS, SMB, Lustre and GPFS report pooled space, overlay hides what is below it.
 _SPACE_TYPES = frozenset(('ext2', 'ext3', 'ext4', 'xfs', 'tmpfs'))
-# One slot per destination filesystem that warns in a run. A run whose warnings reach more filesystems than this prints the
-# extra ones once per file: the number bounds extra lines, it never hides a warning.
+# One slot per destination filesystem that warns in a run; past them one warns once per file: it bounds extra lines only.
 _SPACE_SLOTS = 64
-# The run's slots, shared by its copy workers: (lock, the slots, what a pool's initializer hands a worker that did not fork
-# from the run, or None); None outside a run (a library call of copy_file), or where nothing can be shared: each warning
-# then prints.
+# A run's slots, shared by its copy workers (lock, slots, the Array for a pool's initializer or None); None outside a run.
 _SPACE_WARNED = None
-_MOUNT_TYPES = {}  # (major, minor): the filesystem type /proc/self/mountinfo gives, per process (_mount_type)
+_MOUNT_TYPES = {}  # (major, minor): its type, per process (_mount_type)
 
 def _space_share():
-	"""New slots for a run (_SPACE_WARNED), or None where none can be made. A pool worker forked from this process (the default
-	of Python 3.6 to 3.13 on Linux) inherits an anonymous shared mapping and its lock; any other (forkserver, Python 3.14's
-	default; spawn) gets a multiprocessing.Array through its pool's initializer (_copy_pool). The mapping leaves nothing
-	behind: an Array on Python 3.6 and 3.7 is backed by a file in a pymp- directory, which a stopped run leaves, and 3.6's
-	Array takes no 'Q'."""
-	try:
+	"""New slots for a run, or None where nothing can be shared. Forked workers (Python 3.6 to 3.13 on Linux) inherit an
+	anonymous shared mapping and its lock, which leave no file (an Array on 3.6 and 3.7 leaves a pymp- directory when stopped,
+	and 3.6's takes no 'Q'); others (forkserver, 3.14's default; spawn) get an Array through the initializer (_copy_pool)."""
+	with contextlib.suppress(OSError, ImportError, ValueError, TypeError):
 		if multiprocessing.get_start_method() == 'fork':
 			import mmap
 			return multiprocessing.Lock(), memoryview(mmap.mmap(-1, 8 * _SPACE_SLOTS)).cast('Q'), None
 		if sys.version_info >= (3, 7):
 			array = multiprocessing.Array('Q', _SPACE_SLOTS)
 			return array.get_lock(), array.get_obj(), array
-	except (OSError, ImportError, ValueError, TypeError):
-		pass
 	return None
 
 def _init_space_share(array):
-	"""A copy pool's initializer (_copy_pool): the run's slots, in a worker that did not fork from the run."""
 	global _SPACE_WARNED
 	_SPACE_WARNED = (array.get_lock(), array.get_obj(), array)
 
 def _copy_pool(max_workers):
-	"""The process pool for jobs that may run copy_file (the copies, and the folder syncs, whose jobs copy a source that turns
-	out to be a file): its workers share the run's space-warning slots. Python 3.6's pool takes no initializer; its workers
-	fork from this process at the first submit and inherit them."""
+	"""The pool for jobs that may run copy_file, its workers sharing the run's slots (forked ones inherit them)."""
 	share = _SPACE_WARNED
-	if share is not None and share[2] is not None:
-		return ProcessPoolExecutor(max_workers=max_workers, initializer=_init_space_share, initargs=(share[2],))
-	return ProcessPoolExecutor(max_workers=max_workers)
-
-def _parse_mountinfo(data):
-	"""{(major, minor): type} from the bytes of a mountinfo file: field 3 is major:minor, and the type is the first field after
-	the '-' that ends the optional fields (from field 7 on). A path's spaces are escapes (\\040), never field breaks."""
-	types = {}
-	for line in data.splitlines():
-		fields = line.split()
-		try:
-			major, minor = fields[2].split(b':')
-			types[(int(major), int(minor))] = fields[fields.index(b'-', 6) + 1].decode('ascii', 'replace')
-		except (ValueError, IndexError):
-			continue
-	return types
-
-def _read_mount_types():
-	"""_parse_mountinfo of /proc/self/mountinfo; {} where it cannot be read (off Linux, no /proc)."""
-	try:
-		with open('/proc/self/mountinfo', 'rb') as f:
-			return _parse_mountinfo(f.read())
-	except OSError:
-		return {}
+	hand = {} if share is None or share[2] is None else {'initializer': _init_space_share, 'initargs': (share[2],)}
+	return ProcessPoolExecutor(max_workers=max_workers, **hand)
 
 def _mount_type(dev):
-	"""The type of the filesystem whose st_dev is dev, None where no mount lists it (off Linux, no /proc, a btrfs subvolume's
-	own st_dev). mountinfo is read once per process, and once more at a miss (a mount made since), after which the miss is
-	kept."""
+	"""dev's filesystem type (_mountinfo_entries), None where no mount lists it (off Linux, a btrfs subvolume's st_dev): read
+	once per process and again at a miss (a mount made since), and the miss is kept."""
 	key = (os.major(dev), os.minor(dev))
 	if key not in _MOUNT_TYPES:
-		_MOUNT_TYPES.update(_read_mount_types())
+		_MOUNT_TYPES.update((entry['devnum'], entry['fstype']) for entry in _mountinfo_entries())
 		_MOUNT_TYPES.setdefault(key, None)
 	return _MOUNT_TYPES[key]
 
 def _claim_space(dev):
-	"""True when this process is to print the warning for the filesystem dev: the first in the run to claim it, across the
-	run's workers. Without slots, or with all of them taken, it prints each time; and when the lock is not taken within 1 s,
-	which is far longer than a scan of the slots takes: only a worker that died holding it keeps it that long, and printing
-	again beats hanging the copy."""
+	"""True when this process prints dev's warning: the run's first claim of it, across its workers. Without slots, with all
+	taken, or without the lock within 1 s (far longer than a scan of them takes: a holder died, and printing again beats
+	hanging the copy), it prints each time."""
 	share = _SPACE_WARNED
-	if share is None:
-		return True
-	lock, slots = share[0], share[1]
-	if not lock.acquire(timeout=1):
+	if share is None or not share[0].acquire(timeout=1):
 		return True
 	try:
-		mark = dev + 1  # 0 is an empty slot
+		slots, mark = share[1], dev + 1  # 0 is an empty slot
 		for index in range(len(slots)):
-			if slots[index] == mark:
-				return False
-			if slots[index] == 0:
-				slots[index] = mark
-				return True
+			if slots[index] in (0, mark):
+				claimed, slots[index] = slots[index] == 0, mark
+				return claimed
 		return True
 	finally:
-		lock.release()
+		share[0].release()
 
 def _space_warning(target, src_path, free, need, old):
-	"""Before cp writes target where its directory has free bytes of room, less than need (src_path's allocated size): warn,
-	once per filesystem in a run, then cp tries anyway, as GNU cp does (the user: 'we also try and fail?'). Nothing is
-	refused or skipped, and the exit code is the copy's. old: the room target's old copy holds that cp frees first (a
-	rewrite in place), else 0. Only where the estimate holds (_SPACE_TYPES) and the source is on another device. The line
-	goes to stderr from the process that runs cp, on a line of its own (the progress bar ends its line with a carriage
-	return), and into ERRORS as a 'Space warning' (exit code 0), which a worker's task hands back to the run, repeated at
-	the run's end (_repeat_space_warnings)."""
+	"""Before cp writes target, whose directory has free bytes, less than need (src_path's allocated size): one line per
+	filesystem in a run, then cp tries, as GNU cp does; nothing is refused, and the exit code is the copy's. old: the room an
+	old copy that cp frees first holds (in place), else 0. Only for _SPACE_TYPES, and a source on another device (XFS may
+	clone one on its own). A 'Space warning' (code 0) in ERRORS too, which a task hands back, repeated at the run's end."""
 	directory = os.path.dirname(os.path.abspath(target))
 	try:
 		dev = os.stat(directory).st_dev
-		if dev == os.lstat(src_path).st_dev:
+		if dev == os.lstat(src_path).st_dev or _mount_type(dev) not in _SPACE_TYPES or not _claim_space(dev):
 			return
 	except OSError:
-		return
-	if _mount_type(dev) not in _SPACE_TYPES or not _claim_space(dev):
 		return
 	start = f'Space warning: {directory} has {format_bytes(free)}B free, less than the {format_bytes(need)}B that {src_path} needs'
 	end = 'hpcp copies anyway, as cp does; other files short of room on this filesystem are not warned about again.'
@@ -3720,50 +3679,28 @@ def _space_warning(target, src_path, free, need, old):
 		text = (f"{start}; it fits only by reusing its old copy's room, which cp frees first, so if another writer takes that "
 			f'room the copy fails and the old copy is lost (the source is kept). {end}')
 	else:
-		# -wb writes every rewrite beside its old copy, which stays when the new one cannot be made.
 		lost = "a rewrite's old copy stays (-wb)" if WRITE_BESIDE else "a rewrite's old copy is lost"
 		text = f'{start}, so it may not fit; if the disk runs out the copy fails, and {lost} (the source is kept). {end}'
-	# One write, flushed before cp starts: the newline ends the progress bar's line, and nothing another process writes can
-	# land between it and the text (Python 3.6 to 3.8 buffer a redirected stderr; 3.9 and later flush it at each newline).
-	try:
+	# One write, flushed before cp: its newline ends the bar's line, and no other output lands in it (3.6 to 3.8 buffer stderr).
+	with contextlib.suppress(Exception):
 		sys.stdout.flush()
 		sys.stderr.write('\n' + text + '\n')
 		sys.stderr.flush()
-	except Exception:
-		pass
 	ERRORS.append(text)
 
 def _repeat_space_warnings():
-	"""At a run's end: its space warnings once more, each distinct one once, after the progress bar and the summaries; then
-	out of ERRORS, so that the last line lists only real errors, and a run with nothing else ends 'Done.'."""
-	warnings = [error for error in ERRORS if error.startswith('Space warning:')]
-	if not warnings:
-		return
-	ERRORS[:] = [error for error in ERRORS if not error.startswith('Space warning:')]
-	lines, seen = ['', 'Space warnings in this run (repeated from above):'], set()
-	for warning in warnings:
-		if warning not in seen:
-			seen.add(warning)
-			lines.append(warning)
-	try:
+	"""At a run's end: its space warnings again, each once, then out of ERRORS, so a run with nothing else ends 'Done.'."""
+	warnings = list(dict.fromkeys(error for error in ERRORS if error.startswith('Space warning:')))
+	if warnings:
+		ERRORS[:] = [error for error in ERRORS if not error.startswith('Space warning:')]
 		sys.stdout.flush()
-	except Exception:
-		pass
-	print('\n'.join(lines), file=sys.stderr)
+		print('\n'.join(['', 'Space warnings in this run (repeated from above):'] + warnings), file=sys.stderr)
 
-def _allocated(st):
-	"""The allocated size of what st (a stat result) describes (get_file_size): st_rsize where there is one, else st_blocks *
-	512, else the apparent size. (stat_result is a tuple: `'st_blocks' in st` would compare against field values, not names.)"""
-	if hasattr(st, 'st_rsize'):
-		return st.st_rsize
-	if hasattr(st, 'st_blocks'):
-		return st.st_blocks * 512
-	return st.st_size
-
-def _cp_to(command, src_path, target):
-	"""cp src_path to target, by name: a first copy (cp makes the name), or a FIFO or device the operator named, which cp
-	writes through as it writes its destination (a pipe feed, an image written to a disk). A part it leaves goes
-	(_remove_what_failed). Its size."""
+def _cp_to(command, src_path, target, space=None):
+	"""cp src_path to target by name (a first copy; a FIFO or device the operator named, written through); its size. A part it
+	leaves goes (_remove_what_failed)."""
+	if space is not None:
+		_space_warning(target, src_path, space[0], space[1], 0)
 	before = _copy_state(target)
 	try:
 		run_command_in_multicmd_with_path_check(command + [src_path, target], quiet=True, strict=True)
@@ -3772,137 +3709,83 @@ def _cp_to(command, src_path, target):
 		raise
 	return get_file_size(target)
 
-# How a landing is opened to be written in place (_cp_once): for writing, never through a link put there (ELOOP), never
-# waiting on a FIFO put there (ENXIO without a reader) or on a lease another process holds (EAGAIN), and not inherited by
-# cp. No O_TRUNC: cp truncates it when it opens it in turn.
+# A landing opened to be written in place: never through a link put there (ELOOP), never waiting on a FIFO (ENXIO) or a
+# lease (EAGAIN), not inherited by cp; no O_TRUNC (cp truncates it).
 _LANDING_FLAGS = os.O_WRONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NONBLOCK', 0) | getattr(os, 'O_CLOEXEC', 0)
-
-# (pid, answer) of _reaches_held: whether cp can open this process's descriptors through /proc/PID/fd/N. Asked once per
-# process, at its first rewrite in place; a forked worker has another pid and asks for itself.
-_HELD = [None, False]
+_HELD = [None, False]  # (pid, _reaches_held's answer): asked once per process, so a forked worker asks for itself
 
 def _reaches_held():
-	"""True when cp, started by this process, can open a descriptor of this process through /proc/PID/fd/N, so a rewrite in
-	place can give cp the file it holds open instead of its name. False off Linux or without /proc; where /proc belongs to
-	another PID namespace (/proc/PID there is another process: nothing is ever written through it); where cp is not GNU
-	cp (only GNU coreutils 8.22 to 9.7 were checked writing a held file); and where cp cannot open it (hidepid, a process
-	that is not dumpable, an LSM): asked by doing it, once, cp copying the empty /dev/null onto a descriptor of /dev/zero
-	(writes there are discarded). Where it is False, cp gets the name, as in 9.84."""
+	"""True when cp can open this process's descriptors through /proc/PID/fd/N, the held file of a rewrite in place. False off
+	Linux, without /proc, where /proc is another PID namespace's (/proc/PID is another process), for a cp that is not GNU cp
+	(the one checked), and where cp is refused (hidepid, a worker not dumpable, an LSM): asked by doing it, cp copying
+	/dev/null onto a descriptor of /dev/zero. cp then gets the name, as in 9.84."""
 	pid = os.getpid()
-	if _HELD[0] == pid:
-		return _HELD[1]
-	answer = False
-	if sys.platform.startswith('linux') and os.path.isdir('/proc/self/fd') and cp_supports_sparse():
-		probe = None
-		try:
-			if os.readlink('/proc/self') == str(pid):
-				probe = os.open('/dev/zero', os.O_WRONLY | getattr(os, 'O_CLOEXEC', 0))
-				# 10 s, as cp_supports_sparse waits for cp --version: an empty copy answers in milliseconds, and a cp that
-				# hangs that long is not one to hand a held file to.
-				task = multiCMD.run_commands([[_bin('cp'), os.devnull, '/proc/%d/fd/%d' % (pid, probe)]], timeout=10, quiet=True,
-					return_object=True)[0]
-				answer = task.returncode == 0
-		except Exception:
-			answer = False
-		finally:
-			if probe is not None:
-				os.close(probe)
-	_HELD[0], _HELD[1] = pid, answer
-	return answer
-
-def _remove_torn(target, fd, fst, before):
-	"""After a rewrite in place that failed or was stopped: when cp changed the held file (fd, fst its fstat before cp; before:
-	its size, mtime and ctime then), its content cannot be trusted, so its name goes, if the name still is that file, as
-	9.84 removed a part cp left. A directory that keeps the name (0555, sticky, a bind mount) keeps the torn file; the copy's
-	own error is the one reported. A file cp never changed is the old copy, maybe the only good one, and stays."""
-	try:
-		now = os.fstat(fd)
-		if (now.st_size, now.st_mtime_ns, now.st_ctime_ns) == before:
-			return
-		named = os.lstat(target)
-	except OSError:
-		return
-	if (named.st_dev, named.st_ino) == (fst.st_dev, fst.st_ino):
-		try:
-			os.unlink(target)
-		except OSError:
-			pass
+	if _HELD[0] != pid:
+		_HELD[:] = [pid, False]
+		with contextlib.suppress(Exception):
+			if sys.platform.startswith('linux') and cp_supports_sparse() and os.readlink('/proc/self') == str(pid):
+				with open('/dev/zero', 'wb') as probe:
+					# 10 s, as cp_supports_sparse waits: an empty copy takes milliseconds, and a cp that hangs so long gets no held file.
+					_HELD[1] = multiCMD.run_commands([[_bin('cp'), os.devnull, '/proc/%d/fd/%d' % (pid, probe.fileno())]], timeout=10,
+						quiet=True, return_object=True)[0].returncode == 0
+	return _HELD[1]
 
 def _cp_held(command, src_path, target, fd, fst, space, through_link):
-	"""cp src_path into target, a regular file with one name that this process holds open (fd; fst its fstat); its size.
-
-	cp writes the held file, not the name (_reaches_held: /proc/PID/fd/N is cp's destination), so a link or anything else put
-	at the name since the open is never written through; where that cannot be, cp gets the name, as in 9.84. The inode
-	stays, with what lives on it (its owner, a Lustre or GPFS layout, chattr flags, the project id), and readers holding it
-	read the new bytes. cp truncates it first: a source that fails part way, a full disk or a stop cost the old copy
-	(_remove_torn), as in 9.84; -rbw reads the source to its end first, so a source that fails on read leaves the file as
-	it was (_KeptOld). through_link: target is where a link the operator named (-d) leads; a torn file there stays, as in
-	9.84, so that the retry writes through the link again and the file ends whole or the copy fails. Plain runs then remove
-	a portable xattr that the source does not have (cp -a never removes one). Errors name target, not the /proc path."""
+	"""cp src_path into target, the regular file with one name this process holds open (fd, fst its fstat); its size. cp
+	writes the held file (/proc/PID/fd/N, _reaches_held), so a link put at the name since the open is never written through;
+	else the name, as in 9.84. The inode stays. A cp that fails or is stopped after it changed the file takes the torn name
+	if it is still this file, as 9.84 did, except where a link the operator named led there (through_link: kept for the
+	retry, 9.84). -rbw reads the source first; its failure keeps the file (_KeptOld). Errors name target, not /proc."""
 	if READ_FIRST:
 		failed = _read_through(src_path)
 		if failed is not None:
 			raise _KeptOld(f'{src_path} failed on read ({_why(failed)})')
 	if space is not None:
-		_space_warning(target, src_path, space[0], space[1], _allocated(fst))
+		_space_warning(target, src_path, space[0], space[1], fst.st_blocks * 512)
 	held = '/proc/%d/fd/%d' % (os.getpid(), fd) if _reaches_held() else None
-	before = (fst.st_size, fst.st_mtime_ns, fst.st_ctime_ns)
 	try:
 		run_command_in_multicmd_with_path_check(command + [src_path, held or target], quiet=True, strict=True)
 	except BaseException as e:
-		if not through_link:
-			_remove_torn(target, fd, fst, before)
-		if held is None:
-			raise
-		# Display only: what is reported names the landing, not this process's descriptor (cp's return-code error, recorded
-		# by the runner, and the exception). Nothing decides on it.
-		if ERRORS and held in ERRORS[-1]:
-			ERRORS[-1] = ERRORS[-1].replace(held, target)
-		if not isinstance(e, Exception):
+		with contextlib.suppress(OSError):
+			now, named = os.fstat(fd), os.lstat(target)
+			if (not through_link and (now.st_size, now.st_mtime_ns, now.st_ctime_ns) != (fst.st_size, fst.st_mtime_ns, fst.st_ctime_ns)
+					and (named.st_dev, named.st_ino) == (fst.st_dev, fst.st_ino)):
+				os.unlink(target)
+		if held is not None and ERRORS and held in ERRORS[-1]:
+			ERRORS[-1] = ERRORS[-1].replace(held, target)  # cp's return-code error, as the runner recorded it
+		if held is None or not isinstance(e, Exception):
 			raise
 		raise RuntimeError(str(e).replace(held, target)) from e
 	if not CONTENT_ONLY:
 		_remove_stale_xattrs(src_path, fd)
-	return _allocated(os.fstat(fd))
+	return os.fstat(fd).st_blocks * 512
 
-# Why a rewrite goes beside by default (_cp_once), and under -wb: the start of its reason when the beside route fails.
+# Why a rewrite goes beside (_cp_once): the start of its reason when the beside route fails.
 _OTHER_NAMES = 'it has other names, which a write in place would change'
 _BESIDE_ASKED = '-wb writes beside it'
 
 def _in_place_hint(target, st):
-	"""Under -wb, for a failed rewrite: '; without -wb it would be written in place' where the default would have written it in
-	place (a regular file with one name that opens for writing: asked by opening it, nothing written), else ''."""
-	if not (WRITE_BESIDE and stat.S_ISREG(st.st_mode) and st.st_nlink == 1):
-		return ''
-	try:
-		fd = os.open(target, _LANDING_FLAGS)
-	except OSError:
-		return ''
-	try:
-		opened = os.fstat(fd)
-		return '; without -wb it would be written in place' if stat.S_ISREG(opened.st_mode) and opened.st_nlink == 1 else ''
-	finally:
-		os.close(fd)
+	"""Under -wb, the end of a failed rewrite's reason where the default would have written it in place (one name, and it
+	opens for writing: asked by opening it, nothing written)."""
+	if WRITE_BESIDE and stat.S_ISREG(st.st_mode) and st.st_nlink == 1:
+		with contextlib.suppress(OSError):
+			os.close(os.open(target, _LANDING_FLAGS))
+			return '; without -wb it would be written in place'
+	return ''
 
 def _cp_beside(command, src_path, target, st, why, space):
-	"""cp src_path to a new name beside target (_temp_sibling), write it to disk (_fsync_file) and rename it over target once
-	whole; its size. st: what is at target (its lstat, or the fstat of the file opened there); why: why the rewrite goes
-	beside, the start of a failure's reason (None for what is not a regular file). Nothing is written in place, ever: any failure leaves what is there as it was,
-	a regular file as _KeptOld (190) naming why it went beside and what failed, a FIFO, socket, device node or link as
-	_Refused (213), never opened or written through. Under -co the new file gets the old one's owner, group, mode, carried
-	xattrs and FAT attribute bits (_co_carry, _carry_over); a file with one name whose metadata cannot be carried keeps the
-	old copy (190), and one with other names gets a new file the runner owns, so its other names keep the old content."""
+	"""cp src_path to a new name beside target, write it to disk and rename it over target once whole; its size. st: what is
+	at target (lstat, or the held file's fstat); why: why it goes beside (None for a non-file). Never in place: a failure
+	keeps what is there, a file as _KeptOld (190) naming why and what failed, a FIFO, socket, device or link as _Refused
+	(213). Under -co the new file gets the old one's owner, group, mode, carried xattrs and FAT bits (where they cannot be
+	carried: one name keeps its old copy, 190; other names get a file the runner owns, and keep the old content)."""
 	regular = stat.S_ISREG(st.st_mode)
-	carried = None
-	if CONTENT_ONLY and regular:
-		carried = _co_carry(target, st)
-		if carried is None and st.st_nlink < 2:
-			raise _KeptOld(f'{why}; its owner, group or an xattr cannot be given to a new file{_in_place_hint(target, st)}')
+	carried = _co_carry(target, st) if CONTENT_ONLY and regular else None
+	if CONTENT_ONLY and regular and carried is None and st.st_nlink < 2:
+		raise _KeptOld(f'{why}; its owner, group or an xattr cannot be given to a new file{_in_place_hint(target, st)}')
 	if space is not None:
 		_space_warning(target, src_path, space[0], space[1], 0)
-	temp = _temp_sibling(target)
-	renamed = False
-	what = 'the new copy beside it failed: %s'
+	temp, renamed, what = _temp_sibling(target), False, 'the new copy beside it failed: %s'
 	try:
 		try:
 			run_command_in_multicmd_with_path_check(command + [src_path, temp], quiet=True, strict=True)
@@ -3913,7 +3796,7 @@ def _cp_beside(command, src_path, target, st, why, space):
 				attributes = _fat_attributes(target)
 			elif not CONTENT_ONLY:
 				_remove_stale_xattrs(src_path, temp)
-			# The new copy may not reach the disk: renamed, a power cut could leave nothing where the old copy was.
+			# Renamed unsynced, a power cut could leave nothing where the old copy was.
 			what = 'the new copy cannot be written to disk (%s)'
 			_fsync_file(temp)
 			what = 'it could not be replaced by the new copy (%s)'
@@ -3933,53 +3816,38 @@ def _cp_beside(command, src_path, target, st, why, space):
 			_discard_temp(temp)
 
 def _cp_once(src_path, dest_path, cp_flags, sparse, space=None):
-	"""One attempt at copying src_path to dest_path (copy_file); the size copied. Raises when the attempt fails: _Refused for
-	what this run will not write, _KeptOld for a rewrite that left what is there as it was. space: (free, need) when the
-	destination's free space is below the source's size, for the warning (_space_warning) printed before cp runs.
-
-	What is at the landing (_landing_of) decides the route:
-	- nothing, or a FIFO or device the operator named (-d): cp writes the name (_cp_to; a block device is claimed first,
-	  _claim_device);
-	- a regular file with one name that opens for writing: written in place through the open file (_cp_held), so the
-	  inode stays; a file gone since its lstat is a first copy;
-	- anything else goes beside it and is renamed over it once whole (_cp_beside), as every rewrite does under -wb: a file
-	  with other names (a write in place would change them), one that does not open for writing (a running program, a
-	  read-only file, an immutable one), and a FIFO, socket, device node or link below a destination, never opened."""
+	"""One attempt at copying src_path to dest_path (copy_file); the size copied. Raises _Refused for what this run will not
+	write, _KeptOld for a rewrite that kept what is there. space: (free, need) when the room is short (_space_warning). By
+	what is at the landing (_landing_of): nothing, or a FIFO or device the operator named: cp writes the name (_cp_to). A
+	regular file with one name that opens for writing: in place, through the held file (_cp_held). Anything else (other
+	names, not writable, a running program; a FIFO, socket, device or link below a destination, never opened), and every
+	rewrite under -wb: beside it, renamed over it once whole (_cp_beside)."""
 	target, st, named = _landing_of(dest_path)
 	if named and st is None and os.path.islink(dest_path):
-		# cp writes through no dangling link, and nor does hpcp: a planted link would have it make directories and a file
-		# wherever the link points.
+		# cp writes through no dangling link, nor does hpcp: a planted one would have it make directories and a file anywhere.
 		raise _KeptOld(f'{dest_path} is a link to {os.readlink(dest_path)}, which does not exist (cp writes through no dangling link)')
 	_dest_directory(os.path.dirname(target), make=not NO_CREATE_DIR, source=os.path.dirname(os.path.abspath(src_path)))
 	command = ["cp", cp_flags] + (["--sparse=always"] if sparse and cp_supports_sparse() else [])
 	held = _claim_device(target, st, named, src_path)
 	try:
+		if _written_beside(st, named) and not WRITE_BESIDE and stat.S_ISREG(st.st_mode) and st.st_nlink == 1:
+			try:
+				fd = os.open(target, _LANDING_FLAGS)
+			except FileNotFoundError:
+				st = None  # gone since the lstat: a first copy
+			except OSError as e:
+				return _cp_beside(command, src_path, target, st, f'it cannot be opened for writing ({_why(e)})', space)
+			else:
+				try:
+					st = os.fstat(fd)  # what the descriptor holds decides from here on
+					if stat.S_ISREG(st.st_mode) and st.st_nlink == 1:
+						return _cp_held(command, src_path, target, fd, st, space, target != dest_path)
+				finally:
+					os.close(fd)
 		if not _written_beside(st, named):
-			if st is None and space is not None:
-				_space_warning(target, src_path, space[0], space[1], 0)
-			return _cp_to(command, src_path, target)
-		if WRITE_BESIDE:
-			return _cp_beside(command, src_path, target, st, _BESIDE_ASKED, space)
-		if not stat.S_ISREG(st.st_mode):
-			return _cp_beside(command, src_path, target, st, None, space)
-		if st.st_nlink > 1:
-			return _cp_beside(command, src_path, target, st, _OTHER_NAMES, space)
-		try:
-			fd = os.open(target, _LANDING_FLAGS)
-		except FileNotFoundError:
-			if space is not None:
-				_space_warning(target, src_path, space[0], space[1], 0)
-			return _cp_to(command, src_path, target)
-		except OSError as e:
-			return _cp_beside(command, src_path, target, st, f'it cannot be opened for writing ({_why(e)})', space)
-		try:
-			# What the descriptor holds decides from here on: the name may have changed since the lstat.
-			st = os.fstat(fd)
-			if stat.S_ISREG(st.st_mode) and st.st_nlink == 1:
-				return _cp_held(command, src_path, target, fd, st, space, target != dest_path)
-		finally:
-			os.close(fd)
-		return _cp_beside(command, src_path, target, st, _OTHER_NAMES if stat.S_ISREG(st.st_mode) else None, space)
+			return _cp_to(command, src_path, target, space if st is None else None)
+		why = _BESIDE_ASKED if WRITE_BESIDE else _OTHER_NAMES if stat.S_ISREG(st.st_mode) else None
+		return _cp_beside(command, src_path, target, st, why, space)
 	finally:
 		if held is not None:
 			os.close(held)
@@ -5366,15 +5234,13 @@ def get_entry_state(path, full_hash=False, read_xattrs=True, mark_full=False, st
 def _remove_stale_xattrs(src, dest):
 	"""Remove portable xattrs (user.*, POSIX ACLs, capabilities) that dest has and src does not.
 
-	shutil.copystat() and cp -a copy and overwrite xattrs but never remove one. dest is a path (never
-	followed) or a descriptor (the file a rewrite in place holds). Non-portable, filesystem-internal
-	names are never removed. Skipped under CONTENT_ONLY; unsupported, forbidden or already-gone
-	removals are ignored.
+	shutil.copystat() and cp -a copy and overwrite xattrs but never remove one. dest: a path (never followed), or
+	a descriptor (a rewrite in place). Non-portable, filesystem-internal names are never removed. Skipped under
+	CONTENT_ONLY; unsupported, forbidden or already-gone removals are ignored.
 	"""
 	if CONTENT_ONLY or not hasattr(os, 'listxattr'):
 		return
-	# A descriptor is the file itself: Python refuses follow_symlinks with one.
-	how = {} if isinstance(dest, int) else {'follow_symlinks': False}
+	how = {} if isinstance(dest, int) else {'follow_symlinks': False}  # Python refuses follow_symlinks with a descriptor
 	try:
 		src_names = set(os.listxattr(src, follow_symlinks=False))
 		dest_names = os.listxattr(dest, **how)
@@ -12750,15 +12616,8 @@ def get_args(args = None):
 	parser.add_argument('-tfs','--target_file_system', type=str, default=None, help='Specify the target file system type. Will abort if the target file system type does not match. Example: ext4, xfs, f2fs, ntfs, fat32, exfat. Default is None: do not check target file system type.')
 	parser.add_argument('-ncd','--no_create_dir', action='store_true', help='Ignore any destination folder that does not already exist. ( Will still copy if dest is a file )')
 	parser.add_argument('-co','--content_only', action='store_true', help='Content-only copy: do not sync mode, owner, or timestamps on files or directories. A destination file with other hard links is replaced, not written through. A FIFO, socket or device node is made as cp -a makes it, never read. Still create missing destination directories using filesystem-default permissions (so parent ACL/setgid/setuid inherit).')
-	parser.add_argument('-wb', '--write_beside', '--write-beside', action='store_true', help='Write every rewrite to a new '
-		'file beside the old one, write it to disk and rename it over the old one once whole: a source that fails, a full disk '
-		'or a stop leave the old copy as it was. The file gets a new inode (a per-file Lustre or GPFS layout, chattr flags and '
-		'a project id are not kept; NFS readers holding it open may get ESTALE). Needs a new name in the file\'s directory and '
-		'room for a second copy: without either the old copy stays (exit 190). By default a rewrite is written in place, and '
-		'only a file with other names, one that cannot be opened for writing, or a FIFO, device or link goes beside.')
-	parser.add_argument('-rbw', '--read_before_write', '--read-before-write', action='store_true', help='Before a file at '
-		'the destination is written in place, read its source to the end: a source that fails on read leaves the old copy as '
-		'it is (exit 190). Costs a second read of each rewritten file. Does nothing with -wb, which writes nothing in place.')
+	parser.add_argument('-wb', '--write_beside', '--write-beside', action='store_true', help='Write every rewrite to a new file beside the old one, write it to disk and rename it over the old one once whole: a source that fails, a full disk or a stop leave the old copy as it was. The file gets a new inode (a per-file Lustre or GPFS layout, chattr flags and a project id are not kept; NFS readers holding it open may get ESTALE). Needs a new name in the file\'s directory and room for a second copy: without either the old copy stays (exit 190). By default a rewrite is written in place, and only a file with other names, one that cannot be opened for writing, or a FIFO, device or link goes beside.')
+	parser.add_argument('-rbw', '--read_before_write', '--read-before-write', action='store_true', help='Before a file at the destination is written in place, read its source to the end: a source that fails on read leaves the old copy as it is (exit 190). Costs a second read of each rewritten file. Does nothing with -wb, which writes nothing in place.')
 	parser.add_argument('-ctl','--command_timeout_limit', type=int, default=0, help='Set the command timeout limit in seconds for external commands ( ex. cp / dd ). Default is 0: no timeout.')
 	parser.add_argument('-enes','--exit_not_enough_space', action='store_true', help='Exit if there is not enough space on the destination instead of continuing (Note: Default is continue as in compressed fs copy can be down even if source is bigger than free space; without it, a copy that may not fit is tried, with a warning on ext2/3/4, XFS and tmpfs).')
 	try:
@@ -12857,11 +12716,9 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = multipr
 		max_workers = round(0.5 * multiprocessing.cpu_count())
 	elif max_workers < 0:
 		max_workers = round(- max_workers * multiprocessing.cpu_count())
-	# This run's space-warning slots (_space_warning), shared by its copy workers; a nested run (-dd) has its own, and the
-	# outer run gets its back.
+	# This run's space-warning slots (_space_warning); a nested run (-dd) has its own, and gives the outer one its back.
 	global _SPACE_WARNED
-	outer_space = _SPACE_WARNED
-	_SPACE_WARNED = _space_share() if os.name == 'posix' else None
+	outer_space, _SPACE_WARNED = _SPACE_WARNED, (_space_share() if os.name == 'posix' else None)
 	try:
 		if get_diff_image or load_diff_image or force_apply:
 			if os.name == 'nt':
