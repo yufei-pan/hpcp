@@ -2328,7 +2328,7 @@ def test_every_pool_goes_through_one_door(tmp_path, hpcp_mod, reset_hpcp_globals
 	# One door (_pool) for every process pool, one wait (_wait): what S1 and S2 do holds for each. In the parent, inside a pool
 	# region, nothing but the loop runs (no cp, no prompt): conftest's guard checks every in-process run of the suite, and
 	# these here.
-	with open(HPCP) as f:
+	with open(HPCP, encoding='utf-8') as f:  # hpcp.py is UTF-8 whatever the locale (LANG unset: ASCII on 3.6)
 		source = f.read()
 	assert source.count('ProcessPoolExecutor(') == 1 and source.count('concurrent.futures.wait(') == 1
 	assert 'as_completed(' not in source
