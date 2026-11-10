@@ -13878,7 +13878,8 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = None,
 			if not remove:
 				# The move's backstop, at the end of a copy: two sources that landed in one file, where the destination took their
 				# names for one and no check on names could say so (an 8.3 alias, a legacy name read as UTF-8). The landing is left
-				# as it is: it holds one source whole, and the other content has no name of its own there. A move asks before removing.
+				# as it is: it holds one source whole, or after two cps wrote it at once (a parallel copy) a mix of both; the other content
+				# has no name of its own there. A move asks before removing.
 				# A file whose copy failed has said so: at none of its landings it says nothing more, and a clash is not said
 				# to follow a copy of it.
 				failed = {error.source for error in ERRORS[copy_error_start:] if isinstance(error, _CopyFailure)}
