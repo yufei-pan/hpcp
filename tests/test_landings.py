@@ -1868,7 +1868,8 @@ def test_a_second_stop_after_a_task_s_cleanup_ends_the_worker(hpcp_mod, monkeypa
 	def task():
 		hpcp_mod._stop(signal.SIGTERM, None)
 	hpcp_mod._run_task({}, task)
-	assert ended == [signal.SIGTERM] and not hpcp_mod._IN_TASK
+	# The second stop ends the worker at once (_stop); this stub of _end_by returns, so _run_task's own _end_by follows.
+	assert ended and set(ended) == {signal.SIGTERM} and not hpcp_mod._IN_TASK
 
 
 def test_a_forked_worker_sets_itself_up_at_its_start_only_in_a_run(tmp_path):

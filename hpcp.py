@@ -880,6 +880,11 @@ def _stop(signum, frame):
 	if _ENDING:
 		return
 	if not _IN_TASK and os.getpid() != _MAIN_PID:
+		if _STOPPED_PID == os.getpid():
+			# Stopped already, outside a task: on its way out (_run_task's _end_by, whose first lines a stop raising here would
+			# cut, and the pool's loop would keep the worker, idle for good), or kept by the pool's loop. Either way it ends here.
+			_end_by(_STOPPED)
+			return
 		# A pool worker outside a task (idle, starting, between tasks): nothing to clean up, and any stop ends it. Kept, it
 		# would wait in the pool's queue for good, and the pool's shutdown with it. SystemExit unwinds through the queue's
 		# locks, letting go of the one it holds while it waits (killed holding it, the other workers could never read the
@@ -1281,6 +1286,8 @@ class _pool:
 		"""executor.submit, with the stops blocked in the process that runs main() (a library caller's are left alone): a
 		worker it starts (and a fork server, which every later worker forks from) starts with them blocked, and lets them in
 		once set up (_init_worker). A stop meanwhile is recorded at the restore (_stop, inside the region)."""
+		# A stop recorded inside the region starts no more work: the loop acts on it here, as at its wait.
+		_check_stop()
 		mask = _block_stops() if os.getpid() == _MAIN_PID else None
 		try:
 			future = self.executor.submit(func, *args, **kwargs)
@@ -1333,18 +1340,24 @@ class _pool:
 				# is only recorded (_stop); outside, Python would drop one raised in them.
 				self.executor = self.slots = None
 				return False
-			if stopped or broken:
-				# A broken pool with no stop: SIGTERM ends idle workers (_stop's SystemExit) and busy ones by their cleanup.
-				_pass_stop_on(_STOPPED or signal.SIGTERM)
-			else:
+			if not (stopped or broken):
+				# A failure in the loop, with no stop: what is not started is cancelled, and what runs (with the calls already
+				# queued, which no cancel reaches) ends as it would. A stop meanwhile, or the pool stuck on a dead worker, ends
+				# this wait (_wait).
 				for future in list(self.pending):
 					future.cancel()
+				with contextlib.suppress(KeyboardInterrupt, RuntimeError):
+					while self.pending:
+						_wait(set(self.pending), self)
+			# A stop ends each worker: idle ones at once, busy ones (after a stop or a broken pool) by their cleanup. SIGTERM for
+			# a broken pool or a failure.
+			_pass_stop_on(_STOPPED or signal.SIGTERM)
 			self._wait_for_workers()
-			# Python 3.6's shutdown puts a wakeup into the result queue, under a lock a killed worker may hold: skipped there.
+			# From 3.9 the manager thread is told to end, before main()'s finalizers close the queues it may still close itself.
+			# Not before: 3.6's shutdown puts a wakeup into the result queue under a lock a killed worker may hold, and 3.7's and
+			# 3.8's close the manager thread's pipes and call queue under it (a traceback from that thread).
 			if sys.version_info >= (3, 9):
 				self.executor.shutdown(wait=False, cancel_futures=True)
-			elif sys.version_info >= (3, 7):
-				self.executor.shutdown(wait=False)
 			_ABANDONED = True
 			_LEFT.append(self.executor)
 			return False
@@ -7301,12 +7314,19 @@ def _replace_files(files, target_root, max_workers=1, verbose=False, full_hash=F
 			_finish_replace(job, target_root,
 				functools.partial(_call_raising_recorded_failures, copy, source, [tmp], full_hash, verbose), metadata)
 		return
-	with _pool(max_workers) as executor:
-		futures = {_submit_task(executor, copy, source, [tmp], full_hash, verbose): (row, source, dest, tmp)
-			for row, source, dest, tmp in jobs}
-		while futures:
-			for future in _wait(futures, executor):
-				_finish_replace(futures.pop(future), target_root, functools.partial(_raise_task_failures, future), metadata)
+	futures = {}
+	try:
+		with _pool(max_workers) as executor:
+			for row, source, dest, tmp in jobs:
+				futures[_submit_task(executor, copy, source, [tmp], full_hash, verbose)] = (row, source, dest, tmp)
+			while futures:
+				for future in _wait(futures, executor):
+					_finish_replace(futures.pop(future), target_root, functools.partial(_raise_task_failures, future), metadata)
+	finally:
+		# A stop or a failure: the pool's exit has waited for its workers, so a temporary copy one of them made and this loop
+		# did not rename is discarded here (as _finish_replace discards its own).
+		for row, source, dest, tmp in futures.values():
+			_discard_temp(tmp)
 
 def _replace_with_symlink(row, link_target, dest, target_root):
 	"""Create the symlink at a temporary sibling of dest and rename it over dest."""
@@ -14114,6 +14134,10 @@ def _end_now(rc):
 	with contextlib.suppress(Exception):
 		sys.stdout.flush()
 		sys.stderr.flush()
+	with contextlib.suppress(Exception):
+		# multiCMD's exit hook, which os._exit skips: a command of this process still running is stopped, as at exit (its
+		# approved limitations leave one 'running until kill_all() or the program's exit stops it').
+		multiCMD.kill_all()
 	with contextlib.suppress(Exception):
 		# Finalizers of exit priority 0 and above: the semaphores' unlink and the queues' close, neither of which waits on a
 		# thread (a queue's join is -5, not run).
