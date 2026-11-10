@@ -2642,3 +2642,23 @@ def test_the_held_file_probe_keeps_only_cp_s_own_answer(hpcp_mod, monkeypatch, a
 	answers = list(answers)
 	monkeypatch.setattr(hpcp_mod.multiCMD, 'run_commands', lambda *args, **kwargs: [type('Task', (), {'returncode': answers.pop(0)})()])
 	assert [hpcp_mod._reaches_held() for _ in asked] == asked and answers == left
+
+
+@posix_only
+@not_root
+def test_a_node_source_that_cannot_go_beside_keeps_the_old_file_and_says_why(tmp_path):
+	# out 0555 takes no new name: a FIFO source goes beside by default too (cp -a makes it anew), so both runs keep out/p, 190,
+	# and -wb does not claim that without it the file would be written in place.
+	os.makedirs(str(tmp_path / 'a'))
+	os.mkfifo(str(tmp_path / 'a/p'))
+	write(tmp_path / 'out/p', 'old')
+	os.chmod(str(tmp_path / 'out/p'), 0o666)
+	os.chmod(str(tmp_path / 'out'), 0o555)
+	try:
+		rc, output = run(['a/p', '-d', 'out/'], tmp_path)
+		assert rc == 190 and read(tmp_path / 'out/p') == 'old' and b'a/p is no regular file, which cp makes anew' in output, output[-2000:]
+		rc, output = run(['a/p', '-d', 'out/', '-wb'], tmp_path)
+	finally:
+		os.chmod(str(tmp_path / 'out'), 0o755)
+	assert rc == 190 and read(tmp_path / 'out/p') == 'old' and b'-wb writes beside it; ' in output, output[-2000:]
+	assert b'it would be written in place' not in output, output[-2000:]

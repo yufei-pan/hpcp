@@ -3791,10 +3791,10 @@ def _cp_held(command, src_path, target, fd, fst, space, through_link):
 	return os.fstat(fd).st_blocks * 512
 
 
-def _in_place_hint(target, st):
+def _in_place_hint(target, st, src_path):
 	"""Under -wb, the end of a failed rewrite's reason where the default would have written it in place (one name, and it
-	opens for writing: asked by opening it, nothing written)."""
-	if WRITE_BESIDE and stat.S_ISREG(st.st_mode) and st.st_nlink == 1:
+	opens for writing: asked by opening it, nothing written; and a regular source, as cp -a makes the rest anew)."""
+	if WRITE_BESIDE and stat.S_ISREG(st.st_mode) and st.st_nlink == 1 and _regular_source(src_path):
 		with contextlib.suppress(OSError):
 			os.close(os.open(target, _LANDING_FLAGS))
 			return '; without -wb it would be written in place'
@@ -3809,7 +3809,7 @@ def _cp_beside(command, src_path, target, st, why, space):
 	regular = stat.S_ISREG(st.st_mode)
 	carried = _co_carry(target, st) if CONTENT_ONLY and regular else None
 	if CONTENT_ONLY and regular and carried is None and st.st_nlink < 2:
-		raise _KeptOld(f'{why}; its owner, group or an xattr cannot be given to a new file{_in_place_hint(target, st)}')
+		raise _KeptOld(f'{why}; its owner, group or an xattr cannot be given to a new file{_in_place_hint(target, st, src_path)}')
 	if space is not None:
 		_space_warning(target, src_path, space[0], space[1], 0)
 	temp, renamed, what = _temp_sibling(target), False, 'the new copy beside it failed: %s'
@@ -3834,7 +3834,7 @@ def _cp_beside(command, src_path, target, st, why, space):
 				parent = os.path.dirname(target)
 				raise _Refused(f'cannot replace the {_kind_of(st)} {target} ({parent}: {_why(e)}): not writing ',
 					f' into it; make {parent} writable, or remove {target}')
-			raise _KeptOld(f'{why}; {what % _why(e)}{_in_place_hint(target, st)}')
+			raise _KeptOld(f'{why}; {what % _why(e)}{_in_place_hint(target, st, src_path)}')
 		if attributes is not None and attributes != _fat_attributes(target):
 			_set_fat_attributes(target, attributes, target)
 		return get_file_size(target)
