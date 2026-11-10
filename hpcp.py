@@ -12285,6 +12285,12 @@ def get_dests(dest_paths,dest_image,mount_points: list,loop_devices: list,src_pa
 			else:
 				expanded_dests = [os.path.expanduser(dest)]
 			for path in expanded_dests:
+				# Folded once, lexically, as the copy itself takes it (abspath): l/../out is out, whatever l leads to, so no
+				# directory is made where a link before '..' leads. A trailing separator (copy into) is kept.
+				trailing = path.endswith(os.sep) or bool(os.altsep) and path.endswith(os.altsep)
+				path = os.path.normpath(path)
+				if trailing and not path.endswith(os.sep):
+					path += os.sep
 				pathDest = get_dest_from_path(path,src_paths,src_path,can_be_none=can_be_none)
 				if pathDest:
 					dests.append(pathDest)

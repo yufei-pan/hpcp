@@ -190,14 +190,6 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - **Revisit when:** an operator reports one.
 - **Approved:** 2026-11-10, the user chose "Approve as KL (Recommended)". The user did not ask for it explicitly; it is what remains of the hang the 9.85 review found.
 
-### A destination given through `link/..` also makes an empty directory where the link leads
-- **Kind:** deferred (9.87).
-- **What the operator sees:** `hpcp a/ -d l/../out/`, with `l` a link to `deep/inner`, copies into `out/` (the path is folded as written) and also leaves an empty `deep/out/`, made by following the link. 9.84 does the same. Nothing is lost.
-- **Why:** one step makes the destination's directory from the path as given, where the kernel follows `l` before `..`, while the copy uses the folded path. Not traced to the line yet.
-- **Plan (9.87):** fold `-d` once, at the start, and use only the folded path.
-- **Revisit when:** 9.87.
-- **Noted:** 2026-11-09, found in the 9.85 re-review (checked in Docker on 9.85 and 9.84); the main session's decision, not asked (a deferral).
-
 ### A source that fails part way through a rewrite costs the old copy
 - **Kind:** known limitation.
 - **What the operator sees:** by default a rewrite writes the file in place; when the source fails on read part way (a bad sector, an NFS soft timeout), the copy exits 190 with the source kept, and the old copy, truncated first, is removed (or left torn where its directory keeps it). The destination then has no copy of that file until a rerun. As in 9.84; 9.85 kept the old copy.
