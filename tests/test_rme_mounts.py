@@ -1141,11 +1141,9 @@ def test_a_rerun_with_both_names_there_is_not_a_clash_on_a_read_only_mount(tmp_p
 		if subprocess.run(['mount', '-o', 'remount,bind,ro', str(tmp_path / 'out')], capture_output=True).returncode:
 			pytest.skip('read-only remount failed')
 		task = _hpcp(['a/', '-d', 'out/'], tmp_path)
-		# The copy itself cannot write there; it is no clash. 9.82 to 9.86 ended 193, their folder sync setting every
-		# directory's metadata; 9.87 sets only what differs (none there), and the files, identical, cannot be given the
-		# source's read times (the first run's own read moved them): 190, naming each landing.
-		assert task.returncode == 190 and b'clash' not in task.stdout and b'Read-only file system' in task.stdout, task.stdout[-2000:]
-		assert b'/proc/' not in task.stdout and b'cannot be set (Read-only file system)' in task.stdout, task.stdout[-2000:]
+		# It is no clash. 9.82 to 9.86 ended 193, their folder sync setting every directory's metadata, which the mount
+		# refuses; 9.87 sets only what differs, and nothing does (a read time alone is left), so nothing is written: 0.
+		assert task.returncode == 0 and b'clash' not in task.stdout and b'Read-only' not in task.stdout, task.stdout[-2000:]
 	finally:
 		subprocess.run(['umount', '-l', str(tmp_path / 'out')], capture_output=True)
 
