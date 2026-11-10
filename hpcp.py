@@ -3788,8 +3788,20 @@ def _cp_held(command, src_path, target, fd, fst, space, through_link):
 		raise RuntimeError(str(e).replace(held, target)) from e
 	if not CONTENT_ONLY:
 		_remove_stale_xattrs(src_path, fd)
+		if held is not None:
+			_label_like(src_path, fd)
 	return os.fstat(fd).st_blocks * 512
 
+def _label_like(src_path, fd):
+	"""After cp -a wrote the held file fd through its /proc name: the source's SELinux label on it. cp -a gives an existing
+	destination the source's label by name (lsetfilecon, coreutils 8.23 on), which through /proc/PID/fd/N reaches the /proc
+	link, not the file, and it says nothing when that fails; by name (9.84) and on a new file (9.85) the label came along.
+	Set through the descriptor, only where it differs, and as cp -a does it: silently where it cannot be (no label, not
+	permitted, a filesystem that labels itself)."""
+	with contextlib.suppress(OSError, AttributeError):
+		label = os.getxattr(src_path, 'security.selinux', follow_symlinks=False)
+		if os.getxattr(fd, 'security.selinux') != label:
+			os.setxattr(fd, 'security.selinux', label)
 
 def _in_place_hint(target, st, src_path):
 	"""Under -wb, the end of a failed rewrite's reason where the default would have written it in place (one name, and it

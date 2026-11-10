@@ -884,6 +884,56 @@ def test_a_stale_user_xattr_goes_after_a_rewrite(tmp_path, route):
 	assert _user_xattrs(tmp_path / 'out/x') == ['user.kept'] and (os.stat(str(tmp_path / 'out/x')).st_ino == inode) == (route == [])
 
 
+@posix_only
+@pytest.mark.skipif(not sys.platform.startswith('linux'), reason='the held file is reached through /proc only on Linux')
+def test_a_rewrite_in_place_gives_the_landing_the_source_s_selinux_label(tmp_path):
+	# cp -a sets an existing destination's label by name, which through /proc/PID/fd/N reaches the /proc link (coreutils
+	# 8.23 on): hpcp sets it through the descriptor, as 9.84's cp by name and 9.85's new file had it.
+	write(tmp_path / 'a/x', 'new')
+	write(tmp_path / 'out/x', 'old')
+	try:
+		label = os.getxattr(str(tmp_path / 'a/x'), 'security.selinux')
+		user, role, kind, level = label.rstrip(b'\0').split(b':', 3)
+		if kind == b'usr_t':
+			pytest.skip('the source is usr_t already')
+		os.setxattr(str(tmp_path / 'a/x'), 'security.selinux', b':'.join((user, role, b'usr_t', level)))
+	except (OSError, ValueError):
+		pytest.skip('no SELinux label that can be set here')
+	inode = os.stat(str(tmp_path / 'out/x')).st_ino
+	rc, output = run(['a/', '-d', 'out/'], tmp_path)
+	assert rc == 0 and read(tmp_path / 'out/x') == 'new' and os.stat(str(tmp_path / 'out/x')).st_ino == inode, output[-2000:]
+	assert os.getxattr(str(tmp_path / 'out/x'), 'security.selinux') == os.getxattr(str(tmp_path / 'a/x'), 'security.selinux')
+
+
+@posix_only
+@pytest.mark.skipif(not hasattr(os, 'getxattr'), reason='needs xattrs')
+@pytest.mark.parametrize('case', ['differs', 'same', 'refused', 'no-label'])
+def test_the_label_of_a_held_file_is_set_only_where_it_differs_and_never_fails_the_copy(tmp_path, hpcp_mod, monkeypatch, case):
+	write(tmp_path / 'src', 'new')
+	write(tmp_path / 'held', 'old')
+	labels = {str(tmp_path / 'src'): b'u:r:new_t:s0', 'held': b'u:r:new_t:s0' if case == 'same' else b'u:r:old_t:s0'}
+	calls = []
+
+	def getxattr(path, name, **how):
+		assert name == 'security.selinux'
+		if case == 'no-label' and not isinstance(path, int):
+			raise OSError(errno.ENODATA, 'No data available')
+		return labels['held' if isinstance(path, int) else path]
+
+	def setxattr(path, name, value, **how):
+		calls.append((isinstance(path, int), name, value))
+		if case == 'refused':
+			raise PermissionError(errno.EPERM, 'Operation not permitted')
+	monkeypatch.setattr(hpcp_mod.os, 'getxattr', getxattr)
+	monkeypatch.setattr(hpcp_mod.os, 'setxattr', setxattr)
+	fd = os.open(str(tmp_path / 'held'), os.O_WRONLY)
+	try:
+		hpcp_mod._label_like(str(tmp_path / 'src'), fd)
+	finally:
+		os.close(fd)
+	assert calls == ([(True, 'security.selinux', b'u:r:new_t:s0')] if case in ('differs', 'refused') else [])
+
+
 # ---- -co, option A': decide first, then carry exactly what was there ----
 
 @posix_only
