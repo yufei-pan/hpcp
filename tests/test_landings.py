@@ -888,7 +888,7 @@ def test_a_stale_user_xattr_goes_after_a_rewrite(tmp_path, route):
 @pytest.mark.skipif(not sys.platform.startswith('linux'), reason='the held file is reached through /proc only on Linux')
 def test_a_rewrite_in_place_gives_the_landing_the_source_s_selinux_label(tmp_path):
 	# cp -a sets an existing destination's label by name, which through /proc/PID/fd/N reaches the /proc link (coreutils
-	# 8.23 on): hpcp sets it through the descriptor, as 9.84's cp by name and 9.85's new file had it.
+	# 8.22 on): hpcp sets it through the descriptor, as 9.84's cp by name and 9.85's new file had it.
 	write(tmp_path / 'a/x', 'new')
 	write(tmp_path / 'out/x', 'old')
 	try:
@@ -932,6 +932,27 @@ def test_the_label_of_a_held_file_is_set_only_where_it_differs_and_never_fails_t
 	finally:
 		os.close(fd)
 	assert calls == ([(True, 'security.selinux', b'u:r:new_t:s0')] if case in ('differs', 'refused') else [])
+
+
+@posix_only
+@pytest.mark.skipif(not sys.platform.startswith('linux'), reason='the held file is reached through /proc only on Linux')
+@pytest.mark.parametrize('content_only', [False, True], ids=['plain', 'content-only'])
+def test_a_rewrite_through_the_held_file_asks_for_the_source_s_label_only_on_a_plain_run(tmp_path, hpcp_mod,
+		reset_hpcp_globals, monkeypatch, content_only):
+	# Runs without SELinux too: a plain rewrite through the held file gives it the source's label (_label_like), and -co,
+	# which keeps the old label in every version, does not.
+	if not hpcp_mod._reaches_held():
+		pytest.skip('cp cannot reach the held file here')
+	write(tmp_path / 'a/x', 'new content')
+	write(tmp_path / 'out/x', 'old')
+	inode = os.stat(str(tmp_path / 'out/x')).st_ino
+	monkeypatch.setattr(hpcp_mod, 'CONTENT_ONLY', content_only)
+	monkeypatch.setattr(hpcp_mod, 'NAMED_DESTS', frozenset([str(tmp_path / 'out')]))
+	asked = []
+	monkeypatch.setattr(hpcp_mod, '_label_like', lambda src, fd: asked.append((src, os.fstat(fd).st_ino)))
+	hpcp_mod.copy_file(str(tmp_path / 'a/x'), [str(tmp_path / 'out/x')])
+	assert not hpcp_mod.ERRORS and read(tmp_path / 'out/x') == 'new content' and os.stat(str(tmp_path / 'out/x')).st_ino == inode
+	assert asked == ([] if content_only else [(str(tmp_path / 'a/x'), inode)])
 
 
 # ---- -co, option A': decide first, then carry exactly what was there ----

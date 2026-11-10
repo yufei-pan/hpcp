@@ -3794,7 +3794,7 @@ def _cp_held(command, src_path, target, fd, fst, space, through_link):
 
 def _label_like(src_path, fd):
 	"""After cp -a wrote the held file fd through its /proc name: the source's SELinux label on it. cp -a gives an existing
-	destination the source's label by name (lsetfilecon, coreutils 8.23 on), which through /proc/PID/fd/N reaches the /proc
+	destination the source's label by name (lsetfilecon, coreutils 8.22 on), which through /proc/PID/fd/N reaches the /proc
 	link, not the file, and it says nothing when that fails; by name (9.84) and on a new file (9.85) the label came along.
 	Set through the descriptor, only where it differs, and as cp -a does it: silently where it cannot be (no label, not
 	permitted, a filesystem that labels itself)."""
