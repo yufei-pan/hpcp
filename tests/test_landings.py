@@ -2,7 +2,8 @@
 file hpcp holds open (on Linux cp gets /proc/PID/fd/N), so its inode stays and a link put at its name is never written
 through; anything else there (a file with other names, one that does not open for writing, a FIFO, device node or link) is
 replaced by a new file renamed over it once whole, never opened or written through, as every rewrite is under -wb. Only
-what the operator named (-d) is followed. A stop runs the cleanup."""
+what the operator named (-d) is followed. A stop runs the cleanup. A copy short of room is warned about, then tried."""
+import contextlib
 import errno
 import os
 import signal
@@ -1117,6 +1118,328 @@ def _fill(out, free):
 		os.unlink(fill)
 	vfs = os.statvfs(out)
 	write(fill, b'f' * (vfs.f_bavail * vfs.f_frsize - free))
+
+
+# ---- 9.86: the full-disk warning: warn, then try and fail as GNU cp does ----
+
+_MIB = 1 << 20
+_HEADER = b'Space warnings in this run (repeated from above):'
+
+
+@contextlib.contextmanager
+def _on_small(name):
+	"""A directory of its own on the small filesystem, emptied after."""
+	out = os.path.join(SMALL_FS, '%s-%d' % (name, os.getpid()))
+	subprocess.run(['rm', '-rf', out])
+	os.makedirs(out)
+	try:
+		yield out
+	finally:
+		subprocess.run(['rm', '-rf', out])
+
+
+def _warnings(output, where):
+	"""(the live warning lines naming where, each starting a line of its own; the lines after the end's header)."""
+	head, _, tail = output.partition(_HEADER)
+	live = [line for line in head.split(b'\n') if line.startswith(b'Space warning: ') and where.encode() in line]
+	repeated = [line for line in tail.split(b'\n') if line.startswith(b'Space warning: ')]
+	return live, repeated
+
+
+_LOGGING_CP = '''#!/bin/sh
+# cp that notes each copy it starts in $LOG, then (after $PAUSE seconds, when set) runs the real cp. --version and the
+# held-file probe (cp /dev/null onto a descriptor of /dev/zero) are not copies.
+case "$1" in --version|/dev/null) exec cp "$@";; esac
+echo CP-STARTED >> "$LOG"
+if [ -n "$PAUSE" ]; then sleep "$PAUSE"; fi
+exec cp "$@"
+'''
+
+
+def _logged_run(tmp_path, args, to_file=True, pause=None):
+	"""The CLI with cp noting each copy it starts in a log: (return code, the run's stdout and stderr). to_file: the run writes
+	them to the same log, appended, so the log shows the order of the two; else they go to a pipe."""
+	cp = tmp_path / 'logcp'
+	cp.write_text(_LOGGING_CP)
+	os.chmod(str(cp), 0o755)
+	log = tmp_path / 'log'
+	env = dict(os.environ, CP_PATH=str(cp), LOG=str(log), **({'PAUSE': str(pause)} if pause else {}))
+	if not to_file:
+		return run(args, tmp_path, env=env)
+	with open(str(log), 'ab') as out:
+		task = subprocess.run([sys.executable, HPCP] + args, cwd=str(tmp_path), stdin=subprocess.DEVNULL, stdout=out,
+			stderr=subprocess.STDOUT, env=env, timeout=120)
+	return task.returncode, log.read_bytes()
+
+
+@posix_only
+@small_fs
+def test_the_space_warning_costs_nothing_where_a_file_fits(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	# 1 MiB over 1 MiB with 3 MiB free: no line, and nothing of the warning runs (no stat, no mountinfo, no lock).
+	with _on_small('fits') as out:
+		write(os.path.join(out, 'x'), b'o' * _MIB)
+		write(tmp_path / 'a/x', os.urandom(_MIB))
+		_fill(out, 3 * _MIB)
+		rc, output = run([str(tmp_path / 'a/x'), '-d', out + '/'], tmp_path)
+		assert rc == 0 and b'Space warning' not in output and read_bytes(os.path.join(out, 'x')) == read_bytes(tmp_path / 'a/x'), output[-2000:]
+		def never(*args):
+			raise AssertionError('the warning ran on the normal path')
+		monkeypatch.setattr(hpcp_mod, '_mount_type', never)
+		monkeypatch.setattr(hpcp_mod, '_space_warning', never)
+		write(tmp_path / 'a/x', os.urandom(_MIB))
+		assert hpcp_mod.copy_file(str(tmp_path / 'a/x'), [os.path.join(out, 'x')])[0] > 0 and not hpcp_mod.ERRORS
+
+
+@posix_only
+@small_fs
+def test_the_space_warning_comes_before_the_copy_it_is_about(tmp_path):
+	# 0.5 MiB free, 1 MiB over a 1 MiB old copy: it fits only by reusing the old copy's room. The line is in the output before
+	# cp starts, on a line of its own, and the copy then succeeds (exit 0, the inode kept).
+	with _on_small('before') as out:
+		write(os.path.join(out, 'x'), b'o' * _MIB)
+		inode = os.stat(os.path.join(out, 'x')).st_ino
+		write(tmp_path / 'a/x', os.urandom(_MIB))
+		_fill(out, _MIB // 2)
+		rc, output = _logged_run(tmp_path, [str(tmp_path / 'a/x'), '-d', out + '/'])
+		assert rc == 0 and read_bytes(os.path.join(out, 'x')) == read_bytes(tmp_path / 'a/x'), output[-3000:]
+		assert os.stat(os.path.join(out, 'x')).st_ino == inode
+		live, repeated = _warnings(output, out)
+		assert len(live) == 1 and repeated == live, output[-3000:]
+		assert output.index(live[0]) < output.index(b'CP-STARTED'), output[-3000:]
+		assert (b"; it fits only by reusing its old copy's room, which cp frees first, so if another writer takes that room the "
+			b'copy fails and the old copy is lost (the source is kept). hpcp copies anyway, as cp does;') in live[0]
+		assert live[0].startswith(('Space warning: %s has ' % out).encode()) and output.rstrip().endswith(b'Done.'), output[-3000:]
+
+
+@posix_only
+@small_fs
+@pytest.mark.parametrize('form', ['pipe', 'verbose', 'file'])
+def test_the_space_warning_is_printed_once_per_filesystem_and_repeated_at_the_end(tmp_path, form):
+	# Four 1 MiB rewrites at once (-j 4) with 0.5 MiB free: each worker that runs one in the forced pass could warn; the run's
+	# shared slots let one. cp waits 2 s before it frees an old copy, so every worker that checks the room in that time finds
+	# 0.5 MiB and goes on to the warning (the first one always does). The end repeats it once, and the run ends Done. (a
+	# warning is no error). Each line starts a line of its own, in a pipe and in a file.
+	with _on_small('once') as out:
+		for name in 'abcd':
+			write(os.path.join(out, name), b'o' * _MIB)
+			write(tmp_path / 'src' / name, os.urandom(_MIB))
+		_fill(out, _MIB // 2)
+		args = [str(tmp_path / 'src') + '/', '-d', out + '/', '-j', '4'] + (['-v'] if form == 'verbose' else [])
+		rc, output = _logged_run(tmp_path, args, to_file=form == 'file', pause=2)
+		assert rc == 0 and all(read_bytes(os.path.join(out, name)) == read_bytes(tmp_path / 'src' / name) for name in 'abcd'), output[-3000:]
+		live, repeated = _warnings(output, out)
+		assert len(live) == 1 and repeated == live, output[-3000:]
+		assert b'Done.' in output and b'Error occurred' not in output, output[-3000:]
+
+
+@posix_only
+@small_fs
+def test_a_doomed_rewrite_is_warned_about_and_still_tried(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	# 3 MiB over a 1 MiB old copy with 1 MiB free: it may not fit. cp still runs (GNU cp's way), fails on the full disk, and the
+	# old copy it truncated goes with the torn file (the approved known limitation): 190, the source kept. The warning
+	# changes nothing in that: the same outcome without it.
+	with _on_small('doomed') as out:
+		landing = os.path.join(out, 'x')
+		write(tmp_path / 'a/x', os.urandom(3 * _MIB))
+		write(landing, b'o' * _MIB)
+		_fill(out, _MIB)
+		rc, output = _logged_run(tmp_path, [str(tmp_path / 'a/x'), '-d', out + '/'])
+		assert rc == 190 and b'Copy failed' in output and b'CP-STARTED' in output, output[-3000:]
+		live, _ = _warnings(output, out)
+		assert len(live) == 1 and b', so it may not fit; if the disk runs out the copy fails, and a rewrite\'s old copy is lost' in live[0]
+		assert output.index(live[0]) < output.index(b'CP-STARTED')
+		assert not os.path.lexists(landing) and len(read_bytes(tmp_path / 'a/x')) == 3 * _MIB
+		write(landing, b'o' * _MIB)
+		_fill(out, _MIB)
+		monkeypatch.setattr(hpcp_mod, '_space_warning', lambda *args: None)
+		hpcp_mod.copy_file(str(tmp_path / 'a/x'), [landing])
+		assert not os.path.lexists(landing) and any(error.startswith('Copy failed') for error in hpcp_mod.ERRORS)
+
+
+@posix_only
+@small_fs
+def test_a_doomed_new_file_is_warned_about_and_still_tried(tmp_path):
+	with _on_small('new') as out:
+		write(tmp_path / 'a/x', os.urandom(6 * _MIB))
+		rc, output = _logged_run(tmp_path, [str(tmp_path / 'a/x'), '-d', out + '/'])
+		assert rc == 190 and b'CP-STARTED' in output and os.listdir(out) == [], output[-3000:]
+		live, repeated = _warnings(output, out)
+		assert len(live) == 1 and repeated == live and b'so it may not fit' in live[0], output[-3000:]
+
+
+@posix_only
+@small_fs
+def test_no_space_warning_where_the_estimate_does_not_hold(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	# btrfs (compression, shared blocks) and a source on the landing's own filesystem (XFS may clone it) get no line; the copy
+	# is tried as ever.
+	with _on_small('scope') as out:
+		write(os.path.join(out, 'x'), b'o' * _MIB)
+		write(tmp_path / 'a/x', os.urandom(_MIB))
+		_fill(out, _MIB // 2)
+		monkeypatch.setattr(hpcp_mod, '_mount_type', lambda dev: 'btrfs')
+		assert hpcp_mod.copy_file(str(tmp_path / 'a/x'), [os.path.join(out, 'x')])[0] > 0
+		assert not hpcp_mod.ERRORS and read_bytes(os.path.join(out, 'x')) == read_bytes(tmp_path / 'a/x')
+		monkeypatch.undo()
+		os.unlink(os.path.join(out, 'fill'))
+		write(os.path.join(out, 'src/y'), os.urandom(_MIB))
+		write(os.path.join(out, 'dst/y'), b'o' * _MIB)
+		_fill(out, _MIB // 2)
+		rc, output = run([os.path.join(out, 'src/y'), '-d', os.path.join(out, 'dst') + '/'], tmp_path)
+		assert rc == 0 and b'Space warning' not in output and read_bytes(os.path.join(out, 'dst/y')) == read_bytes(os.path.join(out, 'src/y')), output[-3000:]
+
+
+@posix_only
+@small_fs
+def test_the_space_warning_under_write_beside_says_the_old_copy_stays(tmp_path):
+	# -wb needs room for a second copy: with 0.5 MiB free nothing of the old copy's room is reused (old 0 on the beside route),
+	# so it may not fit; it does not, and the old copy stays, 190, no temporary file.
+	with _on_small('beside') as out:
+		write(os.path.join(out, 'x'), b'o' * _MIB)
+		write(tmp_path / 'a/x', os.urandom(_MIB))
+		_fill(out, _MIB // 2)
+		rc, output = run([str(tmp_path / 'a/x'), '-d', out + '/', '-wb'], tmp_path)
+		assert rc == 190 and read_bytes(os.path.join(out, 'x')) == b'o' * _MIB and temporaries(out) == [], output[-3000:]
+		live, _ = _warnings(output, out)
+		assert len(live) == 1 and b"so it may not fit; if the disk runs out the copy fails, and a rewrite's old copy stays (-wb)" in live[0], output[-3000:]
+
+
+@posix_only
+@small_fs
+def test_several_destinations_spill_over_without_a_warning(tmp_path):
+	# Unchanged: the first pass skips a destination without room, and the file lands on the next; the attempt that ran had
+	# room, so nothing is warned about.
+	with _on_small('spill') as out:
+		os.makedirs(os.path.join(out, 'a'))
+		write(tmp_path / 'src/x', os.urandom(3 * _MIB))
+		_fill(out, _MIB)
+		rc, output = run([str(tmp_path / 'src/x'), '-d', os.path.join(out, 'a') + '/', '-d', str(tmp_path / 'big') + '/'], tmp_path)
+		assert rc == 0 and read_bytes(tmp_path / 'big/x') == read_bytes(tmp_path / 'src/x') and b'Space warning' not in output, output[-3000:]
+		assert not os.path.exists(os.path.join(out, 'a/x'))
+
+
+def test_the_space_slots_are_shared_by_the_run_s_workers(hpcp_mod, monkeypatch):
+	# The run's own slots, under this Python's start method (fork: an inherited mapping; forkserver, 3.14's default: an
+	# Array through the pool's initializer): a filesystem the parent claimed is claimed for the workers too, and one a
+	# worker claimed for the parent.
+	share = hpcp_mod._space_share()
+	assert share is not None
+	monkeypatch.setattr(hpcp_mod, '_SPACE_WARNED', share)
+	assert hpcp_mod._claim_space(111) is True and hpcp_mod._claim_space(111) is False
+	with hpcp_mod._copy_pool(2) as pool:
+		assert [pool.submit(hpcp_mod._claim_space, 111).result() for _ in range(4)] == [False] * 4
+		assert pool.submit(hpcp_mod._claim_space, 222).result() is True
+		assert pool.submit(hpcp_mod._claim_space, 222).result() is False
+	assert hpcp_mod._claim_space(222) is False and hpcp_mod._claim_space(333) is True
+
+
+@pytest.mark.skipif(sys.version_info < (3, 7), reason="Python 3.6's pool takes no initializer (its workers fork)")
+def test_the_space_slots_reach_spawned_workers(hpcp_mod, monkeypatch):
+	import multiprocessing
+	context = multiprocessing.get_context('spawn')
+	array = context.Array('Q', hpcp_mod._SPACE_SLOTS)
+	monkeypatch.setattr(hpcp_mod, '_SPACE_WARNED', (array.get_lock(), array.get_obj(), array))
+	assert hpcp_mod._claim_space(7) is True
+	from concurrent.futures import ProcessPoolExecutor
+	with ProcessPoolExecutor(2, mp_context=context, initializer=hpcp_mod._init_space_share, initargs=(array,)) as pool:
+		assert [pool.submit(hpcp_mod._claim_space, 7).result() for _ in range(3)] == [False] * 3
+		assert pool.submit(hpcp_mod._claim_space, 8).result() is True
+	assert hpcp_mod._claim_space(8) is False
+
+
+def test_a_space_slot_lock_that_cannot_be_taken_prints_anyway(hpcp_mod, monkeypatch):
+	# A worker that died holding the lock: after 1 s the warning prints anyway, and nothing hangs.
+	# Held from another thread: the Array's lock (forkserver, spawn) is an RLock, which its own holder takes again at once.
+	import threading
+	share = hpcp_mod._space_share()
+	assert share is not None
+	monkeypatch.setattr(hpcp_mod, '_SPACE_WARNED', share)
+	held, done = threading.Event(), threading.Event()
+	def hold():
+		with share[0]:
+			held.set()
+			done.wait(60)
+	holder = threading.Thread(target=hold)
+	holder.start()
+	try:
+		assert held.wait(30)
+		started = time.monotonic()
+		assert hpcp_mod._claim_space(5) is True and hpcp_mod._claim_space(5) is True
+		assert 1.5 < time.monotonic() - started < 30
+	finally:
+		done.set()
+		holder.join(60)
+	assert hpcp_mod._claim_space(5) is True and hpcp_mod._claim_space(5) is False
+
+
+def test_every_slot_taken_prints_each_time(hpcp_mod, monkeypatch):
+	share = hpcp_mod._space_share()
+	monkeypatch.setattr(hpcp_mod, '_SPACE_WARNED', share)
+	assert all(hpcp_mod._claim_space(dev) for dev in range(hpcp_mod._SPACE_SLOTS))
+	assert hpcp_mod._claim_space(10 ** 6) is True and hpcp_mod._claim_space(10 ** 6) is True and hpcp_mod._claim_space(3) is False
+
+
+def test_mountinfo_is_parsed_by_its_own_fields(hpcp_mod):
+	sample = (b'22 1 259:2 / / rw,relatime shared:1 - xfs /dev/nvme0n1p2 rw,attr2\n'
+		b'61 22 0:52 / /mnt/with\\040space rw,nosuid shared:30 master:2 - tmpfs tmpfs rw,size=5120k\n'
+		b'62 22 0:53 / /mnt/- rw - ext4 /dev/loop0 rw\n'
+		b'63 22 0:54 / /odd rw\n'
+		b'garbage\n')
+	assert hpcp_mod._parse_mountinfo(sample) == {(259, 2): 'xfs', (0, 52): 'tmpfs', (0, 53): 'ext4'}
+
+
+@pytest.mark.skipif(not hasattr(os, 'makedev'), reason='os.makedev')
+def test_a_mount_type_miss_reads_mountinfo_once_more_then_is_kept(hpcp_mod, monkeypatch):
+	reads = []
+	tables = [{(8, 1): 'ext4'}, {(8, 1): 'ext4', (8, 2): 'xfs'}, {(8, 1): 'ext4', (8, 2): 'xfs', (8, 3): 'btrfs'}]
+	def read_types():
+		reads.append(1)
+		return dict(tables[min(len(reads), len(tables)) - 1])
+	monkeypatch.setattr(hpcp_mod, '_MOUNT_TYPES', {})
+	monkeypatch.setattr(hpcp_mod, '_read_mount_types', read_types)
+	assert hpcp_mod._mount_type(os.makedev(8, 1)) == 'ext4' and len(reads) == 1
+	assert hpcp_mod._mount_type(os.makedev(8, 1)) == 'ext4' and len(reads) == 1
+	assert hpcp_mod._mount_type(os.makedev(8, 2)) == 'xfs' and len(reads) == 2  # mounted since: found on the reread
+	assert hpcp_mod._mount_type(os.makedev(9, 9)) is None and len(reads) == 3
+	assert hpcp_mod._mount_type(os.makedev(9, 9)) is None and len(reads) == 3  # the miss is kept
+
+
+@root_only
+@pytest.mark.skipif(not sys.platform.startswith('linux'), reason='loop mounts are Linux')
+def test_a_root_copy_onto_an_ext4_full_for_users_gets_one_needless_warning(tmp_path):
+	# No root rule: free space is f_bavail, so a root run onto an ext filesystem that is full for users (its reserved blocks
+	# left) is warned about once, needlessly, and the copy fits into the reserve: exit 0. This pins that cost.
+	import shutil
+	mkfs = shutil.which('mkfs.ext4')
+	if not mkfs:
+		pytest.skip('needs mkfs.ext4')
+	image, mount = tmp_path / 'ext.img', tmp_path / 'ext'
+	with open(str(image), 'wb') as f:
+		f.truncate(64 * _MIB)
+	if subprocess.run([mkfs, '-q', '-F', '-m', '10', str(image)], stdout=subprocess.PIPE, stderr=subprocess.PIPE).returncode:
+		pytest.skip('mkfs.ext4 refused')
+	mount.mkdir()
+	result = subprocess.run(['mount', '-o', 'loop', str(image), str(mount)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+	if result.returncode:
+		pytest.skip('mount failed: ' + result.stderr.strip())
+	try:
+		vfs = os.statvfs(str(mount))
+		# Filled as a user would: up to f_bavail, by an unprivileged writer (root would go on into the reserve).
+		with open(str(mount / 'fill'), 'wb') as f:
+			f.write(b'f' * (vfs.f_bavail * vfs.f_frsize))
+			f.flush()
+			os.fsync(f.fileno())
+		while os.statvfs(str(mount)).f_bavail > 0:
+			with open(str(mount / 'fill'), 'ab') as f:
+				f.write(b'f' * (os.statvfs(str(mount)).f_bavail * vfs.f_frsize or vfs.f_frsize))
+		vfs = os.statvfs(str(mount))
+		assert vfs.f_bavail == 0 and vfs.f_bfree * vfs.f_frsize > 4 * _MIB, vfs
+		write(tmp_path / 'a/x', os.urandom(2 * _MIB))
+		rc, output = run([str(tmp_path / 'a/x'), '-d', str(mount / 'out') + '/'], tmp_path)
+		assert rc == 0 and read_bytes(mount / 'out/x') == read_bytes(tmp_path / 'a/x'), output[-3000:]
+		live, repeated = _warnings(output, str(mount))
+		assert len(live) == 1 and repeated == live, output[-3000:]
+	finally:
+		subprocess.run(['umount', '-l', str(mount)], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
 
 # ---- rule 9: a stop is a cleanup ----

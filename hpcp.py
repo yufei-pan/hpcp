@@ -356,6 +356,8 @@ ERROR_TO_RETURNCODE_TABLE = {
 	'FS param probe warning': 0,
 	# A FIFO, socket or device node: not copied (a note, rc 0); a move (-rm) leaves it in place.
 	'Special file skipped': 0,
+	# A copy that may not fit, tried anyway as cp tries (_space_warning): the copy's own result decides the exit code.
+	'Space warning': 0,
 	# -rme met another filesystem below the destination while removing (one mountinfo did not list): left alone.
 	'Other filesystem left': 0,
 	# A move left source entries the copy did not list (written during the move, special files): a note, rc 0.
@@ -3596,6 +3598,159 @@ def _claim_device(target, st, named, src_path):
 			raise _Refused(f'{target} is in use (mounted, swap, or held by device-mapper, md or LVM): not writing ', ' over it')
 		raise
 
+# ---- the full-disk warning: warn before cp, then let cp try and fail, as GNU cp does (_space_warning) ----
+# The filesystems where statvfs's free room is what a copy can take, and a copy takes what it writes. Elsewhere it is not:
+# btrfs, ZFS and bcachefs compress or share blocks; NFS, SMB, Lustre and GPFS report pooled space; overlay hides what is
+# below it. XFS on the source's own device may clone, which needs no room, so the source's device is left out for all five.
+_SPACE_TYPES = frozenset(('ext2', 'ext3', 'ext4', 'xfs', 'tmpfs'))
+# One slot per destination filesystem that warns in a run. A run whose warnings reach more filesystems than this prints the
+# extra ones once per file: the number bounds extra lines, it never hides a warning.
+_SPACE_SLOTS = 64
+# The run's slots, shared by its copy workers: (lock, the slots, what a pool's initializer hands a worker that did not fork
+# from the run, or None); None outside a run (a library call of copy_file), or where nothing can be shared: each warning
+# then prints.
+_SPACE_WARNED = None
+_MOUNT_TYPES = {}  # (major, minor): the filesystem type /proc/self/mountinfo gives, per process (_mount_type)
+
+def _space_share():
+	"""New slots for a run (_SPACE_WARNED), or None where none can be made. A pool worker forked from this process (the default
+	of Python 3.6 to 3.13 on Linux) inherits an anonymous shared mapping and its lock; any other (forkserver, Python 3.14's
+	default; spawn) gets a multiprocessing.Array through its pool's initializer (_copy_pool). The mapping leaves nothing
+	behind: an Array on Python 3.6 and 3.7 is backed by a file in a pymp- directory, which a stopped run leaves, and 3.6's
+	Array takes no 'Q'."""
+	try:
+		if multiprocessing.get_start_method() == 'fork':
+			import mmap
+			return multiprocessing.Lock(), memoryview(mmap.mmap(-1, 8 * _SPACE_SLOTS)).cast('Q'), None
+		if sys.version_info >= (3, 7):
+			array = multiprocessing.Array('Q', _SPACE_SLOTS)
+			return array.get_lock(), array.get_obj(), array
+	except (OSError, ImportError, ValueError, TypeError):
+		pass
+	return None
+
+def _init_space_share(array):
+	"""A copy pool's initializer (_copy_pool): the run's slots, in a worker that did not fork from the run."""
+	global _SPACE_WARNED
+	_SPACE_WARNED = (array.get_lock(), array.get_obj(), array)
+
+def _copy_pool(max_workers):
+	"""The process pool for jobs that may run copy_file (the copies, and the folder syncs, whose jobs copy a source that turns
+	out to be a file): its workers share the run's space-warning slots. Python 3.6's pool takes no initializer; its workers
+	fork from this process at the first submit and inherit them."""
+	share = _SPACE_WARNED
+	if share is not None and share[2] is not None:
+		return ProcessPoolExecutor(max_workers=max_workers, initializer=_init_space_share, initargs=(share[2],))
+	return ProcessPoolExecutor(max_workers=max_workers)
+
+def _parse_mountinfo(data):
+	"""{(major, minor): type} from the bytes of a mountinfo file: field 3 is major:minor, and the type is the first field after
+	the '-' that ends the optional fields (from field 7 on). A path's spaces are escapes (\\040), never field breaks."""
+	types = {}
+	for line in data.splitlines():
+		fields = line.split()
+		try:
+			major, minor = fields[2].split(b':')
+			types[(int(major), int(minor))] = fields[fields.index(b'-', 6) + 1].decode('ascii', 'replace')
+		except (ValueError, IndexError):
+			continue
+	return types
+
+def _read_mount_types():
+	"""_parse_mountinfo of /proc/self/mountinfo; {} where it cannot be read (off Linux, no /proc)."""
+	try:
+		with open('/proc/self/mountinfo', 'rb') as f:
+			return _parse_mountinfo(f.read())
+	except OSError:
+		return {}
+
+def _mount_type(dev):
+	"""The type of the filesystem whose st_dev is dev, None where no mount lists it (off Linux, no /proc, a btrfs subvolume's
+	own st_dev). mountinfo is read once per process, and once more at a miss (a mount made since), after which the miss is
+	kept."""
+	key = (os.major(dev), os.minor(dev))
+	if key not in _MOUNT_TYPES:
+		_MOUNT_TYPES.update(_read_mount_types())
+		_MOUNT_TYPES.setdefault(key, None)
+	return _MOUNT_TYPES[key]
+
+def _claim_space(dev):
+	"""True when this process is to print the warning for the filesystem dev: the first in the run to claim it, across the
+	run's workers. Without slots, or with all of them taken, it prints each time; and when the lock is not taken within 1 s,
+	which is far longer than a scan of the slots takes: only a worker that died holding it keeps it that long, and printing
+	again beats hanging the copy."""
+	share = _SPACE_WARNED
+	if share is None:
+		return True
+	lock, slots = share[0], share[1]
+	if not lock.acquire(timeout=1):
+		return True
+	try:
+		mark = dev + 1  # 0 is an empty slot
+		for index in range(len(slots)):
+			if slots[index] == mark:
+				return False
+			if slots[index] == 0:
+				slots[index] = mark
+				return True
+		return True
+	finally:
+		lock.release()
+
+def _space_warning(target, src_path, free, need, old):
+	"""Before cp writes target where its directory has free bytes of room, less than need (src_path's allocated size): warn,
+	once per filesystem in a run, then cp tries anyway, as GNU cp does (the user: 'we also try and fail?'). Nothing is
+	refused or skipped, and the exit code is the copy's. old: the room target's old copy holds that cp frees first (a
+	rewrite in place), else 0. Only where the estimate holds (_SPACE_TYPES) and the source is on another device. The line
+	goes to stderr from the process that runs cp, on a line of its own (the progress bar ends its line with a carriage
+	return), and into ERRORS as a 'Space warning' (exit code 0), which a worker's task hands back to the run, repeated at
+	the run's end (_repeat_space_warnings)."""
+	directory = os.path.dirname(os.path.abspath(target))
+	try:
+		dev = os.stat(directory).st_dev
+		if dev == os.lstat(src_path).st_dev:
+			return
+	except OSError:
+		return
+	if _mount_type(dev) not in _SPACE_TYPES or not _claim_space(dev):
+		return
+	start = f'Space warning: {directory} has {format_bytes(free)}B free, less than the {format_bytes(need)}B that {src_path} needs'
+	end = 'hpcp copies anyway, as cp does; other files short of room on this filesystem are not warned about again.'
+	if old > 0 and need <= free + old:
+		text = (f"{start}; it fits only by reusing its old copy's room, which cp frees first, so if another writer takes that "
+			f'room the copy fails and the old copy is lost (the source is kept). {end}')
+	else:
+		# -wb writes every rewrite beside its old copy, which stays when the new one cannot be made.
+		lost = "a rewrite's old copy stays (-wb)" if WRITE_BESIDE else "a rewrite's old copy is lost"
+		text = f'{start}, so it may not fit; if the disk runs out the copy fails, and {lost} (the source is kept). {end}'
+	# One write, flushed before cp starts: the newline ends the progress bar's line, and nothing another process writes can
+	# land between it and the text (Python 3.6 to 3.8 buffer a redirected stderr; 3.9 and later flush it at each newline).
+	try:
+		sys.stdout.flush()
+		sys.stderr.write('\n' + text + '\n')
+		sys.stderr.flush()
+	except Exception:
+		pass
+	ERRORS.append(text)
+
+def _repeat_space_warnings():
+	"""At a run's end: its space warnings once more, each distinct one once, after the progress bar and the summaries; then
+	out of ERRORS, so that the last line lists only real errors, and a run with nothing else ends 'Done.'."""
+	warnings = [error for error in ERRORS if error.startswith('Space warning:')]
+	if not warnings:
+		return
+	ERRORS[:] = [error for error in ERRORS if not error.startswith('Space warning:')]
+	lines, seen = ['', 'Space warnings in this run (repeated from above):'], set()
+	for warning in warnings:
+		if warning not in seen:
+			seen.add(warning)
+			lines.append(warning)
+	try:
+		sys.stdout.flush()
+	except Exception:
+		pass
+	print('\n'.join(lines), file=sys.stderr)
+
 def _allocated(st):
 	"""The allocated size of what st (a stat result) describes (get_file_size): st_rsize where there is one, else st_blocks *
 	512, else the apparent size. (stat_result is a tuple: `'st_blocks' in st` would compare against field values, not names.)"""
@@ -3673,7 +3828,7 @@ def _remove_torn(target, fd, fst, before):
 		except OSError:
 			pass
 
-def _cp_held(command, src_path, target, fd, fst, through_link):
+def _cp_held(command, src_path, target, fd, fst, space, through_link):
 	"""cp src_path into target, a regular file with one name that this process holds open (fd; fst its fstat); its size.
 
 	cp writes the held file, not the name (_reaches_held: /proc/PID/fd/N is cp's destination), so a link or anything else put
@@ -3688,6 +3843,8 @@ def _cp_held(command, src_path, target, fd, fst, through_link):
 		failed = _read_through(src_path)
 		if failed is not None:
 			raise _KeptOld(f'{src_path} failed on read ({_why(failed)})')
+	if space is not None:
+		_space_warning(target, src_path, space[0], space[1], _allocated(fst))
 	held = '/proc/%d/fd/%d' % (os.getpid(), fd) if _reaches_held() else None
 	before = (fst.st_size, fst.st_mtime_ns, fst.st_ctime_ns)
 	try:
@@ -3727,7 +3884,7 @@ def _in_place_hint(target, st):
 	finally:
 		os.close(fd)
 
-def _cp_beside(command, src_path, target, st, why):
+def _cp_beside(command, src_path, target, st, why, space):
 	"""cp src_path to a new name beside target (_temp_sibling), write it to disk (_fsync_file) and rename it over target once
 	whole; its size. st: what is at target (its lstat, or the fstat of the file opened there); why: why the rewrite goes
 	beside, the start of a failure's reason (None for what is not a regular file). Nothing is written in place, ever: any failure leaves what is there as it was,
@@ -3741,6 +3898,8 @@ def _cp_beside(command, src_path, target, st, why):
 		carried = _co_carry(target, st)
 		if carried is None and st.st_nlink < 2:
 			raise _KeptOld(f'{why}; its owner, group or an xattr cannot be given to a new file{_in_place_hint(target, st)}')
+	if space is not None:
+		_space_warning(target, src_path, space[0], space[1], 0)
 	temp = _temp_sibling(target)
 	renamed = False
 	what = 'the new copy beside it failed: %s'
@@ -3773,9 +3932,10 @@ def _cp_beside(command, src_path, target, st, why):
 		if not renamed:
 			_discard_temp(temp)
 
-def _cp_once(src_path, dest_path, cp_flags, sparse):
+def _cp_once(src_path, dest_path, cp_flags, sparse, space=None):
 	"""One attempt at copying src_path to dest_path (copy_file); the size copied. Raises when the attempt fails: _Refused for
-	what this run will not write, _KeptOld for a rewrite that left what is there as it was.
+	what this run will not write, _KeptOld for a rewrite that left what is there as it was. space: (free, need) when the
+	destination's free space is below the source's size, for the warning (_space_warning) printed before cp runs.
 
 	What is at the landing (_landing_of) decides the route:
 	- nothing, or a FIFO or device the operator named (-d): cp writes the name (_cp_to; a block device is claimed first,
@@ -3795,27 +3955,31 @@ def _cp_once(src_path, dest_path, cp_flags, sparse):
 	held = _claim_device(target, st, named, src_path)
 	try:
 		if not _written_beside(st, named):
+			if st is None and space is not None:
+				_space_warning(target, src_path, space[0], space[1], 0)
 			return _cp_to(command, src_path, target)
 		if WRITE_BESIDE:
-			return _cp_beside(command, src_path, target, st, _BESIDE_ASKED)
+			return _cp_beside(command, src_path, target, st, _BESIDE_ASKED, space)
 		if not stat.S_ISREG(st.st_mode):
-			return _cp_beside(command, src_path, target, st, None)
+			return _cp_beside(command, src_path, target, st, None, space)
 		if st.st_nlink > 1:
-			return _cp_beside(command, src_path, target, st, _OTHER_NAMES)
+			return _cp_beside(command, src_path, target, st, _OTHER_NAMES, space)
 		try:
 			fd = os.open(target, _LANDING_FLAGS)
 		except FileNotFoundError:
+			if space is not None:
+				_space_warning(target, src_path, space[0], space[1], 0)
 			return _cp_to(command, src_path, target)
 		except OSError as e:
-			return _cp_beside(command, src_path, target, st, f'it cannot be opened for writing ({_why(e)})')
+			return _cp_beside(command, src_path, target, st, f'it cannot be opened for writing ({_why(e)})', space)
 		try:
 			# What the descriptor holds decides from here on: the name may have changed since the lstat.
 			st = os.fstat(fd)
 			if stat.S_ISREG(st.st_mode) and st.st_nlink == 1:
-				return _cp_held(command, src_path, target, fd, st, target != dest_path)
+				return _cp_held(command, src_path, target, fd, st, space, target != dest_path)
 		finally:
 			os.close(fd)
-		return _cp_beside(command, src_path, target, st, _OTHER_NAMES if stat.S_ISREG(st.st_mode) else None)
+		return _cp_beside(command, src_path, target, st, _OTHER_NAMES if stat.S_ISREG(st.st_mode) else None, space)
 	finally:
 		if held is not None:
 			os.close(held)
@@ -4056,11 +4220,13 @@ def copy_file(src_path, dest_paths, full_hash=False, verbose=False, concurrent_p
 						continue
 				if verbose:
 					print(f'\nTrying to copy from {src_path} to {dest_path}')
-				# The forced pass tries once more without --sparse.
+				# The forced pass tries once more without --sparse. Its attempts may run short of room: the warning (_space_warning)
+				# comes before cp, and cp still tries, as GNU cp does.
+				space = (dest_free_space, src_size) if dest_free_space < src_size else None
 				for sparse in [True] + ([False] if using_bak_paths else []):
 					try:
 						if os.name == 'posix':
-							copiedSize = _cp_once(src_path, dest_path, cp_flags, sparse)
+							copiedSize = _cp_once(src_path, dest_path, cp_flags, sparse, space)
 						elif CONTENT_ONLY:
 							shutil.copy(src_path, dest_path, follow_symlinks=False)
 						else:
@@ -4104,9 +4270,9 @@ def copy_file(src_path, dest_paths, full_hash=False, verbose=False, concurrent_p
 			if not copied:
 				_copy_failed(src_path, f'Copy failed: FAILED to copy {src_path} to {dest_paths}')
 				return 0, time.monotonic() - start_time, symLinks
-			# A successful retry resolves this file's failed attempts. Preserve
-			# errors from earlier files and from path validation above.
-			del ERRORS[copy_error_start:]
+			# A successful retry resolves this file's failed attempts; a space warning stays (it is repeated at the run's end).
+			# Preserve errors from earlier files and from path validation above.
+			ERRORS[copy_error_start:] = [error for error in ERRORS[copy_error_start:] if error.startswith('Space warning:')]
 			if verbose:
 				print(f'Copied {src_path} to {dest_path}')
 				print(f'Estimated remaining size: {format_bytes(dest_free_space - copiedSize)}B')
@@ -4211,7 +4377,7 @@ def copy_file_list_parallel(file_list, links, src_path, dest_paths, max_workers,
 	apb = Adaptive_Progress_Bar(total_count=total_files,total_size=estimated_size,last_num_job_for_stats=max(1,max_workers//10),process_word='Copied',suppress_all_output=verbose,bytes_rate_limit=BYTES_RATE_LIMIT,files_rate_limit=FILES_RATE_LIMIT)
 	last_transition_time = time.monotonic()
 	last_under_limit = True
-	with ProcessPoolExecutor(max_workers=max_workers) as executor:
+	with _copy_pool(max_workers) as executor:
 		while file_list_iterator or futures:
 			# counter = 0
 			under_limit = apb.under_rate_limit()
@@ -4315,7 +4481,7 @@ def copy_file_list_parallel_batch(jobs, max_workers, full_hash=False, verbose=Fa
 	apb = Adaptive_Progress_Bar(total_count=total_item_count,total_size=total_size_count,last_num_job_for_stats=max(1,max_workers//10),process_word='Copied',suppress_all_output=verbose,bytes_rate_limit=BYTES_RATE_LIMIT,files_rate_limit=FILES_RATE_LIMIT)
 	last_transition_time = time.monotonic()
 	last_under_limit = True
-	with ProcessPoolExecutor(max_workers=max_workers) as executor:
+	with _copy_pool(max_workers) as executor:
 		while job_list_iterator or futures:
 			# counter = 0
 			under_limit = apb.under_rate_limit()
@@ -4747,7 +4913,7 @@ def sync_directories_parallel(src, dests, max_workers, verbose=False,folder_per_
 
 	print(f"Syncing Dir from {src} to {dests} with {max_workers} workers")
 	apb = Adaptive_Progress_Bar(total_count=len(folders),total_size=len(folders),suppress_all_output=verbose,process_word='Synced',bytes_rate_limit=BYTES_RATE_LIMIT,files_rate_limit=FILES_RATE_LIMIT)
-	with ProcessPoolExecutor(max_workers=max_workers) as executor:
+	with _copy_pool(max_workers) as executor:
 		while folder_list_iterator or futures:
 			# counter = 0
 			while folder_list_iterator and len(futures) <  max_scheduled_jobs and apb.under_rate_limit():
@@ -4839,7 +5005,7 @@ def sync_directories_parallel_batch(jobs, max_workers, verbose=False,folder_per_
 	folder_per_job = max(1,folder_per_job)
 	num_folders_copied_this_job = 0
 	
-	with ProcessPoolExecutor(max_workers=max_workers) as executor:
+	with _copy_pool(max_workers) as executor:
 		while job_iterator or futures:
 			while job_iterator and len(futures) <  max_scheduled_jobs and apb.under_rate_limit():
 				currentJobs = []
@@ -12594,7 +12760,7 @@ def get_args(args = None):
 		'the destination is written in place, read its source to the end: a source that fails on read leaves the old copy as '
 		'it is (exit 190). Costs a second read of each rewritten file. Does nothing with -wb, which writes nothing in place.')
 	parser.add_argument('-ctl','--command_timeout_limit', type=int, default=0, help='Set the command timeout limit in seconds for external commands ( ex. cp / dd ). Default is 0: no timeout.')
-	parser.add_argument('-enes','--exit_not_enough_space', action='store_true', help='Exit if there is not enough space on the destination instead of continuing (Note: Default is continue as in compressed fs copy can be down even if source is bigger than free space).')
+	parser.add_argument('-enes','--exit_not_enough_space', action='store_true', help='Exit if there is not enough space on the destination instead of continuing (Note: Default is continue as in compressed fs copy can be down even if source is bigger than free space; without it, a copy that may not fit is tried, with a warning on ext2/3/4, XFS and tmpfs).')
 	try:
 		args = parser.parse_intermixed_args(args)
 	except Exception:
@@ -12691,6 +12857,11 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = multipr
 		max_workers = round(0.5 * multiprocessing.cpu_count())
 	elif max_workers < 0:
 		max_workers = round(- max_workers * multiprocessing.cpu_count())
+	# This run's space-warning slots (_space_warning), shared by its copy workers; a nested run (-dd) has its own, and the
+	# outer run gets its back.
+	global _SPACE_WARNED
+	outer_space = _SPACE_WARNED
+	_SPACE_WARNED = _space_share() if os.name == 'posix' else None
 	try:
 		if get_diff_image or load_diff_image or force_apply:
 			if os.name == 'nt':
@@ -13069,11 +13240,13 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = multipr
 		eprint(f"General Exception: {e} \n{track}")
 	finally:
 		NAMED_DESTS, RUN_ID, SYNC_COPIES = frozenset(), None, False
+		_SPACE_WARNED = outer_space
 		clean_up(mount_points,loop_devices,delayed_commands)
 		get_partition_details.cache_clear()
 		get_partition_infos.cache_clear()
 		hash_file.cache_clear()
 		_get_file_list_cache.clear()
+	_repeat_space_warnings()
 	return get_rc_from_error()
 		
 def hpcp_gui():
