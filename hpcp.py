@@ -2845,18 +2845,16 @@ def get_mount_table():
 	return mount_table
 
 #%% -- Symbolic Links --
-def create_sym_links(symLinks,exclude=None,link_tracking=False):
+def create_sym_links(symLinks,exclude=None,link_tracking=False,link_dirs=None):
 	"""Recreate symLinks ({src link: [dest paths]}). Returns a (target's destination path, target's source path, link's
 	destination path) triple for each relative link whose target is excluded, and with link tracking (-lt) for each one
 	whose target exists at the source (copied now or already there): -rme keeps those targets, except where the copy
-	itself covers them (_kept_paths)."""
+	itself covers them (_kept_paths). link_dirs (a set, in a move): each directory a link was made in is added, for the
+	move's directory fsyncs (_sync_moved_directories)."""
 	global RANDOM_DESTINATION_SELECTION
 	tracked_targets = set()
 	if len(symLinks) == 0:
 		return tracked_targets
-	# A move's link directories, fsynced once after the last link: a link has no data to fsync, and is made after every file, so
-	# no file's fsync commits it. On ext4 and XFS that fsync also commits every earlier change on its filesystem.
-	link_dirs = set()
 	nestedSymLinks = {}
 	counter = 0
 	print(f"\nFound Symbolic Links:   {len(symLinks)}")
@@ -2946,7 +2944,7 @@ def create_sym_links(symLinks,exclude=None,link_tracking=False):
 					_dest_directory(os.path.dirname(dest), make=not NO_CREATE_DIR, source=os.path.dirname(os.path.abspath(src)))
 					# A relative target is resolved from the link's directory (Windows makes directory and file links apart).
 					os.symlink(linkedTargetFile, dest, target_is_directory=os.path.isdir(os.path.join(os.path.dirname(src), linkedTargetFile)))
-					if SYNC_COPIES:
+					if link_dirs is not None:
 						link_dirs.add(os.path.dirname(os.path.abspath(dest)))
 					if keep_target:
 						tracked_targets.add((os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(dest)), linkedTargetFile)),
@@ -2986,15 +2984,9 @@ Skipping...""")
 
 	endTime = time.monotonic()
 	print(f"Time taken:             {endTime-start_time:0.4f} seconds")
-	# The directory the links went into, with any link on the way to it followed (-d named a link to a directory): _fsync_file passes a link.
-	for directory in sorted({os.path.realpath(directory) for directory in link_dirs}):
-		try:
-			_fsync_file(directory)
-		except OSError as e:
-			eprint(f'Copy failed: the links made in {directory} cannot be written to disk ({_why(e)})')
 	if len(nestedSymLinks) > 0:
 		print(f"\nNested Symbolic Links:   {len(nestedSymLinks)}")
-		tracked_targets |= create_sym_links(nestedSymLinks,exclude=exclude,link_tracking=link_tracking)
+		tracked_targets |= create_sym_links(nestedSymLinks,exclude=exclude,link_tracking=link_tracking,link_dirs=link_dirs)
 	return tracked_targets
 
 #%% -- File list --
@@ -5322,6 +5314,42 @@ def finish_directories(records, max_workers, sync=False):
 				for future in _wait(futures, executor):
 					futures.discard(future)
 					_task_result(future, (0, 0, {}), 'Copy process crashed')
+
+def _sync_moved_directories(files, link_dirs, src_paths, dests, dest_image, finished, max_workers):
+	"""A move's directory fsyncs, past those the finish fsynced (finished: their absolute paths): the directory of every file
+	landing (files: the copy's source paths, one directory map per source directory, so a -nds move is covered), those a link
+	was made in (link_dirs), and the parent of each source's landing, once each. fsync(2) promises a new name only with its
+	directory's fsync: on ext4 and XFS a file's own fsync commits it, elsewhere not. In max_workers threads: an fsync waits on
+	the disk, not the CPU. A directory that is not there (a -nds landing directory in a destination its files did not go to)
+	has nothing to write, and another user's that this run may not read (a write-only drop box) is passed over (_fsync_file).
+	A failure is a failed copy: Copy failed: the directory DIR cannot be written to disk (why), and the move removes nothing.
+	Returns the directories it fsynced (or tried to)."""
+	by_source = _by_source(_src_to_dest_map(src_paths, dests, dest_image))
+	directories = set(link_dirs or ())
+	for parent in {os.path.dirname(path) for path in files}:
+		directories.update(_landings(parent, by_source))
+	for _, landings in _src_to_dest_map(src_paths, dests, dest_image):
+		directories.update(os.path.dirname(os.path.normpath(landing)) for landing in landings)
+	# One spelling each; a destination named as a link to a directory is fsynced where it leads (_fsync_file passes a link).
+	directories = {os.path.abspath(directory) for directory in directories} - finished
+	directories = sorted({os.path.realpath(directory) if directory in NAMED_DESTS else directory for directory in directories})
+	def sync(directory):
+		if _STOPPED_PID is not None:
+			return  # stopped (the parent raises it): the rest is left, and the move removes nothing
+		try:
+			_fsync_file(directory)
+		except FileNotFoundError:
+			pass
+		except OSError as e:
+			eprint(f'Copy failed: the directory {directory} cannot be written to disk ({_why(e)})')
+	if max_workers <= 1 or len(directories) <= 1:
+		for directory in directories:
+			sync(directory)
+	else:
+		with concurrent.futures.ThreadPoolExecutor(min(max_workers, len(directories))) as threads:
+			for _ in threads.map(sync, directories):
+				pass
+	return directories
 
 def sync_directory_metadata_bulk(src_paths, dest_paths,src_path):
 	"""_sync_directory for each of src_paths (below src_path) onto its place below each of dest_paths: (count, seconds,
@@ -13674,7 +13702,9 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = multipr
 					print(f"Copied File: {file}")
 				for link in total_sym_links:
 					print(f"Link: {link} -> {total_sym_links[link]}")
-			link_targets = create_sym_links(total_sym_links,exclude=exclude,link_tracking=link_tracking and not no_link_tracking)
+			# A move's link directories: a link has no data to fsync, and is made after every file, so no file's fsync commits it.
+			link_dirs = set() if SYNC_COPIES else None
+			link_targets = create_sym_links(total_sym_links,exclude=exclude,link_tracking=link_tracking and not no_link_tracking,link_dirs=link_dirs)
 			_check_stop()
 			if not remove:
 				# The move's backstop, at the end of a copy: two sources that landed in one file, where the destination took their
@@ -13720,11 +13750,17 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = multipr
 				print("Removing extra directories...")
 				remove_extra_dirs(src_paths, dests,exclude=exclude,dest_image=bool(dest_image),keep=link_targets,dest_roots=dest_roots,listed=listed,named=named_sources)
 			# Each synced directory's times, exact mode and flags, once what goes in it is in: its files, its links and -rme's
-			# removals (ran or skipped). Before a move's removal, which a directory it could not set stops, as a failed copy does
-			# (9.86 counted a directory it could not set the same way).
+			# removals (ran or skipped); in a move, each fsynced through the same descriptor, and then every other directory the
+			# move wrote into. Before a move's removal, which a directory either could not set or write to disk stops, as a
+			# failed copy does (9.86 counted a directory it could not set the same way).
 			_check_stop()
 			finish_start = len(ERRORS)
-			finish_directories(dir_records, 1 if single_thread else max_workers)
+			finish_directories(dir_records, 1 if single_thread else max_workers, sync=SYNC_COPIES)
+			if SYNC_COPIES:
+				_check_stop()
+				finished = {os.path.abspath(record[1]) for record in dir_records}
+				_sync_moved_directories(total_file_list, link_dirs, src_paths, dests, bool(dest_image), finished,
+					1 if single_thread else max_workers)
 			copy_failures += [error for error in ERRORS[finish_start:] if _is_failure(error)]
 			_check_stop()
 			print('-'*80)

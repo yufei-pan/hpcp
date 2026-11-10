@@ -2712,7 +2712,9 @@ def test_a_move_fsyncs_a_landing_an_earlier_copy_left(tmp_path, hpcp_mod, reset_
 	assert hpcp_mod.hpcp([str(tmp_path / 'a') + os.sep], dest_paths=[str(tmp_path / 'out') + os.sep], single_thread=True) == 0
 	fsynced = []
 	real_fsync = os.fsync
-	monkeypatch.setattr(hpcp_mod.os, 'fsync', lambda fd: fsynced.append(os.fstat(fd).st_ino) or real_fsync(fd))
+	# files only: the move fsyncs its directories too (9.87's M2)
+	monkeypatch.setattr(hpcp_mod.os, 'fsync', lambda fd: (fsynced.append(os.fstat(fd).st_ino) if stat.S_ISREG(os.fstat(fd).st_mode)
+		else None) or real_fsync(fd))
 	assert _move(hpcp_mod, tmp_path) == 0
 	assert fsynced == [os.lstat(str(tmp_path / 'out/x')).st_ino] and not os.path.exists(str(tmp_path / 'a'))
 

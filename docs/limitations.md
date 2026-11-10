@@ -84,12 +84,12 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - **Revisit when:** a Windows machine is available, or an operator runs hpcp moves on Windows.
 - **Approved:** 2026-11-09, the user chose "Approve (Recommended)".
 
-### A move's links in another user's unreadable directory are not fsynced
+### A move's files and links in another user's unreadable directory are not fsynced
 - **Kind:** known limitation.
-- **What the operator sees:** a non-root move that makes links in a directory another user owns and the runner may not read (a write-only drop box) does not fsync that directory: a power cut soon after the move can lose those links while their sources are already gone.
-- **Why:** a directory is fsynced through a descriptor, and one the runner may not read cannot be opened; the alternative, `os.sync()` of every filesystem, can take seconds on a busy host, for a rare case.
-- **Revisit when:** an operator reports moving links into such a directory.
-- **Approved:** 2026-11-09, the user chose "Approve (Recommended)".
+- **What the operator sees:** a non-root move that writes files or links into a directory another user owns and the runner may not read (a write-only drop box) does not fsync that directory. A power cut soon after the move can lose those names while their sources are already gone. Every other directory a move writes into is fsynced once, before any source is removed.
+- **Why:** a directory is fsynced through a descriptor, and one the runner may not read cannot be opened (an `O_PATH` descriptor refuses `fsync` and `syncfs`). The alternative, `syncfs` of the whole filesystem, can take seconds on a busy host, for a rare case.
+- **Revisit when:** an operator reports moving into such a directory.
+- **Approved:** 2026-11-09, the user chose "Approve (Recommended)" (links). Widened to files 2026-11-10: the user chose "Widen the KL to files". The user did not ask for it explicitly; the files part remains of entry 12, which the 9.85 review found.
 
 ### A directory that cannot be asked about a new pair
 - **Kind:** known limitation.
@@ -174,14 +174,6 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - **Plan:** read each landing directory once (`scandir`), take each name's file from the listing where the listing gives one, and `lstat` only the names missing from it (an 8.3 alias is not listed under its short name) or where the listing's numbers cannot be trusted (vfat makes up a number for an uncached inode, FUSE exFAT one for each spelling). And when two fingerprints meet, the second pass now stats every landing again (about 0.45 s per 100,000 files, paid by any merge whose sources share a file, or a source named twice): keep each landing's entry index beside its fingerprint, so it stats only the entries met twice.
 - **Revisit when:** 9.87.
 - **Noted:** 2026-11-08, the user's standing rule that deferrals are noted, not asked.
-
-### A move's directories are not fsynced
-- **Kind:** deferred (9.87).
-- **What the operator sees:** in a move across filesystems, each file is fsynced by its worker and each link's directory once after the last link, but a directory is fsynced only through those. After a power cut within the journal interval (ext4 5 s, XFS up to 30 s), an empty directory the move made, or the mode, owner, xattrs or times of a directory with no file or link made after it on that filesystem, can be missing at the destination while the source is already gone. On ext4 and XFS the fsync of a file or link also commits every earlier change on its filesystem (the directories made before it), so only the last directories of a tree with nothing after them are open: a tree of only empty directories, or the last sources of an `-nb` run that hold only directories. A file's content and name are never at risk by this.
-- **Why:** fsyncing each directory as the folder sync makes it costs 2.6 to 7.8 ms a directory, found in the 9.85 re-review (2,040 empty directories moved in 11.8 to 16.2 s on ext4 and 5.4 to 6.6 s on XFS, on EL7 and EL8, against about 0.4 to 0.6 s). Fsynced once each after all are made it is nearly free (1,000 directories and their 40 parents: 0.02 s on ext4 and 0.07 to 0.23 s on XFS, EL7). The cheap way needs plumbing through `sync_directories_*_batch`, `copy_scheduler` and `process_copy`.
-- **Plan (9.87):** the folder sync returns the destination directories it made or set in a move, as it returns links; after `create_sym_links` the parent fsyncs them and the link directories together, once each, and a failure is a Copy failed that stops the removal.
-- **Revisit when:** 9.87.
-- **Noted:** 2026-11-09, found in the 9.85 re-review; the main session's decision, not asked (a deferral).
 
 ### On macOS a move's fsync does not flush the drive's cache
 - **Kind:** deferred (9.87).

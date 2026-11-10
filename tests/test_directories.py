@@ -1,6 +1,7 @@
 '''9.87 group 2: a directory's metadata goes on after what goes in it (M1), and a move writes its directories to disk (M2,
 M4). Subprocess runs use the CLI as a person does; the call counts and orders are taken in process.'''
 import collections
+import errno
 import functools
 import os
 import signal
@@ -8,6 +9,7 @@ import stat
 import subprocess
 import sys
 import time
+import uuid
 
 import pytest
 
@@ -276,3 +278,136 @@ def test_directory_calls_stay_within_9_86_s(tmp_path, monkeypatch, reset_hpcp_gl
 	monkeypatch.setattr(hpcp, 'NAMED_DESTS', frozenset([str(tmp_path / 'out')]))
 	assert _calls_per_directory(tmp_path, monkeypatch, 'first') <= 17.1
 	assert _calls_per_directory(tmp_path, monkeypatch, 'rerun') <= (23.0 if sys.version_info < (3, 7) else 18.1)
+
+
+# ---- M2: a move fsyncs its directories
+
+proc_fd = pytest.mark.skipif(not os.path.isdir('/proc/self/fd'), reason='names a descriptor by /proc/self/fd')
+
+
+def _move_tree(src):
+	(src / 'empty').mkdir(parents=True)
+	(src / 'm').mkdir()
+	(src / 'm' / 'f').write_text('m')
+	# its last change at the destination is its mode, at the finish
+	os.chmod(str(src / 'm'), 0o700)
+	(src / 'l').mkdir()
+	if hasattr(os, 'symlink'):
+		os.symlink('../top', str(src / 'l' / 'link'))
+	(src / 'top').write_text('top')
+
+
+def _log_fsyncs(monkeypatch, events, src, fail=None):
+	'''events gets ('fsync', directory) for each directory fsynced and ('remove', path) for each removal below src; fail: an
+	errno each directory fsync raises. os.sync and syncfs fail the test.'''
+	real_fsync, real_fstat = os.fsync, os.fstat
+	def fsync(fd):
+		if stat.S_ISDIR(real_fstat(fd).st_mode):
+			events.append(('fsync', os.readlink('/proc/self/fd/%d' % fd)))
+			if fail:
+				raise OSError(fail, os.strerror(fail))
+		return real_fsync(fd)
+	monkeypatch.setattr(hpcp.os, 'fsync', fsync)
+	for name in ('remove', 'unlink', 'rmdir'):
+		real = getattr(os, name)
+		def removing(path, *args, _real=real, **kwargs):
+			where = str(path)
+			if kwargs.get('dir_fd') is not None:
+				where = os.path.join(os.readlink('/proc/self/fd/%d' % kwargs['dir_fd']), where)
+			if os.path.abspath(where).startswith(os.path.realpath(str(src))):
+				events.append(('remove', where))
+			return _real(path, *args, **kwargs)
+		monkeypatch.setattr(hpcp.os, name, removing)
+	def no_sync(*args):
+		raise AssertionError('a move syncs no whole filesystem')
+	monkeypatch.setattr(hpcp.os, 'sync', no_sync, raising=False)
+	monkeypatch.setattr(hpcp, '_syncfs', no_sync)
+
+
+@posix_only
+@proc_fd
+@pytest.mark.parametrize('nds', [False, True], ids=['synced', 'nds'])
+def test_a_move_fsyncs_each_directory_once(tmp_path, monkeypatch, reset_hpcp_globals, nds):
+	# 9.86 fsynced only the directories a move made links in: an empty directory, a directory's mode, owner or times, and the
+	# name of a file outside ext4 and XFS could be lost to a power cut with the source gone
+	src = tmp_path / 'src'
+	_move_tree(src)
+	events = []
+	_log_fsyncs(monkeypatch, events, src)
+	out = tmp_path / 'out'
+	rc = hpcp.hpcp([str(src) + os.sep], dest_paths=[str(out) + os.sep], single_thread=True, max_workers=1, remove=True, remove_force=True,
+		no_directory_sync=nds)
+	assert rc == 0
+	assert (out / 'm' / 'f').read_text() == 'm' and not (src / 'm' / 'f').exists()
+	synced = [path for kind, path in events if kind == 'fsync']
+	expected = [str(tmp_path), str(out), str(out / 'l'), str(out / 'm')] + ([] if nds else [str(out / 'empty')])
+	assert sorted(synced) == sorted(os.path.realpath(path) for path in expected)
+	removals = [i for i, (kind, _) in enumerate(events) if kind == 'remove']
+	assert removals and all(i < removals[0] for i, (kind, _) in enumerate(events) if kind == 'fsync')
+	if not nds:
+		assert stat.S_IMODE(os.lstat(str(out / 'm')).st_mode) == 0o700
+
+
+@posix_only
+@proc_fd
+@pytest.mark.parametrize('nds', [False, True], ids=['synced', 'nds'])
+def test_a_move_whose_directory_cannot_be_written_to_disk_keeps_every_source(tmp_path, monkeypatch, reset_hpcp_globals, nds):
+	src = tmp_path / 'src'
+	_move_tree(src)
+	events = []
+	_log_fsyncs(monkeypatch, events, src, fail=errno.EIO)
+	rc = hpcp.hpcp([str(src) + os.sep], dest_paths=[str(tmp_path / 'out') + os.sep], single_thread=True, max_workers=1,
+		remove=True, remove_force=True, no_directory_sync=nds)
+	assert rc == 212
+	assert (src / 'm' / 'f').exists() and (src / 'top').exists() and not [kind for kind, _ in events if kind == 'remove']
+
+
+@posix_only
+@proc_fd
+def test_the_finish_fsyncs_a_directory_through_the_descriptor_it_opened_before_closing_it(tmp_path, monkeypatch):
+	# a directory whose final mode lacks owner read (0333) cannot be opened once it has it: the finish opens it first
+	dest = tmp_path / 'd'
+	dest.mkdir()
+	events = []
+	_log_fsyncs(monkeypatch, events, tmp_path / 'src')
+	try:
+		hpcp.finish_directories([(str(tmp_path / 'src'), str(dest), 0o333, 10**18, 10**18, None)], 1, sync=True)
+		assert events == [('fsync', str(dest))] and stat.S_IMODE(os.lstat(str(dest)).st_mode) == 0o333
+		assert os.lstat(str(dest)).st_mtime_ns == 10**18
+	finally:
+		os.chmod(str(dest), 0o755)
+
+
+@posix_only
+@not_root
+@proc_fd
+@pytest.mark.skipif(not os.environ.get('HPCP_TEST_DROP_BOX'), reason='needs a directory of another user, mode 0733 (the Docker harness mounts one)')
+def test_a_move_into_another_users_write_only_directory_passes_it_over(tmp_path, monkeypatch, reset_hpcp_globals):
+	# the known limitation: such a directory cannot be opened, so it is not fsynced; the move goes on, every other directory
+	# fsynced, and no whole filesystem is synced
+	box = os.environ['HPCP_TEST_DROP_BOX']
+	assert os.stat(box).st_uid != os.geteuid() and not os.access(box, os.R_OK) and os.access(box, os.W_OK | os.X_OK)
+	name = 'm2-' + uuid.uuid4().hex
+	src = tmp_path / name
+	_move_tree(src)
+	note = tmp_path / (name + '.note')
+	note.write_text('note')
+	events = []
+	_log_fsyncs(monkeypatch, events, tmp_path)
+	try:
+		rc = hpcp.hpcp([str(src), str(note)], dest_paths=[box + os.sep], single_thread=True, max_workers=1, remove=True, remove_force=True)
+		assert rc == 0
+		landing = os.path.join(box, name)
+		assert open(os.path.join(landing, 'm', 'f')).read() == 'm' and open(os.path.join(box, name + '.note')).read() == 'note'
+		assert not src.exists() and not note.exists()
+		synced = sorted(path for kind, path in events if kind == 'fsync')
+		assert synced == sorted([landing] + [os.path.join(landing, d) for d in ('empty', 'l', 'm')])
+	finally:
+		if os.path.isdir(os.path.join(box, name)):
+			for root, dirs, _ in os.walk(os.path.join(box, name)):
+				for d in dirs:
+					os.chmod(os.path.join(root, d), 0o755)
+		import shutil
+		shutil.rmtree(os.path.join(box, name), ignore_errors=True)
+		with __import__('contextlib').suppress(OSError):
+			os.unlink(os.path.join(box, name + '.note'))
