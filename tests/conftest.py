@@ -50,6 +50,28 @@ def _no_global_sync():
 		os.sync = real
 
 
+@pytest.fixture(autouse=True)
+def _the_parent_only_loops_inside_a_pool():
+	"""Inside a pool region (hpcp._DEFER) the parent only loops: no cp or other command, no prompt, so a stop is acted on
+	within 1 s (_check_stop). Every in-process run of the suite checks it; a forked worker inherits the check, and is not
+	the parent. Not monkeypatch, for the reason _no_global_sync gives; a test that replaces either function replaces the
+	check with it."""
+	parent, broken = os.getpid(), []
+	def guard(func):
+		def checked(*args, **kwargs):
+			if hpcp._DEFER and os.getpid() == parent:
+				broken.append(func.__name__)
+			return func(*args, **kwargs)
+		return checked
+	real = hpcp.run_command_in_multicmd_with_path_check, hpcp._confirm
+	hpcp.run_command_in_multicmd_with_path_check, hpcp._confirm = guard(real[0]), guard(real[1])
+	try:
+		yield
+	finally:
+		hpcp.run_command_in_multicmd_with_path_check, hpcp._confirm = real
+	assert not broken, f'called in the parent inside a pool region: {broken}'
+
+
 @pytest.fixture(params=['fd', 'proc', 'path'])
 def scan_mode(request, monkeypatch):
 	"""How hpcp reads a directory it holds open: scandir on the descriptor (Python 3.7+), /proc/self/fd/N (3.6 on

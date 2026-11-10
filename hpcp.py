@@ -9,6 +9,7 @@
 import argparse
 import array
 import concurrent.futures
+import concurrent.futures.process
 import contextlib
 import errno
 import fnmatch
@@ -19,10 +20,12 @@ import itertools
 import locale
 import math
 import multiprocessing
+import multiprocessing.connection
 import multiprocessing.util
 import os
 import pathlib
 import platform
+import queue
 import random
 import re
 import shutil
@@ -37,6 +40,7 @@ import unicodedata
 import uuid
 from collections import Counter, deque, namedtuple
 from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
 from math import log
 from pprint import pformat
 
@@ -793,6 +797,9 @@ def _named_sources(src_path, may_name_destination):
 _STOP_NAMES = ('SIGINT', 'SIGTERM', 'SIGHUP')
 # hpcp's own signal: a worker's parent-death watch sends it to the worker's main thread (neither hpcp nor multiCMD uses it).
 _WATCH_SIGNAL = getattr(signal, 'SIGUSR2', None)
+# The stops and the watch's signal: blocked while a pool's worker is started and until it has set itself up (_pool.submit,
+# _init_worker), and while a directory is asked about a name (_ask_names).
+_STOPS = [getattr(signal, name) for name in _STOP_NAMES + ('SIGUSR2',) if hasattr(signal, name)]
 # The signal that stopped this process, once one did (_stop), and that process: a worker forked after it has both.
 _STOPPED = None
 _STOPPED_PID = None
@@ -803,8 +810,31 @@ _IN_TASK = False
 _MAIN_PID = None
 # True once this process is ending (_end_by): a stop then changes nothing.
 _ENDING = False
-# Twice multiCMD's longest stop of a command (0.01 s, up to 1 s, SIGKILL, up to 1 s more): the watch's grace before os._exit.
+# Twice multiCMD's longest stop of a command (0.01 s, up to 1 s, SIGKILL, up to 1 s more): the watch's grace before os._exit;
+# after a stop, how long a pool's worker between tasks may take to end before it is killed (_pool); and how long a pool may
+# stay silent after one of its workers died before the run ends (_pool.watch).
 _WATCH_GRACE = 4
+# Pool regions this process is in (_pool, _looked_at). Inside one the parent's _stop only records its stop, and the region's
+# loop acts on it within 1 s (_check_stop): raised anywhere in there, its KeyboardInterrupt could leave a lock of Python's
+# pool code held (concurrent.futures.wait's), and the pool's shutdown would wait on it for good.
+_DEFER = 0
+# The parent has acted on its stop (_check_stop raised for it, or hpcp() took its KeyboardInterrupt). Not set where _stop
+# raises: Python drops a KeyboardInterrupt raised in a weakref callback or a __del__, and the next check acts on it then.
+_STOP_ACTED = False
+# The parent has said once that a later stop is ignored while it cleans up (_stop).
+_STOP_NOTED = False
+# A pool, or _looked_at's threads, was left with something of it still running or stuck: main() ends by os._exit, not by the
+# interpreter's exit, which joins Python's pool threads.
+_ABANDONED = False
+# The pools left so, kept for the process's life: Python 3.6 wakes a collected pool's manager thread by a write into its
+# result queue, under a lock a killed worker may hold, and the parent would wait on it for good.
+_LEFT = []
+# A future of the pool in use failed with BrokenProcessPool (_task_result): that pool ends the bounded way (_pool).
+_POOL_BROKEN = False
+# In a pool's worker: the pool's slots, (lock, a (pid, in a task) pair for each worker it can start), and the index of this
+# worker's state there (_claim_slot); None without one. The parent reads the states after a stop (_pool).
+_SLOTS = None
+_MY_SLOT = None
 
 def _end_by(signum):
 	"""End this process by signum with its default action, as a process that never handled it would end. From its first
@@ -825,10 +855,11 @@ def _end_by(signum):
 def _stop(signum, frame):
 	"""The handler for every stop a process can catch: the first raises KeyboardInterrupt, so multiCMD stops cp (in a process
 	group of its own, which no group signal reaches) and every finally runs (a temporary file is discarded, mounts are
-	cleaned up); later ones return, so a second Ctrl-C cannot cut the cleanup halfway. The stop is passed on to this
-	process's pool workers, which a signal to this process alone (kill PID, timeout) never reaches. A pool worker between
-	tasks has nothing to clean up and ends at once."""
-	global _STOPPED, _STOPPED_PID
+	cleaned up); later ones return, so a second Ctrl-C cannot cut the cleanup halfway (the parent says so once, naming
+	Ctrl-\\). The stop is passed on to this process's pool workers, which a signal to this process alone (kill PID, timeout)
+	never reaches. A pool worker between tasks has nothing to clean up and ends at once. In the parent inside a pool region
+	(_DEFER) the first stop is only recorded: the region's loop raises it (_check_stop)."""
+	global _STOPPED, _STOPPED_PID, _STOP_NOTED
 	if _ENDING:
 		return
 	if not _IN_TASK and os.getpid() != _MAIN_PID:
@@ -836,16 +867,58 @@ def _stop(signum, frame):
 		# would wait in the pool's queue for good, and the pool's shutdown with it. SystemExit unwinds through the queue's
 		# locks, letting go of the one it holds while it waits (killed holding it, the other workers could never read the
 		# pool's shutdown), and multiprocessing ends a worker on it without a traceback. At a task's start or end, _run_task
-		# ends the worker on it (_STOPPED). Every such stop raises: the pool's worker loop can take one for a task's error,
-		# or (3.14) a result's.
+		# ends the worker on it (_STOPPED). Every such stop raises while the pool's worker loop runs: it can take one for a
+		# task's error, or (3.7+) a result's, and go on. Outside that loop (starting before it, or ending after it: threading's
+		# shutdown, multiprocessing's exit work, where Python prints a raise as 'Exception ignored' with its traceback) there
+		# is nothing of the pool's to let go of, and the worker ends at once, quietly.
 		if _STOPPED_PID != os.getpid():
 			_STOPPED, _STOPPED_PID = signum, os.getpid()
+		if not _in_pool_loop(frame):
+			_end_by(_STOPPED)
 		raise SystemExit(128 + signum)
 	if _STOPPED_PID == os.getpid():
+		if os.getpid() == _MAIN_PID and not _STOP_NOTED:
+			# One write, never print: a handler printing while the main thread prints raises 'reentrant call'.
+			_STOP_NOTED = True
+			_say('Stopping: cleaning up first (cp stopped, temporary files removed, images unmounted); Ctrl-\\ ends hpcp now, '
+				'which may leave them')
 		return
 	_STOPPED, _STOPPED_PID = signum, os.getpid()
 	_pass_stop_on(signum)
+	if _DEFER and os.getpid() == _MAIN_PID:
+		return
 	raise KeyboardInterrupt
+
+# The pool's worker loop (concurrent.futures.process._process_worker, Python 3.6 to 3.14): a worker's stop raises only while
+# it runs (_stop). Unknown (a Python that renamed it), or no frame to look at: every stop raises, as in 9.86.
+_POOL_LOOP = getattr(getattr(concurrent.futures.process, '_process_worker', None), '__code__', None)
+
+def _in_pool_loop(frame):
+	"""Whether the code a stop interrupted (frame) runs inside the pool's worker loop."""
+	if _POOL_LOOP is None or frame is None:
+		return True
+	while frame is not None:
+		if frame.f_code is _POOL_LOOP:
+			return True
+		frame = frame.f_back
+	return False
+
+def _say(text):
+	"""text as a line of its own on stderr, in one write, after what stdout holds (a progress bar's line ends first)."""
+	with contextlib.suppress(Exception):
+		sys.stdout.flush()
+	with contextlib.suppress(OSError):
+		os.write(2, ('\n' + text + '\n').encode(errors='backslashreplace'))
+
+def _check_stop():
+	"""In the process that runs main(): raise the KeyboardInterrupt of a stop _stop recorded and has not been acted on, once.
+	Inside a pool region _stop only records it; and Python drops one raised in a weakref callback or a __del__ (every Python,
+	3.6 to 3.14), where the run would go on, a move to its removal. Called by every pool loop's wait (_wait), and between
+	the steps of a run (hpcp()): a cheap test, so it can be called often."""
+	global _STOP_ACTED
+	if _STOPPED_PID is not None and not _STOP_ACTED and _STOPPED_PID == os.getpid() == _MAIN_PID:
+		_STOP_ACTED = True
+		raise KeyboardInterrupt
 
 def _pass_stop_on(signum):
 	"""Send a stop to this process's pool workers, which a signal to this process alone (kill PID, timeout) never reaches."""
@@ -858,11 +931,19 @@ def _pass_stop_on(signum):
 def _install_stops(signals=_STOP_NAMES):
 	"""_stop for each of signals that this process was not started ignoring: nohup starts a run with SIGHUP ignored, a
 	background job of a non-interactive sh with SIGINT ignored, and both must stay so, as Python itself keeps an ignored
-	SIGINT. Only from the main thread (signal.signal)."""
+	SIGINT. Only from the main thread (signal.signal). And (Python 3.8+) this process's own stop that Python drops, raised
+	in a weakref callback or a __del__, is not reported as 'Exception ignored' with its traceback: it is acted on all the
+	same (_check_stop, _run_task)."""
 	for name in signals:
 		signum = getattr(signal, name, None)
 		if signum is not None and signal.getsignal(signum) is not signal.SIG_IGN:
 			signal.signal(signum, _stop)
+	hook = getattr(sys, 'unraisablehook', None)
+	if hook is not None and getattr(hook, '__name__', '') != '_unraisable':
+		def _unraisable(unraisable, default=hook):
+			if not (isinstance(unraisable.exc_value, (KeyboardInterrupt, SystemExit)) and _STOPPED_PID == os.getpid()):
+				default(unraisable)
+		sys.unraisablehook = _unraisable
 
 def _on_worker_start():
 	# The process that started the pool: under forkserver (Python 3.14's default) and spawn the worker's own parent is the
@@ -894,23 +975,89 @@ def _on_worker_start():
 
 _worker_initialized = False
 def _init_worker():
-	"""Run _on_worker_start() once per worker process.
-	Used instead of ProcessPoolExecutor's initializer parameter for Python 3.6 compatibility."""
+	"""Set this worker up, once: the stops and the parent watch (_on_worker_start), stdout, its slot (_claim_slot); then let
+	the stops in. A pool worker starts with them blocked (_pool.submit blocks them while it may start one, and a fork server
+	keeps the mask it started with for every worker it forks), so a stop that came meanwhile reaches hpcp's handler only now
+	and ends the worker without a traceback (Python's own SIGINT handler raises one there under forkserver and spawn)."""
 	global _worker_initialized
 	if not _worker_initialized:
 		_on_worker_start()
 		# A worker that did not fork from the parent (forkserver, the default from Python 3.14) has a new stdout.
 		_escape_unencodable_stdout()
+		_claim_slot()
 		_worker_initialized = True
+		_unblock_stops()
+
+def _unblock_stops():
+	"""Let this worker's stops in. One pending since its start runs _stop here, which ends the worker (outside a task it
+	raises SystemExit): caught, so nothing raises out of a pool's initializer (concurrent.futures prints a traceback for one
+	that raises) or out of multiprocessing's after-fork hook."""
+	if hasattr(signal, 'pthread_sigmask'):
+		try:
+			signal.pthread_sigmask(signal.SIG_UNBLOCK, _STOPS)
+		except (KeyboardInterrupt, SystemExit):
+			_end_by(_STOPPED or signal.SIGTERM)
+
+def _block_stops():
+	"""Block the stops in this thread: the old mask, for _restore_stops; None where there is no pthread_sigmask (Windows)."""
+	if hasattr(signal, 'pthread_sigmask'):
+		return signal.pthread_sigmask(signal.SIG_BLOCK, _STOPS)
+	return None
+
+def _restore_stops(mask):
+	if mask is not None:
+		signal.pthread_sigmask(signal.SIG_SETMASK, mask)
+
+def _claim_slot():
+	"""Take this worker's (pid, in a task) pair in its pool's slots, the first free one. Under the slots' lock, taken within
+	1 s (as _claim_space: far longer than a scan of them takes; a holder that died must not hang the worker). Without one
+	(no slots, all taken, no lock) the worker runs on, and the parent counts it as always in a task: it is never killed."""
+	global _MY_SLOT
+	share = _SLOTS
+	if share is None:
+		return
+	lock, slots = share
+	if not lock.acquire(timeout=1):
+		return
+	try:
+		for index in range(0, len(slots), 2):
+			if slots[index] == 0:
+				slots[index + 1] = 0
+				slots[index] = os.getpid()
+				_MY_SLOT = index + 1
+				return
+	finally:
+		lock.release()
+
+def _slot_state(in_task):
+	"""Write this worker's state into its slot: one aligned 8-byte store, which the parent reads whole."""
+	if _MY_SLOT is not None:
+		_SLOTS[1][_MY_SLOT] = 1 if in_task else 0
+
+def _pool_worker_start(slots, space_array, rate_share):
+	"""A pool's initializer (Python 3.7+, every start method): the pool's slots and shares, then the worker's setup
+	(_init_worker; under fork multiprocessing's after-fork hook has run it already, with the slots it inherited). A stop
+	from here on ends the worker; nothing raises out of an initializer."""
+	global _SLOTS
+	try:
+		if slots is not None:
+			_SLOTS = (slots.get_lock(), slots.get_obj())
+		if space_array is not None:
+			_init_space_share(space_array)
+		if rate_share is not None:
+			_init_rate_share(*rate_share)
+		_init_worker()
+	except (KeyboardInterrupt, SystemExit):
+		_end_by(_STOPPED or signal.SIGTERM)
 
 def _register_worker_start():
 	"""multiprocessing runs its after-fork hooks in each child it starts, before the child's work (a pool worker's loop):
 	the worker sets itself up there (_init_worker), not at its first task, so one that never runs a task, or that its pool
 	never counted (a stop landing as it was forked), still has its watch and ends when its parent does. main() registers it
 	(not an import: a program that imports hpcp must not get hpcp's stops and parent watch in its own multiprocessing
-	children). Under fork the registry is inherited, so every pool worker of the run sets up at its start; forkserver and
-	spawn workers, which start from a new interpreter, set up at their first task (_run_task). The registry holds its key
-	weakly: a module-level function lives as long as the module."""
+	children). Under fork the registry is inherited, so every pool worker of the run sets up at its start (Python 3.6 has
+	no other way); forkserver and spawn workers, which start from a new interpreter, set up in the pool's initializer
+	(_pool_worker_start, Python 3.7+). The registry holds its key weakly: a module-level function lives as long as the module."""
 	multiprocessing.util.register_after_fork(_init_worker, lambda init: init())
 
 # The run settings hpcp() keeps in module globals. A pool worker that did not fork from the parent
@@ -924,7 +1071,7 @@ _TASK_SETTINGS = ('NAMED_DESTS', 'RUN_ID', 'CONTENT_ONLY', 'WRITE_BESIDE', 'READ
 	'BYTES_RATE_LIMIT', 'FILES_RATE_LIMIT', 'MIRROR_FS_PARAMS', 'REMOVE_FILES_WHILE_LISTING')
 
 def _submit_task(executor, func, *args, **kwargs):
-	"""Submit func to a process pool with this process's run settings; collect it with _task_result."""
+	"""Submit func to a process pool (a _pool) with this process's run settings; collect it with _task_result."""
 	settings = {name: globals()[name] for name in _TASK_SETTINGS}
 	return executor.submit(_run_task, settings, func, *args, **kwargs)
 
@@ -942,6 +1089,8 @@ def _run_task(settings, func, *args, **kwargs):
 		_init_worker()
 		globals().update(settings)
 		error_start = len(ERRORS)
+		# In a task from here (the parent never kills a worker in one, _pool) until its cleanup has run.
+		_slot_state(True)
 		_IN_TASK = True
 		try:
 			return func(*args, **kwargs), ERRORS[error_start:], None
@@ -954,6 +1103,8 @@ def _run_task(settings, func, *args, **kwargs):
 				# A stop came during the task: its cleanup has run, or the KeyboardInterrupt never got here (Python reports and
 				# drops one raised in a weakref callback or a __del__, and the task went on). Either way the worker ends.
 				_end_by(_STOPPED)
+			# Between tasks: nothing of this one is left (no temporary or torn file, no fsync in flight).
+			_slot_state(False)
 	except (KeyboardInterrupt, SystemExit):
 		if _STOPPED_PID != os.getpid():
 			raise
@@ -961,14 +1112,32 @@ def _run_task(settings, func, *args, **kwargs):
 		# would take it for the task's error and keep the worker (except BaseException, Python 3.6 to 3.14).
 		_end_by(_STOPPED)
 
+def _settled(future):
+	"""(result, errors, crash) of a done _submit_task future. What it failed with is the worker's, a stop (SystemExit,
+	KeyboardInterrupt: the pool's worker loop sends back one raised as it sent a result) included, and becomes a crash; a
+	stop of this process's own is raised on. A BrokenProcessPool marks the pool (_POOL_BROKEN)."""
+	global _POOL_BROKEN
+	try:
+		return future.result()
+	except Exception as e:
+		error = e
+	except BaseException as e:
+		try:
+			theirs = future.exception(timeout=0)
+		except Exception:
+			theirs = None
+		if e is not theirs:
+			raise
+		error = e
+	if isinstance(error, BrokenProcessPool):
+		_POOL_BROKEN = True
+	return None, [], f'{type(error).__name__}: {error}'
+
 def _task_result(future, default, crash_prefix):
 	"""A _submit_task future's result in the parent. The errors the task recorded join ERRORS (the worker printed them);
 	a task that raised, or whose worker died (BrokenProcessPool), is recorded under crash_prefix and gives default.
 	Either way the other tasks go on (a broken pool then fails the next submit)."""
-	try:
-		result, errors, crash = future.result()
-	except Exception as e:
-		result, errors, crash = None, [], f'{type(e).__name__}: {e}'
+	result, errors, crash = _settled(future)
 	ERRORS.extend(errors)
 	if crash is not None:
 		eprint(f'{crash_prefix}: {crash}')
@@ -978,7 +1147,7 @@ def _task_result(future, default, crash_prefix):
 def _raise_task_failures(future):
 	"""A _submit_task future's result, raising its recorded failures (and a crash) as one RuntimeError, as
 	_call_raising_recorded_failures does in-process."""
-	result, errors, crash = future.result()
+	result, errors, crash = _settled(future)
 	failures = [error for error in errors if _is_failure(error)]
 	if crash is not None:
 		failures.append(crash)
@@ -999,6 +1168,197 @@ def _call_raising_recorded_failures(func, *args, **kwargs):
 		# A reused worker must not carry this task's errors into its next job;
 		# an in-process caller reports the raised failures itself.
 		del ERRORS[error_start:]
+
+def _new_slots(count):
+	"""Slots for a pool of count workers: (the parent's (lock, slots), what the initializer hands a worker), or (None, None)
+	where none can be made (its workers then count as always in a task). Forked workers inherit an anonymous shared mapping
+	and a lock, which leave no file (nothing to hand: a pool given another start method than the default gets no slots);
+	forkserver and spawn ones get an Array through the initializer (as _space_share)."""
+	with contextlib.suppress(OSError, ImportError, ValueError, TypeError):
+		if multiprocessing.get_start_method() == 'fork':
+			import mmap
+			return (multiprocessing.Lock(), memoryview(mmap.mmap(-1, 16 * count)).cast('q')), None
+		if sys.version_info >= (3, 7):
+			array = multiprocessing.Array('q', 2 * count)
+			return (array.get_lock(), array.get_obj()), array
+	return None, None
+
+class _pool:
+	"""The one door to a process pool: `with _pool(max_workers) as executor:`, submitting with _submit_task(executor, ...) and
+	waiting with _wait(futures, executor). Inside, the parent only loops (submits, waits, results, the progress bar): no cp,
+	no prompt. A stop is acted on there within 1 s (_DEFER, _check_stop in _wait). Each worker can start (ProcessPoolExecutor
+	never starts more than max_workers, and Python 3.6 to 3.14 replace none that died) gets a (pid, in a task) slot.
+
+	Its exit: as concurrent.futures' own when the loop ended normally. After a stop or a broken pool, the stop (SIGTERM for a
+	broken pool) is passed on, and the parent waits for the pool's workers, each second: from _WATCH_GRACE after the wait
+	began, one between tasks is SIGKILLed (it is stuck on the pool's queue, or on a result half sent, and holds nothing of a
+	file), and one in a task, or without a slot, is waited for with no bound, its cleanup never cut, with one line naming
+	Ctrl-\\. After any other exception the futures not started are cancelled and the running ones end as they would, then
+	the same wait. Either way the pool is then left without a join (_ABANDONED): its manager thread may be stuck for good.
+	space: the workers share the run's space-warning slots (_SPACE_WARNED); rate: the -pfl rate share under -F."""
+	def __init__(self, max_workers, space=False, rate=None):
+		self.max_workers = max_workers
+		self.space = space
+		self.rate = rate
+		self.broken = False
+
+	def __enter__(self):
+		global _DEFER, _POOL_BROKEN, _SLOTS, _RATE_SHARE
+		self.outer = (_SLOTS, _RATE_SHARE)
+		_DEFER += 1
+		try:
+			# Processes of this run alive before this pool: an outer pool's, never this one's to wait for or kill.
+			self.before = {child.pid for child in multiprocessing.active_children()}
+			self.seen = set()
+			self.gone_at = None
+			# The futures not done yet: each leaves by its done callback (run by the pool's manager thread, or by a cancel). No
+			# weak references: their callbacks run in the main thread, where a stop's KeyboardInterrupt is dropped.
+			self.pending = set()
+			_POOL_BROKEN = False
+			if sys.version_info < (3, 7):
+				_quiet_36_pool_shutdown()
+			self.slots, handed = _new_slots(self.max_workers)
+			# Forked workers (Python 3.6, which has no initializer, and the fork start method) inherit these.
+			_SLOTS = self.slots
+			if self.rate is not None:
+				_RATE_SHARE = self.rate
+			kwargs = {}
+			if sys.version_info >= (3, 7):
+				space = _SPACE_WARNED[2] if self.space and _SPACE_WARNED is not None else None
+				kwargs = {'initializer': _pool_worker_start, 'initargs': (handed, space, self.rate)}
+			self.executor = ProcessPoolExecutor(max_workers=self.max_workers, **kwargs)
+		except BaseException:
+			_DEFER -= 1
+			_SLOTS, _RATE_SHARE = self.outer
+			raise
+		return self
+
+	def submit(self, func, *args, **kwargs):
+		"""executor.submit, with the stops blocked in the process that runs main() (a library caller's are left alone): a
+		worker it starts (and a fork server, which every later worker forks from) starts with them blocked, and lets them in
+		once set up (_init_worker). A stop meanwhile is recorded at the restore (_stop, inside the region)."""
+		mask = _block_stops() if os.getpid() == _MAIN_PID else None
+		try:
+			future = self.executor.submit(func, *args, **kwargs)
+		finally:
+			_restore_stops(mask)
+		self.pending.add(future)
+		future.add_done_callback(self.pending.discard)
+		return future
+
+	def _states(self):
+		"""{pid: in a task} for the workers that took a slot."""
+		states = {}
+		if self.slots is not None:
+			slots = self.slots[1]
+			for index in range(0, len(slots), 2):
+				pid = slots[index]
+				if pid:
+					states[pid] = bool(slots[index + 1])
+		return states
+
+	def _alive(self):
+		return [child for child in multiprocessing.active_children() if child.pid not in self.before]
+
+	def watch(self, done):
+		"""One pass of a pool loop's wait (_wait): a worker that died while nothing completes for _WATCH_GRACE means the pool's
+		manager thread is stuck (a pool that sees a death fails every future at once), on a result the dead worker half wrote
+		(the parent holds the result pipe's write end too, so the read never ends): the run ends with 191, as a broken pool's.
+		Workers never end on their own while a pool runs (no max_tasks_per_child), except on a stop, acted on before this."""
+		if done:
+			self.gone_at = None
+			return
+		alive = {child.pid for child in self._alive()}
+		self.seen |= alive | set(self._states())
+		if not self.seen - alive:
+			self.gone_at = None
+		elif self.gone_at is None:
+			self.gone_at = time.monotonic()
+		elif time.monotonic() - self.gone_at >= _WATCH_GRACE:
+			self.broken = True
+			raise RuntimeError('Copy process crashed: a pool worker died and its pool stopped answering')
+
+	def __exit__(self, kind, error, tb):
+		global _DEFER, _ABANDONED, _SLOTS, _RATE_SHARE
+		try:
+			stopped = kind is not None and issubclass(kind, (KeyboardInterrupt, SystemExit))
+			broken = self.broken or _POOL_BROKEN or (kind is not None and issubclass(kind, BrokenProcessPool))
+			if kind is None and not broken:
+				self.executor.shutdown(wait=True)
+				# Let go of it here, inside the region: its parts' weakref callbacks and finalizers run as it goes, where a stop
+				# is only recorded (_stop); outside, Python would drop one raised in them.
+				self.executor = self.slots = None
+				return False
+			if stopped or broken:
+				# A broken pool with no stop: SIGTERM ends idle workers (_stop's SystemExit) and busy ones by their cleanup.
+				_pass_stop_on(_STOPPED or signal.SIGTERM)
+			else:
+				for future in list(self.pending):
+					future.cancel()
+			self._wait_for_workers()
+			# Python 3.6's shutdown puts a wakeup into the result queue, under a lock a killed worker may hold: skipped there.
+			if sys.version_info >= (3, 9):
+				self.executor.shutdown(wait=False, cancel_futures=True)
+			elif sys.version_info >= (3, 7):
+				self.executor.shutdown(wait=False)
+			_ABANDONED = True
+			_LEFT.append(self.executor)
+			return False
+		finally:
+			_DEFER -= 1
+			_SLOTS, _RATE_SHARE = self.outer
+
+	def _wait_for_workers(self):
+		"""Wait for this pool's processes to end, as the class says."""
+		started, said = time.monotonic(), False
+		while True:
+			alive = self._alive()
+			if not alive:
+				return
+			if time.monotonic() - started >= _WATCH_GRACE:
+				states = self._states()
+				idle = [child for child in alive if states.get(child.pid) is False]
+				for child in idle:
+					with contextlib.suppress(OSError):
+						os.kill(child.pid, getattr(signal, 'SIGKILL', signal.SIGTERM))
+				# One deadline for them all: a SIGKILLed process not in an uninterruptible wait exits in milliseconds, 1 s covers a
+				# loaded host, and -j 64 must not wait 64 s.
+				deadline = time.monotonic() + 1
+				for child in idle:
+					child.join(max(0, deadline - time.monotonic()))
+				alive = [child for child in alive if states.get(child.pid) is not False]
+				if alive and not said:
+					said = True
+					_say(f'Waiting for {len(alive)} worker(s) still finishing a file (pids {", ".join(str(child.pid) for child in alive)}): '
+						'Ctrl-\\ ends hpcp now, which may leave a temporary file or a torn file there')
+			if alive:
+				multiprocessing.connection.wait([child.sentinel for child in alive], timeout=1)
+
+_QUIETED_36 = []
+
+def _quiet_36_pool_shutdown():
+	"""Python 3.6's pool manager thread raises queue.Full out of its shutdown_worker when a worker dies while the call queue
+	is full (a stop ends the workers), and threading prints its traceback; 3.7's shutdown_worker catches it. The pool is
+	broken by then, its futures failed and its workers terminated: the thread just ends, quietly. Once per process."""
+	if _QUIETED_36:
+		return
+	real = concurrent.futures.process._queue_management_worker
+	def _queue_management_worker(*args, **kwargs):
+		try:
+			return real(*args, **kwargs)
+		except queue.Full:
+			return None
+	concurrent.futures.process._queue_management_worker = _queue_management_worker
+	_QUIETED_36.append(real)
+
+def _wait(futures, pool):
+	"""The one wait of every pool loop: the futures done within 1 s (most loops refresh the progress bar each second), then
+	the parent's stop acted on (_check_stop), then the pool watched (_pool.watch). So a stop is acted on within 1 s in every
+	loop, and a pool stuck on a dead worker ends the run."""
+	done, _ = concurrent.futures.wait(futures, timeout=1, return_when=concurrent.futures.FIRST_COMPLETED)
+	_check_stop()
+	pool.watch(done)
+	return done
 
 #%% -- Exclude --
 def is_excluded(path, exclude=None):
@@ -2477,6 +2837,7 @@ def create_sym_links(symLinks,exclude=None,link_tracking=False):
 	#print(symLinks)
 	start_time = time.monotonic()
 	for src, dests in symLinks.items():
+		_check_stop()
 		try:
 			src = os.path.normpath(src)
 			dests = [os.path.normpath(d) for d in dests]
@@ -3179,7 +3540,7 @@ def get_file_list_parallel(path,max_workers=56,exclude=None,append_hash=False,fu
 		listed_items = len(file_list) + len(link_list)
 		# A folder's listing that crashed (this default): its folder stays, as before 9.77.
 		no_result = (frozenset(), frozenset(), 0, frozenset())
-		with ProcessPoolExecutor(max_workers=max_workers) as executor:
+		with _pool(max_workers) as executor:
 			while folders_to_expand or futures:
 				under_rate_limit = (
 					FILES_RATE_LIMIT <= 0
@@ -3207,7 +3568,7 @@ def get_file_list_parallel(path,max_workers=56,exclude=None,append_hash=False,fu
 					if folders_to_expand and FILES_RATE_LIMIT > 0:
 						time.sleep(0.05)
 					continue
-				done, _ = concurrent.futures.wait(futures, return_when=concurrent.futures.FIRST_COMPLETED)
+				done = _wait(futures, executor)
 				for doneTask in done:
 					folder_path = futures.pop(doneTask)
 					result = _task_result(doneTask, no_result, 'Listing error')
@@ -3274,7 +3635,7 @@ def delete_file_list_parallel(file_list, max_workers, verbose=False,files_per_jo
 							 suppress_all_output=verbose,bytes_rate_limit=BYTES_RATE_LIMIT,files_rate_limit=FILES_RATE_LIMIT)
 	last_transition_time = time.monotonic()
 	last_under_limit = True
-	with ProcessPoolExecutor(max_workers=max_workers) as executor:
+	with _pool(max_workers) as executor:
 		while file_list_iterator or futures:
 			# counter = 0
 			under_limit = apb.under_rate_limit()
@@ -3292,7 +3653,7 @@ def delete_file_list_parallel(file_list, max_workers, verbose=False,files_per_jo
 						futures[future] = delete_files
 					file_list_iterator = None
 
-			done, _ = concurrent.futures.wait(futures.keys(), return_when=concurrent.futures.FIRST_COMPLETED, timeout=1)
+			done = _wait(futures, executor)
 
 			current_iteration_total_run_time = 0
 			for doneTask in done:
@@ -3657,9 +4018,7 @@ def _init_space_share(array):
 
 def _copy_pool(max_workers):
 	"""The pool for jobs that may run copy_file, its workers sharing the run's slots (forked ones inherit them)."""
-	share = _SPACE_WARNED
-	hand = {} if share is None or share[2] is None else {'initializer': _init_space_share, 'initargs': (share[2],)}
-	return ProcessPoolExecutor(max_workers=max_workers, **hand)
+	return _pool(max_workers, space=True)
 
 def _mount_type(dev):
 	"""dev's filesystem type (_mountinfo_entries), None where no mount lists it (off Linux, a btrfs subvolume's st_dev): read
@@ -4322,7 +4681,7 @@ def copy_file_list_parallel(file_list, links, src_path, dest_paths, max_workers,
 						futures[future] = src_files
 					file_list_iterator = None
 
-			done, _ = concurrent.futures.wait(futures.keys(), return_when=concurrent.futures.FIRST_COMPLETED,timeout=1)
+			done = _wait(futures, executor)
 
 			#print('\n',len(done) ,'\t', len(futures))
 			if file_list_iterator and len(done) > 1 and len(done) / len(futures) > 0.1:
@@ -4426,7 +4785,7 @@ def copy_file_list_parallel_batch(jobs, max_workers, full_hash=False, verbose=Fa
 						futures[future] = current_jobs
 					job_list_iterator = None
 
-			done, _ = concurrent.futures.wait(futures.keys(), return_when=concurrent.futures.FIRST_COMPLETED,timeout=1)
+			done = _wait(futures, executor)
 
 			#print('\n',len(done) ,'\t', len(futures))
 			if job_list_iterator and len(done) > 1 and len(done) / len(futures) > 0.1:
@@ -4563,6 +4922,7 @@ def copy_files_serial(src_path, dest_paths, full_hash=False, verbose=False,exclu
 	start_time = time.monotonic()
 	apb = Adaptive_Progress_Bar(total_count=total_files,total_size=init_size,last_num_job_for_stats=1,process_word='Copied',suppress_all_output=verbose,bytes_rate_limit=BYTES_RATE_LIMIT,files_rate_limit=FILES_RATE_LIMIT)
 	for file in file_list:
+		_check_stop()
 		srcRelativePath = os.path.relpath(file, src_path)
 		size, cpTime ,rtnSymLinks = copy_file(file, [os.path.join(dest_path, srcRelativePath) for dest_path in dest_paths],full_hash = full_hash, verbose=verbose)
 		#update_progress_bar(copy_counter, copy_size_counter, total_files, start_time)
@@ -4600,6 +4960,7 @@ def copy_files_serial_batch(jobs, full_hash=False, verbose=False,exclude=None,ex
 		if not os.path.isdir(src_path) or os.path.islink(src_path):
 			if lost and src_path in lost:
 				continue
+			_check_stop()
 			src_size, _ , symLinks = copy_file(src_path, dest_paths,full_hash=full_hash, verbose=verbose)
 			#return 1, src_size , symLinks , frozenset([src_path])
 			copied_count += 1
@@ -4636,6 +4997,7 @@ def copy_files_serial_batch(jobs, full_hash=False, verbose=False,exclude=None,ex
 	apb.size_counter = copied_size
 	for src_path, dest_paths, file_list, links, init_size in newJobs:
 		for file in file_list:
+			_check_stop()
 			srcRelativePath = os.path.relpath(file, src_path)
 			size, cpTime ,rtnSymLinks = copy_file(file, [os.path.join(dest_path, srcRelativePath) for dest_path in dest_paths],full_hash = full_hash, verbose=verbose)
 			#update_progress_bar(copy_counter, copy_size_counter, total_files, start_time)
@@ -4855,7 +5217,7 @@ def sync_directories_parallel(src, dests, max_workers, verbose=False,folder_per_
 						futures[future] = src_folders
 					folder_list_iterator = None
 
-			done, _ = concurrent.futures.wait(futures.keys(), return_when=concurrent.futures.FIRST_COMPLETED,timeout=1)
+			done = _wait(futures, executor)
 			time_spent_this_iter = 0
 			for future in done:
 				src_folders = futures.pop(future)
@@ -4944,7 +5306,7 @@ def sync_directories_parallel_batch(jobs, max_workers, verbose=False,folder_per_
 						futures[future] = currentJobs
 					job_iterator = None
 
-			done, _ = concurrent.futures.wait(futures.keys(), return_when=concurrent.futures.FIRST_COMPLETED,timeout=1)
+			done = _wait(futures, executor)
 			time_spent_this_iter = 0
 			for future in done:
 				currentJobs = futures.pop(future)
@@ -5670,19 +6032,24 @@ def _states_for_paths(paths, full_hash=False, read_xattrs=True, max_workers=1, m
 			for path in paths}
 	chunk_size = max(64, len(paths) // (max_workers * 4) + 1)
 	states = {}
-	with ProcessPoolExecutor(max_workers=max_workers) as executor:
-		futures = []
+	with _pool(max_workers) as executor:
+		futures = set()
 		for index in range(0, len(paths), chunk_size):
 			chunk = paths[index:index + chunk_size]
-			futures.append(executor.submit(_states_chunk, chunk, full_hash, read_xattrs, HASH_SIZE,
+			futures.add(_submit_task(executor, _states_chunk, chunk, full_hash, read_xattrs, HASH_SIZE,
 				frozenset(path for path in chunk if path in marked),
 				frozenset(path for path in chunk if path in stat_paths) if stats is not None else None))
-		for future in concurrent.futures.as_completed(futures):
-			chunk_states, chunk_errors, chunk_stats = future.result()
-			states.update(chunk_states)
-			ERRORS.extend(chunk_errors)
-			if stats is not None:
-				stats.update(chunk_stats)
+		while futures:
+			for future in _wait(futures, executor):
+				futures.discard(future)
+				result, _, crash = _settled(future)
+				if crash is not None:
+					raise RuntimeError(f"General Exception: the entries' states could not be read: {crash}")
+				chunk_states, chunk_errors, chunk_stats = result
+				states.update(chunk_states)
+				ERRORS.extend(chunk_errors)
+				if stats is not None:
+					stats.update(chunk_stats)
 	return states
 
 def compute_changes(new_map, base_map, full_hash=False, max_workers=multiprocessing.cpu_count(), read_xattrs=True, metadata=True,
@@ -6611,11 +6978,12 @@ def _replace_files(files, target_root, max_workers=1, verbose=False, full_hash=F
 			_finish_replace(job, target_root,
 				functools.partial(_call_raising_recorded_failures, copy, source, [tmp], full_hash, verbose), metadata)
 		return
-	with ProcessPoolExecutor(max_workers=max_workers) as executor:
+	with _pool(max_workers) as executor:
 		futures = {_submit_task(executor, copy, source, [tmp], full_hash, verbose): (row, source, dest, tmp)
 			for row, source, dest, tmp in jobs}
-		for future in concurrent.futures.as_completed(futures):
-			_finish_replace(futures[future], target_root, functools.partial(_raise_task_failures, future), metadata)
+		while futures:
+			for future in _wait(futures, executor):
+				_finish_replace(futures.pop(future), target_root, functools.partial(_raise_task_failures, future), metadata)
 
 def _replace_with_symlink(row, link_target, dest, target_root):
 	"""Create the symlink at a temporary sibling of dest and rename it over dest."""
@@ -9769,7 +10137,9 @@ _STDIN_HELD_LIST = False
 
 def _confirm(question, stop):
 	"""Ask question (y/n); anything but yes raises a 'User requested stop' with stop as its text. From stdin at a
-	terminal; when stdin held the list (find ... | hpcp -rme), from /dev/tty. With neither, the same stop, saying why."""
+	terminal; when stdin held the list (find ... | hpcp -rme), from /dev/tty. With neither, the same stop, saying why. A stop
+	not acted on yet is, first: no question is asked of a run that was stopped."""
+	_check_stop()
 	if _STDIN_HELD_LIST:
 		try:
 			# Unbuffered bytes: a terminal cannot seek, which a buffered read-write file needs.
@@ -10608,6 +10978,8 @@ def _remove_listed_files(items, rmdir=False, rate_limiter=None, one_filesystem=F
 			_report_rmdir_failed(path, e)
 	if not _DIR_FD_WALK:
 		for root, root_id, rel in items:
+			# A serial removal's stop not acted on yet is, before the next entry goes (a no-op in a pool's worker).
+			_check_stop()
 			if one_filesystem and rel not in ('', '.') and foreign(root, rel):
 				eprint(f'Other filesystem left: {os.path.dirname(os.path.join(root, rel))} is another filesystem below {root}: '
 					'nothing in it is removed')
@@ -10624,6 +10996,8 @@ def _remove_listed_files(items, rmdir=False, rate_limiter=None, one_filesystem=F
 	root_dev = None
 	try:
 		for root, root_id, rel in items:
+			# A serial removal's stop not acted on yet is, before the next entry goes (a no-op in a pool's worker).
+			_check_stop()
 			if rel in ('', '.'):
 				remove_one(root, root_id, rel)
 				continue
@@ -11088,38 +11462,25 @@ def _remove_trees_parallel(trees, max_workers, exclude=None, rate_limiter=None):
 	(_remove_directory_entries), queueing the subdirectories each job reports. With rate_limiter (-F), the jobs pace
 	each unlink from one shared count (_shared_rate_wait), and the count carries on into the walk after. Returns the
 	entries unlinked; the directories themselves are left for _remove_tree_fd."""
-	global _RATE_SHARE
 	queue = deque(trees)
 	futures = {}
 	removed = 0
-	pool = {}
-	inherited = False
+	share = None
 	if rate_limiter:
-		# Every job paces each unlink from one shared count (a wide directory too, not just the queueing of jobs).
+		# Every job paces each unlink from one shared count (a wide directory too, not just the queueing of jobs). Python 3.6's
+		# pool takes no initializer: its workers fork from this process at the first submit and inherit it (_pool).
 		counter = multiprocessing.Value('d', rate_limiter['count'])
 		share = (counter, rate_limiter['start_time'], rate_limiter['limit'])
-		if sys.version_info >= (3, 7):
-			pool = dict(initializer=_init_rate_share, initargs=share)
-		else:
-			# Python 3.6's pool takes no initializer: its workers fork from this process at the first submit (its
-			# start method outside Windows) and inherit the share instead.
-			_init_rate_share(*share)
-			inherited = True
-	try:
-		with ProcessPoolExecutor(max_workers=max_workers, **pool) as executor:
-			while queue or futures:
-				while queue and len(futures) < max_workers * 2:
-					path, identity = queue.popleft()
-					futures[_submit_task(executor, _remove_directory_entries, path, identity, exclude)] = path
-				done, _ = concurrent.futures.wait(futures, return_when=concurrent.futures.FIRST_COMPLETED)
-				for future in done:
-					futures.pop(future)
-					count, subdirectories = _task_result(future, (0, []), 'Remove process exception')
-					removed += count
-					queue.extend(subdirectories)
-	finally:
-		if inherited:
-			_RATE_SHARE = None
+	with _pool(max_workers, rate=share) as executor:
+		while queue or futures:
+			while queue and len(futures) < max_workers * 2:
+				path, identity = queue.popleft()
+				futures[_submit_task(executor, _remove_directory_entries, path, identity, exclude)] = path
+			for future in _wait(futures, executor):
+				futures.pop(future)
+				count, subdirectories = _task_result(future, (0, []), 'Remove process exception')
+				removed += count
+				queue.extend(subdirectories)
 	if rate_limiter:
 		rate_limiter['count'] = counter.value
 	return removed
@@ -11354,22 +11715,55 @@ def _looked_at(chunks, look, max_workers):
 	0.31 s in one thread and 0.55 s in 32 for a copy's check (3 us an entry), 0.72 s and 1.2 s for a move's (7 us); on NFS
 	mounted actimeo=0, 10,000 took 6.4 s in one and 3.0 s in 4. So chunks are looked at here while each takes under 20 us
 	an entry, and the rest in max_workers threads once one takes longer, with two chunks a thread in flight, so that the
-	chunks are never all held at once."""
-	for chunk in chunks:
-		started = time.monotonic()
-		yield look(chunk)
-		if max_workers > 1 and time.monotonic() - started > 20e-6 * len(chunk):
-			break
-	else:
-		return
-	with concurrent.futures.ThreadPoolExecutor(max_workers) as pool:
-		pending = deque()
+	chunks are never all held at once.
+
+	A pool region (_DEFER): a stop is acted on after each chunk, and within 1 s while a thread's chunk is awaited. Left by an
+	exception, the threads are not joined (_ABANDONED): an lstat on a dead NFS mount never returns, and the run ends by
+	os._exit (main())."""
+	global _DEFER, _ABANDONED
+	_DEFER += 1
+	try:
 		for chunk in chunks:
-			pending.append(pool.submit(look, chunk))
-			if len(pending) >= 2 * max_workers:
-				yield pending.popleft().result()
-		while pending:
-			yield pending.popleft().result()
+			started = time.monotonic()
+			result = look(chunk)
+			_check_stop()
+			yield result
+			if max_workers > 1 and time.monotonic() - started > 20e-6 * len(chunk):
+				break
+		else:
+			return
+		pool = concurrent.futures.ThreadPoolExecutor(max_workers)
+		def settled(future):
+			while True:
+				try:
+					return future.result(timeout=1)
+				except concurrent.futures.TimeoutError:
+					_check_stop()
+		try:
+			pending = deque()
+			for chunk in chunks:
+				pending.append(pool.submit(look, chunk))
+				if len(pending) >= 2 * max_workers:
+					result = settled(pending.popleft())
+					_check_stop()
+					yield result
+			while pending:
+				result = settled(pending.popleft())
+				_check_stop()
+				yield result
+		except BaseException:
+			_ABANDONED = True
+			if sys.version_info >= (3, 9):
+				pool.shutdown(wait=False, cancel_futures=True)
+			else:
+				pool.shutdown(wait=False)
+			_LEFT.append(pool)
+			raise
+		pool.shutdown(wait=True)
+		# Let go of it inside the region, as _pool does its executor.
+		del pool
+	finally:
+		_DEFER -= 1
 
 def remove_moved_sources(src_paths, file_list, sym_links, single_thread=False, max_workers=multiprocessing.cpu_count(),
 		verbose=False, files_per_job=1, remove_force=False, exclude=None, root_ids=None, dests=None, dest_image=False):
@@ -11419,6 +11813,8 @@ def remove_moved_sources(src_paths, file_list, sym_links, single_thread=False, m
 	print(f"Removing the {len(listed)} files and links copied from {_sources_text(roots)} with {max_workers if not single_thread else '1'} workers")
 	if not remove_force:
 		_confirm("Do you want to continue? (y/n)", "Not removing files")
+	# Nothing is removed for a run that was stopped.
+	_check_stop()
 	start_time = time.monotonic()
 	# A named link goes last, after the trees too: a path named through it (lb/x, lb/d/) is reached while it is there.
 	last = [item for item in listed if item[2] == '.' and item[0] not in holders and os.path.islink(item[0])]
@@ -11745,8 +12141,6 @@ def _roots_overlap(roots):
 	ordered = sorted(root.rstrip(os.path.sep) + os.path.sep for root in roots)
 	return any(below.startswith(root) for root, below in zip(ordered, ordered[1:]))
 
-# What stops a run (_stop), the watch's own signal too: held back while a probe exists (_ask_names).
-_STOPS = [getattr(signal, name) for name in _STOP_NAMES + ('SIGUSR2',) if hasattr(signal, name)]
 
 # What lets a probe be made, by why it could not be.
 _PROBE_FIXES = {errno.EACCES: 'make it writable', errno.EPERM: 'make it writable', errno.EROFS: 'mount it read-write',
@@ -13061,12 +13455,16 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = multipr
 			# Refuses a clash before anything is copied or removed.
 			dropped, replaced, in_place = _settle_destinations(src_paths, dests, dest_image, directory_only, copy_exclude, 1 if single_thread else max_workers,
 				parallel_file_listing, remove=remove, places=places)
+			# Between the steps of a run, a stop not acted on yet is (_check_stop): one recorded inside a pool, or one whose
+			# KeyboardInterrupt Python dropped. Nothing after it runs: no copy, no -rme, no removal.
+			_check_stop()
 			if replaced:
 				print(f"Merged directories: {replaced} file(s) replaced by a later source")
 			total_file_list, total_sym_links = process_copy(src_paths, dests, single_thread=single_thread, max_workers=max_workers,
 																			verbose=verbose, directory_only=directory_only,no_directory_sync=no_directory_sync,
 																			full_hash=full_hash, files_per_job=files_per_job, parallel_file_listing=parallel_file_listing,
 																			exclude=copy_exclude,dest_image=dest_image,batch = batch,exit_not_enough_space = exit_not_enough_space,dropped = dropped,in_place = in_place)
+			_check_stop()
 			if verbose:
 				# sort file list and sym links
 				for file in natural_sort(total_file_list):
@@ -13074,6 +13472,7 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = multipr
 				for link in total_sym_links:
 					print(f"Link: {link} -> {total_sym_links[link]}")
 			link_targets = create_sym_links(total_sym_links,exclude=exclude,link_tracking=link_tracking and not no_link_tracking)
+			_check_stop()
 			if not remove:
 				# The move's backstop, at the end of a copy: two sources that landed in one file, where the destination took their
 				# names for one and no check on names could say so (an 8.3 alias, a legacy name read as UTF-8). The landing is left
@@ -13087,6 +13486,7 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = multipr
 						eprint(f'Destination clash: copied {path}, but {why}')
 					elif not why.startswith('it is at none of its landings'):
 						eprint(f'Destination clash: {path} failed to copy, and {why}')
+				_check_stop()
 			# A copy that reported errors is incomplete: removing the sources (a move) would lose what was not copied,
 			# and an unlisted source subtree would make its destination counterpart look extra.
 			copy_failures = [error for error in ERRORS[copy_error_start:] if _is_failure(error)]
@@ -13133,13 +13533,18 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = multipr
 		elif remove and dests != ...:
 			# A move: only what the copy listed goes (see remove_moved_sources). Each copy was written to disk by its worker
 			# (_sync_landing), and one that could not be is a copy failure, which stopped this branch above.
+			_check_stop()
 			remove_moved_sources(src_paths, total_file_list, total_sym_links, single_thread=single_thread, max_workers=max_workers,
 						verbose=verbose, files_per_job=files_per_job, remove_force=remove_force, exclude=exclude, root_ids=source_ids,
 						dests=dests, dest_image=bool(dest_image))
 		elif remove:
+			_check_stop()
 			process_remove(src_paths,single_thread=single_thread, max_workers=max_workers,verbose=verbose,
 						files_per_job=files_per_job, remove_force=remove_force,exclude=exclude,batch=batch,parallel_file_listing=parallel_file_listing)
 	except KeyboardInterrupt:
+		# The stop is acted on: later checks (_check_stop) change nothing.
+		global _STOP_ACTED
+		_STOP_ACTED = True
 		eprint("Keyboard Interrupt: Signal received, cleaning up and exiting.")
 	except RuntimeError as e:
 		if str(e):
@@ -13301,20 +13706,46 @@ def _escape_unencodable_stdout():
 		return
 	_STRICT_STDOUT = stdout
 
+def _end_now(rc):
+	"""End a run that was stopped, or that left a pool behind (_ABANDONED), without the interpreter's exit: that joins Python's
+	pool threads, and one may be stuck for good (on a lock a killed worker held, on a result it half sent, on an lstat of a
+	dead NFS mount). hpcp registers no atexit handler of its own. Of multiprocessing's exit work, what leaves something
+	behind is done here: its named semaphores (forkserver and spawn; else the resource tracker removes them and warns about
+	each) and its temporary directory (a fork server's socket). SIGTERM and SIGHUP end by their signal, Ctrl-C with 130, a
+	pool left without a stop with rc."""
+	with contextlib.suppress(Exception):
+		sys.stdout.flush()
+		sys.stderr.flush()
+	with contextlib.suppress(Exception):
+		# Finalizers of exit priority 0 and above: the semaphores' unlink and the queues' close, neither of which waits on a
+		# thread (a queue's join is -5, not run).
+		multiprocessing.util._run_finalizers(0)
+	with contextlib.suppress(Exception):
+		tempdir = multiprocessing.current_process()._config.get('tempdir')
+		if tempdir:
+			shutil.rmtree(tempdir, ignore_errors=True)
+	if _STOPPED is not None and _STOPPED != getattr(signal, 'SIGINT', None):
+		# Cleaned up: end by the signal, as 9.84 died by it, so timeout, a shell and systemd see what they sent.
+		_end_by(_STOPPED)
+	os._exit(ERROR_TO_RETURNCODE_TABLE['Keyboard Interrupt'] if _STOPPED is not None else rc)
+
 def main():
 	global RANDOM_DESTINATION_SELECTION, _MAIN_PID
-	_escape_unencodable_stdout()
-	args = get_args()
-	# after get_args: -h and -V print only what they are asked for
-	_warn_bad_overrides()
-	# we run gui if the current platform is windows and src_path is not specified
-	if os.name == 'nt' and len(args.src_path) == 0:
-		hpcp_gui()
-	else:
-		# A stop runs Ctrl-C's cleanup here too: a serial run copies in this process, and hpcp() cleans up mounts in a finally.
-		_MAIN_PID = os.getpid()
+	# A stop runs Ctrl-C's cleanup here too: a serial run copies in this process, and hpcp() cleans up mounts in a finally.
+	# Installed first: a stop while the arguments are read ends the run quietly, as the signal asked (below).
+	_MAIN_PID = os.getpid()
+	_install_stops()
+	rtnCode = 0
+	try:
+		_escape_unencodable_stdout()
+		args = get_args()
+		# after get_args: -h and -V print only what they are asked for
+		_warn_bad_overrides()
+		# we run gui if the current platform is windows and src_path is not specified
+		if os.name == 'nt' and len(args.src_path) == 0:
+			hpcp_gui()
+			return
 		_register_worker_start()
-		_install_stops()
 		rtnCode = hpcp(args.src_path, dest_paths = args.dest_path, single_thread = args.single_thread, max_workers = args.max_workers, verbose = args.verbose,
 			 directory_only =  args.directory_only, no_directory_sync = args.no_directory_sync,full_hash = args.full_hash, files_per_job = args.files_per_job,
 			 target_file_list = args.target_file_list, compare_file_list = args.compare_file_list , diff_file_list = args.diff_file_list, tar_diff_file_list = args.tar_diff_file_list,remove = args.remove, remove_force =args.remove_force,
@@ -13327,14 +13758,16 @@ def main():
 			 no_fs_param_mirror = args.no_fs_param_mirror, get_diff_image = args.get_diff_image,
 			 load_diff_image = args.load_diff_image, force_apply = args.force_apply, write_beside = args.write_beside,
 			 read_before_write = args.read_before_write)
-		if _STOPPED is not None:
-			# A worker forked after the stop was passed on (a stop while the pool was starting) would hold the exit.
-			_pass_stop_on(_STOPPED)
-		if _STOPPED is not None and _STOPPED != getattr(signal, 'SIGINT', None):
-			# Cleaned up: end by the signal, as 9.84 died by it, so timeout, a shell and systemd see what they sent. Ctrl-C keeps 130.
-			_end_by(_STOPPED)
-		if rtnCode:
-			exit(rtnCode)
+	except KeyboardInterrupt:
+		# A stop before hpcp() took it (the arguments, hpcp()'s first lines): nothing was started, nothing to clean up.
+		rtnCode = ERROR_TO_RETURNCODE_TABLE['Keyboard Interrupt']
+	if _STOPPED is not None:
+		# A worker forked after the stop was passed on (a stop while the pool was starting) ends too.
+		_pass_stop_on(_STOPPED)
+	if _STOPPED is not None or _ABANDONED:
+		_end_now(rtnCode)
+	if rtnCode:
+		exit(rtnCode)
 		
 
 if __name__ == '__main__':

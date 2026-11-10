@@ -73,7 +73,7 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 ### A temporary file left by SIGKILL or Ctrl-\ (SIGQUIT)
 - **Kind:** known limitation.
 - **What the operator sees:** hpcp killed with SIGKILL, ended with Ctrl-\ (SIGQUIT), or cut by a power cut while it rewrites a file on the beside route (every rewrite with `-wb`; by default a file with other names, one that cannot be opened for writing, or a FIFO, socket, device node or link at the landing; and a `-siff` apply's files) leaves a hidden `.hpcp_tmp_` file (16 hex digits after the prefix) beside it, in the destination; the file it was rewriting is untouched, its old copy whole. A default rewrite in place leaves no such file (see "A stop during a rewrite costs the old copy"). A rerun leaves the temporary file there; `-rme` removes it as an extra. SIGINT, SIGTERM and SIGHUP remove it (rule 9).
-- **Why:** SIGKILL cannot be handled, and a rewrite that keeps the old copy whole needs the new one under another name until it is. Ctrl-\ is left without a handler on purpose: it is the way out of a run that is stuck (see "A stopped or broken run can still hang, rarely"), so it must not wait for a cleanup.
+- **Why:** SIGKILL cannot be handled, and a rewrite that keeps the old copy whole needs the new one under another name until it is. Ctrl-\ is left without a handler on purpose: it is the way out of a run that is stuck (see "A stopped run waits for a worker whose file operation never returns"), so it must not wait for a cleanup.
 - **Revisit when:** an operator reports finding one.
 - **Approved:** 2026-11-08, the user chose "Approve (Recommended)"; widened to Ctrl-\ (SIGQUIT) 2026-11-09, the user chose "Approve (Recommended)" ("Ctrl-\ stays an instant exit"). Narrowed 2026-11-09 (9.86) to the beside route, which is no longer every rewrite.
 
@@ -215,29 +215,12 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - **Revisit when:** 9.87.
 - **Noted:** 2026-11-09, found in the 9.85 re-review; the main session's decision, not asked (a deferral).
 
-### A stopped or broken run can still hang, rarely
-- **Kind:** deferred (9.87).
-- **What the operator sees:** on Python 3.6 (EL7, EL8) and 3.14, a run stopped early with Ctrl-C or SIGTERM (`kill`, `timeout`, a systemd stop), or one whose copy worker dies, can wait for good instead of ending. A second Ctrl-C does nothing there (9.85's parent ignores later stops); Ctrl-\ (SIGQUIT) or `kill -9` ends it, and like SIGKILL leaves a `.hpcp_tmp_` file where a rewrite on the beside route was under way, and a rewrite in place torn (its `cp`, in a process group of its own, runs on to its end). Measured with the reviewer's probe (early stops, 20 directories of 20 small files, `-j 8`, across EL7, EL8 and Docker 3.6 and 3.14): 9 hangs in 3300 runs with 9.85, against 22 of 3300 at the commit before the last fixes; EL8 early Ctrl-C alone, 4 of 300. 9.84 hung about as often (EL8: 3 of 150 Ctrl-Cs, 4 of 150 SIGTERMs). Sources stay: a stopped or broken copy removes nothing.
-- **Why:** the waits are in Python's process pool, not in hpcp's own code. A stop raised inside CPython's own lock handling strands a lock: the parent inside `concurrent.futures.wait`'s `_AcquireFutures` (verified by injection), or a worker on the pool's call-queue lock (inferred from the hang dumps, not injected). A stop that lands between the two writes of a result over 16 KiB also hangs (verified by injection).
-- **Plan (9.87):** kill workers still alive after a grace period, bound the parent's join and end with `os._exit`; consider polling the stop flag in the pool loops instead of raising in the parent; let a second Ctrl-C end a stuck parent.
-- **Revisit when:** 9.87.
-- **Noted:** 2026-11-09, found in the 9.85 re-reviews; the main session's decision, not asked (a deferral).
-
-### A stop whose KeyboardInterrupt Python drops in the parent is not acted on
-- **Kind:** deferred (9.87).
-- **What the operator sees:** a stop whose `KeyboardInterrupt` Python drops in the parent (it was raised inside a weakref callback or a `__del__`, where every Python reports it as "Exception ignored" and goes on) is not acted on there. While a pool runs, its workers still end on the pass-on, the pool reads as broken, and the run ends with `Copy process crashed: BrokenProcessPool`, exit 191 for a Ctrl-C instead of 130 (a SIGTERM still ends by its signal, 143); seen once in 200 natural runs on Python 3.14. Outside a pool, nothing breaks: the run goes on to its end, a move removing its sources and `-rme` its extras, and a Ctrl-C exits 0; a second Ctrl-C is ignored as a later stop (injected on 3.6 and 3.14: a Ctrl-C dropped while the sources were checked, a second 0.2 s later, and the move ran whole, exit 0). Nothing is lost: what is removed was copied, fsynced and checked first.
-- **Why:** the parent acts on a stop only through the `KeyboardInterrupt` that `_stop` raises, and ignores later stops so that a second Ctrl-C cannot cut the cleanup halfway. Python 3.6 to 3.14 all drop a `KeyboardInterrupt` raised in a weakref callback or a `__del__` (checked: 3.6, 3.12, 3.14); such callbacks run in the parent's main thread as a pool's executor, queues and threads are freed (from reading Python's code, not traced in hpcp: `concurrent.futures`' `weakref_cb`, multiprocessing's `Finalize`, `threading`'s `WeakSet`), so the window is at least the end of each pool phase. Why only 3.14 showed it is not traced.
-- **Plan (9.87):** the parent checks its own stop (`_STOPPED_PID == os.getpid()`) where it can act on it, and raises `KeyboardInterrupt` there: each pass of its pool loops, and before each phase, above all before a removal. That also covers the broken pool (exit 130 or the signal, not 191).
-- **Revisit when:** 9.87.
-- **Noted:** 2026-11-09, found in the 9.85 last review round; the main session's decision, not asked (a deferral).
-
-### On Python 3.14 an early Ctrl-C often prints a traceback
-- **Kind:** deferred (9.87).
-- **What the operator sees:** on Python 3.14, about one early Ctrl-C in three prints a traceback (a `KeyboardInterrupt`) before the run ends with 130. As in 9.84. Nothing is lost.
-- **Why:** under 3.14's default forkserver a worker starts from the fork server, with Python's own SIGINT handler (the server puts back the handlers it started with), and hpcp's handlers go in only at the worker's first task (`_run_task`): the after-fork setup that 9.85's `main()` registers reaches only workers forked from the parent. A Ctrl-C landing before that prints Python's traceback; and a second stop landing in an exit path does the same.
-- **Plan (9.87):** set each worker up before its loop on Python 3.7+ with the pool's `initializer=` (as `-pfl` already does for its rate share), which reaches forkserver and spawn workers too; and the exit paths end on the first stop (as `_end_by` now does in a worker). Ignoring the stops until the handlers are in place cannot be done from the parent under forkserver (the server, not the parent, gives a worker its dispositions), and a stop ignored at a worker's start would stay ignored (`_install_stops` keeps what a process started ignoring).
-- **Revisit when:** 9.87.
-- **Noted:** 2026-11-09, found in the 9.85 last review round; the main session's decision, not asked (a deferral).
+### A stopped run waits for a worker whose file operation never returns
+- **Kind:** known limitation.
+- **What the operator sees:** after Ctrl-C, SIGTERM or SIGHUP, a worker inside a write or fsync that never returns holds the run (for example a dead hard-mounted NFS server, or a disk in an uninterruptible wait). hpcp prints `Waiting for N worker(s) still finishing a file (pids ...): Ctrl-\ ends hpcp now, which may leave a temporary file or a torn file there`. Ctrl-\ ends it at once, and can leave that worker's temporary file or a torn file. Nothing is removed from the sources.
+- **Why:** killing a worker in a task would leave what its cleanup removes, which the approved limitations promise a stop removes. An uninterruptible wait cannot be killed at all.
+- **Revisit when:** an operator reports one.
+- **Approved:** 2026-11-10, the user chose "Approve as KL (Recommended)". The user did not ask for it explicitly; it is what remains of the hang the 9.85 review found.
 
 ### A destination given through `link/..` also makes an empty directory where the link leads
 - **Kind:** deferred (9.87).
