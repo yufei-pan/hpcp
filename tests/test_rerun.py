@@ -5,6 +5,7 @@ import contextlib
 import errno
 import io
 import os
+import random
 import shutil
 import stat
 import subprocess
@@ -258,3 +259,81 @@ def test_a_landing_swapped_after_the_look_gets_no_metadata(tmp_path, reset_hpcp_
 	assert not os.path.islink(landing) and os.lstat(landing).st_ino != os.lstat(victim).st_ino
 	with open(landing) as handle:
 		assert handle.read() == 'same'
+
+
+# ---- R3: the copy check by directory, its second pass by index
+
+def _random_trees(root, seed):
+	'''Two sources merged into one destination, with clashes planted: a landing missing, one with other content, one that is
+	a link, two landings that are one file (a hard link), and both sources' files of one name.'''
+	rng = random.Random(seed)
+	entries = []
+	for source in ('a', 'b'):
+		for _ in range(rng.randrange(20, 60)):
+			rel = os.path.join(*['d%d' % rng.randrange(4) for _ in range(rng.randrange(1, 3))], 'f%d' % rng.randrange(12))
+			path = os.path.join(root, source, rel)
+			if os.path.isdir(path) or any(os.path.isfile(part) for part in hpcp._path_and_parents(os.path.dirname(path), root)):
+				continue
+			os.makedirs(os.path.dirname(path), exist_ok=True)
+			with open(path, 'w') as handle:
+				handle.write(source + rel)
+			entries.append(path)
+	out = os.path.join(root, 'out')
+	for path in entries:
+		landing = os.path.join(out, os.path.relpath(path, os.path.join(root, path[len(root) + 1])))
+		if os.path.isdir(landing) or any(os.path.isfile(part) for part in hpcp._path_and_parents(os.path.dirname(landing), out)):
+			continue
+		os.makedirs(os.path.dirname(landing), exist_ok=True)
+		shutil.copy2(path, landing)
+	landings = sorted(os.path.join(dirpath, name) for dirpath, _, names in os.walk(out) for name in names)
+	rng.shuffle(landings)
+	for landing in landings[:3]:
+		os.remove(landing)
+	for landing in landings[3:5]:
+		with open(landing, 'a') as handle:
+			handle.write('changed')
+	if len(landings) > 7:
+		os.remove(landings[5])
+		os.symlink(landings[6], landings[5])
+	if len(landings) > 9:
+		os.remove(landings[7])
+		os.link(landings[8], landings[7])
+	return entries, [os.path.join(root, 'a') + os.sep, os.path.join(root, 'b') + os.sep], [out + os.sep]
+
+
+@posix_only
+@pytest.mark.parametrize('move', [False, True], ids=['copy', 'move'])
+@pytest.mark.parametrize('seed', range(12))
+def test_the_copy_check_by_directory_matches_a_look_by_path(tmp_path, reset_hpcp_globals, monkeypatch, seed, move):
+	# The same {path: why} as a lstat of each landing by its path (9.86's look).
+	entries, src_paths, dests = _random_trees(str(tmp_path), seed)
+	grouped = hpcp._not_held(list(entries), src_paths, dests, max_workers=1, move=move)
+	monkeypatch.setattr(hpcp, '_lstat_below', lambda path, opened: os.lstat(path))
+	by_path = hpcp._not_held(list(entries), src_paths, dests, max_workers=1, move=move)
+	assert grouped == by_path
+	assert grouped or seed is None  # the planted clashes are found
+
+
+@posix_only
+def test_the_second_pass_stats_only_the_entries_met_twice(tmp_path, reset_hpcp_globals, monkeypatch):
+	# 9.86 looked at every landing again when two may be one file; now only those whose fingerprint met another's. out/d3 is
+	# a link to out/d7, so d3's and d7's 20 files each land in one file of one name.
+	src, out = tmp_path / 'src', tmp_path / 'out'
+	for d in range(10):
+		(src / ('d%d' % d)).mkdir(parents=True)
+		(out / ('d%d' % d)).mkdir(parents=True)
+		for f in range(20):
+			(src / ('d%d' % d) / ('f%d' % f)).write_text('%d-%d' % (d, f))
+			shutil.copy2(str(src / ('d%d' % d) / ('f%d' % f)), str(out / ('d%d' % d) / ('f%d' % f)))
+	shutil.rmtree(str(out / 'd3'))
+	os.symlink('d7', str(out / 'd3'))
+	entries = sorted(str(path) for path in src.rglob('f*'))
+	looked = []
+	real = hpcp._lstat_below
+	def counted(path, opened):
+		looked.append(path)
+		return real(path, opened)
+	monkeypatch.setattr(hpcp, '_lstat_below', counted)
+	not_held = hpcp._not_held(entries, [str(src) + os.sep], [str(out) + os.sep], max_workers=1, move=False)
+	assert len(looked) == 200 + 40
+	assert set(not_held) == {str(src / d / ('f%d' % f)) for d in ('d3', 'd7') for f in range(20)}, not_held
