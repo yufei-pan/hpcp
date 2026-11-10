@@ -12232,7 +12232,58 @@ def _same_contents(first, second):
 			if not chunk:
 				return True
 
+# Filesystems where a stat by name is a round trip to a server for each part of the path the client checks again: there
+# the copy check looks at a directory's landings relative to it, opened once (_lstat_below: one path walk a directory, not
+# one a landing). Measured on NFS only (an EL8 v4.1 loopback mounted actimeo=0, a rerun's copy check of 100,000 landings
+# in 10,000 directories: 2.4 times fewer GETATTRs, 2 to 2.4 times faster); the others are listed because their clients
+# ask the server along a path walk in the same way, not measured. On a local filesystem the opens cost more than the
+# path walks they save (about 10 to 25% slower, Docker), so there a landing is looked at by its path, as in 9.86.
+_NETWORK_FS = frozenset(('nfs', 'nfs4', 'lustre', 'gpfs', 'cifs', 'smb3', 'ceph', 'beegfs'))
+
+def _on_network_fs(paths):
+	"""True when one of paths (the destinations) is on a _NETWORK_FS: one stat a destination, its type from the mount table
+	(_mount_type, Linux; elsewhere never, and a destination that cannot be stat'ed is not)."""
+	for path in paths:
+		try:
+			if _mount_type(os.stat(path).st_dev) in _NETWORK_FS:
+				return True
+		except OSError:
+			pass
+	return False
+
 # A landing directory opened to look at the names in it (_lstat_below): on Linux by O_PATH, which needs no read permission.
+_LOOK_DIRECTORY_FLAGS = getattr(os, 'O_PATH', os.O_RDONLY) | getattr(os, 'O_DIRECTORY', 0) | getattr(os, 'O_CLOEXEC', 0)
+
+class _OpenedDirectories(dict):
+	"""{directory: its descriptor, None where it is not there, False where it is asked by path}: the landing directories one
+	chunk of the copy check opened (_lstat_below), closed at the chunk's end."""
+	def __enter__(self):
+		return self
+	def __exit__(self, *exc):
+		for fd in self.values():
+			if type(fd) is int:
+				os.close(fd)
+
+def _lstat_below(path, opened):
+	"""os.lstat(path), relative to its directory opened once for all the names in it (opened: _OpenedDirectories): one path
+	walk a directory, not one a name. The same answer: the kernel resolves the directory as the path walk does (a link to it
+	followed, an 8.3 alias of the name found), and a directory that is not there has no names. One that cannot be opened for
+	this (another error) is asked by path."""
+	directory, name = os.path.split(path)
+	if not name:
+		return os.lstat(path)
+	if directory not in opened:
+		try:
+			opened[directory] = os.open(directory, _LOOK_DIRECTORY_FLAGS)
+		except OSError as e:
+			opened[directory] = None if e.errno in (errno.ENOENT, errno.ENOTDIR) else False
+	fd = opened[directory]
+	if fd is None:
+		raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), path)
+	if fd is False or os.stat not in os.supports_dir_fd:
+		return os.lstat(path)
+	return os.lstat(name, dir_fd=fd)
+
 def _not_held(entries, src_paths, dests, dest_image=False, max_workers=1, move=True):
 	"""The files and links of a copy (entries: absolute source paths) that no landing holds, as {path: why}: a move keeps
 	them. A backstop that needs no rule on names: whatever the destination took for one name (an 8.3 alias, a legacy
@@ -12252,9 +12303,11 @@ def _not_held(entries, src_paths, dests, dest_image=False, max_workers=1, move=T
 	symlink); and, where the two share a directory as spelled and only their numbers differ (exFAT through FUSE gives each
 	spelling a number of its own), the directory is asked by making both names (_ask_names). A landing that is one file
 	with the landing of another source (another file) holds neither: both stay, whatever the content each now shows. One
-	lstat of each source and each landing (a copy: of each landing), in max_workers threads where a stat waits (on NFS each is
-	a round trip); a file is read only when its landing's time disagrees. Where two landings may be one file, only the
-	entries whose fingerprint met another's are looked at again. Memory: entries as a list, 16 bytes for each landing, and
+	lstat of each source and each landing (a copy: of each landing), in max_workers threads where a stat waits; a file is
+	read only when its landing's time disagrees. Where a destination is on a network filesystem (_NETWORK_FS), the entries go
+	by source directory and each landing is lstat'ed relative to its directory, opened once a chunk (_lstat_below); elsewhere
+	by its path. Where two landings may be one file, only the entries whose fingerprint met another's are looked at again.
+	Memory: entries as a list, 16 bytes for each landing (and 8 for each entry, its place by directory, when grouped), and
 	records only for what is reported or asked; the stats are dropped once looked at."""
 	by_source = _by_source(_src_to_dest_map(src_paths, dests, dest_image))
 	# A file's landings are its directory's, with its name: each directory is mapped once (a source itself goes by _landings).
@@ -12295,12 +12348,13 @@ def _not_held(entries, src_paths, dests, dest_image=False, max_workers=1, move=T
 			return os.lstat(path)
 		except OSError:
 			return None
-	def landed(path, st):
-		"""(the source's lstat or None, [(landing, its stat, written through a link)] for each landing there)."""
+	def landed(path, st, lstat):
+		"""(the source's lstat or None, [(landing, its stat, written through a link)] for each landing there). lstat: os.lstat,
+		or _lstat_below with the chunk's opened directories."""
 		found = []
 		for landing in landings_of(path):
 			try:
-				lt = os.lstat(landing)
+				lt = lstat(landing)
 			except OSError:
 				continue
 			if stat.S_ISLNK(lt.st_mode) and st is None:
@@ -12325,45 +12379,58 @@ def _not_held(entries, src_paths, dests, dest_image=False, max_workers=1, move=T
 		"""(the fingerprints of chunk's landing files with the position of each one's entry, {path: why} not held, {directory:
 		[(path, landing)]} to ask, and {path: its held landings} for those asked about)."""
 		prints, owners, not_held, ask, held = array.array('q'), array.array('q'), {}, {}, {}
-		for position in chunk:
-			path = entries[position]
-			st = source_stat(path) if move else None
-			if move and st is None:
-				# Gone already: the removal has nothing to take.
-				continue
-			st, found = landed(path, st)
-			for _, lt, _ in found:
-				if lt.st_nlink < 2:
-					prints.append(hash((lt.st_dev, lt.st_ino)))
-					owners.append(position)
-			if not move:
-				# A copy whose landing is not there, though its source still is: lost (on vfat, beside an 8.3 alias of its
-				# name). A copy that failed has said so, and hpcp() leaves these out for its sources.
-				if not found and (st or source_stat(path)):
-					not_held[path] = f'it is at none of its landings ({", ".join(landings_of(path))})'
-				continue
-			why, mine, pairs = None, [], []
-			for landing, lt, through_link in found:
-				reason = judge(path, st, landing, lt, through_link)
-				if reason:
-					why = why or reason
+		with _OpenedDirectories() as opened:
+			lstat = functools.partial(_lstat_below, opened=opened) if grouped else os.lstat
+			for position in chunk:
+				path = entries[position]
+				st = source_stat(path) if move else None
+				if move and st is None:
+					# Gone already: the removal has nothing to take.
 					continue
-				if os.path.dirname(landing) == os.path.dirname(path) and (lt.st_dev, lt.st_ino) != (st.st_dev, st.st_ino):
-					pairs.append((path, landing))
-				mine.append(landing)
-			if not mine:
-				not_held[path] = why or f'it is at none of its landings ({", ".join(landings_of(path))})'
-			elif pairs:
-				ask.setdefault(os.path.dirname(path), []).extend(pairs)
-				held[path] = mine
+				st, found = landed(path, st, lstat)
+				for _, lt, _ in found:
+					if lt.st_nlink < 2:
+						prints.append(hash((lt.st_dev, lt.st_ino)))
+						owners.append(position)
+				if not move:
+					# A copy whose landing is not there, though its source still is: lost (on vfat, beside an 8.3 alias of its
+					# name). A copy that failed has said so, and hpcp() leaves these out for its sources.
+					if not found and (st or source_stat(path)):
+						not_held[path] = f'it is at none of its landings ({", ".join(landings_of(path))})'
+					continue
+				why, mine, pairs = None, [], []
+				for landing, lt, through_link in found:
+					reason = judge(path, st, landing, lt, through_link)
+					if reason:
+						why = why or reason
+						continue
+					if os.path.dirname(landing) == os.path.dirname(path) and (lt.st_dev, lt.st_ino) != (st.st_dev, st.st_ino):
+						pairs.append((path, landing))
+					mine.append(landing)
+				if not mine:
+					not_held[path] = why or f'it is at none of its landings ({", ".join(landings_of(path))})'
+				elif pairs:
+					ask.setdefault(os.path.dirname(path), []).extend(pairs)
+					held[path] = mine
 		return prints, owners, not_held, ask, held
 	entries = entries if isinstance(entries, list) else list(entries)
+	grouped = _on_network_fs(dests)
+	if grouped:
+		# The entries by source directory (a source directory's files share their landing directories, each opened once a
+		# chunk), as their positions.
+		by_directory = {}
+		for index, path in enumerate(entries):
+			by_directory.setdefault(path.rpartition(os.sep)[0], []).append(index)
+		order = array.array('q', itertools.chain.from_iterable(by_directory.values()))
+		del by_directory
+	else:
+		order = range(len(entries))
 	def chunks(positions):
 		# 1024 entries a chunk: _looked_at's thread handoff
 		it = iter(positions)
 		return iter(lambda: list(itertools.islice(it, 1024)), [])
 	prints, owners, not_held, ask, held = array.array('q'), array.array('q'), {}, {}, {}
-	for part_prints, part_owners, part_not_held, part_ask, part_held in _looked_at(chunks(range(len(entries))), look, max_workers):
+	for part_prints, part_owners, part_not_held, part_ask, part_held in _looked_at(chunks(order), look, max_workers):
 		prints.extend(part_prints)
 		owners.extend(part_owners)
 		not_held.update(part_not_held)
@@ -12395,11 +12462,13 @@ def _not_held(entries, src_paths, dests, dest_image=False, max_workers=1, move=T
 	del prints, owners
 	def collect(chunk):
 		met = []
-		for position in chunk:
-			path = entries[position]
-			st, found = landed(path, None)
-			met.extend(((lt.st_dev, lt.st_ino), path, landing) for landing, lt, _ in found
-				if lt.st_nlink < 2 and hash((lt.st_dev, lt.st_ino)) in shared)
+		with _OpenedDirectories() as opened:
+			lstat = functools.partial(_lstat_below, opened=opened) if grouped else os.lstat
+			for position in chunk:
+				path = entries[position]
+				st, found = landed(path, None, lstat)
+				met.extend(((lt.st_dev, lt.st_ino), path, landing) for landing, lt, _ in found
+					if lt.st_nlink < 2 and hash((lt.st_dev, lt.st_ino)) in shared)
 		return met
 	by_file = {}
 	for met in _looked_at(chunks(again), collect, max_workers):

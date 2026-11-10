@@ -1,5 +1,5 @@
-'''9.87 group 4: a rerun's looks (R1), the identical file's metadata (R2), the copy check's second pass (R3). In process, as the
-plan's probes count (probe/p1_rerun_calls.py, p3_first_and_dirs.py).'''
+'''9.87 group 4: a rerun's looks (R1), the identical file's metadata (R2), the copy check (R3: its second pass by index, and by
+directory on a network filesystem). In process, as the plan's probes count (probe/p1_rerun_calls.py, p3_first_and_dirs.py).'''
 import collections
 import contextlib
 import errno
@@ -344,7 +344,7 @@ def test_a_landing_swapped_after_the_look_gets_no_metadata(tmp_path, reset_hpcp_
 		assert handle.read() == 'same'
 
 
-# ---- R3: the copy check's second pass by index
+# ---- R3: the copy check's second pass by index; by directory on a network filesystem
 
 def _random_trees(root, seed):
 	'''Two sources merged into one destination, with clashes planted: a landing missing, one with other content, one that is
@@ -423,3 +423,57 @@ def test_the_second_pass_stats_only_the_entries_met_twice(tmp_path, reset_hpcp_g
 	monkeypatch.setattr(hpcp.os, 'lstat', real)
 	assert len(looked) == 200 + 40, len(looked)
 	assert set(not_held) == {str(src / d / ('f%d' % f)) for d in ('d3', 'd7') for f in range(20)}, not_held
+
+
+@posix_only
+@pytest.mark.parametrize('move', [False, True], ids=['copy', 'move'])
+@pytest.mark.parametrize('seed', range(12))
+def test_the_copy_check_by_directory_matches_a_look_by_path(tmp_path, reset_hpcp_globals, monkeypatch, seed, move):
+	# Where the destination is on a network filesystem, each landing is lstat'ed relative to its directory, opened once a
+	# chunk (_lstat_below): the same {path: why} as a look by its path, the planted clashes and links to directories too.
+	entries, src_paths, dests = _random_trees(str(tmp_path), seed)
+	by_path = hpcp._not_held(list(entries), src_paths, dests, max_workers=1, move=move)
+	monkeypatch.setattr(hpcp, '_on_network_fs', lambda paths: True)
+	looked = []
+	real = hpcp._lstat_below
+	def counted(path, opened):
+		looked.append(path)
+		return real(path, opened)
+	monkeypatch.setattr(hpcp, '_lstat_below', counted)
+	grouped = hpcp._not_held(list(entries), src_paths, dests, max_workers=1, move=move)
+	assert grouped == by_path
+	assert grouped and looked  # the planted clashes are found, by directory
+
+
+@posix_only
+@pytest.mark.parametrize('kind', ['nfs4', 'nfs', 'lustre', 'cifs', 'xfs', 'ext4', None])
+def test_the_copy_check_goes_by_directory_only_on_a_network_filesystem(tmp_path, reset_hpcp_globals, monkeypatch, kind):
+	# NFS measured (EL8, actimeo=0): 2.4 times fewer GETATTRs and 2 to 2.4 times faster by directory; locally the opens cost
+	# more than the path walks they save, so a local destination is looked at by path (9.86's). The type is asked once a
+	# destination (_mount_type: None off Linux, and for a mount the table does not list), never once a landing.
+	src, out = tmp_path / 'src', tmp_path / 'out'
+	for d in range(3):
+		(src / ('d%d' % d)).mkdir(parents=True)
+		(out / ('d%d' % d)).mkdir(parents=True)
+		for f in range(5):
+			(src / ('d%d' % d) / ('f%d' % f)).write_text('x')
+			shutil.copy2(str(src / ('d%d' % d) / ('f%d' % f)), str(out / ('d%d' % d) / ('f%d' % f)))
+	entries = sorted(str(path) for path in src.rglob('f*'))
+	asked = []
+	monkeypatch.setattr(hpcp, '_mount_type', lambda dev: asked.append(dev) or kind)
+	by_name, relative = [], []
+	real = os.lstat
+	def counted(path, *args, **kwargs):
+		if kwargs.get('dir_fd') is not None:
+			relative.append(path)
+		elif str(path).startswith(str(out) + os.sep):
+			by_name.append(path)
+		return real(path, *args, **kwargs)
+	monkeypatch.setattr(hpcp.os, 'lstat', counted)
+	not_held = hpcp._not_held(entries, [str(src) + os.sep], [str(out) + os.sep], max_workers=1, move=True)
+	monkeypatch.setattr(hpcp.os, 'lstat', real)
+	assert not_held == {} and len(asked) == 1
+	if kind in hpcp._NETWORK_FS:
+		assert (len(relative), by_name) == (15, [])
+	else:
+		assert (relative, len(by_name)) == ([], 15)
