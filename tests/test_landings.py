@@ -2294,6 +2294,11 @@ def test_an_early_stop_prints_no_traceback(tmp_path, method, batch):
 		finally:
 			if task.poll() is None:
 				os.killpg(task.pid, signal.SIGKILL)
+		if code == 'timeout' and sys.version_info < (3, 7):
+			# Python 3.6's pool can hang in its first submit when the stop that ended a worker left the queue's write lock held:
+			# review A saw 5 hangs in 5,520 early stops (about 1 session in 28). Not this test's subject: limitations.md, "On
+			# Python 3.6 an early stop can rarely hang the run in a pool's submit" (F1, deferred to 9.88). A hang elsewhere fails.
+			pytest.xfail('the Python 3.6 submit hang, F1, deferred to 9.88 (docs/limitations.md)')
 		assert code == 130 and b'Traceback' not in output, (run, output[-3000:])
 
 
