@@ -110,6 +110,8 @@ def _clear_hpcp_transient_state():
 		hpcp._EXT_MKFS_FEATURE_KNOWN.clear()
 	# Reading a list from stdin sets it and only hpcp() clears it: a test calling further in would ask /dev/tty.
 	hpcp._STDIN_HELD_LIST = False
+	# A task run in this process (_run_task) leaves its parent's handed answer (_held_route) behind.
+	hpcp._HELD_GIVEN = None
 	# The door's per-process cache (_DOORS, by RUN_ID: None outside hpcp()) would remember a directory pytest has removed.
 	if hasattr(hpcp, '_DOORS'):
 		hpcp._DOORS.clear()

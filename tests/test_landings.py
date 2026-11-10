@@ -3224,3 +3224,29 @@ def test_a_node_source_that_cannot_go_beside_keeps_the_old_file_and_says_why(tmp
 		os.chmod(str(tmp_path / 'out'), 0o755)
 	assert rc == 190 and read(tmp_path / 'out/p') == 'old' and b'-wb writes beside it; ' in output, output[-2000:]
 	assert b'it would be written in place' not in output, output[-2000:]
+
+
+_STOP_AS_STOPS_GO_IN = '''
+import os, signal, sys
+sys.path.insert(0, %(root)r)
+import hpcp
+real = signal.signal
+def switch(signum, handler):
+	result = real(signum, handler)
+	if signum == signal.SIGTERM and handler is hpcp._stop:
+		os.kill(os.getpid(), signal.SIGINT)
+	return result
+signal.signal = switch
+sys.argv = ['hpcp', '-V']
+hpcp.main()
+'''
+
+
+@posix_only
+def test_a_stop_as_the_stops_go_in_ends_quietly(tmp_path):
+	# A Ctrl-C landing once SIGINT's handler is in, while main() installs the next one: _stop raised it inside signal.signal,
+	# outside main()'s try, and Python printed a traceback and exited 1 (1 early Ctrl-C in 2,400 on 3.7 in the review's probe).
+	script = tmp_path / 'stops.py'
+	script.write_text(_STOP_AS_STOPS_GO_IN % {'root': os.path.dirname(HPCP)})
+	done = subprocess.run([sys.executable, str(script)], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=60)
+	assert done.returncode == 130 and b'Traceback' not in done.stdout, done.stdout

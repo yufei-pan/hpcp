@@ -1175,6 +1175,8 @@ _TASK_SETTINGS = ('NAMED_DESTS', 'RUN_ID', 'CONTENT_ONLY', 'WRITE_BESIDE', 'READ
 def _submit_task(executor, func, *args, **kwargs):
 	"""Submit func to a process pool (a _pool) with this process's run settings; collect it with _task_result."""
 	settings = {name: globals()[name] for name in _TASK_SETTINGS}
+	# What _copy_pool asked once for the run's workers (_held_route): the same cp and the same /proc in every process of it.
+	settings['_HELD_GIVEN'] = (_HELD[1],) if _HELD[0] == os.getpid() else None
 	return executor.submit(_run_task, settings, func, *args, **kwargs)
 
 def _run_task(settings, func, *args, **kwargs):
@@ -4130,7 +4132,10 @@ def _init_space_share(array):
 	_SPACE_WARNED = (array.get_lock(), array.get_obj(), array)
 
 def _copy_pool(max_workers):
-	"""The pool for jobs that may run copy_file, its workers sharing the run's slots (forked ones inherit them)."""
+	"""The pool for jobs that may run copy_file, its workers sharing the run's slots (forked ones inherit them). Asked here, in
+	the parent and outside the pool: how cp writes a held file (_held_route), which its workers are handed (_submit_task), so
+	none makes a probe file or runs a cp for it (an early Ctrl-C met each worker's probe, and left its file)."""
+	_held_route()
 	return _pool(max_workers, space=True)
 
 def _mount_type(dev):
@@ -4213,6 +4218,7 @@ def _cp_to(command, src_path, target, space=None):
 # lease (EAGAIN), not inherited by cp; no O_TRUNC (cp truncates it).
 _LANDING_FLAGS = os.O_WRONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NONBLOCK', 0) | getattr(os, 'O_CLOEXEC', 0)
 _HELD = [None, None]  # (pid, _held_route's answer): asked once per process, so a forked worker asks for itself
+_HELD_GIVEN = None  # (_held_route's answer,), a worker's, handed by its parent's task (_submit_task): the worker asks no cp
 # The name under which cp opens a descriptor it inherited (pass_fds): its own process's, so no other process's /proc is asked.
 _HELD_NAME = '/dev/fd/%d' if sys.platform == 'darwin' else '/proc/self/fd/%d'
 
@@ -4221,7 +4227,8 @@ def _held_route():
 	the file at the source's size (Linux reopens /proc/self/fd/N and truncates; macOS's copyfile truncates after its copy),
 	'cb' when it writes through it but leaves an old tail (a dup opened without truncating: hpcp empties the held file before
 	each cp), None when it does not: cp then gets the name, as 9.84 gave it. Asked once per process by doing it: cp, with the
-	run's flags, copies a 1-byte source holding c onto a held temporary file holding ab, which is read back. Only on Linux
+	run's flags, copies a 1-byte source holding c onto a held temporary file holding ab, which is read back (a pool's workers are
+	handed their parent's answer, _HELD_GIVEN, and ask nothing). Only on Linux
 	with GNU cp (BusyBox's makes every destination anew) and on macOS; elsewhere None. A cp that times out or cannot start
 	keeps no answer (asked again at the next copy, as cp_supports_sparse); a cp that fails or writes elsewhere, or no
 	temporary file (tempfile's TMPDIR, /tmp, /var/tmp, /usr/tmp and the working directory), is None. Both temporary files
@@ -4229,6 +4236,8 @@ def _held_route():
 	pid = os.getpid()
 	if _HELD[0] == pid:
 		return _HELD[1]
+	if _HELD_GIVEN is not None:
+		return _HELD_GIVEN[0]
 	_HELD[:] = [pid, None]
 	if sys.platform.startswith('linux'):
 		gnu = cp_supports_sparse()
@@ -4241,7 +4250,10 @@ def _held_route():
 		return None
 	source = None
 	try:
-		handle, source = tempfile.mkstemp(prefix='hpcp-held-probe-')
+		# Named before it is made, so the finally removes whatever a stop leaves: mkstemp gives the name only after making the
+		# file, and a stop in between left it (about 3% of early Ctrl-Cs on Python 3.6 and 3.7, one file per worker hit).
+		source = os.path.join(tempfile.gettempdir(), 'hpcp-held-probe-%d-%s' % (os.getpid(), uuid.uuid4().hex[:16]))
+		handle = os.open(source, _NEW_FILE_FLAGS, 0o600)
 		try:
 			os.write(handle, b'c')
 		finally:
@@ -4260,9 +4272,12 @@ def _held_route():
 	except Exception:
 		pass  # no temporary file: no route
 	finally:
+		# No call before the unlink (a stop on Python 3.6 to 3.9 can land between any two instructions here).
 		if source is not None:
-			with contextlib.suppress(OSError):
+			try:
 				os.unlink(source)
+			except OSError:
+				pass
 	return _HELD[1]
 
 def _cp_held(command, src_path, target, fd, fst, space, through_link, new=False):
@@ -4332,11 +4347,14 @@ def _cp_made(command, src_path, target, src_st, space):
 	FileExistsError when a name is there) and cp writes through its own descriptor (_cp_held): (that descriptor, still open
 	for the caller to close, the made file's fstat, the size); None where cp has to make it by name (below). A failure
 	removes the made file while its name still leads to it.
-	A plain run gives the new file the source's SELinux label (_label_like), owner and group before cp writes it: cp -a gives
-	a file it did not make another owner only after narrowing its mode and ACL to the owner's (the entries a default ACL gave
-	it go), where a file it makes keeps them. Where they cannot be given (not root) and the file has such entries: None, the
-	file removed, for cp by name as in 9.86. A mode its owner cannot write (-co's 0444 source, a umask taking owner write)
-	has owner write while cp writes, which cp's reopen needs; -co puts the mode back."""
+	A plain run gives the new file the source's SELinux label (_label_like) before cp writes it, and its owner and group too
+	where a default ACL gave it entries beyond its mode: cp -a gives a file it did not make another owner only after
+	narrowing its mode and ACL to the owner's (the entries go), where a file it makes keeps them. Where they cannot be given
+	(not root) and the file has such entries: None, the file removed, for cp by name as in 9.86. Without such entries cp -a
+	gives the owner once it has written, as by name: given first, the data would be charged to the owner while it is written
+	(XFS enforces an owner's quota on a root write, not on root's chown: a user at the hard limit got Disk quota exceeded where
+	9.86 completed). A mode its owner cannot write (-co's 0444 source, a umask taking owner write) has owner write while cp
+	writes, which cp's reopen needs; -co puts the mode back."""
 	src_st = src_st or os.lstat(src_path)
 	fd = os.open(target, _NEW_FILE_FLAGS, _new_file_mode(src_st))
 	made = None
@@ -4344,10 +4362,13 @@ def _cp_made(command, src_path, target, src_st, space):
 		made = os.fstat(fd)
 		if not CONTENT_ONLY:
 			_label_like(src_path, fd)
-			try:
-				os.fchown(fd, src_st.st_uid, src_st.st_gid)
-			except PermissionError:
-				if _has_acl(fd):
+			if _has_acl(fd):
+				# Only where a default ACL gave the file entries, which cp -a would narrow away: elsewhere cp -a gives the owner
+				# once it has written, as by name, so the data is charged to the runner while it is written (XFS enforces the
+				# owner's quota on a root write, not on root's chown).
+				try:
+					os.fchown(fd, src_st.st_uid, src_st.st_gid)
+				except PermissionError:
 					_drop_made(target, made)
 					os.close(fd)
 					return None
@@ -4471,8 +4492,24 @@ def _cp_once(src_path, dest_path, cp_flags, sparse, space=None, look=None, src_s
 	renamed over it once whole (_cp_beside); never to cp by name. look: _landing_of(dest_path) when the caller just took it
 	(copy_file's first attempt); src_st: the source's lstat."""
 	target, st, named = look or _landing_of(dest_path)
+	_judge_landing(dest_path, target, st, named)
+	_dest_directory(os.path.dirname(target), make=not NO_CREATE_DIR, source=os.path.dirname(os.path.abspath(src_path)))
+	command = ["cp", cp_flags] + (["--sparse=always"] if sparse and cp_supports_sparse() else [])
+	# A name that appears at a first copy's landing between the look and hpcp's create is looked at again, judged as the first
+	# look was, and the route that fits it taken; 3 times, the door's bound for the same race.
+	for _ in range(3):
+		try:
+			return _cp_landing(command, src_path, dest_path, target, st, named, space, src_st)
+		except FileExistsError:
+			target, st, named = _landing_of(dest_path)
+			_judge_landing(dest_path, target, st, named)
+	raise OSError(errno.EAGAIN, 'it kept changing while it was copied', target)
+
+def _judge_landing(dest_path, target, st, named):
+	"""What no look at a landing lets through (_cp_once), at every look: a dangling link the operator named (cp writes through
+	none, nor does hpcp: a planted one would have it make directories and a file anywhere), one the kernel will not follow
+	for this run, and a directory (cp would copy into it, through whatever is there)."""
 	if named and st is None and os.path.islink(dest_path):
-		# cp writes through no dangling link, nor does hpcp: a planted one would have it make directories and a file anywhere.
 		raise _KeptOld(f'{dest_path} is a link to {os.readlink(dest_path)}, which does not exist (cp writes through no dangling link)')
 	if named and st is not None and stat.S_ISLNK(st.st_mode):
 		# _landing_of left it: the kernel will not follow it for this run (another user's link in a sticky directory:
@@ -4483,16 +4520,8 @@ def _cp_once(src_path, dest_path, cp_flags, sparse, space=None, look=None, src_s
 			raise _KeptOld(f'{dest_path} is a link to {os.readlink(dest_path)}, which cannot be followed ({_why(e)})')
 		except OSError:
 			pass
-	_dest_directory(os.path.dirname(target), make=not NO_CREATE_DIR, source=os.path.dirname(os.path.abspath(src_path)))
-	command = ["cp", cp_flags] + (["--sparse=always"] if sparse and cp_supports_sparse() else [])
-	# A name that appears at a first copy's landing between the look and hpcp's create is looked at again, and the route that
-	# fits it taken; 3 times, the door's bound for the same race.
-	for _ in range(3):
-		try:
-			return _cp_landing(command, src_path, dest_path, target, st, named, space, src_st)
-		except FileExistsError:
-			target, st, named = _landing_of(dest_path)
-	raise OSError(errno.EAGAIN, 'it kept changing while it was copied', target)
+	if st is not None and stat.S_ISDIR(st.st_mode):
+		raise _Refused(f'{target} is a directory, not copying ', ' over it')
 
 def _cp_landing(command, src_path, dest_path, target, st, named, space, src_st):
 	"""_cp_once's copy onto target, dest_path's landing, by what its look found there (st, named). FileExistsError: a first
@@ -14579,9 +14608,11 @@ def main():
 	# A stop runs Ctrl-C's cleanup here too: a serial run copies in this process, and hpcp() cleans up mounts in a finally.
 	# Installed first: a stop while the arguments are read ends the run quietly, as the signal asked (below).
 	_MAIN_PID = os.getpid()
-	_install_stops()
 	rtnCode = 0
 	try:
+		# In the try: a stop landing while the later stops go in raises from the first one's handler (_stop), inside
+		# signal.signal, and ends the run quietly as any stop before hpcp() does.
+		_install_stops()
 		_escape_unencodable_stdout()
 		args = get_args()
 		# after get_args: -h and -V print only what they are asked for

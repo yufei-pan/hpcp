@@ -18,6 +18,7 @@ import pytest
 
 import hpcp
 
+HPCP = hpcp.__file__
 posix_only = pytest.mark.skipif(os.name != 'posix', reason='POSIX')
 linux_only = pytest.mark.skipif(not sys.platform.startswith('linux'), reason='the held route on Linux: /proc/self/fd')
 root_only = pytest.mark.skipif(not hasattr(os, 'geteuid') or os.geteuid() != 0, reason='needs root')
@@ -48,6 +49,7 @@ def fresh(monkeypatch, reset_hpcp_globals):
 	monkeypatch.setattr(hpcp, '_badOverrides', {})
 	monkeypatch.setattr(hpcp, '_SPARSE', [None, False])
 	monkeypatch.setattr(hpcp, '_HELD', [None, None])
+	monkeypatch.setattr(hpcp, '_HELD_GIVEN', None)
 	hpcp.check_path.cache_clear()
 	yield hpcp
 	hpcp.check_path.cache_clear()
@@ -401,6 +403,25 @@ def test_a_first_copy_ends_as_cp_by_name_makes_it(tmp_path, fresh, monkeypatch, 
 
 @linux_only
 @root_only
+def test_a_root_first_copy_is_given_its_owner_only_once_written(tmp_path, fresh, monkeypatch):
+	# cp -a gives a file its owner once it has written it (9.86 by name): given first, XFS charges the data to the owner's
+	# quota while root writes it, and a user at the hard limit got Disk quota exceeded where 9.86 completed (shown on a real
+	# XFS with a 1 MiB limit). A file with a default ACL is still given its owner first (cp -a would narrow its entries).
+	_held_or_skip()
+	src = write(tmp_path / 'src/f', 'owned by someone else')
+	os.chown(src, 1234, 1234)
+	owners = []
+	real = hpcp.run_command_in_multicmd_with_path_check
+	def cp(command, *args, **kwargs):
+		owners.append(os.stat(command[-1]).st_uid)
+		return real(command, *args, **kwargs)
+	monkeypatch.setattr(hpcp, 'run_command_in_multicmd_with_path_check', cp)
+	_copy_file(monkeypatch, src, tmp_path / 'out/f')
+	assert owners == [0] and os.stat(str(tmp_path / 'out/f')).st_uid == 1234, owners
+
+
+@linux_only
+@root_only
 @pytest.mark.parametrize('content_only', [False, True], ids=['plain', 'content-only'])
 def test_a_first_copy_s_selinux_label_is_cp_by_name_s(tmp_path, fresh, monkeypatch, content_only):
 	# Plain: hpcp gives the new, empty file the source's label before cp writes it (cp -a sets an existing file's label by
@@ -563,3 +584,127 @@ def test_the_held_route_works_from_a_pid_namespace_without_its_own_proc():
 	result = _swap_run(prefix=[unshare, '-p', '-f'])
 	assert result['pid'] == 1, result
 	_written_through_the_held_file(result)
+
+
+@posix_only
+@pytest.mark.parametrize('case', ['named-dangling-link', 'directory-holding-a-link'])
+def test_what_appears_at_a_first_copy_s_name_is_judged_as_the_first_look_is(tmp_path, fresh, monkeypatch, case):
+	# A name put at a first copy's landing between the look and hpcp's create makes the create fail (O_EXCL), and the landing
+	# is looked at again. That look is judged as the first one is: a dangling link the operator named is not written through
+	# (9.86's cp refused it; judged only at the first look, hpcp made the file where it points), and a directory is not
+	# copied into (cp by name wrote through a link inside it, in 9.86 too).
+	_held_or_skip()
+	src = write(tmp_path / 'a/x', 'NEW')
+	victim = write(tmp_path / 'victim/file', 'victim')
+	out = str(tmp_path / 'out')
+	os.makedirs(out)
+	landing = os.path.join(out, 'y' if case == 'named-dangling-link' else 'x')
+	real = hpcp._claim_device
+	def plant(target, st, named, src_path):
+		if not os.path.lexists(landing):
+			if case == 'named-dangling-link':
+				os.symlink('../victim/new', landing)
+			else:
+				os.mkdir(landing)
+				os.symlink(victim, os.path.join(landing, 'x'))
+		return real(target, st, named, src_path)
+	monkeypatch.setattr(hpcp, '_claim_device', plant)
+	monkeypatch.setattr(hpcp, 'NAMED_DESTS', frozenset([landing if case == 'named-dangling-link' else out]))
+	monkeypatch.setattr(hpcp, 'RUN_ID', 'held-%d' % next(_RUNS))
+	with contextlib.redirect_stdout(io.StringIO()):
+		hpcp.copy_file(src, [landing])
+	assert read(victim) == 'victim' and not os.path.lexists(str(tmp_path / 'victim/new')), hpcp.ERRORS
+	assert hpcp.ERRORS
+
+
+@linux_only
+def test_a_stop_as_the_probe_makes_its_file_leaves_nothing(tmp_path, fresh, monkeypatch):
+	# A stop landing just after the probe made its source file (an early Ctrl-C meets each worker's first copy there): named
+	# only once mkstemp had made it, the file was left in the temporary directory (about 3% of early Ctrl-Cs on 3.6 and 3.7).
+	_gnu_cp_or_skip()
+	probes = _probe_dir(tmp_path, monkeypatch)
+	real = os.open
+	def stopped(path, flags, *args, **kwargs):
+		fd = real(path, flags, *args, **kwargs)
+		if os.path.basename(str(path)).startswith('hpcp-held-probe-') and flags & os.O_CREAT:
+			os.close(fd)
+			raise KeyboardInterrupt
+		return fd
+	monkeypatch.setattr(os, 'open', stopped)
+	with pytest.raises(KeyboardInterrupt):
+		hpcp._held_route()
+	monkeypatch.setattr(os, 'open', real)
+	assert os.listdir(probes) == []
+
+
+class _CapturingExecutor:
+	def __init__(self):
+		self.submitted = []
+
+	def submit(self, func, *args, **kwargs):
+		self.submitted.append((func, args, kwargs))
+
+
+@linux_only
+def test_a_pool_s_workers_are_handed_the_route_the_parent_asked(tmp_path, fresh, monkeypatch):
+	# The parent asks cp once, as it opens a copy pool; a worker is handed the answer with its task and runs no probe of its own
+	# (an early Ctrl-C met each worker's probe, and left its file in the temporary directory).
+	_gnu_cp_or_skip()
+	probes = _probe_dir(tmp_path, monkeypatch)
+	monkeypatch.setattr(hpcp, '_pool', lambda *args, **kwargs: None)
+	assert hpcp._copy_pool(2) is None
+	assert hpcp._HELD[:] == [os.getpid(), 'c'] and os.listdir(probes) == []
+	executor = _CapturingExecutor()
+	hpcp._submit_task(executor, len, 'abc')
+	(_, (settings, _, _), _), = executor.submitted
+	assert settings['_HELD_GIVEN'] == ('c',)
+	# the worker: a process of its own, which asks nothing
+	monkeypatch.setattr(hpcp, '_HELD', [None, None])
+	monkeypatch.setattr(hpcp, '_HELD_GIVEN', settings['_HELD_GIVEN'])
+	def asked(*args, **kwargs):
+		raise AssertionError('the worker asked cp for the route itself')
+	monkeypatch.setattr(hpcp.multiCMD, 'run_commands', asked)
+	monkeypatch.setattr(hpcp, 'cp_supports_sparse', asked)
+	assert hpcp._held_route() == 'c'
+	# no answer in the parent (cp timed out): nothing is handed, and the worker asks for itself
+	monkeypatch.setattr(hpcp, '_HELD', [None, None])
+	executor = _CapturingExecutor()
+	hpcp._submit_task(executor, len, 'abc')
+	assert executor.submitted[0][1][0]['_HELD_GIVEN'] is None
+
+
+_PROBES_MADE = '''
+import multiprocessing, os, sys
+sys.path.insert(0, %(root)r)
+import hpcp
+multiprocessing.set_start_method('fork', force=True)
+real = os.open
+def counting(path, flags, *args, **kwargs):
+	fd = real(path, flags, *args, **kwargs)
+	if os.path.basename(str(path)).startswith('hpcp-held-probe-') and flags & os.O_CREAT:
+		log = real(%(log)r, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+		os.write(log, b'%%d\\n' %% os.getpid())
+		os.close(log)
+	return fd
+os.open = counting
+sys.argv = ['hpcp', %(src)r, '-d', %(dst)r, '-j', '4']
+hpcp.main()
+'''
+
+
+@linux_only
+@pytest.mark.skipif('fork' not in __import__('multiprocessing').get_all_start_methods(), reason='forked workers see the patch')
+def test_a_run_with_workers_makes_one_probe(tmp_path):
+	# One probe a run (the parent's), where each of its workers made one: the files made are counted in every process.
+	for i in range(40):
+		write(tmp_path / 'src' / ('f%d' % i), 'data %d' % i)
+	log = str(tmp_path / 'probes.log')
+	script = tmp_path / 'probes.py'
+	script.write_text(_PROBES_MADE % {'root': os.path.dirname(HPCP), 'log': log, 'src': str(tmp_path / 'src') + '/', 'dst': str(tmp_path / 'dst') + '/'})
+	done = subprocess.run([sys.executable, str(script)], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=120,
+		env=dict(os.environ, TMPDIR=str(tmp_path)))
+	assert done.returncode == 0 and read(tmp_path / 'dst/f39') == 'data 39', done.stdout
+	if hpcp._held_route() is None:
+		pytest.skip('cp cannot write a held file here')
+	pids = read(log).split() if os.path.exists(log) else []
+	assert len(pids) == 1, (pids, done.stdout)

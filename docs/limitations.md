@@ -133,6 +133,14 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - **Revisit when:** 9.88.
 - **Noted:** 2026-11-10, found by the 9.87 group 1 review (F1); not a regression (9.86 hung more often); the main session's decision, not asked (a deferral).
 
+### A Ctrl-C that lands while Python imports hpcp can be dropped
+- **Kind:** deferred (9.88).
+- **What the operator sees:** a Ctrl-C in the first tenth of a second, while Python is still importing hpcp, is sometimes dropped: the run goes on as if it had not been pressed and exits 0, and with `-rf` it moves. Python's own handler raises the `KeyboardInterrupt` inside an `importlib` weak-reference callback, which Python reports as `Exception ignored in: ...` and discards. Seen in 2 of 2,100 early Ctrl-Cs on Python 3.7 and 1 of 720 on 3.14 in the 9.87 review's probe; 9.86 is the same.
+- **Why:** the signal is lost inside Python's import machinery, before any hpcp code runs; hpcp installs its stop handlers in `main()`, not as the module loads, so that a program importing hpcp as a library keeps its own handlers.
+- **Plan (9.88):** investigate where the signal is lost (a probe that sends SIGINT at each step of the import), then choose between a recording handler installed as the script starts (only when hpcp is run as the program, never when imported) and asking for the import again when it was cut.
+- **Revisit when:** 9.88.
+- **Noted:** 2026-11-10, found by the 9.87 review A; not a regression (9.86 is the same); the main session's decision, not asked (a deferral).
+
 ### A stopped run waits for a worker whose file operation never returns
 - **Kind:** known limitation.
 - **What the operator sees:** after Ctrl-C, SIGTERM or SIGHUP, a worker inside a write or fsync that never returns holds the run (for example a dead hard-mounted NFS server, or a disk in an uninterruptible wait). hpcp prints `Waiting for N worker(s) still finishing a file (pids ...): Ctrl-\ ends hpcp now, which may leave a temporary file or a torn file there`. Ctrl-\ ends it at once, and can leave that worker's temporary file or a torn file. Nothing is removed from the sources.
@@ -198,7 +206,7 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 
 ### Where cp cannot write a file hpcp holds, a landing can be swapped for a link mid-run
 - **Kind:** known limitation.
-- **What the operator sees:** on the BSDs and other systems that are neither Linux nor macOS, a rewrite in place, a first copy and the beside route's new file give `cp` the landing's name, as 9.84 did. A user who can write the destination directory can then swap the landing for a link between hpcp's look and `cp`'s open, and a root run writes where the link leads. The same holds on Linux where `cp` cannot write the held file through its own `/proc/self/fd/N` (hpcp asks once per worker, by doing it):
+- **What the operator sees:** on the BSDs and other systems that are neither Linux nor macOS, a rewrite in place, a first copy and the beside route's new file give `cp` the landing's name, as 9.84 did. A user who can write the destination directory can then swap the landing for a link between hpcp's look and `cp`'s open, and a root run writes where the link leads. The same holds on Linux where `cp` cannot write the held file through its own `/proc/self/fd/N` (hpcp asks once a run, by doing it, in the parent, which hands the workers the answer):
   - a `cp` other than GNU `cp`, such as BusyBox's or uutils' (uutils' `cp` 0.10 writes the held file but sets no mode or times through it, so it is not asked);
   - no `/proc`, or one of a PID namespace that cannot see `cp`;
   - no writable temporary directory for that question;
