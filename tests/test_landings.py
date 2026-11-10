@@ -2249,6 +2249,51 @@ def test_an_early_stop_prints_no_traceback(tmp_path, method, batch):
 		assert code == 130 and b'Traceback' not in output, (run, output[-3000:])
 
 
+_STOP_IN = '''
+import os, signal, sys, weakref
+sys.path.insert(0, %(root)r)
+import hpcp
+hpcp._MAIN_PID = os.getpid()
+hpcp._install_stops()
+def stop_in(name):
+	def trace(frame, event, arg):
+		if event == 'call' and frame.f_code.co_name == name:
+			sys.settrace(None)
+			os.kill(os.getpid(), signal.SIGINT)
+	return trace
+class Going:
+	def __del__(self):
+		pass
+class Item:
+	pass
+if sys.argv[1] == 'del':
+	sys.settrace(stop_in('__del__'))
+	Going()
+else:
+	items, item = weakref.WeakSet(), Item()
+	items.add(item)
+	sys.settrace(stop_in('_remove'))
+	del item
+sys.settrace(None)
+try:
+	hpcp._check_stop()
+except KeyboardInterrupt:
+	print('acted on')
+'''
+
+
+@posix_only
+@pytest.mark.parametrize('where', ['del', 'weakset'])
+def test_a_stop_in_a_call_python_drops_prints_nothing_and_is_acted_on(tmp_path, where):
+	# Python drops a raise in a __del__ or a weakref callback (a thread's, a pool worker's going), and 3.6 and 3.7, which have
+	# no sys.unraisablehook, printed hpcp's stop there as 'Exception ignored' with its traceback: about 1 early Ctrl-C in
+	# 100 under a loaded host (test_an_early_stop_prints_no_traceback, 3.6). There the stop is only recorded, and acted on.
+	script = tmp_path / 'stop_in.py'
+	script.write_text(_STOP_IN % {'root': os.path.dirname(HPCP)})
+	done = subprocess.run([sys.executable, str(script), where], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=60)
+	assert done.returncode == 0 and done.stdout.strip() == b'acted on', done.stdout
+
+
 @posix_only
 @pytest.mark.parametrize('signum', [signal.SIGINT, signal.SIGTERM], ids=['int', 'term'])
 def test_a_stopped_run_leaves_no_multiprocessing_files(tmp_path, signum):

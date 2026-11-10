@@ -38,6 +38,7 @@ import threading
 import time
 import unicodedata
 import uuid
+import weakref
 from collections import Counter, deque, namedtuple
 from concurrent.futures import ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
@@ -887,7 +888,34 @@ def _stop(signum, frame):
 	_pass_stop_on(signum)
 	if _DEFER and os.getpid() == _MAIN_PID:
 		return
+	if _DROPPING and _in_dropping_call(frame):
+		# Python would drop the raise, and 3.6 and 3.7 print it as 'Exception ignored' with its traceback. Recorded, it is acted
+		# on all the same, as on 3.8+ (_check_stop, _run_task).
+		return
 	raise KeyboardInterrupt
+
+def _dropping_codes():
+	"""The code Python runs as an object of a run goes, where a raise is dropped: the weak containers' callbacks (a thread's,
+	a pool worker's, an ABC cache's) and multiprocessing's finalizers; a __del__ is found by its name (_in_dropping_call).
+	Only where Python prints a dropped raise: 3.6 and 3.7 have no sys.unraisablehook (_install_stops)."""
+	if hasattr(sys, 'unraisablehook'):
+		return frozenset()
+	codes = set()
+	for make in (weakref.WeakSet, weakref.WeakValueDictionary, weakref.WeakKeyDictionary):
+		with contextlib.suppress(AttributeError):
+			codes.add(make()._remove.__code__)
+	codes.add(multiprocessing.util.Finalize.__call__.__code__)
+	return frozenset(codes)
+
+_DROPPING = _dropping_codes()
+
+def _in_dropping_call(frame):
+	"""Whether the code a stop interrupted (frame) runs inside a call whose raise Python drops (_dropping_codes)."""
+	while frame is not None:
+		if frame.f_code in _DROPPING or frame.f_code.co_name == '__del__':
+			return True
+		frame = frame.f_back
+	return False
 
 # The pool's worker loop (concurrent.futures.process._process_worker, Python 3.6 to 3.14): a worker's stop raises only while
 # it runs (_stop). Unknown (a Python that renamed it), or no frame to look at: every stop raises, as in 9.86.
