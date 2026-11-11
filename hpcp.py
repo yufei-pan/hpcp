@@ -60,7 +60,6 @@ try:
 		hasher = xxhash.xxh64()
 		xxhash_available = True
 	except ImportError:
-		import hashlib
 		hasher = hashlib.blake2b()
 		xxhash_available = False
 	try:
@@ -6269,10 +6268,7 @@ def _finish_directory(record, sync=False, late=False):
 				if flags != now.st_flags:
 					os.chflags(dest_path, flags, follow_symlinks=False)
 		except OSError as e:
-			if late:
-				eprint(f"Directory sync error: {src_path} to {dest_path}: its mode, set after the move's removal: {e}")
-			else:
-				eprint(f'Directory sync error: {src_path} to {dest_path}: {e}')
+			eprint(f'Directory sync error: {src_path} to {dest_path}: ' + ("its mode, set after the move's removal: " if late else '') + str(e))
 		if sync and (late or _synced_at_finish(mode)):
 			try:
 				os.fsync(fd)
