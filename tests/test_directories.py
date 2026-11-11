@@ -5,6 +5,7 @@ import errno
 import functools
 import os
 import pathlib
+import shutil
 import signal
 import stat
 import subprocess
@@ -690,3 +691,129 @@ def test_a_rerun_gives_a_restrictive_directory_its_source_s_changed_xattr(tmp_pa
 		for root in (src, tmp_path / 'out'):
 			if os.path.isdir(str(root / 'ro')):
 				os.chmod(str(root / 'ro'), 0o755)
+
+
+# ---- 9.88 D3: a destination directory several sources share is synced once, from the later source
+
+T1, T2 = 1600000000 * 10**9, 1650000000 * 10**9
+
+
+def _shared(path, name, mode, mtime_ns):
+	'''path/name, a directory holding a file of its own (name.f), of mode and modification time mtime_ns.'''
+	path.mkdir(parents=True)
+	(path / (name + '.f')).write_text(name)
+	os.chmod(str(path), mode)
+	os.utime(str(path), ns=(mtime_ns, mtime_ns))
+
+
+@posix_only
+@pytest.mark.parametrize('workers', [['-s'], ['-j', '4']], ids=['serial', 'pool'])
+def test_merged_sources_sync_a_shared_directory_once_from_the_later(tmp_path, workers):
+	# 9.87: out/x got a sync and a finish record from each source, so every rerun set its mode and times twice (its ctime moved
+	# each run), and in a pool which source's metadata won was not fixed. The later source's, as merged files go.
+	_shared(tmp_path / 'a' / 'x', 'a', 0o750, T1)
+	_shared(tmp_path / 'b' / 'x', 'b', 0o700, T2)
+	rc, output = run(['a/', 'b/', '-d', 'out/'] + workers, tmp_path)
+	landed = os.lstat(str(tmp_path / 'out' / 'x'))
+	assert rc == 0 and (stat.S_IMODE(landed.st_mode), landed.st_mtime_ns) == (0o700, T2), output[-3000:]
+	rc, output = run(['a/', 'b/', '-d', 'out/'] + workers, tmp_path)
+	again = os.lstat(str(tmp_path / 'out' / 'x'))
+	assert rc == 0 and again.st_ctime_ns == landed.st_ctime_ns and again.st_mtime_ns == T2, output[-3000:]
+
+
+@posix_only
+@pytest.mark.parametrize('workers', [['-s'], ['-j', '4']], ids=['serial', 'pool'])
+def test_a_merged_source_s_root_wins_over_an_earlier_source_s_folder(tmp_path, workers):
+	# hpcp a/ b -d out/ with a/b/ there: out/b is a/b's folder and b's root. 9.87 synced b's root first and a/b in the pool
+	# after it, so the earlier source's metadata won, and a rerun set it twice.
+	_shared(tmp_path / 'a' / 'b', 'a', 0o750, T1)
+	_shared(tmp_path / 'b', 'b', 0o700, T2)
+	rc, output = run(['a/', 'b', '-d', 'out/'] + workers, tmp_path)
+	landed = os.lstat(str(tmp_path / 'out' / 'b'))
+	assert rc == 0 and (stat.S_IMODE(landed.st_mode), landed.st_mtime_ns) == (0o700, T2), output[-3000:]
+	rc, output = run(['a/', 'b', '-d', 'out/'] + workers, tmp_path)
+	again = os.lstat(str(tmp_path / 'out' / 'b'))
+	assert rc == 0 and again.st_ctime_ns == landed.st_ctime_ns, output[-3000:]
+
+
+@posix_only
+@pytest.mark.parametrize('batch', ['parallel', 'serial'])
+def test_the_folder_sync_batches_give_one_record_per_destination(tmp_path, monkeypatch, reset_hpcp_globals, batch):
+	# The public batches: a destination directory two jobs share, and each job's root (also in its own listing), synced once,
+	# from the last job that has it; one record each. 9.87 returned one per job and the roots twice (parallel).
+	_shared(tmp_path / 'a' / 'x', 'a', 0o750, T1)
+	_shared(tmp_path / 'b' / 'x', 'b', 0o700, T2)
+	out = str(tmp_path / 'out')
+	jobs = [(str(tmp_path / 'a'), [out]), (str(tmp_path / 'b'), [out])]
+	syncs = []
+	real = hpcp._sync_directory
+	def sync(src_path, dest_paths):
+		syncs.append((src_path, tuple(dest_paths)))
+		return real(src_path, dest_paths)
+	monkeypatch.setattr(hpcp, '_sync_directory', sync)
+	if batch == 'parallel':
+		_, records = hpcp.sync_directories_parallel_batch(jobs, 2)
+	else:
+		_, records = hpcp.sync_directories_serial_batch(jobs)
+	destinations = sorted(record[1] for record in records)
+	assert destinations == [out, os.path.join(out, 'x')], records
+	assert {record[1]: record[0] for record in records} == {out: str(tmp_path / 'b'), os.path.join(out, 'x'): str(tmp_path / 'b' / 'x')}
+	if batch == 'serial':  # the pool's syncs run in its workers
+		assert len(syncs) == 2, syncs
+
+
+@posix_only
+def test_a_directory_finish_takes_times_within_the_filesystem_step(tmp_path, monkeypatch, reset_hpcp_globals):
+	# A directory on vfat keeps its time in 2 s steps: the finish compared the source's time exactly and set it again on each
+	# rerun. Within one step, as a file's time is judged (_mtimes_agree), nothing is set.
+	directory = tmp_path / 'd'
+	directory.mkdir()
+	on_disk = 1600000000 * 10**9  # a 2 s step's time, as vfat keeps it
+	os.utime(str(directory), ns=(on_disk, on_disk))
+	mode = stat.S_IMODE(os.lstat(str(directory)).st_mode)
+	set_times = []
+	real = os.utime
+	monkeypatch.setattr(os, 'utime', lambda *args, **kwargs: set_times.append(args) or real(*args, **kwargs))
+	hpcp._finish_directory((str(tmp_path / 'src'), str(directory), mode, on_disk, on_disk + 10**9 + 7, None))
+	assert set_times == [] and not hpcp.ERRORS, (set_times, hpcp.ERRORS)
+	hpcp._finish_directory((str(tmp_path / 'src'), str(directory), mode, on_disk, on_disk + 3 * 10**9, None))
+	assert len(set_times) == 1, set_times
+
+
+@posix_only
+@pytest.mark.skipif(not sys.platform.startswith('linux') or not hasattr(os, 'geteuid') or os.geteuid() != 0,
+	reason='needs root to mount a vfat image (VM 901)')
+def test_a_merged_rerun_on_vfat_sets_no_directory_again(tmp_path, monkeypatch, reset_hpcp_globals):
+	# vfat keeps times in 2 s steps: 9.87's finish compared them exactly, and with merged sources gave a shared directory two
+	# records, so every rerun set its times again (twice). The modes are ones vfat can hold (its default dmask, 022).
+	mkfs = shutil.which('mkfs.vfat') or shutil.which('/usr/sbin/mkfs.vfat') or shutil.which('/sbin/mkfs.vfat')
+	if not mkfs:
+		pytest.skip('needs mkfs.vfat')
+	image, mount = tmp_path / 'fat.img', tmp_path / 'fat'
+	image.write_bytes(b'')
+	os.truncate(str(image), 32 << 20)
+	if subprocess.run([mkfs, str(image)], stdout=subprocess.PIPE, stderr=subprocess.STDOUT).returncode:
+		pytest.skip('mkfs.vfat refused')
+	mount.mkdir()
+	if subprocess.run(['mount', '-o', 'loop', str(image), str(mount)], stdout=subprocess.PIPE, stderr=subprocess.STDOUT).returncode:
+		pytest.skip('this kernel does not mount vfat')
+	try:
+		_shared(tmp_path / 'a' / 'x', 'a', 0o755, T1 + 1)
+		_shared(tmp_path / 'b' / 'x', 'b', 0o755, T2 + 1)
+		_shared(tmp_path / 'b' / 'y', 'b', 0o755, T2 + 3)
+		sources = [str(tmp_path / 'a') + os.sep, str(tmp_path / 'b') + os.sep]
+		assert hpcp.hpcp(sources, dest_paths=[str(mount) + os.sep], single_thread=True, batch=True) == 0, hpcp.ERRORS
+		assert abs(os.lstat(str(mount / 'x')).st_mtime_ns - T2) <= 2 * 10**9
+		changes = []
+		for name in ('utime', 'chmod', 'fchmod'):
+			real = getattr(os, name)
+			def spy(target, *args, _real=real, _name=name, **kwargs):
+				where = os.readlink('/proc/self/fd/%d' % target) if isinstance(target, int) else os.path.abspath(target)
+				if os.path.isdir(where) and where.startswith(str(mount)):
+					changes.append((_name, where))
+				return _real(target, *args, **kwargs)
+			monkeypatch.setattr(os, name, spy)
+		assert hpcp.hpcp(sources, dest_paths=[str(mount) + os.sep], single_thread=True, batch=True) == 0, hpcp.ERRORS
+		assert changes == [], changes
+	finally:
+		subprocess.run(['umount', '-l', str(mount)], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)

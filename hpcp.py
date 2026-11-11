@@ -5829,7 +5829,9 @@ def _finish_directory(record, sync=False):
 			# The read time with the modification time, as cp -a gives both; one that alone differs is left, as a file's
 			# (_settle_identical): a read moves it where it is not after the change time, which any set makes now, so a rerun
 			# chasing it would set it and move the change time on every run (EL8, relatime: the rerun's own listing did).
-			if now.st_mtime_ns != mtime_ns:
+			# Within the filesystem's step, as a file's time is judged (_mtimes_agree): vfat keeps 2 s, exFAT 10 ms, HFS+ 1 s, and
+			# an exact compare set every directory's times again on each rerun there.
+			if not _mtimes_agree(now.st_mtime_ns, mtime_ns):
 				os.utime(fd if os.utime in os.supports_fd else dest_path, ns=(atime_ns, mtime_ns))
 			if flags is not None and hasattr(os, 'chflags') and getattr(now, 'st_flags', flags) != flags:
 				os.chflags(dest_path, flags, follow_symlinks=False)
@@ -6027,7 +6029,35 @@ def sync_directory_metadata_bulk_batch(jobs):
 		records += done
 	return total_count, total_time, symLinks, records
 
+def _last_per_destination(jobs, key):
+	"""jobs, keeping one per destination (key(job): its destination, a hashable): the last, as merged sources' files go (a
+	later source's replaces an earlier one's), so a directory several jobs share is synced once, from the later source."""
+	last = {key(job): index for index, job in enumerate(jobs)}
+	return [job for index, job in enumerate(jobs) if last[key(job)] == index]
+
+def _folder_syncs(jobs, list_folders, copy_link_or_file, exclude):
+	"""The folder syncs of a batch of (src, dests) jobs: (src, folder, dests) for each job's root, then each folder its listing
+	has (list_folders(src); the root among them), in job order, one per destination directory (_last_per_destination: the
+	later source's, as a merged source's files go; and the root once). A job whose src is no directory is handed to
+	copy_link_or_file(src, dests), as before; one excluded or with no valid destination is left out."""
+	syncs = []
+	for src, dests in jobs:
+		dests = _validate_paths(src, dests)
+		if dests is None:
+			continue
+		if exclude and is_excluded(src, exclude):
+			continue
+		if not os.path.isdir(src):
+			copy_link_or_file(src, dests)
+			continue
+		syncs.append((src, src, dests))
+		syncs.extend((src, folder, dests) for folder in list_folders(src))
+	return _last_per_destination(syncs, lambda sync: tuple(os.path.abspath(_below(dest, os.path.relpath(sync[1], sync[0]))) for dest in sync[2]))
+
 def sync_directories_parallel_batch(jobs, max_workers, verbose=False,folder_per_job=64,exclude=None,parallel_file_listing=False):
+	"""Sync the directories of (src, dests) jobs (a pool of max_workers / 4, at least 2): ({link: dests}, the finish's records).
+	A destination directory that several jobs share (merged sources), or a job's root and its listing, is synced once, from
+	the last job that has it (_folder_syncs), and gives one record. The roots are synced here first, the rest in the pool."""
 	global FILES_RATE_LIMIT
 	global BYTES_RATE_LIMIT
 	if FILES_RATE_LIMIT or BYTES_RATE_LIMIT:
@@ -6036,20 +6066,15 @@ def sync_directories_parallel_batch(jobs, max_workers, verbose=False,folder_per_
 		max_scheduled_jobs = max_workers * 1.1
 	symLinks = {}
 	records = []
-	allFolderToSync = []
-	for src, dests in jobs:
-		dests = _validate_paths(src, dests)
-		if dests is None:
-			continue
-		if exclude and is_excluded(src,exclude):
-			continue
-		if not os.path.isdir(src):
-			_, _ , sl = copy_file(src, dests)
-			symLinks.update(sl)
-			continue
-		records += _sync_directory(src, dests)[3]
-		_,_,_,folders  = get_file_list(src, max_workers=max_workers,exclude=exclude,parallel_file_listing=parallel_file_listing)
-		allFolderToSync.extend([(src,folder,dests) for folder in folders])
+	def copy_link_or_file(src, dests):
+		symLinks.update(copy_file(src, dests)[2])
+	syncs = _folder_syncs(jobs, lambda src: get_file_list(src, max_workers=max_workers,exclude=exclude,parallel_file_listing=parallel_file_listing)[3],
+		copy_link_or_file, exclude)
+	# Destinations are unique: which runs first decides nothing.
+	for src, folder, dests in syncs:
+		if folder == src:
+			records += _sync_directory(src, dests)[3]
+	allFolderToSync = [sync for sync in syncs if sync[1] != sync[0]]
 	if not allFolderToSync:
 		return symLinks, records
 	print(f"Syncing Dir for {len(allFolderToSync)} folders with {max_workers} workers")
@@ -6118,39 +6143,25 @@ def sync_directories_parallel_batch(jobs, max_workers, verbose=False,folder_per_
 	return symLinks, records
 
 def sync_directories_serial_batch(jobs,exclude=None):
+	"""sync_directories_parallel_batch in this process: ({link: dests}, the finish's records), one sync and one record per
+	destination directory (_folder_syncs), in job order."""
 	global FILES_RATE_LIMIT
 	global BYTES_RATE_LIMIT
-	newJobs = []
-	# skip if src path or dest path is longer than 4096 characters
 	symLinks = {}
 	records = []
-	totalFolderCount = 0
-	srcFolders = []
-	for src,dests in jobs:
-		dests = _validate_paths(src, dests)
-		if dests is None:
-			continue
-		if exclude and is_excluded(src,exclude):
-			continue
-		if not os.path.isdir(src):
-			_, _ , sls = copy_file(src, dests)
-			symLinks.update(sls)
-			continue
-		newJobs.append((src,dests))
-		_,_,_,folders = get_file_list(src,exclude=exclude,parallel_file_listing=False)
-		srcFolders.append(folders)
-		totalFolderCount += len(folders)
-	if totalFolderCount == 0:
+	def copy_link_or_file(src, dests):
+		symLinks.update(copy_file(src, dests)[2])
+	syncs = _folder_syncs(jobs, lambda src: get_file_list(src,exclude=exclude,parallel_file_listing=False)[3], copy_link_or_file, exclude)
+	if not syncs:
 		return symLinks, records
-	print(f"Syncing Dir from {len(newJobs)} in single thread")
-	apb = Adaptive_Progress_Bar(total_count=totalFolderCount,total_size=totalFolderCount,process_word='Synced',bytes_rate_limit=BYTES_RATE_LIMIT,files_rate_limit=FILES_RATE_LIMIT)
-	for (src, dests), folders in zip(newJobs, srcFolders):
-		for folder in folders:
-			source_relative_path = os.path.relpath(folder, src)
-			count, cpTime, _, done = _sync_directory(folder, [_below(dest, source_relative_path) for dest in dests])
-			records += done
-			apb.update(num_files=1, cpSize=count, cpTime=cpTime , files_per_job=1)
-			apb.rate_limit()
+	print(f"Syncing Dir from {len({(src, tuple(dests)) for src, _, dests in syncs})} in single thread")
+	apb = Adaptive_Progress_Bar(total_count=len(syncs),total_size=len(syncs),process_word='Synced',bytes_rate_limit=BYTES_RATE_LIMIT,files_rate_limit=FILES_RATE_LIMIT)
+	for src, folder, dests in syncs:
+		source_relative_path = os.path.relpath(folder, src)
+		count, cpTime, _, done = _sync_directory(folder, [_below(dest, source_relative_path) for dest in dests])
+		records += done
+		apb.update(num_files=1, cpSize=count, cpTime=cpTime , files_per_job=1)
+		apb.rate_limit()
 	apb.stop()
 	return symLinks, records
 
