@@ -2311,12 +2311,7 @@ def test_an_early_stop_prints_no_traceback(tmp_path, method, batch):
 		finally:
 			if task.poll() is None:
 				os.killpg(task.pid, signal.SIGKILL)
-		if code == 'timeout' and sys.version_info < (3, 7):
-			# Python 3.6's pool can hang in its first submit when the stop that ended a worker left the queue's write lock held:
-			# review A saw 5 hangs in 5,520 early stops (about 1 session in 28). Not this test's subject: limitations.md, "On
-			# Python 3.6 an early stop can rarely hang the run in a pool's submit" (F1, deferred to 9.88). A hang elsewhere fails.
-			pytest.xfail('the Python 3.6 submit hang, F1, deferred to 9.88 (docs/limitations.md)')
-		left = _DROPPED_STOP.sub(b'', output) if sys.version_info < (3, 8) else output
+		left =_DROPPED_STOP.sub(b'', output) if sys.version_info < (3, 8) else output
 		assert code == 130 and b'Traceback' not in left, (run, output[-3000:])
 
 
@@ -2363,6 +2358,77 @@ def test_a_stop_in_a_call_python_drops_prints_nothing_and_is_acted_on(tmp_path, 
 	script.write_text(_STOP_IN % {'root': os.path.dirname(HPCP)})
 	done = subprocess.run([sys.executable, str(script), where], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=60)
 	assert done.returncode == 0 and done.stdout.strip() == b'acted on', done.stdout
+
+
+_SUBMIT_HELD = '''
+import os, signal, sys, threading, time
+sys.path.insert(0, %(root)r)
+import hpcp
+case = sys.argv[1]
+if case == 'ignored':
+	signal.signal(signal.SIGHUP, signal.SIG_IGN)  # as nohup starts a run: _install_stops leaves it so
+hpcp._MAIN_PID = os.getpid()
+hpcp._install_stops()
+hpcp._register_worker_start()
+signum = signal.SIGHUP if case == 'ignored' else signal.SIGINT
+sent = []
+def send():
+	if case != 'recorded':
+		signal.pthread_sigmask(signal.SIG_BLOCK, [signum])  # every thread blocks it: it stays pending
+	time.sleep(0.3)
+	sent.append(time.monotonic())
+	os.kill(os.getpid(), signum)
+def release(lock):
+	# the dead holder's lock, let go of by another process after 1 s
+	signal.pthread_sigmask(signal.SIG_BLOCK, [signum])
+	time.sleep(1)
+	pid = os.fork()
+	if pid == 0:
+		lock.release()
+		os._exit(0)
+	os.waitpid(pid, 0)
+try:
+	with hpcp._pool(2) as pool:
+		pool.submit(os.getpid).result(timeout=30)
+		lock = pool.executor._result_queue._wlock
+		pid = os.fork()
+		if pid == 0:
+			lock.acquire()  # a worker that ended holding the result queue's write lock
+			os._exit(0)
+		os.waitpid(pid, 0)
+		threading.Thread(target=send, daemon=True).start()
+		if case == 'ignored':
+			threading.Thread(target=release, args=(lock,), daemon=True).start()
+		pool.submit(os.getpid).result(timeout=30)
+	print('returned', flush=True)
+except KeyboardInterrupt:
+	print('KeyboardInterrupt %%.1f s after the signal' %% (time.monotonic() - sent[0]), flush=True)
+# Python 3.6's exit wakes each pool's manager thread through that lock: not waited on here
+os._exit(0)
+'''
+
+
+@posix_only
+@pytest.mark.skipif(sys.version_info >= (3, 7), reason="Python 3.6's own submit")
+@pytest.mark.parametrize('case', ['pending', 'recorded', 'ignored'])
+def test_a_stop_ends_a_3_6_submit_that_waits_on_a_dead_worker_s_lock(tmp_path, case):
+	# Python 3.6's submit wakes the pool's manager thread under the result queue's write lock, which a worker ended inside its
+	# acquire leaves held: 9.87's parent waited on it for good, its stops blocked, and a second Ctrl-C printed nothing (about 3
+	# early stops in 2,000). hpcp's own submit takes the lock in 0.1 s steps and acts on a stop _stop handles: pending (every
+	# thread blocks it, as a real run's do while a submit runs) or recorded (another thread took it). An ignored one (nohup's
+	# SIGHUP) stays pending while blocked and is no stop: the submit waits for the lock and returns.
+	script = tmp_path / 'submit_held.py'
+	script.write_text(_SUBMIT_HELD % {'root': os.path.dirname(HPCP)})
+	try:
+		done = subprocess.run([sys.executable, str(script), case], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=60)
+	except subprocess.TimeoutExpired:
+		pytest.fail('the submit waited on the held lock for good (60 s)')
+	output = done.stdout.decode(errors='replace')
+	if case == 'ignored':
+		assert done.returncode == 0 and output.strip() == 'returned', output
+	else:
+		said = re.match(r'KeyboardInterrupt ([0-9.]+) s after the signal$', output.strip())
+		assert done.returncode == 0 and said and float(said.group(1)) < 5, output
 
 
 @posix_only

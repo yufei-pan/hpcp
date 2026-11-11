@@ -1297,6 +1297,41 @@ def _new_slots(count):
 			return (array.get_lock(), array.get_obj()), array
 	return None, None
 
+def _submit_36(executor, mask, fn, args, kwargs):
+	"""ProcessPoolExecutor.submit of Python 3.6 (3.6.15), whose wakeup of the manager thread (_result_queue.put(None)) waits
+	for good on the result queue's write lock when a worker ended holding it (stopped inside SemLock.__enter__): here the
+	lock is taken in 0.1 s steps (_Done's and _wait's step, ten within the 1 s in which a stop is acted on), and in the process
+	that runs main() (mask: the stops are blocked in this thread) each step looks for a stop _stop handles, recorded (_stop
+	ran for one another thread took) or pending (every thread blocks it), and raises it before anything is registered. A
+	signal ignored (nohup's SIGHUP) stays pending while blocked, and is no stop. A pool that broke meanwhile raises
+	BrokenProcessPool, as submit does. The rest is 3.6's own: the work item registered, then the wakeup sent under the lock."""
+	global _STOP_ACTED
+	from concurrent.futures import _base
+	from concurrent.futures.process import _WorkItem
+	results = executor._result_queue
+	with executor._shutdown_lock:
+		if executor._broken:
+			raise BrokenProcessPool('A child process terminated abruptly, the process pool is not usable anymore')
+		if executor._shutdown_thread:
+			raise RuntimeError('cannot schedule new futures after shutdown')
+		while not results._wlock.acquire(True, 0.1):
+			if mask is not None and (_STOPPED_PID == os.getpid()
+					or any(signal.getsignal(s) is _stop for s in signal.sigpending() if s in _STOPS)):
+				_STOP_ACTED = True
+				raise KeyboardInterrupt
+			if executor._broken:
+				raise BrokenProcessPool('A child process terminated abruptly, the process pool is not usable anymore')
+		try:
+			future = _base.Future()
+			executor._pending_work_items[executor._queue_count] = _WorkItem(future, fn, args, kwargs)
+			executor._work_ids.put(executor._queue_count)
+			executor._queue_count += 1
+			results._writer.send_bytes(multiprocessing.reduction.ForkingPickler.dumps(None))
+		finally:
+			results._wlock.release()
+		executor._start_queue_management_thread()
+		return future
+
 class _pool:
 	"""The one door to a process pool: `with _pool(max_workers) as executor:`, submitting with _submit_task(executor, ...) and
 	waiting with _wait(futures, executor). Inside, the parent only loops (submits, waits, results, the progress bar): no cp,
@@ -1350,12 +1385,16 @@ class _pool:
 	def submit(self, func, *args, **kwargs):
 		"""executor.submit, with the stops blocked in the process that runs main() (a library caller's are left alone): a
 		worker it starts (and a fork server, which every later worker forks from) starts with them blocked, and lets them in
-		once set up (_init_worker). A stop meanwhile is recorded at the restore (_stop, inside the region)."""
+		once set up (_init_worker). A stop meanwhile is recorded at the restore (_stop, inside the region). On Python 3.6 hpcp's
+		own copy of its submit (_submit_36), which acts on a stop while a dead worker holds the result queue's lock."""
 		# A stop recorded inside the region starts no more work: the loop acts on it here, as at its wait.
 		_check_stop()
 		mask = _block_stops() if os.getpid() == _MAIN_PID else None
 		try:
-			future = self.executor.submit(func, *args, **kwargs)
+			if sys.version_info >= (3, 7):
+				future = self.executor.submit(func, *args, **kwargs)
+			else:
+				future = _submit_36(self.executor, mask, func, args, kwargs)
 		finally:
 			_restore_stops(mask)
 		self.pending.add(future)
