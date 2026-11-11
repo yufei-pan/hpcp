@@ -420,3 +420,99 @@ def test_a_list_of_paths_below_a_directory_with_a_system_flag_copies_and_moves_a
 	assert read(os.path.join(root, 'out' + source)) == 'x' and read(os.path.join(root, 'moved' + source)) == 'x'
 	assert not os.path.exists(source)
 
+
+# ---- W1 (9.88) on macOS: the door holds read descriptors (no O_PATH, and /dev/fd/D/NAME names nothing below D)
+
+def _victim(path):
+	'''A directory a run must never write: (path, its state now). The runner's own here (no root on the Mac).'''
+	os.makedirs(path)
+	for name in ('x', 'y'):
+		write(os.path.join(path, name), 'victim ' + name, 0o600)
+	return path, _state(path)
+
+
+def _state(path):
+	found = {}
+	for name in sorted(os.listdir(path)):
+		st = os.lstat(os.path.join(path, name))
+		found[name] = (st.st_mode, st.st_mtime_ns, st.st_ino, read(os.path.join(path, name)))
+	st = os.lstat(path)
+	return found, (st.st_mode, st.st_mtime_ns)
+
+
+def _w1_run(monkeypatch, out):
+	'''One run's settings: out named (-d), a run of its own (RUN_ID).'''
+	monkeypatch.setattr(hpcp, 'NAMED_DESTS', frozenset([os.path.abspath(out)]))
+	monkeypatch.setattr(hpcp, 'RUN_ID', 'w1-mac-%d' % next(_RUNS))
+
+
+def _swap_for_link(directory, target):
+	os.rename(directory, directory + '.away')
+	os.symlink(target, directory)
+
+
+@pytest.mark.macos988
+def test_the_door_holds_read_descriptors_on_macos(root, fresh, monkeypatch):
+	# macOS has no O_PATH, and /dev/fd/D/NAME is no path below the directory D holds (ENOENT or ENOTDIR, macOS 26): the door
+	# holds read descriptors, and every call goes relative to them (dir_fd), or by name where Python has no such form.
+	out = os.path.join(root, 'out')
+	os.makedirs(os.path.join(out, 'a'))
+	write(os.path.join(out, 'a/x'), 'x')
+	assert hpcp._PATH_FDS is False
+	_w1_run(monkeypatch, out)
+	base = hpcp._dest_directory(os.path.join(out, 'a'), make=False)
+	try:
+		assert isinstance(base, int)
+		import fcntl
+		assert fcntl.fcntl(base, fcntl.F_GETFL) & os.O_ACCMODE == os.O_RDONLY
+		assert os.lstat('x', dir_fd=base).st_size == 1
+		with pytest.raises(OSError):
+			os.stat('/dev/fd/%d/x' % base)
+	finally:
+		hpcp._close_base(base)
+
+
+@pytest.mark.macos988
+@pytest.mark.parametrize('case', ['first', 'rewrite', 'beside'])
+def test_w1_a_directory_swapped_after_the_door_never_leads_the_copy_elsewhere_on_macos(root, fresh, monkeypatch, case):
+	# W1 case 1 on the read route: out/a is swapped for a link to victim/ after the door looked at it and before the file is
+	# made, opened or renamed. 9.87 made, opened and renamed the landing by path, through the link.
+	victim, before = _victim(os.path.join(root, 'victim'))
+	out = os.path.join(root, 'out')
+	os.makedirs(os.path.join(out, 'a'))
+	src = write(os.path.join(root, 'src/a/x'), 'NEW-CONTENT')
+	if case != 'first':
+		write(os.path.join(out, 'a/x'), 'old')
+	monkeypatch.setattr(hpcp, 'WRITE_BESIDE', case == 'beside')
+	_w1_run(monkeypatch, out)
+	real, done = hpcp._claim_device, []
+	def swapping(*args, **kwargs):
+		if not done:
+			done.append(True)
+			_swap_for_link(os.path.join(out, 'a'), victim)
+		return real(*args, **kwargs)
+	monkeypatch.setattr(hpcp, '_claim_device', swapping)
+	with contextlib.redirect_stdout(io.StringIO()):
+		hpcp.copy_file(src, [os.path.join(out, 'a/x')])
+	assert done and os.path.islink(os.path.join(out, 'a'))
+	assert _state(victim) == before, (before, _state(victim))
+	assert read(os.path.join(out, 'a.away/x')) == 'NEW-CONTENT' and not hpcp.ERRORS, hpcp.ERRORS
+
+
+@pytest.mark.macos988
+def test_w1_a_directory_swapped_between_two_files_never_leads_the_second_elsewhere_on_macos(root, fresh, monkeypatch):
+	# W1 case 2 on the read route: out/a/x is copied, out/a is swapped for a link to victim/, then out/a/y is copied. 9.87
+	# looked at out/a once a process and wrote y by path, through the link.
+	victim, before = _victim(os.path.join(root, 'victim'))
+	out = os.path.join(root, 'out')
+	os.makedirs(os.path.join(out, 'a'))
+	for name in 'xy':
+		write(os.path.join(root, 'src/a', name), 'NEW ' + name)
+	_w1_run(monkeypatch, out)
+	with contextlib.redirect_stdout(io.StringIO()):
+		hpcp.copy_file(os.path.join(root, 'src/a/x'), [os.path.join(out, 'a/x')])
+		_swap_for_link(os.path.join(out, 'a'), victim)
+		hpcp.copy_file(os.path.join(root, 'src/a/y'), [os.path.join(out, 'a/y')])
+	assert _state(victim) == before, (before, _state(victim))
+	assert read(os.path.join(out, 'a.away/x')) == 'NEW x' and read(os.path.join(out, 'a.away/y')) == 'NEW y'
+	assert not hpcp.ERRORS, hpcp.ERRORS
