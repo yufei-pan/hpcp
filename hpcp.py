@@ -13810,7 +13810,7 @@ def get_args(args = None):
 	parser = argparse.ArgumentParser(description='Copy files from source to destination',
 								  epilog=f'Found bins: {list(_binPaths.values())}\n Missing bins: {_binCalled - set(_binPaths.keys())}')
 	parser.add_argument('-s', '--single_thread', action='store_true', help='Use serial processing')
-	parser.add_argument('-j','-m','-t','--max_workers', type=int, default=None, help='Max workers for parallel processing. Default is 1 * CPU count, and at least 16 for a move (-rm, -rf), whose workers wait on their fsyncs. Use negative numbers to indicate {n} * CPU count, 0 means 1/2 CPU count.')
+	parser.add_argument('-j','-m','-t','--max_workers', type=int, default=None, help='Max workers for parallel processing. Default is 1 * CPU count, and at least 16 for -rm and -rf (a move, or a removal without -d), whose workers wait on their fsyncs. Use negative numbers to indicate {n} * CPU count, 0 means 1/2 CPU count.')
 	batch_group = parser.add_mutually_exclusive_group()
 	batch_group.add_argument('-b','--batch',action='store_true', help='Batch mode, process all files in one go',default=True)
 	batch_group.add_argument('-nb','--no_batch','--sequential',action='store_false', dest='batch', help='Do not use batch mode', default=False)

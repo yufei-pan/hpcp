@@ -363,10 +363,10 @@ options:
   -s, --single_thread   Use serial processing
   -j, -m, -t, --max_workers MAX_WORKERS
                         Max workers for parallel processing. Default is 1 *
-                        CPU count, and at least 16 for a move (-rm, -rf),
-                        whose workers wait on their fsyncs. Use negative
-                        numbers to indicate {n} * CPU count, 0 means 1/2 CPU
-                        count.
+                        CPU count, and at least 16 for -rm and -rf (a move, or
+                        a removal without -d), whose workers wait on their
+                        fsyncs. Use negative numbers to indicate {n} * CPU
+                        count, 0 means 1/2 CPU count.
   -b, --batch           Batch mode, process all files in one go
   -nb, --no_batch, --sequential
                         Do not use batch mode
