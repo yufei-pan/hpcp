@@ -322,7 +322,10 @@ def test_directory_calls_stay_within_9_86_s(monkeypatch, reset_hpcp_globals):
 		# p3's tree carried no extended attributes; each one a directory carries is read on both sides, in 9.86 too (SELinux
 		# labels every directory: EL8 counts 18.1 a first copy, the 2 reads of the label over Docker's 16.1)
 		labels = 2 * _attribute_count(str(src / 'd0'))
-		assert _calls_per_directory(base, monkeypatch, 'first') <= 17.1 + labels
+		# 9.88's door (W1) holds each directory on the way by descriptor: here 2.34 more calls a directory than 9.87 (18.46
+		# against 16.12 on 3.6, 3.12 and 3.14; its two door results' closes, the levels it opens and closes, less the lstats
+		# of 9.87's door and mount check; a result's dup is not counted here)
+		assert _calls_per_directory(base, monkeypatch, 'first') <= 17.1 + 2.34 + labels
 		# 3.7 to 3.12 were not in p3: 9.86 counts 21.8 a rerun there, in this test's tree (Docker; 9.87 20.0), and 3.13 and
 		# later make fewer lstats a path, in both
 		rerun = 23.0 if sys.version_info < (3, 7) else 21.8 if sys.version_info < (3, 13) else 18.1

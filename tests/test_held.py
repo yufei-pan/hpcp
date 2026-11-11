@@ -1082,3 +1082,64 @@ def test_w1_a_directory_swapped_at_an_identical_landing_never_leads_its_metadata
 	held = os.lstat(os.path.join(out, 'a.away/x'))
 	assert read(os.path.join(out, 'a.away/x')) == 'SAME-CON' and stat.S_IMODE(held.st_mode) == 0o644
 	assert (held.st_uid, held.st_gid) == (st.st_uid, st.st_gid) and not hpcp.ERRORS, hpcp.ERRORS
+
+
+@root_only
+@linux_only
+def test_w1_a_directory_swapped_before_its_sync_never_leads_its_metadata_elsewhere(tmp_path, fresh, monkeypatch):
+	# W1 case 3: out/a is made (or found) by the folder sync's door, then swapped for a link to victim/ before the sync gives it
+	# its owner, mode and xattrs (_start_directory). 9.87 set them by path, through the link: victim/ took the source's mode
+	# and owner. 9.88 sets them on the directory the door holds.
+	victim = _Victim(tmp_path / 'victim')
+	src = tmp_path / 'src' / 'a'
+	src.mkdir(parents=True)
+	os.chmod(str(src), 0o750)
+	os.chown(str(src), 1000, 1000)
+	out = str(tmp_path / 'out')
+	os.makedirs(os.path.join(out, 'a'))
+	os.chown(out, 1000, 1000)
+	_w1_run(monkeypatch, out)
+	done = _swap_once_at(monkeypatch, '_start_directory', os.path.join(out, 'a'), victim.path)
+	with contextlib.redirect_stdout(io.StringIO()):
+		records = hpcp._sync_directory(str(src), [os.path.join(out, 'a')])[3]
+	assert done and os.path.islink(os.path.join(out, 'a'))
+	assert victim.untouched(), (victim.before, victim.state())
+	held = os.lstat(os.path.join(out, 'a.away'))
+	assert (held.st_uid, held.st_gid) == (1000, 1000) and len(records) == 1 and not hpcp.ERRORS, hpcp.ERRORS
+
+
+@root_only
+@linux_only
+@pytest.mark.parametrize('cursor', ['held', 'walked-again'])
+def test_w1_a_directory_swapped_before_its_finish_never_leads_its_metadata_elsewhere(tmp_path, fresh, monkeypatch, cursor):
+	# W1 case 4: out/a/b is synced, then out/a is swapped for a link to victim/ (which holds a b) before the finish sets b's
+	# exact mode and times. 9.87 opened out/a/b by path (O_NOFOLLOW only on b), through the link: victim/b took them. 9.88
+	# opens b in out/a as the door holds it (held: the process that synced it); a process whose door walks again
+	# (walked-again: a fresh pool worker) meets the link, replaces it by a directory (the door's rule for a link on the way)
+	# and finds no b there: a Directory sync error, nothing written to victim/.
+	victim = _Victim(tmp_path / 'victim')
+	os.mkdir(os.path.join(victim.path, 'b'))
+	os.chmod(os.path.join(victim.path, 'b'), 0o755)
+	victim.before = victim.state()
+	src = tmp_path / 'src' / 'a' / 'b'
+	src.mkdir(parents=True)
+	os.chmod(str(src), 0o700)
+	os.utime(str(src), (1000000000, 1000000000))
+	out = str(tmp_path / 'out')
+	os.makedirs(os.path.join(out, 'a', 'b'))
+	os.chown(out, 1000, 1000)
+	os.chown(os.path.join(out, 'a'), 1000, 1000)
+	_w1_run(monkeypatch, out)
+	with contextlib.redirect_stdout(io.StringIO()):
+		records = hpcp._sync_directory(str(src), [os.path.join(out, 'a', 'b')])[3]
+		_swap_for_link(os.path.join(out, 'a'), victim.path)
+		if cursor == 'walked-again' and hasattr(hpcp, '_close_cursors'):
+			hpcp._close_cursors()
+		for record in records:
+			hpcp._finish_directory(record)
+	assert victim.untouched(), (victim.before, victim.state())
+	if cursor == 'held':
+		held = os.lstat(os.path.join(out, 'a.away', 'b'))
+		assert stat.S_IMODE(held.st_mode) == 0o700 and held.st_mtime_ns == 1000000000 * 10**9 and not hpcp.ERRORS, hpcp.ERRORS
+	else:
+		assert any(error.startswith('Directory sync error') for error in hpcp.ERRORS), hpcp.ERRORS

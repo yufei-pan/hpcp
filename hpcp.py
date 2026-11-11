@@ -5915,23 +5915,23 @@ def _below(dest, relative):
 
 def _make_dest_directory(src_path, dest_path):
 	"""dest_path as the directory src_path lands on, made if missing, through the one door (_dest_directory): below a
-	named destination a link, FIFO or node there is replaced by the directory. False when a file is in the way, or what is
-	there cannot be replaced, which is reported."""
+	named destination a link, FIFO or node there is replaced by the directory. Returns the door's result for it (a
+	descriptor the caller closes, _close_base, or its path); None when a file is in the way, or what is there cannot be
+	replaced, which is reported."""
 	named = _landing_path(dest_path)[1]
 	if os.path.lexists(dest_path) and not os.path.isdir(dest_path) and (named or stat.S_ISREG(os.lstat(dest_path).st_mode)):
 		# A file (or a link to one the operator named) is no directory's to take: its mode and owner stay, and nothing can be
 		# made below it.
 		eprint(f'Destination clash: {dest_path} is not a directory, not syncing the directory {src_path} onto it')
-		return False
+		return None
 	try:
-		if not os.path.ismount(dest_path):
-			_close_base(_dest_directory(dest_path, source=src_path))
+		return _dest_directory(dest_path, source=src_path)
 	except _Refused as e:
 		eprint(e.text(f'the directory {src_path}'))
-		return False
+		return None
 	except FileExistsError:
 		print(f"Destination path {dest_path} maybe a mounted dir, known issue with os.path.exists\nContinuing without creating dest folder...", file=sys.stderr)
-	return True
+		return dest_path
 
 def _sync_xattrs(src_path, dest):
 	"""Give the directory dest src_path's xattrs: stale portable ones removed (_remove_stale_xattrs' rule), and each of the
@@ -5970,39 +5970,50 @@ def _sync_xattrs(src_path, dest):
 				raise
 	return changed
 
-def _start_directory(src_path, dest_path, st):
+def _held_directory(held, dest_path):
+	"""What a call that acts on a directory itself takes for it (os.stat, chmod, chown, the xattr calls): its /proc/self/fd
+	entry for a held O_PATH descriptor (Linux with /proc: an O_PATH descriptor takes no fchmod, fchown or flistxattr), the
+	descriptor itself for a held read one (macOS, Linux without /proc), else dest_path (held a path: nothing held)."""
+	if isinstance(held, int):
+		return '/proc/self/fd/%d' % held if _PATH_FDS else held
+	return dest_path
+
+def _start_directory(src_path, dest_path, st, held=None):
 	"""The directory sync's part of dest_path's metadata (src_path's lstat st): what does not stop the copy writing into it,
 	each made only where dest_path differs. Its xattrs, its owner and group (_chown_like_cp), and its mode, plus read, write
 	and search for its owner when the runner is not root and owns it (rsync's rule; root needs none): a 0555 source
 	directory still takes its files. Its times and BSD flags, and the exact mode, wait for the finish, after what goes in it
 	(finish_directories), as cp -a and rsync set a directory's last. Returns the finish's record: (src_path, dest_path, the
-	mode, atime_ns, mtime_ns, BSD flags or None); the mode is None under -co, which sets no directory metadata."""
+	mode, atime_ns, mtime_ns, BSD flags or None); the mode is None under -co, which sets no directory metadata. held: the
+	door's result for dest_path (_make_dest_directory), which every call acts on (_held_directory): never a link put on
+	the way since the door walked it."""
 	if CONTENT_ONLY:
 		return (src_path, dest_path, None, None, None, None)
+	directory = _held_directory(held, dest_path)
 	mode = stat.S_IMODE(st.st_mode)
-	now = os.stat(dest_path)
+	now = os.stat(directory)
 	current = stat.S_IMODE(now.st_mode)
 	runner = os.geteuid() if hasattr(os, 'geteuid') else 0
 	if runner and now.st_uid == runner and current & stat.S_IRWXU != stat.S_IRWXU:
 		# A rerun meets the restrictive mode the finish gave it: opened before its xattrs, or its owner may not set them
 		# (EACCES, which copystat's rule ignores) and a source's changed xattr would never come.
 		current |= stat.S_IRWXU
-		os.chmod(dest_path, current)
-	if _sync_xattrs(src_path, dest_path):
-		now = os.stat(dest_path)
+		os.chmod(directory, current)
+	if _sync_xattrs(src_path, directory):
+		now = os.stat(directory)
 		current = stat.S_IMODE(now.st_mode)
 	if os.name == 'posix':
 		if (now.st_uid, now.st_gid) != (st.st_uid, st.st_gid):
-			owner_kept, group_kept = _chown_like_cp(dest_path, st)
+			owner_kept, group_kept = _chown_like_cp(directory, st)
 			# chmod after chown: no set-user-ID / set-group-ID bit for an owner / group not kept (9.86's rule).
 			mode &= ~((0 if owner_kept else stat.S_ISUID) | (0 if group_kept else stat.S_ISGID))
-			now = os.stat(dest_path)
+			now = os.stat(directory)
 			current = stat.S_IMODE(now.st_mode)
 		opened = mode
 		if runner and now.st_uid == runner:
 			opened |= stat.S_IRWXU
 		if current != opened:
-			os.chmod(dest_path, opened)
+			os.chmod(directory, opened)
 	return (src_path, dest_path, mode, st.st_atime_ns, st.st_mtime_ns, getattr(st, 'st_flags', None))
 
 def _sync_directory(src_path, dest_paths):
@@ -6030,11 +6041,15 @@ def _sync_directory(src_path, dest_paths):
 	records = []
 	for dest_path in dest_paths:
 		# One directory that cannot be created or synced is recorded; the others (and the other dests) go on.
+		held = None
 		try:
-			if _make_dest_directory(src_path, dest_path):
-				records.append(_start_directory(src_path, dest_path, st))
+			held = _make_dest_directory(src_path, dest_path)
+			if held is not None:
+				records.append(_start_directory(src_path, dest_path, st, held))
 		except OSError as e:
 			eprint(f'Directory sync error: {src_path} to {dest_path}: {e}')
+		finally:
+			_close_base(held)
 	return 1, time.monotonic() - start_time, {}, records
 
 def sync_directory_metadata(src_path, dest_paths):
@@ -6074,7 +6089,10 @@ def _finish_directory(record, sync=False, late=False):
 	named with -d is followed, as everywhere). sync (a move): a directory its mode shuts to its owner (_synced_at_finish), or
 	any in the late pass, is fsynced through that descriptor, opened while the mode still let its owner in; the others are
 	fsynced after the whole finish, once each (an fsync right after each change would commit the journal once per
-	directory). A failure is a Directory sync error, or the move's copy failure when only the fsync failed."""
+	directory). A failure is a Directory sync error, or the move's copy failure when only the fsync failed. Below a named
+	destination the directory is opened by its name in its parent as the door holds it (_dest_directory, nothing made), the
+	named destination itself through the door (its pin), so a directory on the way swapped for a link since is not followed;
+	BSD flags (macOS: no descriptor form in Python) still go by name."""
 	src_path, dest_path, mode, atime_ns, mtime_ns, flags = record
 	if mode is None:
 		return  # -co: no directory metadata
@@ -6086,13 +6104,27 @@ def _finish_directory(record, sync=False, late=False):
 			eprint(f'Directory sync error: {src_path} to {dest_path}: {e}')
 		return
 	how = os.O_RDONLY | getattr(os, 'O_CLOEXEC', 0) | getattr(os, 'O_DIRECTORY', 0)
-	if os.path.abspath(dest_path) not in NAMED_DESTS:
-		how |= getattr(os, 'O_NOFOLLOW', 0)
+	path = os.path.abspath(dest_path)
+	base = None
 	try:
-		fd = os.open(dest_path, how)
-	except OSError as e:
-		eprint(f'Directory sync error: {src_path} to {dest_path}: {e}')
-		return
+		try:
+			if path in NAMED_DESTS:
+				# the named destination, followed as named, through the door's open of it
+				base, name = _dest_directory(path, make=False), os.curdir
+			else:
+				how |= getattr(os, 'O_NOFOLLOW', 0)
+				base, name = _dest_directory(os.path.dirname(path), make=False), os.path.basename(path)
+			if base is None:
+				raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), dest_path)
+			fd = os.open(*_at(base, name), how, **_fd_of(base))
+		except _Refused as e:
+			eprint(e.text(f'the directory {src_path}'))
+			return
+		except OSError as e:
+			eprint(f'Directory sync error: {src_path} to {dest_path}: {_shown(e, os.path.dirname(path), base)}')
+			return
+	finally:
+		_close_base(base)
 	try:
 		try:
 			now = os.fstat(fd)
@@ -13902,7 +13934,7 @@ def process_copy(src_paths: list, dests:list = [], single_thread = False, max_wo
 					if not NO_CREATE_DIR:
 						for dest in dests:
 							try:
-								_make_dest_directory(src, dest)
+								_close_base(_make_dest_directory(src, dest))
 							except OSError as e:
 								eprint(f'Directory sync error: {src} to {dest}: {e}')
 				else:
