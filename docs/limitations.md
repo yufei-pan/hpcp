@@ -117,13 +117,6 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - **Revisit when:** 9.88, started as soon as 9.87 ships.
 - **Noted:** 2026-11-10, the main session's decision (a deferral, not asked).
 
-### An early stop can very rarely hang the run in Python's own thread-start lock
-- **Kind:** deferred (multiCMD 1.60; its entry in docs/limitations.md, "A Ctrl-C inside Thread.start() can leave Python's thread lock held").
-- **What the operator sees:** a Ctrl-C or SIGTERM that lands in the parent while multiCMD starts the output readers of `cp --version` or of the held-file probe's `cp` (the two serial runs before each copy pool, a few milliseconds of an early stop's first second) can leave the run waiting for good: every later thread start blocks, and on Python 3.6 so does the exit. Ctrl-\ ends it. The 9.87 re-review estimated about 1 in a million early stops, against 11 of 900 early stops hung on 3.6 in 9.86 for other reasons.
-- **Why:** CPython's `with` race: a signal right after `Thread.start()` takes `threading._active_limbo_lock`, before the block's exit is armed, leaves it held. The fix belongs in multiCMD (1.60: record a stop while it starts a thread and raise it after); hpcp needs nothing then.
-- **Revisit when:** multiCMD 1.60.
-- **Noted:** 2026-11-10, found by the 9.87 fix-round re-review (R5); not worse than 9.86 overall; the main session's decision, not asked (a deferral).
-
 ### On Python 3.6 and 3.7 an early Ctrl-C can print an `Exception ignored ... KeyboardInterrupt` block
 - **Kind:** known limitation.
 - **What the operator sees:** on Python 3.6 and 3.7 (EL7, EL8), an early Ctrl-C (or SIGTERM or SIGHUP, which hpcp stops the same way) now and then prints Python's `Exception ignored in: <...>` line, a traceback ending in hpcp's `_stop` at `raise KeyboardInterrupt`, and `KeyboardInterrupt:`. The run still stops as it should (130 for Ctrl-C, its cleanup done) and nothing is lost. In the 9.87 reviews' probes, 9.87 printed it in 1 of 2,100 early stops and 0 of 1,200, against 11 of 1,200 for 9.86 (about 1 in 2,000 against about 1 in 100). Python 3.8 and later never print it.
