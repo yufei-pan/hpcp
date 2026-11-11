@@ -74,6 +74,12 @@ def _named(target):
 	return os.path.join(held, name) if name else held
 
 
+def _made_by_cp(target, named, path):
+	'''cp's destination argument (target, leading to named while cp ran) names path for cp to make, not a file hpcp holds:
+	path itself, or (9.88, W1) its name below the directory the door holds, /proc/self/fd/D/NAME.'''
+	return named == path and (target == path or (target.startswith(_HELD_PREFIX) and '/' in target[len(_HELD_PREFIX):]))
+
+
 def _record_cp(monkeypatch, after=None):
 	'''Each cp the copy runs, as (its destination argument, what that leads to, pass_fds); after(command, named) runs once cp
 	has.'''
@@ -454,7 +460,8 @@ def test_a_root_first_copy_is_given_its_owner_only_once_written(tmp_path, fresh,
 def test_a_root_first_copy_into_a_default_acl_directory_is_written_as_root_too(tmp_path, fresh, monkeypatch):
 	# There hpcp gave the new file its owner first (cp -a narrows the ACL of a file it did not make before it gives it another
 	# owner), so root's write was charged to that owner's quota, as review A's finding 4 showed without an ACL. cp makes the
-	# file by name there, as in 9.86: written as root, the owner given at the end, the directory's entries kept as cp keeps them.
+	# file by name there, as in 9.86 (since 9.88 its name below the directory the door holds): written as root, the owner given
+	# at the end, the directory's entries kept as cp keeps them.
 	_held_or_skip()
 	out = tmp_path / 'out'
 	out.mkdir()
@@ -465,11 +472,12 @@ def test_a_root_first_copy_into_a_default_acl_directory_is_written_as_root_too(t
 	seen = []
 	real = hpcp.run_command_in_multicmd_with_path_check
 	def cp(command, *args, **kwargs):
-		seen.append((command[-1], os.stat(command[-1]).st_uid if os.path.lexists(command[-1]) else None))
+		seen.append((_made_by_cp(command[-1], _named(command[-1]), str(out / 'f')),
+			os.stat(command[-1]).st_uid if os.path.lexists(command[-1]) else None))
 		return real(command, *args, **kwargs)
 	monkeypatch.setattr(hpcp, 'run_command_in_multicmd_with_path_check', cp)
 	_copy_file(monkeypatch, src, out / 'f')
-	assert seen == [(str(out / 'f'), None)] and os.stat(str(out / 'f')).st_uid == 1234, seen
+	assert seen == [(True, None)] and os.stat(str(out / 'f')).st_uid == 1234, seen
 
 
 @linux_only
@@ -492,16 +500,14 @@ def test_a_root_first_copy_of_another_group_s_file_into_a_default_acl_directory_
 	seen = []
 	real = hpcp.run_command_in_multicmd_with_path_check
 	def cp(command, *args, **kwargs):
-		seen.append(command[-1])
+		seen.append((command[-1], _made_by_cp(command[-1], _named(command[-1]), str(out / 'f'))))
 		return real(command, *args, **kwargs)
 	monkeypatch.setattr(hpcp, 'run_command_in_multicmd_with_path_check', cp)
 	_copy_file(monkeypatch, src, out / 'f')
 	made = os.stat(str(out / 'f'))
 	assert (made.st_uid, made.st_gid) == (owner, group), (made.st_uid, made.st_gid)
-	if by_name:
-		assert seen == [str(out / 'f')], seen
-	else:
-		assert len(seen) == 1 and seen[0].startswith(_HELD_PREFIX), seen
+	# by name: cp makes the landing; else cp writes the file hpcp holds (/proc/self/fd/N)
+	assert len(seen) == 1 and seen[0][1] == by_name and seen[0][0].startswith(_HELD_PREFIX), seen
 
 
 @linux_only
