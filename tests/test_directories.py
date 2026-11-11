@@ -850,12 +850,21 @@ def _shut_out_tree():
 
 
 def _as_nobody(args, cwd, script=None):
-	'''hpcp (or script, a wrapper that runs hpcp.main()) as nobody: (return code, output).'''
+	'''hpcp (or script, a wrapper that runs hpcp.main()) as nobody: (return code, output). Skips where nobody cannot reach
+	Python or hpcp.py (the EL VMs keep the checkout and the venv in a home directory of mode 0700); a venv's Python is
+	run by its real path, which hpcp needs nothing beyond.'''
+	python = os.path.realpath(sys.executable)
+	for path in (python, HPCP, script or HPCP):
+		above = os.path.dirname(path)
+		while above != os.path.dirname(above):
+			if not os.stat(above).st_mode & stat.S_IXOTH:
+				pytest.skip(f'nobody cannot reach {path}: {above} is not searchable by others')
+			above = os.path.dirname(above)
 	def demote():
 		os.setgroups([])
 		os.setgid(NOBODY)
 		os.setuid(NOBODY)
-	task = subprocess.run([sys.executable, script or HPCP] + args, cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+	task = subprocess.run([python, script or HPCP] + args, cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
 		stderr=subprocess.STDOUT, preexec_fn=demote, timeout=120, env=dict(os.environ, HOME=cwd))
 	return task.returncode, task.stdout.decode(errors='replace')
 
