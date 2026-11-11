@@ -1384,16 +1384,22 @@ class _pool:
 			_POOL_BROKEN = False
 			if sys.version_info < (3, 7):
 				_quiet_36_pool_shutdown()
-			self.slots, handed = _new_slots(self.max_workers)
-			# Forked workers (Python 3.6, which has no initializer, and the fork start method) inherit these.
-			_SLOTS = self.slots
-			if self.rate is not None:
-				_RATE_SHARE = self.rate
-			kwargs = {}
-			if sys.version_info >= (3, 7):
-				space = _SPACE_WARNED[2] if self.space and _SPACE_WARNED is not None else None
-				kwargs = {'initializer': _pool_worker_start, 'initargs': (handed, space, self.rate)}
-			self.executor = ProcessPoolExecutor(max_workers=self.max_workers, **kwargs)
+			# The slots' lock and the executor's queues are SemLocks: made with the stops blocked in the process that runs main(),
+			# so a semaphore tracker Python 3.6 and 3.7 start for them (forkserver, spawn) starts with them blocked (hpcp()).
+			mask = _block_stops() if os.getpid() == _MAIN_PID else None
+			try:
+				self.slots, handed = _new_slots(self.max_workers)
+				# Forked workers (Python 3.6, which has no initializer, and the fork start method) inherit these.
+				_SLOTS = self.slots
+				if self.rate is not None:
+					_RATE_SHARE = self.rate
+				kwargs = {}
+				if sys.version_info >= (3, 7):
+					space = _SPACE_WARNED[2] if self.space and _SPACE_WARNED is not None else None
+					kwargs = {'initializer': _pool_worker_start, 'initargs': (handed, space, self.rate)}
+				self.executor = ProcessPoolExecutor(max_workers=self.max_workers, **kwargs)
+			finally:
+				_restore_stops(mask)
 		except BaseException:
 			_DEFER -= 1
 			_SLOTS, _RATE_SHARE = self.outer
@@ -14029,9 +14035,17 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = None,
 		max_workers = round(0.5 * multiprocessing.cpu_count())
 	elif max_workers < 0:
 		max_workers = round(- max_workers * multiprocessing.cpu_count())
-	# This run's space-warning slots (_space_warning); a nested run (-dd) has its own, and gives the outer one its back.
+	# This run's space-warning slots (_space_warning); a nested run (-dd) has its own, and gives the outer one its back. Made
+	# with the stops blocked in the process that runs main(), as the pools' are (_pool): its lock is the run's first SemLock,
+	# and under forkserver or spawn Python 3.6 and 3.7 start their semaphore tracker for it with nothing blocked, where an
+	# early Ctrl-C printed the tracker's traceback (3.8's resource tracker blocks them itself). The tracker keeps them blocked.
 	global _SPACE_WARNED
-	outer_space, _SPACE_WARNED = _SPACE_WARNED, (_space_share() if os.name == 'posix' else None)
+	mask = _block_stops() if os.getpid() == _MAIN_PID else None
+	try:
+		share = _space_share() if os.name == 'posix' else None
+	finally:
+		_restore_stops(mask)
+	outer_space, _SPACE_WARNED = _SPACE_WARNED, share
 	try:
 		if get_diff_image or load_diff_image or force_apply:
 			if os.name == 'nt':

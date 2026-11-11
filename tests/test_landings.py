@@ -2281,16 +2281,10 @@ def test_an_early_stop_prints_no_traceback(tmp_path, method, batch):
 	# in only later: about one early Ctrl-C in three printed a KeyboardInterrupt traceback on 3.14. A worker now starts with
 	# the stops blocked and lets them in once set up. 10 runs a batch, 40 a start method; each stopped at a random 0 to 0.3 s
 	# after hpcp.main() was called, by SIGINT to the run's process group, as a terminal's Ctrl-C. On 3.6 and 3.7 Python's own
-	# block for hpcp's dropped stop is accepted (_DROPPED_STOP, a known limitation there).
-	if sys.version_info < (3, 8) and method != 'fork':
-		# 3.6's pools fork. On 3.7 a forkserver or spawn child (or the semaphore tracker it starts) can take the same Ctrl-C
-		# while Python itself starts or imports, which prints a traceback from Python's own code (importlib, initsite,
-		# multiprocessing.spawn; 3.7's semaphore tracker KeyError in cache.remove). That is the deferral "A Ctrl-C that lands
-		# while Python imports hpcp can be dropped" (docs/limitations.md, 9.88), and 9.86 prints it more (one round of 100 runs a
-		# method, 3.7, runs with a traceback, 9.86 against 9.87: forkserver 25 against 8, spawn 94 against 15; every 9.87 run
-		# exits 130. The README and the deferral give another, larger measure: 200 runs a method, forkserver 45 against 13, spawn
-		# 187 against 28).
-		pytest.skip('Python 3.6 pools fork; on 3.7 the child start-up prints its own traceback (the 9.88 deferral in docs/limitations.md)')
+	# block for hpcp's dropped stop is accepted (_DROPPED_STOP, a known limitation there). 9.88: on 3.6 and 3.7 with
+	# forkserver or spawn (skipped in 9.87), the semaphore tracker they start at the run's first SemLock starts with the stops
+	# blocked, as 3.8's resource tracker blocks them itself: before, a Ctrl-C there printed the tracker's traceback (13 and 28
+	# of 200 runs on 3.7 in the 9.87 docs round).
 	cp = tmp_path / 'slowcp'
 	cp.write_text(_SLOWER_CP)
 	os.chmod(str(cp), 0o755)
@@ -2311,7 +2305,7 @@ def test_an_early_stop_prints_no_traceback(tmp_path, method, batch):
 		finally:
 			if task.poll() is None:
 				os.killpg(task.pid, signal.SIGKILL)
-		left =_DROPPED_STOP.sub(b'', output) if sys.version_info < (3, 8) else output
+		left = _DROPPED_STOP.sub(b'', output) if sys.version_info < (3, 8) else output
 		assert code == 130 and b'Traceback' not in left, (run, output[-3000:])
 
 
