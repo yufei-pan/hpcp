@@ -1412,6 +1412,28 @@ def test_w1_a_tree_deeper_than_half_the_open_files_limit_is_copied(tmp_path):
 
 
 @not_root
+@posix_only
+@pytest.mark.parametrize('route', ['proc', 'read'])
+def test_w1_a_directory_the_door_cannot_enter_is_named_by_its_path(tmp_path, monkeypatch, reset_hpcp_globals, route):
+	# W1 risk 6: the door opens each level relative to the one it holds, so the kernel's error names the component alone
+	# ("Permission denied: 'sub'"); 9.87's walk by path named the path, and so does the door's error now. Here out/d, the
+	# runner's, has no search for its owner (0607, a non-root move's exact mode).
+	if route == 'proc' and not hpcp._PATH_FDS:
+		pytest.skip('no /proc/self/fd here')
+	monkeypatch.setattr(hpcp, '_PATH_FDS', route == 'proc')
+	out = str(tmp_path / 'out')
+	os.makedirs(os.path.join(out, 'd', 'sub'))
+	os.chmod(os.path.join(out, 'd'), 0o607)
+	_w1_run(monkeypatch, out)
+	try:
+		with pytest.raises(PermissionError) as raised:
+			hpcp._dest_directory(os.path.join(out, 'd', 'sub'), make=False)
+	finally:
+		os.chmod(os.path.join(out, 'd'), 0o755)
+	assert raised.value.filename == os.path.join(out, 'd', 'sub'), raised.value
+
+
+@not_root
 @linux_only
 def test_w1_a_failing_cp_s_message_names_the_landing_not_its_proc_path(tmp_path, fresh, monkeypatch):
 	# W1 risk 6: cp given the landing below the held directory (/proc/self/fd/D/NAME: a FIFO source, which cp -a makes) fails

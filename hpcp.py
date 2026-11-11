@@ -4409,6 +4409,8 @@ def _dest_directory(path, make=True, source=None):
 		except OSError as e:
 			if _by_path_error(e):
 				return _door_by_path(os.path.dirname(current), parts[index:], make, source)
+			if e.filename == parts[index]:
+				e.filename = current  # a call relative to the held directory names the component alone: messages name its path
 			raise
 		if fd is None:
 			return None
