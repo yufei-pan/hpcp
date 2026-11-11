@@ -355,3 +355,24 @@ def test_the_cli_copies_reruns_and_moves(tmp_path):
 	assert read(tmp_path / 'dst/a.txt') == 'a' and read(tmp_path / 'dst/Sub/b.txt') == 'b'
 	run('src/', '-d', 'moved/', '-rf')
 	assert read(tmp_path / 'moved/Sub/b.txt') == 'b' and not os.path.exists(str(tmp_path / 'src/a.txt'))
+
+
+# ---- 9.88 (macos988: added in 9.88 and not yet run on macOS; select them with -m macos988)
+
+@pytest.mark.macos988
+@pytest.mark.parametrize('handler', ['hpcp', 'python'])
+def test_a_stop_anywhere_in_the_probe_leaves_nothing_on_macos(tmp_path, fresh, monkeypatch, stop_alarms, handler):
+	# S6: macOS has no O_TMPFILE, so the probe's held file is made with a name and unlinked at once. Each of the probe's files
+	# is held by C as it is made (_create), and each name goes whatever a stop does (9.87 used tempfile, whose own files a stop
+	# could leave). cp is left out: the runner answers at once.
+	probes = os.path.realpath(str(tmp_path / 'probe-tmp'))
+	os.makedirs(probes)
+	monkeypatch.setattr(tempfile, 'tempdir', probes)
+	class Done:
+		returncode = 0
+	monkeypatch.setattr(hpcp.multiCMD, 'run_commands', lambda *args, **kwargs: [Done()])
+	def call(index, got):
+		hpcp._HELD[:] = [None, None]
+		got.extend(map(lambda _: hpcp._held_route() or True, (None,)))
+	stopped = stop_alarms(handler, call, 2000)
+	assert stopped and os.listdir(probes) == [], (len(stopped), os.listdir(probes)[:10])

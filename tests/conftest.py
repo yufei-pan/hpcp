@@ -290,3 +290,49 @@ def exec_dir(tmp_path):
 			return
 		shutil.rmtree(directory, ignore_errors=True)
 	pytest.skip('no writable directory allows executing scripts (every candidate is mounted noexec)')
+
+
+@pytest.fixture
+def stop_alarms(monkeypatch, reset_hpcp_globals):
+	"""run(handler, call, count, settle=None): call(index, got) count times, each with SIGALRM at a random moment over 1.5
+	times its median unstopped run (timed first), as a stop: hpcp's handler (handler 'hpcp': _stop as the main process's, no
+	stop recorded before each call, none passed on) or Python's own ('python': signal.default_int_handler, as in a program
+	that imports hpcp). call stores its result in got by C (list.extend over map), so a stop after the call returned is not
+	taken for one inside it; settle(got) runs once the alarm is off. Returns the indexes of the calls that raised."""
+	import random
+	import signal
+	import time
+	def run(handler, call, count, settle=lambda got: None):
+		timings = []
+		for index in range(50):
+			got = []
+			started = time.perf_counter()
+			call(-1 - index, got)
+			timings.append(time.perf_counter() - started)
+			settle(got)
+		window = sorted(timings)[len(timings) // 2] * 1.5
+		for name, value in (('_MAIN_PID', os.getpid()), ('_DEFER', 0), ('_pass_stop_on', lambda signum: None)):
+			monkeypatch.setattr(hpcp, name, value)
+		old = signal.signal(signal.SIGALRM, hpcp._stop if handler == 'hpcp' else signal.default_int_handler)
+		stopped = []
+		try:
+			for index in range(count):
+				hpcp._STOPPED = hpcp._STOPPED_PID = None
+				hpcp._STOP_ACTED = hpcp._STOP_NOTED = False
+				got = []
+				try:
+					signal.setitimer(signal.ITIMER_REAL, random.uniform(1e-6, window))
+					call(index, got)
+					signal.setitimer(signal.ITIMER_REAL, 0)
+				except KeyboardInterrupt:
+					signal.setitimer(signal.ITIMER_REAL, 0)
+				settle(got)
+				if not got:
+					stopped.append(index)
+		finally:
+			signal.setitimer(signal.ITIMER_REAL, 0)
+			signal.signal(signal.SIGALRM, old)
+			hpcp._STOPPED = hpcp._STOPPED_PID = None
+			hpcp._STOP_ACTED = hpcp._STOP_NOTED = False
+		return stopped
+	return run

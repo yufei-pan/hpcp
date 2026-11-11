@@ -893,9 +893,6 @@ _IN_TASK = False
 _MAIN_PID = None
 # True once this process is ending (_end_by): a stop then changes nothing.
 _ENDING = False
-# True while a call makes a file that nothing yet holds the name of (_cp_made's landing, the test file of tempfile.gettempdir in
-# _held_route): a stop is then only recorded (_stop), and raised there once the file is known or removed.
-_MAKING = False
 # Twice multiCMD's longest stop of a command (0.01 s, up to 1 s, SIGKILL, up to 1 s more): the watch's grace before os._exit;
 # after a stop, how long a pool's worker between tasks may take to end before it is killed (_pool); and how long a pool may
 # stay silent after one of its workers died before the run ends (_pool.watch).
@@ -951,8 +948,8 @@ def _stop(signum, frame):
 	cleaned up); later ones return, so a second Ctrl-C cannot cut the cleanup halfway (the parent says so once, naming
 	Ctrl-\\). The stop is passed on to this process's pool workers, which a signal to this process alone (kill PID, timeout)
 	never reaches. A pool worker between tasks has nothing to clean up and ends at once. In the parent inside a pool region
-	(_DEFER) the first stop is only recorded: the region's loop raises it (_check_stop). So it is while a call makes a file that
-	nothing holds the name of yet (_MAKING): the call raises it once the file is known or removed."""
+	(_DEFER) the first stop is only recorded: the region's loop raises it (_check_stop). A file hpcp makes is held by C before
+	this can run (_create), so a stop that raises there leaves nothing the caller's cleanup cannot find."""
 	global _STOPPED, _STOPPED_PID, _STOP_NOTED
 	if _ENDING:
 		return
@@ -985,10 +982,6 @@ def _stop(signum, frame):
 	_STOPPED, _STOPPED_PID = signum, os.getpid()
 	_pass_stop_on(signum)
 	if _DEFER and os.getpid() == _MAIN_PID:
-		return
-	if _MAKING:
-		# Raised as os.open returns, it would leave the file just made with nothing holding its name: the caller (_cp_made,
-		# _held_route) raises it.
 		return
 	if _DROPPING and _in_dropping_call(frame):
 		# Python would drop the raise, and 3.6 and 3.7 print it as 'Exception ignored' with its traceback. Recorded, it is acted
@@ -4295,18 +4288,35 @@ _HELD_GIVEN = None  # (_held_route's answer,), a worker's, handed by its parent'
 # The name under which cp opens a descriptor it inherited (pass_fds): its own process's, so no other process's /proc is asked.
 _HELD_NAME = '/dev/fd/%d' if sys.platform == 'darwin' else '/proc/self/fd/%d'
 
+# Where the held-file probe makes its two files (_held_route): tempfile's candidates after the environment's, in its order,
+# then the working directory.
+_TEMP_DIRS = ('/tmp', '/var/tmp', '/usr/tmp')
+
+def _temp_candidates():
+	"""The directories the held-file probe tries, in tempfile.gettempdir's order: tempfile.tempdir alone when a program set it
+	(gettempdir returns it untried); else TMPDIR, TEMP and TMP, then _TEMP_DIRS, then the working directory."""
+	if tempfile.tempdir is not None:
+		return [tempfile.tempdir]
+	found = [os.environ[name] for name in ('TMPDIR', 'TEMP', 'TMP') if os.environ.get(name)]
+	found.extend(_TEMP_DIRS)
+	with contextlib.suppress(OSError):
+		found.append(os.getcwd())
+	return [os.path.abspath(directory) for directory in found]
+
 def _held_route():
 	"""How cp writes a file this process holds open, through the descriptor it inherits (_HELD_NAME): 'c' when its write leaves
 	the file at the source's size (Linux reopens /proc/self/fd/N and truncates; macOS's copyfile truncates after its copy),
 	'cb' when it writes through it but leaves an old tail (a dup opened without truncating: hpcp empties the held file before
 	each cp), None when it does not: cp then gets the name, as 9.84 gave it. Asked once per process by doing it: cp, with the
-	run's flags, copies a 1-byte source holding c onto a held temporary file holding ab, which is read back (a pool's workers are
-	handed their parent's answer, _HELD_GIVEN, and ask nothing). Only on Linux
-	with GNU cp (BusyBox's makes every destination anew) and on macOS; elsewhere None. A cp that times out or cannot start
-	keeps no answer (asked again at the next copy, as cp_supports_sparse); a cp that fails or writes elsewhere, or no
-	temporary file (tempfile's TMPDIR, /tmp, /var/tmp, /usr/tmp and the working directory), is None. Both temporary files
-	go whatever happens."""
-	global _MAKING
+	run's flags, copies a 1-byte source holding c onto a held file holding ab, which is read back (a pool's workers are
+	handed their parent's answer, _HELD_GIVEN, and ask nothing). Only on Linux with GNU cp (BusyBox's makes every destination
+	anew) and on macOS; elsewhere None. A cp that times out or cannot start keeps no answer (asked again at the next copy, as
+	cp_supports_sparse); a cp that fails or writes elsewhere, or no directory to make the files in (_temp_candidates), is
+	None. The source is made where the first candidate takes it, and the held file beside it with no name (O_TMPFILE), or
+	named and unlinked at once where it cannot be (a kernel before 3.11, which ignores the flag; a filesystem without it;
+	macOS), as tempfile.TemporaryFile does. Each is held by C as it is made (_create), and each name made goes whatever
+	happens: tempfile's own calls left their files to a stop landing between its create and its unlink (gettempdir's test
+	file, mkstemp's; 9.87 deferred stops there, for hpcp's own handler only)."""
 	pid = os.getpid()
 	if _HELD[0] == pid:
 		return _HELD[1]
@@ -4322,50 +4332,55 @@ def _held_route():
 			return None
 	elif sys.platform != 'darwin':
 		return None
-	source = None
+	# Each name is set before its create, and removed as soon as it has served: by the finally only where a stop or an error
+	# came first (a stop that lands in a finally the run reached normally cuts it), and then only once the create has stored its
+	# descriptor (_create).
+	source = held_name = None
+	sources, helds = [], []
 	try:
-		# gettempdir's first call makes and removes a test file in the directory it tries (CPython: 8 characters, 4 bytes): a
-		# stop in between left it (14 of 9,900 early stops of the final review's probe; 9.86 made no file). TemporaryFile, where
-		# it cannot make a file without a name (macOS; a kernel or TMPDIR without O_TMPFILE), makes mkstemp's tmp* file and
-		# unlinks it: a stop in between left it (4 % of stops in the probe's first 0.5 ms); and on Python 3.6 to 3.9 a stop as
-		# it returns closed the file twice, so it raised EBADF in place of the stop, taken below for no route (1 % of them).
-		# A stop is only recorded while they run (_MAKING, as for the file _cp_made makes), and raised after them.
-		_MAKING = True
-		try:
-			directory = tempfile.gettempdir()
-			held = tempfile.TemporaryFile()
-		finally:
-			_MAKING = False
-			if _STOPPED_PID == os.getpid():
-				raise KeyboardInterrupt
-		# Named before it is made, so the finally removes whatever a stop leaves: mkstemp gives the name only after making the
-		# file, and a stop in between left it (about 3% of early Ctrl-Cs on Python 3.6 and 3.7, one file per worker hit).
-		source = os.path.join(directory, 'hpcp-held-probe-%d-%s' % (os.getpid(), uuid.uuid4().hex[:16]))
-		handle = os.open(source, _NEW_FILE_FLAGS, 0o600)
-		try:
-			os.write(handle, b'c')
-		finally:
-			os.close(handle)
-		with held:
-			fd = held.fileno()
-			os.write(fd, b'ab')
-			os.lseek(fd, 0, os.SEEK_SET)  # as a landing's fresh descriptor: macOS's /dev/fd/N shares its offset
-			# an empty copy takes milliseconds; a cp that hangs this long gets no route (_CP_ASK_TIMEOUT)
-			task = multiCMD.run_commands([[_bin('cp'), '-f' if CONTENT_ONLY else '-af', source, _HELD_NAME % fd]],
-				timeout=_CP_ASK_TIMEOUT, quiet=True, return_object=True, pass_fds=(fd,))[0]
-			if task.returncode in _NO_ANSWER:
-				_HELD[0] = None
-			elif task.returncode == 0:
-				_HELD[1] = {b'c': 'c', b'cb': 'cb'}.get(os.pread(fd, 8, 0))
-	except Exception:
-		pass  # no temporary file: no route
-	finally:
-		# No call before the unlink (a stop on Python 3.6 to 3.9 can land between any two instructions here).
-		if source is not None:
+		for directory in _temp_candidates():
+			source = os.path.join(directory, 'hpcp-held-probe-%d-%s' % (pid, uuid.uuid4().hex[:16]))
 			try:
-				os.unlink(source)
+				_create(directory, os.path.basename(source), _NEW_FILE_FLAGS, 0o600, sources)
+				break
 			except OSError:
-				pass
+				continue
+		else:
+			return None  # no directory to make the probe's files in: no route
+		os.write(sources[0], b'c')
+		try:
+			helds.extend(map(functools.partial(os.open, flags=os.O_TMPFILE | os.O_RDWR | getattr(os, 'O_CLOEXEC', 0), mode=0o600),
+				(directory,)))
+		except (AttributeError, OSError):
+			held_name = source + '-held'
+			_create(directory, os.path.basename(held_name), _NEW_FILE_FLAGS & ~os.O_WRONLY | os.O_RDWR, 0o600, helds)
+			os.unlink(held_name)
+			held_name = None
+		fd = helds[0]
+		os.write(fd, b'ab')
+		os.lseek(fd, 0, os.SEEK_SET)  # as a landing's fresh descriptor: macOS's /dev/fd/N shares its offset
+		# an empty copy takes milliseconds; a cp that hangs this long gets no route (_CP_ASK_TIMEOUT)
+		task = multiCMD.run_commands([[_bin('cp'), '-f' if CONTENT_ONLY else '-af', source, _HELD_NAME % fd]],
+			timeout=_CP_ASK_TIMEOUT, quiet=True, return_object=True, pass_fds=(fd,))[0]
+		os.unlink(source)
+		source = None
+		if task.returncode in _NO_ANSWER:
+			_HELD[0] = None
+		elif task.returncode == 0:
+			_HELD[1] = {b'c': 'c', b'cb': 'cb'}.get(os.pread(fd, 8, 0))
+	except Exception:
+		pass  # no file to probe with: no route
+	finally:
+		# The names first: a second stop landing in here cuts what follows it (a descriptor left open in a process that is ending).
+		if sources and source is not None:
+			with contextlib.suppress(OSError):
+				os.unlink(source)
+		if helds and held_name is not None:
+			with contextlib.suppress(OSError):
+				os.unlink(held_name)
+		for opened in (sources, helds):
+			while opened:
+				os.close(opened.pop())
 	return _HELD[1]
 
 def _cp_held(command, src_path, target, fd, fst, space, through_link, new=False):
@@ -4416,6 +4431,15 @@ def _new_file_mode(src_st):
 	the source's permission bits, which the umask and a default ACL then make what cp -f makes."""
 	return stat.S_IMODE(src_st.st_mode) & 0o777 if CONTENT_ONLY and src_st is not None else 0o600
 
+def _create(base, name, flags, mode, opened):
+	"""Make name in base (a directory's descriptor, or its path: _at) with flags (O_CREAT | O_EXCL ...) and mode, its
+	descriptor appended to opened (a list) by C: list.extend over map stores what os.open returns before Python runs another
+	instruction, so a stop's handler (hpcp's _stop, or Python's own in a program that imports hpcp) never lands between the
+	create and the store, where `fd = os.open(...)` loses the descriptor and leaves the file. The caller's cleanup closes
+	and removes what opened holds."""
+	opened.extend(map(functools.partial(os.open, flags=flags, mode=mode, **_fd_of(base)), _at(base, name)))
+	return opened[-1]
+
 def _drop_made(target, made):
 	"""Remove target while its name still leads to made, the file hpcp made there (its fstat): never what was put there since."""
 	with contextlib.suppress(OSError):
@@ -4446,21 +4470,12 @@ def _cp_made(command, src_path, target, src_st, space):
 	written (XFS enforces an owner's or a group's quota on a root write, not on root's chown: a user, or a group, at the hard
 	limit got Disk quota exceeded where 9.86 completed). A mode its owner cannot write (-co's 0444 source, a umask taking
 	owner write) has owner write while cp writes, which cp's reopen needs; -co puts the mode back."""
-	global _MAKING
 	src_st = src_st or os.lstat(src_path)
-	fd = made = None
+	# the descriptor, held from its create on (_create): a stop's cleanup below always finds the file it made
+	opened, made = [], None
 	try:
-		# A stop is only recorded while the file is made (_stop) and raised here once it is known, or the create has failed: one
-		# raised as os.open returned left the file, empty, at the landing, with nothing to say it was this run's (1 early stop
-		# in 20 on a busy host, 1 in 240 on a quiet one, on every Python; 9.86's cp by name left none).
-		_MAKING = True
-		try:
-			fd = os.open(target, _NEW_FILE_FLAGS, _new_file_mode(src_st))
-			made = os.fstat(fd)
-		finally:
-			_MAKING = False
-			if _STOPPED_PID == os.getpid():
-				raise KeyboardInterrupt
+		fd = _create(os.path.dirname(target), os.path.basename(target), _NEW_FILE_FLAGS, _new_file_mode(src_st), opened)
+		made = os.fstat(fd)
 		if not CONTENT_ONLY:
 			_label_like(src_path, fd)
 			if _has_acl(fd):
@@ -4478,10 +4493,9 @@ def _cp_made(command, src_path, target, src_st, space):
 				if by_name:
 					_drop_made(target, made)
 					made = None
-					# marked closed before the close: a stop raised as it returns would have the handler below close it again,
+					# out of opened before the close: a stop raised as it returns would have the handler below close it again,
 					# whose EBADF took the stop's place (a false Copy failed, the stop left to the task's end)
-					fd, closing = None, fd
-					os.close(closing)
+					os.close(opened.pop())
 					return None
 		narrow = not made.st_mode & stat.S_IWUSR
 		if narrow:
@@ -4491,10 +4505,14 @@ def _cp_made(command, src_path, target, src_st, space):
 			os.fchmod(fd, stat.S_IMODE(made.st_mode))
 		return fd, made, size
 	except BaseException:
-		if made is not None:
-			_drop_made(target, made)
-		if fd is not None:
-			os.close(fd)
+		if opened:
+			if made is None:
+				# stopped before the fstat stored it
+				with contextlib.suppress(OSError):
+					made = os.fstat(opened[0])
+			if made is not None:
+				_drop_made(target, made)
+			os.close(opened.pop())
 		raise
 
 def _cp_new(command, src_path, target, src_st, space):
