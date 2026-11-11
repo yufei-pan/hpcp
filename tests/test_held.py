@@ -1394,11 +1394,13 @@ if __name__ == '__main__':
 @posix_only
 def test_w1_a_tree_deeper_than_half_the_open_files_limit_is_copied(tmp_path):
 	# W1 risk 4: the door holds at most half the open-files limit (64 here, as macOS's 256 stays); the levels below go by
-	# path, so the other half stays for what each copy opens (its file, cp's pipes). A tree 50 levels deep, files on the way
-	# and at its bottom. Held to the limit, the copies at the bottom fail with "Too many open files" (budget-off).
+	# path, so the other half stays for what each copy opens (its file, cp's pipes). A tree 100 levels deep, files on the way
+	# and at its bottom. Held to the limit (budget-off), the door takes every descriptor the process has left before it goes
+	# by path, and the copies below fail with "Too many open files", however many others the process holds (at 50 levels a
+	# forked worker on 3.12 had room left: it copied all).
 	path = tmp_path / 'src'
 	names = []
-	for level in range(50):
+	for level in range(100):
 		path = path / ('l%02d' % level)
 		if level % 10 == 9:
 			names.append(os.path.relpath(str(path / 'f'), str(tmp_path / 'src')))
