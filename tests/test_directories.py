@@ -785,7 +785,9 @@ def test_a_directory_finish_takes_times_within_the_filesystem_step(tmp_path, mon
 	reason='needs root to mount a vfat image (VM 901)')
 def test_a_merged_rerun_on_vfat_sets_no_directory_again(tmp_path, monkeypatch, reset_hpcp_globals):
 	# vfat keeps times in 2 s steps: 9.87's finish compared them exactly, and with merged sources gave a shared directory two
-	# records, so every rerun set its times again (twice). The modes are ones vfat can hold (its default dmask, 022).
+	# records, so every rerun set its times again (twice). The modes are ones vfat can hold (its default dmask, 022). The
+	# copy goes below the mount: vfat's root directory keeps no times (it reads 1970 after a touch: VM 901, Linux 6.1), so
+	# a run sets them on every rerun, as 9.87 did.
 	mkfs = shutil.which('mkfs.vfat') or shutil.which('/usr/sbin/mkfs.vfat') or shutil.which('/sbin/mkfs.vfat')
 	if not mkfs:
 		pytest.skip('needs mkfs.vfat')
@@ -802,8 +804,9 @@ def test_a_merged_rerun_on_vfat_sets_no_directory_again(tmp_path, monkeypatch, r
 		_shared(tmp_path / 'b' / 'x', 'b', 0o755, T2 + 1)
 		_shared(tmp_path / 'b' / 'y', 'b', 0o755, T2 + 3)
 		sources = [str(tmp_path / 'a') + os.sep, str(tmp_path / 'b') + os.sep]
-		assert hpcp.hpcp(sources, dest_paths=[str(mount) + os.sep], single_thread=True, batch=True) == 0, hpcp.ERRORS
-		assert abs(os.lstat(str(mount / 'x')).st_mtime_ns - T2) <= 2 * 10**9
+		dest = str(mount / 'out') + os.sep
+		assert hpcp.hpcp(sources, dest_paths=[dest], single_thread=True, batch=True) == 0, hpcp.ERRORS
+		assert abs(os.lstat(str(mount / 'out' / 'x')).st_mtime_ns - T2) <= 2 * 10**9
 		changes = []
 		for name in ('utime', 'chmod', 'fchmod'):
 			real = getattr(os, name)
@@ -813,7 +816,7 @@ def test_a_merged_rerun_on_vfat_sets_no_directory_again(tmp_path, monkeypatch, r
 					changes.append((_name, where))
 				return _real(target, *args, **kwargs)
 			monkeypatch.setattr(os, name, spy)
-		assert hpcp.hpcp(sources, dest_paths=[str(mount) + os.sep], single_thread=True, batch=True) == 0, hpcp.ERRORS
+		assert hpcp.hpcp(sources, dest_paths=[dest], single_thread=True, batch=True) == 0, hpcp.ERRORS
 		assert changes == [], changes
 	finally:
 		subprocess.run(['umount', '-l', str(mount)], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
