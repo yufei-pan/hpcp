@@ -1188,3 +1188,50 @@ def test_w1_a_directory_swapped_at_a_link_s_copy_never_leads_it_elsewhere(tmp_pa
 	assert done and victim.untouched(), (victim.before, victim.state())
 	assert os.path.islink(directory)
 	assert os.readlink(os.path.join(out, 'a.away', name)) == 'target-of-the-source' and not hpcp.ERRORS, hpcp.ERRORS
+
+
+_PIN_SWAP = '''
+import os, sys
+if __name__ == '__main__':  # (forkserver and spawn workers import this module again)
+	sys.path.insert(0, sys.argv[1])
+	import hpcp
+	restore, victim = sys.argv[2], sys.argv[3]
+	real = hpcp._settle_destinations
+	def settle_then_swap(*args, **kwargs):
+		# the run has started (hpcp() named and pinned its destinations): the destination's owner swaps it for a link
+		result = real(*args, **kwargs)
+		os.rename(restore, restore + '.away')
+		os.symlink(victim, restore)
+		return result
+	hpcp._settle_destinations = settle_then_swap
+	sys.argv = ['hpcp'] + sys.argv[4:]
+	sys.exit(hpcp.main())
+'''
+
+
+@root_only
+@linux_only
+@pytest.mark.parametrize('workers', [1, 3], ids=['serial', 'pool'])
+def test_w1_a_named_destination_swapped_mid_run_is_written_no_more(tmp_path, workers):
+	# Q2's pin: a root run into alice's destination, -d /home/alice/restore/; once the run has started alice swaps restore for
+	# a link to victim/. 9.87 followed the name whenever a process opened it, as named: its directory sync, files and links
+	# went into victim/. 9.88 pins the destination at the run's start: a process that finds it leading elsewhere writes
+	# nothing there and says so once (213), each file recorded (a move keeps its source).
+	victim = _Victim(tmp_path / 'victim')
+	src = tmp_path / 'src'
+	for name in ('a/x', 'a/y', 'b/z', 'top'):
+		write(src / name, 'new ' + name)
+	os.symlink('top', str(src / 'link'))
+	restore = tmp_path / 'home' / 'alice' / 'restore'
+	restore.mkdir(parents=True)
+	os.chown(str(restore.parent), 1000, 1000)
+	os.chown(str(restore), 1000, 1000)
+	script = write(tmp_path / 'pin.py', _PIN_SWAP)
+	task = subprocess.run([sys.executable, script, os.path.dirname(HPCP), str(restore), victim.path, str(src) + '/', '-d',
+		str(restore) + '/'] + (['-s'] if workers == 1 else ['-j', str(workers)]), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+		timeout=120)
+	output = task.stdout.decode(errors='replace') + task.stderr.decode(errors='replace')
+	assert victim.untouched(), (victim.before, victim.state(), output[-3000:])
+	lines = [line for line in output.splitlines() if 'now leads to another directory than the one this run started writing in' in line]
+	assert task.returncode == 213 and 1 <= len(lines) <= 1 + workers, (task.returncode, lines, output[-3000:])
+	assert os.listdir(str(restore) + '.away') == [], output[-3000:]

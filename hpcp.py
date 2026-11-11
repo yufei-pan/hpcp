@@ -1192,7 +1192,12 @@ def _register_worker_start():
 # holds (_dest_directory) never outlive it.
 NAMED_DESTS = frozenset()
 RUN_ID = None
-_TASK_SETTINGS = ('NAMED_DESTS', 'RUN_ID', 'CONTENT_ONLY', 'WRITE_BESIDE', 'READ_FIRST', 'NO_CREATE_DIR', 'SYNC_COPIES', 'RANDOM_DESTINATION_SELECTION', 'HASH_SIZE', 'COMMAND_TIMEOUT',
+# The named destinations that are directories when the run's copy starts, as named (a link followed): {path (absolute):
+# (st_dev, st_ino)}, the run's pin. Each process checks a named destination against it as its door opens it
+# (_dest_directory): a worker that opens it later (a fresh one: forkserver, Python 3.14's default on Linux; spawn, macOS's)
+# never follows a swap of it for a link to another directory. One the run makes later is pinned by each process's open.
+NAMED_IDS = {}
+_TASK_SETTINGS = ('NAMED_DESTS', 'RUN_ID', 'NAMED_IDS', 'CONTENT_ONLY', 'WRITE_BESIDE', 'READ_FIRST', 'NO_CREATE_DIR', 'SYNC_COPIES', 'RANDOM_DESTINATION_SELECTION', 'HASH_SIZE', 'COMMAND_TIMEOUT',
 	'BYTES_RATE_LIMIT', 'FILES_RATE_LIMIT', 'MIRROR_FS_PARAMS', 'REMOVE_FILES_WHILE_LISTING', '_BAR')
 
 def _submit_task(executor, func, *args, **kwargs):
@@ -3129,7 +3134,7 @@ def create_sym_links(symLinks,exclude=None,link_tracking=False,link_dirs=None):
 				except Exception as e:
 					# Notes: only 'Failed to create symbolic link' below, when every destination failed, is the error.
 					if isinstance(e, _Refused):
-						eprint(e.text(f'the link {src}'))
+						_say_refused(e, f'the link {src}')
 					print(f'Could not create symbolic link from {linkedTargetFile} to {dest}', file=sys.stderr)
 					if dests:
 						print("Trying next destination...", file=sys.stderr)
@@ -4077,12 +4082,20 @@ _PATH_FDS = hasattr(os, 'O_PATH') and os.path.isdir('/proc/self/fd')
 
 class _Refused(Exception):
 	"""A landing this run will not write, for each file it would hold: a 'Destination clash' (213) naming what is there and
-	the fix. text(file) is the message for one file."""
-	def __init__(self, before, after):
+	the fix. text(file) is the message for one file. said: this process has printed it (a pinned destination that leads
+	elsewhere, _dest_directory): recorded for each file, printed once (_say_refused)."""
+	def __init__(self, before, after, said=False):
 		super().__init__(before + '...' + after)
-		self.before, self.after = before, after
+		self.before, self.after, self.said = before, after, said
 	def text(self, path):
 		return f'Destination clash: {self.before}{path}{self.after}'
+
+def _say_refused(refusal, what):
+	"""refusal's 213 line for what (eprint), or only its record where this process printed it already (refusal.said)."""
+	if refusal.said:
+		ERRORS.append(refusal.text(what))
+	else:
+		eprint(refusal.text(what))
 
 class _KeptOld(Exception):
 	"""A copy that left what is at its landing as it was (a rewrite beside whose new copy could not be made, filled, written to
@@ -4104,16 +4117,18 @@ _HOLD_PATH_FLAGS = getattr(os, 'O_PATH', 0) | getattr(os, 'O_DIRECTORY', 0) | ge
 _HOLD_READ_FLAGS = os.O_RDONLY | getattr(os, 'O_NONBLOCK', 0) | getattr(os, 'O_DIRECTORY', 0) | getattr(os, 'O_CLOEXEC', 0)
 
 # Per process, in a run (RUN_ID): {named destination (absolute): the directories the door holds from it down to the last
-# one asked for (_HeldDirs)}. A forked worker inherits its parent's, whose descriptors stay valid in it. The cursor's own
-# descriptors never leave it (the door hands out a dup): the next door call may close them, and a number reused then would
-# lead a stale holder's write elsewhere.
+# one asked for (_HeldDirs), or the refusal of one that no longer leads to its pin (NAMED_IDS)}. A forked worker inherits
+# its parent's, whose descriptors stay valid in it. The cursor's own descriptors never leave it (the door hands out a dup):
+# the next door call may close them, and a number reused then would lead a stale holder's write elsewhere.
 _CURSORS = {}
 _CURSORS_RUN = [None]
 
 def _close_cursors():
 	"""Close every descriptor the door holds in this process (a new run, the run's end)."""
 	while _CURSORS:
-		_CURSORS.popitem()[1].close_all()
+		held = _CURSORS.popitem()[1]
+		if isinstance(held, _HeldDirs):
+			held.close_all()
 
 def _close_base(base):
 	"""Close a door's result (_dest_directory) where it is a descriptor: the caller's, always in a finally."""
@@ -4175,6 +4190,17 @@ def _by_path_error(e):
 	directory the runner may not read where the door holds read descriptors (macOS; Linux without /proc), as 9.87 did. On
 	Linux with /proc an O_PATH open needs only search, so EACCES there is the error a path walk meets."""
 	return e.errno in (errno.EMFILE, errno.ENFILE) or (e.errno == errno.EACCES and not _PATH_FDS)
+
+def _named_ids(roots):
+	"""{root: (st_dev, st_ino)} for each of roots (absolute) that is a directory now, as named (a link followed): the run's pin
+	(NAMED_IDS). One stat each, once a run."""
+	ids = {}
+	for root in roots:
+		with contextlib.suppress(OSError):
+			st = os.stat(root)
+			if stat.S_ISDIR(st.st_mode):
+				ids[root] = (st.st_dev, st.st_ino)
+	return ids
 
 def _door_step(base, name, current, make, source, below):
 	"""One component of the way to a landing: name in base (a held directory's descriptor, or its path: _at), current its
@@ -4280,7 +4306,8 @@ def _dest_directory(path, make=True, source=None):
 	is held (no named destination above it: a library call; no descriptor calls, _DIR_FD_WALK; _by_path_error); None when
 	path or a directory on its way is missing and make is False (not under -ncd for a file's parent). The destination the
 	operator named and what is above it are made as os.makedirs makes them, through links (it is named), and it is opened
-	once per process in a run, following a link. Below it each component is opened one level at a time without following a link (_door_step: its rules for
+	once per process in a run, following a link, and checked against the run's pin (NAMED_IDS): one that leads to another
+	directory now is refused for everything below it (_Refused, said once a process). Below it each component is opened one level at a time without following a link (_door_step: its rules for
 	what is there; source: the source directory that lands at path, to name the -d form in a note), and the levels shared
 	with the last path asked for are kept open (_HeldDirs): a directory swapped for a link after it was opened is no longer
 	on the way, as hpcp writes into the one it holds, wherever it is now."""
@@ -4296,12 +4323,21 @@ def _dest_directory(path, make=True, source=None):
 		_CURSORS_RUN[0] = RUN_ID
 	parts = path[len(root.rstrip(os.sep)) + 1:].split(os.sep) if path != root else []
 	held = _CURSORS.get(root)
+	if isinstance(held, _Refused):
+		raise _Refused(held.before, held.after, said=True)
 	if held is None:
-		if make:
+		pinned = NAMED_IDS.get(root)
+		if make and pinned is None:
 			_makedirs(root, exist_ok=True)
 		if not _DIR_FD_WALK:
 			if not make and not os.path.isdir(root):
 				return None
+			if pinned is not None and os.path.isdir(root):
+				st = os.stat(root)
+				if (st.st_dev, st.st_ino) != pinned:
+					refusal = _CURSORS[root] = _Refused(f'{root} now leads to another directory than the one this run started writing '
+						'in: not copying ', '; run hpcp again to write where it leads now')
+					raise refusal
 			return _door_by_path(root, parts, make, source)
 		try:
 			fd = os.open(root, _HOLD_PATH_FLAGS if _PATH_FDS else _HOLD_READ_FLAGS)
@@ -4311,6 +4347,17 @@ def _dest_directory(path, make=True, source=None):
 			if not make and e.errno in (errno.ENOENT, errno.ENOTDIR):
 				return None
 			raise
+		if pinned is not None:
+			try:
+				st = os.fstat(fd)
+			except BaseException:
+				os.close(fd)
+				raise
+			if (st.st_dev, st.st_ino) != pinned:
+				os.close(fd)
+				refusal = _CURSORS[root] = _Refused(f'{root} now leads to another directory than the one this run started writing '
+					'in: not copying ', '; run hpcp again to write where it leads now')
+				raise refusal
 		held = _CURSORS[root] = _HeldDirs(fd)
 	depth = 0
 	while depth < len(parts) and depth + 1 < len(held) and held.names[depth + 1] == parts[depth]:
@@ -5140,8 +5187,12 @@ class _CopyFailure(str):
 	def __reduce__(self):
 		return _CopyFailure, (str(self), self.source)
 
-def _copy_failed(source, text):
-	"""eprint(text), recorded as the failure of source's copy."""
+def _copy_failed(source, text, said=False):
+	"""eprint(text), recorded as the failure of source's copy; said: recorded only (a refusal this process printed already:
+	_Refused.said)."""
+	if said:
+		ERRORS.append(_CopyFailure(text, source))
+		return
 	eprint(text)
 	if ERRORS and ERRORS[-1] == text:
 		ERRORS[-1] = _CopyFailure(text, source)
@@ -5204,7 +5255,7 @@ def _copy_file(src_path, dest_paths, full_hash, verbose, concurrent_processes, b
 		dest_paths = [dest for dest in dest_paths if dest not in refused]
 		if not dest_paths:
 			for refusal in refused.values():
-				_copy_failed(src_path, refusal.text(src_path))
+				_copy_failed(src_path, refusal.text(src_path), refusal.said)
 			return 0, time.monotonic() - start_time, symLinks
 	looks = {dest: _landing_of(dest, bases.get(dest)) for dest in dest_paths}
 	if not src_is_link:
@@ -5345,7 +5396,7 @@ def _copy_file(src_path, dest_paths, full_hash, verbose, concurrent_processes, b
 				if using_bak_paths and not dest_paths:
 					for failure in failures.values():
 						if isinstance(failure, _Refused):
-							_copy_failed(src_path, failure.text(src_path))
+							_copy_failed(src_path, failure.text(src_path), failure.said)
 					last = failures[dest_path]
 					if isinstance(last, _KeptOld):
 						_copy_failed(src_path, f'Copy failed: cannot copy {src_path} to {dest_path}, leaving {dest_path} as it is: {last}')
@@ -5956,7 +6007,7 @@ def _make_dest_directory(src_path, dest_path):
 	try:
 		return _dest_directory(dest_path, source=src_path)
 	except _Refused as e:
-		eprint(e.text(f'the directory {src_path}'))
+		_say_refused(e, f'the directory {src_path}')
 		return None
 	except FileExistsError:
 		print(f"Destination path {dest_path} maybe a mounted dir, known issue with os.path.exists\nContinuing without creating dest folder...", file=sys.stderr)
@@ -6147,7 +6198,7 @@ def _finish_directory(record, sync=False, late=False):
 				raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), dest_path)
 			fd = os.open(*_at(base, name), how, **_fd_of(base))
 		except _Refused as e:
-			eprint(e.text(f'the directory {src_path}'))
+			_say_refused(e, f'the directory {src_path}')
 			return
 		except OSError as e:
 			eprint(f'Directory sync error: {src_path} to {dest_path}: {_shown(e, os.path.dirname(path), base)}')
@@ -14735,8 +14786,11 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = None,
 			pinned_dest_roots = _destination_roots(dests) if remove_extra else None
 			copy_error_start = len(ERRORS)
 			# What the operator named is followed and written through, as cp follows its destination; below it nothing is.
-			global NAMED_DESTS, RUN_ID, SYNC_COPIES, _BAR
+			global NAMED_DESTS, RUN_ID, NAMED_IDS, SYNC_COPIES, _BAR
 			NAMED_DESTS, RUN_ID = frozenset(os.path.abspath(dest) for dest in dests), uuid.uuid4().hex
+			# Each named destination that is a directory now is pinned, as named: a process that opens it later and finds it
+			# leading elsewhere writes nothing there (_dest_directory).
+			NAMED_IDS = _named_ids(NAMED_DESTS)
 			SYNC_COPIES = bool(remove)
 			# -v turns the progress bars off (suppress_all_output)
 			_BAR = not verbose
@@ -14870,7 +14924,7 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = None,
 		track = traceback.format_exc()
 		eprint(f"General Exception: {e} \n{track}")
 	finally:
-		NAMED_DESTS, RUN_ID, SYNC_COPIES, _BAR = frozenset(), None, False, False
+		NAMED_DESTS, RUN_ID, NAMED_IDS, SYNC_COPIES, _BAR = frozenset(), None, {}, False, False
 		# what the door held for the run (_dest_directory): its workers' went with them
 		_close_cursors()
 		_SPACE_WARNED = outer_space
