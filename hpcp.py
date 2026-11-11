@@ -6,44 +6,70 @@
 #     "multiCMD>=1.56",
 # ]
 # ///
-import argparse
-import array
-import concurrent.futures
-import concurrent.futures.process
-import contextlib
-import errno
-import fnmatch
-import functools
-import glob
-import hashlib
-import itertools
-import locale
-import math
-import multiprocessing
-import multiprocessing.connection
-import multiprocessing.util
-import os
-import pathlib
-import platform
-import queue
-import random
-import re
-import shutil
-import signal
-import stat
-import struct
-import sys
-import tempfile
-import threading
-import time
-import unicodedata
-import uuid
-import weakref
-from collections import Counter, deque, namedtuple
-from concurrent.futures import ProcessPoolExecutor
-from concurrent.futures.process import BrokenProcessPool
-from math import log
-from pprint import pformat
+# A Ctrl-C while Python imports this module: Python's own handler can raise it inside importlib's weak-reference callbacks,
+# which drop it, and the run went on (a move to its removal). SIGINT is held in the importing thread for every import of
+# the module (_signal: a builtin, loaded before any module runs), and the finally lets it in on every path, a failed import
+# too, only where it was not blocked before (a forkserver or spawn pool worker imports hpcp with it blocked, until
+# _init_worker). One that came meanwhile is raised there, at the finally. Below the header the module imports nothing more
+# and runs no subprocess (_fat_ioctl_numbers).
+import _signal
+_IMPORT_MASK = _signal.pthread_sigmask(_signal.SIG_BLOCK, (_signal.SIGINT,)) if hasattr(_signal, 'pthread_sigmask') else None
+try:
+	import argparse
+	import array
+	import concurrent.futures
+	import concurrent.futures.process
+	import contextlib
+	import errno
+	import fnmatch
+	import functools
+	import glob
+	import hashlib
+	import itertools
+	import locale
+	import math
+	import multiprocessing
+	import multiprocessing.connection
+	import multiprocessing.util
+	import os
+	import pathlib
+	import platform
+	import queue
+	import random
+	import re
+	import shutil
+	import signal
+	import stat
+	import struct
+	import sys
+	import tempfile
+	import threading
+	import time
+	import unicodedata
+	import uuid
+	import weakref
+	from collections import Counter, deque, namedtuple
+	from concurrent.futures import ProcessPoolExecutor
+	from concurrent.futures.process import BrokenProcessPool
+	from math import log
+	from pprint import pformat
+	# (multiCMD's embed goes here with multiCMD 1.60, one tab in, so the mask covers it; until then it follows the finally,
+	# its imports outside the mask)
+	try:
+		import xxhash  # type: ignore
+		hasher = xxhash.xxh64()
+		xxhash_available = True
+	except ImportError:
+		import hashlib
+		hasher = hashlib.blake2b()
+		xxhash_available = False
+	try:
+		import resource  # the open-files limit (below _PARENT_FLAGS)
+	except ImportError:
+		resource = None
+finally:
+	if _IMPORT_MASK is not None and _signal.SIGINT not in _IMPORT_MASK:
+		_signal.pthread_sigmask(_signal.SIG_UNBLOCK, (_signal.SIGINT,))
 
 try:
 	import multiCMD  # type: ignore
@@ -241,14 +267,6 @@ nO>aFpPc(P(LkpfLXW4<0.$u'MKUCKBp=(@Ap.Q/Sd+5JnqjdhUh%N!V(STm7XBQ7kMb(S<#_dqjr5,e
 B9YICo[2b3g-4U"8O-YB*56]Y&SPV9`_Zj<J4jJ52^YQ?AS:.Gb5!'u+@7FQr6&DC:!'*;^Pb4)fK(2>:,Wma_`!,/:igdZ!c_t)m0lQSjcMRVr[9"k7
 -loH'd'<'*0sG.1qg,;$@q/`W>?DX$:0mum?q---dZH&_<u$j84j[(,+\31$4LUtJ!!0Ta!QjF*:7S8LZ,C;P!WW3#!!HG.'''
 	exec(lzma.decompress(base64.a85decode(_SRC_B85)).decode("utf-8"), multiCMD.__dict__)
-try:
-	import xxhash  # type: ignore
-	hasher = xxhash.xxh64()
-	xxhash_available = True
-except ImportError:
-	import hashlib
-	hasher = hashlib.blake2b()
-	xxhash_available = False
 
 version = '9.87'
 __version__ = version
@@ -7584,11 +7602,14 @@ def _discard_temp(path):
 		print(f"Warning: cannot remove temporary file {path}: {e}", file=sys.stderr)
 
 def _fat_ioctl_numbers(machine=None):
-	"""(FAT_IOCTL_GET_ATTRIBUTES, FAT_IOCTL_SET_ATTRIBUTES) for machine (platform.machine() by default):
+	"""(FAT_IOCTL_GET_ATTRIBUTES, FAT_IOCTL_SET_ATTRIBUTES) for machine (os.uname()'s by default, read at import:
+	platform.machine() runs `uname -p` there on Python 3.6 to 3.8, and the import runs no subprocess):
 	_IOR('r', 0x10, __u32) and _IOW('r', 0x11, __u32). alpha, mips, powerpc and sparc put _IOC_READ (2) and
 	_IOC_WRITE (4) at bit 29, and parisc swaps the generic read and write bits: on all of them the two numbers come
 	out the other way round."""
-	machine = (platform.machine() if machine is None else machine).lower()
+	if machine is None:
+		machine = os.uname().machine if hasattr(os, 'uname') else platform.machine()
+	machine = machine.lower()
 	if machine.startswith(('alpha', 'mips', 'ppc', 'powerpc', 'sparc', 'parisc')):
 		return 0x40047210, 0x80047211
 	return 0x80047210, 0x40047211
@@ -11490,13 +11511,13 @@ _BELOW_FLAGS = _DIRECTORY_FLAGS | getattr(os, 'O_NOFOLLOW', 0)
 _PARENT_FLAGS = (getattr(os, 'O_PATH', 0) or os.O_RDONLY) | getattr(os, 'O_DIRECTORY', 0) | getattr(os, 'O_CLOEXEC', 0)
 # A descriptor walk or cursor holds one directory descriptor a level: a tree deeper than the soft open-files limit
 # (often 1024) needs more, so the soft limit is raised to the hard one (often 524288), where the platform allows.
-try:
-	import resource
-	_soft_nofile, _hard_nofile = resource.getrlimit(resource.RLIMIT_NOFILE)
-	if _soft_nofile < _hard_nofile:
-		resource.setrlimit(resource.RLIMIT_NOFILE, (_hard_nofile, _hard_nofile))
-except (ImportError, ValueError, OSError):
-	pass
+if resource is not None:  # (imported in the import header)
+	try:
+		_soft_nofile, _hard_nofile = resource.getrlimit(resource.RLIMIT_NOFILE)
+		if _soft_nofile < _hard_nofile:
+			resource.setrlimit(resource.RLIMIT_NOFILE, (_hard_nofile, _hard_nofile))
+	except (ValueError, OSError):
+		pass
 
 def _path_identity(path):
 	"""(st_dev, st_ino) of path itself (a symlink is not followed), or None when it cannot be read."""

@@ -2431,6 +2431,120 @@ def test_a_stop_ends_a_3_6_submit_that_waits_on_a_dead_worker_s_lock(tmp_path, c
 		assert done.returncode == 0 and said and float(said.group(1)) < 5, output
 
 
+# ---- a Ctrl-C while Python imports hpcp ----
+
+_IMPORT_STOP = '''
+import os, signal, sys
+sys.path.insert(0, %(root)r)
+VERSION_LINE = %(version_line)d
+seen = {'line': None, 'sent': None}
+def module_lines(frame, event, arg):
+	if event == 'line':
+		seen['line'] = frame.f_lineno
+	return module_lines
+def trace(frame, event, arg):
+	code = frame.f_code
+	if event != 'call':
+		return None
+	if code.co_name == '<module>' and os.path.basename(code.co_filename) == 'hpcp.py':
+		return module_lines
+	# importlib's weak-reference callbacks (a module lock's cb; 3.12+ also KeyedRef.remove), while hpcp's import header runs
+	if (seen['sent'] is None and seen['line'] is not None and seen['line'] < VERSION_LINE and code.co_name in ('cb', 'remove')
+			and code.co_filename.startswith('<frozen importlib')):
+		seen['sent'] = (code.co_name, seen['line'])
+		os.kill(os.getpid(), signal.SIGINT)
+	return None
+sys.settrace(trace)
+try:
+	import hpcp
+finally:
+	sys.settrace(None)
+	print('sent in', seen['sent'], flush=True)
+print('continued', flush=True)
+'''
+
+
+def _version_line():
+	with open(HPCP, encoding='utf-8') as f:
+		return next(number for number, line in enumerate(f, 1) if line.startswith('version = '))
+
+
+@posix_only
+def test_a_ctrl_c_in_an_import_callback_is_not_dropped():
+	# Python's own SIGINT handler raised a Ctrl-C that came while Python imported hpcp inside importlib's weak-reference
+	# callbacks, which drop it ('Exception ignored in: ...cb'), and the run went on, with -rf to its removal (1 in 3,000 early
+	# Ctrl-Cs through pip's launcher, 3.7 and 3.14). SIGINT is held for hpcp's imports, and raised once they are done.
+	done = subprocess.run([sys.executable, '-c', _IMPORT_STOP % {'root': os.path.dirname(HPCP), 'version_line': _version_line()}],
+		stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
+	out, err = done.stdout.decode(errors='replace'), done.stderr.decode(errors='replace')
+	assert 'sent in None' not in out, (out, err)  # the callback ran inside the header, and the Ctrl-C was sent there
+	assert 'continued' not in out and 'KeyboardInterrupt' in err and 'Exception ignored' not in err, (out, err)
+
+
+_IMPORT_MASKS = '''
+import signal, sys
+sys.path.insert(0, %(root)r)
+case = sys.argv[1]
+if case == 'blocked':
+	signal.pthread_sigmask(signal.SIG_BLOCK, [signal.SIGINT])
+elif case != 'plain':
+	sys.modules[case] = None  # an import of hpcp's that fails
+	sys.modules['multiCMD'] = None  # the embedded one is used
+try:
+	import hpcp
+	print('imported')
+except ImportError:
+	print('ImportError')
+print('SIGINT blocked' if signal.SIGINT in signal.pthread_sigmask(signal.SIG_BLOCK, []) else 'SIGINT open')
+'''
+
+
+def _embed_codec():
+	with open(HPCP, encoding='utf-8') as f:
+		return re.search(r'exec\((\w+)\.decompress\(', f.read()).group(1)
+
+
+@posix_only
+@pytest.mark.parametrize('case', ['plain', 'blocked', 'uuid', 'codec'])
+def test_the_import_mask_is_released_on_every_path(case):
+	# The mask covers hpcp's import header only, released by a finally on every path: a failed import (one of its imports,
+	# or the embedded multiCMD's codec, missing) leaves SIGINT open, as it was; one blocked before the import stays blocked.
+	if case == 'codec':
+		case = _embed_codec()
+	done = subprocess.run([sys.executable, '-c', _IMPORT_MASKS % {'root': os.path.dirname(HPCP)}, case],
+		stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=120)
+	expected = {'plain': 'imported\nSIGINT open', 'blocked': 'imported\nSIGINT blocked'}.get(case, 'ImportError\nSIGINT open')
+	assert done.stdout.decode(errors='replace').strip() == expected, done.stdout
+
+
+_IMPORT_POPENS = '''
+import os, subprocess, sys
+sys.path.insert(0, %(root)r)
+started = []
+real = subprocess.Popen.__init__
+def spy(self, args, *rest, **kwargs):
+	# whose module's import started it: the innermost module frame (uuid's own ldconfig on 3.6 is uuid's)
+	frame = sys._getframe(1)
+	while frame is not None and frame.f_code.co_name != '<module>':
+		frame = frame.f_back
+	started.append((args, frame and os.path.basename(frame.f_code.co_filename)))
+	return real(self, args, *rest, **kwargs)
+subprocess.Popen.__init__ = spy
+import hpcp
+print([args for args, whose in started if whose == 'hpcp.py'])
+'''
+
+
+@posix_only
+def test_importing_hpcp_runs_no_subprocess():
+	# On Python 3.6 to 3.8 platform.machine() runs `uname -p` (platform.uname() computes the processor there), which
+	# _fat_ioctl_numbers called as hpcp's module ran: a fork and exec each import, and a Ctrl-C was dropped in its Popen.__del__
+	# once the import mask had ended. os.uname() asks the kernel.
+	done = subprocess.run([sys.executable, '-c', _IMPORT_POPENS % {'root': os.path.dirname(HPCP)}],
+		stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=120)
+	assert done.returncode == 0 and done.stdout.decode(errors='replace').strip() == '[]', done.stdout
+
+
 @posix_only
 @pytest.mark.parametrize('signum', [signal.SIGINT, signal.SIGTERM], ids=['int', 'term'])
 def test_a_stopped_run_leaves_no_multiprocessing_files(tmp_path, signum):
