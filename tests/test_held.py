@@ -1728,3 +1728,30 @@ def test_f3_the_door_by_path_looks_at_each_level_once_a_run(tmp_path, monkeypatc
 	assert all(read(os.path.join(out, 'a/b/c/d%d/e/f%d' % (i % 10, i))) == 'x' for i in range(100))
 
 
+@posix_only
+@pytest.mark.parametrize('route', ['proc', 'read'])
+def test_f4_a_directory_sync_error_names_the_directory_not_its_descriptor(tmp_path, reset_hpcp_globals, monkeypatch, route):
+	# F4: 9.87 named the directory ("Operation not permitted: 'out/d'"); the sync acts on the directory the door holds, by its
+	# /proc/self/fd entry (Linux with /proc) or the descriptor itself (macOS, Linux without /proc), and the error named that
+	# ('/proc/self/fd/9', or 9). The call is made to fail as the kernel fails a chmod of a directory another user owns.
+	if route == 'proc' and not hpcp._PATH_FDS:
+		pytest.skip('no /proc/self/fd here')
+	monkeypatch.setattr(hpcp, '_PATH_FDS', route == 'proc')
+	write(tmp_path / 'src' / 'd' / 'f', 'x')
+	os.chmod(str(tmp_path / 'src' / 'd'), 0o750)
+	os.makedirs(str(tmp_path / 'out' / 'd'))
+	os.chmod(str(tmp_path / 'out' / 'd'), 0o777)
+	real = os.chmod
+	def refused(path, mode, *args, **kwargs):
+		if isinstance(path, int) or str(path).startswith('/proc/self/fd/'):
+			raise PermissionError(errno.EPERM, os.strerror(errno.EPERM), path)
+		return real(path, mode, *args, **kwargs)
+	monkeypatch.setattr(os, 'chmod', refused)
+	src, out = str(tmp_path / 'src'), str(tmp_path / 'out')
+	errors = io.StringIO()
+	with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(errors):
+		rc = hpcp.hpcp([src + '/'], dest_paths=[out + '/'], single_thread=True)
+	wanted = "Directory sync error: %s/d to %s/d: [Errno 1] Operation not permitted: '%s/d'" % (src, out, out)
+	assert rc != 0 and wanted in errors.getvalue() and '/proc/self/fd' not in errors.getvalue(), (rc, errors.getvalue())
+
+

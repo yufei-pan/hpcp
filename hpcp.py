@@ -6169,6 +6169,15 @@ def _held_directory(held, dest_path):
 		return '/proc/self/fd/%d' % held if _PATH_FDS else held
 	return dest_path
 
+def _shown_directory(e, given, dest_path):
+	"""e, an OSError of a call made on given (_held_directory: a directory's /proc/self/fd entry, or its descriptor), naming
+	dest_path, the directory, where the error names given. Returns e."""
+	for attribute in ('filename', 'filename2'):
+		name = getattr(e, attribute, None)
+		if name is not None and name == given:
+			setattr(e, attribute, dest_path)
+	return e
+
 def _start_directory(src_path, dest_path, st, held=None):
 	"""The directory sync's part of dest_path's metadata (src_path's lstat st): what does not stop the copy writing into it,
 	each made only where dest_path differs. Its xattrs, its owner and group (_chown_like_cp), and its mode, plus read, write
@@ -6181,31 +6190,35 @@ def _start_directory(src_path, dest_path, st, held=None):
 	if CONTENT_ONLY:
 		return (src_path, dest_path, None, None, None, None)
 	directory = _held_directory(held, dest_path)
-	mode = stat.S_IMODE(st.st_mode)
-	now = os.stat(directory)
-	current = stat.S_IMODE(now.st_mode)
-	runner = os.geteuid() if hasattr(os, 'geteuid') else 0
-	if runner and now.st_uid == runner and current & stat.S_IRWXU != stat.S_IRWXU:
-		# A rerun meets the restrictive mode the finish gave it: opened before its xattrs, or its owner may not set them
-		# (EACCES, which copystat's rule ignores) and a source's changed xattr would never come.
-		current |= stat.S_IRWXU
-		os.chmod(directory, current)
-	if _sync_xattrs(src_path, directory):
+	try:
+		mode = stat.S_IMODE(st.st_mode)
 		now = os.stat(directory)
 		current = stat.S_IMODE(now.st_mode)
-	if os.name == 'posix':
-		if (now.st_uid, now.st_gid) != (st.st_uid, st.st_gid):
-			owner_kept, group_kept = _chown_like_cp(directory, st)
-			# chmod after chown: no set-user-ID / set-group-ID bit for an owner / group not kept (9.86's rule).
-			mode &= ~((0 if owner_kept else stat.S_ISUID) | (0 if group_kept else stat.S_ISGID))
+		runner = os.geteuid() if hasattr(os, 'geteuid') else 0
+		if runner and now.st_uid == runner and current & stat.S_IRWXU != stat.S_IRWXU:
+			# A rerun meets the restrictive mode the finish gave it: opened before its xattrs, or its owner may not set them
+			# (EACCES, which copystat's rule ignores) and a source's changed xattr would never come.
+			current |= stat.S_IRWXU
+			os.chmod(directory, current)
+		if _sync_xattrs(src_path, directory):
 			now = os.stat(directory)
 			current = stat.S_IMODE(now.st_mode)
-		opened = mode
-		if runner and now.st_uid == runner:
-			opened |= stat.S_IRWXU
-		if current != opened:
-			os.chmod(directory, opened)
-	return (src_path, dest_path, mode, st.st_atime_ns, st.st_mtime_ns, getattr(st, 'st_flags', None))
+		if os.name == 'posix':
+			if (now.st_uid, now.st_gid) != (st.st_uid, st.st_gid):
+				owner_kept, group_kept = _chown_like_cp(directory, st)
+				# chmod after chown: no set-user-ID / set-group-ID bit for an owner / group not kept (9.86's rule).
+				mode &= ~((0 if owner_kept else stat.S_ISUID) | (0 if group_kept else stat.S_ISGID))
+				now = os.stat(directory)
+				current = stat.S_IMODE(now.st_mode)
+			opened = mode
+			if runner and now.st_uid == runner:
+				opened |= stat.S_IRWXU
+			if current != opened:
+				os.chmod(directory, opened)
+		return (src_path, dest_path, mode, st.st_atime_ns, st.st_mtime_ns, getattr(st, 'st_flags', None))
+	except OSError as e:
+		# the error names the directory by what the call was given (its /proc/self/fd entry, or the descriptor): its path, as 9.87's did
+		raise _shown_directory(e, directory, dest_path)
 
 def _sync_directory(src_path, dest_paths):
 	"""The directory sync of src_path onto dest_paths: each made (_make_dest_directory) and given its start
