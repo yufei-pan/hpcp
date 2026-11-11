@@ -4240,11 +4240,19 @@ def _by_path_error(e):
 
 def _named_ids(roots):
 	"""{root: (st_dev, st_ino)} for each of roots (absolute) that is a directory now, as named (a link followed): the run's pin
-	(NAMED_IDS). One stat each, once a run."""
+	(NAMED_IDS). Opened as the door opens it, once a run: a stat does not mount an automount (an NFSv4 submount) and an
+	open does, so a pin taken by stat named the directory below the mount and refused the run's own destination (213)."""
 	ids = {}
 	for root in roots:
 		with contextlib.suppress(OSError):
-			st = os.stat(root)
+			if not _DIR_FD_WALK:
+				st = os.stat(root)  # the door compares a stat there too (no descriptor walk: Windows)
+			else:
+				fd = os.open(root, _HOLD_PATH_FLAGS if _PATH_FDS else _HOLD_READ_FLAGS)
+				try:
+					st = os.fstat(fd)
+				finally:
+					os.close(fd)
 			if stat.S_ISDIR(st.st_mode):
 				ids[root] = (st.st_dev, st.st_ino)
 	return ids
