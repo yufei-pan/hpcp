@@ -1324,9 +1324,12 @@ def _submit_36(executor, mask, fn, args, kwargs):
 	signal ignored (nohup's SIGHUP) stays pending while blocked, and is no stop. A pool that broke meanwhile raises
 	BrokenProcessPool, as submit does. The rest is 3.6's own: the work item registered, then the wakeup sent under the lock."""
 	global _STOP_ACTED
+	results = executor._result_queue
+	if results._wlock is None:
+		# Windows: 3.6's result queue has no write lock there (a pipe message is written whole), so its submit cannot hang on one
+		return executor.submit(fn, *args, **kwargs)
 	from concurrent.futures import _base
 	from concurrent.futures.process import _WorkItem
-	results = executor._result_queue
 	with executor._shutdown_lock:
 		if executor._broken:
 			raise BrokenProcessPool('A child process terminated abruptly, the process pool is not usable anymore')

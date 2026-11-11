@@ -2427,6 +2427,20 @@ def test_a_stop_ends_a_3_6_submit_that_waits_on_a_dead_worker_s_lock(tmp_path, c
 		assert done.returncode == 0 and said and float(said.group(1)) < 5, output
 
 
+def test_a_3_6_submit_without_a_write_lock_is_the_stock_one():
+	# Python 3.6 on Windows makes the result queue with no write lock (_wlock None: a pipe message is written whole there), so
+	# its submit cannot hang on one; hpcp's own submit took the lock unconditionally and raised AttributeError on every pooled
+	# task (9.87 used the stock submit). Faked: no Windows machine here.
+	import hpcp
+	class _Queue:
+		_wlock = None
+	class _Executor:
+		_result_queue = _Queue()
+		def submit(self, fn, *args, **kwargs):
+			return ('stock', fn, args, kwargs)
+	assert hpcp._submit_36(_Executor(), None, max, (1, 2), {'key': len}) == ('stock', max, (1, 2), {'key': len})
+
+
 # ---- a Ctrl-C while Python imports hpcp ----
 
 _IMPORT_STOP = '''
