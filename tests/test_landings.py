@@ -7,6 +7,7 @@ import contextlib
 import errno
 import os
 import random
+import re
 import shutil
 import signal
 import stat
@@ -2264,6 +2265,14 @@ def _start_methods():
 	return [method for method in ('fork', 'forkserver', 'spawn') if method in multiprocessing.get_all_start_methods()]
 
 
+# Python 3.6 and 3.7 have no sys.unraisablehook: a raise Python drops (a generator the collector closes, a weakref callback, a
+# __del__) is printed by the interpreter itself. limitations.md, "On Python 3.6 and 3.7 an early Ctrl-C can print an
+# `Exception ignored ... KeyboardInterrupt` block" (F8, about 1 early stop in 2,000). Only hpcp's own stop, raised by _stop
+# after it recorded it, so the run still acts on it (130). The block can follow a progress bar frame on its line.
+_DROPPED_STOP = re.compile(rb'Exception ignored in: [^\n]*\nTraceback \(most recent call last\):\n(?:  [^\n]*\n)*?'
+	rb'  File "[^"\n]*hpcp\.py", line \d+, in _stop\n    raise KeyboardInterrupt\nKeyboardInterrupt(?::[^\n]*)?\n')
+
+
 @posix_only
 @pytest.mark.parametrize('batch', range(4))
 @pytest.mark.parametrize('method', _start_methods())
@@ -2271,7 +2280,8 @@ def test_an_early_stop_prints_no_traceback(tmp_path, method, batch):
 	# Entry 18: under forkserver (3.14's default) and spawn a worker started with Python's own SIGINT handler, and hpcp's went
 	# in only later: about one early Ctrl-C in three printed a KeyboardInterrupt traceback on 3.14. A worker now starts with
 	# the stops blocked and lets them in once set up. 10 runs a batch, 40 a start method; each stopped at a random 0 to 0.3 s
-	# after hpcp.main() was called, by SIGINT to the run's process group, as a terminal's Ctrl-C.
+	# after hpcp.main() was called, by SIGINT to the run's process group, as a terminal's Ctrl-C. On 3.6 and 3.7 Python's own
+	# block for hpcp's dropped stop is accepted (_DROPPED_STOP, a known limitation there).
 	if sys.version_info < (3, 7) and method != 'fork':
 		pytest.skip('Python 3.6 pools fork')
 	cp = tmp_path / 'slowcp'
@@ -2299,7 +2309,8 @@ def test_an_early_stop_prints_no_traceback(tmp_path, method, batch):
 			# review A saw 5 hangs in 5,520 early stops (about 1 session in 28). Not this test's subject: limitations.md, "On
 			# Python 3.6 an early stop can rarely hang the run in a pool's submit" (F1, deferred to 9.88). A hang elsewhere fails.
 			pytest.xfail('the Python 3.6 submit hang, F1, deferred to 9.88 (docs/limitations.md)')
-		assert code == 130 and b'Traceback' not in output, (run, output[-3000:])
+		left = _DROPPED_STOP.sub(b'', output) if sys.version_info < (3, 8) else output
+		assert code == 130 and b'Traceback' not in left, (run, output[-3000:])
 
 
 _STOP_IN = '''
