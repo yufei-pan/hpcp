@@ -3002,7 +3002,9 @@ def create_sym_links(symLinks,exclude=None,link_tracking=False,link_dirs=None):
 	destination path) triple for each relative link whose target is excluded, and with link tracking (-lt) for each one
 	whose target exists at the source (copied now or already there): -rme keeps those targets, except where the copy
 	itself covers them (_kept_paths). link_dirs (a set, in a move): each directory a link was made in is added, for the
-	move's directory fsyncs (_sync_moved_directories)."""
+	move's directory fsyncs (_sync_moved_directories). Each link's directory goes through the door first (_dest_directory,
+	nothing made), and the link already there, its removal, the test for what holds its place and the new link go relative
+	to what the door holds."""
 	global RANDOM_DESTINATION_SELECTION
 	tracked_targets = set()
 	if len(symLinks) == 0:
@@ -3016,6 +3018,8 @@ def create_sym_links(symLinks,exclude=None,link_tracking=False,link_dirs=None):
 	start_time = time.monotonic()
 	for src, dests in symLinks.items():
 		_check_stop()
+		# The door's result for each destination's directory (none: missing, or refused, kept in refusals); closed below.
+		bases, refusals = {}, {}
 		try:
 			src = os.path.normpath(src)
 			dests = [os.path.normpath(d) for d in dests]
@@ -3026,18 +3030,32 @@ def create_sym_links(symLinks,exclude=None,link_tracking=False,link_dirs=None):
 			# place) would be gone, and unreadable.
 			linkedTargetFile = os.readlink(src)
 			source_stat = os.lstat(src)
+			for d in dests:
+				try:
+					bases[d] = _dest_directory(os.path.dirname(d), make=False, source=os.path.dirname(os.path.abspath(src)))
+				except (_Refused, OSError) as e:
+					refusals[d] = e
+			def look(d):
+				"""What is at d now, by its name in what the door holds (lstat); None for nothing there."""
+				if bases.get(d) is None:
+					return None
+				try:
+					return os.lstat(*_at(bases[d], os.path.basename(d)), **_fd_of(bases[d]))
+				except OSError:
+					return None
+			looks = {d: look(d) for d in dests}
 			# The link is already there: it is its own copy.
-			dests = [d for d in dests if not (os.path.islink(d) and os.path.samestat(source_stat, os.lstat(d)))]
+			dests = [d for d in dests if not (looks[d] is not None and stat.S_ISLNK(looks[d].st_mode) and os.path.samestat(source_stat, looks[d]))]
 			if not dests:
 				continue
 			for d in dests:
-				if os.path.islink(d):
-					os.remove(d)
+				if looks[d] is not None and stat.S_ISLNK(looks[d].st_mode):
+					os.remove(*_at(bases[d], os.path.basename(d)), **_fd_of(bases[d]))
 			# A real file or directory already at the link's path (in any dest: a file lives in one) keeps its place.
-			occupied = next((d for d in dests if os.path.exists(d)), None)
+			occupied = next(((d, st) for d, st in ((d, look(d)) for d in dests) if st is not None), None)
 			if occupied is not None:
 				# An error, not a note: the destination does not match the source, and a move (-rm) must not go on.
-				eprint(f"Failed to create symbolic link: {pformat(occupied)} is a {'directory' if os.path.isdir(occupied) else 'file'} "
+				eprint(f"Failed to create symbolic link: {pformat(occupied[0])} is a {'directory' if stat.S_ISDIR(occupied[1].st_mode) else 'file'} "
 					f"in the destination, skipping the link {pformat(src)}")
 				continue
 			# Determine if the link is a absolute link or relative link
@@ -3092,18 +3110,26 @@ def create_sym_links(symLinks,exclude=None,link_tracking=False,link_dirs=None):
 				elif dest in dests:
 					dests.remove(dest)
 				try:
-					# The link's directory, made as a file's is (-nds, or a link reached through a linked directory, has none yet).
-					_close_base(_dest_directory(os.path.dirname(dest), make=not NO_CREATE_DIR, source=os.path.dirname(os.path.abspath(src))))
+					if dest in refusals:
+						raise refusals.pop(dest)
+					if bases.get(dest) is None:
+						# The link's directory, made as a file's is (-nds, or a link reached through a linked directory, has none
+						# yet); under -ncd, a missing one by its path, which the link's make meets.
+						bases[dest] = _dest_directory(os.path.dirname(dest), make=not NO_CREATE_DIR, source=os.path.dirname(os.path.abspath(src)))
+					base = bases[dest] if bases[dest] is not None else os.path.dirname(dest)
 					# A relative target is resolved from the link's directory (Windows makes directory and file links apart).
-					os.symlink(linkedTargetFile, dest, target_is_directory=os.path.isdir(os.path.join(os.path.dirname(src), linkedTargetFile)))
+					os.symlink(linkedTargetFile, *_at(base, os.path.basename(dest)),
+						target_is_directory=os.path.isdir(os.path.join(os.path.dirname(src), linkedTargetFile)), **_fd_of(base))
 					if link_dirs is not None:
 						link_dirs.add(os.path.dirname(os.path.abspath(dest)))
 					if keep_target:
 						tracked_targets.add((os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(dest)), linkedTargetFile)),
 							sourceLinkedFile, os.path.abspath(dest)))
 					break
-				except Exception:
+				except Exception as e:
 					# Notes: only 'Failed to create symbolic link' below, when every destination failed, is the error.
+					if isinstance(e, _Refused):
+						eprint(e.text(f'the link {src}'))
 					print(f'Could not create symbolic link from {linkedTargetFile} to {dest}', file=sys.stderr)
 					if dests:
 						print("Trying next destination...", file=sys.stderr)
@@ -3132,6 +3158,9 @@ Exception caught!
 {src} -> {dests}
 Skipping...""")
 			continue
+		finally:
+			for base in bases.values():
+				_close_base(base)
 
 
 	endTime = time.monotonic()

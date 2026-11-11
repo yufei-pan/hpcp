@@ -1143,3 +1143,48 @@ def test_w1_a_directory_swapped_before_its_finish_never_leads_its_metadata_elsew
 		assert stat.S_IMODE(held.st_mode) == 0o700 and held.st_mtime_ns == 1000000000 * 10**9 and not hpcp.ERRORS, hpcp.ERRORS
 	else:
 		assert any(error.startswith('Directory sync error') for error in hpcp.ERRORS), hpcp.ERRORS
+
+
+@root_only
+@linux_only
+@pytest.mark.parametrize('case', ['removes-old-link', 'makes-link'])
+def test_w1_a_directory_swapped_at_a_link_s_copy_never_leads_it_elsewhere(tmp_path, fresh, monkeypatch, case):
+	# W1 case 5 (B3): out/a is swapped for a link to victim/ after the door's look and before create_sym_links removes the old
+	# link out/a/link (removes-old-link: victim/ holds a link of that name), or before it makes out/a/made (makes-link). 9.87
+	# removed and made links by path, through the link: victim/link went, or victim/made came. 9.88 removes and makes them in
+	# the directory the door holds.
+	victim = _Victim(tmp_path / 'victim')
+	out = str(tmp_path / 'out')
+	os.makedirs(os.path.join(out, 'a'))
+	os.makedirs(str(tmp_path / 'src/a'))
+	name = 'link' if case == 'removes-old-link' else 'made'
+	os.symlink('target-of-the-source', str(tmp_path / 'src/a' / name))
+	if case == 'removes-old-link':
+		os.symlink('an-old-target', os.path.join(out, 'a', name))
+	os.chown(out, 1000, 1000)
+	os.chown(os.path.join(out, 'a'), 1000, 1000)
+	_w1_run(monkeypatch, out)
+	directory = os.path.join(out, 'a')
+	if case == 'removes-old-link':
+		real, done = os.path.samestat, []
+		def swapping(*args):
+			if not done:
+				done.append(True)
+				_swap_for_link(directory, victim.path)
+			return real(*args)
+		monkeypatch.setattr(os.path, 'samestat', swapping)
+	else:
+		real_door, done = hpcp._dest_directory, []
+		# the swap once the door has answered for out/a (9.87: its making call, right before the link is made)
+		def door_then_swap(path, *args, **kwargs):
+			result = real_door(path, *args, **kwargs)
+			if not done and os.path.abspath(path) == directory:
+				done.append(True)
+				_swap_for_link(directory, victim.path)
+			return result
+		monkeypatch.setattr(hpcp, '_dest_directory', door_then_swap)
+	with contextlib.redirect_stdout(io.StringIO()):
+		hpcp.create_sym_links({str(tmp_path / 'src/a' / name): [os.path.join(out, 'a', name)]})
+	assert done and victim.untouched(), (victim.before, victim.state())
+	assert os.path.islink(directory)
+	assert os.readlink(os.path.join(out, 'a.away', name)) == 'target-of-the-source' and not hpcp.ERRORS, hpcp.ERRORS
