@@ -1680,3 +1680,51 @@ def test_f2_a_mount_below_the_destination_cannot_be_unmounted_during_the_run(tmp
 		subprocess.run(['umount', '-l', str(out)], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
 
+@posix_only
+@pytest.mark.parametrize('route', ['no-descriptor-walk', 'budget', 'emfile'])
+def test_f3_the_door_by_path_looks_at_each_level_once_a_run(tmp_path, monkeypatch, reset_hpcp_globals, route):
+	# F3: where nothing is held (Windows: no descriptor calls; levels past the budget; EMFILE) the door walked each landing's
+	# levels by stat every time: 8.3 calls a file at depth 6, against 9.87's 0.03 (its per-process memo of the levels it had
+	# looked at). A first copy and a rerun of 100 files in 10 directories at depth 6, the stat and lstat calls made inside the
+	# door counted.
+	if route == 'no-descriptor-walk':
+		monkeypatch.setattr(hpcp, '_DIR_FD_WALK', False)
+	elif route == 'budget':
+		monkeypatch.setattr(hpcp, '_hold_budget', lambda: 1)
+	else:
+		real_open = os.open
+		def no_descriptors(path, flags, *args, **kwargs):
+			if sys._getframe(1).f_code.co_name == '_door_step':  # the door's open of a level, nothing else of the run's
+				raise OSError(errno.EMFILE, os.strerror(errno.EMFILE), path)
+			return real_open(path, flags, *args, **kwargs)
+		monkeypatch.setattr(os, 'open', no_descriptors)
+	for i in range(100):
+		write(tmp_path / 'src' / 'a' / 'b' / 'c' / ('d%d' % (i % 10)) / 'e' / ('f%d' % i), 'x')
+	counts = [0]
+	real_door = hpcp._dest_directory
+	def counted(*args, **kwargs):
+		real_lstat, real_stat = os.lstat, os.stat
+		def lstat(*a, **k):
+			counts[0] += 1
+			return real_lstat(*a, **k)
+		def stat_(*a, **k):
+			counts[0] += 1
+			return real_stat(*a, **k)
+		os.lstat, os.stat = lstat, stat_
+		try:
+			return real_door(*args, **kwargs)
+		finally:
+			os.lstat, os.stat = real_lstat, real_stat
+	monkeypatch.setattr(hpcp, '_dest_directory', counted)
+	out = str(tmp_path / 'out')
+	for run in ('first copy', 'rerun'):
+		counts[0] = 0
+		with contextlib.redirect_stdout(io.StringIO()):
+			rc = hpcp.hpcp([str(tmp_path / 'src') + '/'], dest_paths=[out + '/'], single_thread=True)
+		assert rc == 0, (run, hpcp.ERRORS)
+		# 9.87's door made 25 calls for this tree of directories (measured with 1,000 files in them, a first copy and a rerun
+		# alike: its memo; the files add none); 9.88's first build walked by stat every time, 8 a file (8,289 for 1,000)
+		assert counts[0] <= 30, (route, run, counts[0])
+	assert all(read(os.path.join(out, 'a/b/c/d%d/e/f%d' % (i % 10, i))) == 'x' for i in range(100))
+
+

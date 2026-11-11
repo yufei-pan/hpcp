@@ -4154,6 +4154,10 @@ _HOLD_READ_FLAGS = os.O_RDONLY | getattr(os, 'O_NONBLOCK', 0) | getattr(os, 'O_D
 # the next door call may close them, and a number reused then would lead a stale holder's write elsewhere.
 _CURSORS = {}
 _CURSORS_RUN = [None]
+# The way by path (9.87's door), where nothing is held (no descriptor calls: Windows; the open-files limit; a directory the read
+# route cannot enter): the components this process has walked in the run, each looked at once, and the named destinations
+# whose pin it has checked. Cleared with the cursors.
+_BY_PATH = {}
 # How many directories the door may hold at once in a process: half its open-files limit, so the other half stays for what a
 # copy opens beside them (its held file, cp's pipes, the pool's, the skip check's reads). Deeper levels go by path (macOS
 # keeps its soft limit of 256: past 128 levels; Linux, where hpcp raises it to the hard limit at import, past 262,144, or
@@ -4173,7 +4177,8 @@ def _hold_budget():
 	return _HOLD_BUDGET[1]
 
 def _close_cursors():
-	"""Close every descriptor the door holds in this process (a new run, the run's end)."""
+	"""Close every descriptor the door holds in this process, and forget what it walked by path (a new run, the run's end)."""
+	_BY_PATH.clear()
 	while _CURSORS:
 		held = _CURSORS.popitem()[1]
 		if isinstance(held, _HeldDirs):
@@ -4381,8 +4386,11 @@ def _door_by_path(start, parts, make, source):
 	current = start
 	for index, part in enumerate(parts):
 		current = os.path.join(current, part)
+		if current in _BY_PATH:
+			continue  # looked at in this run: 9.87's per-process memo (_BY_PATH), so the walk costs its lstats once
 		if _door_step(os.path.dirname(current), part, current, make, source, len(parts) - 1 - index) is None:
 			return None
+		_BY_PATH[current] = True
 	return current
 
 def _dest_directory(path, make=True, source=None):
@@ -4396,7 +4404,8 @@ def _dest_directory(path, make=True, source=None):
 	Below it each component is opened one level at a time without following a link (_door_step: its rules for
 	what is there; source: the source directory that lands at path, to name the -d form in a note), and the levels shared
 	with the last path asked for are kept open (_HeldDirs): a directory swapped for a link after it was opened is no longer
-	on the way, as hpcp writes into the one it holds, wherever it is now."""
+	on the way, as hpcp writes into the one it holds, wherever it is now. Where nothing can be held the walk is 9.87's, by path,
+	each component looked at once a process in a run (_BY_PATH)."""
 	path = os.path.abspath(path)
 	root = _named_root(path)
 	if root is None:
@@ -4414,14 +4423,20 @@ def _dest_directory(path, make=True, source=None):
 		if make and pinned is None:
 			_makedirs(root, exist_ok=True)
 		if not _DIR_FD_WALK:
-			if not make and not os.path.isdir(root):
-				return None
-			if pinned is not None and os.path.isdir(root):
-				st = os.stat(root)
-				if (st.st_dev, st.st_ino) != pinned:
-					refusal = _CURSORS[root] = _Refused(f'{root} now leads to another directory than the one this run started writing '
-						'in: not copying ', '; run hpcp again to write where it leads now')
-					raise refusal
+			if root not in _BY_PATH:
+				# Once a process in a run, as 9.87's door looked at the destination once (_BY_PATH): a stat for each level of each
+				# landing is 8 calls a file at depth 6.
+				is_dir = os.path.isdir(root)
+				if not make and not is_dir:
+					return None
+				if pinned is not None and is_dir:
+					st = os.stat(root)
+					if (st.st_dev, st.st_ino) != pinned:
+						refusal = _CURSORS[root] = _Refused(f'{root} now leads to another directory than the one this run started writing '
+							'in: not copying ', '; run hpcp again to write where it leads now')
+						raise refusal
+				if is_dir:
+					_BY_PATH[root] = True
 			return _door_by_path(root, parts, make, source)
 		try:
 			fd = os.open(root, _HOLD_PATH_FLAGS if _PATH_FDS else _HOLD_READ_FLAGS)
