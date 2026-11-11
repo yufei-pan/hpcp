@@ -15,13 +15,14 @@ def _run_with_embedded_multicmd(tmp_path, code):
 
 
 @pytest.mark.parametrize('installed, uses_installed', [
-	("'1.60'", True),
+	("'1.61'", True),
 	("'1.100'", True),   # float('1.100') == 1.1 would wrongly reject it
 	("'2.0'", True),
-	("'1.59'", False),   # older than the embedded copy, which brings the thread-start fix (1.60)
+	("'1.60'", False),   # older than the embedded copy, which brings the exec wrapper's SIGINT mask (1.61)
+	("'1.59'", False),   # older still: no thread-start fix (1.60)
 	("'1.58'", False),   # older still: no pass_fds
 	("'1.56'", False),   # the floor pip accepts, older than the embedded copy
-	("'1.9'", False),    # minor 9 < 60, though float('1.9') > 1.60
+	("'1.9'", False),    # minor 9 < 61, though float('1.9') > 1.61
 	("'garbage'", False),
 	(None, False),       # a module without a version
 ])
@@ -32,11 +33,11 @@ def test_an_installed_multicmd_is_used_only_when_not_older_than_the_embedded_one
 		cwd=str(tmp_path), env=env, universal_newlines=True, check=True).stdout.split()
 	assert out[0] == str(uses_installed)
 	if not uses_installed:
-		assert out[1] == '1.60'
+		assert out[1] == '1.61'
 
 
 def test_embedded_multicmd_is_used_when_the_installed_one_is_older(tmp_path):
-	assert _run_with_embedded_multicmd(tmp_path, 'import hpcp; print(hpcp.multiCMD.version)').strip() == '1.60'
+	assert _run_with_embedded_multicmd(tmp_path, 'import hpcp; print(hpcp.multiCMD.version)').strip() == '1.61'
 
 
 @pytest.mark.skipif(os.name != 'posix', reason='pass_fds is POSIX')
@@ -48,7 +49,7 @@ r, w = os.pipe()
 task = hpcp.multiCMD.run_commands([['sh', '-c', 'echo through >&%d' % w]], quiet=True, return_object=True, pass_fds=(w,))[0]
 os.close(w)
 print(hpcp.multiCMD.version, task.returncode, os.read(r, 100).decode().strip())"""
-	assert _run_with_embedded_multicmd(tmp_path, code).split() == ['1.60', '0', 'through']
+	assert _run_with_embedded_multicmd(tmp_path, code).split() == ['1.61', '0', 'through']
 
 
 def test_the_import_gate_tracks_the_embedded_copy_and_the_floor_is_one_number():
@@ -59,7 +60,7 @@ def test_the_import_gate_tracks_the_embedded_copy_and_the_floor_is_one_number():
 		source = f.read()
 	# the embed sits one tab in, inside the import's signal mask (9.88)
 	gate = re.search(r"\) < \((\d+), (\d+)\):\n\t\t\traise ImportError\('multiCMD too old'\)", source)
-	assert '%s.%s' % gate.groups() == '1.60'
+	assert '%s.%s' % gate.groups() == '1.61'
 	with open(os.path.join(_ROOT, 'setup.py'), encoding='utf-8') as f:
 		assert "'multiCMD>=1.56'" in f.read()
 	assert '"multiCMD>=1.56"' in source
