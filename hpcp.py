@@ -793,6 +793,13 @@ def _mtimes_agree(first_ns, second_ns):
 	float_step_ns = 2.0 ** (math.frexp(max(abs(first_ns), abs(second_ns)) / 1e9)[1] - 53) * 1e9
 	return abs(first_ns - second_ns) <= max(_mtime_step_ns(first_ns), _mtime_step_ns(second_ns), float_step_ns)
 
+def _time_stored_as(stored_ns, wanted_ns):
+	"""Whether a destination that reads back stored_ns holds wanted_ns as well as it can: within the step it keeps (its own
+	time's, _mtime_step_ns) or one float step (_mtimes_agree). Not within the wanted time's step: a source time on an even
+	second (vfat's) is no reason to leave a finer destination's time 1.5 s off it."""
+	float_step_ns = 2.0 ** (math.frexp(max(abs(stored_ns), abs(wanted_ns)) / 1e9)[1] - 53) * 1e9
+	return abs(stored_ns - wanted_ns) <= max(_mtime_step_ns(stored_ns), float_step_ns)
+
 def get_last_existing_parent(path):
 	"""
 	Get the last existing parent directory of the given path.
@@ -6243,9 +6250,9 @@ def _finish_directory(record, sync=False, late=False):
 			# The read time with the modification time, as cp -a gives both; one that alone differs is left, as a file's
 			# (_settle_identical): a read moves it where it is not after the change time, which any set makes now, so a rerun
 			# chasing it would set it and move the change time on every run (EL8, relatime: the rerun's own listing did).
-			# Within the filesystem's step, as a file's time is judged (_mtimes_agree): vfat keeps 2 s, exFAT 10 ms, HFS+ 1 s, and
-			# an exact compare set every directory's times again on each rerun there.
-			if not _mtimes_agree(now.st_mtime_ns, mtime_ns):
+			# Within the step the destination keeps (_time_stored_as): vfat keeps 2 s, exFAT 10 ms, HFS+ 1 s, and an exact compare
+			# set every directory's times again on each rerun there.
+			if not _time_stored_as(now.st_mtime_ns, mtime_ns):
 				os.utime(fd if os.utime in os.supports_fd else dest_path, ns=(atime_ns, mtime_ns))
 			if flags is not None and hasattr(os, 'chflags') and getattr(now, 'st_flags', flags) != flags:
 				os.chflags(dest_path, flags, follow_symlinks=False)

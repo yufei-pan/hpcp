@@ -768,7 +768,7 @@ def test_the_folder_sync_batches_give_one_record_per_destination(tmp_path, monke
 @posix_only
 def test_a_directory_finish_takes_times_within_the_filesystem_step(tmp_path, monkeypatch, reset_hpcp_globals):
 	# A directory on vfat keeps its time in 2 s steps: the finish compared the source's time exactly and set it again on each
-	# rerun. Within one step, as a file's time is judged (_mtimes_agree), nothing is set.
+	# rerun. Within the step the destination keeps (_time_stored_as), nothing is set.
 	directory = tmp_path / 'd'
 	directory.mkdir()
 	on_disk = 1600000000 * 10**9  # a 2 s step's time, as vfat keeps it
@@ -781,6 +781,20 @@ def test_a_directory_finish_takes_times_within_the_filesystem_step(tmp_path, mon
 	assert set_times == [] and not hpcp.ERRORS, (set_times, hpcp.ERRORS)
 	hpcp._finish_directory((str(tmp_path / 'src'), str(directory), mode, on_disk, on_disk + 3 * 10**9, None))
 	assert len(set_times) == 1, set_times
+
+
+@posix_only
+def test_a_directory_finish_sets_an_even_second_source_time_exactly_on_a_fine_filesystem(tmp_path, reset_hpcp_globals):
+	# The tolerance is the step the destination keeps, not the source's: a source time on an even second (vfat's, or a
+	# whole-second tool's) onto a directory this filesystem (tmpfs, ext4, XFS: 1 ns) last wrote 1.5 s later. 9.88's first
+	# build took the coarser step of the two (2 s) and left it 1.5 s off; 9.87 set it exactly.
+	directory = tmp_path / 'd'
+	directory.mkdir()
+	source_ns = 1700000000 * 10**9
+	os.utime(str(directory), ns=(source_ns + 1523456789, source_ns + 1523456789))
+	mode = stat.S_IMODE(os.lstat(str(directory)).st_mode)
+	hpcp._finish_directory((str(tmp_path / 'src'), str(directory), mode, source_ns, source_ns, None))
+	assert os.lstat(str(directory)).st_mtime_ns == source_ns and not hpcp.ERRORS, hpcp.ERRORS
 
 
 @posix_only
