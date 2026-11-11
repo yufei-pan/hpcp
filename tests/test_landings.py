@@ -2286,8 +2286,10 @@ def test_an_early_stop_prints_no_traceback(tmp_path, method, batch):
 		# 3.6's pools fork. On 3.7 a forkserver or spawn child (or the semaphore tracker it starts) can take the same Ctrl-C
 		# while Python itself starts or imports, which prints a traceback from Python's own code (importlib, initsite,
 		# multiprocessing.spawn; 3.7's semaphore tracker KeyError in cache.remove). That is the deferral "A Ctrl-C that lands
-		# while Python imports hpcp can be dropped" (docs/limitations.md, 9.88), and 9.86 prints it more (100 runs a method, 3.7:
-		# forkserver 25 against 8, spawn 94 against 15 runs with a traceback; every 9.87 run exits 130).
+		# while Python imports hpcp can be dropped" (docs/limitations.md, 9.88), and 9.86 prints it more (one round of 100 runs a
+		# method, 3.7, runs with a traceback, 9.86 against 9.87: forkserver 25 against 8, spawn 94 against 15; every 9.87 run
+		# exits 130. The README and the deferral give another, larger measure: 200 runs a method, forkserver 45 against 13, spawn
+		# 187 against 28).
 		pytest.skip('Python 3.6 pools fork; on 3.7 the child start-up prints its own traceback (the 9.88 deferral in docs/limitations.md)')
 	cp = tmp_path / 'slowcp'
 	cp.write_text(_SLOWER_CP)
