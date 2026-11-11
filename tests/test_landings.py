@@ -2272,6 +2272,43 @@ def _start_methods():
 _DROPPED_STOP = re.compile(rb'Exception ignored in: [^\n]*\nTraceback \(most recent call last\):\n(?:  [^\n]*\n)*?'
 	rb'  File "[^"\n]*hpcp\.py", line \d+, in _stop\n    raise KeyboardInterrupt\nKeyboardInterrupt(?::[^\n]*)?\n')
 
+# Item (b), 9.89's deferral (docs/limitations.md "On Python 3.6 and 3.7 an early stop with forkserver or spawn can print a worker's
+# EOFError"): a stop's SystemExit lands in an idle worker between a queued job's length and its payload, and the next worker reads
+# the payload as a length: 2 early stops in 3,800 on 3.6 in 9.87, 0 in 3,800 in 9.88's review; old, and the run still ends 130.
+# Only that worker's traceback is accepted: _process_worker's call_queue.get ending in EOFError. The line can follow a bar frame.
+_OLD_EOF = re.compile(rb'Process [^\n]*:\nTraceback \(most recent call last\):\n(?:  [^\n]*\n)*?'
+	rb'  File "[^"\n]*process\.py", line \d+, in _process_worker\n    call_item = call_queue\.get\(block=True\)\n'
+	rb'(?:  [^\n]*\n)*?EOFError: Ran out of input\n')
+
+
+def _without_old_blocks(output):
+	"""output with the known blocks of Python 3.6 and 3.7 (_DROPPED_STOP, _OLD_EOF) taken out."""
+	return _OLD_EOF.sub(b'', _DROPPED_STOP.sub(b'', output))
+
+
+def _expected_old_blocks(output):
+	"""What an early stop's output may not hold: it, less the known blocks on 3.6 and 3.7; whole on 3.8 and later."""
+	return _without_old_blocks(output) if sys.version_info < (3, 8) else output
+
+
+_EOF_BLOCK = (b'1 F Synced | 0 Scheduled |\xe2\x96\x88|100.0% | 0sProcess Process-2:\n'
+	b'Traceback (most recent call last):\n'
+	b'  File "/usr/local/lib/python3.6/multiprocessing/process.py", line 258, in _bootstrap\n    self.run()\n'
+	b'  File "/usr/local/lib/python3.6/multiprocessing/process.py", line 93, in run\n    self._target(*self._args, **self._kwargs)\n'
+	b'  File "/usr/local/lib/python3.6/concurrent/futures/process.py", line 169, in _process_worker\n'
+	b'    call_item = call_queue.get(block=True)\n'
+	b'  File "/usr/local/lib/python3.6/multiprocessing/queues.py", line 113, in get\n    return _ForkingPickler.loads(res)\n'
+	b'EOFError: Ran out of input\n')
+
+
+def test_only_the_old_eoferror_block_is_taken_out_of_an_early_stop_s_output():
+	# the block as the 9.88 review saw it (3.6 forkserver and spawn), after a bar frame, is accepted; no other traceback is
+	assert _without_old_blocks(b'Copying\n' + _EOF_BLOCK + b'Done\n') == b'Copying\n1 F Synced | 0 Scheduled |\xe2\x96\x88|100.0% | 0sDone\n'
+	for other in (_EOF_BLOCK.replace(b'EOFError: Ran out of input', b'BrokenPipeError: [Errno 32] Broken pipe'),
+			_EOF_BLOCK.replace(b'call_queue.get(block=True)', b'result_queue.put(item)'),
+			b'Traceback (most recent call last):\n  File "x.py", line 1, in <module>\nEOFError: Ran out of input\n'):
+		assert b'Traceback' in _without_old_blocks(b'Copying\n' + other), other
+
 
 @posix_only
 @pytest.mark.parametrize('batch', range(4))
@@ -2305,7 +2342,7 @@ def test_an_early_stop_prints_no_traceback(tmp_path, method, batch):
 		finally:
 			if task.poll() is None:
 				os.killpg(task.pid, signal.SIGKILL)
-		left = _DROPPED_STOP.sub(b'', output) if sys.version_info < (3, 8) else output
+		left = _expected_old_blocks(output)
 		if code != 130 or b'Traceback' in left:
 			print(output.decode(errors='replace'))  # whole, in the failure's captured stdout: an assertion message is cut short
 		assert code == 130 and b'Traceback' not in left, (run, output[-3000:])
