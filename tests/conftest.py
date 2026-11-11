@@ -112,8 +112,10 @@ def _clear_hpcp_transient_state():
 	hpcp._STDIN_HELD_LIST = False
 	# A task run in this process (_run_task) leaves its parent's handed answer (_held_route) behind.
 	hpcp._HELD_GIVEN = None
-	# The door's per-process cache (_DOORS, by RUN_ID: None outside hpcp()) would remember a directory pytest has removed.
-	if hasattr(hpcp, '_DOORS'):
+	# The door's descriptors (by RUN_ID: None outside hpcp()) would hold a directory pytest has removed.
+	if hasattr(hpcp, '_close_cursors'):
+		hpcp._close_cursors()
+	elif hasattr(hpcp, '_DOORS'):
 		hpcp._DOORS.clear()
 	hash_file = getattr(hpcp, 'hash_file', None)
 	if hash_file is not None and hasattr(hash_file, 'cache_clear'):

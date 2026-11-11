@@ -1186,8 +1186,8 @@ def _register_worker_start():
 # The run settings hpcp() keeps in module globals. A pool worker that did not fork from the parent
 # (spawn, forkserver) would otherwise run with the import-time defaults.
 # The destinations the operator named (-d), absolute: what is followed and written through, as cp follows its destination
-# argument; below them nothing is (_landing_of, _dest_directory). RUN_ID: one hpcp() run, so a worker's directory cache
-# (_dest_directory) never outlives it.
+# argument; below them nothing is (_landing_of, _dest_directory). RUN_ID: one hpcp() run, so the descriptors a process's door
+# holds (_dest_directory) never outlive it.
 NAMED_DESTS = frozenset()
 RUN_ID = None
 _TASK_SETTINGS = ('NAMED_DESTS', 'RUN_ID', 'CONTENT_ONLY', 'WRITE_BESIDE', 'READ_FIRST', 'NO_CREATE_DIR', 'SYNC_COPIES', 'RANDOM_DESTINATION_SELECTION', 'HASH_SIZE', 'COMMAND_TIMEOUT',
@@ -3091,7 +3091,7 @@ def create_sym_links(symLinks,exclude=None,link_tracking=False,link_dirs=None):
 					dests.remove(dest)
 				try:
 					# The link's directory, made as a file's is (-nds, or a link reached through a linked directory, has none yet).
-					_dest_directory(os.path.dirname(dest), make=not NO_CREATE_DIR, source=os.path.dirname(os.path.abspath(src)))
+					_close_base(_dest_directory(os.path.dirname(dest), make=not NO_CREATE_DIR, source=os.path.dirname(os.path.abspath(src))))
 					# A relative target is resolved from the link's directory (Windows makes directory and file links apart).
 					os.symlink(linkedTargetFile, dest, target_is_directory=os.path.isdir(os.path.join(os.path.dirname(src), linkedTargetFile)))
 					if link_dirs is not None:
@@ -4048,102 +4048,194 @@ def _why(e):
 	text = str(e)
 	return text[text.rfind(': cp: ') + 2:] if ': cp: ' in text else text
 
-# The directories below a named destination that this process has looked at in this run (RUN_ID): each lstat once.
-_DOORS = {}
-_DOORS_RUN = [None]
+# The directories the door holds (_dest_directory). Linux with /proc (_PATH_FDS): O_PATH, which search permission on the way is
+# enough for, as for a path walk; a call with no dir_fd form reaches a held directory through its /proc/self/fd entry (_io).
+# Elsewhere (macOS; Linux without /proc, where an O_PATH descriptor takes no fchmod, fchown, futimens, fsync or flistxattr):
+# read, and O_NONBLOCK so a FIFO at the name is never waited on. The named destination is opened following a link (the
+# operator named it); each step below it adds O_NOFOLLOW (_door_step).
+_HOLD_PATH_FLAGS = getattr(os, 'O_PATH', 0) | getattr(os, 'O_DIRECTORY', 0) | getattr(os, 'O_CLOEXEC', 0)
+_HOLD_READ_FLAGS = os.O_RDONLY | getattr(os, 'O_NONBLOCK', 0) | getattr(os, 'O_DIRECTORY', 0) | getattr(os, 'O_CLOEXEC', 0)
 
-def _dest_directory(path, make=True, source=None):
-	"""The one door for a directory below a destination: path as a real directory. The destination the operator named and
-	what is above it are made as os.makedirs makes them, through links (a named destination is followed). Below it each
-	component is looked at by lstat once per process in a run: a directory stays; a missing one is made (make: not under
-	-ncd for a file's parent); a link, FIFO, socket or device node is a name of the tree and is unlinked and made a directory,
-	with a note for a link (source: the source directory that lands at path, to name the -d form); a regular file raises
-	NotADirectoryError, the clash it always was. Raises _Refused where the component cannot be replaced (its directory
-	refuses the unlink), and under -ncd, which makes no directory in place of anything: nothing is written through it.
-	Workers racing on one path look again: an unlink meeting ENOENT or EISDIR, a mkdir meeting EEXIST, are fine when the next
-	lstat says directory. A mkdir that meets EEXIST where lstat then finds nothing, on a second attempt (vfat iocharset=utf8
-	holds the name in another case), raises ENOENT."""
-	if _DOORS_RUN[0] != RUN_ID:
-		_DOORS.clear()
-		_DOORS_RUN[0] = RUN_ID
-	path = os.path.abspath(path)
-	if path in _DOORS:
-		return
-	root = _named_root(path)
-	if root is None or root == path:
-		# Remembered only once made: a look without make (copy_file's) leaves the making to the copy.
-		if make:
-			_makedirs(path, exist_ok=True)
-			_DOORS[path] = True
-		return
-	if root not in _DOORS:
-		if make:
-			_makedirs(root, exist_ok=True)
-		elif not os.path.isdir(root):
-			return
-		_DOORS[root] = True
-	parts = path[len(root.rstrip(os.sep)) + 1:].split(os.sep)
-	current = root
+# Per process, in a run (RUN_ID): {named destination (absolute): the directories the door holds from it down to the last
+# one asked for (_HeldDirs)}. A forked worker inherits its parent's, whose descriptors stay valid in it. The cursor's own
+# descriptors never leave it (the door hands out a dup): the next door call may close them, and a number reused then would
+# lead a stale holder's write elsewhere.
+_CURSORS = {}
+_CURSORS_RUN = [None]
+
+def _close_cursors():
+	"""Close every descriptor the door holds in this process (a new run, the run's end)."""
+	while _CURSORS:
+		_CURSORS.popitem()[1].close_all()
+
+def _close_base(base):
+	"""Close a door's result (_dest_directory) where it is a descriptor: the caller's, always in a finally."""
+	if isinstance(base, int):
+		os.close(base)
+
+def _by_path_error(e):
+	"""Whether the door finishes by path from where e (an OSError of an open) met it: the open-files limit anywhere, and a
+	directory the runner may not read where the door holds read descriptors (macOS; Linux without /proc), as 9.87 did. On
+	Linux with /proc an O_PATH open needs only search, so EACCES there is the error a path walk meets."""
+	return e.errno in (errno.EMFILE, errno.ENFILE) or (e.errno == errno.EACCES and not _PATH_FDS)
+
+def _door_step(base, name, current, make, source, below):
+	"""One component of the way to a landing: name in base (a held directory's descriptor, or its path: _at), current its
+	path (messages), below how many components lie below it (the Note's source). Returns name's descriptor (base a
+	descriptor; the caller holds it) or current (base a path) once it is a directory; None when it is missing and make is
+	False. 9.87's rules, relative to base: a missing one is made (mkdir meeting EEXIST where lstat then finds nothing, on a
+	second attempt: vfat iocharset=utf8, ENOENT); a link, FIFO, socket or device node is a name of the tree, unlinked and
+	made a directory (a note for a link; _Refused under -ncd, which makes no directory in place of anything, and where its
+	directory refuses the unlink); a regular file raises NotADirectoryError, the clash it always was. Three attempts at it,
+	the race's bound since 9.85 (workers racing on one path: an unlink meeting ENOENT or EISDIR, a mkdir meeting EEXIST, are
+	fine when the next look says directory), and a descriptor's last open after them. An open meeting a link (O_NOFOLLOW) or
+	another kind of entry says ENOTDIR (Linux) or ELOOP (macOS): it is looked at by lstat."""
+	held = isinstance(base, int)
+	how = _fd_of(base)
+	for attempt in range(4):
+		missing = False
+		if held:
+			try:
+				return os.open(name, (_HOLD_PATH_FLAGS if _PATH_FDS else _HOLD_READ_FLAGS) | getattr(os, 'O_NOFOLLOW', 0), dir_fd=base)
+			except OSError as e:
+				if e.errno not in (errno.ENOENT, errno.ENOTDIR, errno.ELOOP):
+					raise
+				missing = e.errno == errno.ENOENT
+		if attempt == 3:
+			break
+		st = None
+		if not missing:
+			try:
+				st = os.lstat(*_at(base, name), **how)
+			except FileNotFoundError:
+				pass
+			else:
+				if stat.S_ISDIR(st.st_mode):
+					if held:
+						continue  # a directory since the open: open it again
+					return current
+		if st is None:
+			if not make:
+				return None
+			try:
+				os.mkdir(*_at(base, name), **how)
+			except FileExistsError:
+				# Another worker may have made it since the look: look again before calling it vfat's.
+				try:
+					again = os.lstat(*_at(base, name), **how)
+				except FileNotFoundError:
+					again = None
+				if again is not None and stat.S_ISDIR(again.st_mode):
+					if held:
+						continue
+					return current
+				if again is None and attempt:
+					raise OSError(errno.ENOENT, 'the directory holds this name in another case and does not find it in this '
+						'one (vfat mounted iocharset=utf8: mount with utf8 instead)', current)
+				continue
+			if held:
+				continue
+			return current
+		if stat.S_ISREG(st.st_mode):
+			raise NotADirectoryError(errno.ENOTDIR, os.strerror(errno.ENOTDIR), current)
+		kind = _kind_of(st)
+		link = os.readlink(*_at(base, name), **how) if stat.S_ISLNK(st.st_mode) else None
+		above = source
+		for _ in range(below):
+			above = above and os.path.dirname(above.rstrip(os.sep))
+		named_form = f'name it with -d {_shell_word(current + os.sep)} to write through it' if link is not None else f'remove {current}'
+		if NO_CREATE_DIR:
+			raise _Refused(f'{current} is a {kind}' + (f' to {link}' if link is not None else '') +
+				' and -ncd makes no directory in its place: not copying ', f' below it; {named_form}')
+		try:
+			os.unlink(*_at(base, name), **how)
+		except (FileNotFoundError, IsADirectoryError):
+			continue
+		except OSError as e:
+			parent = os.path.dirname(current)
+			raise _Refused(f'cannot replace the {kind} {current}' + (f' (to {link})' if link is not None else '') +
+				f' by a directory ({parent}: {e.strerror}): not copying ', f' below it; make {parent} writable, or remove {current}')
+		try:
+			os.mkdir(*_at(base, name), **how)
+		except FileExistsError:
+			continue
+		if link is not None:
+			print(f'Note: {current} was a link to {link} and is now a directory; nothing was written to {link}. To write through '
+				f'a link, name it as the destination: hpcp {_shell_word(above.rstrip(os.sep) + os.sep) if above else "SRC/"} -d '
+				f'{_shell_word(current + os.sep)}')
+		if not held:
+			return current
+	raise OSError(errno.EAGAIN, 'it kept changing while it was made a directory', current)
+
+def _door_by_path(start, parts, make, source):
+	"""The door's walk by path (9.87's) from start, a directory, through parts: the last path, or None when one is missing and
+	make is False. Where no descriptor can be had (_DIR_FD_WALK, _by_path_error)."""
+	current = start
 	for index, part in enumerate(parts):
 		current = os.path.join(current, part)
-		if current in _DOORS:
-			continue
-		for attempt in range(3):
-			try:
-				st = os.lstat(current)
-			except FileNotFoundError:
-				st = None
-			if st is None:
-				if not make:
-					return
-				try:
-					os.mkdir(current)
-				except FileExistsError:
-					# Another worker may have made it since the lstat: look again before calling it vfat's.
-					try:
-						again = os.lstat(current)
-					except FileNotFoundError:
-						again = None
-					if again is not None and stat.S_ISDIR(again.st_mode):
-						break
-					if again is None and attempt:
-						raise OSError(errno.ENOENT, 'the directory holds this name in another case and does not find it in this '
-							'one (vfat mounted iocharset=utf8: mount with utf8 instead)', current)
-					continue
-				break
-			if stat.S_ISDIR(st.st_mode):
-				break
-			if stat.S_ISREG(st.st_mode):
-				raise NotADirectoryError(errno.ENOTDIR, os.strerror(errno.ENOTDIR), current)
-			kind = _kind_of(st)
-			link = os.readlink(current) if stat.S_ISLNK(st.st_mode) else None
-			above = source
-			for _ in range(len(parts) - 1 - index):
-				above = above and os.path.dirname(above.rstrip(os.sep))
-			named_form = f'name it with -d {_shell_word(current + os.sep)} to write through it' if link is not None else f'remove {current}'
-			if NO_CREATE_DIR:
-				raise _Refused(f'{current} is a {kind}' + (f' to {link}' if link is not None else '') +
-					' and -ncd makes no directory in its place: not copying ', f' below it; {named_form}')
-			try:
-				os.unlink(current)
-			except (FileNotFoundError, IsADirectoryError):
-				continue
-			except OSError as e:
-				parent = os.path.dirname(current)
-				raise _Refused(f'cannot replace the {kind} {current}' + (f' (to {link})' if link is not None else '') +
-					f' by a directory ({parent}: {e.strerror}): not copying ', f' below it; make {parent} writable, or remove {current}')
-			try:
-				os.mkdir(current)
-			except FileExistsError:
-				continue
-			if link is not None:
-				print(f'Note: {current} was a link to {link} and is now a directory; nothing was written to {link}. To write through '
-					f'a link, name it as the destination: hpcp {_shell_word(above.rstrip(os.sep) + os.sep) if above else "SRC/"} -d '
-					f'{_shell_word(current + os.sep)}')
-			break
-		else:
-			raise OSError(errno.EAGAIN, 'it kept changing while it was made a directory', current)
-		_DOORS[current] = True
+		if _door_step(os.path.dirname(current), part, current, make, source, len(parts) - 1 - index) is None:
+			return None
+	return current
+
+def _dest_directory(path, make=True, source=None):
+	"""The one door for a directory below a destination: path as a real directory, and where its names are made from: a
+	descriptor of it (a dup of the cursor's, the caller's to close in a finally: _close_base), or path itself where nothing
+	is held (no named destination above it: a library call; no descriptor calls, _DIR_FD_WALK; _by_path_error); None when
+	path or a directory on its way is missing and make is False (not under -ncd for a file's parent). The destination the
+	operator named and what is above it are made as os.makedirs makes them, through links (it is named), and it is opened
+	once per process in a run, following a link. Below it each component is opened one level at a time without following a link (_door_step: its rules for
+	what is there; source: the source directory that lands at path, to name the -d form in a note), and the levels shared
+	with the last path asked for are kept open (_HeldDirs): a directory swapped for a link after it was opened is no longer
+	on the way, as hpcp writes into the one it holds, wherever it is now."""
+	path = os.path.abspath(path)
+	root = _named_root(path)
+	if root is None:
+		if make:
+			_makedirs(path, exist_ok=True)
+			return path
+		return path if os.path.isdir(path) else None
+	if _CURSORS_RUN[0] != RUN_ID:
+		_close_cursors()
+		_CURSORS_RUN[0] = RUN_ID
+	parts = path[len(root.rstrip(os.sep)) + 1:].split(os.sep) if path != root else []
+	held = _CURSORS.get(root)
+	if held is None:
+		if make:
+			_makedirs(root, exist_ok=True)
+		if not _DIR_FD_WALK:
+			if not make and not os.path.isdir(root):
+				return None
+			return _door_by_path(root, parts, make, source)
+		try:
+			fd = os.open(root, _HOLD_PATH_FLAGS if _PATH_FDS else _HOLD_READ_FLAGS)
+		except OSError as e:
+			if _by_path_error(e):
+				return _door_by_path(root, parts, make, source)
+			if not make and e.errno in (errno.ENOENT, errno.ENOTDIR):
+				return None
+			raise
+		held = _CURSORS[root] = _HeldDirs(fd)
+	depth = 0
+	while depth < len(parts) and depth + 1 < len(held) and held.names[depth + 1] == parts[depth]:
+		depth += 1
+	held.truncate(depth)
+	for index in range(depth, len(parts)):
+		current = os.path.join(root, *parts[:index + 1])
+		try:
+			fd = _door_step(held.top(), parts[index], current, make, source, len(parts) - 1 - index)
+		except OSError as e:
+			if _by_path_error(e):
+				return _door_by_path(os.path.dirname(current), parts[index:], make, source)
+			raise
+		if fd is None:
+			return None
+		held.push(parts[index], fd)
+	try:
+		return os.dup(held.top())
+	except OSError as e:
+		if e.errno in (errno.EMFILE, errno.ENFILE):
+			return path  # nothing to hold it with: by path, as 9.87
+		raise
 
 def _read_through(path):
 	"""None when path, a regular file, reads to its end now (1 MiB reads, discarded), else the error: under -rbw a source that
@@ -4624,7 +4716,7 @@ def _cp_once(src_path, dest_path, cp_flags, sparse, space=None, look=None, src_s
 	(copy_file's first attempt); src_st: the source's lstat."""
 	target, st, named = look or _landing_of(dest_path)
 	_judge_landing(dest_path, target, st, named)
-	_dest_directory(os.path.dirname(target), make=not NO_CREATE_DIR, source=os.path.dirname(os.path.abspath(src_path)))
+	_close_base(_dest_directory(os.path.dirname(target), make=not NO_CREATE_DIR, source=os.path.dirname(os.path.abspath(src_path))))
 	command = ["cp", cp_flags] + (["--sparse=always"] if sparse and cp_supports_sparse() else [])
 	# A name that appears at a first copy's landing between the look and hpcp's create is looked at again, judged as the first
 	# look was, and the route that fits it taken; 3 times, the door's bound for the same race.
@@ -4929,7 +5021,7 @@ def copy_file(src_path, dest_paths, full_hash=False, verbose=False, concurrent_p
 	refused = {}
 	for dest in dest_paths:
 		try:
-			_dest_directory(os.path.dirname(_landing_path(dest)[0]), make=False, source=os.path.dirname(os.path.abspath(src_path)))
+			_close_base(_dest_directory(os.path.dirname(_landing_path(dest)[0]), make=False, source=os.path.dirname(os.path.abspath(src_path))))
 		except _Refused as e:
 			refused[dest] = e
 		except OSError:
@@ -5674,7 +5766,7 @@ def _make_dest_directory(src_path, dest_path):
 		return False
 	try:
 		if not os.path.ismount(dest_path):
-			_dest_directory(dest_path, source=src_path)
+			_close_base(_dest_directory(dest_path, source=src_path))
 	except _Refused as e:
 		eprint(e.text(f'the directory {src_path}'))
 		return False
@@ -11723,7 +11815,8 @@ def _unlink_failed(name, dir_fd, path, exc):
 		_report_unremoved(path, exc)
 
 class _HeldDirs:
-	"""The directories on the path a removal walk or cursor is at, by descriptor, from a pinned root: one a level."""
+	"""The directories on the path a removal walk or cursor (the copy's door, _dest_directory) is at, by descriptor, from a
+	pinned root: one a level."""
 	__slots__ = ('names', 'fds')
 
 	def __init__(self, root_fd):
@@ -14548,6 +14641,8 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = None,
 		eprint(f"General Exception: {e} \n{track}")
 	finally:
 		NAMED_DESTS, RUN_ID, SYNC_COPIES, _BAR = frozenset(), None, False, False
+		# what the door held for the run (_dest_directory): its workers' went with them
+		_close_cursors()
 		_SPACE_WARNED = outer_space
 		clean_up(mount_points,loop_devices,delayed_commands)
 		get_partition_details.cache_clear()
