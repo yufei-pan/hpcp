@@ -111,51 +111,11 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 
 ### A directory on the way to a landing can be swapped for a link mid-run
 - **Kind:** deferred (9.88).
-- **What the operator sees:** a user who can write a directory below a destination can swap a directory on the way to a landing for a link. The window is between hpcp's look at it (`_dest_directory`, once per worker in a run) and the next write below it. A root run then writes the rest of that directory's files where the link leads. The folder sync's metadata, the directory finish and the links made there follow it too. On Linux and macOS a landing's own name no longer races since 9.87 (except that a link at a name given with `-d` is followed whenever it appears, as in 9.86: the operator named that place): a first copy, a rewrite in place and the beside route's new file are written through a descriptor hpcp holds, and an identical regular file's metadata is set through a descriptor checked against hpcp's look. Off Linux (macOS has no `O_PATH`) an identical FIFO or device node still gets its mode and owner by name, so a link put at its name after the look is followed; a root run could then give the link's target the source's mode and owner. Elsewhere see "Where cp cannot write a file hpcp holds, a landing can be swapped for a link mid-run".
+- **What the operator sees:** a user who can write a directory below a destination can swap a directory on the way to a landing for a link. The window is between hpcp's look at it (`_dest_directory`, once per worker in a run) and the next write below it. A root run then writes the rest of that directory's files where the link leads. The folder sync's metadata, the directory finish and the links made there follow it too. On Linux and macOS a landing's own name no longer races since 9.87 (except that a link at a name given with `-d` is followed whenever it appears, as in 9.86: the operator named that place): a first copy, a rewrite in place and the beside route's new file are written through a descriptor hpcp holds, and an identical regular file's metadata is set through a descriptor checked against hpcp's look. Off Linux (macOS has no `O_PATH`), and on Linux without /proc, an identical FIFO or device node gets its owner and mode by name; since 9.88 without following a link put at its name after the look (`lchown`, and on macOS `lchmod`; Linux has no `lchmod`, so there without /proc its mode still follows such a link). Elsewhere see "Where cp cannot write a file hpcp holds, a landing can be swapped for a link mid-run".
 - **Why:** closing it needs every write below a destination to go through descriptors walked from the destination with O_NOFOLLOW at each step, the size of 9.86's redesign. It is built apart from 9.87's other work so that each is measured and reviewed on its own.
-- **Plan (9.88):** for each landing, walk from the named destination one level at a time by `O_PATH | O_NOFOLLOW | O_DIRECTORY` opens (`O_RDONLY` where there is no `O_PATH`). A link, FIFO or node met on the way gets the door's rules, relative to the held directory. Every name below a destination is made through the held directory (`dir_fd=`, or `/proc/self/fd/D/NAME`). `cp` gets the held file as its own inherited descriptor. Off Linux, an identical FIFO or device node's mode and owner are set with `follow_symlinks=False` (`os.chmod(path, mode, follow_symlinks=False)` and a no-follow chown), until the walk gives them a descriptor. Measured against 9.87, local and on NFS, with the bars in the 9.87 plan (W1).
+- **Plan (9.88):** for each landing, walk from the named destination one level at a time by `O_PATH | O_NOFOLLOW | O_DIRECTORY` opens (`O_RDONLY` where there is no `O_PATH`). A link, FIFO or node met on the way gets the door's rules, relative to the held directory. Every name below a destination is made through the held directory (`dir_fd=`, or `/proc/self/fd/D/NAME`). `cp` gets the held file as its own inherited descriptor. Measured against 9.87, local and on NFS, with the bars in the 9.87 plan (W1).
 - **Revisit when:** 9.88, started as soon as 9.87 ships.
 - **Noted:** 2026-11-10, the main session's decision (a deferral, not asked).
-
-### Off Linux, the copy check stats each landing on a network filesystem by name
-- **Kind:** deferred (9.88).
-- **What the operator sees:** on macOS (and wherever Linux's mount table is not there to read), the check at the end of a copy, and the move's before its removal, `lstat`s each landing by its path on a network destination too: on NFS mounted `actimeo=0` a round trip for each part of each path. On Linux, where a destination is on NFS, Lustre, GPFS, CIFS/SMB3, CephFS or BeeGFS, each landing is looked at relative to its directory, opened once: on an EL8 NFSv4.1 loopback the check of 100,000 landings took 9.5 to 21.5 s against 23.1 to 47.5 s by path, and a rerun 4.06 million GETATTRs against 4.61 million (9.87, fa5fb6b). Only NFS was measured; the other five take the route because their clients walk a path through the server the same way.
-- **Why:** hpcp reads a filesystem's type from Linux's mount table (`/proc/self/mountinfo`, which the space warning reads too); Python's `statvfs` gives no type, and macOS has no such table. Local filesystems keep the look by path on purpose: there the opens cost more than they save.
-- **Plan:** 9.88: on macOS, each destination's type from `statfs`'s `f_fstypename`, once a destination; then `nfs`, `smbfs` and `afpfs` take the directory route.
-- **Revisit when:** 9.88.
-- **Noted:** 2026-11-08, the user's standing rule that deferrals are noted, not asked; narrowed 2026-11-10 (9.87's R3: the directory route on network filesystems, the main session's call).
-
-### A move's `-d` path: the parent of a new top directory is not fsynced
-- **Kind:** deferred (9.88).
-- **What the operator sees:** `hpcp src/ -d new1/new2/ -rf` with `new1` missing makes `new1` in the working directory, and the move fsyncs `new1/new2` and everything below it but not the working directory, which holds the new name `new1`. On ext4, XFS and btrfs a file's own fsync commits that name; on vfat a directory entry is written only by its directory's fsync, so a power cut soon after the move can lose the path to the moved files while their sources are gone. 9.86 fsynced none of these.
-- **Why:** the fsyncs between a destination and each landing's directory are known from the landings (9.87's review B, P4); the parent of a directory the run made is known only to the code that made it, which does not report it.
-- **Plan (9.88):** `_dest_directory` returns the first missing ancestor it made, and the move fsyncs that ancestor's parent once, with the rest.
-- **Revisit when:** 9.88.
-- **Noted:** 2026-11-10, 9.87 review B (F4, the half P4 leaves); not a regression; the main session's decision, not asked (a deferral).
-
-### A move of a directory whose mode shuts its owner out fails 212 with a misleading reason
-- **Kind:** deferred (9.88).
-- **What the operator sees:** a non-root move of a tree holding another user's directory of mode 0607 (owner `rw-`, other `rwx`: no search for its owner, the runner) with a subdirectory in it copies everything, then prints `Copy failed: the directory OUT/d/sub cannot be written to disk (Permission denied)` and exits 212, every source kept. The copy is right and nothing is lost; the reason names a write failure that did not happen. 9.86 failed the copy itself (190 or 193) and kept its sources too.
-- **Why:** the finish gives `OUT/d` mode 0607, which takes search from the runner; the move's directory fsync then reaches `d/sub` by path, and `lstat` fails with EACCES, which the fsync reports as a disk failure.
-- **Plan (9.88):** fsync at the finish, through its descriptor, every directory below one whose final mode lacks owner search: the finish goes deepest first, so the child is finished while its parent is still open (the idea of `_shut_to_its_owner` for owner read).
-- **Revisit when:** 9.88.
-- **Noted:** 2026-11-10, 9.87 review B (F5); not a regression; the main session's decision, not asked (a deferral).
-
-### A directory shared by merged sources has its times set twice, and every rerun sets them again on a coarse-time filesystem
-- **Kind:** deferred (9.88).
-- **What the operator sees:** with `hpcp a/ b/ -d out/`, each destination directory that both sources have gets two finish records: every rerun sets its times twice (and its mode twice where the sources differ), so its ctime moves each run, and in a pooled finish which source's metadata wins is not fixed. On a filesystem with coarse times (vfat 2 s, exFAT 10 ms, HFS+ 1 s) the finish compares mtime exactly, so a rerun sets every directory's times again. 9.86 set them on every run everywhere; no data is affected.
-- **Why:** the finish keeps one record per source directory, not per destination, and its mtime compare has no tolerance (a file's has, R2).
-- **Plan (9.88):** `finish_directories` keeps the last record per destination, and compares times within the filesystem's granularity as the file rule does.
-- **Revisit when:** 9.88.
-- **Noted:** 2026-11-10, 9.87 review B (F6); not a regression; the main session's decision, not asked (a deferral).
-
-### On Python 3.6 an early stop can rarely hang the run in a pool's submit
-- **Kind:** deferred (9.88).
-- **What the operator sees:** on Python 3.6 (EL7, EL8), a Ctrl-C or SIGTERM in the first second of a copy, while its pool takes its first jobs, can leave hpcp waiting for good: every worker has ended, and a second Ctrl-C prints nothing (not even `Stopping: cleaning up first`) and SIGTERM does nothing; Ctrl-\ or `kill -9` ends it. About 3 in 2,000 early Ctrl-Cs in the 9.87 review's probe (9.86: 4 in 716). Other Pythons are not affected.
-- **Why:** 3.6's `ProcessPoolExecutor.submit` wakes its manager thread through the result queue, under that queue's write lock, which the workers share. A worker that the same Ctrl-C ended can leave that lock held (its stop raised in `SemLock.__enter__`, after it took the semaphore and before `with` armed its exit), and the parent then waits on it with its stops blocked (`_pool.submit`'s mask, which keeps a 3.6 worker's start closed to stops). The review tried letting the parent's stop raise inside 3.6's `submit` (it cut multiprocessing's own bookkeeping and printed new tracebacks) and raising only from the lock wait (it still hung): each made something else worse.
-- **Plan (9.88):** hpcp owns the 3.6 wakeup: on 3.6 only, its own `submit` takes the result queue's write lock with a timed acquire in a loop, the stops staying blocked as now, and each pass reads `signal.sigpending()`; a pending stop raises before anything is taken.
-- **Revisit when:** 9.88.
-- **Noted:** 2026-11-10, found by the 9.87 group 1 review (F1); not a regression (9.86 hung more often); the main session's decision, not asked (a deferral).
 
 ### An early stop can very rarely hang the run in Python's own thread-start lock
 - **Kind:** deferred (multiCMD 1.60; its entry in docs/limitations.md, "A Ctrl-C inside Thread.start() can leave Python's thread lock held").
@@ -163,14 +123,6 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - **Why:** CPython's `with` race: a signal right after `Thread.start()` takes `threading._active_limbo_lock`, before the block's exit is armed, leaves it held. The fix belongs in multiCMD (1.60: record a stop while it starts a thread and raise it after); hpcp needs nothing then.
 - **Revisit when:** multiCMD 1.60.
 - **Noted:** 2026-11-10, found by the 9.87 fix-round re-review (R5); not worse than 9.86 overall; the main session's decision, not asked (a deferral).
-
-### A Ctrl-C that lands while Python imports hpcp can be dropped
-- **Kind:** deferred (9.88).
-- **What the operator sees:** a Ctrl-C in the first tenth of a second, while Python is still importing hpcp, is sometimes dropped: the run goes on as if it had not been pressed and exits 0, and with `-rf` it moves. Python's own handler raises the `KeyboardInterrupt` inside an `importlib` weak-reference callback, which Python reports as `Exception ignored in: ...` and discards. Seen in 2 of 2,100 early Ctrl-Cs on Python 3.7 and 1 of 720 on 3.14 in the 9.87 review's probe; 9.86 is the same. On Python 3.7 with `forkserver` or `spawn`, the child's own start-up (or the semaphore tracker's) can print such a traceback too, from Python's own code (`<frozen importlib...>`, `initsite`, and 3.7's semaphore tracker `KeyError` in `cache.remove`), the run still ending 130 (3.7, 200 early Ctrl-Cs a start method, runs that printed a traceback: `forkserver` 13 for 9.87 against 45 for 9.86, `spawn` 28 against 187).
-- **Why:** the signal is lost inside Python's import machinery, before any hpcp code runs; hpcp installs its stop handlers in `main()`, not as the module loads, so that a program importing hpcp as a library keeps its own handlers.
-- **Plan (9.88):** investigate where the signal is lost (a probe that sends SIGINT at each step of the import), then choose between a recording handler installed as the script starts (only when hpcp is run as the program, never when imported) and asking for the import again when it was cut.
-- **Revisit when:** 9.88.
-- **Noted:** 2026-11-10, found by the 9.87 review A; not a regression (9.86 is the same); the main session's decision, not asked (a deferral).
 
 ### On Python 3.6 and 3.7 an early Ctrl-C can print an `Exception ignored ... KeyboardInterrupt` block
 - **Kind:** known limitation.
