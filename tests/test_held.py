@@ -1465,3 +1465,81 @@ def test_w1_a_failing_cp_s_message_names_the_landing_not_its_proc_path(tmp_path,
 	assert seen and all(target.startswith(_HELD_PREFIX) for target, _, _ in seen), seen
 	assert hpcp.ERRORS and not any('/proc/self/fd/' in error for error in hpcp.ERRORS), hpcp.ERRORS
 	assert any(os.path.join(out, 'a/x') in error for error in hpcp.ERRORS), hpcp.ERRORS
+
+
+# ---- 9.88 W1 review fixes (F1 to F5): what was worse than 9.87 ----
+
+_ONE_DESTINATION_TWICE = '''
+import resource, sys
+if __name__ == '__main__':
+	# the limit 9.87 ran at (macOS's soft 256; a container's 1,024), hard too: hpcp raises the soft one to the hard one at import
+	resource.setrlimit(resource.RLIMIT_NOFILE, (1024, 1024))
+	sys.path.insert(0, sys.argv[1])
+	import hpcp
+	sys.argv = [hpcp.__file__] + sys.argv[2:]
+	sys.exit(hpcp.main())
+'''
+
+
+@posix_only
+def test_f1_a_destination_given_twice_copies_every_file_at_a_low_open_files_limit(tmp_path):
+	# F1: -d out/ -d out/ asked the door for out/ twice a file and kept the second descriptor: the first was never closed, one
+	# leaked a file, and at 1,024 descriptors 1,007 of 1,500 files were copied and the run exited 193 ("Too many open files").
+	# 9.87 held nothing and copied all.
+	for i in range(1500):
+		write(tmp_path / 'src' / ('d%d' % (i % 9)) / ('f%d' % i), 'x')
+	script = write(tmp_path / 'low.py', _ONE_DESTINATION_TWICE)
+	task = subprocess.run([sys.executable, script, os.path.dirname(HPCP), 'src/', '-d', 'out/', '-d', 'out/', '-s'], cwd=str(tmp_path),
+		stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=600)
+	output = task.stdout.decode(errors='replace')
+	copied = sum(len(files) for _, _, files in os.walk(str(tmp_path / 'out')))
+	assert task.returncode == 0 and copied == 1500 and 'Too many open files' not in output, (task.returncode, copied, output[-3000:])
+
+
+@posix_only
+@pytest.mark.parametrize('route', ['proc', 'read'])
+def test_f1_a_destination_given_twice_holds_one_descriptor(tmp_path, fresh, monkeypatch, route):
+	# F1 at the door's callers (copy_file, create_sym_links): the descriptors held after a call are the cursor's, whatever
+	# the number of times the destination is listed; the closing loop closes each base even when one close fails.
+	if route == 'proc' and not hpcp._PATH_FDS:
+		pytest.skip('no /proc/self/fd here')
+	monkeypatch.setattr(hpcp, '_PATH_FDS', route == 'proc')
+	for name in ('a/x', 'a/y', 'b/z'):
+		write(tmp_path / 'src' / name, name)
+	os.symlink('a/x', str(tmp_path / 'src' / 'a' / 'link'))
+	out = str(tmp_path / 'out')
+	os.makedirs(out)
+	with contextlib.redirect_stdout(io.StringIO()):
+		hpcp.copy_file(str(tmp_path / 'src/b/z'), [str(tmp_path / 'warm')])  # cp's answers asked, outside a run
+	baseline = _open_descriptors()
+	_w1_run(monkeypatch, out)
+	with contextlib.redirect_stdout(io.StringIO()):
+		for name in ('a/x', 'a/y', 'b/z'):
+			landing = os.path.join(out, name)
+			hpcp.copy_file(str(tmp_path / 'src' / name), [landing, landing, landing])
+			assert _open_descriptors() == baseline + 1 + name.count('/'), (name, baseline, _open_descriptors())
+		link = os.path.join(out, 'a', 'link')
+		hpcp.create_sym_links({str(tmp_path / 'src/a/link'): [link, link]})
+		assert _open_descriptors() == baseline + 2, (baseline, _open_descriptors())
+	hpcp._close_cursors()
+	assert _open_descriptors() == baseline
+	assert all(read(os.path.join(out, name)) == name for name in ('a/x', 'a/y', 'b/z')) and os.readlink(link) == 'a/x' and not hpcp.ERRORS, hpcp.ERRORS
+
+
+@posix_only
+def test_f1_every_base_is_closed_even_when_one_close_fails():
+	first, second, third = os.open(os.devnull, os.O_RDONLY), os.open(os.devnull, os.O_RDONLY), os.open(os.devnull, os.O_RDONLY)
+	os.close(first)  # already closed: its close raises EBADF
+	try:
+		with pytest.raises(OSError) as raised:
+			hpcp._close_bases({'a': first, 'b': second, 'c': third, 'd': None, 'e': '/a/path'})
+		assert raised.value.errno == errno.EBADF
+		for fd in (second, third):
+			with pytest.raises(OSError):
+				os.fstat(fd)  # closed all the same
+	finally:
+		for fd in (second, third):
+			with contextlib.suppress(OSError):
+				os.close(fd)
+
+

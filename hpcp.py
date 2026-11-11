@@ -3056,6 +3056,8 @@ def create_sym_links(symLinks,exclude=None,link_tracking=False,link_dirs=None):
 			linkedTargetFile = os.readlink(src)
 			source_stat = os.lstat(src)
 			for d in dests:
+				if d in bases or d in refusals:
+					continue  # a destination given twice is asked once (copy_file)
 				try:
 					bases[d] = _dest_directory(os.path.dirname(d), make=False, source=os.path.dirname(os.path.abspath(src)))
 				except (_Refused, OSError) as e:
@@ -3184,8 +3186,7 @@ Exception caught!
 Skipping...""")
 			continue
 		finally:
-			for base in bases.values():
-				_close_base(base)
+			_close_bases(bases)
 
 
 	endTime = time.monotonic()
@@ -4181,6 +4182,18 @@ def _close_base(base):
 	"""Close a door's result (_dest_directory) where it is a descriptor: the caller's, always in a finally."""
 	if isinstance(base, int):
 		os.close(base)
+
+def _close_bases(bases):
+	"""Close every door result in bases ({destination: the door's result}), each even when another's close raises; the first
+	error is raised after the last close."""
+	error = None
+	for base in bases.values():
+		try:
+			_close_base(base)
+		except OSError as e:
+			error = error or e
+	if error is not None:
+		raise error
 
 def _io(base, name, path):
 	"""A path for a call that takes no dir_fd (xattrs, an ioctl's open, chflags, cp's argument) on name in base, the door's
@@ -5283,8 +5296,7 @@ def copy_file(src_path, dest_paths, full_hash=False, verbose=False, concurrent_p
 	try:
 		return _copy_file(src_path, dest_paths, full_hash, verbose, concurrent_processes, bases)
 	finally:
-		for base in bases.values():
-			_close_base(base)
+		_close_bases(bases)
 
 def _copy_file(src_path, dest_paths, full_hash, verbose, concurrent_processes, bases):
 	"""copy_file's body; bases: {dest: the door's result for its landing's directory}, filled here, closed by copy_file."""
@@ -5311,6 +5323,8 @@ def _copy_file(src_path, dest_paths, full_hash, verbose, concurrent_processes, b
 	# left out, its refusal kept; one whose directory is missing (None) is made by the door at the copy (_cp_once).
 	refused = {}
 	for dest in dest_paths:
+		if dest in bases or dest in refused:
+			continue  # a destination given twice (-d out -d out) is asked once: a second answer would replace the first, never closed
 		try:
 			bases[dest] = _dest_directory(os.path.dirname(_landing_path(dest)[0]), make=False, source=os.path.dirname(os.path.abspath(src_path)))
 		except _Refused as e:
