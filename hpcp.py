@@ -3874,21 +3874,22 @@ def delete_file_list_parallel(file_list, max_workers, verbose=False,files_per_jo
 	return apb.item_counter, apb.size_counter
 
 #%% ---- Copy Files ----
-def _chown_like_cp(path, st):
+def _chown_like_cp(path, st, **how):
 	"""Give path st's owner and group, as cp -a does: without privileges another user's ownership cannot be kept,
 	so keep at least the group (one the user belongs to) and treat the rest as no error. Root failures raise.
-	Returns (owner kept, group kept), as path has them now (it may have had the right owner already)."""
+	Returns (owner kept, group kept), as path has them now (it may have had the right owner already). how: os.chown's and
+	os.stat's keywords (follow_symlinks=False: a link at the name is changed, never what it leads to)."""
 	try:
-		os.chown(path, st.st_uid, st.st_gid)
+		os.chown(path, st.st_uid, st.st_gid, **how)
 		return True, True
 	except PermissionError:
 		if os.geteuid() == 0:
 			raise
 		try:
-			os.chown(path, -1, st.st_gid)
+			os.chown(path, -1, st.st_gid, **how)
 		except PermissionError:
 			pass
-	now = os.stat(path)
+	now = os.stat(path, **how)
 	return now.st_uid == st.st_uid, now.st_gid == st.st_gid
 
 def _named_root(path):
@@ -4803,7 +4804,8 @@ def _settle_identical(src_path, src_st, dest, look):
 	another file's name, put there since: neither gets the source's owner or mode), for the caller to look again.
 
 	On Linux an O_PATH descriptor, reached by its /proc/self/fd name (as _carry_over); elsewhere a regular file opened for
-	reading without following a link (the check just read it), and a node by name."""
+	reading without following a link (the check just read it), and a node by name, its owner, xattrs, times and (where chmod
+	can be told so) mode set without following a link put at it."""
 	fd = None
 	try:
 		if _PATH_FDS:
@@ -4827,7 +4829,7 @@ def _settle_identical(src_path, src_st, dest, look):
 		owner_kept = group_kept = True
 		chowned = os.name == 'posix' and (now.st_uid, now.st_gid) != (src_st.st_uid, src_st.st_gid)
 		if chowned:
-			owner_kept, group_kept = _chown_like_cp(path, src_st)
+			owner_kept, group_kept = _chown_like_cp(path, src_st, **how)
 		# xattrs after the owner, as cp -a: a chown clears a file capability (security.capability), and before the mode, which
 		# may make the file read-only
 		if hasattr(os, 'listxattr'):
@@ -4856,7 +4858,9 @@ def _settle_identical(src_path, src_st, dest, look):
 		# As cp -a: no set-user-ID / set-group-ID bit for an owner / group not kept. A chown may have cleared them: set again.
 		mode = stat.S_IMODE(src_st.st_mode) & ~((0 if owner_kept else stat.S_ISUID) | (0 if group_kept else stat.S_ISGID))
 		if chowned or stat.S_IMODE(now.st_mode) != mode:
-			os.chmod(path, mode)
+			# a node by name: not through a link put at it where chmod can say so (macOS's lchmod; Linux has none, so there,
+			# without /proc, the mode goes by name)
+			os.chmod(path, mode, **(how if os.chmod in os.supports_follow_symlinks else {}))
 		if now.st_mtime_ns != src_st.st_mtime_ns:
 			# The read time goes with it, as cp -a gives it; alone it is not chased: a read moves it (relatime moves one older
 			# than the change time, which setting it makes it), so the skip check's own read would have it set on every rerun.

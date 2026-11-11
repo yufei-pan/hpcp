@@ -383,3 +383,24 @@ def test_every_destination_takes_the_copy_check_by_directory_on_macos(tmp_path):
 	# C1: macOS has no mount table to read, so 9.87 took every destination for a local one (by path), NFS, SMB and AFP too.
 	assert hpcp._on_network_fs([str(tmp_path)]) is True
 
+
+@pytest.mark.macos988
+def test_a_link_swapped_at_an_identical_fifo_gets_no_owner_or_mode(root, fresh, monkeypatch):
+	# N1: _settle_identical sets an identical FIFO's metadata by name (no descriptor for a node off Linux's /proc): a link put
+	# at the name after its look took the source's mode (9.87's chmod followed it). lchmod and lchown now change the link.
+	source, landing, victim = (os.path.join(root, name) for name in ('p', 'q', 'victim'))
+	os.mkfifo(source, 0o644)
+	os.mkfifo(landing, 0o600)
+	write(victim, 'victim', mode=0o600)
+	look = os.lstat(landing)
+	real_lstat = os.lstat
+	def swapped(path, *args, **kwargs):
+		result = real_lstat(path, *args, **kwargs)
+		if path == landing and stat.S_ISFIFO(result.st_mode):
+			os.unlink(landing)
+			os.symlink(victim, landing)  # after the look _settle_identical takes
+		return result
+	monkeypatch.setattr(os, 'lstat', swapped)
+	hpcp._settle_identical(source, real_lstat(source), landing, look)
+	monkeypatch.setattr(os, 'lstat', real_lstat)
+	assert stat.S_IMODE(os.stat(victim).st_mode) == 0o600 and read(victim) == 'victim'

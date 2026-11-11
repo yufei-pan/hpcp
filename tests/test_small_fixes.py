@@ -533,3 +533,39 @@ def test_an_empty_destination_is_no_destination(tmp_path, sources):
 	rc, output = run(sources + ['-d', ''], tmp_path)
 	assert 'Destination path not specified, using' in output, output[-2000:]
 	assert not (tmp_path / 'fa').exists()
+
+
+# ---- 9.88 N1: an identical FIFO or device node's owner and mode, set by name, never through a link put at it
+
+@pytest.mark.skipif(os.name != 'posix' or not hasattr(os, 'mkfifo'), reason='FIFOs')
+def test_an_identical_node_s_owner_and_mode_are_set_without_following_a_link(tmp_path, monkeypatch, reset_hpcp_globals):
+	# Off Linux (macOS) and on Linux without /proc, _settle_identical has no descriptor for a FIFO or device node: it sets its
+	# metadata by name. 9.87 gave the owner (_chown_like_cp) and the mode by a call that follows a link put at the name since
+	# the look, so a root run could give the link's target the source's owner and mode. chown is told not to follow
+	# always; chmod where the platform can (macOS's lchmod; Linux has none: the approved known limitation).
+	import types
+	import hpcp
+	monkeypatch.setattr(hpcp, '_PATH_FDS', False)
+	source, landing = str(tmp_path / 'p'), str(tmp_path / 'q')
+	os.mkfifo(source, 0o644)
+	os.mkfifo(landing, 0o600)
+	look = os.lstat(landing)
+	real = os.lstat(source)
+	# another owner and group than the landing's, and another mode: both are set
+	wanted = types.SimpleNamespace(**{name: getattr(real, name) for name in dir(real) if name.startswith('st_')})
+	wanted.st_uid, wanted.st_gid = real.st_uid + 1, real.st_gid + 1
+	calls = []
+	for name in ('chown', 'chmod'):
+		original = getattr(os, name)
+		def spy(path, *args, _original=original, _name=name, **kwargs):
+			calls.append((_name, kwargs.get('follow_symlinks', True)))
+			return _original(path, *args, **kwargs)
+		monkeypatch.setattr(os, name, spy)
+	try:
+		hpcp._settle_identical(source, wanted, landing, look)
+	except PermissionError:
+		pass  # root's chown to an owner that may not exist here is no part of this
+	follows = {name: [follow for kind, follow in calls if kind == name] for name in ('chown', 'chmod')}
+	assert follows['chown'] and not any(follows['chown']), calls
+	if os.chmod in os.supports_follow_symlinks:
+		assert follows['chmod'] and not any(follows['chmod']), calls
