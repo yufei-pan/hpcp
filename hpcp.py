@@ -3950,6 +3950,16 @@ def _chown_like_cp(path, st, **how):
 	now = os.stat(path, **how)
 	return now.st_uid == st.st_uid, now.st_gid == st.st_gid
 
+def _flags_to_set(src_flags, now_flags):
+	"""The BSD flags (st_flags) a destination that has now_flags is given for a source's src_flags: all of them in a root run.
+	A non-root run sets only the user flags (UF_SETTABLE, the lower 16 bits) and keeps the system flags there, which only
+	root can change (SF_*: macOS gives /Users sunlnk), as an owner it cannot keep is no error (_chown_like_cp): chflags with
+	a system flag is EPERM for the whole call, a list-mode copy of a path under /Users exited 193 and a move never ended."""
+	if os.geteuid() == 0:
+		return src_flags
+	user = getattr(stat, 'UF_SETTABLE', 0xffff)
+	return (now_flags & ~user) | (src_flags & user)
+
 def _named_root(path):
 	"""The longest destination the operator named (NAMED_DESTS) that path, absolute, is or lies below; None when there is
 	none (no run set them: a library call of copy_file, say)."""
@@ -5202,9 +5212,9 @@ def _settle_identical(src_path, src_st, dest, look, base=None):
 			# The read time goes with it, as cp -a gives it; alone it is not chased: a read moves it (relatime moves one older
 			# than the change time, which setting it makes it), so the skip check's own read would have it set on every rerun.
 			os.utime(path, ns=(src_st.st_atime_ns, src_st.st_mtime_ns), **how)
-		if getattr(src_st, 'st_flags', 0) != getattr(now, 'st_flags', 0):
+		if hasattr(os, 'chflags') and _flags_to_set(src_st.st_flags, now.st_flags) != now.st_flags:
 			try:
-				os.chflags(_io(base, leaf, dest), src_st.st_flags, follow_symlinks=False)
+				os.chflags(_io(base, leaf, dest), _flags_to_set(src_st.st_flags, now.st_flags), follow_symlinks=False)
 			except OSError as e:
 				if e.errno not in (errno.ENOTSUP, errno.EOPNOTSUPP):
 					raise
@@ -6254,8 +6264,10 @@ def _finish_directory(record, sync=False, late=False):
 			# set every directory's times again on each rerun there.
 			if not _time_stored_as(now.st_mtime_ns, mtime_ns):
 				os.utime(fd if os.utime in os.supports_fd else dest_path, ns=(atime_ns, mtime_ns))
-			if flags is not None and hasattr(os, 'chflags') and getattr(now, 'st_flags', flags) != flags:
-				os.chflags(dest_path, flags, follow_symlinks=False)
+			if flags is not None and hasattr(os, 'chflags'):
+				flags = _flags_to_set(flags, now.st_flags)
+				if flags != now.st_flags:
+					os.chflags(dest_path, flags, follow_symlinks=False)
 		except OSError as e:
 			if late:
 				eprint(f"Directory sync error: {src_path} to {dest_path}: its mode, set after the move's removal: {e}")

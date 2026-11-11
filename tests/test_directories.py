@@ -783,6 +783,20 @@ def test_a_directory_finish_takes_times_within_the_filesystem_step(tmp_path, mon
 	assert len(set_times) == 1, set_times
 
 
+def test_a_non_root_run_sets_only_the_user_bsd_flags(monkeypatch):
+	# macOS gives /Users, /private and /var/folders sunlnk (SF_NOUNLINK), a system flag only root can set: a non-root list-mode
+	# copy of a path below /Users synced /Users to out/Users, and chflags with the source's flags was EPERM for the whole call
+	# (exit 193; a move never ended). A non-root run sets the user flags (UF_*, the lower 16 bits) and keeps the system ones
+	# the destination has, as an owner it cannot keep is no error; root sets them all.
+	hidden, nodump, sunlnk, archived = 0x8000, 0x1, 0x100000, 0x10000
+	monkeypatch.setattr(os, 'geteuid', lambda: 1000, raising=False)
+	assert hpcp._flags_to_set(sunlnk | hidden, 0) == hidden
+	assert hpcp._flags_to_set(sunlnk, archived | nodump) == archived
+	assert hpcp._flags_to_set(0, archived) == archived
+	monkeypatch.setattr(os, 'geteuid', lambda: 0, raising=False)
+	assert hpcp._flags_to_set(sunlnk | hidden, archived | nodump) == sunlnk | hidden
+
+
 @posix_only
 def test_a_directory_finish_sets_an_even_second_source_time_exactly_on_a_fine_filesystem(tmp_path, reset_hpcp_globals):
 	# The tolerance is the step the destination keeps, not the source's: a source time on an even second (vfat's, or a

@@ -398,3 +398,25 @@ def test_a_link_swapped_at_an_identical_fifo_gets_no_owner_or_mode(root, fresh, 
 	hpcp._settle_identical(source, real_lstat(source), landing, look)
 	monkeypatch.setattr(os, 'lstat', real_lstat)
 	assert stat.S_IMODE(os.stat(victim).st_mode) == 0o600 and read(victim) == 'victim'
+
+
+@pytest.mark.macos988
+@pytest.mark.skipif(not hasattr(os, 'geteuid') or os.geteuid() == 0, reason='root sets system flags')
+def test_a_list_of_paths_below_a_directory_with_a_system_flag_copies_and_moves_as_non_root(root):
+	# P2: a list-mode copy spells each source in full, so the copy syncs every directory on its way (/Users, /private) into the
+	# destination, and their finish gave the copies the source's flags: sunlnk (SF_NOUNLINK) is root's to set, chflags was
+	# EPERM for the whole call, "Directory sync error: /Users to out/Users: [Errno 1] Operation not permitted", exit 193, and
+	# a move (-rf) never removed its sources. Now the user flags are set, the system ones left (_flags_to_set).
+	parts = root.split(os.sep)
+	flagged = [path for path in (os.sep.join(parts[:end]) or os.sep for end in range(1, len(parts)))
+		if getattr(os.lstat(path), 'st_flags', 0) & ~0xffff]
+	if not flagged:
+		pytest.skip('no directory above the test directory has a system flag here')
+	source = write(os.path.join(root, 'src/a/x.txt'), 'x')
+	for args in (['-d', 'out'], ['-d', 'out'], ['-d', 'moved', '-rf']):
+		task = subprocess.run([sys.executable, HPCP] + args, cwd=root, input=source + '\n', stdout=subprocess.PIPE,
+			stderr=subprocess.STDOUT, universal_newlines=True, timeout=300)
+		assert task.returncode == 0 and 'Operation not permitted' not in task.stdout, (args, task.stdout[-3000:])
+	assert read(os.path.join(root, 'out' + source)) == 'x' and read(os.path.join(root, 'moved' + source)) == 'x'
+	assert not os.path.exists(source)
+
