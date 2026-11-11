@@ -5886,11 +5886,23 @@ def finish_directories(records, max_workers, sync=False):
 					futures.discard(future)
 					_task_result(future, (0, 0, {}), 'Copy process crashed')
 
-def _sync_moved_directories(files, link_dirs, src_paths, dests, dest_image, records, max_workers):
+def _first_missing(path):
+	"""The topmost directory on the way to path (made absolute) that is not there yet, path itself when only it is missing;
+	None when path is there. A run makes it, and a name made in a directory is on disk only once that directory is fsynced."""
+	path, missing = os.path.abspath(path), None
+	while not os.path.lexists(path):
+		missing, parent = path, os.path.dirname(path)
+		if parent == path:
+			break
+		path = parent
+	return missing
+
+def _sync_moved_directories(files, link_dirs, src_paths, dests, dest_image, records, max_workers, made_tops=()):
 	"""A move's directory fsyncs, once the finish (finish_directories) is done: each directory the copy synced (records), but
 	those the finish fsynced (_shut_to_its_owner), the directory of every file landing (files: the copy's source paths, one
 	directory map per source directory, so a -nds move is covered), those a link was made in (link_dirs), and the parent of
-	each source's landing, once each. fsync(2) promises a new name only with its directory's fsync: on ext4 and XFS a file's
+	each source's landing, and for each directory a -d path made (made_tops, _first_missing) its parent and every directory
+	from it down to the destination, once each. fsync(2) promises a new name only with its directory's fsync: on ext4 and XFS a file's
 	own fsync commits it, elsewhere not; there the first fsync here commits every change before it, so the rest cost little
 	(2,040 directories fsynced each right after its own change took 1.4 to 3.1 s on EL7 and EL8, against 9.86's 0.4 to 0.7 s
 	for the move). In max_workers threads: an fsync waits on the disk, not the CPU. A directory that is not there (a -nds landing directory in a destination its files did not go to)
@@ -5905,6 +5917,17 @@ def _sync_moved_directories(files, link_dirs, src_paths, dests, dest_image, reco
 		directories.update(_landings(parent, by_source))
 	for _, landings in _src_to_dest_map(src_paths, dests, dest_image):
 		directories.update(os.path.dirname(os.path.normpath(landing)) for landing in landings)
+	for top in made_tops:
+		# its parent holds its name; below it, every directory on the way to a destination it holds (a file destination's
+		# own directory up)
+		directories.add(os.path.dirname(top))
+		for dest in dests:
+			path = os.path.abspath(dest)
+			if not os.path.isdir(path):
+				path = os.path.dirname(path)
+			while path == top or path.startswith(top.rstrip(os.sep) + os.sep):
+				directories.add(path)
+				path = os.path.dirname(path)
 	directories = {os.path.abspath(directory) for directory in directories}
 	# The directories between a destination and each landing directory: under -nds no folder sync made them records, and a
 	# name made in one is promised to disk only by its own fsync. With the folder sync each parent is a record already: one
@@ -14284,6 +14307,10 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = None,
 			os.getcwd()
 		except FileNotFoundError:
 			os.chdir(os.sep)
+		# A move: the top directory of each -d path the run will make (the loop below makes one ending in a separator; the copy
+		# makes the rest), looked for before anything is made. Its parent holds the new name, which only that parent's fsync
+		# commits on vfat: _sync_moved_directories fsyncs it and every directory from the top down to the destination.
+		made_tops = [top for top in (_first_missing(dest) for dest in dests if dest and dest != ...) if top] if remove and not dest_image else []
 
 		dests_to_remove = []
 		for dest in dests:
@@ -14439,7 +14466,7 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = None,
 			if SYNC_COPIES:
 				_check_stop()
 				synced = _sync_moved_directories(total_file_list, link_dirs, src_paths, dests, bool(dest_image), dir_records,
-					1 if single_thread else max_workers)
+					1 if single_thread else max_workers, made_tops)
 				_check_stop()
 				_flush_drives(total_file_list, set(synced).union(os.path.abspath(record[1]) for record in dir_records), src_paths,
 					dests, bool(dest_image))

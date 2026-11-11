@@ -1637,3 +1637,25 @@ def test_rme_asks_about_sources_once_a_directory_not_once_an_extra(tmp_path, hpc
 	assert _rme_answered(hpcp_mod, monkeypatch, ['b', 'out/sub/']) == 0
 	assert not os.path.exists('out/b/many') and open('out/sub/x').read() == 'S'
 	assert calls[0] < 50, calls[0]
+
+
+@pytest.mark.skipif(os.name != 'posix', reason='POSIX directory fsyncs')
+@pytest.mark.parametrize('dest', ['new1/new2/', 'new1/new2'], ids=['made-by-hpcp', 'made-by-the-copy'])
+def test_a_move_into_a_new_path_fsyncs_each_directory_it_made_and_their_parent(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch, dest):
+	# 9.88 D1, the deferral's own example: hpcp src/ -d new1/new2/ -rf with new1 missing. 9.87 fsynced new1/new2 and below, but
+	# neither new1 nor the working directory, which holds the name new1: on vfat (a directory entry is written only by its
+	# directory's fsync) a power cut soon after could lose the path to the moved files, their sources gone.
+	(tmp_path / 'src' / 'sub').mkdir(parents=True)
+	(tmp_path / 'src' / 'f').write_text('f')
+	(tmp_path / 'src' / 'sub' / 'g').write_text('g')
+	monkeypatch.chdir(str(tmp_path))
+	synced = []
+	real = hpcp_mod._fsync_file
+	def fsync(path, *args, **kwargs):
+		synced.append(os.path.abspath(path))
+		return real(path, *args, **kwargs)
+	monkeypatch.setattr(hpcp_mod, '_fsync_file', fsync)
+	assert hpcp_mod.hpcp(['src/'], dest_paths=[dest], remove=True, remove_force=True, single_thread=True) == 0, hpcp_mod.ERRORS
+	assert (tmp_path / 'new1' / 'new2' / 'sub' / 'g').read_text() == 'g' and not (tmp_path / 'src' / 'f').exists()
+	wanted = {str(tmp_path), str(tmp_path / 'new1'), str(tmp_path / 'new1' / 'new2')}
+	assert wanted <= set(synced), sorted(wanted - set(synced))
