@@ -817,3 +817,103 @@ def test_a_merged_rerun_on_vfat_sets_no_directory_again(tmp_path, monkeypatch, r
 		assert changes == [], changes
 	finally:
 		subprocess.run(['umount', '-l', str(mount)], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+
+
+# ---- 9.88 D2: a non-root move of a directory whose mode shuts its owner out
+
+root_only = pytest.mark.skipif(not hasattr(os, 'geteuid') or os.geteuid() != 0, reason='needs root to make another user\'s tree')
+NOBODY = 65534
+
+
+def _shut_out_tree():
+	'''f5's tree, made as root in a work directory nobody can use (0777, not sticky, so a move may remove the source root):
+	src/d of mode 0607 owned by root (no search for its owner; nobody, the runner, reaches it as "other", and owns the copy),
+	holding sub/f and g; out owned by nobody.'''
+	import tempfile
+	work = tempfile.mkdtemp(prefix='hpcp-d2-')
+	os.chmod(work, 0o777)
+	src = os.path.join(work, 'src')
+	os.makedirs(os.path.join(src, 'd', 'sub'))
+	for path, text in ((os.path.join(src, 'd', 'sub', 'f'), 'hi'), (os.path.join(src, 'd', 'g'), 'top')):
+		with open(path, 'w') as handle:
+			handle.write(text)
+		os.chmod(path, 0o666)
+	os.chmod(src, 0o777)
+	os.chmod(os.path.join(src, 'd', 'sub'), 0o777)
+	os.chmod(os.path.join(src, 'd'), 0o607)
+	os.mkdir(os.path.join(work, 'out'))
+	os.chown(os.path.join(work, 'out'), NOBODY, NOBODY)
+	return work
+
+
+def _as_nobody(args, cwd, script=None):
+	'''hpcp (or script, a wrapper that runs hpcp.main()) as nobody: (return code, output).'''
+	def demote():
+		os.setgroups([])
+		os.setgid(NOBODY)
+		os.setuid(NOBODY)
+	task = subprocess.run([sys.executable, script or HPCP] + args, cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+		stderr=subprocess.STDOUT, preexec_fn=demote, timeout=120, env=dict(os.environ, HOME=cwd))
+	return task.returncode, task.stdout.decode(errors='replace')
+
+
+@posix_only
+@root_only
+def test_a_non_root_move_of_a_directory_its_owner_cannot_search_completes(tmp_path):
+	# 9.87: exit 212, 'Copy failed: the directory OUT/d/sub cannot be written to disk (Permission denied)', every source kept:
+	# the finish gave out/d 0607, and the move's fsync of d/sub (by path) met EACCES. Its mode is now set after the removal.
+	work = _shut_out_tree()
+	try:
+		rc, output = _as_nobody(['src/', '-d', 'out/', '-rf'], work)
+		out = os.path.join(work, 'out', 'd')
+		assert rc == 0 and not os.path.exists(os.path.join(work, 'src', 'd')), output[-3000:]
+		assert stat.S_IMODE(os.lstat(out).st_mode) == 0o607, oct(os.lstat(out).st_mode)
+		with open(os.path.join(out, 'sub', 'f')) as f, open(os.path.join(out, 'g')) as g:
+			assert (f.read(), g.read()) == ('hi', 'top')
+	finally:
+		shutil.rmtree(work, ignore_errors=True)
+
+
+_STOPPED_AT_REMOVAL = '''import sys
+sys.path.insert(0, %(root)r)
+import hpcp
+def stopped(*args, **kwargs):
+	raise KeyboardInterrupt  # a stop as the move's removal starts: the late pass never runs
+hpcp.remove_moved_sources = stopped
+if __name__ == '__main__':  # forkserver and spawn workers import this file as __mp_main__
+	sys.argv = [%(hpcp)r] + sys.argv[1:]
+	hpcp.main()
+'''
+
+
+@posix_only
+@root_only
+def test_a_stopped_move_leaves_owner_search_until_a_rerun(tmp_path):
+	# A stop before the late pass (here as the removal starts) leaves such a directory with owner read and search (0707): a
+	# rerun of the move sets its exact mode.
+	work = _shut_out_tree()
+	try:
+		script = os.path.join(work, 'stopped.py')
+		with open(script, 'w') as handle:
+			handle.write(_STOPPED_AT_REMOVAL % {'root': os.path.dirname(HPCP), 'hpcp': HPCP})
+		out = os.path.join(work, 'out', 'd')
+		rc, output = _as_nobody(['src/', '-d', 'out/', '-rf'], work, script)
+		assert rc == 130 and stat.S_IMODE(os.lstat(out).st_mode) == 0o707, (oct(os.lstat(out).st_mode), output[-3000:])
+		rc, output = _as_nobody(['src/', '-d', 'out/', '-rf'], work)
+		assert rc == 0 and stat.S_IMODE(os.lstat(out).st_mode) == 0o607, (oct(os.lstat(out).st_mode), output[-3000:])
+		assert not os.path.exists(os.path.join(work, 'src', 'd'))
+	finally:
+		shutil.rmtree(work, ignore_errors=True)
+
+
+@posix_only
+def test_a_move_off_posix_does_not_ask_for_an_euid(tmp_path, monkeypatch, reset_hpcp_globals):
+	# Windows has no os.geteuid: 9.87's _shut_to_its_owner called it for every directory a move synced (an AttributeError
+	# out of _sync_moved_directories; reasoned, no Windows machine here). Off POSIX the finish sets no mode first.
+	out = tmp_path / 'out'
+	out.mkdir()
+	monkeypatch.setattr(hpcp, 'SYNC_COPIES', True)
+	monkeypatch.delattr(os, 'geteuid', raising=False)
+	record = (str(tmp_path / 'src'), str(out), 0o600, 0, 0, None)
+	hpcp._sync_moved_directories([], set(), [str(tmp_path / 'src') + os.sep], [str(out) + os.sep], False, [record], 1)
+	assert hpcp._first_mode(0o600) == 0o600 and hpcp._synced_at_finish(0o600) is False

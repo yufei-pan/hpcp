@@ -2306,6 +2306,8 @@ def test_an_early_stop_prints_no_traceback(tmp_path, method, batch):
 			if task.poll() is None:
 				os.killpg(task.pid, signal.SIGKILL)
 		left = _DROPPED_STOP.sub(b'', output) if sys.version_info < (3, 8) else output
+		if code != 130 or b'Traceback' in left:
+			print(output.decode(errors='replace'))  # whole, in the failure's captured stdout: an assertion message is cut short
 		assert code == 130 and b'Traceback' not in left, (run, output[-3000:])
 
 

@@ -5790,18 +5790,35 @@ def sync_directory_metadata(src_path, dest_paths):
 		_finish_directory(record)
 	return count, seconds, links
 
-def _shut_to_its_owner(mode):
-	"""Whether a non-root runner could not open a directory of this final mode again (no owner read): a move fsyncs it at the
-	finish, through the descriptor that set the mode (_finish_directory), and every other directory once they all are
-	finished (_sync_moved_directories)."""
-	return mode is not None and os.geteuid() != 0 and not mode & stat.S_IRUSR
+def _first_mode(mode):
+	"""The mode the finish gives a directory whose final mode is mode: in a move by a non-root runner, one without owner
+	search keeps owner read and search until the move's check and removal are done (_finish_late), or every name below it
+	would be out of the runner's reach (its fsyncs, the check's looks: 212 or 213 where the copy was whole)."""
+	if mode is not None and SYNC_COPIES and hasattr(os, 'geteuid') and os.geteuid() != 0 and not mode & stat.S_IXUSR:
+		return mode | stat.S_IRUSR | stat.S_IXUSR
+	return mode
 
-def _finish_directory(record, sync=False):
-	"""The rest of a synced directory's metadata, once what goes in it is in (_start_directory's record): its exact mode, its
-	times and its BSD flags, each set only where the directory differs, through one descriptor opened without following a
-	link (a link the operator named with -d is followed, as everywhere). sync (a move): a directory its mode now shuts to its
-	owner (_shut_to_its_owner) is fsynced through that descriptor, opened while the sync's mode still let its owner in; the
-	others are fsynced after the whole finish, once each (an fsync right after each change would commit the journal once per
+def _synced_at_finish(mode):
+	"""Whether the finish fsyncs a directory of this final mode itself (a move): one whose first mode (_first_mode) lets a
+	non-root owner not read it, which no later open by the runner reaches (_sync_moved_directories passes it over)."""
+	first = _first_mode(mode)
+	return first is not None and hasattr(os, 'geteuid') and os.geteuid() != 0 and not first & stat.S_IRUSR
+
+def _finish_late(records):
+	"""After a non-root move's removal step (ran or skipped): the exact mode of each directory _first_mode left open to its
+	owner, deepest first (each parent still searchable while its children are set), each fsynced through its own descriptor
+	(_finish_directory, late)."""
+	late = [record for record in records if record[2] is not None and _first_mode(record[2]) != record[2]]
+	for record in sorted(late, key=lambda record: -os.path.abspath(record[1]).count(os.sep)):
+		_finish_directory(record, sync=True, late=True)
+
+def _finish_directory(record, sync=False, late=False):
+	"""The rest of a synced directory's metadata, once what goes in it is in (_start_directory's record): its exact mode (in a
+	non-root move first _first_mode's, and the exact one in the late pass, late: _finish_late), its times and its BSD flags,
+	each set only where the directory differs, through one descriptor opened without following a link (a link the operator
+	named with -d is followed, as everywhere). sync (a move): a directory its mode shuts to its owner (_synced_at_finish), or
+	any in the late pass, is fsynced through that descriptor, opened while the mode still let its owner in; the others are
+	fsynced after the whole finish, once each (an fsync right after each change would commit the journal once per
 	directory). A failure is a Directory sync error, or the move's copy failure when only the fsync failed."""
 	src_path, dest_path, mode, atime_ns, mtime_ns, flags = record
 	if mode is None:
@@ -5824,8 +5841,9 @@ def _finish_directory(record, sync=False):
 	try:
 		try:
 			now = os.fstat(fd)
-			if stat.S_IMODE(now.st_mode) != mode:
-				os.fchmod(fd, mode)
+			wanted = mode if late else _first_mode(mode)
+			if stat.S_IMODE(now.st_mode) != wanted:
+				os.fchmod(fd, wanted)
 			# The read time with the modification time, as cp -a gives both; one that alone differs is left, as a file's
 			# (_settle_identical): a read moves it where it is not after the change time, which any set makes now, so a rerun
 			# chasing it would set it and move the change time on every run (EL8, relatime: the rerun's own listing did).
@@ -5836,8 +5854,11 @@ def _finish_directory(record, sync=False):
 			if flags is not None and hasattr(os, 'chflags') and getattr(now, 'st_flags', flags) != flags:
 				os.chflags(dest_path, flags, follow_symlinks=False)
 		except OSError as e:
-			eprint(f'Directory sync error: {src_path} to {dest_path}: {e}')
-		if sync and _shut_to_its_owner(mode):
+			if late:
+				eprint(f"Directory sync error: {src_path} to {dest_path}: its mode, set after the move's removal: {e}")
+			else:
+				eprint(f'Directory sync error: {src_path} to {dest_path}: {e}')
+		if sync and (late or _synced_at_finish(mode)):
 			try:
 				os.fsync(fd)
 			except OSError as e:
@@ -5899,7 +5920,7 @@ def _first_missing(path):
 
 def _sync_moved_directories(files, link_dirs, src_paths, dests, dest_image, records, max_workers, made_tops=()):
 	"""A move's directory fsyncs, once the finish (finish_directories) is done: each directory the copy synced (records), but
-	those the finish fsynced (_shut_to_its_owner), the directory of every file landing (files: the copy's source paths, one
+	those the finish fsynced (_synced_at_finish), the directory of every file landing (files: the copy's source paths, one
 	directory map per source directory, so a -nds move is covered), those a link was made in (link_dirs), and the parent of
 	each source's landing, and for each directory a -d path made (made_tops, _first_missing) its parent and every directory
 	from it down to the destination, once each. fsync(2) promises a new name only with its directory's fsync: on ext4 and XFS a file's
@@ -5912,7 +5933,7 @@ def _sync_moved_directories(files, link_dirs, src_paths, dests, dest_image, reco
 	by_source = _by_source(_src_to_dest_map(src_paths, dests, dest_image))
 	directories = set(link_dirs or ())
 	directories.update(record[1] for record in records)
-	finished = {os.path.abspath(record[1]) for record in records if _shut_to_its_owner(record[2])}
+	finished = {os.path.abspath(record[1]) for record in records if _synced_at_finish(record[2])}
 	for parent in {os.path.dirname(path) for path in files}:
 		directories.update(_landings(parent, by_source))
 	for _, landings in _src_to_dest_map(src_paths, dests, dest_image):
@@ -14497,6 +14518,10 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = None,
 			_check_stop()
 			process_remove(src_paths,single_thread=single_thread, max_workers=max_workers,verbose=verbose,
 						files_per_job=files_per_job, remove_force=remove_force,exclude=exclude,batch=batch,parallel_file_listing=parallel_file_listing)
+		if SYNC_COPIES:
+			# A non-root move's directories whose exact mode takes their owner's search (0607): set now, after the removal step
+			# that looked below them (a stop before this leaves them with owner read and search until a rerun).
+			_finish_late(dir_records)
 	except KeyboardInterrupt:
 		# The stop is acted on: later checks (_check_stop) change nothing.
 		global _STOP_ACTED
