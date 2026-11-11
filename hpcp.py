@@ -14925,29 +14925,35 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = None,
 				print(f"Number of files / links: {len(total_file_list)}")
 				print(f"Number of links: {len(total_sym_links)}")
 				print(f"Total time taken: {time.monotonic()-programStartTime:0.4f} seconds")
-		if remove and copy_failures:
-			eprint(f'Remove skipped: not removing {_sources_text(src_paths)}: the copy reported {len(copy_failures)} error(s); '
-				'fix them (or exclude those paths with -e) and re-run')
-		elif remove and dests != ... and replaced:
-			# Removing the earlier directory would destroy the only copy of each file the later one replaced.
-			# -rme ran before this, and never removes a source (_source_guard).
-			eprint(f"Remove skipped: not removing {_sources_text(src_paths)}: {replaced} file(s) in merged directories "
-				'were replaced by a later source, and the earlier source holds their only copy; every source stays')
-		elif remove and dests != ...:
-			# A move: only what the copy listed goes (see remove_moved_sources). Each copy was written to disk by its worker
-			# (_sync_landing), and one that could not be is a copy failure, which stopped this branch above.
-			_check_stop()
-			remove_moved_sources(src_paths, total_file_list, total_sym_links, single_thread=single_thread, max_workers=max_workers,
-						verbose=verbose, files_per_job=files_per_job, remove_force=remove_force, exclude=exclude, root_ids=source_ids,
-						dests=dests, dest_image=bool(dest_image))
-		elif remove:
-			_check_stop()
-			process_remove(src_paths,single_thread=single_thread, max_workers=max_workers,verbose=verbose,
-						files_per_job=files_per_job, remove_force=remove_force,exclude=exclude,batch=batch,parallel_file_listing=parallel_file_listing)
-		if SYNC_COPIES:
-			# A non-root move's directories whose exact mode takes their owner's search (0607): set now, after the removal step
-			# that looked below them (a stop before this leaves them with owner read and search until a rerun).
-			_finish_late(dir_records)
+		removal_ended = False
+		try:
+			if remove and copy_failures:
+				eprint(f'Remove skipped: not removing {_sources_text(src_paths)}: the copy reported {len(copy_failures)} error(s); '
+					'fix them (or exclude those paths with -e) and re-run')
+			elif remove and dests != ... and replaced:
+				# Removing the earlier directory would destroy the only copy of each file the later one replaced.
+				# -rme ran before this, and never removes a source (_source_guard).
+				eprint(f"Remove skipped: not removing {_sources_text(src_paths)}: {replaced} file(s) in merged directories "
+					'were replaced by a later source, and the earlier source holds their only copy; every source stays')
+			elif remove and dests != ...:
+				# A move: only what the copy listed goes (see remove_moved_sources). Each copy was written to disk by its worker
+				# (_sync_landing), and one that could not be is a copy failure, which stopped this branch above.
+				_check_stop()
+				remove_moved_sources(src_paths, total_file_list, total_sym_links, single_thread=single_thread, max_workers=max_workers,
+							verbose=verbose, files_per_job=files_per_job, remove_force=remove_force, exclude=exclude, root_ids=source_ids,
+							dests=dests, dest_image=bool(dest_image))
+			elif remove:
+				_check_stop()
+				process_remove(src_paths,single_thread=single_thread, max_workers=max_workers,verbose=verbose,
+							files_per_job=files_per_job, remove_force=remove_force,exclude=exclude,batch=batch,parallel_file_listing=parallel_file_listing)
+			removal_ended = True
+		finally:
+			if SYNC_COPIES:
+				# A non-root move's directories whose exact mode takes their owner's search (0607): set after the removal step
+				# that looked below them. After a stop or an error in it, only those whose source directory it removed: no rerun
+				# reaches them; the others keep owner read and search for the rerun, whose folder sync looks below them (a rerun
+				# over a 0607 one can fail: docs/limitations.md).
+				_finish_late(dir_records if removal_ended else [record for record in dir_records if not os.path.lexists(record[0])])
 	except KeyboardInterrupt:
 		# The stop is acted on: later checks (_check_stop) change nothing.
 		global _STOP_ACTED

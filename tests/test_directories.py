@@ -921,6 +921,39 @@ def test_a_stopped_move_leaves_owner_search_until_a_rerun(tmp_path):
 		shutil.rmtree(work, ignore_errors=True)
 
 
+_STOPPED_AFTER_REMOVAL = '''import sys
+sys.path.insert(0, %(root)r)
+import hpcp
+removal = hpcp.remove_moved_sources
+def stopped(*args, **kwargs):
+	removal(*args, **kwargs)
+	raise KeyboardInterrupt  # a stop as the move's removal ends: every source directory is gone
+hpcp.remove_moved_sources = stopped
+if __name__ == '__main__':  # forkserver and spawn workers import this file as __mp_main__
+	sys.argv = [%(hpcp)r] + sys.argv[1:]
+	hpcp.main()
+'''
+
+
+@posix_only
+@root_only
+def test_a_move_stopped_as_its_removal_ends_still_gets_the_exact_mode(tmp_path):
+	# A stop at the end of the removal (a big tree's removal takes long, so a Ctrl-C there is likely): out/d's source is gone,
+	# so no rerun reaches it (one exits 240, the source does not exist), and 9.88's first build left it 0707 for good. The late
+	# pass now runs however the removal ended, for each directory whose source it removed.
+	work = _shut_out_tree()
+	try:
+		script = os.path.join(work, 'stopped.py')
+		with open(script, 'w') as handle:
+			handle.write(_STOPPED_AFTER_REMOVAL % {'root': os.path.dirname(HPCP), 'hpcp': HPCP})
+		out = os.path.join(work, 'out', 'd')
+		rc, output = _as_nobody(['src/', '-d', 'out/', '-rf'], work, script)
+		assert rc == 130 and not os.path.exists(os.path.join(work, 'src', 'd')), output[-3000:]
+		assert stat.S_IMODE(os.lstat(out).st_mode) == 0o607, (oct(os.lstat(out).st_mode), output[-3000:])
+	finally:
+		shutil.rmtree(work, ignore_errors=True)
+
+
 @posix_only
 def test_a_move_off_posix_does_not_ask_for_an_euid(tmp_path, monkeypatch, reset_hpcp_globals):
 	# Windows has no os.geteuid: 9.87's _shut_to_its_owner called it for every directory a move synced (an AttributeError
