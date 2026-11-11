@@ -278,9 +278,9 @@ finally:
 	if _IMPORT_MASK is not None and _signal.SIGINT not in _IMPORT_MASK:
 		_signal.pthread_sigmask(_signal.SIG_UNBLOCK, (_signal.SIGINT,))
 
-version = '9.87'
+version = '9.88'
 __version__ = version
-COMMIT_DATE = '2026-11-10'
+COMMIT_DATE = '2026-11-11'
 
 MAGIC_NUMBER = 1.61803398875
 RANDOM_DESTINATION_SELECTION = False

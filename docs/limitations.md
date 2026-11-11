@@ -109,14 +109,6 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - **Revisit when:** an operator needs that mount option.
 - **Approved:** 2026-11-10, the user chose "Approve both as KLs (Recommended)". The user did not ask for it explicitly; the 9.84 review found it.
 
-### A directory on the way to a landing can be swapped for a link mid-run
-- **Kind:** deferred (9.88).
-- **What the operator sees:** a user who can write a directory below a destination can swap a directory on the way to a landing for a link. The window is between hpcp's look at it (`_dest_directory`, once per worker in a run) and the next write below it. A root run then writes the rest of that directory's files where the link leads. The folder sync's metadata, the directory finish and the links made there follow it too. On Linux and macOS a landing's own name no longer races since 9.87 (except that a link at a name given with `-d` is followed whenever it appears, as in 9.86: the operator named that place): a first copy, a rewrite in place and the beside route's new file are written through a descriptor hpcp holds, and an identical regular file's metadata is set through a descriptor checked against hpcp's look. Off Linux (macOS has no `O_PATH`), and on Linux without /proc, an identical FIFO or device node gets its owner and mode by name; since 9.88 without following a link put at its name after the look (`lchown`, and on macOS `lchmod`; Linux has no `lchmod`, so there without /proc its mode still follows such a link). Elsewhere see "Where cp cannot write a file hpcp holds, a landing can be swapped for a link mid-run".
-- **Why:** closing it needs every write below a destination to go through descriptors walked from the destination with O_NOFOLLOW at each step, the size of 9.86's redesign. It is built apart from 9.87's other work so that each is measured and reviewed on its own.
-- **Plan (9.88):** for each landing, walk from the named destination one level at a time by `O_PATH | O_NOFOLLOW | O_DIRECTORY` opens (`O_RDONLY` where there is no `O_PATH`). A link, FIFO or node met on the way gets the door's rules, relative to the held directory. Every name below a destination is made through the held directory (`dir_fd=`, or `/proc/self/fd/D/NAME`). `cp` gets the held file as its own inherited descriptor. Measured against 9.87, local and on NFS, with the bars in the 9.87 plan (W1).
-- **Revisit when:** 9.88, started as soon as 9.87 ships.
-- **Noted:** 2026-11-10, the main session's decision (a deferral, not asked).
-
 ### On Python 3.6 and 3.7 an early Ctrl-C can print an `Exception ignored ... KeyboardInterrupt` block
 - **Kind:** known limitation.
 - **What the operator sees:** on Python 3.6 and 3.7 (EL7, EL8), an early Ctrl-C (or SIGTERM or SIGHUP, which hpcp stops the same way) now and then prints Python's `Exception ignored in: <...>` line, a traceback ending in hpcp's `_stop` at `raise KeyboardInterrupt`, and `KeyboardInterrupt:`. The run still stops as it should (130 for Ctrl-C, its cleanup done) and nothing is lost. In the 9.87 reviews' probes, 9.87 printed it in 1 of 2,100 early stops and 0 of 1,200, against 11 of 1,200 for 9.86 (about 1 in 2,000 against about 1 in 100). Python 3.8 and later never print it.
@@ -196,7 +188,7 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   - for one file: a plain first copy, or the beside route's new file, of a source whose owner and group a non-root run cannot give, in a directory whose default ACL gave the new file entries of its own. `cp -a` narrows the ACL of a file it did not make before it gives it an owner, so it would drop them; `cp` makes that file by name, as before, and keeps them;
   - for one file: a root run's plain first copy, or the beside route's new file, of a file of another user or group (an owner or group other than the new file's own: root, and the directory's group where it is setgid, otherwise root's), in a directory whose default ACL gave the new file entries of its own. Keeping them would mean giving the file its owner before `cp` writes it, and then the data is charged to that owner's or group's quota while root writes it (XFS enforces an owner's and a group's quota on a root write, not on root's chown): in an earlier 9.87 build, which did that, a user at the hard limit got `Disk quota exceeded`, exit 190, where 9.86 completed; so did a root file of a group at its hard limit (`root:G`, XFS with `grpquota`, a 4 MiB file against a 1 MiB limit: 9.87 exit 190, 9.86 exit 0). `cp` makes that file by name, as in 9.86, and gives it its owner once it has written it. A root run's file with the owner and group the new file has (root:root, or root and the group of a setgid directory) is given nothing first and keeps the held route.
 
-  BusyBox's `cp` writes data only into a file it creates itself, never through a link. But it sets owner, mode and times by name after closing the file, so a link put at the name in that moment gets them. Otherwise, on Linux with GNU `cp` and on macOS, the held file is written, and a link put at the name is never written through. Use `-wb` for a root run into a tree others can write: it renames a new file over the name, and never writes data through it. Directories on the way: see "A directory on the way to a landing can be swapped for a link mid-run".
+  BusyBox's `cp` writes data only into a file it creates itself, never through a link. But it sets owner, mode and times by name after closing the file, so a link put at the name in that moment gets them. Otherwise, on Linux with GNU `cp` and on macOS, the held file is written, and a link put at the name is never written through. Use `-wb` for a root run into a tree others can write: it renames a new file over the name, and never writes data through it. Directories on the way: since 9.88 hpcp holds them by descriptor. Where `cp` makes a landing itself on Linux with a `cp` that writes a held file (the default-ACL cases above), it gets the landing's name below the held directory (`/proc/self/fd/D/NAME`), so they cannot lead it elsewhere. Where `cp` cannot write a held file (the BSDs, a `cp` other than GNU `cp`, no usable `/proc` or temporary directory), it gets the full path, and a directory on the way swapped in that moment leads it too.
 - **Why:**
   - The BSDs show no `/dev/fd/N` past 2 unless fdescfs is mounted (fdescfs(5)), and FreeBSD's `cp -f` unlinks the destination first (freebsd-src `bin/cp/utils.c`). There is no BSD machine here to test a route on.
   - BusyBox's `cp` makes every destination anew with `O_EXCL` (BusyBox `libbb/copy_file.c`; checked in Alpine: the probe gives no route).
@@ -212,3 +204,42 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - **Plan (9.89):** measure the check on a macOS NFS and SMB mount, by path and by directory; where by directory wins, ask each destination's filesystem type (`statfs`'s `f_fstypename`) and check network mounts by directory.
 - **Revisit when:** 9.89.
 - **Noted:** 2026-11-11, the main session's call on the review's F3 (a deferral, not asked).
+
+### On macOS a node copy and BSD flags, and on Linux without /proc an identical node's mode, go by name below the held directory
+- **Kind:** known limitation.
+- **What the operator sees:** in a root run on macOS into a tree another user can write, that user can, by swapping a directory on the way for a link at the right microsecond, have the run make a copied FIFO or socket where the link leads (a device node too, if the source holds one; a user's own tree cannot). On macOS the same swap can also give an identical file's BSD flags to another file of that name there. On Linux with /proc not mounted, it can give an identical FIFO's or device node's mode to such a file. Regular files, directories and links go through the directory hpcp holds (9.88). What `cp` gets where it cannot write a file hpcp holds is in "Where cp cannot write a file hpcp holds, a landing can be swapped for a link mid-run".
+- **Why:** hpcp would have to make FIFOs, sockets and nodes itself instead of `cp -a`, plus a ctypes `fchflags`: new code for node files in root macOS runs into other users' trees.
+- **Revisit when:** an operator runs root copies on macOS into trees others can write, or Python gains `fchflags`.
+- **Approved:** 2026-11-10, the user chose "Approve as KL (Recommended)". The user did not ask for it explicitly; the 9.88 plan found it.
+
+### `-siff`'s patch apply writes below its target by path
+- **Kind:** deferred (9.89).
+- **What the operator sees:** a root `-siff` apply into a target a user can write: a directory the patch writes into, swapped for a link after hpcp's check (`_unsafe_parent`) and before the write, has the write go where the link leads.
+- **Why:** the patch apply is a flow of its own, built before 9.88's descriptor door; it checks paths, which leaves the window the copy closed in 9.88.
+- **Plan (9.89):** the patch apply's writes through the copy's door (`_dest_directory`), relative to what it holds.
+- **Revisit when:** 9.89.
+- **Noted:** 2026-11-10, the 9.88 plan; the main session's decision, not asked (a deferral).
+
+### A non-root rerun over a directory whose mode shuts its owner out can fail below it
+- **Kind:** deferred (9.89).
+- **What the operator sees:** a non-root copy or move gives a directory of mode 0607 (no search for its owner) that mode at its end. A later non-root copy or move of the same tree syncs that directory's subdirectories, and one synced before the directory's own start has opened it to its owner again fails: `Directory sync error: SRC/d/sub to OUT/d/sub: [Errno 13] Permission denied: 'OUT/d/sub'`, exit 193 (with `-rf` the sources stay; a retry may pass). Since 9.88 a job's folders are synced parents first, so it takes a parallel run and such a directory with more than one pool job's folders below it (64): with 200 subdirectories, 9.87 failed all 12 reruns on Python 3.6 and 3.14, 9.88 some on 3.6 and none on 3.14; with one subdirectory 9.87 failed some reruns, by hash order, and 9.88 none.
+- **Why:** the folder sync reaches a directory below its parent, and only the parent's own start gives the parent owner search; pool jobs run side by side. Not worse than 9.87.
+- **Plan (9.89):** where the door meets EACCES at a directory the runner owns that lacks owner search, give it owner search first, as `_start_directory` does for a rerun's own directory (the finish sets its exact mode again); or start each pool job's parents before it.
+- **Revisit when:** 9.89.
+- **Noted:** 2026-11-11, found by the 9.88 A–C review (P1); the main session's decision, not asked (a deferral).
+
+### macOS: a rerun carries no changed xattr or ACL
+- **Kind:** deferred (9.89).
+- **What the operator sees:** on macOS a first copy gets its source's xattrs and ACL from `cp -a`, but a rerun that finds a landing identical does not carry an xattr or ACL the source changed since: Python has no `os.listxattr` there, and hpcp reads no ACL. The same in 9.87.
+- **Why:** Linux's xattr calls are in Python's `os` module; macOS's are not, and ACLs need `acl_get_fd`/`acl_set_fd`.
+- **Plan (9.89):** read and set them on macOS through libc (ctypes: `listxattr`, `getxattr`, `setxattr`, `removexattr` with `XATTR_NOFOLLOW`, and the ACL calls), through the descriptor the rerun already holds.
+- **Revisit when:** 9.89.
+- **Noted:** 2026-11-11, found by the 9.88 A–C review's macOS run; the main session's decision, not asked (a deferral).
+
+### macOS: a named socket in a source ends in a misleading 213
+- **Kind:** deferred (9.89).
+- **What the operator sees:** macOS's `cp` does not copy a named socket (`cp: ... is a socket (not copied)`), and hpcp then reports the socket as a failed copy (`Copy failed: ...`, naming its landing), exit 213; with `-rf` the sources stay. On Linux `cp -a` makes the socket node and the run exits 0. The same in 9.87.
+- **Why:** hpcp leaves every node to `cp -a`, and macOS's `cp` skips sockets.
+- **Plan (9.89):** make the socket node at the landing as Linux's `cp -a` does (an `AF_UNIX` socket bound there, relative to the held directory), so a socket copies on macOS too.
+- **Revisit when:** 9.89.
+- **Noted:** 2026-11-11, found by the 9.88 A–C review's macOS run; the main session's decision, not asked (a deferral).
