@@ -376,3 +376,10 @@ def test_a_stop_anywhere_in_the_probe_leaves_nothing_on_macos(tmp_path, fresh, m
 		got.extend(map(lambda _: hpcp._held_route() or True, (None,)))
 	stopped = stop_alarms(handler, call, 2000)
 	assert stopped and os.listdir(probes) == [], (len(stopped), os.listdir(probes)[:10])
+
+
+@pytest.mark.macos988
+def test_every_destination_takes_the_copy_check_by_directory_on_macos(tmp_path):
+	# C1: macOS has no mount table to read, so 9.87 took every destination for a local one (by path), NFS, SMB and AFP too.
+	assert hpcp._on_network_fs([str(tmp_path)]) is True
+

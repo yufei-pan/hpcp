@@ -12368,7 +12368,12 @@ _NETWORK_FS = frozenset(('nfs', 'nfs4', 'lustre', 'gpfs', 'cifs', 'smb3', 'ceph'
 
 def _on_network_fs(paths):
 	"""True when one of paths (the destinations) is on a _NETWORK_FS: one stat a destination, its type from the mount table
-	(_mount_type, Linux; elsewhere never, and a destination that cannot be stat'ed is not)."""
+	(_mount_type, Linux; on the BSDs never, and a destination that cannot be stat'ed is not). On macOS always."""
+	if sys.platform == 'darwin':
+		# macOS has no mount table to read (_mount_type): every destination takes the check by directory. On a local disk the
+		# opens cost 10 to 25 % of a check that takes 0.33 s per 100,000 landings (9.87's measures on Linux: _NETWORK_FS's
+		# comment and its final review), 0.03 to 0.08 s; on NFS, SMB or AFP they save a round trip for each part of each path.
+		return True
 	for path in paths:
 		try:
 			if _mount_type(os.stat(path).st_dev) in _NETWORK_FS:
