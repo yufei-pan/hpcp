@@ -379,12 +379,6 @@ def test_a_stop_anywhere_in_the_probe_leaves_nothing_on_macos(tmp_path, fresh, m
 
 
 @pytest.mark.macos988
-def test_every_destination_takes_the_copy_check_by_directory_on_macos(tmp_path):
-	# C1: macOS has no mount table to read, so 9.87 took every destination for a local one (by path), NFS, SMB and AFP too.
-	assert hpcp._on_network_fs([str(tmp_path)]) is True
-
-
-@pytest.mark.macos988
 def test_a_link_swapped_at_an_identical_fifo_gets_no_owner_or_mode(root, fresh, monkeypatch):
 	# N1: _settle_identical sets an identical FIFO's metadata by name (no descriptor for a node off Linux's /proc): a link put
 	# at the name after its look took the source's mode (9.87's chmod followed it). lchmod and lchown now change the link.

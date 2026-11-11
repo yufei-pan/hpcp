@@ -436,7 +436,7 @@ def test_the_second_pass_stats_only_the_entries_met_twice(tmp_path, reset_hpcp_g
 	looked = []
 	real = os.lstat
 	def counted(path, *args, **kwargs):
-		# by path, or by name relative to its directory (the route on a network filesystem, and on macOS: 9.88)
+		# by path, or by name relative to its directory (the route on a network filesystem)
 		if kwargs.get('dir_fd') is not None or str(path).startswith(str(out) + os.sep):
 			looked.append(path)
 		return real(path, *args, **kwargs)
@@ -494,10 +494,8 @@ def test_the_copy_check_goes_by_directory_only_on_a_network_filesystem(tmp_path,
 	monkeypatch.setattr(hpcp.os, 'lstat', counted)
 	not_held = hpcp._not_held(entries, [str(src) + os.sep], [str(out) + os.sep], max_workers=1, move=True)
 	monkeypatch.setattr(hpcp.os, 'lstat', real)
-	# 9.88: on macOS every destination takes the check by directory, its type never asked (no mount table there)
-	darwin = sys.platform == 'darwin'
-	assert not_held == {} and len(asked) == (0 if darwin else 1)
-	if darwin or kind in hpcp._NETWORK_FS:
+	assert not_held == {} and len(asked) == 1
+	if kind in hpcp._NETWORK_FS:
 		assert (len(relative), by_name) == (15, [])
 	else:
 		assert (relative, len(by_name)) == ([], 15)
