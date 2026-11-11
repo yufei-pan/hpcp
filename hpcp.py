@@ -4261,12 +4261,16 @@ def _held_route():
 		return None
 	source = None
 	try:
-		# The first call makes and removes a test file in the directory it tries (CPython: 8 characters, 4 bytes), which a stop in
-		# between leaves (14 of 9,900 early stops of the final review's probe; 9.86 made no file): it is only recorded while
-		# the call runs (_MAKING, as for the file _cp_made makes) and raised after it.
+		# gettempdir's first call makes and removes a test file in the directory it tries (CPython: 8 characters, 4 bytes): a
+		# stop in between left it (14 of 9,900 early stops of the final review's probe; 9.86 made no file). TemporaryFile, where
+		# it cannot make a file without a name (macOS; a kernel or TMPDIR without O_TMPFILE), makes mkstemp's tmp* file and
+		# unlinks it: a stop in between left it (4 % of stops in the probe's first 0.5 ms); and on Python 3.6 to 3.9 a stop as
+		# it returns closed the file twice, so it raised EBADF in place of the stop, taken below for no route (1 % of them).
+		# A stop is only recorded while they run (_MAKING, as for the file _cp_made makes), and raised after them.
 		_MAKING = True
 		try:
 			directory = tempfile.gettempdir()
+			held = tempfile.TemporaryFile()
 		finally:
 			_MAKING = False
 			if _STOPPED_PID == os.getpid():
@@ -4279,7 +4283,7 @@ def _held_route():
 			os.write(handle, b'c')
 		finally:
 			os.close(handle)
-		with tempfile.TemporaryFile() as held:
+		with held:
 			fd = held.fileno()
 			os.write(fd, b'ab')
 			os.lseek(fd, 0, os.SEEK_SET)  # as a landing's fresh descriptor: macOS's /dev/fd/N shares its offset
@@ -4409,7 +4413,11 @@ def _cp_made(command, src_path, target, src_st, space):
 						by_name = True
 				if by_name:
 					_drop_made(target, made)
-					os.close(fd)
+					made = None
+					# marked closed before the close: a stop raised as it returns would have the handler below close it again,
+					# whose EBADF took the stop's place (a false Copy failed, the stop left to the task's end)
+					fd, closing = None, fd
+					os.close(closing)
 					return None
 		narrow = not made.st_mode & stat.S_IWUSR
 		if narrow:

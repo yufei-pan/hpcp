@@ -479,6 +479,43 @@ def test_a_root_first_copy_of_another_group_s_file_into_a_default_acl_directory_
 
 @linux_only
 @root_only
+def test_a_stop_as_a_by_name_first_copy_s_made_file_is_closed_is_a_stop(tmp_path, fresh, monkeypatch):
+	# Where cp makes the file by name (a default-ACL directory, another user's file), hpcp drops the file it made and closes it.
+	# A stop whose handler raised as that close returned had the failure handler close it again: EBADF took the stop's place,
+	# a false Copy failed, and the worker went on to its task's end (4 % of stops landing in _cp_made, 3.6 and 3.14).
+	import signal
+	_held_or_skip()
+	out = tmp_path / 'out'
+	out.mkdir()
+	if not _default_acl(str(out)):
+		pytest.skip('no POSIX ACLs here')
+	src = write(tmp_path / 'src/f', 'another user\'s')
+	os.chown(src, 1234, 1234)
+	target = str(out / 'f')
+	_as_the_main_process(monkeypatch)
+	made = []
+	real_open, real_close = os.open, os.close
+	def opened(path, flags, *args, **kwargs):
+		fd = real_open(path, flags, *args, **kwargs)
+		if path == target:
+			made.append(fd)
+		return fd
+	def closed(fd):
+		real_close(fd)
+		if made and fd == made[0]:
+			del made[:]
+			hpcp._stop(signal.SIGINT, None)
+	monkeypatch.setattr(os, 'open', opened)
+	monkeypatch.setattr(os, 'close', closed)
+	with pytest.raises(KeyboardInterrupt):
+		hpcp._cp_made(['cp', '-af'], src, target, None, None)
+	monkeypatch.setattr(os, 'open', real_open)
+	monkeypatch.setattr(os, 'close', real_close)
+	assert not os.path.lexists(target)
+
+
+@linux_only
+@root_only
 @pytest.mark.parametrize('content_only', [False, True], ids=['plain', 'content-only'])
 def test_a_first_copy_s_selinux_label_is_cp_by_name_s(tmp_path, fresh, monkeypatch, content_only):
 	# Plain: hpcp gives the new, empty file the source's label before cp writes it (cp -a sets an existing file's label by
@@ -717,6 +754,38 @@ def test_a_stop_as_tempfile_makes_its_test_file_leaves_nothing(tmp_path, fresh, 
 	def stopped(path, flags, *args, **kwargs):
 		fd = real(path, flags, *args, **kwargs)
 		if os.path.dirname(str(path)) == str(directory) and flags & os.O_CREAT:
+			try:
+				hpcp._stop(signal.SIGINT, None)
+			except BaseException:
+				os.close(fd)  # the descriptor a raise here loses
+				raise
+		return fd
+	monkeypatch.setattr(os, 'open', stopped)
+	with pytest.raises(KeyboardInterrupt):
+		hpcp._held_route()
+	monkeypatch.setattr(os, 'open', real)
+	assert os.listdir(str(directory)) == [] and not hpcp._MAKING
+
+
+@linux_only
+def test_a_stop_as_tempfile_makes_the_held_file_leaves_nothing(tmp_path, fresh, monkeypatch):
+	# The probe's held file is tempfile.TemporaryFile's. Where it cannot make a file without a name (macOS always; a kernel or
+	# TMPDIR without O_TMPFILE), it makes mkstemp's tmp* file and unlinks it before it returns: a stop whose handler raised as
+	# that create returned left the file in TMPDIR, empty (9.86 made none). The stop is recorded there, and raised after.
+	import signal
+	_gnu_cp_or_skip()
+	directory = tmp_path / 'tmp'
+	directory.mkdir()
+	monkeypatch.setenv('TMPDIR', str(directory))
+	monkeypatch.setattr(tempfile, 'tempdir', None)
+	monkeypatch.setattr(tempfile, '_O_TMPFILE_WORKS', False, raising=False)  # as on macOS
+	_as_the_main_process(monkeypatch)
+	real = os.open
+	def stopped(path, flags, *args, **kwargs):
+		fd = real(path, flags, *args, **kwargs)
+		name = os.path.basename(str(path))
+		# mkstemp's name (tmp and 8 characters), not gettempdir's test file (8 characters) or the probe's source
+		if os.path.dirname(str(path)) == str(directory) and name.startswith('tmp') and len(name) == 11:
 			try:
 				hpcp._stop(signal.SIGINT, None)
 			except BaseException:
