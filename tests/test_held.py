@@ -13,6 +13,8 @@ import struct
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 
 import pytest
 
@@ -1850,3 +1852,154 @@ def test_f6_a_door_error_at_the_first_look_of_a_link_leaves_the_old_link_found_b
 	with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
 		hpcp.create_sym_links({str(tmp_path / 'src-link'): [os.path.join(out, 'l')]})
 	assert len(calls) >= 2 and os.readlink(os.path.join(out, 'l')) == 'new-target' and not hpcp.ERRORS, (calls, hpcp.ERRORS)
+
+
+# ---- 9.88 final review (N1, N2, N6): what was worse than 9.87, closed by taking the state out ----
+
+@posix_only
+@pytest.mark.parametrize('second, move', [('out/', False), ('out/', True), ('outlink/', False)], ids=['again', 'again-move', 'spelled-otherwise'])
+def test_n1_a_stale_link_at_a_links_landing_under_a_destination_given_twice(tmp_path, second, move):
+	# N1: create_sym_links took each landing's look once for all its entries and removed the old link once for each entry
+	# whose look was a link, so the second entry for one landing (-d out/ -d out/, or -d out/ -d outlink/ with outlink a link to
+	# out) met ENOENT: exit 213 (a move: 212) and the landing's link gone. 9.87 asked islink afresh for each entry.
+	write(tmp_path / 'src' / 'a' / 'f', 'x')
+	os.symlink('f', str(tmp_path / 'src' / 'a' / 'l'))
+	os.makedirs(str(tmp_path / 'out' / 'a'))
+	landing = str(tmp_path / 'out' / 'a' / 'l')
+	os.symlink('old-target', landing)
+	os.symlink('out', str(tmp_path / 'outlink'))
+	command = [sys.executable, HPCP, 'src/', '-d', 'out/', '-d', second] + (['-rf'] if move else [])
+	for run in range(1 if move else 2):
+		task = subprocess.run(command, cwd=str(tmp_path), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=300)
+		output = task.stdout.decode(errors='replace')
+		assert task.returncode == 0 and 'Errno' not in output, (run, task.returncode, output[-2000:])
+		assert os.readlink(landing) == 'f', run
+		if not move:
+			os.remove(landing)  # a rerun over another stale link
+			os.symlink('old-target', landing)
+	if move:
+		assert not os.path.lexists(str(tmp_path / 'src' / 'a' / 'l')) and not os.path.lexists(str(tmp_path / 'src' / 'a' / 'f'))
+
+
+_LEASE_HOLDER = '''
+import fcntl, os, signal, sys, time
+path, marker, hold = sys.argv[1], sys.argv[2], float(sys.argv[3])
+fd = os.open(path, os.O_RDWR)
+broken = []
+signal.signal(signal.SIGIO, lambda *args: broken.append(1))
+try:
+	fcntl.fcntl(fd, fcntl.F_SETLEASE, fcntl.F_WRLCK)
+except OSError as e:
+	print('refused %d' % e.errno, flush=True)  # not the file's owner (no CAP_LEASE), a filesystem without leases
+	sys.exit(0)
+print('leased', flush=True)
+while not broken:
+	time.sleep(0.01)
+open(marker, 'w').close()  # someone opened the file: the break signal came
+time.sleep(hold)
+fcntl.fcntl(fd, fcntl.F_SETLEASE, fcntl.F_UNLCK)
+'''
+
+
+@linux_only
+def test_n2_a_landing_under_a_write_lease_is_waited_for_and_kept(tmp_path):
+	# N2: the skip check read a landing with O_NONBLOCK, so a write lease on it (Samba's kernel oplocks, an NFS server's write
+	# delegation, any program's fcntl lease) made the open fail with EAGAIN at once: "Copy process crashed ... Resource
+	# temporarily unavailable", exit 191, where 9.87's plain open waited for the lease to be given up and the run ended 0 with
+	# the inode kept. Not the EAGAIN made a "not known": the copy would go beside an identical file, a new inode under whoever holds it.
+	fcntl = pytest.importorskip('fcntl')
+	if not hasattr(fcntl, 'F_SETLEASE'):
+		pytest.skip('no fcntl leases here')
+	write(tmp_path / 'src' / 'f', 'same content')
+	command = [sys.executable, HPCP, 'src/', '-d', 'out/', '-s']
+	first = subprocess.run(command, cwd=str(tmp_path), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=300)
+	assert first.returncode == 0, first.stdout
+	landing, marker = str(tmp_path / 'out' / 'f'), str(tmp_path / 'broken')
+	hold = 1.5  # how long the holder takes to let go once told (the kernel's own limit, fs.lease-break-time, is 45 s)
+	holder = subprocess.Popen([sys.executable, '-c', _LEASE_HOLDER, landing, marker, str(hold)], stdout=subprocess.PIPE, universal_newlines=True)
+	try:
+		said = holder.stdout.readline().strip()
+		if said != 'leased':
+			pytest.skip('the kernel gives this user no lease here: %s' % said)
+		inode = os.stat(landing).st_ino
+		started = time.monotonic()
+		task = subprocess.run(command, cwd=str(tmp_path), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=300)
+		waited = time.monotonic() - started
+		output = task.stdout.decode(errors='replace')
+		assert task.returncode == 0 and 'crashed' not in output and 'Errno' not in output, (task.returncode, output[-2000:])
+		assert os.path.exists(marker), 'the run never opened the landing: nothing was tested'
+		assert waited >= hold * 0.9, waited  # it waited for the lease to go
+		assert os.stat(landing).st_ino == inode and read(landing) == 'same content'  # not copied beside and renamed over it
+	finally:
+		holder.kill()
+		holder.wait()
+		holder.stdout.close()
+
+
+@posix_only
+def test_n2_a_fifo_put_at_the_landing_since_the_look_is_waited_on_as_in_9_87(tmp_path, reset_hpcp_globals):
+	# N2's flag also made a FIFO swapped in between the look and the skip check's read open at once and fail on the read
+	# (exit 191, "not seekable"); 9.87's plain open waited for a writer, and so does this. Released here by a writer that
+	# closes at once, so the test ends; what the read then makes of an empty FIFO is not the point, that the open waited is.
+	write(tmp_path / 'src', 'same')
+	write(tmp_path / 'out' / 'x', 'same')
+	for path in (tmp_path / 'src', tmp_path / 'out' / 'x'):
+		os.utime(str(path), ns=(1_000_000_000, 1_000_000_000))  # the times agree, so the check reads the landing
+	src_st, dest_st = os.stat(str(tmp_path / 'src')), os.stat(str(tmp_path / 'out' / 'x'))
+	fifo = str(tmp_path / 'out' / 'x')
+	os.unlink(fifo)
+	os.mkfifo(fifo)
+	base = os.open(str(tmp_path / 'out'), os.O_RDONLY)
+	answers = []
+	def check():
+		try:
+			answers.append(hpcp._known_identical(str(tmp_path / 'src'), fifo, src_st.st_size, False, src_st=src_st, dest_st=dest_st, base=base))
+		except BaseException as e:  # what the read of an empty FIFO makes of it
+			answers.append(e)
+	thread = threading.Thread(target=check, daemon=True)
+	thread.start()
+	try:
+		thread.join(1.0)
+		waiting = thread.is_alive()
+		assert waiting, ('the open did not wait for a writer: it answered', answers)
+	finally:
+		deadline = time.monotonic() + 10
+		while thread.is_alive() and time.monotonic() < deadline:
+			try:
+				os.close(os.open(fifo, os.O_WRONLY | os.O_NONBLOCK))  # a writer: ENXIO until the reader's open is in
+			except OSError:
+				time.sleep(0.01)
+			thread.join(0.05)
+		thread.join(10)
+		os.close(base)
+	assert not thread.is_alive()
+
+
+@posix_only
+def test_n6_the_look_after_a_landing_changed_is_made_the_way_the_first_was(tmp_path, fresh, monkeypatch):
+	# N6: copy_file looked at a landing with two expressions: at first by the directory the door held, or by its path where the
+	# door had met a transient error; when the settling of an identical landing found it changed, the second look gave
+	# "nothing there" for a destination without a door answer (bases.get). Both looks are one function now.
+	write(tmp_path / 'src', 'same')
+	write(tmp_path / 'out' / 'f', 'same')
+	for path in (tmp_path / 'src', tmp_path / 'out' / 'f'):
+		os.utime(str(path), ns=(1_000_000_000, 1_000_000_000))
+	out = str(tmp_path / 'out')
+	_w1_run(monkeypatch, out)
+	_door_fails_once(monkeypatch)
+	real_settle, said_changed = hpcp._settle_identical, []
+	def changed_once(*args, **kwargs):
+		if not said_changed:
+			said_changed.append(True)
+			return False  # the landing is not the file looked at any more
+		return real_settle(*args, **kwargs)
+	monkeypatch.setattr(hpcp, '_settle_identical', changed_once)
+	real_landing, bases_given = hpcp._landing_of, []
+	def landing(dest_path, base):
+		bases_given.append(base)
+		return real_landing(dest_path, base)
+	monkeypatch.setattr(hpcp, '_landing_of', landing)
+	with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+		hpcp.copy_file(str(tmp_path / 'src'), [os.path.join(out, 'f')])
+	assert said_changed and len(bases_given) >= 2
+	assert bases_given[0] == out and bases_given[1] == out, bases_given[:2]  # its directory's path both times, never None (nothing there)

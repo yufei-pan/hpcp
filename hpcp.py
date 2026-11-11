@@ -3083,14 +3083,20 @@ def create_sym_links(symLinks,exclude=None,link_tracking=False,link_dirs=None):
 					return os.lstat(*_at(where(d), os.path.basename(d)), **_fd_of(where(d)))
 				except OSError:
 					return None
-			looks = {d: look(d) for d in dests}
-			# The link is already there: it is its own copy.
-			dests = [d for d in dests if not (looks[d] is not None and stat.S_ISLNK(looks[d].st_mode) and os.path.samestat(source_stat, looks[d]))]
+			# Each entry is looked at when its turn comes, none kept across a removal (a destination given twice, or two spellings of
+			# one directory, is one landing under two entries: the second meets what the first left): the link already there is its
+			# own copy; another link there goes.
+			kept = []
+			for d in dests:
+				st = look(d)
+				if st is not None and stat.S_ISLNK(st.st_mode):
+					if os.path.samestat(source_stat, st):
+						continue
+					os.remove(*_at(where(d), os.path.basename(d)), **_fd_of(where(d)))
+				kept.append(d)
+			dests = kept
 			if not dests:
 				continue
-			for d in dests:
-				if looks[d] is not None and stat.S_ISLNK(looks[d].st_mode):
-					os.remove(*_at(where(d), os.path.basename(d)), **_fd_of(where(d)))
 			# A real file or directory already at the link's path (in any dest: a file lives in one) keeps its place.
 			occupied = next(((d, st) for d, st in ((d, look(d)) for d in dests) if st is not None), None)
 			if occupied is not None:
@@ -5175,8 +5181,11 @@ def _remove_what_failed(base, name, before):
 		except OSError:
 			pass  # its directory will not let it go (0555, sticky, a bind mount): the copy's own error is the one to report
 
-# A landing opened to be read (the skip check): never through a link put there, never waiting on a FIFO.
-_LANDING_READ_FLAGS = os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NONBLOCK', 0) | getattr(os, 'O_CLOEXEC', 0)
+# A landing opened to be read (the skip check): never through a link put there. Not O_NONBLOCK, as 9.87's plain open: the open
+# waits for a write lease on the landing to be given up (Samba's kernel oplocks, an NFS server's write delegation), which with the
+# flag failed with EAGAIN and ended the run 191; a FIFO put there since the look is waited on too, where with the flag its read
+# failed ("not seekable", 191).
+_LANDING_READ_FLAGS = os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_CLOEXEC', 0)
 
 def _known_identical(src_path, dest_path, src_size, full_hash, src_st=None, dest_st=None, base=None):
 	"""is_file_identical, where a side that may not be read is not known to be the same: the copy then goes on, and a source
@@ -5202,7 +5211,7 @@ def _known_identical(src_path, dest_path, src_size, full_hash, src_st=None, dest
 		return False
 	except OSError as e:
 		if dest_open is not None and e.errno in (errno.ELOOP, errno.ENXIO, errno.ENOENT):
-			return False  # a link (O_NOFOLLOW) or a FIFO put at the landing since the look, or the landing gone: the copy looks again
+			return False  # a link (O_NOFOLLOW) or a socket put at the landing since the look, or the landing gone: the copy looks again
 		raise
 
 # The errors shutil.copystat's xattr copy ignores (3.6 to 3.14, together): a name the destination or the runner cannot have.
@@ -5382,7 +5391,9 @@ def _copy_file(src_path, dest_paths, full_hash, verbose, concurrent_processes, b
 			return 0, time.monotonic() - start_time, symLinks
 	# A directory the door could not answer for (a transient error: kept out of bases above) is looked at by its path, as 9.87 did:
 	# nothing there is only what the door found missing (None).
-	looks = {dest: _landing_of(dest, bases[dest] if dest in bases else os.path.dirname(_landing_path(dest)[0])) for dest in dest_paths}
+	def look_at(dest):
+		return _landing_of(dest, bases[dest] if dest in bases else os.path.dirname(_landing_path(dest)[0]))
+	looks = {dest: look_at(dest) for dest in dest_paths}
 	if not src_is_link:
 		# cp would put the file inside a directory at its place (dest/x/x), and a move would then lose the source. A link there
 		# is a name of the tree, replaced, unless the operator named it (_landing_of).
@@ -5415,7 +5426,7 @@ def _copy_file(src_path, dest_paths, full_hash, verbose, concurrent_processes, b
 					_copy_failed(src_path, f'Copy failed: ERROR copying {src_path} to {target}: it holds the source\'s content, but its owner, mode, times or xattrs cannot be set ({_why(e)})')
 					return 0, time.monotonic() - start_time, symLinks
 				if not settled:
-					looks[dest] = _landing_of(dest, bases.get(dest))
+					looks[dest] = look_at(dest)
 					continue
 				if SYNC_COPIES:
 					# A copy an earlier run left (or a plain copy before this move) may still be in memory.
