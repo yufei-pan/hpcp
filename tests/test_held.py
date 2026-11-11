@@ -1794,3 +1794,59 @@ def test_f5_a_landing_removed_between_the_look_and_the_skip_check_is_copied(tmp_
 	assert not hpcp.ERRORS and read(os.path.join(out, 'x')) == 'same', hpcp.ERRORS
 
 
+def _door_fails_once(monkeypatch):
+	'''The door's first answer is a transient error (the EAGAIN of its race bound, an ESTALE, an EIO), then it works.'''
+	real, calls = hpcp._dest_directory, []
+	def door(*args, **kwargs):
+		calls.append(args)
+		if len(calls) == 1:
+			raise OSError(errno.EAGAIN, os.strerror(errno.EAGAIN))
+		return real(*args, **kwargs)
+	monkeypatch.setattr(hpcp, '_dest_directory', door)
+	return calls
+
+
+@posix_only
+@pytest.mark.parametrize('what', ['directory', 'link'])
+def test_f6_a_door_error_at_the_first_look_leaves_the_landing_looked_at_by_its_path(tmp_path, fresh, monkeypatch, what):
+	# The Haiku lead on copy_file's first look: the door's transient error was kept as "nothing at the landing" (a directory
+	# missing), where 9.87 looked at the landing by its path whatever the door said. Where cp is given the name (no held-file
+	# route: BusyBox's cp, no /proc), the stale look let it copy INTO a directory at the landing (out/f/src) and write THROUGH a
+	# link there, to a file outside the destination (a link below the named destination is a name of the tree, replaced).
+	write(tmp_path / 'src', 'NEW content')
+	out = str(tmp_path / 'out')
+	os.makedirs(out)
+	if what == 'directory':
+		write(os.path.join(out, 'f', 'keep'), 'keep')
+	else:
+		write(tmp_path / 'victim', 'victim')
+		os.symlink(str(tmp_path / 'victim'), os.path.join(out, 'f'))
+	monkeypatch.setattr(hpcp, '_held_route', lambda: False)
+	_w1_run(monkeypatch, out)
+	calls = _door_fails_once(monkeypatch)
+	with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+		hpcp.copy_file(str(tmp_path / 'src'), [os.path.join(out, 'f')])
+	assert calls  # the transient error was met
+	if what == 'directory':
+		assert sorted(os.listdir(os.path.join(out, 'f'))) == ['keep'], os.listdir(os.path.join(out, 'f'))
+		assert any('is a directory' in error for error in hpcp.ERRORS), hpcp.ERRORS
+	else:
+		assert len(calls) >= 2  # asked again at the copy
+		assert read(tmp_path / 'victim') == 'victim' and not os.path.islink(os.path.join(out, 'f')) and read(os.path.join(out, 'f')) == 'NEW content'
+		assert not hpcp.ERRORS, hpcp.ERRORS
+
+
+@posix_only
+def test_f6_a_door_error_at_the_first_look_of_a_link_leaves_the_old_link_found_by_its_path(tmp_path, fresh, monkeypatch):
+	# create_sym_links: the same transient error kept the destination's directory as "nothing there" (and, kept as a refusal,
+	# failed the link), so an old link at the name was neither found nor removed, and the new one met EEXIST. 9.87 looked by
+	# the path and made the directory at the make.
+	os.symlink('new-target', str(tmp_path / 'src-link'))
+	out = str(tmp_path / 'out')
+	os.makedirs(out)
+	os.symlink('old-target', os.path.join(out, 'l'))
+	_w1_run(monkeypatch, out)
+	calls = _door_fails_once(monkeypatch)
+	with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+		hpcp.create_sym_links({str(tmp_path / 'src-link'): [os.path.join(out, 'l')]})
+	assert len(calls) >= 2 and os.readlink(os.path.join(out, 'l')) == 'new-target' and not hpcp.ERRORS, (calls, hpcp.ERRORS)

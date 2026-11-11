@@ -3061,14 +3061,20 @@ def create_sym_links(symLinks,exclude=None,link_tracking=False,link_dirs=None):
 					continue  # a destination given twice is asked once (copy_file)
 				try:
 					bases[d] = _dest_directory(os.path.dirname(d), make=False, source=os.path.dirname(os.path.abspath(src)))
-				except (_Refused, OSError) as e:
+				except _Refused as e:
 					refusals[d] = e
+				except OSError:
+					pass  # a transient error is no missing directory: asked again where the link is made, looked at by its path meanwhile (9.87)
+			def where(d):
+				"""The directory d is looked at, and an old link there removed, in: the door's result, or its path where the door
+				could not answer."""
+				return bases[d] if d in bases else os.path.dirname(d)
 			def look(d):
 				"""What is at d now, by its name in what the door holds (lstat); None for nothing there."""
-				if bases.get(d) is None:
+				if d in refusals or (d in bases and bases[d] is None):
 					return None
 				try:
-					return os.lstat(*_at(bases[d], os.path.basename(d)), **_fd_of(bases[d]))
+					return os.lstat(*_at(where(d), os.path.basename(d)), **_fd_of(where(d)))
 				except OSError:
 					return None
 			looks = {d: look(d) for d in dests}
@@ -3078,7 +3084,7 @@ def create_sym_links(symLinks,exclude=None,link_tracking=False,link_dirs=None):
 				continue
 			for d in dests:
 				if looks[d] is not None and stat.S_ISLNK(looks[d].st_mode):
-					os.remove(*_at(bases[d], os.path.basename(d)), **_fd_of(bases[d]))
+					os.remove(*_at(where(d), os.path.basename(d)), **_fd_of(where(d)))
 			# A real file or directory already at the link's path (in any dest: a file lives in one) keeps its place.
 			occupied = next(((d, st) for d, st in ((d, look(d)) for d in dests) if st is not None), None)
 			if occupied is not None:
@@ -5368,7 +5374,9 @@ def _copy_file(src_path, dest_paths, full_hash, verbose, concurrent_processes, b
 			for refusal in refused.values():
 				_copy_failed(src_path, refusal.text(src_path), refusal.said)
 			return 0, time.monotonic() - start_time, symLinks
-	looks = {dest: _landing_of(dest, bases.get(dest)) for dest in dest_paths}
+	# A directory the door could not answer for (a transient error: kept out of bases above) is looked at by its path, as 9.87 did:
+	# nothing there is only what the door found missing (None).
+	looks = {dest: _landing_of(dest, bases[dest] if dest in bases else os.path.dirname(_landing_path(dest)[0])) for dest in dest_paths}
 	if not src_is_link:
 		# cp would put the file inside a directory at its place (dest/x/x), and a move would then lose the source. A link there
 		# is a name of the tree, replaced, unless the operator named it (_landing_of).
