@@ -911,3 +911,26 @@ def test_a_run_with_workers_makes_one_probe(tmp_path):
 		pytest.skip('cp cannot write a held file here')
 	pids = read(log).split() if os.path.exists(log) else []
 	assert len(pids) == 1, (pids, done.stdout)
+
+
+# ---- W1 (9.88): the door holds the directories on the way to a landing by descriptor, from the named destination down
+
+def test_a_job_s_files_are_copied_in_path_order(tmp_path, reset_hpcp_globals, monkeypatch):
+	# Each directory's subtree is one run of a job's files (the paths below it share its path and a separator), so a
+	# worker's consecutive landings share their directories and the door enters each once. 9.87 took the listing's set
+	# order.
+	names = ['b/x', 'a.x/q', 'a/b/g', 'a/f', 'a/z', 'a/b/c/d', 'a/b.c/h', 'a-1/y', 'c']
+	for name in names:
+		write(tmp_path / 'src' / name, name)
+	src = str(tmp_path / 'src')
+	files = frozenset(os.path.join(src, name) for name in names)
+	assert [f for _, _, f in hpcp.get_copy_file_job_iter([(src, [str(tmp_path / 'out')], files)])] == sorted(files)
+	seen = []
+	monkeypatch.setattr(hpcp, 'copy_file', lambda src_path, dests, **kwargs: seen.append(src_path) or (0, 0, {}))
+	with contextlib.redirect_stdout(io.StringIO()):
+		hpcp.copy_files_serial_batch([(src + '/', [str(tmp_path / 'out') + '/'])])
+	assert seen == sorted(files)
+	# each directory's subtree is one run: the door enters it once
+	for directory in {os.path.dirname(path) for path in seen}:
+		inside = [index for index, path in enumerate(seen) if path.startswith(directory + os.sep)]
+		assert inside == list(range(inside[0], inside[-1] + 1)), (directory, seen)
