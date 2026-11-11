@@ -50,7 +50,7 @@ Nothing needs doing to upgrade, except in a program that calls `sync_directories
 - **Planned for 9.88: a move's `-d` path of new directories (`-d new1/new2/` with `new1` missing) does not fsync the parent of `new1`;** a power cut soon after the move can lose that name on vfat, with the sources gone (see [docs/limitations.md](docs/limitations.md)).
 - **Planned for 9.88: a move of another user's directory of mode 0607 (no search for its owner) holding a subdirectory copies it, then prints `Copy failed: the directory ... cannot be written to disk (Permission denied)` and exits 212;** every source is kept (see [docs/limitations.md](docs/limitations.md)).
 - **Planned for 9.88: merged sources set a shared directory's times twice per run, and every rerun on a filesystem with coarse times (vfat, exFAT, HFS+) sets them again,** so a directory's ctime moves each run (see [docs/limitations.md](docs/limitations.md)).
-- **Planned for 9.88: a Ctrl-C in the first tenth of a second, while Python imports hpcp, is sometimes dropped:** the run goes on and exits 0, and with `-rf` it moves; 9.86 does the same (see [docs/limitations.md](docs/limitations.md)).
+- **Planned for 9.88: a Ctrl-C in the first tenth of a second, while Python imports hpcp, is sometimes dropped:** the run goes on and exits 0, and with `-rf` it moves; 9.86 does the same. On Python 3.7 with `forkserver` or `spawn` a Ctrl-C in a child's own start-up can also print a traceback from Python's own code (exit 130 still; in 200 early Ctrl-Cs on 3.7, `forkserver` 13 runs for 9.87 against 45 for 9.86, `spawn` 28 against 187) (see [docs/limitations.md](docs/limitations.md)).
 
 ## Upgrading to 9.86 from 9.85
 
