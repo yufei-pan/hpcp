@@ -5189,8 +5189,8 @@ def _known_identical(src_path, dest_path, src_size, full_hash, src_st=None, dest
 	except PermissionError:
 		return False
 	except OSError as e:
-		if dest_open is not None and e.errno in (errno.ELOOP, errno.ENXIO):
-			return False  # a link (O_NOFOLLOW) or a FIFO put at the landing since the look: the copy looks at it again
+		if dest_open is not None and e.errno in (errno.ELOOP, errno.ENXIO, errno.ENOENT):
+			return False  # a link (O_NOFOLLOW) or a FIFO put at the landing since the look, or the landing gone: the copy looks again
 		raise
 
 # The errors shutil.copystat's xattr copy ignores (3.6 to 3.14, together): a name the destination or the runner cannot have.

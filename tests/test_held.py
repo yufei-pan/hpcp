@@ -1755,3 +1755,42 @@ def test_f4_a_directory_sync_error_names_the_directory_not_its_descriptor(tmp_pa
 	assert rc != 0 and wanted in errors.getvalue() and '/proc/self/fd' not in errors.getvalue(), (rc, errors.getvalue())
 
 
+@posix_only
+def test_f5_a_landing_gone_since_the_look_is_not_known_to_be_the_same(tmp_path, reset_hpcp_globals):
+	# F5: the skip check's docstring says a gone landing is not known to be the same, but the open's ENOENT raised (as in
+	# 9.87): "Copy process crashed". The copy goes on and looks again.
+	write(tmp_path / 'src', 'same')
+	write(tmp_path / 'out' / 'x', 'same')
+	os.utime(str(tmp_path / 'out' / 'x'), ns=(1_000_000_000, 1_000_000_000))  # the times agree, so the check reads the landing
+	os.utime(str(tmp_path / 'src'), ns=(1_000_000_000, 1_000_000_000))
+	src_st, dest_st = os.stat(str(tmp_path / 'src')), os.stat(str(tmp_path / 'out' / 'x'))
+	base = os.open(str(tmp_path / 'out'), os.O_RDONLY)
+	try:
+		os.unlink(str(tmp_path / 'out' / 'x'))
+		assert hpcp._known_identical(str(tmp_path / 'src'), str(tmp_path / 'out' / 'x'), src_st.st_size, False, src_st=src_st,
+			dest_st=dest_st, base=base) is False
+	finally:
+		os.close(base)
+
+
+@posix_only
+def test_f5_a_landing_removed_between_the_look_and_the_skip_check_is_copied(tmp_path, reset_hpcp_globals, monkeypatch):
+	# F5 end to end: the landing is removed after copy_file looked at it, before the skip check reads it. The copy goes ahead
+	# (9.87: "Copy process crashed: Fatal Error copying ... No such file or directory", a failed copy).
+	write(tmp_path / 'src' / 'x', 'same')
+	write(tmp_path / 'out' / 'x', 'same')
+	for path in (tmp_path / 'src' / 'x', tmp_path / 'out' / 'x'):
+		os.utime(str(path), ns=(1_000_000_000, 1_000_000_000))  # the times agree, so the check reads the landing
+	real = hpcp._known_identical
+	def gone(src_path, dest_path, *args, **kwargs):
+		if os.path.exists(dest_path):
+			os.unlink(dest_path)
+		return real(src_path, dest_path, *args, **kwargs)
+	monkeypatch.setattr(hpcp, '_known_identical', gone)
+	out = str(tmp_path / 'out')
+	_w1_run(monkeypatch, out)
+	with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+		hpcp.copy_file(str(tmp_path / 'src' / 'x'), [os.path.join(out, 'x')])
+	assert not hpcp.ERRORS and read(os.path.join(out, 'x')) == 'same', hpcp.ERRORS
+
+
