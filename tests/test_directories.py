@@ -612,13 +612,13 @@ def test_a_failed_fsync_removes_only_the_landing_it_wrote(tmp_path, monkeypatch,
 	(tmp_path / 'src').mkdir()
 	(tmp_path / 'src' / 'f').write_text('source')
 	real = hpcp._fsync_file
-	def fsync_file(path):
+	def fsync_file(path, *args):
 		if os.path.basename(path) == 'f' and os.path.isfile(path):
 			os.rename(path, path + '.away')
 			with open(path, 'w') as other:
 				other.write('someone else')
 			raise OSError(errno.EIO, os.strerror(errno.EIO))
-		return real(path)
+		return real(path, *args)
 	monkeypatch.setattr(hpcp, '_fsync_file', fsync_file)
 	rc = hpcp.hpcp([str(tmp_path / 'src') + os.sep], dest_paths=[str(tmp_path / 'out') + os.sep], single_thread=True,
 		max_workers=1, remove=True, remove_force=True)

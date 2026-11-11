@@ -65,8 +65,13 @@ def _copy_file(monkeypatch, src, dest):
 
 
 def _named(target):
-	'''What cp's destination argument leads to: the held file's name for /proc/self/fd/N, else itself. Asked while cp runs.'''
-	return os.readlink(target) if target.startswith(_HELD_PREFIX) else target
+	'''What cp's destination argument leads to: the held file's name for /proc/self/fd/N, the landing below the held
+	directory for /proc/self/fd/D/NAME (9.88), else itself. Asked while cp runs.'''
+	if not target.startswith(_HELD_PREFIX):
+		return target
+	number, _, name = target[len(_HELD_PREFIX):].partition('/')
+	held = os.readlink(_HELD_PREFIX + number)
+	return os.path.join(held, name) if name else held
 
 
 def _record_cp(monkeypatch, after=None):
@@ -255,7 +260,8 @@ def test_a_first_copy_whose_name_keeps_being_taken_fails_after_three_looks(tmp_p
 	creates = []
 	real = os.open
 	def taken(path, flags, *args, **kwargs):
-		if path == landing and flags & os.O_EXCL:
+		# by its path, or (9.88) by its name relative to the directory the door holds
+		if path in (landing, 'x') and flags & os.O_EXCL:
 			creates.append(path)
 			raise FileExistsError(errno.EEXIST, 'File exists', path)
 		return real(path, flags, *args, **kwargs)
@@ -934,3 +940,145 @@ def test_a_job_s_files_are_copied_in_path_order(tmp_path, reset_hpcp_globals, mo
 	for directory in {os.path.dirname(path) for path in seen}:
 		inside = [index for index, path in enumerate(seen) if path.startswith(directory + os.sep)]
 		assert inside == list(range(inside[0], inside[-1] + 1)), (directory, seen)
+
+
+class _Victim:
+	'''A root-owned directory a run must never write: its names, contents, modes, owners, times and xattrs, as taken now.'''
+
+	def __init__(self, path, names=('x', 'y')):
+		self.path = str(path)
+		os.makedirs(self.path)
+		for name in names:
+			write(os.path.join(self.path, name), 'victim ' + name, 0o600)
+			with contextlib.suppress(OSError):
+				os.setxattr(os.path.join(self.path, name), 'user.keep', b'1')
+		os.symlink('x', os.path.join(self.path, 'link'))
+		self.before = self.state()
+
+	def state(self):
+		found = {}
+		for name in sorted(os.listdir(self.path)):
+			path = os.path.join(self.path, name)
+			st = os.lstat(path)
+			xattrs = None
+			with contextlib.suppress(OSError, AttributeError):
+				xattrs = sorted((key, os.getxattr(path, key, follow_symlinks=False)) for key in os.listxattr(path, follow_symlinks=False))
+			found[name] = (st.st_mode, st.st_uid, st.st_gid, st.st_mtime_ns, st.st_ino, xattrs,
+				os.readlink(path) if stat.S_ISLNK(st.st_mode) else read(path) if stat.S_ISREG(st.st_mode) else None)
+		st = os.lstat(self.path)
+		return found, (st.st_mode, st.st_uid, st.st_gid, st.st_mtime_ns)
+
+	def untouched(self):
+		return self.state() == self.before
+
+
+def _swap_for_link(directory, target):
+	'''A user who can write directory's parent swaps directory for a link to target; the directory moves to .away, whole.'''
+	os.rename(directory, directory + '.away')
+	os.symlink(target, directory)
+
+
+def _w1_run(monkeypatch, out):
+	'''One run's settings: out named (-d), a run of its own (RUN_ID), its descriptors closed after the test.'''
+	monkeypatch.setattr(hpcp, 'NAMED_DESTS', frozenset([os.path.abspath(out)]))
+	monkeypatch.setattr(hpcp, 'RUN_ID', 'w1-%d' % next(_RUNS))
+
+
+def _swap_once_at(monkeypatch, name, directory, victim, when=lambda *args, **kwargs: True):
+	'''hpcp.<name> swaps directory for a link to victim the first time it is called (and when(...) says so), then runs.'''
+	real, done = getattr(hpcp, name), []
+	def swapping(*args, **kwargs):
+		if not done and when(*args, **kwargs):
+			done.append(True)
+			_swap_for_link(directory, victim)
+		return real(*args, **kwargs)
+	monkeypatch.setattr(hpcp, name, swapping)
+	return done
+
+
+@root_only
+@linux_only
+@pytest.mark.parametrize('case', ['first', 'rewrite', 'beside', 'node-by-cp'])
+def test_w1_a_directory_swapped_after_the_door_never_leads_the_copy_elsewhere(tmp_path, fresh, monkeypatch, case):
+	# W1 case 1: out/a, a directory on the way to the landing out/a/x (out is uid 1000's: a user who can write it), is swapped
+	# for a link to victim/ after the door looked at it and before the file is made, opened or given to cp. 9.87 made,
+	# opened, renamed and gave cp the landing by path, through the link: the victim's x got the content (or was replaced).
+	# 9.88 writes relative to the directory the door holds, now out/a.away. node-by-cp: a FIFO source, which cp -a makes by
+	# name (_cp_to), given the landing below the held directory where cp writes a held file (GNU cp, /proc).
+	_held_or_skip()
+	victim = _Victim(tmp_path / 'victim')
+	out = str(tmp_path / 'out')
+	os.makedirs(os.path.join(out, 'a'))
+	if case == 'node-by-cp':
+		os.makedirs(str(tmp_path / 'src/a'))
+		os.mkfifo(str(tmp_path / 'src/a/x'))
+		src = str(tmp_path / 'src/a/x')
+	else:
+		src = write(tmp_path / 'src/a/x', 'NEW-CONTENT')
+	if case in ('rewrite', 'beside'):
+		write(os.path.join(out, 'a/x'), 'old')
+	for path in (out, os.path.join(out, 'a')):
+		os.chown(path, 1000, 1000)
+	monkeypatch.setattr(hpcp, 'WRITE_BESIDE', case == 'beside')
+	_w1_run(monkeypatch, out)
+	done = _swap_once_at(monkeypatch, '_claim_device', os.path.join(out, 'a'), victim.path)
+	with contextlib.redirect_stdout(io.StringIO()):
+		hpcp.copy_file(src, [os.path.join(out, 'a/x')])
+	assert done and os.path.islink(os.path.join(out, 'a'))
+	assert victim.untouched(), (victim.before, victim.state())
+	held = os.path.join(out, 'a.away/x')
+	if case == 'node-by-cp':
+		assert stat.S_ISFIFO(os.lstat(held).st_mode) and not hpcp.ERRORS, hpcp.ERRORS
+	else:
+		assert read(held) == 'NEW-CONTENT' and not hpcp.ERRORS, hpcp.ERRORS
+
+
+@root_only
+@linux_only
+def test_w1_a_directory_swapped_between_two_files_never_leads_the_second_elsewhere(tmp_path, fresh, monkeypatch):
+	# W1 case 2: a run copies out/a/x, then out/a is swapped for a link to victim/, then it copies out/a/y. 9.87's door looked
+	# at out/a once a process (_DOORS) and wrote y by path, through the link. 9.88 holds out/a from the first file on.
+	victim = _Victim(tmp_path / 'victim')
+	out = str(tmp_path / 'out')
+	os.makedirs(os.path.join(out, 'a'))
+	for name in 'xy':
+		write(tmp_path / 'src/a' / name, 'NEW ' + name)
+	os.chown(out, 1000, 1000)
+	os.chown(os.path.join(out, 'a'), 1000, 1000)
+	_w1_run(monkeypatch, out)
+	with contextlib.redirect_stdout(io.StringIO()):
+		hpcp.copy_file(str(tmp_path / 'src/a/x'), [os.path.join(out, 'a/x')])
+		_swap_for_link(os.path.join(out, 'a'), victim.path)
+		hpcp.copy_file(str(tmp_path / 'src/a/y'), [os.path.join(out, 'a/y')])
+	assert victim.untouched(), (victim.before, victim.state())
+	assert read(os.path.join(out, 'a.away/x')) == 'NEW x' and read(os.path.join(out, 'a.away/y')) == 'NEW y'
+	assert not hpcp.ERRORS, hpcp.ERRORS
+
+
+@root_only
+@linux_only
+@pytest.mark.parametrize('when', ['settle', 'hash-read'])
+def test_w1_a_directory_swapped_at_an_identical_landing_never_leads_its_metadata_elsewhere(tmp_path, fresh, monkeypatch, when):
+	# W1 cases 6 and 7: out/a/x is identical to its source (contents, size, time) but has another mode and owner, so the skip
+	# sets them; out/a is swapped for a link to victim/ (whose x differs) before the skip check reads the landing (hash-read)
+	# or before it settles the metadata (settle). 9.87 read and settled by path: it took victim/x for the landing, and the
+	# copy that followed wrote it. 9.88 reads and settles the landing relative to the directory it holds.
+	victim = _Victim(tmp_path / 'victim')
+	out = str(tmp_path / 'out')
+	# the victim's x has the landing's size (8 bytes), so 9.87's read of it through the link hashed it, unlike the source
+	src = write(tmp_path / 'src/a/x', 'SAME-CON', 0o644)
+	landing = write(os.path.join(out, 'a/x'), 'SAME-CON', 0o600)
+	st = os.stat(src)
+	os.utime(landing, ns=(st.st_atime_ns, st.st_mtime_ns))
+	os.chown(landing, 1000, 1000)
+	os.chown(out, 1000, 1000)
+	os.chown(os.path.join(out, 'a'), 1000, 1000)
+	_w1_run(monkeypatch, out)
+	done = _swap_once_at(monkeypatch, '_settle_identical' if when == 'settle' else '_known_identical', os.path.join(out, 'a'), victim.path)
+	with contextlib.redirect_stdout(io.StringIO()):
+		hpcp.copy_file(src, [landing])
+	assert done and os.path.islink(os.path.join(out, 'a'))
+	assert victim.untouched(), (victim.before, victim.state())
+	held = os.lstat(os.path.join(out, 'a.away/x'))
+	assert read(os.path.join(out, 'a.away/x')) == 'SAME-CON' and stat.S_IMODE(held.st_mode) == 0o644
+	assert (held.st_uid, held.st_gid) == (st.st_uid, st.st_gid) and not hpcp.ERRORS, hpcp.ERRORS

@@ -753,16 +753,18 @@ def _allocated_size(st):
 		return st.st_blocks * 512
 	return st.st_size
 
-def get_file_size(path):
+def get_file_size(path, dir_fd=None):
 	"""
 	Get the on-disk (allocated) size of a file, falling back to the apparent size.
 	Use os.path.getsize() where the apparent size is needed, e.g. for content comparison.
+	dir_fd: path is a name relative to that directory's descriptor.
 	"""
+	how = {} if dir_fd is None else {'dir_fd': dir_fd}
 	try:
-		realSize = _allocated_size(os.stat(path,follow_symlinks=False))
+		realSize = _allocated_size(os.stat(path, follow_symlinks=False, **how))
 	except Exception:
 		try:
-			realSize = os.path.getsize(path)
+			realSize = os.stat(path, **how).st_size
 		except Exception:
 			realSize = 0
 	return realSize
@@ -3242,18 +3244,23 @@ def hash_file(path,size = ...,full_hash=False):
 		return ''
 	if size == ...:
 		size = os.path.getsize(path)
-	hasher = xxhash.xxh64() if xxhash_available else hashlib.blake2b()
 	with open(path, 'rb') as f:
-		if not full_hash:
-			# Only hash the last hash_size bytes
-			#f.seek(-min(1<<16,size), os.SEEK_END)
-			f.seek(-min(HASH_SIZE,size), os.SEEK_END)
-		for chunk in iter(lambda: f.read(4096), b''):
-			hasher.update(chunk)
+		return _hash_stream(f, size, full_hash)
+
+def _hash_stream(f, size, full_hash):
+	"""hash_file's hash of f, an open binary file of size bytes: its last HASH_SIZE bytes, or all of it (full_hash)."""
+	hasher = xxhash.xxh64() if xxhash_available else hashlib.blake2b()
+	if not full_hash:
+		# Only hash the last hash_size bytes
+		f.seek(-min(HASH_SIZE,size), os.SEEK_END)
+	for chunk in iter(lambda: f.read(4096), b''):
+		hasher.update(chunk)
 	return hasher.hexdigest()
 
-def is_file_identical(src_path, dest_path,src_size,full_hash=False,compare_metadata=False,src_st=None,dest_st=None):
-	"""src_st, dest_st: their stats, when the caller has them (copy_file's looks): nothing is stat'ed again."""
+def is_file_identical(src_path, dest_path,src_size,full_hash=False,compare_metadata=False,src_st=None,dest_st=None,dest_open=None):
+	"""src_st, dest_st: their stats, when the caller has them (copy_file's looks): nothing is stat'ed again. dest_open: a
+	callable that opens the destination as a binary file (copy_file's: relative to the directory the door holds), read
+	uncached; without it the destination is read by its path, through hash_file's cache, as the source always is."""
 	dst_size = dest_st.st_size if dest_st is not None else os.path.getsize(dest_path)
 	# try to find the mtime are different
 	if src_size != dst_size:
@@ -3270,9 +3277,10 @@ def is_file_identical(src_path, dest_path,src_size,full_hash=False,compare_metad
 	if not (stat.S_ISREG(src_st.st_mode) and stat.S_ISREG(dst_st.st_mode)):
 		return not floored and stat.S_IFMT(src_st.st_mode) == stat.S_IFMT(dst_st.st_mode) and src_st.st_rdev == dst_st.st_rdev
 	if floored:
-		if not _same_contents(src_path, dest_path):
+		if not _same_contents(src_path, dest_path, dest_open):
 			return False
-	elif hash_file(src_path,src_size,full_hash) != hash_file(dest_path,dst_size,full_hash):
+	elif hash_file(src_path,src_size,full_hash) != (hash_file(dest_path,dst_size,full_hash) if dest_open is None else
+			'' if HASH_SIZE <= 0 else _hash_opened(dest_open, dst_size, full_hash)):
 		return False
 	if compare_metadata:
 		src_st = os.lstat(src_path)
@@ -3284,6 +3292,12 @@ def is_file_identical(src_path, dest_path,src_size,full_hash=False,compare_metad
 		if src_xattr is not None and dst_xattr is not None and src_xattr != dst_xattr:
 			return False
 	return True
+
+def _hash_opened(opener, size, full_hash):
+	"""hash_file's hash of the file opener() opens: not cached, as what it opens is not named by a path (a key of
+	/proc/self/fd/D/NAME would come back for another directory once D is reused)."""
+	with opener() as f:
+		return _hash_stream(f, size, full_hash)
 
 def get_file_repr(filename,append_hash=False,full_hash=False):
 	if append_hash:
@@ -3901,13 +3915,17 @@ def _named_root(path):
 			found = root
 	return found
 
-def _landing_of(dest_path):
+def _landing_of(dest_path, base):
 	"""(where a copy to dest_path writes, its lstat or None, named). A destination the operator named (-d) is followed when it
 	is a link, as cp follows its destination argument (outside a run, every path counts as named); a landing below one is a
-	name of the tree and never followed: a link, FIFO, socket or device node there is replaced, never opened (_cp_once)."""
+	name of the tree and never followed: a link, FIFO, socket or device node there is replaced, never opened (_cp_once).
+	base: the door's result for the landing's directory (_dest_directory), which the landing is looked at relative to; None
+	where the door found that directory missing: nothing is there."""
 	target, named = _landing_path(dest_path)
+	if base is None:
+		return target, None, named
 	try:
-		return target, os.lstat(target), named
+		return target, os.lstat(*_at(base, os.path.basename(target)), **_fd_of(base)), named
 	except OSError:
 		return target, None, named
 
@@ -4072,6 +4090,56 @@ def _close_base(base):
 	"""Close a door's result (_dest_directory) where it is a descriptor: the caller's, always in a finally."""
 	if isinstance(base, int):
 		os.close(base)
+
+def _io(base, name, path):
+	"""A path for a call that takes no dir_fd (xattrs, an ioctl's open, chflags, cp's argument) on name in base, the door's
+	result for path's directory: on Linux with /proc name below base's /proc/self/fd entry, which leads to the directory the
+	door holds (only name is looked up there); else path, the logical one (macOS; Linux without /proc)."""
+	return '/proc/self/fd/%d/%s' % (base, name) if isinstance(base, int) and _PATH_FDS else path
+
+def _cp_io(base, name, path):
+	"""cp's argument for name in base, the door's result for path's directory: below base's /proc/self/fd entry (_io) where cp
+	writes a held file (_held_route: it opens its own /proc/self/fd/N), else path. A cp the probe did not prove able to open
+	its own /proc/self/fd (a cp other than GNU cp, an LSM rule, a /proc that does not show it) gets path, as in 9.87."""
+	return _io(base, name, path) if _held_route() else path
+
+def _io_fds(base, given, path):
+	"""The descriptors a child given given (_cp_io) for path inherits (pass_fds): base's, which /proc/self/fd/BASE names in it."""
+	return (base,) if given != path and isinstance(base, int) else ()
+
+def _shown(e, directory, base):
+	"""e, an OSError of a call made relative to base (a directory's descriptor) on a name in directory, naming its file(s) by
+	the logical path: a bare name joined to directory, a /proc/self/fd/BASE/ prefix (_io) replaced by it. Returns e."""
+	if isinstance(base, int):
+		prefix = '/proc/self/fd/%d/' % base
+		for attribute in ('filename', 'filename2'):
+			name = getattr(e, attribute, None)
+			if isinstance(name, str):
+				if name.startswith(prefix):
+					setattr(e, attribute, os.path.join(directory, name[len(prefix):]))
+				elif name and os.sep not in name:
+					setattr(e, attribute, os.path.join(directory, name))
+	return e
+
+def _cp_failed(e, given, target):
+	"""Raise e, cp's failure on target, naming target where cp was given another name for it (given: the held file's
+	/proc/self/fd/N or /dev/fd/N; the landing below its held directory, /proc/self/fd/D/NAME), in the error the runner
+	recorded (ERRORS[-1]) and in the one raised; a stop (no Exception) as it is."""
+	if given == target:
+		raise e
+	pairs = [(re.compile(re.escape(given) + '(?![0-9])'), target)]
+	name = os.path.basename(target)
+	if given.endswith(os.sep + name) and given.startswith('/proc/self/fd/'):
+		pairs.append((re.compile(re.escape(given[:-len(name)])), os.path.dirname(target) + os.sep))
+	def mapped(text):
+		for pattern, replacement in pairs:
+			text = pattern.sub(lambda match: replacement, text)
+		return text
+	if ERRORS and given in ERRORS[-1]:
+		ERRORS[-1] = mapped(ERRORS[-1])  # cp's return-code error, as the runner recorded it
+	if not isinstance(e, Exception):
+		raise e
+	raise RuntimeError(mapped(str(e))) from e
 
 def _by_path_error(e):
 	"""Whether the door finishes by path from where e (an OSError of an open) met it: the open-files limit anywhere, and a
@@ -4360,18 +4428,22 @@ def _repeat_space_warnings():
 		sys.stdout.flush()
 		print('\n'.join(['', 'Space warnings in this run (repeated from above):'] + warnings), file=sys.stderr)
 
-def _cp_to(command, src_path, target, space=None):
-	"""cp src_path to target by name (a first copy; a FIFO or device the operator named, written through); its size. A part it
-	leaves goes (_remove_what_failed)."""
+def _cp_to(command, src_path, target, space=None, base=None):
+	"""cp src_path to target by name (a first copy; a FIFO or device the operator named, written through); its size. base:
+	the door's result for its directory (None: its path), cp given the landing below it (_io). A part it leaves goes
+	(_remove_what_failed)."""
+	base = os.path.dirname(target) if base is None else base
+	name = os.path.basename(target)
 	if space is not None:
 		_space_warning(target, src_path, space[0], space[1], 0)
-	before = _copy_state(target)
+	given = _cp_io(base, name, target)
+	before = _copy_state(base, name)
 	try:
-		run_command_in_multicmd_with_path_check(command + [src_path, target], quiet=True, strict=True)
-	except BaseException:
-		_remove_what_failed(target, before)
-		raise
-	return get_file_size(target)
+		run_command_in_multicmd_with_path_check(command + [src_path, given], quiet=True, strict=True, pass_fds=_io_fds(base, given, target))
+	except BaseException as e:
+		_remove_what_failed(base, name, before)
+		_cp_failed(e, given, target)
+	return get_file_size(*_at(base, name), **_fd_of(base))
 
 # A landing opened to be written in place: never through a link put there (ELOOP), never waiting on a FIFO (ENXIO) or a
 # lease (EAGAIN), not inherited by cp; no O_TRUNC (cp truncates it).
@@ -4476,14 +4548,17 @@ def _held_route():
 				os.close(opened.pop())
 	return _HELD[1]
 
-def _cp_held(command, src_path, target, fd, fst, space, through_link, new=False):
+def _cp_held(command, src_path, target, fd, fst, space, through_link, new=False, base=None):
 	"""cp src_path into target, the regular file with one name this process holds open (fd, fst its fstat); its size. cp
 	writes the held file through the descriptor it inherits (_held_route), so a link put at the name since the open is never
 	written through; with no route, the name, as in 9.84. The inode stays. A cp that fails or is stopped after it changed the
 	file takes the torn name if it is still this file, as 9.84 did, except where a link the operator named led there
 	(through_link: kept for the retry, 9.84). -rbw reads the source first; its failure keeps the file (_KeptOld). new: the
 	file is one hpcp just made (_cp_made): no -rbw read, no old copy, and a failure takes the name while it leads to
-	it. Errors name target, not the descriptor's name."""
+	it. Errors name target, not the descriptor's name. base: the door's result for target's directory (None: its path), where
+	the name is looked at and taken, and cp with no route gets the landing below it (_io)."""
+	base = os.path.dirname(target) if base is None else base
+	name = os.path.basename(target)
 	if READ_FIRST and not new:
 		failed = _read_through(src_path)
 		if failed is not None:
@@ -4492,22 +4567,19 @@ def _cp_held(command, src_path, target, fd, fst, space, through_link, new=False)
 		_space_warning(target, src_path, space[0], space[1], 0 if new else fst.st_blocks * 512)
 	route = _held_route()
 	held = _HELD_NAME % fd if route else None
+	given = held or _cp_io(base, name, target)
 	if route == 'cb' and not new:
 		os.ftruncate(fd, 0)  # cp's open will not truncate it, and a shorter source would leave the old tail
 	try:
-		run_command_in_multicmd_with_path_check(command + [src_path, held or target], quiet=True, strict=True,
-			pass_fds=(fd,) if held else ())
+		run_command_in_multicmd_with_path_check(command + [src_path, given], quiet=True, strict=True,
+			pass_fds=(fd,) if held else _io_fds(base, given, target))
 	except BaseException as e:
 		with contextlib.suppress(OSError):
-			now, named = os.fstat(fd), os.lstat(target)
+			now, named = os.fstat(fd), os.lstat(*_at(base, name), **_fd_of(base))
 			if (not through_link and (new or (now.st_size, now.st_mtime_ns, now.st_ctime_ns) != (fst.st_size, fst.st_mtime_ns, fst.st_ctime_ns))
 					and (named.st_dev, named.st_ino) == (fst.st_dev, fst.st_ino)):
-				os.unlink(target)
-		if held is not None and ERRORS and held in ERRORS[-1]:
-			ERRORS[-1] = ERRORS[-1].replace(held, target)  # cp's return-code error, as the runner recorded it
-		if held is None or not isinstance(e, Exception):
-			raise
-		raise RuntimeError(str(e).replace(held, target)) from e
+				os.unlink(*_at(base, name), **_fd_of(base))
+		_cp_failed(e, given, target)
 	if not CONTENT_ONLY and not new:
 		_remove_stale_xattrs(src_path, fd)
 		if held is not None:
@@ -4533,12 +4605,13 @@ def _create(base, name, flags, mode, opened):
 	opened.extend(map(functools.partial(os.open, flags=flags, mode=mode, **_fd_of(base)), _at(base, name)))
 	return opened[-1]
 
-def _drop_made(target, made):
-	"""Remove target while its name still leads to made, the file hpcp made there (its fstat): never what was put there since."""
+def _drop_made(base, name, made):
+	"""Remove name in base (_at) while it still leads to made, the file hpcp made there (its fstat): never what was put there
+	since."""
 	with contextlib.suppress(OSError):
-		named = os.lstat(target)
+		named = os.lstat(*_at(base, name), **_fd_of(base))
 		if (named.st_dev, named.st_ino) == (made.st_dev, made.st_ino):
-			os.unlink(target)
+			os.unlink(*_at(base, name), **_fd_of(base))
 
 def _has_acl(fd):
 	"""Whether the file fd is open on carries POSIX ACL entries beyond its mode (Linux; False where it cannot be asked)."""
@@ -4547,7 +4620,7 @@ def _has_acl(fd):
 	except (OSError, AttributeError, TypeError):
 		return False
 
-def _cp_made(command, src_path, target, src_st, space):
+def _cp_made(command, src_path, target, src_st, space, base=None):
 	"""cp src_path, a regular file, into target, a new file hpcp makes for it (O_EXCL: never through a link put at the name;
 	FileExistsError when a name is there) and cp writes through its own descriptor (_cp_held): (that descriptor, still open
 	for the caller to close, the made file's fstat, the size); None where cp has to make it by name (below). A failure
@@ -4562,12 +4635,15 @@ def _cp_made(command, src_path, target, src_st, space):
 	cp -a gives the owner once it has written, as by name: given first, the data would be charged to the owner while it is
 	written (XFS enforces an owner's or a group's quota on a root write, not on root's chown: a user, or a group, at the hard
 	limit got Disk quota exceeded where 9.86 completed). A mode its owner cannot write (-co's 0444 source, a umask taking
-	owner write) has owner write while cp writes, which cp's reopen needs; -co puts the mode back."""
+	owner write) has owner write while cp writes, which cp's reopen needs; -co puts the mode back. base: the door's result for
+	target's directory (None: its path), which the file is made in."""
+	base = os.path.dirname(target) if base is None else base
+	name = os.path.basename(target)
 	src_st = src_st or os.lstat(src_path)
 	# the descriptor, held from its create on (_create): a stop's cleanup below always finds the file it made
 	opened, made = [], None
 	try:
-		fd = _create(os.path.dirname(target), os.path.basename(target), _NEW_FILE_FLAGS, _new_file_mode(src_st), opened)
+		fd = _create(base, name, _NEW_FILE_FLAGS, _new_file_mode(src_st), opened)
 		made = os.fstat(fd)
 		if not CONTENT_ONLY:
 			_label_like(src_path, fd)
@@ -4584,7 +4660,7 @@ def _cp_made(command, src_path, target, src_st, space):
 					except PermissionError:
 						by_name = True
 				if by_name:
-					_drop_made(target, made)
+					_drop_made(base, name, made)
 					made = None
 					# out of opened before the close: a stop raised as it returns would have the handler below close it again,
 					# whose EBADF took the stop's place (a false Copy failed, the stop left to the task's end)
@@ -4593,7 +4669,7 @@ def _cp_made(command, src_path, target, src_st, space):
 		narrow = not made.st_mode & stat.S_IWUSR
 		if narrow:
 			os.fchmod(fd, stat.S_IMODE(made.st_mode) | stat.S_IWUSR)
-		size = _cp_held(command, src_path, target, fd, made, space, False, new=True)
+		size = _cp_held(command, src_path, target, fd, made, space, False, new=True, base=base)
 		if narrow and CONTENT_ONLY:
 			os.fchmod(fd, stat.S_IMODE(made.st_mode))
 		return fd, made, size
@@ -4604,17 +4680,17 @@ def _cp_made(command, src_path, target, src_st, space):
 				with contextlib.suppress(OSError):
 					made = os.fstat(opened[0])
 			if made is not None:
-				_drop_made(target, made)
+				_drop_made(base, name, made)
 			os.close(opened.pop())
 		raise
 
-def _cp_new(command, src_path, target, src_st, space):
-	"""A first copy (nothing at target) of a regular source, where cp writes a held file (_held_route): made by hpcp and
-	written through cp's own descriptor (_cp_made), else by name (_cp_to). FileExistsError when a name appeared there since
-	the look, for the caller to look again."""
-	made = _cp_made(command, src_path, target, src_st, space)
+def _cp_new(command, src_path, target, src_st, space, base=None):
+	"""A first copy (nothing at target) of a regular source, where cp writes a held file (_held_route): made by hpcp in base
+	(the door's result for its directory) and written through cp's own descriptor (_cp_made), else by name (_cp_to).
+	FileExistsError when a name appeared there since the look, for the caller to look again."""
+	made = _cp_made(command, src_path, target, src_st, space, base)
 	if made is None:
-		return _cp_to(command, src_path, target, space)
+		return _cp_to(command, src_path, target, space, base)
 	os.close(made[0])
 	return made[2]
 
@@ -4630,28 +4706,35 @@ def _label_like(src_path, fd):
 		if os.getxattr(fd, 'security.selinux') != label:
 			os.setxattr(fd, 'security.selinux', label)
 
-def _in_place_hint(target, st, src_path):
+def _in_place_hint(target, st, src_path, base=None):
 	"""Under -wb, the end of a failed rewrite's reason where the default would have written it in place (one name, and it
-	opens for writing: asked by opening it, nothing written; and a regular source, as cp -a makes the rest anew)."""
+	opens for writing: asked by opening it in base, the door's result for its directory, nothing written; and a regular
+	source, as cp -a makes the rest anew)."""
 	if WRITE_BESIDE and stat.S_ISREG(st.st_mode) and st.st_nlink == 1 and _regular_source(src_path):
+		base = os.path.dirname(target) if base is None else base
 		with contextlib.suppress(OSError):
-			os.close(os.open(target, _LANDING_FLAGS))
+			os.close(os.open(*_at(base, os.path.basename(target)), _LANDING_FLAGS, **_fd_of(base)))
 			return '; without -wb it would be written in place'
 	return ''
 
-def _cp_beside(command, src_path, target, st, why, space, src_st=None):
+def _cp_beside(command, src_path, target, st, why, space, src_st=None, base=None):
 	"""cp src_path to a new name beside target, write it to disk and rename it over target once whole; its size. st: what is
 	at target (lstat, or the held file's fstat); why: why it goes beside (None for a non-file). Never in place: a failure
 	keeps what is there, a file as _KeptOld (190) naming why and what failed, a FIFO, socket, device or link as _Refused
 	(213). Under -co the new file gets the old one's owner, group, mode, carried xattrs and FAT bits (where they cannot be
-	carried: one name keeps its old copy, 190; other names get a file the runner owns, and keep the old content)."""
+	carried: one name keeps its old copy, 190; other names get a file the runner owns, and keep the old content). base: the
+	door's result for target's directory (None: its path): the new name is made, looked at and renamed in it, and a call
+	with no dir_fd form goes below it (_io)."""
+	base = os.path.dirname(target) if base is None else base
+	name = os.path.basename(target)
 	regular = stat.S_ISREG(st.st_mode)
-	carried = _co_carry(target, st) if CONTENT_ONLY and regular else None
+	carried = _co_carry(_io(base, name, target), st) if CONTENT_ONLY and regular else None
 	if CONTENT_ONLY and regular and carried is None and st.st_nlink < 2:
-		raise _KeptOld(f'{why}; its owner, group or an xattr cannot be given to a new file{_in_place_hint(target, st, src_path)}')
+		raise _KeptOld(f'{why}; its owner, group or an xattr cannot be given to a new file{_in_place_hint(target, st, src_path, base)}')
 	if space is not None:
 		_space_warning(target, src_path, space[0], space[1], 0)
 	temp, renamed, what = _temp_sibling(target), False, 'the new copy beside it failed: %s'
+	tname = os.path.basename(temp)
 	# A regular source's new file is made by hpcp and written by cp through its descriptor (_held_route), and what follows goes
 	# through that descriptor too: a second name of another file put at the temporary name is never what hpcp holds. A node
 	# source is made by cp -a (mknod), by name.
@@ -4659,22 +4742,26 @@ def _cp_beside(command, src_path, target, st, why, space, src_st=None):
 	try:
 		try:
 			if _regular_source(src_path, src_st) and _held_route():
-				made = _cp_made(command, src_path, temp, src_st, None)
+				made = _cp_made(command, src_path, temp, src_st, None, base)
 				if made is not None:
 					fd, made = made[:2]
 			if fd is None:
-				run_command_in_multicmd_with_path_check(command + [src_path, temp], quiet=True, strict=True)
+				given = _cp_io(base, tname, temp)
+				try:
+					run_command_in_multicmd_with_path_check(command + [src_path, given], quiet=True, strict=True, pass_fds=_io_fds(base, given, temp))
+				except BaseException as e:
+					_cp_failed(e, given, temp)
 			attributes = None
 			if carried is not None:
 				what = 'its owner, group or an xattr cannot be given to the new copy (%s)'
-				_carry_over(st, temp, carried, fd)
-				attributes = _fat_attributes(target)
+				_carry_over(st, _io(base, tname, temp), carried, fd)
+				attributes = _fat_attributes(_io(base, name, target))
 			elif not CONTENT_ONLY:
-				_remove_stale_xattrs(src_path, temp if fd is None else fd)
+				_remove_stale_xattrs(src_path, _io(base, tname, temp) if fd is None else fd)
 			# Renamed unsynced, a power cut could leave nothing where the old copy was.
 			what = 'the new copy cannot be written to disk (%s)'
 			if fd is None:
-				_fsync_file(temp)
+				_fsync_file(temp, base, tname)
 			else:
 				try:
 					os.fsync(fd)
@@ -4685,48 +4772,59 @@ def _cp_beside(command, src_path, target, st, why, space, src_st=None):
 			if fd is not None:
 				# the rename is by name: something put there since (a user who can write the directory) is not renamed over
 				# the old copy
-				now = os.lstat(temp)
+				now = os.lstat(*_at(base, tname), **_fd_of(base))
 				if (now.st_dev, now.st_ino) != (made.st_dev, made.st_ino):
 					raise OSError(errno.EEXIST, 'something else was put at its name', temp)
-			os.rename(temp, target)
+			os.rename(*_at(base, tname), *_at(base, name), **({'src_dir_fd': base, 'dst_dir_fd': base} if isinstance(base, int) else {}))
 			renamed = True  # nothing left to discard: an unlink of the gone name costs a round trip on NFS
 		except Exception as e:
 			if not regular:
 				parent = os.path.dirname(target)
-				raise _Refused(f'cannot replace the {_kind_of(st)} {target} ({parent}: {_why(e)}): not writing ',
+				raise _Refused(f'cannot replace the {_kind_of(st)} {target} ({parent}: {_why(_shown(e, parent, base))}): not writing ',
 					f' into it; make {parent} writable, or remove {target}')
-			raise _KeptOld(f'{why}; {what % _why(e)}{_in_place_hint(target, st, src_path)}')
-		if attributes is not None and attributes != _fat_attributes(target):
-			_set_fat_attributes(target, attributes, target)
-		return get_file_size(target)
+			raise _KeptOld(f'{why}; {what % _why(_shown(e, os.path.dirname(target), base))}{_in_place_hint(target, st, src_path, base)}')
+		if attributes is not None and attributes != _fat_attributes(_io(base, name, target)):
+			_set_fat_attributes(_io(base, name, target), attributes, target)
+		return get_file_size(*_at(base, name), **_fd_of(base))
 	finally:
 		if fd is not None:
 			os.close(fd)
 		if not renamed:
-			_discard_temp(temp)
+			_discard_temp(temp, base)
 
-def _cp_once(src_path, dest_path, cp_flags, sparse, space=None, look=None, src_st=None):
+def _cp_once(src_path, dest_path, cp_flags, sparse, space=None, look=None, src_st=None, base=None):
 	"""One attempt at copying src_path to dest_path (copy_file); the size copied. Raises _Refused for what this run will not
 	write, _KeptOld for a rewrite that kept what is there. space: (free, need) when the room is short (_space_warning). By
 	what is at the landing (_landing_of): nothing, or a FIFO or device the operator named: cp writes the name (_cp_to). A
 	regular file with one name that opens for writing, of a regular source: in place, through the held file (_cp_held).
 	Anything else (other names, not writable, a running program, a source cp makes anew; a FIFO, socket, device or link below
 	a destination, never opened), anything the open finds changed since the look, and every rewrite under -wb: beside it,
-	renamed over it once whole (_cp_beside); never to cp by name. look: _landing_of(dest_path) when the caller just took it
-	(copy_file's first attempt); src_st: the source's lstat."""
-	target, st, named = look or _landing_of(dest_path)
-	_judge_landing(dest_path, target, st, named)
-	_close_base(_dest_directory(os.path.dirname(target), make=not NO_CREATE_DIR, source=os.path.dirname(os.path.abspath(src_path))))
-	command = ["cp", cp_flags] + (["--sparse=always"] if sparse and cp_supports_sparse() else [])
-	# A name that appears at a first copy's landing between the look and hpcp's create is looked at again, judged as the first
-	# look was, and the route that fits it taken; 3 times, the door's bound for the same race.
-	for _ in range(3):
-		try:
-			return _cp_landing(command, src_path, dest_path, target, st, named, space, src_st)
-		except FileExistsError:
-			target, st, named = _landing_of(dest_path)
-			_judge_landing(dest_path, target, st, named)
-	raise OSError(errno.EAGAIN, 'it kept changing while it was copied', target)
+	renamed over it once whole (_cp_beside); never to cp by name. look: _landing_of(dest_path, base) when the caller just
+	took it (copy_file's first attempt); src_st: the source's lstat. base: the door's result for the landing's directory
+	(copy_file's, which closes it), every name below it made, looked at and written relative to it; None: the door is asked
+	here (made, not under -ncd), its result closed here. An OSError raised out names its file by the logical path."""
+	opened = None
+	try:
+		if base is None:
+			directory = os.path.dirname(_landing_path(dest_path)[0])
+			opened = _dest_directory(directory, make=not NO_CREATE_DIR, source=os.path.dirname(os.path.abspath(src_path)))
+			base = directory if opened is None else opened
+		target, st, named = look or _landing_of(dest_path, base)
+		_judge_landing(dest_path, target, st, named)
+		command = ["cp", cp_flags] + (["--sparse=always"] if sparse and cp_supports_sparse() else [])
+		# A name that appears at a first copy's landing between the look and hpcp's create is looked at again, judged as the
+		# first look was, and the route that fits it taken; 3 times, the door's bound for the same race.
+		for _ in range(3):
+			try:
+				return _cp_landing(command, src_path, dest_path, target, st, named, space, src_st, base)
+			except FileExistsError:
+				target, st, named = _landing_of(dest_path, base)
+				_judge_landing(dest_path, target, st, named)
+		raise OSError(errno.EAGAIN, 'it kept changing while it was copied', target)
+	except OSError as e:
+		raise _shown(e, os.path.dirname(os.path.abspath(dest_path)), base)
+	finally:
+		_close_base(opened)
 
 def _judge_landing(dest_path, target, st, named):
 	"""What no look at a landing lets through (_cp_once), at every look: a dangling link the operator named (cp writes through
@@ -4746,29 +4844,29 @@ def _judge_landing(dest_path, target, st, named):
 	if st is not None and stat.S_ISDIR(st.st_mode):
 		raise _Refused(f'{target} is a directory, not copying ', ' over it')
 
-def _cp_landing(command, src_path, dest_path, target, st, named, space, src_st):
-	"""_cp_once's copy onto target, dest_path's landing, by what its look found there (st, named). FileExistsError: a first
-	copy's name taken since."""
+def _cp_landing(command, src_path, dest_path, target, st, named, space, src_st, base):
+	"""_cp_once's copy onto target, dest_path's landing, by what its look found there (st, named), relative to base (the door's
+	result for its directory). FileExistsError: a first copy's name taken since."""
 	held = _claim_device(target, st, named, src_path)
 	try:
 		if not _written_beside(st, named):
 			if st is None and _regular_source(src_path, src_st) and _held_route():
-				return _cp_new(command, src_path, target, src_st, space)
-			return _cp_to(command, src_path, target, space if st is None else None)
+				return _cp_new(command, src_path, target, src_st, space, base)
+			return _cp_to(command, src_path, target, space if st is None else None, base)
 		if not WRITE_BESIDE and stat.S_ISREG(st.st_mode) and st.st_nlink == 1 and _regular_source(src_path, src_st):
 			try:
-				fd = os.open(target, _LANDING_FLAGS)
+				fd = os.open(*_at(base, os.path.basename(target)), _LANDING_FLAGS, **_fd_of(base))
 			except FileNotFoundError:
 				# gone since the lstat: a first copy
 				if _held_route():
-					return _cp_new(command, src_path, target, src_st, space)
-				return _cp_to(command, src_path, target, space)
+					return _cp_new(command, src_path, target, src_st, space, base)
+				return _cp_to(command, src_path, target, space, base)
 			except OSError as e:
-				return _cp_beside(command, src_path, target, st, f'it cannot be opened for writing ({_why(e)})', space, src_st)
+				return _cp_beside(command, src_path, target, st, f'it cannot be opened for writing ({_why(e)})', space, src_st, base)
 			try:
 				st = os.fstat(fd)  # what the descriptor holds decides from here on
 				if stat.S_ISREG(st.st_mode) and st.st_nlink == 1:
-					return _cp_held(command, src_path, target, fd, st, space, target != dest_path)
+					return _cp_held(command, src_path, target, fd, st, space, target != dest_path, base=base)
 			finally:
 				os.close(fd)
 			# Changed since the lstat (another name, a FIFO someone holds open): beside, never cp by name.
@@ -4776,7 +4874,7 @@ def _cp_landing(command, src_path, dest_path, target, st, named, space, src_st):
 		why = ('-wb writes beside it' if WRITE_BESIDE else None if not stat.S_ISREG(st.st_mode) else
 			'it has other names, which a write in place would change' if st.st_nlink > 1 else
 			f'{src_path} is no regular file, which cp makes anew')
-		return _cp_beside(command, src_path, target, st, why, space, src_st)
+		return _cp_beside(command, src_path, target, st, why, space, src_st, base)
 	finally:
 		if held is not None:
 			os.close(held)
@@ -4810,28 +4908,40 @@ def _can_open(path, st=None):
 		pass
 	return True
 
-def _can_make_node(src_path, dest_paths, src_st=None):
+def _can_make_node(src_path, dest_paths, src_st=None, bases=None):
 	"""False when src_path is a device node that this user cannot make, and a destination holds something. cp -a unlinks
 	what is there before its mknod, so a user who may not make nodes (not root) would lose the old file and get nothing.
 	Asked by doing it: a node of src_path's kind and number is made under a name of its own beside a destination that
 	exists, and removed again; PermissionError is the answer. Any other error (EROFS, say) is no answer: the next existing
 	destination is asked, and when none answers it is cp's to answer. Nothing is made for a
-	source that is no device, or when no destination exists (cp then has nothing to lose)."""
+	source that is no device, or when no destination exists (cp then has nothing to lose). bases: {dest: the door's result
+	for its directory} (copy_file's), which each is looked at and asked in."""
 	try:
 		st = src_st or os.lstat(src_path)
 	except OSError:
 		return True
 	if not (stat.S_ISBLK(st.st_mode) or stat.S_ISCHR(st.st_mode)):
 		return True
-	existing = [dest for dest in dest_paths if os.path.lexists(dest)]
+	bases = bases or {}
+	def held(dest):
+		return bases.get(dest) if bases.get(dest) is not None else os.path.dirname(dest)
+	existing = []
+	for dest in dest_paths:
+		with contextlib.suppress(OSError):
+			os.lstat(*_at(held(dest), os.path.basename(dest)), **_fd_of(held(dest)))
+			existing.append(dest)
 	if not existing:
 		return True
 	for dest in existing:
 		name = '.hpcp-node-probe-%d-%s' % (os.getpid(), uuid.uuid4().hex)
 		base = None
 		try:
-			# Relative to the directory's descriptor where it can be (_ask_names): the name costs its own length.
-			base = os.open(os.path.dirname(dest) or os.curdir, _PARENT_FLAGS) if _PROBE_BY_FD and os.mknod in os.supports_dir_fd else os.path.dirname(dest)
+			# Relative to the directory's descriptor where it can be (_ask_names): the name costs its own length. The door's
+			# own is never closed here: a dup of it.
+			if _PROBE_BY_FD and os.mknod in os.supports_dir_fd:
+				base = os.dup(held(dest)) if isinstance(held(dest), int) else os.open(os.path.dirname(dest) or os.curdir, _PARENT_FLAGS)
+			else:
+				base = held(dest) if not isinstance(held(dest), int) else os.path.dirname(dest)
 			os.mknod(*_at(base, name), 0o600 | stat.S_IFMT(st.st_mode), st.st_rdev, **_fd_of(base))
 		except PermissionError:
 			return False
@@ -4849,44 +4959,58 @@ def _can_make_node(src_path, dest_paths, src_st=None):
 				os.close(base)
 	return True
 
-def _copy_state(path):
-	"""What a copy to path would change at path itself: a link stays whatever cp did through it, so a retry writes through it
-	again and its target ends whole or the file fails. None when nothing is there."""
+def _copy_state(base, name):
+	"""What a copy to name in base (_at) would change at that name itself: a link stays whatever cp did through it, so a retry
+	writes through it again and its target ends whole or the file fails. None when nothing is there."""
 	try:
-		st = os.lstat(path)
+		st = os.lstat(*_at(base, name), **_fd_of(base))
 	except OSError:
 		return None
 	return st.st_ino, st.st_size, st.st_mtime_ns
 
-def _remove_what_failed(path, before):
-	"""After a failed copy to path, whose _copy_state was before: its part goes. What it never touched is the destination's
-	old copy, maybe the only good one, so that stays."""
-	if _copy_state(path) not in (None, before):
+def _remove_what_failed(base, name, before):
+	"""After a failed copy to name in base (_at), whose _copy_state was before: its part goes. What it never touched is the
+	destination's old copy, maybe the only good one, so that stays."""
+	if _copy_state(base, name) not in (None, before):
 		try:
-			os.remove(path)
+			os.remove(*_at(base, name), **_fd_of(base))
 		except OSError:
 			pass  # its directory will not let it go (0555, sticky, a bind mount): the copy's own error is the one to report
 
-def _known_identical(src_path, dest_path, src_size, full_hash, src_st=None, dest_st=None):
+# A landing opened to be read (the skip check): never through a link put there, never waiting on a FIFO.
+_LANDING_READ_FLAGS = os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NONBLOCK', 0) | getattr(os, 'O_CLOEXEC', 0)
+
+def _known_identical(src_path, dest_path, src_size, full_hash, src_st=None, dest_st=None, base=None):
 	"""is_file_identical, where a side that may not be read is not known to be the same: the copy then goes on, and a source
 	stops at _can_open, its old copy kept. Only that: any other read error stays a crash, because cp would truncate first.
 
 	Under -co, which carries no times, a regular landing of the source's size is the same when it reads the same to the end
 	(_same_contents), whatever its time: the time test never matched there, so every rerun rewrote every file, and the hash
-	reads only the last HASH_SIZE bytes, missing a change before them. Under -hs 0 ("file attributes only") it is rewritten."""
+	reads only the last HASH_SIZE bytes, missing a change before them. Under -hs 0 ("file attributes only") it is rewritten.
+
+	base: the door's result for the landing's directory (copy_file's): the landing is read by its name there, never through
+	a link put at it since the look (O_NOFOLLOW; one there, or the name gone, is not known to be the same)."""
+	dest_open = None
+	if base is not None:
+		name = os.path.basename(dest_path)
+		dest_open = lambda: os.fdopen(os.open(*_at(base, name), _LANDING_READ_FLAGS, **_fd_of(base)), 'rb')
 	try:
 		if CONTENT_ONLY and HASH_SIZE > 0:
 			src_st, dest_st = src_st or os.stat(src_path), dest_st or os.stat(dest_path)
 			if stat.S_ISREG(src_st.st_mode) and stat.S_ISREG(dest_st.st_mode):
-				return src_st.st_size == dest_st.st_size and _same_contents(src_path, dest_path)
-		return is_file_identical(src_path, dest_path, src_size, full_hash, src_st=src_st, dest_st=dest_st)
+				return src_st.st_size == dest_st.st_size and _same_contents(src_path, dest_path, dest_open)
+		return is_file_identical(src_path, dest_path, src_size, full_hash, src_st=src_st, dest_st=dest_st, dest_open=dest_open)
 	except PermissionError:
 		return False
+	except OSError as e:
+		if dest_open is not None and e.errno in (errno.ELOOP, errno.ENXIO):
+			return False  # a link (O_NOFOLLOW) or a FIFO put at the landing since the look: the copy looks at it again
+		raise
 
 # The errors shutil.copystat's xattr copy ignores (3.6 to 3.14, together): a name the destination or the runner cannot have.
 _XATTR_SKIPPED = frozenset((errno.EPERM, errno.ENOTSUP, errno.EOPNOTSUPP, errno.ENODATA, errno.EINVAL, errno.EACCES))
 
-def _settle_identical(src_path, src_st, dest, look):
+def _settle_identical(src_path, src_st, dest, look, base=None):
 	"""Give dest, a landing the skip check found identical to src_path (look: its lstat then; src_st: the source's, taken before
 	the check read it), what the skip has always given it (9.86's _remove_stale_xattrs, copystat, _chown_like_cp, chmod and
 	utime): stale portable xattrs removed and the source's set, owner and group as cp -a keeps them, the mode less set-user-ID
@@ -4896,28 +5020,37 @@ def _settle_identical(src_path, src_st, dest, look):
 	another file's name, put there since: neither gets the source's owner or mode), for the caller to look again.
 
 	On Linux an O_PATH descriptor, reached by its /proc/self/fd name (as _carry_over); elsewhere a regular file opened for
-	reading without following a link (the check just read it), and a node by name, its owner, xattrs, times and (where chmod
-	can be told so) mode set without following a link put at it."""
+	reading without following a link (the check just read it), and a node by its name in base, its owner, times and (where
+	chmod can be told so) mode set relative to base without following a link put at it, its xattrs (Linux without /proc)
+	and BSD flags (macOS) by name (no dir_fd form). base: the door's result for dest's directory (None: its path), which the
+	landing is opened in."""
+	base = os.path.dirname(dest) if base is None else base
+	leaf = os.path.basename(dest)
 	fd = None
 	try:
 		if _PATH_FDS:
-			fd = os.open(dest, os.O_PATH | os.O_NOFOLLOW | getattr(os, 'O_CLOEXEC', 0))
+			fd = os.open(*_at(base, leaf), os.O_PATH | os.O_NOFOLLOW | getattr(os, 'O_CLOEXEC', 0), **_fd_of(base))
 		elif stat.S_ISREG(look.st_mode):
-			fd = os.open(dest, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NONBLOCK', 0) | getattr(os, 'O_CLOEXEC', 0))
+			fd = os.open(*_at(base, leaf), os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NONBLOCK', 0) | getattr(os, 'O_CLOEXEC', 0),
+				**_fd_of(base))
 	except OSError as e:
 		if e.errno in (errno.ENOENT, errno.ELOOP):
 			return False  # gone, or a link put there (O_NOFOLLOW)
 		raise
 	try:
-		now = os.fstat(fd) if fd is not None else os.lstat(dest)
+		now = os.fstat(fd) if fd is not None else os.lstat(*_at(base, leaf), **_fd_of(base))
 		if (now.st_dev, now.st_ino, stat.S_IFMT(now.st_mode)) != (look.st_dev, look.st_ino, stat.S_IFMT(look.st_mode)):
 			return False
 		if fd is None:
-			path, how = dest, {'follow_symlinks': False}
+			# a node, by its name in base: calls with a dir_fd form never follow a link put at it; xattrs have none
+			path, how = _at(base, leaf)[0], dict(_fd_of(base), follow_symlinks=False)
+			xpath, xhow = _io(base, leaf, dest), {'follow_symlinks': False}
 		elif _PATH_FDS:
 			path, how = '/proc/self/fd/%d' % fd, {}  # leads to the descriptor's file, and no further
+			xpath, xhow = path, how
 		else:
 			path, how = fd, {}
+			xpath, xhow = path, how
 		owner_kept = group_kept = True
 		chowned = os.name == 'posix' and (now.st_uid, now.st_gid) != (src_st.st_uid, src_st.st_gid)
 		if chowned:
@@ -4927,7 +5060,7 @@ def _settle_identical(src_path, src_st, dest, look):
 		if hasattr(os, 'listxattr'):
 			try:
 				src_names = os.listxattr(src_path, follow_symlinks=False)
-				dest_names = os.listxattr(path, **how)
+				dest_names = os.listxattr(xpath, **xhow)
 			except OSError as e:
 				if e.errno not in (errno.ENOTSUP, errno.EOPNOTSUPP):
 					raise
@@ -4935,31 +5068,31 @@ def _settle_identical(src_path, src_st, dest, look):
 			for name in dest_names:
 				if name not in src_names and _is_portable_xattr(name):
 					try:
-						os.removexattr(path, name, **how)
+						os.removexattr(xpath, name, **xhow)
 					except OSError as e:
 						if e.errno not in (errno.ENOTSUP, errno.EPERM, errno.ENODATA, errno.EACCES, errno.EINVAL, errno.ENOENT):
 							raise
 			for name in src_names:
 				try:
 					value = os.getxattr(src_path, name, follow_symlinks=False)
-					if name not in dest_names or os.getxattr(path, name, **how) != value:
-						os.setxattr(path, name, value, **how)
+					if name not in dest_names or os.getxattr(xpath, name, **xhow) != value:
+						os.setxattr(xpath, name, value, **xhow)
 				except OSError as e:
 					if e.errno not in _XATTR_SKIPPED:
 						raise
 		# As cp -a: no set-user-ID / set-group-ID bit for an owner / group not kept. A chown may have cleared them: set again.
 		mode = stat.S_IMODE(src_st.st_mode) & ~((0 if owner_kept else stat.S_ISUID) | (0 if group_kept else stat.S_ISGID))
 		if chowned or stat.S_IMODE(now.st_mode) != mode:
-			# a node by name: not through a link put at it where chmod can say so (macOS's lchmod; Linux has none, so there,
-			# without /proc, the mode goes by name)
-			os.chmod(path, mode, **(how if os.chmod in os.supports_follow_symlinks else {}))
+			# a node by its name in base: not through a link put at it where chmod can say so (macOS's lchmod; Linux has none,
+			# so there, without /proc, the mode follows one)
+			os.chmod(path, mode, **(how if os.chmod in os.supports_follow_symlinks else _fd_of(base) if fd is None else {}))
 		if now.st_mtime_ns != src_st.st_mtime_ns:
 			# The read time goes with it, as cp -a gives it; alone it is not chased: a read moves it (relatime moves one older
 			# than the change time, which setting it makes it), so the skip check's own read would have it set on every rerun.
 			os.utime(path, ns=(src_st.st_atime_ns, src_st.st_mtime_ns), **how)
 		if getattr(src_st, 'st_flags', 0) != getattr(now, 'st_flags', 0):
 			try:
-				os.chflags(dest, src_st.st_flags, follow_symlinks=False)
+				os.chflags(_io(base, leaf, dest), src_st.st_flags, follow_symlinks=False)
 			except OSError as e:
 				if e.errno not in (errno.ENOTSUP, errno.EOPNOTSUPP):
 					raise
@@ -4998,6 +5131,17 @@ def copy_file(src_path, dest_paths, full_hash=False, verbose=False, concurrent_p
 	Returns:
 		tuple: A tuple containing the size of the copied file, the time taken for the copy operation, and a dictionary of symbolic links encountered during the copy.
 	"""
+	# The door's result for each landing's directory (_dest_directory): every name below a destination is looked at, made and
+	# written relative to it; closed here whatever happens.
+	bases = {}
+	try:
+		return _copy_file(src_path, dest_paths, full_hash, verbose, concurrent_processes, bases)
+	finally:
+		for base in bases.values():
+			_close_base(base)
+
+def _copy_file(src_path, dest_paths, full_hash, verbose, concurrent_processes, bases):
+	"""copy_file's body; bases: {dest: the door's result for its landing's directory}, filled here, closed by copy_file."""
 	global RANDOM_DESTINATION_SELECTION
 	global NO_CREATE_DIR
 	global CONTENT_ONLY
@@ -5016,12 +5160,13 @@ def copy_file(src_path, dest_paths, full_hash=False, verbose=False, concurrent_p
 		src_st = None  # gone: cp says so
 	src_is_link = src_st is not None and stat.S_ISLNK(src_st.st_mode)
 	# Each destination's directories go through the door first (_dest_directory, nothing made: the file lands on one of
-	# them), so a link there is replaced before anything looks below it: the skip check's metadata sync, the space and the
-	# node probes would otherwise go through it. A destination the door refuses is left out, its refusal kept.
+	# them), so a link there is replaced before anything looks below it, and what follows (the look, the skip check and its
+	# metadata, the node probe, the copy) goes relative to the directory it holds (bases). A destination the door refuses is
+	# left out, its refusal kept; one whose directory is missing (None) is made by the door at the copy (_cp_once).
 	refused = {}
 	for dest in dest_paths:
 		try:
-			_close_base(_dest_directory(os.path.dirname(_landing_path(dest)[0]), make=False, source=os.path.dirname(os.path.abspath(src_path))))
+			bases[dest] = _dest_directory(os.path.dirname(_landing_path(dest)[0]), make=False, source=os.path.dirname(os.path.abspath(src_path)))
 		except _Refused as e:
 			refused[dest] = e
 		except OSError:
@@ -5032,7 +5177,7 @@ def copy_file(src_path, dest_paths, full_hash=False, verbose=False, concurrent_p
 			for refusal in refused.values():
 				_copy_failed(src_path, refusal.text(src_path))
 			return 0, time.monotonic() - start_time, symLinks
-	looks = {dest: _landing_of(dest) for dest in dest_paths}
+	looks = {dest: _landing_of(dest, bases.get(dest)) for dest in dest_paths}
 	if not src_is_link:
 		# cp would put the file inside a directory at its place (dest/x/x), and a move would then lose the source. A link there
 		# is a name of the tree, replaced, unless the operator named it (_landing_of).
@@ -5055,22 +5200,22 @@ def copy_file(src_path, dest_paths, full_hash=False, verbose=False, concurrent_p
 				if src_st is None or src_is_link or dest_st is None or not (stat.S_ISREG(dest_st.st_mode) or
 						(not stat.S_ISDIR(dest_st.st_mode) and stat.S_IFMT(dest_st.st_mode) == src_kind)):
 					break
-				if not _known_identical(src_path, target, src_st.st_size, full_hash, src_st=src_st, dest_st=dest_st):
+				if not _known_identical(src_path, target, src_st.st_size, full_hash, src_st=src_st, dest_st=dest_st, base=bases.get(dest)):
 					break
 				try:
-					settled = CONTENT_ONLY or _settle_identical(src_path, src_st, target, dest_st)
+					settled = CONTENT_ONLY or _settle_identical(src_path, src_st, target, dest_st, bases.get(dest))
 				except OSError as e:
 					# Identical, but what the skip gives it cannot be set (a read-only mount, another user's file): a failed
 					# copy that names the landing.
 					_copy_failed(src_path, f'Copy failed: ERROR copying {src_path} to {target}: it holds the source\'s content, but its owner, mode, times or xattrs cannot be set ({_why(e)})')
 					return 0, time.monotonic() - start_time, symLinks
 				if not settled:
-					looks[dest] = _landing_of(dest)
+					looks[dest] = _landing_of(dest, bases.get(dest))
 					continue
 				if SYNC_COPIES:
 					# A copy an earlier run left (or a plain copy before this move) may still be in memory.
 					try:
-						_sync_landing(target)
+						_sync_landing(target, bases.get(dest))
 					except _NotOnDisk as e:
 						_copy_failed(src_path, f'Copy failed: ERROR copying {src_path} to {target}: {e}')
 						return 0, time.monotonic() - start_time, symLinks
@@ -5088,7 +5233,7 @@ def copy_file(src_path, dest_paths, full_hash=False, verbose=False, concurrent_p
 				# No cp at all: cp -a takes away a destination with other names before it finds it cannot read.
 				_copy_failed(src_path, f'Copy failed: cannot open {src_path}, leaving {dest_paths} as they are')
 				return 0, time.monotonic() - start_time, symLinks
-			if not _can_make_node(src_path, dest_paths, src_st):
+			if not _can_make_node(src_path, dest_paths, src_st, bases):
 				_copy_failed(src_path, f'Copy failed: cannot make a device node like {src_path} here, leaving {dest_paths} as they are')
 				return 0, time.monotonic() - start_time, symLinks
 			copied = False
@@ -5136,14 +5281,21 @@ def copy_file(src_path, dest_paths, full_hash=False, verbose=False, concurrent_p
 				for sparse in [True] + ([False] if using_bak_paths else []):
 					try:
 						if os.name == 'posix':
+							if bases.get(dest_path) is None:
+								# Missing at the look: judged as the look is (a dangling link the operator named makes no directory),
+								# then the door makes it (not under -ncd) and holds it for the copy (one door call a landing otherwise).
+								_judge_landing(dest_path, *(looks.get(dest_path) or _landing_of(dest_path, None)))
+								bases[dest_path] = _dest_directory(os.path.dirname(_landing_path(dest_path)[0]), make=not NO_CREATE_DIR,
+									source=os.path.dirname(os.path.abspath(src_path)))
 							# The first attempt at a destination acts on its look; a later one looks again.
-							copiedSize = _cp_once(src_path, dest_path, cp_flags, sparse, space, look=looks.pop(dest_path, None), src_st=src_st)
+							copiedSize = _cp_once(src_path, dest_path, cp_flags, sparse, space, look=looks.pop(dest_path, None), src_st=src_st,
+								base=bases[dest_path])
 						elif CONTENT_ONLY:
 							shutil.copy(src_path, dest_path, follow_symlinks=False)
 						else:
 							shutil.copy2(src_path, dest_path, follow_symlinks=False)
 						if SYNC_COPIES:
-							_sync_landing(dest_path)
+							_sync_landing(dest_path, bases.get(dest_path))
 						copied = True
 						break
 					except _Refused as e:
@@ -5765,7 +5917,7 @@ def _make_dest_directory(src_path, dest_path):
 	"""dest_path as the directory src_path lands on, made if missing, through the one door (_dest_directory): below a
 	named destination a link, FIFO or node there is replaced by the directory. False when a file is in the way, or what is
 	there cannot be replaced, which is reported."""
-	named = _landing_of(dest_path)[2]
+	named = _landing_path(dest_path)[1]
 	if os.path.lexists(dest_path) and not os.path.isdir(dest_path) and (named or stat.S_ISREG(os.lstat(dest_path).st_mode)):
 		# A file (or a link to one the operator named) is no directory's to take: its mode and owner stay, and nothing can be
 		# made below it.
@@ -7774,10 +7926,14 @@ def _rows_escaping_target(rows, target_root):
 			escaping.append(row)
 	return escaping
 
-def _discard_temp(path):
-	"""Remove a temporary entry that was not renamed into place; a missing one is fine."""
+def _discard_temp(path, base=None):
+	"""Remove a temporary entry that was not renamed into place; a missing one is fine. base: the door's result for its
+	directory (_cp_beside), which it is removed from."""
 	try:
-		os.unlink(path)
+		if base is None:
+			os.unlink(path)
+		else:
+			os.unlink(*_at(base, os.path.basename(path)), **_fd_of(base))
 	except FileNotFoundError:
 		pass
 	except OSError as e:
@@ -12452,9 +12608,10 @@ def _rmdir_below(root, root_id, rel):
 			os.close(fd)
 	return None
 
-def _same_contents(first, second):
-	"""True when two regular files hold the same bytes, read to the end; an OSError is the caller's."""
-	with open(first, 'rb') as one, open(second, 'rb') as other:
+def _same_contents(first, second, second_open=None):
+	"""True when two regular files hold the same bytes, read to the end; an OSError is the caller's. second_open: a callable
+	that opens the second (is_file_identical's dest_open)."""
+	with open(first, 'rb') as one, (open(second, 'rb') if second_open is None else second_open()) as other:
 		while True:
 			chunk = one.read(1 << 20)
 			if chunk != other.read(1 << 20):
@@ -13891,7 +14048,7 @@ def _syncfs(path):
 # the copy goes on without it, as it did before 9.85.
 _NO_FSYNC = frozenset(getattr(errno, name) for name in ('EINVAL', 'ENOTSUP', 'EOPNOTSUPP', 'ENOSYS') if hasattr(errno, name))
 
-def _fsync_file(path):
+def _fsync_file(path, base=None, name=None):
 	"""Write the data of path, a regular file this run made (a temporary copy about to be renamed over a landing, or a move's
 	landing), to disk: renamed unsynced, a power cut can leave the landing empty where the old copy was (XFS does not flush on
 	such a rename, and no filesystem orders the data before the rename); and a move's source, removed after an unsynced copy,
@@ -13904,21 +14061,23 @@ def _fsync_file(path):
 	A file whose mode lets its owner neither read nor write it (a copy of another user's file readable by group or others
 	only, mode 0044) cannot be opened as it is: the owner (this run's effective uid) is given read for the open, and the exact
 	mode is put back through the descriptor (fchmod) before the fsync, so the file has the wider mode for microseconds, never
-	afterwards. Anyone else who cannot open it gets the error. Off POSIX it returns at once."""
+	afterwards. Anyone else who cannot open it gets the error. Off POSIX it returns at once. base, name: path is name in base,
+	the door's result for its directory (_dest_directory), and every call goes relative to it."""
 	if os.name != 'posix':
 		return  # Windows' fsync wants a descriptor open for writing, and nothing here has been run there
-	st = os.lstat(path)
+	at, how = ((path,), {}) if base is None else (_at(base, name), _fd_of(base))
+	st = os.lstat(*at, **how)
 	directory = stat.S_ISDIR(st.st_mode)
 	if not (directory or stat.S_ISREG(st.st_mode)):
 		return
 	flags = getattr(os, 'O_CLOEXEC', 0) | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NONBLOCK', 0)
 	try:
-		fd = os.open(path, os.O_RDONLY | flags)
+		fd = os.open(*at, os.O_RDONLY | flags, **how)
 	except PermissionError as first:
 		try:
 			if directory:
 				raise first  # a directory opens for reading only
-			fd = os.open(path, os.O_WRONLY | flags)
+			fd = os.open(*at, os.O_WRONLY | flags, **how)
 		except PermissionError:
 			if st.st_uid != os.geteuid():
 				if directory:
@@ -13926,11 +14085,11 @@ def _fsync_file(path):
 					return
 				raise first
 			mode = stat.S_IMODE(st.st_mode)
-			os.chmod(path, mode | stat.S_IRUSR)
+			os.chmod(*at, mode | stat.S_IRUSR, **how)
 			try:
-				fd = os.open(path, os.O_RDONLY | flags)
+				fd = os.open(*at, os.O_RDONLY | flags, **how)
 			except BaseException:
-				os.chmod(path, mode)
+				os.chmod(*at, mode, **how)
 				raise
 			try:
 				os.fchmod(fd, mode)
@@ -13948,7 +14107,7 @@ def _fsync_file(path):
 class _NotOnDisk(Exception):
 	"""A move's copy that the filesystem failed to write to disk (_sync_landing): a failed copy, so no source is removed."""
 
-def _sync_landing(dest_path):
+def _sync_landing(dest_path, base=None):
 	"""For a move (SYNC_COPIES): the copy at dest_path on disk before its file is reported copied, so no source goes while the
 	copy may be only in memory (a power cut then loses both), and a write error the filesystem reports is met here, on the
 	descriptor of the copy's own file while its data is still dirty (a writeback error is kept only on the in-memory inode,
@@ -13957,19 +14116,22 @@ def _sync_landing(dest_path):
 	finished copy (same size and time). Only the file the copy wrote is removed: the one at the name when the fsync began (one
 	lstat right after the copy); a file put at the name since is someone else's. A block device named by -d is not fsynced
 	(_fsync_file passes it): a move onto one writes it and keeps every source (213: a landing that is another kind of entry holds
-	no source), so nothing can be lost."""
-	target = _landing_of(dest_path)[0]
+	no source), so nothing can be lost. base: the door's result for the landing's directory (None: its path), every call
+	relative to it."""
+	target = _landing_path(dest_path)[0]
+	base = os.path.dirname(target) if base is None else base
+	name = os.path.basename(target)
 	try:
-		written = os.lstat(target)
+		written = os.lstat(*_at(base, name), **_fd_of(base))
 	except OSError:
 		written = None
 	try:
-		_fsync_file(target)
+		_fsync_file(target, base, name)
 	except OSError as e:
 		try:
-			now = os.lstat(target)
+			now = os.lstat(*_at(base, name), **_fd_of(base))
 			if written is not None and stat.S_ISREG(now.st_mode) and (now.st_dev, now.st_ino) == (written.st_dev, written.st_ino):
-				os.remove(target)
+				os.remove(*_at(base, name), **_fd_of(base))
 		except OSError:
 			pass
 		raise _NotOnDisk(f'{dest_path} cannot be written to disk ({_why(e)})')

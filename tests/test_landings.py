@@ -2100,9 +2100,9 @@ def slow(path):
 		open(os.environ['MARK'] + '.done', 'w').close()
 		signal.pthread_sigmask(signal.SIG_SETMASK, mask)
 real_fsync, real_os_fsync = hpcp._fsync_file, os.fsync
-def fsync_file(path):
+def fsync_file(path, *args):
 	slow(path)
-	return real_fsync(path)
+	return real_fsync(path, *args)
 def os_fsync(fd):
 	# the beside route's new file, made and held by hpcp, is fsynced through its descriptor
 	slow(os.readlink('/proc/self/fd/%d' % fd) if os.path.isdir('/proc/self/fd') else '')
@@ -2789,7 +2789,7 @@ def _spy_fsync_and_renames(hpcp_mod, monkeypatch, fsync_error=None):
 		return real_fsync(fd)
 	def renamer(real):
 		def rename(src, dst, *args, **kwargs):
-			events.append(('rename', os.lstat(src).st_ino))
+			events.append(('rename', os.lstat(src, dir_fd=kwargs.get('src_dir_fd')).st_ino))
 			return real(src, dst, *args, **kwargs)
 		return rename
 	monkeypatch.setattr(hpcp_mod.os, 'fsync', fsync)
@@ -2851,7 +2851,7 @@ def test_a_rewrite_in_place_outside_a_move_is_not_fsynced(tmp_path, hpcp_mod, re
 	monkeypatch.setattr(hpcp_mod, 'NAMED_DESTS', frozenset([str(tmp_path / 'out')]))
 	events = _spy_fsync_and_renames(hpcp_mod, monkeypatch)
 	synced = []
-	monkeypatch.setattr(hpcp_mod, '_fsync_file', synced.append)
+	monkeypatch.setattr(hpcp_mod, '_fsync_file', lambda path, *args: synced.append(path))
 	hpcp_mod.copy_file(str(tmp_path / 'a/x'), [str(tmp_path / 'out/x')])
 	assert read(tmp_path / 'out/x') == 'new content' and os.stat(str(tmp_path / 'out/x')).st_ino == inode
 	assert synced == [] and events == [] and not hpcp_mod.ERRORS
@@ -3040,7 +3040,7 @@ def test_a_landing_that_cannot_be_opened_by_anyone_here_is_a_failed_fsync(tmp_pa
 @not_root
 def test_a_move_whose_landing_cannot_be_opened_is_a_failed_copy_not_a_removed_source(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch, capsys):
 	write(tmp_path / 'a/x', 'X')
-	def refuse(path):
+	def refuse(path, *args):
 		raise PermissionError(errno.EACCES, os.strerror(errno.EACCES), path)
 	monkeypatch.setattr(hpcp_mod, '_fsync_file', refuse)
 	assert _move(hpcp_mod, tmp_path) != 0
