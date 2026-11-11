@@ -6287,8 +6287,9 @@ def _synced_at_finish(mode):
 	return first is not None and hasattr(os, 'geteuid') and os.geteuid() != 0 and not first & stat.S_IRUSR
 
 def _finish_late(records):
-	"""After a non-root move's removal step (ran or skipped): the exact mode of each directory _first_mode left open to its
-	owner, deepest first (each parent still searchable while its children are set), each fsynced through its own descriptor
+	"""After a non-root move's removal step (ran, or skipped, but for the copy's errors, whose remedy is a rerun, and after a stop or
+	an error in it: hpcp() passes the records that fit): the exact mode of each directory _first_mode left open to its owner,
+	deepest first (each parent still searchable while its children are set), each fsynced through its own descriptor
 	(_finish_directory, late)."""
 	late = [record for record in records if record[2] is not None and _first_mode(record[2]) != record[2]]
 	for record in sorted(late, key=lambda record: -os.path.abspath(record[1]).count(os.sep)):
@@ -15045,13 +15046,15 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = None,
 				_check_stop()
 				process_remove(src_paths,single_thread=single_thread, max_workers=max_workers,verbose=verbose,
 							files_per_job=files_per_job, remove_force=remove_force,exclude=exclude,batch=batch,parallel_file_listing=parallel_file_listing)
-			removal_ended = True
+			# Skipped for the copy's errors, the move is not done: the message's remedy is a rerun (see below).
+			removal_ended = not copy_failures
 		finally:
 			if SYNC_COPIES:
 				# A non-root move's directories whose exact mode takes their owner's search (0607): set after the removal step
-				# that looked below them. After a stop or an error in it, only those whose source directory it removed: no rerun
-				# reaches them; the others keep owner read and search for the rerun, whose folder sync looks below them (a rerun
-				# over a 0607 one can fail: docs/limitations.md).
+				# that looked below them. After a stop or an error in it, or where it was skipped for the copy's errors (a rerun
+				# is their remedy), only those whose source directory it removed: no rerun reaches them; the others keep owner read
+				# and search for the rerun, whose folder sync looks below them (a rerun over a 0607 one can fail:
+				# docs/limitations.md).
 				_finish_late(dir_records if removal_ended else [record for record in dir_records if not os.path.lexists(record[0])])
 	except KeyboardInterrupt:
 		# The stop is acted on: later checks (_check_stop) change nothing.

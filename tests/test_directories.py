@@ -949,13 +949,17 @@ def test_a_stopped_move_leaves_owner_search_until_a_rerun(tmp_path):
 		shutil.rmtree(work, ignore_errors=True)
 
 
-_STOPPED_AFTER_REMOVAL = '''import sys
+_STOPPED_AFTER_REMOVAL = '''import os, signal, sys
 sys.path.insert(0, %(root)r)
 import hpcp
 removal = hpcp.remove_moved_sources
 def stopped(*args, **kwargs):
 	removal(*args, **kwargs)
-	raise KeyboardInterrupt  # a stop as the move's removal ends: every source directory is gone
+	# a stop as the move's removal ends: every source directory is gone. Raised as a test raises one, or as a person's Ctrl-C
+	# comes (the handler, _stop: it records the stop and raises, and nothing has acted on it, so a _check_stop would raise again)
+	if %(signal)r:
+		os.kill(os.getpid(), signal.SIGINT)
+	raise KeyboardInterrupt
 hpcp.remove_moved_sources = stopped
 if __name__ == '__main__':  # forkserver and spawn workers import this file as __mp_main__
 	sys.argv = [%(hpcp)r] + sys.argv[1:]
@@ -965,7 +969,8 @@ if __name__ == '__main__':  # forkserver and spawn workers import this file as _
 
 @posix_only
 @root_only
-def test_a_move_stopped_as_its_removal_ends_still_gets_the_exact_mode(tmp_path):
+@pytest.mark.parametrize('how', ['raised', 'signal'])
+def test_a_move_stopped_as_its_removal_ends_still_gets_the_exact_mode(tmp_path, how):
 	# A stop at the end of the removal (a big tree's removal takes long, so a Ctrl-C there is likely): out/d's source is gone,
 	# so no rerun reaches it (one exits 240, the source does not exist), and 9.88's first build left it 0707 for good. The late
 	# pass now runs however the removal ended, for each directory whose source it removed.
@@ -973,11 +978,76 @@ def test_a_move_stopped_as_its_removal_ends_still_gets_the_exact_mode(tmp_path):
 	try:
 		script = os.path.join(work, 'stopped.py')
 		with open(script, 'w') as handle:
-			handle.write(_STOPPED_AFTER_REMOVAL % {'root': os.path.dirname(HPCP), 'hpcp': HPCP})
+			handle.write(_STOPPED_AFTER_REMOVAL % {'root': os.path.dirname(HPCP), 'hpcp': HPCP, 'signal': how == 'signal'})
 		out = os.path.join(work, 'out', 'd')
 		rc, output = _as_nobody(['src/', '-d', 'out/', '-rf'], work, script)
 		assert rc == 130 and not os.path.exists(os.path.join(work, 'src', 'd')), output[-3000:]
 		assert stat.S_IMODE(os.lstat(out).st_mode) == 0o607, (oct(os.lstat(out).st_mode), output[-3000:])
+	finally:
+		shutil.rmtree(work, ignore_errors=True)
+
+
+@posix_only
+@root_only
+def test_a_move_whose_removal_was_skipped_for_a_failed_copy_keeps_owner_search_for_the_rerun(tmp_path):
+	# One file of the tree cannot be read (root's, 0600; nobody moves it): the copy reports it, the removal is skipped ("Remove
+	# skipped ... fix them and re-run") and every source stays. The remedy is a rerun, whose folder sync looks below out/d, and
+	# a rerun over a 0607 directory can fail there (docs/limitations.md): out/d keeps owner read and search (0707), as after a
+	# stop before the removal. 9.88's first build gave it 0607 here. The rerun, the file readable, completes and sets 0607.
+	work = _shut_out_tree()
+	try:
+		unreadable = os.path.join(work, 'src', 'd', 'h')
+		with open(unreadable, 'w') as handle:
+			handle.write('secret')
+		os.chmod(unreadable, 0o600)
+		out = os.path.join(work, 'out', 'd')
+		rc, output = _as_nobody(['src/', '-d', 'out/', '-rf'], work)
+		assert rc != 0 and 'Remove skipped' in output and os.path.exists(os.path.join(work, 'src', 'd', 'sub', 'f')), (rc, output[-3000:])
+		assert stat.S_IMODE(os.lstat(out).st_mode) == 0o707, (oct(os.lstat(out).st_mode), output[-3000:])
+		os.chmod(unreadable, 0o666)
+		rc, output = _as_nobody(['src/', '-d', 'out/', '-rf'], work)
+		assert rc == 0 and stat.S_IMODE(os.lstat(out).st_mode) == 0o607 and not os.path.exists(os.path.join(work, 'src', 'd')), (
+			oct(os.lstat(out).st_mode), output[-3000:])
+	finally:
+		shutil.rmtree(work, ignore_errors=True)
+
+
+_REMOVAL_FAILS_AND_THE_LATE_MODE_FAILS = '''import os, sys
+sys.path.insert(0, %(root)r)
+import hpcp
+removal = hpcp.remove_moved_sources
+after = []
+def failing(*args, **kwargs):
+	removal(*args, **kwargs)
+	after.append(True)
+	raise RuntimeError('the removal failed after it ran')  # what the run reports when its removal step raises
+hpcp.remove_moved_sources = failing
+real_fchmod = os.fchmod
+def fchmod(fd, mode):
+	if after:
+		raise PermissionError(1, 'Operation not permitted')  # the late pass's mode
+	return real_fchmod(fd, mode)
+os.fchmod = fchmod
+if __name__ == '__main__':  # forkserver and spawn workers import this file as __mp_main__
+	sys.argv = [%(hpcp)r] + sys.argv[1:]
+	hpcp.main()
+'''
+
+
+@posix_only
+@root_only
+def test_a_late_mode_that_cannot_be_set_never_hides_the_removal_s_own_error(tmp_path):
+	# The late pass runs in a finally, after an error in the removal step: its own failure is a Directory sync error it
+	# prints (every OSError of the pass is taken inside it), so what the removal raised is still reported, and the exit is
+	# not 0. A second stop cannot cut it short either (_stop returns for every stop after the first).
+	work = _shut_out_tree()
+	try:
+		script = os.path.join(work, 'failing.py')
+		with open(script, 'w') as handle:
+			handle.write(_REMOVAL_FAILS_AND_THE_LATE_MODE_FAILS % {'root': os.path.dirname(HPCP), 'hpcp': HPCP})
+		rc, output = _as_nobody(['src/', '-d', 'out/', '-rf'], work, script)
+		assert rc != 0 and 'the removal failed after it ran' in output, (rc, output[-3000:])
+		assert "its mode, set after the move's removal: [Errno 1] Operation not permitted" in output and 'Traceback' not in output, output[-3000:]
 	finally:
 		shutil.rmtree(work, ignore_errors=True)
 
