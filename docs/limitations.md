@@ -20,6 +20,20 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - **Revisit when:** someone needs `-nb` on big lists.
 - **Approved:** 2026-11-05, the user chose "Known limitation (Recommended)".
 
+### `-nb` with merged sources moves a shared directory's ctime on reruns
+- **Kind:** known limitation.
+- **What the operator sees:** with `-nb` (each source in turn), a directory that several merged sources share (`hpcp a/ b/ -d out/ -nb`) is started and finished once per source. Where their modes or times differ, every rerun sets them again, and the directory's change time moves each run; the later source's mode and times are what it keeps. 9.87 does the same. Batch mode (the default) syncs such a directory once, from the later source.
+- **Why:** fixing it needs the later sources known before the first is synced, which `-nb` exists to avoid.
+- **Revisit when:** `-nb` gains a pre-scan of the sources.
+- **Approved:** 2026-11-11, the user chose "Approve as KL (Recommended)". The user did not ask for it explicitly; the 9.88 A–C review found it.
+
+### A Ctrl-C while Python itself is starting is dropped
+- **Kind:** known limitation.
+- **What the operator sees:** a Ctrl-C that lands in the first milliseconds after hpcp is started, while Python is still starting (inside pip's launcher script, before hpcp's first line runs), is dropped: the copy starts, and a second Ctrl-C stops it as usual. In the 9.88 build's probes it happened 2 times in 12,000 early stops. 9.87 does the same.
+- **Why:** no code of hpcp's runs yet at that point, so hpcp has nothing to hold the signal with.
+- **Revisit when:** Python changes how it starts, or an operator reports it.
+- **Approved:** 2026-11-11, the user chose "Approve as KL (Recommended)". The user did not ask for it explicitly; the 9.88 build's import probe found it.
+
 ### False Added/Deleted pair on compare with `-nhfl`
 - **Kind:** known limitation.
 - **What the operator sees:** comparing against a stored list without hashes, a name with surrounding whitespace shows Added `s/a/x ` and Deleted `s/a/x`. 9.80 does the same; with default hashes there is no false pair.
