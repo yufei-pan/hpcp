@@ -187,7 +187,7 @@ def test_remove_extra_after_dest_image_layout_copy_keeps_the_copies(tmp_path, hp
 	(src / 'sub' / 'deep.txt').write_text('deep')
 	dest = str(tmp_path / 'mnt') + os.sep
 	os.makedirs(dest)
-	files, links = hpcp_mod.process_copy([str(src)], [dest], single_thread=True, max_workers=1, dest_image='stand-in.img', batch=True)
+	files, links, _ = hpcp_mod.process_copy([str(src)], [dest], single_thread=True, max_workers=1, dest_image='stand-in.img', batch=True)
 	mirrored = tmp_path / 'mnt' / os.path.relpath(str(src), '/')
 	assert (mirrored / 'sub' / 'deep.txt').read_text() == 'deep'
 	(mirrored / 'old.txt').write_text('extra')
@@ -522,7 +522,7 @@ def test_tracked_directory_holding_another_sources_copy_keeps_its_own_contents(t
 	mnt = str(tmp_path / 'mnt') + os.sep
 	os.makedirs(mnt)
 	srcs = [str(s / 'a'), str(s / 'c' / 'sub')]
-	files, links = hpcp_mod.process_copy(srcs, [mnt], single_thread=True, max_workers=1, dest_image='stand-in.img', batch=True)
+	files, links, _ = hpcp_mod.process_copy(srcs, [mnt], single_thread=True, max_workers=1, dest_image='stand-in.img', batch=True)
 	keep = hpcp_mod.create_sym_links(links, link_tracking=True)
 	image_c = tmp_path / 'mnt' / os.path.relpath(str(s / 'c'), '/')
 	# img/s/c exists (sub's parent), so tracking found its target there; other is from an earlier run.
@@ -1159,8 +1159,11 @@ def test_a_copy_whose_sources_landed_in_one_file_exits_213_naming_both(tmp_path,
 	for path, landing, other, other_landing in (('a/p', 'out/p', 'b/q', 'out/q'), ('b/q', 'out/q', 'a/p', 'out/p')):
 		assert (f'Destination clash: copied {tmp_path / path}, but {tmp_path / landing} is one file with {tmp_path / other_landing} '
 			f'(from {tmp_path / other}): the destination took the names for one') in error
-	# The landing holds whichever was written last (in parallel, either), whole.
-	assert open('a/p').read() == 'A' and open('b/q').read() == 'BB' and open('out/p').read() in ('A', 'BB')
+	# Serial, the landing holds whichever was written last, whole. In parallel two cp processes can write the one file at once
+	# (each truncates, then writes): it held 'AB' once in a loaded 3.6 suite run, so there only the sources are checked.
+	assert open('a/p').read() == 'A' and open('b/q').read() == 'BB'
+	if single_thread:
+		assert open('out/p').read() in ('A', 'BB')
 
 
 @pytest.mark.parametrize('copy_failed', [False, True])

@@ -142,12 +142,12 @@ def test_cp_version_is_read_in_the_c_locale(monkeypatch):
 		task.stdout = ['cp (GNU coreutils) 9.4']
 		return [task]
 
-	hpcp.cp_supports_sparse.cache_clear()
+	hpcp._SPARSE[:] = [None, False]
 	monkeypatch.setattr(hpcp.multiCMD, 'run_commands', fake_run)
 	try:
 		assert hpcp.cp_supports_sparse() is True
 	finally:
-		hpcp.cp_supports_sparse.cache_clear()
+		hpcp._SPARSE[:] = [None, False]
 	assert seen == [{'LC_ALL': 'C'}]
 
 

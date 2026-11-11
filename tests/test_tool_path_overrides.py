@@ -51,11 +51,11 @@ def test_cp_path_is_the_cp_whose_options_are_probed(exec_dir, monkeypatch):
 	# the real cp here is GNU: only the override can make this False
 	monkeypatch.setenv('CP_PATH', _fake_tool(exec_dir, 'my-cp', 'echo "my cp 1.0"\n'))
 	hpcp.check_path('cp')  # as at import
-	hpcp.cp_supports_sparse.cache_clear()
+	hpcp._SPARSE[:] = [None, False]
 	try:
 		assert hpcp.cp_supports_sparse() is False
 	finally:
-		hpcp.cp_supports_sparse.cache_clear()
+		hpcp._SPARSE[:] = [None, False]
 
 
 def test_an_override_with_another_name_is_judged_as_the_tool(exec_dir, monkeypatch):
@@ -139,3 +139,19 @@ def test_an_override_in_a_directory_with_an_equals_sign_runs(exec_dir, monkeypat
 	directory.mkdir()
 	monkeypatch.setenv('DUMPE2FS_PATH', _fake_tool(directory, 'dumpe2fs', 'echo "Block size:               1024"\n'))
 	assert hpcp._probe_ext('/dev/x')['block_size'] == 1024
+
+
+def test_a_cp_version_that_gives_no_answer_is_asked_again(exec_dir, monkeypatch):
+	# entry 5: 9.86 kept a timed-out `cp --version` (False) for the process's life: that worker's copies lost --sparse, and its
+	# rewrites went to cp by name. A fake cp silent past the timeout once, then answering.
+	marker = exec_dir / 'asked'
+	fake = _fake_tool(exec_dir, 'slow-cp', 'if [ ! -e "%s" ]; then : > "%s"; sleep 30; fi\necho "cp (GNU coreutils) 9.4"\n' % (marker, marker))
+	monkeypatch.setenv('CP_PATH', fake)
+	# 3 s for the second ask to answer: with 0.2 s, a command's start on Python 3.6 (through the exec wrapper, a second
+	# interpreter) outlasted it on a busy host, and the test failed 8 of 40 times beside 96 busy loops (final review)
+	monkeypatch.setattr(hpcp, '_CP_ASK_TIMEOUT', 3)
+	monkeypatch.setattr(hpcp, '_SPARSE', [None, False])
+	monkeypatch.setattr(hpcp, '_HELD', [None, None])
+	# the held-file route, the first to ask: no answer, so it is asked again at the next rewrite
+	assert hpcp._held_route() is None and hpcp._HELD[0] is None
+	assert hpcp.cp_supports_sparse() is True and hpcp._SPARSE[1] is True

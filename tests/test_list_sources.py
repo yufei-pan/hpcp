@@ -3160,14 +3160,16 @@ def test_a_source_that_cannot_be_read_leaves_a_hard_linked_destination_alone(tmp
 
 
 def _cp_writing_a_part(hpcp_mod, monkeypatch, fails):
-	"""A cp that dies part way through its write to each path in fails, to the file held open at one (a rewrite in place
-	gives cp /proc/PID/fd/N: os.readlink names it), or to a temporary name beside one, and works elsewhere."""
+	"""A cp that dies part way through its write to each path in fails, to the file held open at one (a first copy, a
+	rewrite in place and the beside route's new file give cp /proc/self/fd/N: os.readlink names it), or to a temporary name
+	beside one, and works elsewhere."""
 	real = hpcp_mod.run_command_in_multicmd_with_path_check
 	beside = {os.path.dirname(path) for path in fails}
 	def named(path):
 		return os.readlink(path) if path.startswith('/proc/') else path
 	def cp(command, *args, **kwargs):
-		if named(command[-1]) in fails or (os.path.basename(command[-1]).startswith('.hpcp_tmp_') and os.path.dirname(command[-1]) in beside):
+		target = named(command[-1])
+		if target in fails or (os.path.basename(target).startswith('.hpcp_tmp_') and os.path.dirname(target) in beside):
 			with open(command[-1], 'w') as target:
 				target.write('par')
 			raise RuntimeError('cp: write error: No space left on device')

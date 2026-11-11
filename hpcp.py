@@ -9,6 +9,7 @@
 import argparse
 import array
 import concurrent.futures
+import concurrent.futures.process
 import contextlib
 import errno
 import fnmatch
@@ -19,10 +20,12 @@ import itertools
 import locale
 import math
 import multiprocessing
+import multiprocessing.connection
 import multiprocessing.util
 import os
 import pathlib
 import platform
+import queue
 import random
 import re
 import shutil
@@ -35,201 +38,208 @@ import threading
 import time
 import unicodedata
 import uuid
+import weakref
 from collections import Counter, deque, namedtuple
 from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
 from math import log
 from pprint import pformat
 
 try:
 	import multiCMD  # type: ignore
-	if tuple(int(x) for x in multiCMD.version.split('.')) < (1, 57):
+	if tuple(int(x) for x in multiCMD.version.split('.')) < (1, 59):
 		raise ImportError('multiCMD too old')
-except (ImportError, AttributeError, ValueError):
+except Exception:
 	import sys,types,base64,lzma   # noqa: E401
 	multiCMD = types.ModuleType("multiCMD")
 	sys.modules["multiCMD"] = multiCMD
 	_SRC_B85=r'''
-rAT%)=o\O*k16n/!WXAE$ig8-O-i5'i9DjZ(gR+RLdFUh,;[5]%l=/aQgL]knEMJj2Td\)1[`bH(.0)JfPPs3eIh)]U<,WTZEDeSe:(YNb%NdN`;%MLm
+rAT%)=o\O*k16n/!WXAE('"=7F>)aNi:=rV**iOVLdFUh,;[5]%l=/aQgL]knEMJj2Td\)1[`bH(.0)JfPPs3eIh)]U<,WTZEDeSe:(YNb%NdN`;%MLm
 ps(uYZLt9N^(d>j;?gF2fq.JS8E^d=!D`Sq$Gt&.k_&Jr(6<fc-."_L#%?6QoJ:i3GQHb>?A/=XqGZdH'Nu>j"g6i-cqUX1Al)9;U'hMS[PsbB-tdCiI
-VVRN65*?GL<kIO7Z/j:-TJ#--6!gZ@"9F@Y4QIP8RIA*-bdk,+]#OSpqE:>dQXWo%Vq.P6Z$)MWFf[k`LRT2[,*GhHZ+.Lg1@2O[<[B*K-.'N:N8H<<,
-&E1(pirr)5m!#H$,j*ACTEldRI5YNJ%bV?H%V$;hdcSHb_`4D:n9m6o6@reHo[D[;$.gm!9.Uh1`p@H#R:?pqY4dp,biP?jQA8q`8J7=e]+2fTO:g:r5
-JD/Ok+BP:ZNg8Ufpp3_R\<^ssZ3(N!N1mi^M3B+b</b`/fF4E#P't""3\3U3n+KsNdn[1$*@<O#[P9\R2mZ*;$KpQ;XhrMlS-FUZb`eQ,TOC-C/_K(@j
-PS&3r><Ohgcbp[!B!$O+V0s6Q*L=G+)9sZT4"^I33/EHdeWoqeM1AFkeq;a9;_(1$pohE.-O0H8Z%ig;DbR7sJfs!6,df=,m"Yh6+Jl[7)fnV89KQCa>
-3[_N#]9:M5PP]W7s"2cp4i!CBq:"AATg$E%1S_/rL2m-6XXi*5k$<V/Yl0R,8?)[&/2ejCJu^?Ke67`g1/<jVKg#j$PTRGgQRs98%nJ+NOUbn%8]ad--
-ma!bMPQn5/M?bHbm%ifkhBrKVu?^K?$#B(Q*SoIg<Q'Ep-(4HWNA:g+_Ep)/;T4KS)ir9$hSAWc><up/R]#U*>W^IO-LN`^hTa7P9RK)SF*GFNOdX]8N
-/3(.`NaL!NX"O=j=KrM=&*GG^]>H)OgF5+nd:$R=u[RHTCZr80Wos5]#U>WKDXm)SB:h)@`^G9KKs1kZ,umF0>FH75KKO:o8.!F[3Y\P@CTTm/L6/[s'
-u"E#+Fki,nQBnoR:<*R3S\M.hRaNu<1Qn9Q"GR?$DaM2)YP5_$gXTNCLb9h;V]Q)uj*&7Cg0@nC5;HH#Q?Z>^&$OrnWq^I)5!>1tE.Te&0:\Iej]Dh5X
-7N_Rl@-.K(fruakhuWDsa8IdP'_@YbhX]9qQ0Y#rQ#HINO"TAdjSMr,/o\KsR%%?K]U#BoRMp8#;m:cpKE&%(Y'eI<iK]u@Nek4@:J`[]UquS2q*eEd(
-*aF,^,3R-82%b?3OS?55]1l@Ul6GSgVDT/$BYW0)[l7+<G3aNDJ/890F*3N5X?K6;A7KGmqEDA]q`W0`SQ13&Rh`Ifd-7W.PXjR7.kh3h):5B37kA%Q]
-8Q!SUPlN7G_pQU`F5F.8K5I[L"YMfjrFiC?"ca.@s7*(oXDMlnY#iDggDune[gu3-)ceAVTpPE8=IMK]72IZAu?-.p8n5j!17AK&a0[R_:(:Hcm7PG3n
-1;H4jTGSG/g6]jcta<;LqQ_b=Rk.kc;.o7,IEn<1LF]lRMHJOjG8/,LA*r'1&+?:RR-06Su9Z1`CRIK?9q)%u.q]'L,^_g(LQ,#@<C`AY1XJ0"jb(=aX
-aR7M1BTS.EpY(#;@rD?DqA7[[C+\l1bIGp-h!KpG^ZVl0U:M*IiX\'(jHd<9YPr:B6D/#sDI:-^k%f=*cj^;bTEV55l98-^51[nLaN%1'=0U8J<55Z+Q
-rJ=/keu5:`$C<ZaUq'U2oSa+18d<m!DR%Qn!rQ[cH)#"gXj^qmUb6Z`ntY[k[H,*j\LYSas*C)4XkIA+,r"QRbUQ:+m+_9!cU(/]Ohu0U/:nIFDrs/$:
->#",l6Wk@kSUH]\p"EbU%8u%E)O"dArh,n43^%78FAo',d00'%:@FW%,o+PQ<oXM6L_7!o@m*ag$GuK^O'fq6aaA/>Z1n^a9)/60;s@Ns3HV07YtsnUX
-\XXC7XVHW_3X+70L<'8]=2<aTa/!HDqqKFk(dVj?(6\FrlNe<=0,R"s/$C`%I28?q]N?"m`#RRr'f9RkD2u%:nm88\hL%9J3D_-M;t1km!4V)m7J&f-^
-17lY1n6mOCl!7n.&I4N%h'8XV1HVY"WAJU@pT<>n9%j36bVYU->KNreqbgilGDiV>.lK,b3I\]ir%IRl0CFlO![-1RTDI"kgE1g!9Q0o_T1J8pI##II4
-43VrP&m[u]LZn4`Hm&/^a32Lhucc7c4&o:qKKPC"73.[uh5O4$-,c66.-J2CLi``S7Q=.uiS%dXnqupaC!g-IJ*HIQZ1H_su-f_+uUYH3(k0="X4>U9D
-^([WH%oRg9I1!pra3Za-!(TeWB4A"\Q^3bj4&9p+*4aM"Kb!<NeI"40.4.N^S%TR,(u:Z-d?=in*TR$+eD.tp!d"j5R3VVGFqI8o7EW75ai20WdW'>FT
-;\1mVWYJ2%U_!/IKg85Y[K/3gY`&Sei4=_K>c9HBjQ^)l)'Lqfp22Q7984hrh(t)WC:$a'T=)Yp`3ehdS_N4B%IbK+#eW1ousKsUfE<@>YpJGME"95kF
-0qjcTb\fJAVT]#?'hW1hS@<A$pb?k0t<n70P;_RlI#lNY!?qa*hqK)nel\$_n%fdfpg6SU1;'G=4ntjuk[Kk_%skR=sUCrldB*R_V.M?@RC9jS!fN*Po
-@$6n=u7EJ5q@_R4'2M&gK<.7<:1;,(:V&'&T_[_!f!dTTZ@,FRnN@FkVW:D*ZE-IF]LeH['8kj6Og";E=VQrf7c^W;>?mceI;ejPN!0h-/l$u6\P3Zga
-Q^Q$W6n):&tL[M&Sr\)YL>k`8hlk@]Kepb[P8BE`s.,oXnc!UWs[c>dMV?qYjA:MV*41?'+jU=PFR&EHb(KP<j)*osOG#T\6:"F_H@psl_jUF:qH194%
-8NFGG>VQChPO/*cA$?0"J8CV[ZAO:jU8;7g_,TI97uF5#<Dq1EkO*tQ^<$02@ICVOn@`XGI^2T,?D-,T-ACteP6OigQr,PS6;="m?$pm.0D2n#o[U<Rj
-rg1reUut_nLBU:$qM<noHUZ^(`LMb&&&@G8MU?ZKB@b5J./__(@8)3aFerC8N_3^[db.r)'jWV'Q`^"+`\8J]rU+?Qb*>HCBXId[!]Rl7][)XZ2jsL()
-*>CY[bjMjLHmJB9@FnND#k90kRU?pm*?-:KQg@"NGtGf68CTKS=)&kpd(Hm^Jo`k'5>u]R=Y=Y,/C*>lqK&r:Rr9Ic2\tYqg]8NQQ"70U@:+=#8B[CLr
-(8Qg?h^RZrHrd@C]f:-'XAbRkuA:NLhORhZ2MYNe40.+D=QKt3CHR'&O#n)k&m21jU_dKD6iptKBJE4FAGfEb)?[=&)L&-h"^%e/WFbm75"_kap<UH2F
-$=)<+hL%>L;fWdcTflL*Z_EU1PqXURi"D]SG!C.#jl)Fk-bN4GuoXa+;oR]\Z.bct.f;W$Y[Uq2`lsh#8e]#TNK[Y<4Z#XFR$Ro;uC_J[5:@J7:G*,Qp
-c<V.[hK*4oIGBcb7R@u<To6K-['/Yh5oC;6=PmI.&r1(*&"$%@BA_O"fPLdUe'2K;)%,tRB8Ir2dB1-VOJi?4BY^bjZM,nLW!?^I^^aadDRI!7l<fU<j
-+1_l;qEtCrCC_3VOtXB6G[/DYUBIZq!e8bNY?#@G*H`L$F>$H!a]Co=DT3/!q)SK@C#'*!,G6^dnuNP7<#fL(9M/>8,64q2ZtqtW5H*AhRl=Ur$^9t7T
-*+8?Lsu;^\KOk=o[@acks)dKf,r%hm<AC;c;34ki@Md+^M28BD)j[@.$Ag;CH!305Yr^8i0IFm)\aRF-GSq-P4ch&F2_4X),=n)s\2+)KO/4p1?SaW2I
-%TO$<Puo^8VXBOY!8m5r#/46h?%V9dX[1,,8eDurUo"O$k8%TXYP(sEYkC@LiHG94\,%JW:f,)Be[aBbYCBQ_b&s0!K,X-UbgDl&`s;0H+iGbmO7pSP4
-+B[7A6X_:[N"%c$:Bk1i0pgK<$&0$i4B2odQUuI$)+96Wo(;'sEMA=QJ8q-bScAm@W]K^]nDtp.1&D3.4Y1Eia/+^!F>?qRnICiNk7l.<1W03Hah\C/#
-l9O8/FlIcpRrgqD`fp2P+PV!@LpOi7L1(QI%h2&=D',]OE?'?QRj&G"fZhKn-,I2A_a(ds@PfHU"XMuN+cb;eIq_M3ZW[l*6$Z6pQJa@`!&]9E!e@PTb
-pR[:=ab$,EpUcPaYV22Pk`B!Q_AOJJmoa??laIe#UsbUBK`@(Z20Ra52qABD_OVCc^h91)iZe2+J!e4S_"gXr!-=hW7WM^'JiB4W0KQlHhVur5WFd'5p
-PS4Q=<_o@tqme_X:-.:cN@SU2m`:kTM/YjX/&f+Ef]!-C#KF3^sulYG,b=n7VHGcdQc6+D9V`\#LDcje24KoZn?;LBG/<jr<1'bTpfkV0>[dOd?/;[^S
-:YX1?:d=iNK549n,9nu=KI.?P51-D%.,45jjgY0_NP!)\`6Z5(U%?o&i%qM#<+<m/:3Ue1@G5A0K+""#(H*?G1"B*EX\^Q7K_NM>#G@3^@l,*RfIKqhF
-K&-r[4#%L<HqdIA"mjgRB]Etl=Wo<X"iAts):QF!kqSX/dj_/"C7^5fol\K_h2W@#4A9R7h#mVTup'+=gEl2F_<&BY^<6a"?e$n\.pSJ9$NdpB[p!PQo
-X?!Y7K)2kcP<D,k[RR;Yn\q=&-n`hZV$Q`2#*Q94Mg;)=!i,ut@8#AtNgEHKe,CQ#Nrip-!8TZO-<sd"iTjqV"G7K<>ZN=u;5mc/TTl/#Sj95LHsB$WF
-=R!h!<,0SIc3/.i]#LV=e`^iOA[IF]sh7)LGXm[Ir]Y*34Uof\k$O)d)t%;H%^Da(DP%>W-)=1!l0jA8!NliA_S]LW3[!&">;/;R7R+O^\F/X?Q0?@d%
-trUO<Xq4eKB;a(1#.0qV7^Hb)t53C4mAa$"IYuD&mFBAm=Z7T/&;p:.HF/H0<((YAE<QjAG.7D'lC\NI5bRBO#)6OGMICY6@99J+*uA]@q(m%""3)8$2
-t/:g5!a#]s*2hdC_ecWF&Y`mnE1K\*=o*FfnaEd"2MAepg9&BOp5JlAgfQAt!j$cmQoLY&Dc+IZ=7N7EkKL9-kB)<3(kbg%E9Ed1,kWdh]/pOWk[&83:
-b;3o1i:YqN</iBKU,V(>U&Dke#&l&kDN2SO5<(MH3fqI3EDHO(G@Fib!'*N:8VR3&I2L.=n@)Q=cQ*q%Jk1.01[MS7U!Ga[)Xkc"oE0OlOmG`htDT"PY
-_BChXVhNsu$1RTTj-2**Rm/e`@KD%Go0bhW0uUpf%.IQ+-7k;!IfEMW[gLN^N,h;D?-&^N&+e"em;*a*a1B)nEJ&3J;X\>Pm)hpn8"FN`PDa?[<Met>g
-M,Jk=K(>.C:9$I<c=rl:"K9%^G<:cp&\7cMu((OY5=h3&EXe3m,MB0V/`#Nr"HZJE[&)ldFuN)UqSo['=T70>EYKr`=o$L?o^RmKZpQ#gf(I1Ck\aT)s
-olp3?i,r&F1,eX?)?-S%0or:$A'!Tb9;0-)i+7MrANK`j2M__UXA6BX]ppQRmtK_1*M:$70c0`;o@^8+:mX0D3jJ_26-4M%>'pm9([L27;mui>kE;m#>
-mql4`#Wl:h<?/n^H,#[<Ymft%E@eI)T&.pt=R_o/M_jqlar'qLaF9-,ooC@2bkk?:nNn=$+m:F&88rGpJC>+dX$d=&nXf3]=WN5n#dRlH9jBFWRkQ@)X
-N*4q,NHDK1<c0V06emd95_J)kEL!VFB]k96R@eYhEju:07/kX>k?e+QT]8Wh&b$10p%kR8c0o0anS\Mmnr:Gj^l%l8ue-&kjK*,+]f+H;gN5eF+A%!?O
-rCo)X#YM/AWan!YKB5!NI>!YG15.mr!/4Sb/SBYqo>`Ek"3YE\>>b1iirP"pX:_2LW=C@cm*/><:LcoqLC$b.K%(oHpWV9(!h6A7#HGWYh%^=YDIgi,m
-b*hT/GR>98u)/Ek[$pamr"5NpCb5eE64j@JD18/\<7mLUEa*ji@G#aB$gRB=Ddj?\>C3nG#Yd>a1p>gHdF2]%PG%RGO1,K7s$\!WFAgR`J("Z%h%N*`Q
-UNk7NHJJj>lu_>nC)hmg]qXckYTF#:d#Be[]GS)a[RPcm7_=dM(+/<sYI:X8qk1-.q,b\u>aMBI`V\1<[AGa`(U3kXT)Y[)N.[$I_[A<_P-`9aaT$Lf,
-mp0quDXB][rM]<.h-CuuaI&>K"CC&-4m1lWM+4*91H")Ds6AiI&WNrg5_@:mLI$@Y?\Z@'?S>X'>W1oS[l\nW'$rH1"6Q8u]:g_W:HNP&?DX@c[t/^>A
-Tq)E9V_*)HEP"V5g'-.-*Y];Nl]^hW*Y1Ze&[4!tgHo>=OlPKh2^Qiap99=J[>aXJrf=kPkInEIb1TU)$5*@M3Rj[]':Pc>[J@`a)BGj5PBmtK"._=Ea
-XpsPBVb,<Zb'bF/2SL3_r0jU>R?C_&T4%):q+p0]qVjgT(r?;kYXWSAdfRV1"tT)-/qK%[SuV8@+'Y1q,JJj\p&dD357LS^'Mh.*guHQZ59?IM^Y?MFX
-bE4a2***HW72g`,m&q0,/S!mR[\4CYb++9gGo[1!'SbD9'eO$9+R:DGcXl/)iAL9Bg82#!YXb)I5&L$;1rds4_M7>j[#6p3NLl2[J]r>2U_oiTQN#T9M
-HVkC-0*W?Q\.G\\m+!W.k$o#U"n4lODUXbIoSu%JdKRXTq:Y"0'"8cQTsqVRn4'oT?4L,2@T>+?Agg*J2ID!2-$#"-D>KIp$3/V<jE#X.lPBch^#S;3*
-KOJBR+i9:f1*+Q"jrjCF*JZf-Sf$Kg,7m?0<<W#L-U+g9sh]qt,Y8i8@!ZAt!rA*1.>L/>;cmF#P8oE6!.gH1SO;13YP)Tb0DcaE$eQRu)cKe>Ve%>eW
-U9($W5W72BHr+QVb$&_n(4*7t>_E"EiRR"nKeKol;6tHRiml-q)R%e\u@C6$+P`Qi%Mg1sp"oFRXKQ@1KU/(.M*_i&7?'#g<9*mhn#[>X,U7"HAm2eFM
-ccN&5l\]*[g%MO3JK&$%6ML%CqlbBlhUtlGT6].gGZ57-6mkI<5X7$`5W5(Xr)+ps[(n*gh8i@3+@*d,.Up=55o,7udd$+!cp*Z8Uk%<(GejXf!fC<]q
-ccX7l_og:DZn5NcrfJ03f"mu:>n9%q1mrk]bYZg,LI2;(8/bkb#cI!dd5HlHH&oAXK^NqF$_d%E340mK1S!(P5<"?#Z"9fH"1?9F%1[cB]s+)H2IMX!&
-NB&G"qR!%r^+I4P([&M<<-n6NTrj[s8iGm3$fG.4'0:iGU,*0k;FXLUfS=nVWs1#.+S:=MHS.,<&N=7oaA7\<-<m'TYp+5*J_?,kX[<Oc)3Uo1H\iZ84
-0H>7NSD>4Z$'0*-rD/5a?i4!jajUrk^:G>;WmVc2Gpc1qO$7<4YKkFJn2Q+/j3PutlK^uS9"AA]s,2\i]?K[Ts7^t[-f*0V$$K!2Z$Tcj>:O)b=YPYMo
-lc*LrRk9Rk>S''[ME:q3Qddj+RhBJc7C8a<eo5glGnqnI!7F/WZ-=PqS6=uadd=K"*MXVcH=%7Q#pT4K&CG;6C7CbJ?i)iR49?*r+J4"[T?U@V?9(LXn
-GTdlejCHIrQAk@3i_3')XXlGkH&Wc$=s%ie#fA969^N=[n6M(b]rA_k\B29XW<Hr4:X)Y3Yin1C#i!=/YPCpM#jOaB,6R2#fI`%IF:lrb`:$orNPT9X=
-3<;CgJu?)"#0Dr)bGOY89.J'(t[og:K'k-c21SXii[(IUOAl+VGlUjI'<9b$!Bk6/V'gt].0gb.;s-]Tfa$T54-Z)=5R5'522aA>O':QcH.PiY"&OW`k
-(tn;Z8uK!BHI^op<J'),mu=W,;lq2`XM3kZ)OB;]'sV%#Eql0Uh>'.TJ";l_*4M[1ZNt7-l3>@BCjda0X4k,J@Su7KfJSY2O7K)Jb%5S6a:u:(eXg^)9
-He6E>EF'M6`=-#NlO%K\W*1=]IG"#i+0N8!T3P7HA#X/i1_)*-NP6+!:,8RL-$"IereO_M2_QeZhH1A0qhHa?b+=IhjU,$.JcM+.*Z7EYHgcouh07oBW
-%&VH4X$b>`[oAZ`p<42Oo(43r;A@tj:DW^NTLNW9\Oh:N.X+I[tCja-?Fu]Y:`B0E>;2-+qd5tkELS+JeR;R\*eh4]RnZ[o=F'[`tSL(6!+3V?#p7jt2
-8jJ7@ajYZ!7"T=u<Pa@3O9E[>HduQR8`E[$q3+@KPIlnco<k,pW"-CPA27kC]SR/V?oX,TQLs*qC<E>9M2eBs+^WKhC/Kg4ZK92U#g'[c\8ArPV50B<B
-jFSc:3s6ZDR]18Hf]IYk@f"*8-#Sb[2r1e.32pVFND.YN0.D!Q5lUkA!hdl*G.]KGQ"$fforNHO'P:\m)W!0n4F7@JoX.d2#nfJAm,IXjHJ\(Q%keGj]
-hQ*,,S+u;+b0T;3YI9B<AN/\tKRjM3NuJW)c&"_Nh\eIZo'2n8!2Zb4@HEb,tq/A+>sgf^mr$A4_aWZq,cBcI`0tQYArR4,7\ma6=1piGgLl18t^MA+9
-'GhS]C\FP[9U;"c_=n?,TF5o]f<!<F%8Ys0bkpnqG/>O^k:h_=l,U9eNgnJYZ#%K$2>W+jXeJYB%8VOQQ'!_OZQKWB4SRAI,>l)c6KoaKY,Rdk8RH@/"
-h-?J_+2e"dG7')hH+m$;d?:L=@Y!NaFKNCIoTY:rkJP@"7Qq'?h??3qmW1C-=E4-cq"B$[L4g^eN=@btE<pB=@B-m/b>B1#0-TB=]Q7!>NSG5pFe.oQG
-l8dm([%kZU?+R;tFV8Tu:?Ms_ZV8AqHArnVotmI<LkE.O_JQ0AQ)q]ps%gXup%WqFI8UcbJF$fVFMZn"lp[#lMcTki-UM)K)kfZgFg)u,,.41V<k"036
-X3K"16&!-*81:\&&@.c&t"M.f6&;N"T=:NG$>l\MKla]]:YA??+_*r(5%i,?\$`-L4`EnYS8("%S4Li8lro+Ipt850\VESpu_4J/X#PRKmH8@S[)em&u
-peYP/Yb08^C8VJP&*oE;^&7$XBqGX(R]Uf:,4bZ34:L<idG8#L$-(=Hl*p]?Y5\HU+RL2uB75"kc*5#DHQ4\#RpHZH1PKDJ[M_eg+XKW-!RsH@]c&::I
-?m1%VBM[4a;g?4,;!;Y3es["Oq2mlb5C`a4E?ACJDWSecSD)H3L2$!+Z/*XB)4`D@"Bpb0)dd9sj4P'RJ770A;RV44LG&Q_3a[.2Ejb.T!3PIG6K1T[F
-W#41PHZ#cK-:)pHi#/'//?_AHodBWM1<\2+1V\.;[_;4Lhm9TN?GjGCm(IsBP/X$)?,.biKfcAVE\t(W[0Vbo(e\t7WQ4^lhp'CmHQFLJ!7'be%cDRfs
-r=+s&%Fc7G2HhZ<Imi\H"*AA[,/no`?tg^OTIY4q^%a.5'E:uR&hV#^da@^8Ee(=-];VT1Ceq`(GlE-V$T%uL,FJ?QMGZM(P(n;XKg3M]9jI;O_kGVWn
-_HDlKIja$C1fS!$VY+a+:%,$\oBf+rUH<!2qKp?geW=(O(%A@Sm.`g67CP1ci.BY&Ao?>(ngpb#UG<Sp]'iU`goJ$`cIct:&f!SF!!s!0:q)?>?C@RpB
-D#'64hK7(lJh$JjYERjBsYdAFp=&cVh)tgkC_Sr\lsLrMS__N1'?^bT!_"bcf-lQ@+!1/dIccgF+HrE@W\pRUM7li2/l)(Q/)rf<EI(rUjjO[4Cam?kh
-a-R7_`t%6_anG#i!7ZlQ'Uo6;W,C1XB>GPgC;kJ=f]+R-ur9i.9^&>M:U0^`9-GAa$E#K'.*h&L='l^]t48_kkG@pupQ;-sB21A#BLR0mGtm1pLVhQ&D
-W#2+:BCi/UkX8JaK%*HQo"#RnHb:>*?`&!AgVT&Eq0c'i&%4TWLX;_OWP*W>4l&f&T570mumI=R!n$hkhQ6RDR&4fi(4cEj<'`aEjbBIRFY;]N9&p^'"
-/]'6Zg$ZC#M\?WglCAC(c+>)^?O@SXRTAtE!!@#*k$=ulmrD6G:GX<*#<H/"TDXYAI!7m_?S[*B[oNsKegJ&^:/+H_a9$$dA\V;*WQsDJmT5m:,g`9rZ
-N)W)RQASES4hhS9b1AqF!7l9Bh68;2,)fb<KmN.#Se:pK=^+@]BnRW<-P>)d$@+1ikN\Z;Cg#YFuMiLZ'MQ*>MoW\PDJ45C/qbkErP,]9c+=C$[p66kB
-cYE?:]mif9&jtjT-^.[WZ4KC]?SD1[[4#.D&bu6ol`9K!<>ojX-#?,Y*62hmj!TcfX@kc7%SNJ^1KC]PK^Mb>BFe%)k*kkS'W.J-N?<3-_(W%&qE>:(#
-2G<8@6\cY8+.:&GaP7W(GEGiVih28MYh2iToA!d:)2%9'j/:jo?H4rn+G-08nLP;q=D?(\jCq3J^k1/f>nj\?mGR4^DDTAS&;N2ID@pF$!"Tm3FMI83V
-!D=!CZA@!tf#_%fa?2+:#Iu#9bej%1q<0sMZrZW#jD&7%u^S.bIPf6MP*I/Ta:TKA$>r]35>SLt.hS8Mbp<M7G@KAYG!h>n%Y:kk=Ma5lA"c.NE&VSuJ
-]&raa[-_+pdRO8@IN^MqQqo^q!$S3&c9m(CpqoNoi\0>VoH"536KVN"]MgnuXs<(%al523nGH1::)''OLL0JpDde4qIb7c/>cI-HCb4<YU9Id0FZ&e9h
-Iu-p?Qt,gDeT4lS^7gLTTiOuNaUQd[ErW2V<kMV7[:ah:e$9k`(hg+o2P"ePpn%2VoX3n;*6u1=5]ZHbg`4ior6\L+Cr[^.'bf:7I&qg_m\q;RsTtk?6
-*G.kqm9FM0qY_iO3N_WQcq&dhaA+'b\6j0S")q+,o=5D3Sb4?HLea?.fDtb.M;KW3hG7\qgQO;&p3k@90(u%36QS\)k0WdW,;^X]7?CFZ0\lP5'(%5i,
-\MP\e[g?Z%0*,*P_bCpTWB#Ka.JBFpP<&gJVfWR*r<!mE^be\@r?:\fftk:DYhPk0(M9:p$1f)2)L;,%E+b,bK3UG&30SW-?:k3[?X8YWI05BdBq:=!A
-MH7UrkXa\XHqj0`tIMDP48Nq#`0C<p.-5+s%<4;d+cClh0EVdiq?ZJM\N/sM=Bbs4prJN&L1J7;eqV&A-"[:"YCp^FP4l7u[mE-.P>X=;d'4PlD2#%/#
-)V9OB`$b*uS/6]8b)D1aHq**BPWskgSsPC-X[:Zs<k\RcO#F3siAeOee4.2'oZJ4R/Th:;5hN-_Ou?8,kg2L#jZg-n&OsV/DVJ(:s+Q6\gKuV5DKeHLK
-W7,6r@AinLX'*?*Q-^I/Af'5Ys*W-S#=3Tr+fjj.['Qr[aNFc;I+[<SEAEW781D-CMS.]KE3qUP_V?Ip_J->P4Wk[G6o$\R@]9X)FFt&qCK&SQfjU0D0
-Dp!-gn7W%V'9U<aqOW!CHkSnFVN7<L#fFO1u0[4hFLt^c-(_j6_%h,<Y[e,Z]J6Dk=,(XjH!a!IjhZ(nJ/1I-4f`_`<LgrPIZ&gRB'85ToYjoF.YLrU4
-o90n2V#fq-'u>7S9s=r_gmTMR@6P<k$?Y,N_UOolrrYB=OhD/kn!P_d9T<Em;EZNtq9,p,>SJ:Jcr'kW01)EDOF5CZk;3GFqX<2RND8\Z17[R,l46qSo
-WI#g?$dpFmDeiNMJ:0,Tf<!-3XXh%6FnUHq<<"E%SIfRm#CmL$f_?+,W*KTpt;jqO!N=CuKYQo"-%*Tq@D-25^KMu;[=]7E?g];NrB(0s@>>-Q6Pe_2l
-mgn3.N3P=4a8l/"UfGHi*ohI@)"mL-i%o]!qrTNW+-,?7K\?ISH$Rf])GmCSgO_>L=$Y/ZJp,i.o83qAPM<4NY>7:O>j;iE]&dGX_f<ii6/1#K<M'G7F
-sRl?`A_NN^O<hMfF:uIQdF9R/"u11`'APH.Br>No2h>q;7W%A&;1cCNt+.W0k.u(dg30.6#jg20i:>N;P(8_a.J[V[$hP-X4kP?(V#TQ%<<cl8Ckj3Jd
-$DHEO<QOnI.Pk3!f+l=@q[9O\ncIk+/&DR#'S14CuVn%(L-u?VCARV?/]0gMsn/KPd@#p*r1b](_cS%no8J-9)<k%;3IpN2=hURTD"qEtO+QoVl\>\Wa
-g&A-IsFN%HVRZI(9bh<Em%M%Gs&ghL%):?&-6X>q?6BRs$;p5HR1CZeI"?oVS,M+:PQ!OT33;iicd/i]4=FlEI!*YEAX#=<g]Q>1WmR=&=j;pF`c*]Z_
->/2*0I?%!=&@=46&$D;E%%`Ic2q,YHd7^S_>JYP?:[m')7U:s%9eioG4Y(XQ/`_bSN:sbEC?.jG/[RG\miRkgHo@^,#m0_kOS0<=mq+=[o/e+biETD*L
-K#J]%XG=]<3,`/ELs81,?Es)H8$c`\BLKbbEQ1D6Z2Y'DeXq7PXVF_2^W<4qqn0K0]l8iO&I/o=mOk9:Zser3*W*Yo4Ld8,!gAsh5E64@ao*I?CI)eIc
-jtnNPEW"QdKi-m'eM2LkV1l44:UmA,#3VJQj$hHZ$mT]8uR:,m,CV4Ya[)`U8eu\0p+'K4TAjAs&89[DY;Sc(:Fl/Ks,lI'j\a[#[dVNL9Bg;F`E^KG.
-K9G8l..l&%(_Uh?]%UJqV]7SZ=YX#q+Z%r\*1D34I:Am@6YEOk^Ip/pXNa.n$(lkmi.0@>DPk89(M$b9H>([B)IoUK"g%5/VI@!OR/rG<LGeLF\B'?NQ
-%,c]A!m&[Ou@/3&71-Vo,(+U3/lY\&nc9j@OW`"jO$+,N.cltdL=E9c5%?K:o$[="I\l88WQN,U25BMe/f$-nOOmiE_4fFo>i_)4p-=M1<hC+.[,%;5a
-gG_J)"rf^csFkDCki#1h$RSdub*d[;hdg(X-Ydj@o$Nu92Q+hBu%Q!+.+'a&YF(F[!Y1l1DG"Y]#YGffkD$O>=dk0q\1Kr*Pmujb%ms"[l^t=,/aohFh
-K-npQF_4Y2W'[^(%#$^KkXS<O56AG<Hf;:sS\?&[.MMTXh"M85;50A-dY:-'qJQEp?9AV(XYV&G#Kbb$6m^:aW(m^nJS[E)&=*JHj)CChReTnZ\[>7Qe
-7cMeCWP*Xg@6U&[)`a.QC:CPPUp@-[AWHR!k:Ot.)i_nL%%R7V:2ZcC+[;r%:q"r5Z8p4)0gN4>>tUFr^F]TN&?kWLUurro:<D^W4Fc;K>TB:'GTsJ]I
-Qg1#\M[b;O1=NS\&$0cf/\,1M"4SW!Q*F-YuR5#;*l+->;f8maBM6)^uu9\\kT(Va'Gf]b=e:Rd(:81M`GpGH]<P286iG^poD;=&!L*m*!?]Pc%JMRR2
-uj<C-fgokjVPo&`P4e1[RmKcmV+6:H!C!JSTa0&L\-_k4&-qVn,9()pOKE1!7pYYr?"2n)T:Mn*`a`\VC\h#?"r@<_5fT5)MZ+aYEI]1Z-s/d;U9ZrOE
-u&_ql%hS3\.b*'&10D<_W2.qp4A@1#fHA)jJEibS76;gMo$>DbO9V\&,i(^^9$SC@I)o.9dSk,E2T3mT+r:2#AmTW04`(SRb:umQH-7oi0SIc2O\W4F_
-WHnU0:=F&8k75T8\<.P65*1fY!]?&c:m6:_<GVu)''`^pnP^biTb1=Y!Di"B^(@kT]1LM@&aZB'1E^>sKEX<_:gD^^do8O&_T:_n_;fol7sFPb2Qo.G@
-9^CSB4!7*Bdq;].7F!rnu#0`WA.;C?2e%^IF"-FI!'C[V8K$&P3T[f9&ahqea*fUMLP.lF_.QtWJ#@s)(rLj_/SR?1FmO^#q<691Df[V,j6-9j[ZsUq$
-G2E+C61tKde1tmk%02+WEQuDZa%CD2q=gdK;24!kq/qp`)F.+;1(3-MpaA?^0VbjesiYI_/Wp'!'t513f5IJ)IlN\%U(GS^X.Nh8bMHe9rO`">`@2bpL
-01<1o^knPNMMC"!To,s],Ie+rFFQdBl`ERM;Hn0Jf_SSufs]8iUu8O#=Q2Kjn#h1BX5%*388jB@VJiK"npP^\_E3lX-cSi2P9EFn^4S\r<%H:bMVfeJ6
-BYU=F9Hg.ir+9-q#6-TA_6NCt'XO8/U<)'ng>3C1heu8bu"@qEKN'J;_`d\4&ctFeih4H!I_)f)Z&J.ig?"X\/Z&4hC>En]u7QR`n>'Y>TIpDl<2+Q&j
-&^t@@Eca7"%arK[gHKkMlk+hqcL'M5(,KKf@@[.Ar[_5r5#0]Gg<m>hf7"+Y1jN;km'Cu#R?4loVb)*R,hOgi<%[&.446e;!5H`qF)i>-6XGjr0X=ZXK
-S@<ICO7R$GdCVqF.^8nTB&fGe1HnR?t6pKE!IMWdRSh"WF,pP&&J:^5^%J[YGb`dBE&elf7Ka3KL0Nu3Pbp>*.f0``*rR$KTn.F5%@_aA!!'?Pbb@<@e
-V_R[7josbKQq6hb24*n=!+CW9EA'>N!k88m-q!p+aSfs._8;nV"`r#7nB^n??pY@TC)Gaf/]b,),>8l?l\DQQ@#U`h,QS3Eefs%d;3Vm>_-A7Ykbr@X0
-9`Wsf62A*d9,Z!9#QdF6^Ch'S]rDS@Q&fW;ucX/8^G1r4?*^qe3b5/G(VJH@PhPkRaNIS)c^Q_;$NoCXZQDs9p8EpQBZZ5^;L4Du&ZFj_J7s#G<<r=[\
-BR/?Ci5Y'Z7,5Rp&/FfUNM,%W5B1>?.=H>"'cQl(Cgpa-Ee*Fhdk,UEK"'YIP@lM)G:1D7]'f(NADoEEU$YqQF"ubl%-Vj=#m,#="rKBY`<PAL1.8OM5
-HPYQSO\&jsr#PYYA]EoRpMS'7@pi@>*et'ub?%6jkqr2LrL<I>X@3HQ8Pb'Y'V%T^XU7!s<.9#IO.+KU6@TnL)`8T+1@X$=c`e%H],,MQT@Vk[.:mFqO
-Q)5^YBlY)d>NAD>]II"]O)SQiC@`2q0^4@<]^l0^>?$9Nu(>q^],=":9RpOL68(;["XJD.dlBLs*hB%qt#W'YHR1FU80a1@/44i-Y:@g3/9h9Di)R.R6
-rD681*h_m*u^B]3mo)epVGIJRtYQI"/Hf`c$24^7A).jVW_V)'mN[BOj/tL/1d$VIm%'&7^f<L8NQL?Osd5"?;%P]V@b=YFMaM#7I?6_SVbrQ$pc@#qi
-%UK$UK^._j^GPD`p@+i6R[.)ArqZ/)\aE^1g#puT%ElrHDLes#.D%r!d%qM-IHE*=K@8e8)V\E-qCJi0OKNUR>a6sX_!4mZ1aZiOOMSJL]ms6&t!_^37
-[44(Gg./=;m(hDt'hUi<sJU+dT+1_-5Lt,e=Dp>U4?8f-\mB^V_H'S)^o+=.UjR0T9Y7VA)3LVGDC=qJM\0P!kR>DnJmbdhd$,"XQV:F$HV49+,b8Qo9
-P_#X_7jt@e[N\XXZ*UOUb=Qdo?IP]?cFqL?Z.i+(^dAJXcEpZ>&j*UbhfJu=l@@Tt4Z08K@e-o[690_;?uQZ:#/nK+T1VDRXWk4P`t!_Om60rq,"44-j
-\Vq_p%&c%IqS.Y246<@*g;;85@GM8>Z_]-fGb+CqM6fgcN2EalCKJJ3OF^,AP.Q/iN\+V_2$s5eS`KsEAmp8@`W`<prlr<8%Hh"@(P*>Z*+ULcs0gkJ\
->hmQ>CZPfP"LuGEMLkAJt:L,p9,%P"C(pMa_k$kXp^.JmgF^#AY,V)>a>6(g@WjhS6bA+]OipGoAJ^?jX]<Q#H*:'ar0DXmr'kqBTS1/iS(E+NN3q*?>
-fKMo%6mfhK-^okmPsq5\c@W;Kk9'^O]ig=e8t:s9J$#a!XhIk:Xn_"L9m2/11B02)^"_E!jhNu_`d7:r?n:#3MtHRE<[^cT<(:NJEE/91Hh:YU(#)EnJ
-<b)f^u1SjGALA\2t7;WX'cm#.,L@sfhip,&[SojPYgFbG;o>KJF"\3'j3-">Vm"G-rjmXW(>qhmj,+`i9/^L->#-L9Y*,\D/05s^E"IoLapp@&e=S1fB
-'&"&i5K#qiit2P>K^3s.ekda!kT>3G>?'QT/Du@RkF0E,8*aqti4V;NbCRLl]/42iP=e1^N6HE@ga;RdM?gUr/pbV'.4?/SPa'UAmgk(0@XL,1@8ecS@
-lN@.Vkg*URU=(M_\_]_$smD&J;VV#<EeZFdO%6`?37&YO`qU.AbA'b"2AuZPJtLP++BfH*`YC^IpRUl/<h\L#u$G1?I=In:SQd7P9?&%=%1>aGU$+5HN
-+E+qqXheGIG$lYFm4GMC5YqAD4\.Z[D,ceI;&Ib(oS[N;r)lK)12A57R+0M7[_`"Ib\:U'Cf616T8WlJ^$q$37^9S*,R9iA$Ctcr/.Q'/K+?n7.n9R%B
-\*B>VjQ$d/IdP)1V5#ucOIMmG+snNmCOHdZW]o[olQ,,Tn(^:t\$m2&WRElJUVDo.kbE*Z@1P7"=&Q[;a?6DqK[f=HFN$SoNH,sm?7Bb!#\;IY.++DVW
-7rR5?mV.XR*fnBeB5j``#8Rq#DnJ;H7[35PpX$_cW.u-L!#BX5u'(AAA5]W-o1o6C9o0XJS93TfA:3aui1TG,e@ZC#:P2`TPU_.eFB7OEsVXk>X\%@)b
-^!ZDDCA00`#&R2Xg*(i=?6`hY%At;3Fp@_i$=^9>8Fj?Pm%cH@+a[?_SJ@E6Vs-i:s%pK<3++!d#/(8ch)'8ZNN`Z+6fk#6(W7!QA1\Qoq"m!d@2_n64
-9?aPXU<[uc+ba"'c'[Ae<MN`X:fF!Zknc%15LW5,_h\:OUmD`\+PSP+o3_J$1KjCm#L=qNu&T/(]LsDZT(J7af<iA?O;KX&D5=0d#&k7+=jfbdm]5U\B
-EF[rISA1]-hEUb9!mC%1(A"QcB@TH-(;fn=@"TiPn)B]QF(+.)YNo7`GGqr+P,`:k;1K*o6PZ+5[I#R/a['0[Q2/9JFp=mpd0XKsGHCb?<>U-1qEq'E<
-4/TgE"3!A%r5KL,,tEqG6,Ynd6f@`\P32hNh=)sYb++,?&qOqFHUj9T',e=sWWag%0V);'Du3DtIJ-WE=(Q["=;EAeg!1Qi=HX]3B/o`^hAGqi\+aMbF
-QWkY3)=Duo]_VMp5?RFDtEE<i!;99(l5r+SR<[/1G_GfY?WsjdK$?8AiHY(Hd3kqM][A@a/^Jj5P8-.7NnPOEr9mi)Mk!j7X9AptH[fN2$_0l:R;M=%R
-2'X4<PE&B@Tn_NH\B!E]i-!I\Xt"O40=Cfh/HrcA6g.R@8uq7=&_I5a5jPWsoKFr<+Qmb;L?`OT"'D8^NjmMqG"_8U$Jn\)6;m#dQJLWN_e.I\,9QKp4
-/"h<CC+!\J(PI1RIEj5_FJ"A\]Ud?1u@KQkMbl5G&VVg#hYNrgWWNfKY:fp`#jh)D"TFg`ZV^0j@dI9g+OKXq,[g@3IR&W%NBO5*kZ<mluXGqU+//6:X
-*gV`k+Xg$#LhlMhXfmm=0:^lAYYrZ1u6HU;0guH.O)!r$5-$-/[[b,/@`ll[SbDbKf,JVNN!_(?5l/>9*]*laZ=iaAcj%q?cB<C(G&;8i%7p_:mACPk(
-L0k&m5^2PcFDTV3TUGPD4+$VKr5K@hg@i#K\iLADK<8k$0m\P@0!"5;@5(I:uI+:/.*C_3G<^=Sr;($QTdNbt0K:*-gO]0ZI#$0&$*:4WupiO9'(*TB@
-%I`0lA&:"gI(rg=[>u^GZXCf=J:l?@U*Ef"-9_LnLeDY@WYLJX;Fg]j1B*-ZC]r2V@6%BEg`7tn/c#^/\UX[&L3!JhGJ'F@jfc/Zc_$5uu==5^g.\N^'
-c6aJqWJC\"+WtV\0>^>Lb6Z/Jrl2gZ'm$aIPFO?!RK!i5Dc>[kUd2p8CIuh#4%WdPI)hndcX0KEHo9D,3W2!NPeOogm>eA/;uqiD/!UD![gBJ;%Y?#f(
-N8,hf&WGlZtJ=j?4_Tj:n!2i*3\Yr4&Uq1M5jF1oDC+$2m8"uL;cT1Ag8JLUQNQsoeZ>2pu:%2JiTjX+J>-Jn9<73"NaYGbQ@,ST0JfG+Q\),KWho@OK
-s5kq6R=-&+ZUGYLX-*lT#X2AkVWFC?!$)nTr.ur6A#5<or:o6DDJ+\`YSmDX;,L!9RG)a`2$i*r%,k:mX42P4f1$-</<QVlt;d%!L^NFPbmp(R\+3%4Z
-fM2_:g@i4>;5-Ih&+7:W>@<L$-rj\J(2k(uZ!2-FFV[RZ1#d\28MR%sS>'4QX2f_n-I]b(udnNG(\biHeZW\n9@K&#SOWB9;D[,s@t\05H69_-qP2P4q
-rmg_!W,M5hYPuogEW!Iq&4e?=7j5FFD(:0nJi'f%ODOLp-4FNri.uI2JN8_&n]sQn+gkE"[J\jsW[DaH9S=T<7BC-<oG(ou.D0$IN+?O;qW2srEPOE`D
-7)m@%G3TH_Ps"Lnd'0m=BheO>d'XG:4u[&,s44=-504b]<t1Y\BKHpXT!p*q4u;Ds`GJnnAL`dW*itIM@D:H2'"c3phs[M_GfW?7FYTrYnTA"@+5eh<X
-/..-mr6CIUFO'6anE?]rsX7"$4Rf$W+/B<0_SNAOC24BqeI<"i^t#kef0s'SK&"+kc[bmac0[\YTVu8@<CFTlWPK-n7TsjR94UupYX5eEE1%CJGm)qT5
-ed([+AP2>'_so3F5UqSH8Z9a%+gu@S0Ft"^HWp(_+.q8M&Y2V*WZ$4pDo\&M,:u,`iqK&Q!;A2o:\s3nQLA[Lk?6ZVT,FVDIa`V."8_cPCTIO_2g3d2q
-"E[O:DXAkN.3[A$He"PmS.A#=8-P^)_2`onio:e!'2]kDZ#;!43qcM<G'9?o)9`BA"8c$D@_X"S$6)fu!HqA"\#[p^0M&GVoTqc0Mo+SNj`M?=Ts7A,A
-RCJ/lr3].]MURVbu9.1We8]c&J,E<\W'10<OX5+9$3,@[uH(6E"?V%sDNP10gH97eQgKh!=%9bgMT%%3gG1>]^.97m+9@YL4^W%2q$u87t@Y\,e5'Z0l
-*8AXs$WG4i_R*EGN/p2nhL>EpHeq5[T_45seP[D\,WQ[3-T)0r-fL[M)dcOO3gMDiVfZ[eS**b`"I<dIM\%E/cVVo`L+foT.NcEmi0-F7c?aVk&qla(m
-Rn\j#_I;\5S7!1NA"O]Z3%R/)CmZ"18_pcd>`C%QsduLcGI)mZ\2S]%[<D!Z&:s-Yaq5l0A\*IT`aM5M+:@N,97_Zh',aU%'j$$b:fK+9A[1bCG_d!8c
-oV^*jo-)m?!70g^1TNeLl3Y^hG^?^Em)(%Lb50>#LU0c%.+-2LsgAF]TrIE!Tc$n>&1J'J19M7hrAdZh6@3+/"J5RNhg%?L.h5#R'aSj4aSE9<()Z@8A
-eHShZ".,1rGFW)d6Go22Ak<&Wu)'q:iAR3-ac2\jnt(>C5(A?1P8'#:7g_KeY"34[5h6,#knOr79FM#r$iierNpi5,N9=e4'rXguLb]XtDK!7QuPYC$`
-'p5:sV`S&I`5lHAjkp'_a\/_[iHD?j*5,8[KB1nkfYdUG?jirL&]+%5_[dPKW\hL%cV3);V2-Zh!cNHXYc&(M$jiX:Jeq%`]hePd_HUq(oqqi1Z`SpL]
-\9^4C7ZXLgU]H,O1,`_elO0liI'UTpXo@Ie<`97'1/iW<?6K4#.:;"=h=/T%eN?X(7pX4G>7NtCAe=UHX4>s4X+*6F.+;E3TItS8O&0kEB;/946mA'US
-Tcb`!E:T*3N#uW(&#4=io3X82kNI0#Wj5KM3l;=l.a^KRP,B%;ns.l1B9?l'bs/>oC0:T0%=Q^P#7h+[Cp9a*2jJ3'ak#+8<c40^:=p+DrelZK0@h&on
-BT3caX.mHnYS4JXZKs6_,K;PU.]O3AsrLU7NBVh:i[3%b_&E!L]nogporM74Ws2qi`1(TuIF-UfR%,q8kn`_.E(M^7?VRVAS2F+j=ZXglJ_jM\ji/4k#
-PH[^TL`>cUKd`:KS^M7lrk;fg],SsV%E0HD:G9tlPco2i>'QQY!QHq__HoC**HbjMb(@_J/1`.K/>1OKp-qcWTE)OuL!*c("sF<K"aq.k>n,3,q;5*rH
-=YZ0eS'Jg_lmGWrMek>*A37=LN)>XG5='"@/<3[)9l3=3&A0Ct)'&eb\-#a_^.iu9;<;n@uG4ed\;t]'%B1P&a3Q[H"^KR*TK4i#$KF.C>QA9R]LkOhq
-4`2C"`66`Vs*4ZIQi>(!N.($`ZQ^!U4X'Tt#n(^*bJJC5KGj38X:bjcO>V_.laQR8m91r#@mc!ZZ,O[RTPI3?71;TJXXnL8<G[QWD,gY?b5QDB>Zuo*g
-KTBBe`=UNfrS"$kd<o$9gi.-0&nhD1@8QjjiFtbJ4E8(HVgbf#!.*%nQsr&Xd->@G0>PpA\=EpV$ckclK)7iKmmcj$#'cVYf4VW(;&17+Y/l&Q=NL-0F
-jpS<39J*K!n*Z;Uab/X\_SGs1;9/CcZC]^>UIfoshUQX+AN\as7f\943D]>`FDdX`K-Jd0F7(Ht2DjU3GN>$?!/tc42]D\gj7l<;g=X[%&?\ID6]/AZ_
-7XdqEB>]6c"GXV9]MRH\p,jBeb_Ikc866VS/j%C,a#9\!\;od5McS>@0p,m>>P2RTm+eOH7BjUj>M[T\rUr"c5^ptPTOrI^inDOZ5^?A)SMM6c<do;CS
-8#`QZ#V'u1dipY!A:8Z62T5V9,5``Z>cbs_'!-2$W(SCUjB.9^E?jmTo28fI%O=0SZO\17/<O&4%;OfG-cJe1abjHfdP`9"Jhp%;<AntW;j.Q&>X65m_
-f*Mp)*FX)6ago\?(P<lh*pg-'Kb"Wc)JMPDW/g4!Ff7,!P[e>bBN2gMXrAP[Xgp5!Go>4A&-t3oWmAWpF-i7JGi-UT813=)kQ6pE6t]sl=#nNW%tb@/8
-WJ)?&u#74Vbab%Y\VI>@`4`UF<^)jh>hV;Tppm6O"VC6RON1r&_B&5."l70FZ]*3?FFLdku9,[(8jk!fDk_#=b_9tCG'ssc%7I'n0>31a?qP3CE;D%*^
-W:-cb.I;=qhlkb<8R7)W_,hXf!'CckKW@K)abt,e`<ZF*Q4)`Tmj[<&%GSW]!IT"cOQ@Z(9%\O4-fhc)A*4S3K4?A]ioVbKX%BnJ`Wt4qN#+'&3RQOBH
-L(0>5]R/'5[AI'LIN$XC_lTp/24DRL0^gS[BVH"en),:l;$C;WK4F?P!S[IoJ!qi*ftb,(<D28C8Lb+F^uNEFNXA8M?>p#bfKK&TGQi/;Rhh3Ng5Ba@N
-'erkE+FoD(2pBn'cM_+HG)]ta0g\L@&VVl%Z:E'`J[iN2:5)Vgt,cd[SEEDDi^mM2j,bbhG(?5I?m]`MHhOB7A9s9]6q#JfbKVS-tN"d`A`MMcI7PDrR
-!!0HY!NjiR]:N`,Z,C;P!WW3#!!HG.'''
+VVRN65*?GL<kIO7Z=mU4u4VKNr5CflUSB48`AZQ<O!o56.5)A@KI42W:)mWjP.7V"FYI88TLE(J'j#AVe8Eeh%CF,$8]XM46g9;,T/C$'$!;/WY^tg;T
+%)kt>#SHo/!XLPa/XSKstQ>:g+Jr/ZquR/FXc]G[-+/8afANn_AP$KHf5"LG_IAO2cb6&`?)g?nA9]NDNU@b279H&#bIZc)hnE@N.%)Qj:?bT'+RlES'
+)dIB8I!qbXLEp@iE!#0eM$@f"Zj!CtT&G&VIl)4TZZ+AAq&:IR[@iO:,*DR);QR1C[[i_bKWO$N3J9@Hu&A+^3FJqh1$hr4Vq8!iSAAoH^b:O<V0(RSZ
+8q[X/@mLA!r%\rD`KI&9iAr])7>cqFP>m6fq[?dq?Pgi2q#h*q<D8l\.9^W,?fEBm2Z7EB+MH^f:;,meT6B+qgq"?\1\7e<J-e>NnaBAIB`gNU2mpA`F
+%a&Br'i+0ZFD\u78;uC=B?$a?6%_"'#=j2-K6RR=mu?UERMoWM6kOIV=tN%CDGn++d+s6M6daN/(mkurXoP,F5T,(6LCgh?>*bciUUUB)h#=Y\H,>N=.
+bFV_i@!NPM.ODgA&DTaQ$e<[eCO9_(LYg".rfE\7nYm[%OYK$XC'9aL[O;g.eCZ_$kuo97[t23U(lC'I\7k_'e?>T3g(n$[!F!=(A22+[gG'k8fJrNp?
+);CY8$2hls5697k,8$fghWV:op^XtoLdr:#V>46[k:hKRL^4j.CmbqlXgI<&^^!Q>47GleEg-cf<H'j/%8M,;#A%A91[*Qg7`TQl!hoZW-PH@[8MiTJ<
+L[<,k;h]O7Z@fRD[K-Hn"#l]>^W,o_8?W4Up`mZ+b_Lf8T:*G9Doau;%FeUg?NJP[Q&oIfEEQt1)=oGFbPhaXOpoFp@Q6@&HB%t.2986QgG,rHQcS_.E
+UZ@(ZLjd>q9H9NS0JWb@)K%Y'.sc'$kOu=n6Z+Nuo];Bm,T/2i",8K(q3_8<=8+egfgfoe2DCMNNR3ju4)'?QUpXrn+%J:Or2\KE_)A!I;94U)fE2[V:
+q'&lHI>=i;us]@R?9SO9-Gn0Yl(K]G8!3AS6^>V]:rIML-/qc_3QbhEQ*c2M"h+jU=hJujEtEQkp_XGWeeVaqDIjk(B4K1k($mZb)3fK^kLs4[a#;XO@
+GuW>k66DN#Y=hYOKeg`UD&Who+n1EeV]n-3.7nJXV4$B#0*H!J]$D\[t1G(d3Ah,_J-\Nu9f!PI6Kt;GDiZqhZUalBO3OJod8Ke]Vrq]Yd'YfjGU*QH>
+;ph:UA',pO?ZbI`.h'9/I;`:^."HD;4M:cXLP""Pk[Nu+es/<$glXNe^8Ip!+L;;U`.nY,PF$Pj]0gQKH0jFX$L;MKL/n=rEr7U`UhLA5Hh#u%6F1uc1
+1fe$JjU1V;r),28+Sdd>]bV%^<mAM&acW0lI32t*@qN*0je@H[s2#]:V>1!^N!nK3@cX[S9:s^qmlP<&Q%_q_(g@X4AHnk>G41H^ES4@DIC$M^';4;'c
+'Cdh;Qn9(",^fs`::uNfjV<YDiM754o3`ka^"olUG1qSA>H\>Di55%t=k$i:ZuVBnjo,OZD5'M5eJcXL;;u!<A1[Ep!D9s^IWaV5`-"#u2arNo=h!rkC
+*Zh3J]b)9*4DLJP&ji7RSCqGc[^*Sl<$'-6<kNYf<(;Z$`m_n@%NR1K7"+=]u'](g(^+f2S#e!]oZl9D!I$[1KmfVDTr@'CSEc4m.Z]8+O3_Z-JYNidW
+C0?:k%?S-aH]E0pTZ[oT-_r_0#W;!X.tbK3PK[)8OA+BF4Fo4;>tmidWEZI+7REnTdhI+Ph/uUpLfn\c#Tb)F%M]NG\pHi939+H>4<i?'o&B=\?.tlJQ
+e;dj"]>]J,Lh7/MhW`lK#7)0s]gca6>4LA*OM3XD\]_.>lL,*:e7$*muG\eBcHmPXaL.uXTQfuqj)r=i8hR6DE<KB^@<UBG%5.<Ug%Mp0'\B3DE9`i`*
+I1VOm5!bIZcp2+5@3B0k5[W[EKf>RS'@YLgGl_IT`a,cK3/4F'_DccX^k458[?=F\4qL.*eT8UR/T.<dR1uXtMfEl9?5$)a6jnP+Z+Wp,b.`\C!-L6o3
+H:#p=F/82gbK=Zcdd<Y;;+p+S"F`c.hUaRFAn\OE2Zk;I69MbaSpcMZVr$03q[BmDZXoOCB/\3)@eqrW"qFT897#.7*kf<D=@)9fq40Pe3MA[]!Q2*^+
+aJMf<THX#+'C;Qn^1e9gE$er3Q%Y9=nE3\)B14AL7E1sB;T07>lUt!<=F6MEGpd,Vg;/8<L,k0(#btbQ7]ig\77E<02I6:]&RWCpJJ%"LtfA%`dG^M\o
+>'fK//lWCYbR*p4gk'2Y;T\M^amXS0:j84g;\iEq9-W"Bu?007rr4m%bNECI!CR03o#!eA8I#Qq,8Q;`T6h/a0HfMga*?obDaC"ZDurL+CjInel7Z".N
+cg*\Dc[8+i'u7Bki$O"pX_D3OD)#BN[E^q-9%rJQndqWJP#()BWS_$MM@q[Gg:'0jIlEO4JVf.)!@eBnG2S#/r;B8ZEZT@`Z3+R,adLP*ksV:BRJUj.2
+>ImW:L^&@9``F&fglc8L*b:=D+Y!nd`UU$oi)Eo\5URQCpZ]:2Zio;E8L-?,@7E5r(SQhh%S@C(6C/BqUQW$Y%h*Ge(P?9[7AbPW7]7_\4.NY.Cpmu3q
+k#54P'%7.i"\VOeBn>Yq..S+R)[u_?>=?,Z6MJ-J"+6Pd1q5`_BnguO8a>7;$KY.'Fu38d'?`/hTJ.:'L^i(8nrfk/i`%O^ALqAbhi,PBrH"#NYc&e>W
+Qf`[=FjLQ^K,4o"ojb*QGm!?Q,!RF*QM9!\kkbR(J$`.ZZ72+X*TTdr=BfM/*%bP+Kp$?-EPH"+jeuus';\sAhuo9/&bcg%O6HbOq.d7O2[NhkeP5cd"
+RI_j]?OhK_Oh_2tp3L8hEO+?n1(gV^3rm/_j:H9RX1pN.9pk9B?cfEjpq]XEmR]i&Wj*799J,'FF_]B4\D_BQk?`H*SDUG"]T"D&GPhdr%f"HdJiin\[
+:G@/FW+6i+k*WUjcbR+?BcasgJgE/,=lF9]_C7$;f:).&$S8^KR[Nq3Quj6PaZ^kD3[e'd%f7S*K@b7pEC:7,m`LKXp_s71SHk<=VT:e(OpmRK#d/,et
+:Ln&6s&Gq%d\PqQF06Y;VT(&m$1_I,.]22@-E`T^akP(JY$@&kDE7f(lMN[^MN9A+ah'6[)<Obt-f@*p3Ij3!'m.t')&Ln]pFT;I7mi,<>Zo?"m_.`2e
+<BMiI!NlHT:1@X1f1R%b/+qEP=Zm537U=j1[T'DVW)Hhdg4O:5Y.ZN;Dn)#t(8#n-2(g'5+e?AN>SU8TIiVK<>QV<GS_lOLDJ,_-kYD(=:g!%5WL=?k-
+WWG;1qDe;.=5Ob%kJgN]*ND6C[kA1Z"ENo'E'9^:Sc7>QF+Tf+cX-`,VD:M(YW+6_'kb'J;^a?6O6B%SHt.3IPd24'9I+3k7>X>nIkRan%)GY3d,3DP<
+hP#k<bm99V'^\K%h$TO`Y',k+hCU1d-kg`fcm'-fTZ5jl*%HoE7qt`F#O).SXA^Rh63^_6Fo@JH-.JVIr4%KPAosmC"Fu`^)`l$<2X^AjZ^rWidT,\>5
+SYJCrq<<i#?Ii-:>PUIHlZ2G3#rpF1Aqfm>T1&l8`fi,![@3(`X:X)"NGf6u=,2?r$r1gsWmaR!+tj,iEnD.)O4iX1-6%q3mhpmNm_ST:nGE\_S?;b_(
+i3L+fTr4Z#mgJM__go3S,%>Bsei5iNR)/idO1R*lV[<cooaDH3(5u(Ni(E;:t!)e*q1$^\i/.'\Y\A@e2Agt;`6]Q1U+9p!iG.1[iH/8@j+bX3U!akpZ
+q.=H>NIT8=j09C+c')`%iqlL6g;nk6-Sc&1nX;jdC\L\PT/-:UPib0D)*+B,-SO=T&G>jXXrI!)[A-38E]kfeI$9`b#4b6qcG>NB8"Y:/R=S(G$'=.I(
+3#/brbC>Ifp\V-T^m):Mhc"UTfV+2*_"h-%Y&)&"C$@WlK`skn=*c?[6!OT0>N7!2NA82@75L&fo=!DqnutjVJI^R(uaZcrfG>@ah7:G[q[-14]:O3gY
+bd7A#iks=5[HfcF^"pY/"Q8Np&<6#JO9&\2dHLb+%f3$G"0_i0Fs3jIUZ0m#agK1a.;1TS<IAOd`r<bX('X/PM3]W,ld3k1*XU>:,49(r@tm6$u47/e=
+J"(S,_J#Ptrq\9kA*jc=f3cI@D'g,WeAZYp[+8tHh->F1Sg%4].o^XJ8`c)-WCcQcD!oSnL!V#F=E0B0WVfa4`*_=TuC5Y\_D_CGH]#F%#=:s65i`XrA
+.+5\;"fNflP4+esG+^MtIS]QY9$UVl3L>lTm/`kbcLNi<Pm,\G7=]_0$Wb9KAoo\qU-B]ULb9h`.F\og^Ad,0ITs,$Zb$NtpPNFOF_f3$d+/&V6-C7ec
+^@I9g9X!e#b5T3N1SgCK.s'q.1HBp4"?!r#e#B^]ls=jnF'=0Nn:?&&P-%i?'n1Q?$Y'o#E@KWa[/bIb6t\qf9)UrAIjFZ`#dPue5uFgVVMfH[F;-=/T
+/=u=3NO5rp$)b&])hG?Z&:PSe.Il2S1&Q#]GVU,`)-Um)<m1iOE'j+T;!4Y9Bmq.FGfB03qhgi\\!G[LSpA]]$7%;.SOBVg<!*L]j(Gjh;XW?!Z?%9L1
+7-/[MpW6Oda5R>sIOhq5"fdN@=hk.bbrA3jm+KL<0)YDfkG%`ubn+l5%cF;GB4_D"d`P`o)K<,pZBU;"sCE,1*C:%c+LU:`rPfXCM:gU"HL7/f?:NB,X
+/mQ[5X8P2-!moe0VKnlDE9EI,F;WQB"LoHg&7>6W!k!*R=!Fq4tS4%!.u]*!8SVF?APc+(W\.\PNn05-&l`.p)W0g)Aq)]@Z:V8ic/e\Dk_RoXGKA#JA
+Rk6^8C.t6g!"#!$ECa)CRT'_(H^TO4a@5kBncUmRe:ckDkY:L"1Bd$B-]WkCj'nJr'D?;7Y5KDId8[#eK8G=r>8PeoINDXjEi_4ptY!4s0e!2E(,:r(&
+p]a6rk5sIM*PK8T%Fu7+D<SE^(:(,1"Pe?@D[u6cIV1;#)3bB'Jo9fE_&6-M\\k%Il]*'GKhe<i"9*CgLJcRn,SgP^pX6XfKDgoL;T1QK)9)i!Srp6e+
+'d$\N/dLkWB<0aEh8mVHg>.Z7+XcOXtt)c<A<VO7V*I:'9o8S[C`"b;(DgO3h"&r/U?bHRu.gCSuD):S$Rjq0kMVG7+$$lH\MEY`Wa-XbL$^7HWV!+^#
+1)kEE!"?WA\[0_.n/A=%fAM?FlWRV,7'qmRQ\/:;C:5T+rFjOM71rN>[pBD(;^):K;bC9#4sg[K)?5_][6B[`!3-Y$85-1&ad9]e/L_F`GFWXD4q#>0g
+7T2ihMC/LH:W?J`adl7]3r#tm(L&k,]W:s7*0\/bf0JA..?/TO9tNNSSlCFlMWp-]`2*ekm^3HH@Y"6U*4ch@N2]mi@gJD6M'AQDB'Vus;)G(1lF.8Ea
+6NUF)669<hpisuhp;G`rf[nA'jbm&PT4$l)k6L,_kMJY;1-qS\W0a%V)JP2W5&'%[lLI9iA]eRMFbKi_DFK,f#?=ZV0ne5edFPXiuO;7hr+Fs:q[H@oN
+;!+B3TS,ka)s?"DOCm@Z4L``$(^$js+^F'j8Q;`EHH?-/rXHVFeHIKRq@n!c09HLom7QRW#i(pQZgOl^[;>0bX'g_6@XKpigqBERE@O;tJe-,Dm\P"Rm
+.qE\b4gJ<Q]b3i"ea<'R=sSR5nb5o[&m7V3IUUs*H[gH;`:Gb<Ep:^<n1(u"+GoZLQC-[(MY=n>L+K82+HB`[j`OcP(;3dZE3k!PE;5!)Bi;Dp"Ru3`'
+>(2[5HZ^8-&b*>0u7H<DHU<J(YoJd)rMJG^bb-"9i[aX[bBM,G%Isi3@c^7GW[?i>7e$<H2E4bo8=-m]^pF]lnB`VpDEF_#BF4I-E0>q/d#Vn]F)84(K
+\8k_l,p)VME=@9WMaYs5ZN`a:K2IhEC>HXNs,BU,+hW2)#.=E5Q9EE7?ALP/5fgF9_tV-%O>(3R^VD1<i8d8!=>2'AEQH-6kU[C=P/77K4TgeOHI&Pol
+u5L`9El)buaD<fUt?.qm-SoK\*hga)\'G#hKjL8Uirj)abNW-ZJfV)L_8j0uK1ht+u[$d_#F"m:YB1#enPIr:rFT!CV<GhPtSi8N$TCUL;?ZU":iWN"m
+\X-"0g!(^e.[WYd;tA2`bP;>f;V[8VXl;!9O7K\">fU.LJc-nSl/=ED:a":>prkS<*0[<3n!3A(=@EP6D7A9>)'EF49P.?Kr;gtcSAr.tf:A&i!8W$D0
+SujM,Ii\;1_GcC:TVJYR"\j.qFR)Q;)L::Ac1(&(`ZP\#-"(()ShkF$0*j+Vc6XNOatCKeqHpE3f*CAL@NYrXcH&3T6E06&Asj9\Ql;:R"&mP?E_7nYe
+hU)72951s(3R<Mj\b337@^N20Bf.K!Sk&?"JNBJn*9RF"l",=8&"J=nMZ][$q:0^cE2:kKuj/k5e+Sn7)Q*Z9#FO^:>/MlP';NJC^S9"7Tb2F9aP77`8
+[ak_0GAE3@9GQRWD1*[`kI^BEOHoq"\XKG-r5ps)M="f(AGqq_OuA\1`!Wn6(]/+J",$i^*A@Qc0$;^Ko?l>fPCpE&h-<@(c:nnMYl;O%FbM.%3HRojH
+5e"8,H-`&1G.R_b=l4gXB\?X(SAmY:/]PUGF]V&(u8eRNA8#te3L6)6Gj^fsf!r3kthd5]n1.&$QNnes^ETGtcLtN,d<"RTHj`>N4+C'ae51d)-GfQrQ
+^pS4bj/jNT,kcY+B-\cjKJ*qCLq'6pLlcl!Xh*$)T$'c2#DdYMMuG!U`B9Xi=[2:b!9mY)nI[:KYZk>U<Ig-h2!.(l)VWOq!?e`tjWM]6PE,Y7(qa%S4
+Oe39!Z!X,GQK0[F&(A?P*TH/q<0.$Z)D7KpsQ9'%\b8K*;>/ZF\CsK215mn/Q@2l(+KG38+XiG*\#Y85.qsK7Vp%hnbuSjSl2r)i$dn)^Q-'Mi+_P>kX
+qWJ[UD5m?Tdma(@@dsAkM]:1NYJ'Q*RjJ.$G=?[Wi&TY:]ZN[GKI6jDa[L-S<8uPUZ0t\-U=R<kd+p@+0-68<^7P>#NW8Ym-q(=2Hm(G,G"b*2"4X47)
+(m;[Hh\nE:m&'CoO5n;V.U%PI+:',AF2_k+Q)8`$Y=khRQ3E*iQD]OPrP6XOl\p-_Q#08$k;XXU.m2io*]K?IhljC=*h]5i*<5(2Z`Zf1e"flM[4dQ6\
+J9@ijZrTMDF80:>Wo,"ttLp$(A9HG[`TnQBlP+6>S0ZGTNeXZB.4GQU>LS4Og/>:a%hP>f(TS)EI:PSVh_(Ri4jZi*(S#;!5n,S)+,bP2\j1L5_h]>Al
+N4L^+#-aC"Gm*_r3.(Dajt/EhYbNLWPQJai+ZWP"\@:>b>^`r^W/Y@=0tP4BM"s<&kQ#VW$Hf6'O!p%E+jb,o;mL09Bsa6V?bfscn<^A:jE+`8]tPY%A
+h9I7dN=7O.E`rpc";7EUjWEX<H<"Y'e><-P^;F>`#GX<pa+D\!C'KM?fPm3m;L]L-ZT=__<Z8gbP$+CATN2`kG[S1kU?Y+^OR2F!cV)=nN?j0c:sDS-r
+)o3BOte#[1:]AJ?2tun@4SW$AI4:jt_Vke<ot#%8>5H<c"Me,*7=LhZd_bkf+K2ll(/Ph^;RAX:lr(?g!5&<^\C4G\:9M7fM1DX(*9TYb!V2_0!=g$f_
+0<D<",6m&/h'(,F5p64HMt7Jd.Ec-]h_.GCL3(6pAcJ8:IuAJ:>3,Pt"90N6OfK6,_]Wd4I`)5nrg`Q]%7rB<,;SnT<<N*[kC@njt+X[1IjeSsF)H?o:
+DY.X;/bf+Wo0C\i\q"u/)'tsKG,!O&CW`dFBX^PG:`+dIJr9.`M81<f^")QaMY]S;n%_>qUaC9\`&L=r!B?-9^-;]jNNNZpb)(BEEiXB*u#>BCco^"rU
+J"bO7[/[6dF[DPM/1MIN]DG)!Y`0pp/"]6i+S-0<Jh(@#eF9f2^300G'I=l-"o1J`chV9(\KAsVi^8`J%p#_'Eu_!=h95;niEF[>d[><V,I3-qMIjT[r
+nQ+7L`7bP!3A@bJ17*8Z*o$[M6j?&A(1BqWFu.hp2T.k%HRGsSWc<+>J1;9$KhJ?'%%"3#jYV!\gV@_>_ZliKb8/QI+,rU$qcoNn.pF86#0$g4a#qo,`
+0t,SVRQnO.NZc3M$eAKTV3.UN9(J"5]j&R;,W=1rVc"%,fAq35KfX,b\\?H/cEt4&!#kocg0OJH!I.Ni;IeCl&6QQW3nP4'S_;3H$:TkGr33&@r41E0[
+Ni&8VXC2Yg:ZUGQJt:+M.8cYQhB7lVC7fh!D%(3/@ojPl)H&-)d.lcQkEpY/$f^quL;9FTLXf&,&dI-*4o^D@rAaAhgh6a<8M@+-JiGog\*-LXAqp:gd
++Lb1S9n&KT*&I[r&:3US`Z)T>98gQsNii8ardtrenRgW`g-L7KD'>,5eMS6hFPQHrLc@qY7*YJ)OpRb6#-ShUcPq64cEb3MIG6ipUC2]/\A.uDM_/=BC
+jT\Mim`B/1`Xe?)??q<U'@D=];@89o-uSgEo<lC1.>@g*"JH0@_*=W\&=e+-aZ'C-IPnFFFAiL&[J*"W'$fjO!JA#iW&[qn[h.a)_^J,TZ3%Wrm1C2BI
+3rZXA0i/TebZT0k1VR'O\T+/I1:'.P#?Bb4,njU(q@pLA?m)n?4_311`c:LJ[@sUUE](OpXiZb?t4VmEubIOk0W.>J!\Ak2f401-/ke9',(P[iDMZsmC
+b4H=hCU*RgugQm&;V[cD8O0]3Nq]0RAq#WQ9/P[=e_%oGpN%>U<0h4X"3^2>5Dc')%<k%)btiq'!!V)65g"HKqjY&^;n,Dq'\L#cQn(DV;bP.W2C"F?D
+fte]%]M-KhEnK1":%FrN$?I"8Pr).SNpD'+g0.s6s\R%&`m/Oq!">qb$G2EMbs)@!mQ6+BN#gs(BuXpqe?F(uVj)[hJeg#m'BUo=8iDC]%%5jB%q=LjS
+^Y!!_\PF0J#?kI#i+hDPUS38lm%$b=jaJN^k9,e$k3fE`"buq-9n$#UO>`@CK_:(MGOq(+`=pc3&CY6i(i:CoV'rC"c]n(V"a=Jr'o#SSh+p=M-:&H[<
+5n5ko:2DLj63Mi$Oqg0Q;)$,&78]PJY58iecVp7SB&BqUe4R#6`k3t#g)cTi9XTKGeAXoJL=&aCfs4M_@0&4AReGs/6Bo:\cG'mJ&L;hPIaEl4mRp=2r
+Y%m(W0$*$!,F,^hM+tS`?O,-U9K9E*%ProS>a[f(FPMkSZG&L+[!Y@NAd%s>TORJj([ekhd,>GISSd(KX,:;?^OPSk3X5tm>2tYYtbBA5Z!be[ma$moS
+1F$jd#a;Si("4hEh=>BPcC[7XJlK'o28:dfq*/B1HInd-G,@,B3hn402V7XjVU^V"OGg#3aGVN_pk<JD,_?YWD]Z:7:Y2hOU:Jm=F6I?$UC^7or7\2?(
+ES6[nqY/mo@["H&26-VW2Fcj>2@561V!5ZQ=2F;t8&"PU2e700$J+fZ=sO&"*`!Y!e)AN])\a+QND_[`nki&Q"G8N%Fh;+,sSM@!Fa6TonhGRo(r#tCM
+r?.8LBaJG+.bCO5f-D&EWqlADZa%A7EeK<s4of%uEL&eJEV+;#P^U81qo4l,Xj-OWt8i@"-BFBo2aOQ<tJIES+fpj.G.WIdfLa3O,@a_5h$J(GubQ5\,
+N_4=h.`;]]fdD7jIBN%\6k'Ri`Y0qn,\@ik#2luC&/Yn_8EE'<>3beON*a`".HO/1=JD=HUro^d0L,L"@_8G)R@/PM'rFF0k'7%Y:ou#?n)'Sr(7-is4
+W)8l_epMXTN\^cP\)^L<#GNaDCPXSkIs+'a.7b0'sujTUGf3-c3%bJ2S_6@P[Vc5A)fPOR^`qq!>+NB+:L@r%#asrMoW\a&H:mrH7UXS=4HM7b5Y80bf
+Y\eH8ST!kdN5UDTK*rZEprs?k3I0L'5gD(.uW2O@P/IH_rR\gc[[[!HcP)a.K9[Ek&'F:[##*.\s<;RZ;:SE8SF^^`[JtNdf&(#4sje-P$W;On7Y@52p
+nJ%VU!Y!gk24's59^>3r/8X]2-!Cmgc6@-_@EbOSr;bigP<NU<#O#['Rmg!rY_.Ua(/fQjjYq!cgn]!;7d<R!a/5q[0s:Ka3__HLSKaO_lbQ-fS,lBPL
+sq[4RDFXLK_5.i=qi)_G+V1>&TLF::UHk>pdj8\Jnk>%WF\iQF:8mpC3,X,pNA$^d<o6n*c.I7:GBR"K(=&n19@^&?RQ.W-!S'nO%PNfopR^dhB!GtNr
+PBX:HhCT<!g):2sO%;$[=?2Y/1/r+V$K0<!M+m=T6#Eirrh`$PB[G!q_/e%phb@qR(DKV18W99=4m2XFd+FKi!,]N1]p%8f*i(YB1W2u_PCo'jiOsBo3
+hKc/oQgePZ2Gp0/GW6g_+TVN&&SgLMJ.T6on.Z9l[(B.@e#?),'GD:FacMs:cWCfKiXJM(,YE$jXTYo#H'66-T\;tAF/Id>GHKo2s*1uh09!K%V]MBYf
+T;uJ0a;&!#_OMa=Cle+^RYuL0oY#6)[XhlsY[Yb*Z;r%J6L=nPAXhPnV`.CpUdD[^Jeh])+%f`Or#XN7P':Jd@jN;?jhY_C<5t)T1o^nYusZ[6;r4+&c
+12,!jfq.9+jrHY2tCYBlPl+O-j9]RX53k@>CrVae(ZJ+0S,CT\i$97bHl_Yf#c,\&"`m:U')W,kM[1#KWZk4W'=L'</JYSUt4XO`2P(dSXDcU\'E1(IS
+a2eQCYLMTd<:]G$4m;UP#D>9L=UZp9a8"QO7A#/a7#=C'jp2tiq:WuhKAgN8ProZP!g[Q[`Q3i<MNP/p*'Vn:jH8]=ma_gE_[],.-/risc&)ql@%k^S%
+Nu;$'\Vna#^Le^R%8'foo`l[-=4o!'kfMp46L>\)(p]1gecW_N7P7na^@p'XF[+2\mGaC(H0?T-DlB/0c@3;0fq&81[mq4.3Ul;qG%K7]lRS<DQ%5=\2
+f1S%g^9hn1)REBT+ei]G(q"jRX?U/?;&3V;bY@U(CLq@!Z0sJ-"ca.gDNX;;4nArb7@O)%)H?5i.sa:"hf[E8+,K'1Fo^HW]qF0DlO_U-KlINdS!-=s"
+U%DA=+6=iN2""dF@B_l[dk-*8q2NDsYbNN\C(;W0+CPK.%hrnWe)B*2a[`XTDI6rSDK+YL]?+"8rn48T(Ic=@fK4Dau`A`$)>j&uTkLlH4TjV%:&#HY!
+c;?nEF%\E9p0Y>fc>=j@UDCV=(pFU[3JS/ANIb>H6npgJoCn"@\cb6)c_;C$dMD\W2gi5SNBpNL<famDfGr5hJqo!*)tJfCAtf?)[EM^L-)n;]tV2CuA
+7Eo\>6,u1X6:RjJBW)^SY2\f_kj*,EZ1OMSG@Zue.)XoJ@RQk2Gn_elC/H=>5?Q-5AXWI2Fb<UR^8G\6==Q^I4QF5bD"nBAZBaa`[[PhRgCeY=_AF2>\
+*o!!eRhnaOWLD41r0<BO(>M,Vkh@.Blp8=Mp',.CAVCISl>3#k0?sEHqUYL%]$k]<jA$'Y'D)aIlUf9kR)(lZXdP-6:5ngPU:@WJm6=ba%oo=[LeI2`k
+?,8^4a^4k;SP26ZT!8Q'P55Q(l\Rbl8d":)U6YKn\Ma,Ph_?GacrM+>eG(N,h?bP]P*)n8s\3O%5?qkUk!S$<ZP6,_DK?hM,o25rJJ5FS]^LN_gN._kh
+5hL!qe'qlZuDFB(HP=!(<Q1%5S+$I#0^W$Im:,We-06>@Z>\#aRCC['!"X2pT&`Q)48&D=^*)''#$m'p2ktT_I"(PIca%UN^lcj^RJKK?!8^D:5GnM>p
+$f"A/8ACGV6#:<@mmZDs5_/a1Fd\:m_3J9A$KM^euq5%l8mU3JLn#N\nR<j,'AI[eJa\_qdTB(98?@?J`p.&-=hBfXtC4qg,q.(3a*(UF,FS<7oW;'Uq
+<M''@=&Sa>0/65l4Kj.!`&=$(a75Bk+n5"HCjG_$S@X;XTZpCF+'bfN&^sW.=XrnppXGPJAW>^h$P-O%u>iZ]'+1<,cFA*bn&l!Pl#=p'2C1uUo*f[Z+
+_VDp_k0]^GT!Y;:!5^D7>Z0rR+*=9T*58o7R1mBQ`Clp!#RM7)k`Mr0/K+q=ZOZ]ni!B5KhIJ7JKtdGM?GVU<Vh9q:UU4GZRZ>Z/$.%-1id76*n]eC&C
+2')7[k8727ZA#Z0ss$Z]kk(]kUD2l/cF%[>9Z6eTtFe4j36];7.9=k%ioN6)DQ-1[.?sSo;DF2?_=&2-97F3M*/7tFl;Drb_MC6<8V]V7DDR<;41C#K&
+(lFo:A_/\KcVF\(]0%GM/#P&P>D3DhA0[9fECP#3KJUcG__^)B"%MO>fRfPM.8Ff_58<#gKXmNPs\V.1b!O:NT\&:eVaeMb7:1c!sU2eZ&8D9Gp5T=0L
+=-dho1k:D4A[Vr"LdN&Hi.a6ZQ7-MZ\&>9Uo`h6(\+![JK-#aEm>!;bK=9pQp6XOZ"8C=ce5]FDGFLEY`qlOH\[M<QsShc6g3m'5PRF=;:,_n.?)B1e#
+6Eb-kQ#oc"!TnM17)85MMOjognrHcLn4#><O&[p']b2%.G?>@.pU8b7T5Z_t:++mF`,2%24,Ju)`gIXcWnupqDpa<G;NZqt"ZngD7\FnM\#!THs&-XT9
+_%o+':sf,iDg--]Nja&_>4QV62)g)h67cC*03N%G8T.&FJuo;q4%t<9!<OYL(4%hjR/,&6!6"HJMKmJ&O=t4kZ$2L8nK.0)bW0]3i(E1nT&n5?I?m3/Y
+&do.q;#\aeL]Q@gn'[bK[LE$)"4u:EaLrOI9f%)`LX6t6,QiFE)A.C.!18g)nE1"mZuW36IF@WTQ2Zr+f5&6\0=,e^>JNALcDq!rm2Pd:P98ldn)7E=H
+j9C=-_ShaB3NX4C)PIl`\o:c#i3IR>lZ%5hukn^=ecJ5s+W(^/tNNHp+\CK;m4H]%^EITd(\6(&blF36T@/@]p12O2p;)@l]<,@4>SBGB$9nBHnGS&\o
+U.?2Y7srqY#FY(fnRVo``CCt@f/TAd$Vg.u@lIm/ahBLZTqljVqPU4>bB>#^!Y`Gq).k7u3.M3IZ7n5&gE:@'0r=IpM'X+;=NPF3,XKe6g4ge#I!Z8o3
+Q2uNPoQ[+Rd%.T.[mat=]hGppJR%$7+ngK`/2ZqiB443'SMW(<sUT?.XcbeIqQrb[aq`j'V6mE:I,A5>BPa]*Qd]0O`%Y4*,()i0-[d*5H?L5PW%L'Y[
+j>/iCq;l7HYiY#rg52NT#i3S`b]W:cMSA3b9L9<'2#sdrPGV5i#6"-/<TG&1pMV2OKH4ja:Q,ajIdm-0=G3JD"34j@WcUqoa3c>$6Vc`)Q`S+h.-so@i
+-_Qu,Ns<jd42>rp!1C2d9iN&FBQneSi)H#mToj3R'1Mk'JP##$->hng74%_cKjToK2$ktlfc%?&NIkMC'4I82NnN;B%5ATdA\%`k/[8^.dYceOk\r"Rl
+#CZ)nPaa9R=dm>%$Pg"AKChIAX.*rUIg)$MgOB"beF6-d#o4q9nIq,e(spNcFF9?7b<12,>]WFf0\>^PN4Jm.U,_%+7Pc+eK2u:mpkVEGaV=Wel*6d@V
+KbnC0(aFi.2?Td@Wn%hPS?nSQHO'03RA^1T91#2]OCCc-;'r4KVs5)AEX>\tBoo+am)m!C(0"pN0:#1H-^HV#kPmJ8;6O@AGXTT$:*D4$_Ks.A8rU_!-
+.,+?3@>d!),N!U^/N6bJne2$]k/:oBiMcC!_J7_/KX+1n5DY4V!bIF*3CD;;p[$]BKcpO>!]3`8<@R^W<l-p.u$OI<YLbY$L$j5BLmk$CuHRn_,EH/V#
+_oGd'H0S:H]6lu`\8Ksb[V+]pV.T"</+b1:C1:q7#SR'3&cE9s@Y6NG!_7HGp'`kSOdL<tO6<(E5#PIknY7g][k)>73%IrY>JL]Lc2jhf1!Wk5oEA!PX
+BusDLAof1nmlK!2-O(r=acJ'%)R(oJ]'e_p%h?OC`I8e58@YRO9G6p#g&3[\eq0s(,0e;G-O0LZHeq(_Q6*@)r>Ld!Sp"L.bH>7Hu1F+8S9a:?pt^N>[
+=<$3Xtrs`_R$8qm#DkZGqf@O(B`<SWcQE['h)91Om^MH3aK[oC;Ko*`Y#\5n=22CtJPKCjJ_)A;##%*G<!?a?u-Q;+Ak!f`nG_++bm9ZMqBs-o<3H<MC
++tNHJA3.@-B39X)1d]>+Z\MQHgm9;(MS+a:j"a4PF836_=T4u:5%/28<.m@WKWO$2B1IFZrPIIPLe6rQZ/GAMYd`]G?-cSp0b^2ti!S&2RH;kuhH!Kec
+1OQ(EL>N?_PG#HbW?L)H=1!qKO<PX7-DCjgd=,ONG-;%L_*MT_>qX@ekLaQifH1GQB=Lgi!h@km5)KKq.!lf8]LOsS6@T$2:l)ZS]U_md)(mh;52Ua`C
+R#,-Hf41M2(40/@"G>WAUUXq7K>[u*<.s^V.OL]coCiFUNoPTJ>ZHT$*H^Emg>_.@U@5Zs),-X2mQ-7Eb(*XKke3@Ps/F3:K[umDRq))i;D-=tgaJ5Yl
+r,bUP05Gq*\"K="e)#O#%Pr,Roe5<DET[PoI31Ndd!93g"[ACd';ZK(u-so6J1+?C\Ltgl2),Ono;;Qn1-rng,jqscOClAFPFQSEX26\hp*8]QuLFagR
+fAqSkdLq&`5%G-0lZcggE#F@Q*+-0\4Hb-+I@$Q4!Xg)\O^j7`gt+$WkjPIt@fh$$Z3J%@CukZ#l7;0L/Ec=mf_95k;j%&'QVm?I*uEEF#f014\DrZ3%
+R@6k`SA=5Z\9BI,pMR7#)[Kbf+t9OhVkPT8uYO"d8%&("$PNPJS\3CLOlFJEok!K4[_6LIg?6#$Y+)$0gq:W-h3lHi1_W0\FIbG#g=6Ju.u.&ht!:]&.
+<4[,`.@Zr1(=a'`Q<RN?ZM(b?:ID]up%a/^f@(#HUWX-n;8(KhbJs4"&0.*OdhnUa5Ga-17CH>R;H#6?,bQhDk69@8YlriF.gK.j]jsKRq[>6s3"_VbR
+FuhB>%iQ`G\UZqp7:\0%Gh`>_QM[im*C>ni6hH1<dr\:"AjlM#k1YC1Qit!jV[Sk;l_Kk6;iVk7@p&Eef7A82)a2c1s%uI1aSo?%^4GjCE;t7T>f9%MV
+l#--Oqp?:#&o^EAcER">eltW,&u=)0EsEV'OGrf\u=YoR@T5PE*6rhm*VUieqjM^`]K$)kFg4p%Lj$>kXU2d<Dqnc=mC=])]]s#%bI(qo.r1cXZO8`.J
+uD%4sUib-8/(]ESMhi2=N"I56$\F?_D4g4JqA>r"sUu]NK-U:BQ=9PUlX`\gd:?aU4p<@K'G'lq<3o^)#8OFDlo:mtFApQY+MjM>;U2UW$L$$Mi\#Z+U
+6Y#.60S>D'PDl/GD4V(pnuRB_P"k9qKW9bHW;3]P42Bdi(u'k+P8CZa^/(bBR^A7u53Ig''[-HX3(,<,+D=Vo@4>:`7Xe8+cr?GC`tH8^L$,uO(`W;?/
+4i'2a/)GL7amVOT6ipS?8#7N.Y"!t6nGEAHR;fLPeFD?Lo1o#A"+h@E.bX&^'P^PnIV>b4T5Vk^nSff(=iHZV&5r0:_Lr+t67j[Yk.sgKZACM';YeUac
+ZD8.\lN,J)$le,+aum\LOrn/^70/$XG*0u*s!,o_6H$IlkfcOQ[&(tMd7Y7,*TG&PTa04,(I"D6<b@+C"a8\l>[+aPfLU:&kAj.a]'^%1rs0\*0+LZRl
+`AF#kTO_]@(0E2=kghGEI8Rg9ukJO8RI1)C0!QN2e+n:2q[/GDT>mQE`Z=]68P]e0G_I*.ig(!amf`b"-"Z%]FD86Dpo1Di%tW2*<k>r:0"b>9KCnTI)
+C*bmPt?fHX^'PMr@TqLYPifYthV**%$f&Ljr`qD8l9nD^0/F4IV'IX5'oJm/eUKCQl!NhVlgm,Ck&3EtM;hon.q4gRt#:FpCWDH\r\'_8'!*_XJJ?l4i
+O+SD,MfdXeMCjB;-,c-W:6Uc)Lc\p$H&e"SK:ZXecb!b)V24Y]HNbCPqSY==!5hM2I%6L'?_)F"cF<P\Nap:[JSVVH+T%j<on#gq>IA_A8M*[=u?pgG%
+o)S'EB@(`(XY[j"7]VG7WS3B/@B=I',#:Ud^ho\SPdU4qBq_LTJ@ep41@lhH?i#X8R:t6Dc,Ha67^,n*0Y7O&NI3Fs`eu:M0V#C'ZXjrHc2Z6r6&q6\C
+-`&riXf$jTD'(s;<Um&ndQT^#6GYsH5o'!Hs-,"gf<N>Xi!!OS/_=D(H;]B)EJ)kHYpC)V!lZ"KK]_FpW#(Lq5abu^aNP;^ScPu;m>*`]8bLs^O,,M`L
+2+867mr8kpY`hS,*q.[QO5?,:mA<dbk7=FfRI8"jeX]2o<ulu4CXcBPf"2%+?9f/e_#bZG\>=;+5iQS5@oUhGHdU6qVR/,gHA"LZNU7^<R@kV/-R2tr*
+.$s_2CR?pPR-_EqU&\+[URcX1$@R,CjKDQ\?t9ngV:8n=-gtre!t/X[ED%.<8o)\u@^d&"^[IH;gk,dTabJ7ba%U-Utg/1>IT<MuOm2!n(tD[-!>^2eq
+fFr*6NZ_0)WGl1s`'nf_VdboA8G<NBaF:r)GQp^';AAfp0#57_8GFUf^68kr0E7/_035"#2ko8@3KDk?N@3Yq[pVe.&51GKgc2c1cTO:]%`SopfNGk8D
+i@FcPm+"A$loG;'YA20V+XPG#mA*X%!AM*:7P6a(l%uM->R![)R!K.qAB)NBS0YQS>NL`s4"a`bLkj]hQngl9%!gd+<fPJ-]5=T0Y9?!MVPKf:3%"[QW
+h`'uFF6J*p)r[ct_p'<)bnA7e(<YFCS[:.J;tbte]]%2QAHMg4g&G][e_4,%&=WQI0Kp^*q3Hm0+<O.T2o=N)_(E))?id\)I6ZB1Pg980Ma:YL7W'k/4
+-203$G?U%-/:1ZZ+o+r4R'68ro>#+$pLa'#-@&DpW1"9*Ck['`Zgk/HfT%5k;WQ,Aj4k"MJb#D4=6$+m]2o+RB>bIcZhbV2:^96kj*niVtd4)q$B\FhK
+AQ#hdAZC81e.Bb7:U9p#ZTcmU85)d/'FGc":bg>DdPVF\&GT"=%l9k+_Eje(jWQfMJ2k^d;;Ifg\@RMF8D<7q7qV@eabA$%laB$'*Z\6d$$/qU4OFns/
+LPV[Gp&J0+$D;jI^-h7G,g>e.>`eFL*!!WAC4\X2&g;_5BR1NMg%He95.!-j%Sm$'f]0H9q>6E3f/;_/9RbUp=$AeZTqX\IQJrs"7q^)b\[,bIj>]Xgg
+D'jb;lj\L7pT8.g>5TrL[-#fcPU0#=]MjArgYJl(2U:%9rB&:aQ+)fj(kSLGVLpGL<KP/g_i+/!ofg#6mX*>#/eZC_^f@Crc`-Mfp8^o)(67l/cEUorq
+i(OOA%MRLa.\@Qa"k`d#[olHATA@jgn$ZrH:ahWCGLr;9^p*[=K44DmY7W91%T?M,F\MIq*J>MWVkB+:HWZL-)"#!*,)_cs[GMF]XM90Qe!_*0KDu5t)
+'u2*E2F>MF2nVb6m[CKR]Ke6@72Du'hgqgM^A(?Ep;hBR<!(jZ\$V3><I87O#o2&2Y*W7iVJ=Z&XD$`_GQ$9$bkcK,!A.b'*'%UJu#G:,kS$@V.-@A,?
+d"g!D9Adj:u"7Y,<?3f6j:$"9N\'=p_,VWcd6f735TV&@86W[<]H"3fanbLgZ3AQ_j;\+U>f:[n0'-,V:C4@]Z7H1+`J_r>a4]g^]>:Lp>3\jqNY8@m@
+%_9`"/mY,bZI,3RG]Hi2!GUXYUhpR[&d:cMSU1S.Sr+o!r6<tpLa:ggl4P:J,ESiF$N!i[jNHF$Xqn)K:gq0WkLZeQuqU8uRUGTU?k,h`ph]j<Z&(,r.
+M!Dp=fikdeYg*n1j,a;.9kJ<em84urZT+s6m4VB,p7J?-rU$dXJ5N#)(;*meD)Srb:gM(Id2mq@.c\<ur#LdAlfmO5Q39ZNqK\O9HZuV:fHajmIXtY8C
+VM)R%D,Y_aoA<SIp4aD2=rTD:e&E4oK0nc=EVS95;sKb+S)2,h*nh\SA+k_Q\Zo0cTH61UfHGKa1%4r3L3&g'77&1@3$MV"F#Gm$`D1_;8Djel4bL:b7
+$7GPYUA*t"h1N#TO4%#ZGnm<(V-ts5T$LjQJ%MF'\as)f**%^NDD01B5@h>HsDe8Q9pZjP*dDbkQL:9U^2I;1_]QV]4u_5dbQV:Q2HbnA=@J%s"&q!/l
+EgNP>)hg73i*A1:?>P]cIebDfqk\d<aIXn%HA<`+rIO^ZVom19lu($B&DY":F2*9%%.PT?a0[-_CbK=.o,=q/re,UJ:kk3R`JEYDI"eJ,oigHTO^0jPt
+.l`(P`fQsh0s&M.7:;'1-sa*)Ci:#EIS%o;t/ap?5>mHh5&e@#]!Wflg.SQ*2<bZm?:?d,r'k>pdQ5p0a@QJk\mk@0$IVi7=%orT-+cnYu&Ld=HtGShi
+,l;p^#fl@%8"u0mop.,uA][DqBHI@c6CHuApB<=QjFA>BZ@nfuHO\ht4nl73q^47\X/8&87SBNa:lP"_'/].]C$u+9'PRj0fS0i5j`L'X`pSZ@V;N![H
+37h7sXi9('@g,H!X(NJc<%)XqJsguS_W!iK34POGdD9*%GFL_#ZJmZQX2.&inrh.=]==/SD!J0gWl=;gn\hTiHBC^pO2JP2Qh`<tZ%UN3!V@n01i?a1.
+>+uH?D'E:q9mX<_&`e*%VciO-'Mi`F39i]o%%=O0_\tEUsMiU925bpV93$#o<1]@@Ep/0JjIpMK:J[%$R5K@i^sfETX5Z2%cP*K.5:]1b1WT"k(e<n*K
+f#l!3N]A+K/-^.!LuYr2WO)lA)4QQ75\Lang5/S26LF=TfkOMgj<`/:u6+:$Op@M6t%PM3*@an)8^5I#\B*M.oT+1""5.=N:Jl3KKhsIP7!,T;$Va!mg
+pkPeol)aQ0k8kjhkW*8C#7&$gI0f\+^mPc<Wm5,9"X3(`.\Z;Co1S.i3t&?t+0T-F<jhbuZHS2G\BoJ()4Ffq0bp?fg<F6Q,)h:l6b('"Ir9Y)Q*#/sB
+u&%$JAhfCko5V&rUg%^EAk^=SBd\*0F9I>22A_SqgmVLJ7<*rK,\hAhLZqS]\5,2>Wl)]hPJ@%K3cI2Wb7ZP]U42YM%aGN"!V<rU'+`n&L]Vf/t4;!uT
+#ns$dL?)lUr4lPY,*.;r('"9+=HFdk1fQr#o7'L)RBW"/MIo$A4p'XFlrp#elNhtl0lepDr],p<(H8i$,:h@44VNgs['9_#_`;U^o'$/*/5T831A-b4h
+j40M]1t#UHDPBFeMqo&UIe,C!an9=pHXE'EjT,uIg7)W[m$roD>lK4J!:pY<L_l9U'k(9kXhO=57=C*eNj]`48=n6`tc[qV/l#h"7l2s!72)UbXe*V:9
+_(cRq6N16(Y`!FB,/fZjJWH$<5oIdt7uUPK,/1fVpm?65IXH4YCY&lW*NI+Hc=iL,_;F8k#<a&<^\74<=*ETC"##n/Nc>8d>&jInt1"C;mEsBEDLp/P;
+`:.7#h<Y=AoFNh\83?:s;/DpM(Wq=OAamcl[(oJi!t1E">!P/T!%#Zg8q&i0[-@)YM!-l&ZDSU";7-H0J.blfHs;L1FC]V\9?1`G26X3>4rj4mm5%bEB
+Q33Br#X&ZeMa\*[T5(rcq$ROE'TOucdi$Tl0chSPJ)4>F`,TqG582qo<TqpmOR`n!1lOS#grU+FL6kpBCmXk"`K"`eHC=]g.0ANsW/b_juHY3)n!h]oE
+Cd=FrWAa?>S`&2(E</;72J]!CSYPiD0\.?D%.r8TPlof50"q-f3T%c6d8Rul(IRQi^U+"%5k!&qoX//NJbL!89TTr,5iGMRX<M'\DtBrb_ssaP2Bjb&>
+@1^*^.=noOD-$$>q"X2kLD(,$V.;8o^Xmcq\flEGq7Q7/V]!T8EDJdaJ//GJB83O-M(0Wrfp%>=u"'62sJ!;52W:N1f_aeE8spC6Z/mFfimWk7.Ut1Rq
+pf![W#uMY+U*YXE<mq\;HkYYgP@:&J>+N"3"@NFPfKf<emGXbLT15Ej!g0HE1`9@/)f_rE:eQA^`li)Ch743WklQjBYBd6+f:MlZB@#ZL(75Y1G4op2,
+LQ#FNDc_Db9:j_<Stf!;<0`>::!Yhj9eK:(NrK;R#VUp98F^O*%Xm6lhg`F_aPIqK2ESuL6Cr$WWY=H=g[P$uTR;8:o.0qY1IScZG].!X67OPuj\U6Q1
+)&V(k=?<M&MH8:04>XG3ghqIg,+bk:e*75oUo#bVFNgra_Ooc/@]:4kP1X&/09stHi/Pm[ZQ^3E'P@=o(%hBu$9#l27T]#G;qS:gSj<j@NZ<,jT"o>m9
+><kZ@3=CFTI,Mkr7b?\BJ/q,-qY3>:21D[:p5)oa``LL2Zc1b^^h`]LoFJW/W@#ub_M)rSi.sWT6cATE_^Y=MT(sh^"!0;I22&$q'r%L3SV$s<nAOXri
+QrAh:Y.BBii>.-m$5>aW)%8>]n[-I.b0Rmkd6PbCjk1mGGM>^V!b2pU0U]8T3F(9J>GklXA49(E&jr\?85`X#+ZBc)u)6*A9b'Z)b-o?rA">sF:9dPAg
+O$Sgl#-';,Yh-@ET/!X4\I^""fqS]F:u('sl>S?jrX*^?QZ-.i4KTh,O3?'0*(L-Tj+DE%0aLloC$\b94UDB'NiOnH!^).7LpUf3WVU)^CE1U]qXYG80
+a+0O8ETdOZ;Z1&oSi9FT7o>XonDOq[P4c-=7C\dXQ<]F0@33rcuU@qB+OV$);E8M?LE+%^^o5D%hr8IBWc23ZPP*?`nM;SQ=GhGS06G0$^g7n5NRQAt4
++:QHW4EM_^;oTij2',5+L\VDm_bV<d*=gfg],=qcRCZA*Zf=;j8KA6O.9Y)u"1R&^lms*M+?L[9ITh(2B45Lg)Bupc$O#SsL7u"jB9<cJmFB/3&Hok,`
+f/AI'K1>s^_k?)3cRoYu&h:otA)7g8@Pf>>:G_KX_gbdLXcls[[:+`t.fXMp;J&]@8D0(oNm5Xt8fNh_^HMo;_AX7S4aC1]f/Kf>5si7LS?@i%ng&[)`
+)E(eD[:=0T%fP1gsuA8(M75iQj^+hU03FU8q;-WE,`356#)T<%^u)sOVM+E&'MV3A$h)cUY&*/])Q>E][*R+P!@WsP)9+]pMpQ:m6qP$2YkP4?D@OnJ$
+!)5(@A6VP9$>Y[D:d4.H.Sk.r3hjcVr;c'01BC6<_d['gdkK[h58,JrAt3eoAHgS.@*X24kBb,>oO3Y@lu7.(U;/.+q"H*dL5Yn1?b0h]3/NP'$XlKO\
+nO>aFpPc(P(LkpfLXW4<0.$u'MKUCKBp=(@Ap.Q/Sd+5JnqjdhUh%N!V(STm7XBQ7kMb(S<#_dqjr5,e`<3ND)k,'DTJEeD;;oETfg?aA_%ekQ'+YL#^
+B9YICo[2b3g-4U"8O-YB*56]Y&SPV9`_Zj<J4jJ52^YQ?AS:.Gb5!'u+@7FQr6&DC:!'*;^Pb4)fK(2>:,Wma_`!,/:igdZ!c_t)m0lQSjcMRVr[9"k7
+-loH'd'<'*0sG.1qg,;$@q/`W>?DX$:0mum?q---dZH&_<u$j84j[(,+\31$4LUtJ!!0Ta!QjF*:7S8LZ,C;P!WW3#!!HG.'''
 	exec(lzma.decompress(base64.a85decode(_SRC_B85)).decode("utf-8"), multiCMD.__dict__)
 try:
 	import xxhash  # type: ignore
@@ -240,9 +250,9 @@ except ImportError:
 	hasher = hashlib.blake2b()
 	xxhash_available = False
 
-version = '9.86'
+version = '9.87'
 __version__ = version
-COMMIT_DATE = '2026-11-09'
+COMMIT_DATE = '2026-11-10'
 
 MAGIC_NUMBER = 1.61803398875
 RANDOM_DESTINATION_SELECTION = False
@@ -371,8 +381,39 @@ REMOVE_FILES_WHILE_LISTING = True
 SINGLE_PASS_FILE_LIMIT = 1_000_000
 
 #%% ---- Helper Functions ----
+# Whether this run shows a progress bar (not under -v, which turns it off): a pool task's error line may then land on the
+# bar's line (_bar_line_start). A run setting, handed to the workers (_TASK_SETTINGS).
+_BAR = False
+# Whether the parent's progress bar drew a frame since its line last ended (Adaptive_Progress_Bar sets it, stop() clears it).
+_BAR_DRAWN = False
+_LINE_START = [None, '']  # (pid, _line_start's answer)
+
+def _line_start():
+	"""What starts an error line that may land on a progress bar's line, once per process: '\\033[2K\\r' when stderr is a
+	terminal (it clears the bar's line and starts there, also where the bar reaches the terminal through | tee); '\\n' when
+	stdout and stderr are one file (> log 2>&1), which ends the bar's line; else nothing (no bar is in stderr's file)."""
+	pid = os.getpid()
+	if _LINE_START[0] != pid:
+		start = ''
+		with contextlib.suppress(Exception):
+			if sys.stderr.isatty():
+				start = '\033[2K\r'
+			else:
+				out, err = os.fstat(sys.stdout.fileno()), os.fstat(sys.stderr.fileno())
+				if (out.st_dev, out.st_ino, out.st_rdev) == (err.st_dev, err.st_ino, err.st_rdev):
+					start = '\n'
+		_LINE_START[:] = [pid, start]
+	return _LINE_START[1]
+
+def _bar_line_start():
+	"""_line_start where a progress bar may hold the line: in a pool task of a run that shows one, or in the parent while its
+	bar has drawn a frame since its line last ended; else nothing."""
+	return _line_start() if (_IN_TASK and _BAR) or _BAR_DRAWN else ''
+
 def eprint(*args, **kwargs):
 	global ERRORS
+	out = kwargs.get('file', sys.stderr)
+	start = _bar_line_start() if out is sys.stderr else ''
 	# What stdout holds goes first: a redirected stdout is buffered, and an error printed past it lands mid-line (after a
 	# progress bar's carriage return).
 	try:
@@ -380,10 +421,10 @@ def eprint(*args, **kwargs):
 	except Exception:
 		pass
 	try:
-		if 'file' in kwargs:
-			print(*args, **kwargs)
-		else:
-			print(*args, file=sys.stderr, **kwargs)
+		# One write, flushed: the line start and the line land together, and at once. 3.6 to 3.8 buffer a redirected stderr,
+		# and a line left in its buffer lands later, after the bar frames drawn meanwhile and on the last one's line.
+		out.write(start + kwargs.get('sep', ' ').join(map(str, args)) + kwargs.get('end', '\n'))
+		out.flush()
 	except Exception as e:
 		print(f"Error: Cannot print to stderr: {e}")
 		print(*args, **kwargs)
@@ -502,10 +543,16 @@ class Adaptive_Progress_Bar:
 			suffix += f' {format_time(remaining_time)}'
 		callArgs = (self.item_counter, self.total_count, prefix, suffix)
 		if callArgs != self.last_call_args:
+			global _BAR_DRAWN
 			self.last_call_args = callArgs
 			multiCMD.print_progress_bar(*callArgs)
+			# The frame leaves its line open for the next error line to start off, but the frame at the total ends it
+			# (print_progress_bar's newline).
+			_BAR_DRAWN = not (self.total_count > 0 and self.item_counter == self.total_count)
 	def stop(self):
+		global _BAR_DRAWN
 		self.stop_flag = True
+		_BAR_DRAWN = False
 	def update(self, num_files, cpSize, cpTime= 0 , files_per_job=1):
 		self.item_counter += num_files
 		self.size_counter += cpSize
@@ -586,18 +633,19 @@ _binCalled = {'lsblk', 'losetup', 'sgdisk', 'blkid', 'umount', 'mount','dd','cp'
 # and the user's locale stays for every command whose output is shown or not read.
 _C_LOCALE = {'LC_ALL': 'C'}
 
-def run_command_in_multicmd_with_path_check(command, timeout=...,max_threads=1,quiet=False,strict=False,extra_env=None):
+def run_command_in_multicmd_with_path_check(command, timeout=...,max_threads=1,quiet=False,strict=False,extra_env=None,pass_fds=()):
 	"""run_commands_in_multicmd_with_path_check for one command: its stdout lines."""
-	return run_commands_in_multicmd_with_path_check([command], timeout=timeout, max_threads=max_threads, quiet=quiet, strict=strict, extra_env=extra_env)[0]
+	return run_commands_in_multicmd_with_path_check([command], timeout=timeout, max_threads=max_threads, quiet=quiet, strict=strict, extra_env=extra_env, pass_fds=pass_fds)[0]
 
-def run_commands_in_multicmd_with_path_check(commands, timeout=...,max_threads=1,quiet=False,strict=False,extra_env=None):
+def run_commands_in_multicmd_with_path_check(commands, timeout=...,max_threads=1,quiet=False,strict=False,extra_env=None,pass_fds=()):
 	"""
 	Run commands (lists, or strings split on whitespace) with multiCMD, each tool as _bin finds it.
 
 	A missing tool, a timeout (COMMAND_TIMEOUT unless timeout is given) and a non-zero exit are recorded in ERRORS
 	(the exit code) and printed unless quiet (a missing tool always is); e2fsck's exit 1-3 is a success. strict raises
 	on each of them. extra_env: variables set for these commands only, on top of the inherited ones (a None value
-	removes one); pass _C_LOCALE for a tool whose output is parsed.
+	removes one); pass _C_LOCALE for a tool whose output is parsed. pass_fds: descriptors the commands inherit, at the same
+	numbers (multiCMD 1.59, as subprocess's pass_fds).
 
 	Returns:
 		list: The stdout lines of each command.
@@ -619,7 +667,7 @@ def run_commands_in_multicmd_with_path_check(commands, timeout=...,max_threads=1
 		# judged as the tool the caller named: an override may be a program of any other name
 		tools.append(os.path.basename(tool))
 		newCommands.append([_bin(tool)] + command[1:])
-	tasks = multiCMD.run_commands(newCommands, timeout=timeout, max_threads=max_threads, quiet=quiet, return_object=True, extra_env=extra_env)
+	tasks = multiCMD.run_commands(newCommands, timeout=timeout, max_threads=max_threads, quiet=quiet, return_object=True, extra_env=extra_env, pass_fds=pass_fds)
 	for tool, task in zip(tools, tasks):
 		# multiCMD appends 'Timeout!' and then sends SIGINT, so whatever the tool prints while dying lands after it
 		if task.returncode == 124 and any(line.strip() == 'Timeout!' for line in task.stderr):
@@ -641,23 +689,51 @@ def run_commands_in_multicmd_with_path_check(commands, timeout=...,max_threads=1
 	return [task.stdout for task in tasks]
 
 def get_free_space_bytes(path):
-	if not os.path.exists(path):
-		path = get_last_existing_parent(path)
-	stat = os.statvfs(path)
-	return stat.f_bavail * stat.f_frsize  # available blocks * fragment size
+	try:
+		st = os.statvfs(path)
+	except OSError:
+		# missing, or below a directory the runner cannot search (EACCES) or a file (ENOTDIR): the nearest parent that
+		# answers, as 9.86 asked; the copy then meets the real error and reports it as a failed copy
+		st = os.statvfs(get_last_existing_parent(path))
+	return st.f_bavail * st.f_frsize  # available blocks * fragment size
 
-@functools.lru_cache(maxsize=None)
+# How long `cp --version` (and the held-file probe, _held_route) may stay silent: it answers in milliseconds, and one that
+# hangs this long under a host's load gets asked again at the next call (cp_supports_sparse).
+_CP_ASK_TIMEOUT = 10
+
+# multiCMD's codes for a command that did not end by itself: timed out (124), handed nothing to run (125), could not start
+# (126, 127), killed (137, -1). cp gave no answer then.
+_NO_ANSWER = frozenset((124, 125, 126, 127, 137, -1))
+
+_SPARSE = [None, False]  # (pid, cp_supports_sparse's answer): kept once cp answered, per process, as _HELD
+
 def cp_supports_sparse():
-	"""
-	Whether the cp the copy runs (CP_PATH, else `cp` from PATH) accepts --sparse (GNU coreutils does, BSD / macOS cp does not).
-	"""
+	"""Whether the cp the copy runs (CP_PATH, else `cp` from PATH) accepts --sparse (GNU coreutils does, BSD / macOS cp does
+	not): True or False once `cp --version` ended by itself (exit 0: by its text; any other exit: not GNU), kept for the
+	process; None when it gave no answer (it timed out or could not start), and the next call asks again. 9.86 kept a
+	timeout's False for the process's life (an lru_cache, which a forked worker also inherited)."""
 	if os.name != 'posix':
 		return False
-	try:
-		task = multiCMD.run_commands([[_bin('cp'), '--version']], timeout=10, quiet=True, return_object=True, extra_env=_C_LOCALE)[0]
-		return task.returncode == 0 and 'GNU' in '\n'.join(task.stdout)
-	except Exception:
-		return False
+	pid = os.getpid()
+	if _SPARSE[0] != pid:
+		try:
+			task = multiCMD.run_commands([[_bin('cp'), '--version']], timeout=_CP_ASK_TIMEOUT, quiet=True, return_object=True,
+				extra_env=_C_LOCALE)[0]
+		except Exception:
+			return None
+		if task.returncode in _NO_ANSWER:
+			return None
+		_SPARSE[:] = [pid, task.returncode == 0 and 'GNU' in '\n'.join(task.stdout)]
+	return _SPARSE[1]
+
+def _allocated_size(st):
+	"""The bytes a file takes on its disk, from its stat: its apparent size where the platform gives no other."""
+	# stat_result is a tuple: `'st_blocks' in st` would compare against field values, not names
+	if hasattr(st, 'st_rsize'):
+		return st.st_rsize
+	if hasattr(st, 'st_blocks'):
+		return st.st_blocks * 512
+	return st.st_size
 
 def get_file_size(path):
 	"""
@@ -665,14 +741,7 @@ def get_file_size(path):
 	Use os.path.getsize() where the apparent size is needed, e.g. for content comparison.
 	"""
 	try:
-		st = os.stat(path,follow_symlinks=False)
-		# stat_result is a tuple: `'st_blocks' in st` would compare against field values, not names
-		if hasattr(st, 'st_rsize'):
-			realSize = st.st_rsize
-		elif hasattr(st, 'st_blocks'):
-			realSize = st.st_blocks * 512
-		else:
-			realSize = st.st_size
+		realSize = _allocated_size(os.stat(path,follow_symlinks=False))
 	except Exception:
 		try:
 			realSize = os.path.getsize(path)
@@ -793,6 +862,9 @@ def _named_sources(src_path, may_name_destination):
 _STOP_NAMES = ('SIGINT', 'SIGTERM', 'SIGHUP')
 # hpcp's own signal: a worker's parent-death watch sends it to the worker's main thread (neither hpcp nor multiCMD uses it).
 _WATCH_SIGNAL = getattr(signal, 'SIGUSR2', None)
+# The stops and the watch's signal: blocked while a pool's worker is started and until it has set itself up (_pool.submit,
+# _init_worker), and while a directory is asked about a name (_ask_names).
+_STOPS = [getattr(signal, name) for name in _STOP_NAMES + ('SIGUSR2',) if hasattr(signal, name)]
 # The signal that stopped this process, once one did (_stop), and that process: a worker forked after it has both.
 _STOPPED = None
 _STOPPED_PID = None
@@ -803,8 +875,34 @@ _IN_TASK = False
 _MAIN_PID = None
 # True once this process is ending (_end_by): a stop then changes nothing.
 _ENDING = False
-# Twice multiCMD's longest stop of a command (0.01 s, up to 1 s, SIGKILL, up to 1 s more): the watch's grace before os._exit.
+# True while a call makes a file that nothing yet holds the name of (_cp_made's landing, the test file of tempfile.gettempdir in
+# _held_route): a stop is then only recorded (_stop), and raised there once the file is known or removed.
+_MAKING = False
+# Twice multiCMD's longest stop of a command (0.01 s, up to 1 s, SIGKILL, up to 1 s more): the watch's grace before os._exit;
+# after a stop, how long a pool's worker between tasks may take to end before it is killed (_pool); and how long a pool may
+# stay silent after one of its workers died before the run ends (_pool.watch).
 _WATCH_GRACE = 4
+# Pool regions this process is in (_pool, _looked_at). Inside one the parent's _stop only records its stop, and the region's
+# loop acts on it within 1 s (_check_stop): raised anywhere in there, its KeyboardInterrupt could leave a lock of Python's
+# pool code held (concurrent.futures.wait's), and the pool's shutdown would wait on it for good.
+_DEFER = 0
+# The parent has acted on its stop (_check_stop raised for it, or hpcp() took its KeyboardInterrupt). Not set where _stop
+# raises: Python drops a KeyboardInterrupt raised in a weakref callback or a __del__, and the next check acts on it then.
+_STOP_ACTED = False
+# The parent has said once that a later stop is ignored while it cleans up (_stop).
+_STOP_NOTED = False
+# A pool, or _looked_at's threads, was left with something of it still running or stuck: main() ends by os._exit, not by the
+# interpreter's exit, which joins Python's pool threads.
+_ABANDONED = False
+# The pools left so, kept for the process's life: Python 3.6 wakes a collected pool's manager thread by a write into its
+# result queue, under a lock a killed worker may hold, and the parent would wait on it for good.
+_LEFT = []
+# A future of the pool in use failed with BrokenProcessPool (_task_result): that pool ends the bounded way (_pool).
+_POOL_BROKEN = False
+# In a pool's worker: the pool's slots, (lock, a (pid, in a task) pair for each worker it can start), and the index of this
+# worker's state there (_claim_slot); None without one. The parent reads the states after a stop (_pool).
+_SLOTS = None
+_MY_SLOT = None
 
 def _end_by(signum):
 	"""End this process by signum with its default action, as a process that never handled it would end. From its first
@@ -817,35 +915,122 @@ def _end_by(signum):
 		sys.stderr.flush()
 	except Exception:
 		pass
+	# Blocked here while the action changes: a stop landing inside signal.signal, between Python's check for pending ones and
+	# the switch (a worker gets a Ctrl-C twice, from the terminal and passed on by the pool), would find the default action
+	# already Python's, which prints 'Signal 2 ignored due to race condition' with a traceback (3.10+; 3.6 to 3.9 raise
+	# TypeError out of here). Blocked, it waits, and the default action ends the process once it is let in.
+	held = _block_stops()
 	signal.signal(signum, signal.SIG_DFL)
 	os.kill(os.getpid(), signum)
+	if held is not None:
+		signal.pthread_sigmask(signal.SIG_UNBLOCK, [signum])
 	# A default action that does not end the process (none of ours): end anyway.
 	os._exit(128 + signum)
 
 def _stop(signum, frame):
 	"""The handler for every stop a process can catch: the first raises KeyboardInterrupt, so multiCMD stops cp (in a process
 	group of its own, which no group signal reaches) and every finally runs (a temporary file is discarded, mounts are
-	cleaned up); later ones return, so a second Ctrl-C cannot cut the cleanup halfway. The stop is passed on to this
-	process's pool workers, which a signal to this process alone (kill PID, timeout) never reaches. A pool worker between
-	tasks has nothing to clean up and ends at once."""
-	global _STOPPED, _STOPPED_PID
+	cleaned up); later ones return, so a second Ctrl-C cannot cut the cleanup halfway (the parent says so once, naming
+	Ctrl-\\). The stop is passed on to this process's pool workers, which a signal to this process alone (kill PID, timeout)
+	never reaches. A pool worker between tasks has nothing to clean up and ends at once. In the parent inside a pool region
+	(_DEFER) the first stop is only recorded: the region's loop raises it (_check_stop). So it is while a call makes a file that
+	nothing holds the name of yet (_MAKING): the call raises it once the file is known or removed."""
+	global _STOPPED, _STOPPED_PID, _STOP_NOTED
 	if _ENDING:
 		return
 	if not _IN_TASK and os.getpid() != _MAIN_PID:
+		if _STOPPED_PID == os.getpid():
+			# Stopped already, outside a task: on its way out (_run_task's _end_by, whose first lines a stop raising here would
+			# cut, and the pool's loop would keep the worker, idle for good), or kept by the pool's loop. Either way it ends here.
+			_end_by(_STOPPED)
+			return
 		# A pool worker outside a task (idle, starting, between tasks): nothing to clean up, and any stop ends it. Kept, it
 		# would wait in the pool's queue for good, and the pool's shutdown with it. SystemExit unwinds through the queue's
 		# locks, letting go of the one it holds while it waits (killed holding it, the other workers could never read the
 		# pool's shutdown), and multiprocessing ends a worker on it without a traceback. At a task's start or end, _run_task
-		# ends the worker on it (_STOPPED). Every such stop raises: the pool's worker loop can take one for a task's error,
-		# or (3.14) a result's.
+		# ends the worker on it (_STOPPED). Every such stop raises while the pool's worker loop runs: it can take one for a
+		# task's error, or (3.7+) a result's, and go on. Outside that loop (starting before it, or ending after it: threading's
+		# shutdown, multiprocessing's exit work, where Python prints a raise as 'Exception ignored' with its traceback) there
+		# is nothing of the pool's to let go of, and the worker ends at once, quietly.
 		if _STOPPED_PID != os.getpid():
 			_STOPPED, _STOPPED_PID = signum, os.getpid()
+		if not _in_pool_loop(frame):
+			_end_by(_STOPPED)
 		raise SystemExit(128 + signum)
 	if _STOPPED_PID == os.getpid():
+		if os.getpid() == _MAIN_PID and not _STOP_NOTED:
+			# One write, never print: a handler printing while the main thread prints raises 'reentrant call'.
+			_STOP_NOTED = True
+			_say('Stopping: cleaning up first (cp stopped, temporary files removed, images unmounted); Ctrl-\\ ends hpcp now, '
+				'which may leave them')
 		return
 	_STOPPED, _STOPPED_PID = signum, os.getpid()
 	_pass_stop_on(signum)
+	if _DEFER and os.getpid() == _MAIN_PID:
+		return
+	if _MAKING:
+		# Raised as os.open returns, it would leave the file just made with nothing holding its name: the caller (_cp_made,
+		# _held_route) raises it.
+		return
+	if _DROPPING and _in_dropping_call(frame):
+		# Python would drop the raise, and 3.6 and 3.7 print it as 'Exception ignored' with its traceback. Recorded, it is acted
+		# on all the same, as on 3.8+ (_check_stop, _run_task).
+		return
 	raise KeyboardInterrupt
+
+def _dropping_codes():
+	"""The code Python runs as an object of a run goes, where a raise is dropped: the weak containers' callbacks (a thread's,
+	a pool worker's, an ABC cache's) and multiprocessing's finalizers; a __del__ is found by its name (_in_dropping_call).
+	Only where Python prints a dropped raise: 3.6 and 3.7 have no sys.unraisablehook (_install_stops)."""
+	if hasattr(sys, 'unraisablehook'):
+		return frozenset()
+	codes = set()
+	for make in (weakref.WeakSet, weakref.WeakValueDictionary, weakref.WeakKeyDictionary):
+		with contextlib.suppress(AttributeError):
+			codes.add(make()._remove.__code__)
+	codes.add(multiprocessing.util.Finalize.__call__.__code__)
+	return frozenset(codes)
+
+_DROPPING = _dropping_codes()
+
+def _in_dropping_call(frame):
+	"""Whether the code a stop interrupted (frame) runs inside a call whose raise Python drops (_dropping_codes)."""
+	while frame is not None:
+		if frame.f_code in _DROPPING or frame.f_code.co_name == '__del__':
+			return True
+		frame = frame.f_back
+	return False
+
+# The pool's worker loop (concurrent.futures.process._process_worker, Python 3.6 to 3.14): a worker's stop raises only while
+# it runs (_stop). Unknown (a Python that renamed it), or no frame to look at: every stop raises, as in 9.86.
+_POOL_LOOP = getattr(getattr(concurrent.futures.process, '_process_worker', None), '__code__', None)
+
+def _in_pool_loop(frame):
+	"""Whether the code a stop interrupted (frame) runs inside the pool's worker loop."""
+	if _POOL_LOOP is None or frame is None:
+		return True
+	while frame is not None:
+		if frame.f_code is _POOL_LOOP:
+			return True
+		frame = frame.f_back
+	return False
+
+def _say(text):
+	"""text as a line of its own on stderr, in one write, after what stdout holds (a progress bar's line ends first)."""
+	with contextlib.suppress(Exception):
+		sys.stdout.flush()
+	with contextlib.suppress(OSError):
+		os.write(2, ('\n' + text + '\n').encode(errors='backslashreplace'))
+
+def _check_stop():
+	"""In the process that runs main(): raise the KeyboardInterrupt of a stop _stop recorded and has not been acted on, once.
+	Inside a pool region _stop only records it; and Python drops one raised in a weakref callback or a __del__ (every Python,
+	3.6 to 3.14), where the run would go on, a move to its removal. Called by every pool loop's wait (_wait), and between
+	the steps of a run (hpcp()): a cheap test, so it can be called often."""
+	global _STOP_ACTED
+	if _STOPPED_PID is not None and not _STOP_ACTED and _STOPPED_PID == os.getpid() == _MAIN_PID:
+		_STOP_ACTED = True
+		raise KeyboardInterrupt
 
 def _pass_stop_on(signum):
 	"""Send a stop to this process's pool workers, which a signal to this process alone (kill PID, timeout) never reaches."""
@@ -858,11 +1043,19 @@ def _pass_stop_on(signum):
 def _install_stops(signals=_STOP_NAMES):
 	"""_stop for each of signals that this process was not started ignoring: nohup starts a run with SIGHUP ignored, a
 	background job of a non-interactive sh with SIGINT ignored, and both must stay so, as Python itself keeps an ignored
-	SIGINT. Only from the main thread (signal.signal)."""
+	SIGINT. Only from the main thread (signal.signal). And (Python 3.8+) this process's own stop that Python drops, raised
+	in a weakref callback or a __del__, is not reported as 'Exception ignored' with its traceback: it is acted on all the
+	same (_check_stop, _run_task)."""
 	for name in signals:
 		signum = getattr(signal, name, None)
 		if signum is not None and signal.getsignal(signum) is not signal.SIG_IGN:
 			signal.signal(signum, _stop)
+	hook = getattr(sys, 'unraisablehook', None)
+	if hook is not None and getattr(hook, '__name__', '') != '_unraisable':
+		def _unraisable(unraisable, default=hook):
+			if not (isinstance(unraisable.exc_value, (KeyboardInterrupt, SystemExit)) and _STOPPED_PID == os.getpid()):
+				default(unraisable)
+		sys.unraisablehook = _unraisable
 
 def _on_worker_start():
 	# The process that started the pool: under forkserver (Python 3.14's default) and spawn the worker's own parent is the
@@ -894,23 +1087,89 @@ def _on_worker_start():
 
 _worker_initialized = False
 def _init_worker():
-	"""Run _on_worker_start() once per worker process.
-	Used instead of ProcessPoolExecutor's initializer parameter for Python 3.6 compatibility."""
+	"""Set this worker up, once: the stops and the parent watch (_on_worker_start), stdout, its slot (_claim_slot); then let
+	the stops in. A pool worker starts with them blocked (_pool.submit blocks them while it may start one, and a fork server
+	keeps the mask it started with for every worker it forks), so a stop that came meanwhile reaches hpcp's handler only now
+	and ends the worker without a traceback (Python's own SIGINT handler raises one there under forkserver and spawn)."""
 	global _worker_initialized
 	if not _worker_initialized:
 		_on_worker_start()
 		# A worker that did not fork from the parent (forkserver, the default from Python 3.14) has a new stdout.
 		_escape_unencodable_stdout()
+		_claim_slot()
 		_worker_initialized = True
+		_unblock_stops()
+
+def _unblock_stops():
+	"""Let this worker's stops in. One pending since its start runs _stop here, which ends the worker (outside a task it
+	raises SystemExit): caught, so nothing raises out of a pool's initializer (concurrent.futures prints a traceback for one
+	that raises) or out of multiprocessing's after-fork hook."""
+	if hasattr(signal, 'pthread_sigmask'):
+		try:
+			signal.pthread_sigmask(signal.SIG_UNBLOCK, _STOPS)
+		except (KeyboardInterrupt, SystemExit):
+			_end_by(_STOPPED or signal.SIGTERM)
+
+def _block_stops():
+	"""Block the stops in this thread: the old mask, for _restore_stops; None where there is no pthread_sigmask (Windows)."""
+	if hasattr(signal, 'pthread_sigmask'):
+		return signal.pthread_sigmask(signal.SIG_BLOCK, _STOPS)
+	return None
+
+def _restore_stops(mask):
+	if mask is not None:
+		signal.pthread_sigmask(signal.SIG_SETMASK, mask)
+
+def _claim_slot():
+	"""Take this worker's (pid, in a task) pair in its pool's slots, the first free one. Under the slots' lock, taken within
+	1 s (as _claim_space: far longer than a scan of them takes; a holder that died must not hang the worker). Without one
+	(no slots, all taken, no lock) the worker runs on, and the parent counts it as always in a task: it is never killed."""
+	global _MY_SLOT
+	share = _SLOTS
+	if share is None:
+		return
+	lock, slots = share
+	if not lock.acquire(timeout=1):
+		return
+	try:
+		for index in range(0, len(slots), 2):
+			if slots[index] == 0:
+				slots[index + 1] = 0
+				slots[index] = os.getpid()
+				_MY_SLOT = index + 1
+				return
+	finally:
+		lock.release()
+
+def _slot_state(in_task):
+	"""Write this worker's state into its slot: one aligned 8-byte store, which the parent reads whole."""
+	if _MY_SLOT is not None:
+		_SLOTS[1][_MY_SLOT] = 1 if in_task else 0
+
+def _pool_worker_start(slots, space_array, rate_share):
+	"""A pool's initializer (Python 3.7+, every start method): the pool's slots and shares, then the worker's setup
+	(_init_worker; under fork multiprocessing's after-fork hook has run it already, with the slots it inherited). A stop
+	from here on ends the worker; nothing raises out of an initializer."""
+	global _SLOTS
+	try:
+		if slots is not None:
+			_SLOTS = (slots.get_lock(), slots.get_obj())
+		if space_array is not None:
+			_init_space_share(space_array)
+		if rate_share is not None:
+			_init_rate_share(*rate_share)
+		_init_worker()
+	except (KeyboardInterrupt, SystemExit):
+		_end_by(_STOPPED or signal.SIGTERM)
 
 def _register_worker_start():
 	"""multiprocessing runs its after-fork hooks in each child it starts, before the child's work (a pool worker's loop):
 	the worker sets itself up there (_init_worker), not at its first task, so one that never runs a task, or that its pool
 	never counted (a stop landing as it was forked), still has its watch and ends when its parent does. main() registers it
 	(not an import: a program that imports hpcp must not get hpcp's stops and parent watch in its own multiprocessing
-	children). Under fork the registry is inherited, so every pool worker of the run sets up at its start; forkserver and
-	spawn workers, which start from a new interpreter, set up at their first task (_run_task). The registry holds its key
-	weakly: a module-level function lives as long as the module."""
+	children). Under fork the registry is inherited, so every pool worker of the run sets up at its start (Python 3.6 has
+	no other way); forkserver and spawn workers, which start from a new interpreter, set up in the pool's initializer
+	(_pool_worker_start, Python 3.7+). The registry holds its key weakly: a module-level function lives as long as the module."""
 	multiprocessing.util.register_after_fork(_init_worker, lambda init: init())
 
 # The run settings hpcp() keeps in module globals. A pool worker that did not fork from the parent
@@ -921,11 +1180,13 @@ def _register_worker_start():
 NAMED_DESTS = frozenset()
 RUN_ID = None
 _TASK_SETTINGS = ('NAMED_DESTS', 'RUN_ID', 'CONTENT_ONLY', 'WRITE_BESIDE', 'READ_FIRST', 'NO_CREATE_DIR', 'SYNC_COPIES', 'RANDOM_DESTINATION_SELECTION', 'HASH_SIZE', 'COMMAND_TIMEOUT',
-	'BYTES_RATE_LIMIT', 'FILES_RATE_LIMIT', 'MIRROR_FS_PARAMS', 'REMOVE_FILES_WHILE_LISTING')
+	'BYTES_RATE_LIMIT', 'FILES_RATE_LIMIT', 'MIRROR_FS_PARAMS', 'REMOVE_FILES_WHILE_LISTING', '_BAR')
 
 def _submit_task(executor, func, *args, **kwargs):
-	"""Submit func to a process pool with this process's run settings; collect it with _task_result."""
+	"""Submit func to a process pool (a _pool) with this process's run settings; collect it with _task_result."""
 	settings = {name: globals()[name] for name in _TASK_SETTINGS}
+	# What _copy_pool asked once for the run's workers (_held_route): the same cp and the same /proc in every process of it.
+	settings['_HELD_GIVEN'] = (_HELD[1],) if _HELD[0] == os.getpid() else None
 	return executor.submit(_run_task, settings, func, *args, **kwargs)
 
 def _run_task(settings, func, *args, **kwargs):
@@ -942,6 +1203,8 @@ def _run_task(settings, func, *args, **kwargs):
 		_init_worker()
 		globals().update(settings)
 		error_start = len(ERRORS)
+		# In a task from here (the parent never kills a worker in one, _pool) until its cleanup has run.
+		_slot_state(True)
 		_IN_TASK = True
 		try:
 			return func(*args, **kwargs), ERRORS[error_start:], None
@@ -954,6 +1217,8 @@ def _run_task(settings, func, *args, **kwargs):
 				# A stop came during the task: its cleanup has run, or the KeyboardInterrupt never got here (Python reports and
 				# drops one raised in a weakref callback or a __del__, and the task went on). Either way the worker ends.
 				_end_by(_STOPPED)
+			# Between tasks: nothing of this one is left (no temporary or torn file, no fsync in flight).
+			_slot_state(False)
 	except (KeyboardInterrupt, SystemExit):
 		if _STOPPED_PID != os.getpid():
 			raise
@@ -961,14 +1226,32 @@ def _run_task(settings, func, *args, **kwargs):
 		# would take it for the task's error and keep the worker (except BaseException, Python 3.6 to 3.14).
 		_end_by(_STOPPED)
 
+def _settled(future):
+	"""(result, errors, crash) of a done _submit_task future. What it failed with is the worker's, a stop (SystemExit,
+	KeyboardInterrupt: the pool's worker loop sends back one raised as it sent a result) included, and becomes a crash; a
+	stop of this process's own is raised on. A BrokenProcessPool marks the pool (_POOL_BROKEN)."""
+	global _POOL_BROKEN
+	try:
+		return future.result()
+	except Exception as e:
+		error = e
+	except BaseException as e:
+		try:
+			theirs = future.exception(timeout=0)
+		except Exception:
+			theirs = None
+		if e is not theirs:
+			raise
+		error = e
+	if isinstance(error, BrokenProcessPool):
+		_POOL_BROKEN = True
+	return None, [], f'{type(error).__name__}: {error}'
+
 def _task_result(future, default, crash_prefix):
 	"""A _submit_task future's result in the parent. The errors the task recorded join ERRORS (the worker printed them);
 	a task that raised, or whose worker died (BrokenProcessPool), is recorded under crash_prefix and gives default.
 	Either way the other tasks go on (a broken pool then fails the next submit)."""
-	try:
-		result, errors, crash = future.result()
-	except Exception as e:
-		result, errors, crash = None, [], f'{type(e).__name__}: {e}'
+	result, errors, crash = _settled(future)
 	ERRORS.extend(errors)
 	if crash is not None:
 		eprint(f'{crash_prefix}: {crash}')
@@ -978,7 +1261,7 @@ def _task_result(future, default, crash_prefix):
 def _raise_task_failures(future):
 	"""A _submit_task future's result, raising its recorded failures (and a crash) as one RuntimeError, as
 	_call_raising_recorded_failures does in-process."""
-	result, errors, crash = future.result()
+	result, errors, crash = _settled(future)
 	failures = [error for error in errors if _is_failure(error)]
 	if crash is not None:
 		failures.append(crash)
@@ -999,6 +1282,205 @@ def _call_raising_recorded_failures(func, *args, **kwargs):
 		# A reused worker must not carry this task's errors into its next job;
 		# an in-process caller reports the raised failures itself.
 		del ERRORS[error_start:]
+
+def _new_slots(count):
+	"""Slots for a pool of count workers: (the parent's (lock, slots), what the initializer hands a worker), or (None, None)
+	where none can be made (its workers then count as always in a task). Forked workers inherit an anonymous shared mapping
+	and a lock, which leave no file (nothing to hand: a pool given another start method than the default gets no slots);
+	forkserver and spawn ones get an Array through the initializer (as _space_share)."""
+	with contextlib.suppress(OSError, ImportError, ValueError, TypeError):
+		if multiprocessing.get_start_method() == 'fork':
+			import mmap
+			return (multiprocessing.Lock(), memoryview(mmap.mmap(-1, 16 * count)).cast('q')), None
+		if sys.version_info >= (3, 7):
+			array = multiprocessing.Array('q', 2 * count)
+			return (array.get_lock(), array.get_obj()), array
+	return None, None
+
+class _pool:
+	"""The one door to a process pool: `with _pool(max_workers) as executor:`, submitting with _submit_task(executor, ...) and
+	waiting with _wait(futures, executor). Inside, the parent only loops (submits, waits, results, the progress bar): no cp,
+	no prompt. A stop is acted on there within 1 s (_DEFER, _check_stop in _wait). Each worker can start (ProcessPoolExecutor
+	never starts more than max_workers, and Python 3.6 to 3.14 replace none that died) gets a (pid, in a task) slot.
+
+	Its exit: as concurrent.futures' own when the loop ended normally. After a stop or a broken pool, the stop (SIGTERM for a
+	broken pool) is passed on, and the parent waits for the pool's workers, each second: from _WATCH_GRACE after the wait
+	began, one between tasks is SIGKILLed (it is stuck on the pool's queue, or on a result half sent, and holds nothing of a
+	file), and one in a task, or without a slot, is waited for with no bound, its cleanup never cut, with one line naming
+	Ctrl-\\. After any other exception the futures not started are cancelled and the running ones end as they would, then
+	the same wait. Either way the pool is then left without a join (_ABANDONED): its manager thread may be stuck for good.
+	space: the workers share the run's space-warning slots (_SPACE_WARNED); rate: the -pfl rate share under -F."""
+	def __init__(self, max_workers, space=False, rate=None):
+		self.max_workers = max_workers
+		self.space = space
+		self.rate = rate
+		self.broken = False
+
+	def __enter__(self):
+		global _DEFER, _POOL_BROKEN, _SLOTS, _RATE_SHARE
+		self.outer = (_SLOTS, _RATE_SHARE)
+		_DEFER += 1
+		try:
+			# Processes of this run alive before this pool: an outer pool's, never this one's to wait for or kill.
+			self.before = {child.pid for child in multiprocessing.active_children()}
+			self.seen = set()
+			self.gone_at = None
+			# The futures not done yet: each leaves by its done callback (run by the pool's manager thread, or by a cancel). No
+			# weak references: their callbacks run in the main thread, where a stop's KeyboardInterrupt is dropped.
+			self.pending = set()
+			_POOL_BROKEN = False
+			if sys.version_info < (3, 7):
+				_quiet_36_pool_shutdown()
+			self.slots, handed = _new_slots(self.max_workers)
+			# Forked workers (Python 3.6, which has no initializer, and the fork start method) inherit these.
+			_SLOTS = self.slots
+			if self.rate is not None:
+				_RATE_SHARE = self.rate
+			kwargs = {}
+			if sys.version_info >= (3, 7):
+				space = _SPACE_WARNED[2] if self.space and _SPACE_WARNED is not None else None
+				kwargs = {'initializer': _pool_worker_start, 'initargs': (handed, space, self.rate)}
+			self.executor = ProcessPoolExecutor(max_workers=self.max_workers, **kwargs)
+		except BaseException:
+			_DEFER -= 1
+			_SLOTS, _RATE_SHARE = self.outer
+			raise
+		return self
+
+	def submit(self, func, *args, **kwargs):
+		"""executor.submit, with the stops blocked in the process that runs main() (a library caller's are left alone): a
+		worker it starts (and a fork server, which every later worker forks from) starts with them blocked, and lets them in
+		once set up (_init_worker). A stop meanwhile is recorded at the restore (_stop, inside the region)."""
+		# A stop recorded inside the region starts no more work: the loop acts on it here, as at its wait.
+		_check_stop()
+		mask = _block_stops() if os.getpid() == _MAIN_PID else None
+		try:
+			future = self.executor.submit(func, *args, **kwargs)
+		finally:
+			_restore_stops(mask)
+		self.pending.add(future)
+		future.add_done_callback(self.pending.discard)
+		return future
+
+	def _states(self):
+		"""{pid: in a task} for the workers that took a slot."""
+		states = {}
+		if self.slots is not None:
+			slots = self.slots[1]
+			for index in range(0, len(slots), 2):
+				pid = slots[index]
+				if pid:
+					states[pid] = bool(slots[index + 1])
+		return states
+
+	def _alive(self):
+		return [child for child in multiprocessing.active_children() if child.pid not in self.before]
+
+	def watch(self, done):
+		"""One pass of a pool loop's wait (_wait): a worker that died while nothing completes for _WATCH_GRACE means the pool's
+		manager thread is stuck (a pool that sees a death fails every future at once), on a result the dead worker half wrote
+		(the parent holds the result pipe's write end too, so the read never ends): the run ends with 191, as a broken pool's.
+		Workers never end on their own while a pool runs (no max_tasks_per_child), except on a stop, acted on before this."""
+		if done:
+			self.gone_at = None
+			return
+		alive = {child.pid for child in self._alive()}
+		self.seen |= alive | set(self._states())
+		if not self.seen - alive:
+			self.gone_at = None
+		elif self.gone_at is None:
+			self.gone_at = time.monotonic()
+		elif time.monotonic() - self.gone_at >= _WATCH_GRACE:
+			self.broken = True
+			raise RuntimeError('Copy process crashed: a pool worker died and its pool stopped answering')
+
+	def __exit__(self, kind, error, tb):
+		global _DEFER, _ABANDONED, _SLOTS, _RATE_SHARE
+		try:
+			stopped = kind is not None and issubclass(kind, (KeyboardInterrupt, SystemExit))
+			broken = self.broken or _POOL_BROKEN or (kind is not None and issubclass(kind, BrokenProcessPool))
+			if kind is None and not broken:
+				self.executor.shutdown(wait=True)
+				# Let go of it here, inside the region: its parts' weakref callbacks and finalizers run as it goes, where a stop
+				# is only recorded (_stop); outside, Python would drop one raised in them.
+				self.executor = self.slots = None
+				return False
+			if not (stopped or broken):
+				# A failure in the loop, with no stop: what is not started is cancelled, and what runs (with the calls already
+				# queued, which no cancel reaches) ends as it would. A stop meanwhile, or the pool stuck on a dead worker, ends
+				# this wait (_wait).
+				for future in list(self.pending):
+					future.cancel()
+				with contextlib.suppress(KeyboardInterrupt, RuntimeError):
+					while self.pending:
+						_wait(set(self.pending), self)
+			# A stop ends each worker: idle ones at once, busy ones (after a stop or a broken pool) by their cleanup. SIGTERM for
+			# a broken pool or a failure.
+			_pass_stop_on(_STOPPED or signal.SIGTERM)
+			self._wait_for_workers()
+			# From 3.9 the manager thread is told to end, before main()'s finalizers close the queues it may still close itself.
+			# Not before: 3.6's shutdown puts a wakeup into the result queue under a lock a killed worker may hold, and 3.7's and
+			# 3.8's close the manager thread's pipes and call queue under it (a traceback from that thread).
+			if sys.version_info >= (3, 9):
+				self.executor.shutdown(wait=False, cancel_futures=True)
+			_ABANDONED = True
+			_LEFT.append(self.executor)
+			return False
+		finally:
+			_DEFER -= 1
+			_SLOTS, _RATE_SHARE = self.outer
+
+	def _wait_for_workers(self):
+		"""Wait for this pool's processes to end, as the class says."""
+		started, said = time.monotonic(), False
+		while True:
+			alive = self._alive()
+			if not alive:
+				return
+			if time.monotonic() - started >= _WATCH_GRACE:
+				states = self._states()
+				idle = [child for child in alive if states.get(child.pid) is False]
+				for child in idle:
+					with contextlib.suppress(OSError):
+						os.kill(child.pid, getattr(signal, 'SIGKILL', signal.SIGTERM))
+				# One deadline for them all: a SIGKILLed process not in an uninterruptible wait exits in milliseconds, 1 s covers a
+				# loaded host, and -j 64 must not wait 64 s.
+				deadline = time.monotonic() + 1
+				for child in idle:
+					child.join(max(0, deadline - time.monotonic()))
+				alive = [child for child in alive if states.get(child.pid) is not False]
+				if alive and not said:
+					said = True
+					_say(f'Waiting for {len(alive)} worker(s) still finishing a file (pids {", ".join(str(child.pid) for child in alive)}): '
+						'Ctrl-\\ ends hpcp now, which may leave a temporary file or a torn file there')
+			if alive:
+				multiprocessing.connection.wait([child.sentinel for child in alive], timeout=1)
+
+_QUIETED_36 = []
+
+def _quiet_36_pool_shutdown():
+	"""Python 3.6's pool manager thread raises queue.Full out of its shutdown_worker when a worker dies while the call queue
+	is full (a stop ends the workers), and threading prints its traceback; 3.7's shutdown_worker catches it. The pool is
+	broken by then, its futures failed and its workers terminated: the thread just ends, quietly. Once per process."""
+	if _QUIETED_36:
+		return
+	real = concurrent.futures.process._queue_management_worker
+	def _queue_management_worker(*args, **kwargs):
+		try:
+			return real(*args, **kwargs)
+		except queue.Full:
+			return None
+	concurrent.futures.process._queue_management_worker = _queue_management_worker
+	_QUIETED_36.append(real)
+
+def _wait(futures, pool):
+	"""The one wait of every pool loop: the futures done within 1 s (most loops refresh the progress bar each second), then
+	the parent's stop acted on (_check_stop), then the pool watched (_pool.watch). So a stop is acted on within 1 s in every
+	loop, and a pool stuck on a dead worker ends the run."""
+	done, _ = concurrent.futures.wait(futures, timeout=1, return_when=concurrent.futures.FIRST_COMPLETED)
+	_check_stop()
+	pool.watch(done)
+	return done
 
 #%% -- Exclude --
 def is_excluded(path, exclude=None):
@@ -2457,18 +2939,16 @@ def get_mount_table():
 	return mount_table
 
 #%% -- Symbolic Links --
-def create_sym_links(symLinks,exclude=None,link_tracking=False):
+def create_sym_links(symLinks,exclude=None,link_tracking=False,link_dirs=None):
 	"""Recreate symLinks ({src link: [dest paths]}). Returns a (target's destination path, target's source path, link's
 	destination path) triple for each relative link whose target is excluded, and with link tracking (-lt) for each one
 	whose target exists at the source (copied now or already there): -rme keeps those targets, except where the copy
-	itself covers them (_kept_paths)."""
+	itself covers them (_kept_paths). link_dirs (a set, in a move): each directory a link was made in is added, for the
+	move's directory fsyncs (_sync_moved_directories)."""
 	global RANDOM_DESTINATION_SELECTION
 	tracked_targets = set()
 	if len(symLinks) == 0:
 		return tracked_targets
-	# A move's link directories, fsynced once after the last link: a link has no data to fsync, and is made after every file, so
-	# no file's fsync commits it. On ext4 and XFS that fsync also commits every earlier change on its filesystem.
-	link_dirs = set()
 	nestedSymLinks = {}
 	counter = 0
 	print(f"\nFound Symbolic Links:   {len(symLinks)}")
@@ -2477,6 +2957,7 @@ def create_sym_links(symLinks,exclude=None,link_tracking=False):
 	#print(symLinks)
 	start_time = time.monotonic()
 	for src, dests in symLinks.items():
+		_check_stop()
 		try:
 			src = os.path.normpath(src)
 			dests = [os.path.normpath(d) for d in dests]
@@ -2557,7 +3038,7 @@ def create_sym_links(symLinks,exclude=None,link_tracking=False):
 					_dest_directory(os.path.dirname(dest), make=not NO_CREATE_DIR, source=os.path.dirname(os.path.abspath(src)))
 					# A relative target is resolved from the link's directory (Windows makes directory and file links apart).
 					os.symlink(linkedTargetFile, dest, target_is_directory=os.path.isdir(os.path.join(os.path.dirname(src), linkedTargetFile)))
-					if SYNC_COPIES:
+					if link_dirs is not None:
 						link_dirs.add(os.path.dirname(os.path.abspath(dest)))
 					if keep_target:
 						tracked_targets.add((os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(dest)), linkedTargetFile)),
@@ -2597,15 +3078,9 @@ Skipping...""")
 
 	endTime = time.monotonic()
 	print(f"Time taken:             {endTime-start_time:0.4f} seconds")
-	# The directory the links went into, with any link on the way to it followed (-d named a link to a directory): _fsync_file passes a link.
-	for directory in sorted({os.path.realpath(directory) for directory in link_dirs}):
-		try:
-			_fsync_file(directory)
-		except OSError as e:
-			eprint(f'Copy failed: the links made in {directory} cannot be written to disk ({_why(e)})')
 	if len(nestedSymLinks) > 0:
 		print(f"\nNested Symbolic Links:   {len(nestedSymLinks)}")
-		tracked_targets |= create_sym_links(nestedSymLinks,exclude=exclude,link_tracking=link_tracking)
+		tracked_targets |= create_sym_links(nestedSymLinks,exclude=exclude,link_tracking=link_tracking,link_dirs=link_dirs)
 	return tracked_targets
 
 #%% -- File list --
@@ -2721,12 +3196,13 @@ def hash_file(path,size = ...,full_hash=False):
 			hasher.update(chunk)
 	return hasher.hexdigest()
 
-def is_file_identical(src_path, dest_path,src_size,full_hash=False,compare_metadata=False):
-	dst_size = os.path.getsize(dest_path)
+def is_file_identical(src_path, dest_path,src_size,full_hash=False,compare_metadata=False,src_st=None,dest_st=None):
+	"""src_st, dest_st: their stats, when the caller has them (copy_file's looks): nothing is stat'ed again."""
+	dst_size = dest_st.st_size if dest_st is not None else os.path.getsize(dest_path)
 	# try to find the mtime are different
 	if src_size != dst_size:
 		return False
-	src_st, dst_st = os.stat(src_path), os.stat(dest_path)
+	src_st, dst_st = src_st or os.stat(src_path), dest_st or os.stat(dest_path)
 	# A landing at a time its filesystem could not keep (a source from before 1980, on vfat at or after it) says nothing of its
 	# contents: both are read in full, as the move's backstop does, for those files only. Two reads instead of a copy on
 	# every rerun; reading on every other time that differs would read a changed file twice before copying it anyway.
@@ -3179,7 +3655,7 @@ def get_file_list_parallel(path,max_workers=56,exclude=None,append_hash=False,fu
 		listed_items = len(file_list) + len(link_list)
 		# A folder's listing that crashed (this default): its folder stays, as before 9.77.
 		no_result = (frozenset(), frozenset(), 0, frozenset())
-		with ProcessPoolExecutor(max_workers=max_workers) as executor:
+		with _pool(max_workers) as executor:
 			while folders_to_expand or futures:
 				under_rate_limit = (
 					FILES_RATE_LIMIT <= 0
@@ -3207,7 +3683,7 @@ def get_file_list_parallel(path,max_workers=56,exclude=None,append_hash=False,fu
 					if folders_to_expand and FILES_RATE_LIMIT > 0:
 						time.sleep(0.05)
 					continue
-				done, _ = concurrent.futures.wait(futures, return_when=concurrent.futures.FIRST_COMPLETED)
+				done = _wait(futures, executor)
 				for doneTask in done:
 					folder_path = futures.pop(doneTask)
 					result = _task_result(doneTask, no_result, 'Listing error')
@@ -3274,7 +3750,7 @@ def delete_file_list_parallel(file_list, max_workers, verbose=False,files_per_jo
 							 suppress_all_output=verbose,bytes_rate_limit=BYTES_RATE_LIMIT,files_rate_limit=FILES_RATE_LIMIT)
 	last_transition_time = time.monotonic()
 	last_under_limit = True
-	with ProcessPoolExecutor(max_workers=max_workers) as executor:
+	with _pool(max_workers) as executor:
 		while file_list_iterator or futures:
 			# counter = 0
 			under_limit = apb.under_rate_limit()
@@ -3292,7 +3768,7 @@ def delete_file_list_parallel(file_list, max_workers, verbose=False,files_per_jo
 						futures[future] = delete_files
 					file_list_iterator = None
 
-			done, _ = concurrent.futures.wait(futures.keys(), return_when=concurrent.futures.FIRST_COMPLETED, timeout=1)
+			done = _wait(futures, executor)
 
 			current_iteration_total_run_time = 0
 			for doneTask in done:
@@ -3372,6 +3848,15 @@ def _landing_of(dest_path):
 	"""(where a copy to dest_path writes, its lstat or None, named). A destination the operator named (-d) is followed when it
 	is a link, as cp follows its destination argument (outside a run, every path counts as named); a landing below one is a
 	name of the tree and never followed: a link, FIFO, socket or device node there is replaced, never opened (_cp_once)."""
+	target, named = _landing_path(dest_path)
+	try:
+		return target, os.lstat(target), named
+	except OSError:
+		return target, None, named
+
+def _landing_path(dest_path):
+	"""(where a copy to dest_path writes, named), as _landing_of gives them, without its lstat of the landing: below a named
+	destination nothing is looked at."""
 	root = _named_root(os.path.abspath(dest_path))
 	named = root is None or root == os.path.abspath(dest_path)
 	target = dest_path
@@ -3384,10 +3869,7 @@ def _landing_of(dest_path):
 			target = os.path.realpath(dest_path)  # dangling or a loop
 		else:
 			target = os.path.realpath(dest_path)
-	try:
-		return target, os.lstat(target), named
-	except OSError:
-		return target, None, named
+	return target, named
 
 def _kind_of(st):
 	"""What st (an lstat) is, in a message."""
@@ -3440,22 +3922,25 @@ def _co_carry(target, st):
 				return None
 	return carried
 
-def _carry_over(st, temp, carried):
+def _carry_over(st, temp, carried, held=None):
 	"""Give temp, the new file of a -co rewrite, exactly what the old file (st, carried: _co_carry) had: its carried xattrs
 	(each set, and any such name temp gained, as an ACL inherited from a default ACL, removed), owner and group, and mode, less
 	set-user-ID, and set-group-ID where group-execute is set, when the runner is not root: the kernel clears those on a write
 	by such a user, so the write in place lost them too. A label the filesystem gives itself (setting security.selinux fails
 	with EOPNOTSUPP: vfat, a context= mount) is skipped. Anything else that fails raises. On Linux each step reaches what cp
 	made through an O_PATH descriptor of it (never opened: a node made of a device is not acted on): a link or another file
-	put at its name since (a user who can write the directory) is refused, so no chown or chmod goes through a link."""
-	fd = os.open(temp, os.O_PATH | os.O_NOFOLLOW | getattr(os, 'O_CLOEXEC', 0)) if _PATH_FDS else None
+	put at its name since (a user who can write the directory) is refused, so no chown or chmod goes through a link. held: the
+	descriptor hpcp made temp by (_cp_beside), which every step goes through instead."""
+	fd = os.open(temp, os.O_PATH | os.O_NOFOLLOW | getattr(os, 'O_CLOEXEC', 0)) if _PATH_FDS and held is None else None
 	try:
 		if fd is not None:
 			now = os.fstat(fd)
 			if stat.S_ISLNK(now.st_mode) or now.st_nlink != 1:
 				raise OSError(errno.EEXIST, 'it was replaced since cp made it', temp)
 			temp = '/proc/self/fd/%d' % fd  # leads to the descriptor's file, and no further
-		how = {} if fd is not None else {'follow_symlinks': False}
+		elif held is not None:
+			temp = held
+		how = {} if fd is not None or held is not None else {'follow_symlinks': False}
 		if hasattr(os, 'listxattr'):
 			try:
 				gained = os.listxattr(temp, **how)
@@ -3578,7 +4063,7 @@ def _dest_directory(path, make=True, source=None):
 			above = source
 			for _ in range(len(parts) - 1 - index):
 				above = above and os.path.dirname(above.rstrip(os.sep))
-			named_form = f'name it with -d {current}{os.sep} to write through it' if link is not None else f'remove {current}'
+			named_form = f'name it with -d {_shell_word(current + os.sep)} to write through it' if link is not None else f'remove {current}'
 			if NO_CREATE_DIR:
 				raise _Refused(f'{current} is a {kind}' + (f' to {link}' if link is not None else '') +
 					' and -ncd makes no directory in its place: not copying ', f' below it; {named_form}')
@@ -3596,7 +4081,8 @@ def _dest_directory(path, make=True, source=None):
 				continue
 			if link is not None:
 				print(f'Note: {current} was a link to {link} and is now a directory; nothing was written to {link}. To write through '
-					f'a link, name it as the destination: hpcp {(above or "SRC").rstrip(os.sep)}{os.sep} -d {current}{os.sep}')
+					f'a link, name it as the destination: hpcp {_shell_word(above.rstrip(os.sep) + os.sep) if above else "SRC/"} -d '
+					f'{_shell_word(current + os.sep)}')
 			break
 		else:
 			raise OSError(errno.EAGAIN, 'it kept changing while it was made a directory', current)
@@ -3656,10 +4142,11 @@ def _init_space_share(array):
 	_SPACE_WARNED = (array.get_lock(), array.get_obj(), array)
 
 def _copy_pool(max_workers):
-	"""The pool for jobs that may run copy_file, its workers sharing the run's slots (forked ones inherit them)."""
-	share = _SPACE_WARNED
-	hand = {} if share is None or share[2] is None else {'initializer': _init_space_share, 'initargs': (share[2],)}
-	return ProcessPoolExecutor(max_workers=max_workers, **hand)
+	"""The pool for jobs that may run copy_file, its workers sharing the run's slots (forked ones inherit them). Asked here, in
+	the parent and outside the pool: how cp writes a held file (_held_route), which its workers are handed (_submit_task), so
+	none makes a probe file or runs a cp for it (an early Ctrl-C met each worker's probe, and left its file)."""
+	_held_route()
+	return _pool(max_workers, space=True)
 
 def _mount_type(dev):
 	"""dev's filesystem type (_mountinfo_entries), None where no mount lists it (off Linux, a btrfs subvolume's st_dev): read
@@ -3708,10 +4195,11 @@ def _space_warning(target, src_path, free, need, old):
 	else:
 		lost = "a rewrite's old copy stays (-wb)" if WRITE_BESIDE else "a rewrite's old copy is lost"
 		text = f'{start}, so it may not fit; if the disk runs out the copy fails, and {lost} (the source is kept). {end}'
-	# One write, flushed before cp: its newline ends the bar's line, and no other output lands in it (3.6 to 3.8 buffer stderr).
+	# One write, flushed before cp: its start leaves the bar's line (_line_start), and no other output lands in it (3.6 to 3.8
+	# buffer stderr).
 	with contextlib.suppress(Exception):
 		sys.stdout.flush()
-		sys.stderr.write('\n' + text + '\n')
+		sys.stderr.write(_line_start() + text + '\n')
 		sys.stderr.flush()
 	ERRORS.append(text)
 
@@ -3739,46 +4227,109 @@ def _cp_to(command, src_path, target, space=None):
 # A landing opened to be written in place: never through a link put there (ELOOP), never waiting on a FIFO (ENXIO) or a
 # lease (EAGAIN), not inherited by cp; no O_TRUNC (cp truncates it).
 _LANDING_FLAGS = os.O_WRONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NONBLOCK', 0) | getattr(os, 'O_CLOEXEC', 0)
-_HELD = [None, False]  # (pid, _reaches_held's answer): asked once per process, so a forked worker asks for itself
+_HELD = [None, None]  # (pid, _held_route's answer): asked once per process, so a forked worker asks for itself
+_HELD_GIVEN = None  # (_held_route's answer,), a worker's, handed by its parent's task (_submit_task): the worker asks no cp
+# The name under which cp opens a descriptor it inherited (pass_fds): its own process's, so no other process's /proc is asked.
+_HELD_NAME = '/dev/fd/%d' if sys.platform == 'darwin' else '/proc/self/fd/%d'
 
-def _reaches_held():
-	"""True when cp can open this process's descriptors through /proc/PID/fd/N, the held file of a rewrite in place. False off
-	Linux, without /proc, where /proc is another PID namespace's (/proc/PID is another process), for a cp that is not GNU cp
-	(the one checked), and where cp is refused (hidepid, a worker not dumpable, an LSM): asked by doing it, cp copying
-	/dev/null onto a descriptor of /dev/zero. cp then gets the name, as in 9.84."""
+def _held_route():
+	"""How cp writes a file this process holds open, through the descriptor it inherits (_HELD_NAME): 'c' when its write leaves
+	the file at the source's size (Linux reopens /proc/self/fd/N and truncates; macOS's copyfile truncates after its copy),
+	'cb' when it writes through it but leaves an old tail (a dup opened without truncating: hpcp empties the held file before
+	each cp), None when it does not: cp then gets the name, as 9.84 gave it. Asked once per process by doing it: cp, with the
+	run's flags, copies a 1-byte source holding c onto a held temporary file holding ab, which is read back (a pool's workers are
+	handed their parent's answer, _HELD_GIVEN, and ask nothing). Only on Linux
+	with GNU cp (BusyBox's makes every destination anew) and on macOS; elsewhere None. A cp that times out or cannot start
+	keeps no answer (asked again at the next copy, as cp_supports_sparse); a cp that fails or writes elsewhere, or no
+	temporary file (tempfile's TMPDIR, /tmp, /var/tmp, /usr/tmp and the working directory), is None. Both temporary files
+	go whatever happens."""
+	global _MAKING
 	pid = os.getpid()
-	if _HELD[0] != pid:
-		_HELD[:] = [pid, False]
-		with contextlib.suppress(Exception):
-			if sys.platform.startswith('linux') and cp_supports_sparse() and os.readlink('/proc/self') == str(pid):
-				with open('/dev/zero', 'wb') as probe:
-					# 10 s, as cp_supports_sparse waits: an empty copy takes milliseconds, and a cp that hangs so long gets no held file.
-					code = multiCMD.run_commands([[_bin('cp'), os.devnull, '/proc/%d/fd/%d' % (pid, probe.fileno())]], timeout=10,
-						quiet=True, return_object=True)[0].returncode
-				_HELD[1] = code == 0
-				if code not in (0, 1):
-					_HELD[0] = None  # no answer (a timeout, a cp that could not start): asked again at the next rewrite
+	if _HELD[0] == pid:
+		return _HELD[1]
+	if _HELD_GIVEN is not None:
+		return _HELD_GIVEN[0]
+	_HELD[:] = [pid, None]
+	if sys.platform.startswith('linux'):
+		gnu = cp_supports_sparse()
+		if gnu is None:
+			_HELD[0] = None  # cp gave no answer: asked again at the next copy
+			return None
+		if not gnu or not os.path.isdir('/proc/self/fd'):
+			return None
+	elif sys.platform != 'darwin':
+		return None
+	source = None
+	try:
+		# gettempdir's first call makes and removes a test file in the directory it tries (CPython: 8 characters, 4 bytes): a
+		# stop in between left it (14 of 9,900 early stops of the final review's probe; 9.86 made no file). TemporaryFile, where
+		# it cannot make a file without a name (macOS; a kernel or TMPDIR without O_TMPFILE), makes mkstemp's tmp* file and
+		# unlinks it: a stop in between left it (4 % of stops in the probe's first 0.5 ms); and on Python 3.6 to 3.9 a stop as
+		# it returns closed the file twice, so it raised EBADF in place of the stop, taken below for no route (1 % of them).
+		# A stop is only recorded while they run (_MAKING, as for the file _cp_made makes), and raised after them.
+		_MAKING = True
+		try:
+			directory = tempfile.gettempdir()
+			held = tempfile.TemporaryFile()
+		finally:
+			_MAKING = False
+			if _STOPPED_PID == os.getpid():
+				raise KeyboardInterrupt
+		# Named before it is made, so the finally removes whatever a stop leaves: mkstemp gives the name only after making the
+		# file, and a stop in between left it (about 3% of early Ctrl-Cs on Python 3.6 and 3.7, one file per worker hit).
+		source = os.path.join(directory, 'hpcp-held-probe-%d-%s' % (os.getpid(), uuid.uuid4().hex[:16]))
+		handle = os.open(source, _NEW_FILE_FLAGS, 0o600)
+		try:
+			os.write(handle, b'c')
+		finally:
+			os.close(handle)
+		with held:
+			fd = held.fileno()
+			os.write(fd, b'ab')
+			os.lseek(fd, 0, os.SEEK_SET)  # as a landing's fresh descriptor: macOS's /dev/fd/N shares its offset
+			# an empty copy takes milliseconds; a cp that hangs this long gets no route (_CP_ASK_TIMEOUT)
+			task = multiCMD.run_commands([[_bin('cp'), '-f' if CONTENT_ONLY else '-af', source, _HELD_NAME % fd]],
+				timeout=_CP_ASK_TIMEOUT, quiet=True, return_object=True, pass_fds=(fd,))[0]
+			if task.returncode in _NO_ANSWER:
+				_HELD[0] = None
+			elif task.returncode == 0:
+				_HELD[1] = {b'c': 'c', b'cb': 'cb'}.get(os.pread(fd, 8, 0))
+	except Exception:
+		pass  # no temporary file: no route
+	finally:
+		# No call before the unlink (a stop on Python 3.6 to 3.9 can land between any two instructions here).
+		if source is not None:
+			try:
+				os.unlink(source)
+			except OSError:
+				pass
 	return _HELD[1]
 
-def _cp_held(command, src_path, target, fd, fst, space, through_link):
+def _cp_held(command, src_path, target, fd, fst, space, through_link, new=False):
 	"""cp src_path into target, the regular file with one name this process holds open (fd, fst its fstat); its size. cp
-	writes the held file (/proc/PID/fd/N, _reaches_held), so a link put at the name since the open is never written through;
-	else the name, as in 9.84. The inode stays. A cp that fails or is stopped after it changed the file takes the torn name
-	if it is still this file, as 9.84 did, except where a link the operator named led there (through_link: kept for the
-	retry, 9.84). -rbw reads the source first; its failure keeps the file (_KeptOld). Errors name target, not /proc."""
-	if READ_FIRST:
+	writes the held file through the descriptor it inherits (_held_route), so a link put at the name since the open is never
+	written through; with no route, the name, as in 9.84. The inode stays. A cp that fails or is stopped after it changed the
+	file takes the torn name if it is still this file, as 9.84 did, except where a link the operator named led there
+	(through_link: kept for the retry, 9.84). -rbw reads the source first; its failure keeps the file (_KeptOld). new: the
+	file is one hpcp just made (_cp_made): no -rbw read, no old copy, and a failure takes the name while it leads to
+	it. Errors name target, not the descriptor's name."""
+	if READ_FIRST and not new:
 		failed = _read_through(src_path)
 		if failed is not None:
 			raise _KeptOld(f'{src_path} failed on read ({_why(failed)})')
 	if space is not None:
-		_space_warning(target, src_path, space[0], space[1], fst.st_blocks * 512)
-	held = '/proc/%d/fd/%d' % (os.getpid(), fd) if _reaches_held() else None
+		_space_warning(target, src_path, space[0], space[1], 0 if new else fst.st_blocks * 512)
+	route = _held_route()
+	held = _HELD_NAME % fd if route else None
+	if route == 'cb' and not new:
+		os.ftruncate(fd, 0)  # cp's open will not truncate it, and a shorter source would leave the old tail
 	try:
-		run_command_in_multicmd_with_path_check(command + [src_path, held or target], quiet=True, strict=True)
+		run_command_in_multicmd_with_path_check(command + [src_path, held or target], quiet=True, strict=True,
+			pass_fds=(fd,) if held else ())
 	except BaseException as e:
 		with contextlib.suppress(OSError):
 			now, named = os.fstat(fd), os.lstat(target)
-			if (not through_link and (now.st_size, now.st_mtime_ns, now.st_ctime_ns) != (fst.st_size, fst.st_mtime_ns, fst.st_ctime_ns)
+			if (not through_link and (new or (now.st_size, now.st_mtime_ns, now.st_ctime_ns) != (fst.st_size, fst.st_mtime_ns, fst.st_ctime_ns))
 					and (named.st_dev, named.st_ino) == (fst.st_dev, fst.st_ino)):
 				os.unlink(target)
 		if held is not None and ERRORS and held in ERRORS[-1]:
@@ -3786,16 +4337,118 @@ def _cp_held(command, src_path, target, fd, fst, space, through_link):
 		if held is None or not isinstance(e, Exception):
 			raise
 		raise RuntimeError(str(e).replace(held, target)) from e
-	if not CONTENT_ONLY:
+	if not CONTENT_ONLY and not new:
 		_remove_stale_xattrs(src_path, fd)
 		if held is not None:
 			_label_like(src_path, fd)
 	return os.fstat(fd).st_blocks * 512
 
+# A file hpcp makes for cp to write (_cp_made: a first copy, the beside route's new file): never through a link or onto a
+# name there.
+_NEW_FILE_FLAGS = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_CLOEXEC', 0)
+
+def _new_file_mode(src_st):
+	"""The mode a file hpcp makes for cp starts with (_cp_made): 0600 for cp -a, which gives it the source's mode through the
+	descriptor when it ends (no reader sees it wider than the source); under -co (cp -f, which keeps an existing file's mode)
+	the source's permission bits, which the umask and a default ACL then make what cp -f makes."""
+	return stat.S_IMODE(src_st.st_mode) & 0o777 if CONTENT_ONLY and src_st is not None else 0o600
+
+def _drop_made(target, made):
+	"""Remove target while its name still leads to made, the file hpcp made there (its fstat): never what was put there since."""
+	with contextlib.suppress(OSError):
+		named = os.lstat(target)
+		if (named.st_dev, named.st_ino) == (made.st_dev, made.st_ino):
+			os.unlink(target)
+
+def _has_acl(fd):
+	"""Whether the file fd is open on carries POSIX ACL entries beyond its mode (Linux; False where it cannot be asked)."""
+	try:
+		return 'system.posix_acl_access' in os.listxattr(fd)
+	except (OSError, AttributeError, TypeError):
+		return False
+
+def _cp_made(command, src_path, target, src_st, space):
+	"""cp src_path, a regular file, into target, a new file hpcp makes for it (O_EXCL: never through a link put at the name;
+	FileExistsError when a name is there) and cp writes through its own descriptor (_cp_held): (that descriptor, still open
+	for the caller to close, the made file's fstat, the size); None where cp has to make it by name (below). A failure
+	removes the made file while its name still leads to it.
+	A plain run gives the new file the source's SELinux label (_label_like) before cp writes it, and its owner and group too
+	where a default ACL gave it entries beyond its mode: cp -a gives a file it did not make another owner only after
+	narrowing its mode and ACL to the owner's (the entries go), where a file it makes keeps them. Where they cannot be given
+	(not root) and the file has such entries: None, the file removed, for cp by name as in 9.86; and so for a root run of
+	a file whose owner or group is not the made file's (another user's or another group's), where giving it first charges
+	root's write to that owner's or group's quota (below). A root run of a file whose owner and group are the made file's
+	(root:root, or root and the group of a setgid directory) gives nothing and keeps the held route. Without such entries
+	cp -a gives the owner once it has written, as by name: given first, the data would be charged to the owner while it is
+	written (XFS enforces an owner's or a group's quota on a root write, not on root's chown: a user, or a group, at the hard
+	limit got Disk quota exceeded where 9.86 completed). A mode its owner cannot write (-co's 0444 source, a umask taking
+	owner write) has owner write while cp writes, which cp's reopen needs; -co puts the mode back."""
+	global _MAKING
+	src_st = src_st or os.lstat(src_path)
+	fd = made = None
+	try:
+		# A stop is only recorded while the file is made (_stop) and raised here once it is known, or the create has failed: one
+		# raised as os.open returned left the file, empty, at the landing, with nothing to say it was this run's (1 early stop
+		# in 20 on a busy host, 1 in 240 on a quiet one, on every Python; 9.86's cp by name left none).
+		_MAKING = True
+		try:
+			fd = os.open(target, _NEW_FILE_FLAGS, _new_file_mode(src_st))
+			made = os.fstat(fd)
+		finally:
+			_MAKING = False
+			if _STOPPED_PID == os.getpid():
+				raise KeyboardInterrupt
+		if not CONTENT_ONLY:
+			_label_like(src_path, fd)
+			if _has_acl(fd):
+				# Only where a default ACL gave the file entries, which cp -a would narrow away once it gives a file it did not
+				# make another owner. Elsewhere cp -a gives the owner once it has written, as by name. A root run does not give
+				# another user or another group the file first: the data would be charged to that owner's or group's quota while
+				# root writes it (XFS enforces both on a root write, not on root's chown), so there cp makes the file by name,
+				# as in 9.86. Only a change of owner or group is charged differently: a file with the made file's owner and group keeps the route.
+				by_name = os.geteuid() == 0 and (made.st_uid, made.st_gid) != (src_st.st_uid, src_st.st_gid)
+				if not by_name:
+					try:
+						os.fchown(fd, src_st.st_uid, src_st.st_gid)
+					except PermissionError:
+						by_name = True
+				if by_name:
+					_drop_made(target, made)
+					made = None
+					# marked closed before the close: a stop raised as it returns would have the handler below close it again,
+					# whose EBADF took the stop's place (a false Copy failed, the stop left to the task's end)
+					fd, closing = None, fd
+					os.close(closing)
+					return None
+		narrow = not made.st_mode & stat.S_IWUSR
+		if narrow:
+			os.fchmod(fd, stat.S_IMODE(made.st_mode) | stat.S_IWUSR)
+		size = _cp_held(command, src_path, target, fd, made, space, False, new=True)
+		if narrow and CONTENT_ONLY:
+			os.fchmod(fd, stat.S_IMODE(made.st_mode))
+		return fd, made, size
+	except BaseException:
+		if made is not None:
+			_drop_made(target, made)
+		if fd is not None:
+			os.close(fd)
+		raise
+
+def _cp_new(command, src_path, target, src_st, space):
+	"""A first copy (nothing at target) of a regular source, where cp writes a held file (_held_route): made by hpcp and
+	written through cp's own descriptor (_cp_made), else by name (_cp_to). FileExistsError when a name appeared there since
+	the look, for the caller to look again."""
+	made = _cp_made(command, src_path, target, src_st, space)
+	if made is None:
+		return _cp_to(command, src_path, target, space)
+	os.close(made[0])
+	return made[2]
+
 def _label_like(src_path, fd):
-	"""After cp -a wrote the held file fd through its /proc name: the source's SELinux label on it. cp -a gives an existing
-	destination the source's label by name (lsetfilecon, coreutils 8.22 on), which through /proc/PID/fd/N reaches the /proc
-	link, not the file, and it says nothing when that fails; by name (9.84) and on a new file (9.85) the label came along.
+	"""The source's SELinux label on fd, a held file cp -a writes through its descriptor's name (after a rewrite, before a first
+	copy). cp -a gives an existing destination the source's label by name (lsetfilecon, coreutils 8.22 on), which through
+	/proc/self/fd/N reaches the /proc link, not the file, and it says nothing when that fails; by name (9.84) and on a new file
+	(9.85) the label came along.
 	Set through the descriptor, only where it differs, and as cp -a does it: silently where it cannot be (no label, not
 	permitted, a filesystem that labels itself)."""
 	with contextlib.suppress(OSError, AttributeError):
@@ -3812,7 +4465,7 @@ def _in_place_hint(target, st, src_path):
 			return '; without -wb it would be written in place'
 	return ''
 
-def _cp_beside(command, src_path, target, st, why, space):
+def _cp_beside(command, src_path, target, st, why, space, src_st=None):
 	"""cp src_path to a new name beside target, write it to disk and rename it over target once whole; its size. st: what is
 	at target (lstat, or the held file's fstat); why: why it goes beside (None for a non-file). Never in place: a failure
 	keeps what is there, a file as _KeptOld (190) naming why and what failed, a FIFO, socket, device or link as _Refused
@@ -3825,20 +4478,42 @@ def _cp_beside(command, src_path, target, st, why, space):
 	if space is not None:
 		_space_warning(target, src_path, space[0], space[1], 0)
 	temp, renamed, what = _temp_sibling(target), False, 'the new copy beside it failed: %s'
+	# A regular source's new file is made by hpcp and written by cp through its descriptor (_held_route), and what follows goes
+	# through that descriptor too: a second name of another file put at the temporary name is never what hpcp holds. A node
+	# source is made by cp -a (mknod), by name.
+	fd = None
 	try:
 		try:
-			run_command_in_multicmd_with_path_check(command + [src_path, temp], quiet=True, strict=True)
+			if _regular_source(src_path, src_st) and _held_route():
+				made = _cp_made(command, src_path, temp, src_st, None)
+				if made is not None:
+					fd, made = made[:2]
+			if fd is None:
+				run_command_in_multicmd_with_path_check(command + [src_path, temp], quiet=True, strict=True)
 			attributes = None
 			if carried is not None:
 				what = 'its owner, group or an xattr cannot be given to the new copy (%s)'
-				_carry_over(st, temp, carried)
+				_carry_over(st, temp, carried, fd)
 				attributes = _fat_attributes(target)
 			elif not CONTENT_ONLY:
-				_remove_stale_xattrs(src_path, temp)
+				_remove_stale_xattrs(src_path, temp if fd is None else fd)
 			# Renamed unsynced, a power cut could leave nothing where the old copy was.
 			what = 'the new copy cannot be written to disk (%s)'
-			_fsync_file(temp)
+			if fd is None:
+				_fsync_file(temp)
+			else:
+				try:
+					os.fsync(fd)
+				except OSError as e:
+					if e.errno not in _NO_FSYNC:
+						raise
 			what = 'it could not be replaced by the new copy (%s)'
+			if fd is not None:
+				# the rename is by name: something put there since (a user who can write the directory) is not renamed over
+				# the old copy
+				now = os.lstat(temp)
+				if (now.st_dev, now.st_ino) != (made.st_dev, made.st_ino):
+					raise OSError(errno.EEXIST, 'something else was put at its name', temp)
 			os.rename(temp, target)
 			renamed = True  # nothing left to discard: an unlink of the gone name costs a round trip on NFS
 		except Exception as e:
@@ -3851,20 +4526,39 @@ def _cp_beside(command, src_path, target, st, why, space):
 			_set_fat_attributes(target, attributes, target)
 		return get_file_size(target)
 	finally:
+		if fd is not None:
+			os.close(fd)
 		if not renamed:
 			_discard_temp(temp)
 
-def _cp_once(src_path, dest_path, cp_flags, sparse, space=None):
+def _cp_once(src_path, dest_path, cp_flags, sparse, space=None, look=None, src_st=None):
 	"""One attempt at copying src_path to dest_path (copy_file); the size copied. Raises _Refused for what this run will not
 	write, _KeptOld for a rewrite that kept what is there. space: (free, need) when the room is short (_space_warning). By
 	what is at the landing (_landing_of): nothing, or a FIFO or device the operator named: cp writes the name (_cp_to). A
 	regular file with one name that opens for writing, of a regular source: in place, through the held file (_cp_held).
 	Anything else (other names, not writable, a running program, a source cp makes anew; a FIFO, socket, device or link below
 	a destination, never opened), anything the open finds changed since the look, and every rewrite under -wb: beside it,
-	renamed over it once whole (_cp_beside); never to cp by name."""
-	target, st, named = _landing_of(dest_path)
+	renamed over it once whole (_cp_beside); never to cp by name. look: _landing_of(dest_path) when the caller just took it
+	(copy_file's first attempt); src_st: the source's lstat."""
+	target, st, named = look or _landing_of(dest_path)
+	_judge_landing(dest_path, target, st, named)
+	_dest_directory(os.path.dirname(target), make=not NO_CREATE_DIR, source=os.path.dirname(os.path.abspath(src_path)))
+	command = ["cp", cp_flags] + (["--sparse=always"] if sparse and cp_supports_sparse() else [])
+	# A name that appears at a first copy's landing between the look and hpcp's create is looked at again, judged as the first
+	# look was, and the route that fits it taken; 3 times, the door's bound for the same race.
+	for _ in range(3):
+		try:
+			return _cp_landing(command, src_path, dest_path, target, st, named, space, src_st)
+		except FileExistsError:
+			target, st, named = _landing_of(dest_path)
+			_judge_landing(dest_path, target, st, named)
+	raise OSError(errno.EAGAIN, 'it kept changing while it was copied', target)
+
+def _judge_landing(dest_path, target, st, named):
+	"""What no look at a landing lets through (_cp_once), at every look: a dangling link the operator named (cp writes through
+	none, nor does hpcp: a planted one would have it make directories and a file anywhere), one the kernel will not follow
+	for this run, and a directory (cp would copy into it, through whatever is there)."""
 	if named and st is None and os.path.islink(dest_path):
-		# cp writes through no dangling link, nor does hpcp: a planted one would have it make directories and a file anywhere.
 		raise _KeptOld(f'{dest_path} is a link to {os.readlink(dest_path)}, which does not exist (cp writes through no dangling link)')
 	if named and st is not None and stat.S_ISLNK(st.st_mode):
 		# _landing_of left it: the kernel will not follow it for this run (another user's link in a sticky directory:
@@ -3875,19 +4569,28 @@ def _cp_once(src_path, dest_path, cp_flags, sparse, space=None):
 			raise _KeptOld(f'{dest_path} is a link to {os.readlink(dest_path)}, which cannot be followed ({_why(e)})')
 		except OSError:
 			pass
-	_dest_directory(os.path.dirname(target), make=not NO_CREATE_DIR, source=os.path.dirname(os.path.abspath(src_path)))
-	command = ["cp", cp_flags] + (["--sparse=always"] if sparse and cp_supports_sparse() else [])
+	if st is not None and stat.S_ISDIR(st.st_mode):
+		raise _Refused(f'{target} is a directory, not copying ', ' over it')
+
+def _cp_landing(command, src_path, dest_path, target, st, named, space, src_st):
+	"""_cp_once's copy onto target, dest_path's landing, by what its look found there (st, named). FileExistsError: a first
+	copy's name taken since."""
 	held = _claim_device(target, st, named, src_path)
 	try:
 		if not _written_beside(st, named):
+			if st is None and _regular_source(src_path, src_st) and _held_route():
+				return _cp_new(command, src_path, target, src_st, space)
 			return _cp_to(command, src_path, target, space if st is None else None)
-		if not WRITE_BESIDE and stat.S_ISREG(st.st_mode) and st.st_nlink == 1 and _regular_source(src_path):
+		if not WRITE_BESIDE and stat.S_ISREG(st.st_mode) and st.st_nlink == 1 and _regular_source(src_path, src_st):
 			try:
 				fd = os.open(target, _LANDING_FLAGS)
 			except FileNotFoundError:
-				return _cp_to(command, src_path, target, space)  # gone since the lstat: a first copy
+				# gone since the lstat: a first copy
+				if _held_route():
+					return _cp_new(command, src_path, target, src_st, space)
+				return _cp_to(command, src_path, target, space)
 			except OSError as e:
-				return _cp_beside(command, src_path, target, st, f'it cannot be opened for writing ({_why(e)})', space)
+				return _cp_beside(command, src_path, target, st, f'it cannot be opened for writing ({_why(e)})', space, src_st)
 			try:
 				st = os.fstat(fd)  # what the descriptor holds decides from here on
 				if stat.S_ISREG(st.st_mode) and st.st_nlink == 1:
@@ -3899,32 +4602,33 @@ def _cp_once(src_path, dest_path, cp_flags, sparse, space=None):
 		why = ('-wb writes beside it' if WRITE_BESIDE else None if not stat.S_ISREG(st.st_mode) else
 			'it has other names, which a write in place would change' if st.st_nlink > 1 else
 			f'{src_path} is no regular file, which cp makes anew')
-		return _cp_beside(command, src_path, target, st, why, space)
+		return _cp_beside(command, src_path, target, st, why, space, src_st)
 	finally:
 		if held is not None:
 			os.close(held)
 
-def _regular_source(src_path):
+def _regular_source(src_path, src_st=None):
 	"""False for a source that cp -a makes anew (a FIFO, socket or device node: it unlinks what is at the landing, and cannot
-	unlink a held file's /proc name); a source that is gone is cp's to answer."""
+	unlink a held file's /proc name); a source that is gone is cp's to answer. src_st: its lstat, when the caller has it."""
 	try:
-		return stat.S_ISREG(os.lstat(src_path).st_mode)
+		return stat.S_ISREG((src_st or os.lstat(src_path)).st_mode)
 	except OSError:
 		return True
 
-def _cp_flags(src_path):
+def _cp_flags(src_path, src_st=None):
 	"""How cp copies src_path. Under -co cp -f reads what it is given and writes through what is there, so only a regular file
 	goes that way: cp -a makes a new node for anything else and never opens it, so a device is not read to its end and a FIFO
 	does not wait for a writer. A source that is gone is cp's to answer."""
-	return "-f" if CONTENT_ONLY and _regular_source(src_path) else "-af"
+	return "-f" if CONTENT_ONLY and _regular_source(src_path, src_st) else "-af"
 
-def _can_open(path):
+def _can_open(path, st=None):
 	"""False when cp could not read the regular file path. Asked by opening, with the ids cp runs with: access() answers for
 	the real uid, and a service with a read capability or a setuid wrapper can open more. Only a regular file: cp -a makes a
 	new node for the rest, and opening one is an act of its own (a FIFO's writer wakes, a watchdog arms). No search
 	permission on the way answers as a file does."""
 	try:
-		if stat.S_ISREG(os.stat(path).st_mode):
+		# st: the caller's lstat (its source is no link), else a stat: a link to a file is read as cp -a's caller reads it.
+		if stat.S_ISREG((st or os.stat(path)).st_mode):
 			os.close(os.open(path, os.O_RDONLY))
 	except PermissionError:
 		return False
@@ -3932,7 +4636,7 @@ def _can_open(path):
 		pass
 	return True
 
-def _can_make_node(src_path, dest_paths):
+def _can_make_node(src_path, dest_paths, src_st=None):
 	"""False when src_path is a device node that this user cannot make, and a destination holds something. cp -a unlinks
 	what is there before its mknod, so a user who may not make nodes (not root) would lose the old file and get nothing.
 	Asked by doing it: a node of src_path's kind and number is made under a name of its own beside a destination that
@@ -3940,11 +4644,13 @@ def _can_make_node(src_path, dest_paths):
 	destination is asked, and when none answers it is cp's to answer. Nothing is made for a
 	source that is no device, or when no destination exists (cp then has nothing to lose)."""
 	try:
-		st = os.lstat(src_path)
+		st = src_st or os.lstat(src_path)
 	except OSError:
 		return True
+	if not (stat.S_ISBLK(st.st_mode) or stat.S_ISCHR(st.st_mode)):
+		return True
 	existing = [dest for dest in dest_paths if os.path.lexists(dest)]
-	if not existing or not (stat.S_ISBLK(st.st_mode) or stat.S_ISCHR(st.st_mode)):
+	if not existing:
 		return True
 	for dest in existing:
 		name = '.hpcp-node-probe-%d-%s' % (os.getpid(), uuid.uuid4().hex)
@@ -3987,13 +4693,103 @@ def _remove_what_failed(path, before):
 		except OSError:
 			pass  # its directory will not let it go (0555, sticky, a bind mount): the copy's own error is the one to report
 
-def _known_identical(src_path, dest_path, src_size, full_hash):
+def _known_identical(src_path, dest_path, src_size, full_hash, src_st=None, dest_st=None):
 	"""is_file_identical, where a side that may not be read is not known to be the same: the copy then goes on, and a source
-	stops at _can_open, its old copy kept. Only that: any other read error stays a crash, because cp would truncate first."""
+	stops at _can_open, its old copy kept. Only that: any other read error stays a crash, because cp would truncate first.
+
+	Under -co, which carries no times, a regular landing of the source's size is the same when it reads the same to the end
+	(_same_contents), whatever its time: the time test never matched there, so every rerun rewrote every file, and the hash
+	reads only the last HASH_SIZE bytes, missing a change before them. Under -hs 0 ("file attributes only") it is rewritten."""
 	try:
-		return is_file_identical(src_path, dest_path, src_size, full_hash)
+		if CONTENT_ONLY and HASH_SIZE > 0:
+			src_st, dest_st = src_st or os.stat(src_path), dest_st or os.stat(dest_path)
+			if stat.S_ISREG(src_st.st_mode) and stat.S_ISREG(dest_st.st_mode):
+				return src_st.st_size == dest_st.st_size and _same_contents(src_path, dest_path)
+		return is_file_identical(src_path, dest_path, src_size, full_hash, src_st=src_st, dest_st=dest_st)
 	except PermissionError:
 		return False
+
+# The errors shutil.copystat's xattr copy ignores (3.6 to 3.14, together): a name the destination or the runner cannot have.
+_XATTR_SKIPPED = frozenset((errno.EPERM, errno.ENOTSUP, errno.EOPNOTSUPP, errno.ENODATA, errno.EINVAL, errno.EACCES))
+
+def _settle_identical(src_path, src_st, dest, look):
+	"""Give dest, a landing the skip check found identical to src_path (look: its lstat then; src_st: the source's, taken before
+	the check read it), what the skip has always given it (9.86's _remove_stale_xattrs, copystat, _chown_like_cp, chmod and
+	utime): stale portable xattrs removed and the source's set, owner and group as cp -a keeps them, the mode less set-user-ID
+	or set-group-ID where the owner or group is not kept, the times where the modification time differs (a read time alone
+	is left: reads move it), BSD flags last. Each only where it differs, all through one descriptor checked against the
+	look. False, with nothing set, when dest is no longer the file looked at (a link, or
+	another file's name, put there since: neither gets the source's owner or mode), for the caller to look again.
+
+	On Linux an O_PATH descriptor, reached by its /proc/self/fd name (as _carry_over); elsewhere a regular file opened for
+	reading without following a link (the check just read it), and a node by name."""
+	fd = None
+	try:
+		if _PATH_FDS:
+			fd = os.open(dest, os.O_PATH | os.O_NOFOLLOW | getattr(os, 'O_CLOEXEC', 0))
+		elif stat.S_ISREG(look.st_mode):
+			fd = os.open(dest, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NONBLOCK', 0) | getattr(os, 'O_CLOEXEC', 0))
+	except OSError as e:
+		if e.errno in (errno.ENOENT, errno.ELOOP):
+			return False  # gone, or a link put there (O_NOFOLLOW)
+		raise
+	try:
+		now = os.fstat(fd) if fd is not None else os.lstat(dest)
+		if (now.st_dev, now.st_ino, stat.S_IFMT(now.st_mode)) != (look.st_dev, look.st_ino, stat.S_IFMT(look.st_mode)):
+			return False
+		if fd is None:
+			path, how = dest, {'follow_symlinks': False}
+		elif _PATH_FDS:
+			path, how = '/proc/self/fd/%d' % fd, {}  # leads to the descriptor's file, and no further
+		else:
+			path, how = fd, {}
+		owner_kept = group_kept = True
+		chowned = os.name == 'posix' and (now.st_uid, now.st_gid) != (src_st.st_uid, src_st.st_gid)
+		if chowned:
+			owner_kept, group_kept = _chown_like_cp(path, src_st)
+		# xattrs after the owner, as cp -a: a chown clears a file capability (security.capability), and before the mode, which
+		# may make the file read-only
+		if hasattr(os, 'listxattr'):
+			try:
+				src_names = os.listxattr(src_path, follow_symlinks=False)
+				dest_names = os.listxattr(path, **how)
+			except OSError as e:
+				if e.errno not in (errno.ENOTSUP, errno.EOPNOTSUPP):
+					raise
+				src_names = dest_names = ()
+			for name in dest_names:
+				if name not in src_names and _is_portable_xattr(name):
+					try:
+						os.removexattr(path, name, **how)
+					except OSError as e:
+						if e.errno not in (errno.ENOTSUP, errno.EPERM, errno.ENODATA, errno.EACCES, errno.EINVAL, errno.ENOENT):
+							raise
+			for name in src_names:
+				try:
+					value = os.getxattr(src_path, name, follow_symlinks=False)
+					if name not in dest_names or os.getxattr(path, name, **how) != value:
+						os.setxattr(path, name, value, **how)
+				except OSError as e:
+					if e.errno not in _XATTR_SKIPPED:
+						raise
+		# As cp -a: no set-user-ID / set-group-ID bit for an owner / group not kept. A chown may have cleared them: set again.
+		mode = stat.S_IMODE(src_st.st_mode) & ~((0 if owner_kept else stat.S_ISUID) | (0 if group_kept else stat.S_ISGID))
+		if chowned or stat.S_IMODE(now.st_mode) != mode:
+			os.chmod(path, mode)
+		if now.st_mtime_ns != src_st.st_mtime_ns:
+			# The read time goes with it, as cp -a gives it; alone it is not chased: a read moves it (relatime moves one older
+			# than the change time, which setting it makes it), so the skip check's own read would have it set on every rerun.
+			os.utime(path, ns=(src_st.st_atime_ns, src_st.st_mtime_ns), **how)
+		if getattr(src_st, 'st_flags', 0) != getattr(now, 'st_flags', 0):
+			try:
+				os.chflags(dest, src_st.st_flags, follow_symlinks=False)
+			except OSError as e:
+				if e.errno not in (errno.ENOTSUP, errno.EOPNOTSUPP):
+					raise
+		return True
+	finally:
+		if fd is not None:
+			os.close(fd)
 
 class _CopyFailure(str):
 	"""A 'Copy failed' error in ERRORS that names its source (.source): the copy's check (_not_held) asks which sources
@@ -4035,13 +4831,20 @@ def copy_file(src_path, dest_paths, full_hash=False, verbose=False, concurrent_p
 	if dest_paths is None:
 		return 0, 0, symLinks
 	start_time = time.monotonic()
+	# The source is looked at once (its kind, size, times), and each landing once (_landing_of): what the skip check and the
+	# first attempt act on. A later attempt looks again.
+	try:
+		src_st = os.lstat(src_path)
+	except OSError:
+		src_st = None  # gone: cp says so
+	src_is_link = src_st is not None and stat.S_ISLNK(src_st.st_mode)
 	# Each destination's directories go through the door first (_dest_directory, nothing made: the file lands on one of
 	# them), so a link there is replaced before anything looks below it: the skip check's metadata sync, the space and the
 	# node probes would otherwise go through it. A destination the door refuses is left out, its refusal kept.
 	refused = {}
 	for dest in dest_paths:
 		try:
-			_dest_directory(os.path.dirname(_landing_of(dest)[0]), make=False, source=os.path.dirname(os.path.abspath(src_path)))
+			_dest_directory(os.path.dirname(_landing_path(dest)[0]), make=False, source=os.path.dirname(os.path.abspath(src_path)))
 		except _Refused as e:
 			refused[dest] = e
 		except OSError:
@@ -4052,62 +4855,68 @@ def copy_file(src_path, dest_paths, full_hash=False, verbose=False, concurrent_p
 			for refusal in refused.values():
 				_copy_failed(src_path, refusal.text(src_path))
 			return 0, time.monotonic() - start_time, symLinks
-	if not os.path.islink(src_path):
+	looks = {dest: _landing_of(dest) for dest in dest_paths}
+	if not src_is_link:
 		# cp would put the file inside a directory at its place (dest/x/x), and a move would then lose the source. A link there
 		# is a name of the tree, replaced, unless the operator named it (_landing_of).
-		usable = [dest for dest in dest_paths if not (lambda st: st is not None and stat.S_ISDIR(st.st_mode))(_landing_of(dest)[1])]
+		usable = [dest for dest in dest_paths if not (looks[dest][1] is not None and stat.S_ISDIR(looks[dest][1].st_mode))]
 		if not usable:
 			eprint(f'Destination clash: {dest_paths[0]} is a directory, not copying {src_path} over it')
 			return 0, 0, symLinks
 		dest_paths = usable
 	try:
-		src_size = get_file_size(src_path)
+		src_size = _allocated_size(src_st) if src_st is not None else get_file_size(src_path)
 		copiedSize = 0
-		try:
-			src_kind = stat.S_IFMT(os.lstat(src_path).st_mode)
-		except OSError:
-			src_kind = None
+		src_kind = stat.S_IFMT(src_st.st_mode) if src_st is not None else None
 		for dest in dest_paths:
-			dest, dest_st, _ = _landing_of(dest)
-			# Only a regular file, or a node of the source's own kind, can be the same: a link is never identical, and its
-			# target's mode and owner are never touched.
-			if dest_st is None or not (stat.S_ISREG(dest_st.st_mode) or (not stat.S_ISDIR(dest_st.st_mode) and
-					stat.S_IFMT(dest_st.st_mode) == src_kind)):
-				continue
-			if (not os.path.islink(src_path)) and _known_identical(src_path, dest,os.path.getsize(src_path),full_hash):
-				if not CONTENT_ONLY:
-					st = os.stat(src_path,follow_symlinks=False)
-					_remove_stale_xattrs(src_path, dest)
-					shutil.copystat(src_path, dest,follow_symlinks=False)
-					if os.name == 'posix':
-						owner_kept, group_kept = _chown_like_cp(dest, st)
-						#also copy the modes (as cp -a: no set-user-ID / set-group-ID bit for an owner / group not kept)
-						os.chmod(dest, st.st_mode & ~((0 if owner_kept else stat.S_ISUID) | (0 if group_kept else stat.S_ISGID)))
-					os.utime(dest, ns=(st.st_atime_ns, st.st_mtime_ns),follow_symlinks=False)
+			# A landing that changed between the skip check's look and its settling is looked at and judged again, as the door
+			# bounds its own race.
+			for _ in range(3):
+				target, dest_st, _ = looks[dest]
+				# Only a regular file, or a node of the source's own kind, can be the same: a link is never identical, and its
+				# target's mode and owner are never touched.
+				if src_st is None or src_is_link or dest_st is None or not (stat.S_ISREG(dest_st.st_mode) or
+						(not stat.S_ISDIR(dest_st.st_mode) and stat.S_IFMT(dest_st.st_mode) == src_kind)):
+					break
+				if not _known_identical(src_path, target, src_st.st_size, full_hash, src_st=src_st, dest_st=dest_st):
+					break
+				try:
+					settled = CONTENT_ONLY or _settle_identical(src_path, src_st, target, dest_st)
+				except OSError as e:
+					# Identical, but what the skip gives it cannot be set (a read-only mount, another user's file): a failed
+					# copy that names the landing.
+					_copy_failed(src_path, f'Copy failed: ERROR copying {src_path} to {target}: it holds the source\'s content, but its owner, mode, times or xattrs cannot be set ({_why(e)})')
+					return 0, time.monotonic() - start_time, symLinks
+				if not settled:
+					looks[dest] = _landing_of(dest)
+					continue
 				if SYNC_COPIES:
 					# A copy an earlier run left (or a plain copy before this move) may still be in memory.
 					try:
-						_sync_landing(dest)
+						_sync_landing(target)
 					except _NotOnDisk as e:
-						_copy_failed(src_path, f'Copy failed: ERROR copying {src_path} to {dest}: {e}')
+						_copy_failed(src_path, f'Copy failed: ERROR copying {src_path} to {target}: {e}')
 						return 0, time.monotonic() - start_time, symLinks
 				endTime = time.monotonic()
 				return 0, endTime - start_time , symLinks #, task_to_run
+			else:
+				_copy_failed(src_path, f'Copy failed: ERROR copying {src_path} to {target}: it kept changing while it was looked at')
+				return 0, time.monotonic() - start_time, symLinks
 		bak_dest_paths = dest_paths.copy()
 		using_bak_paths = False
-		if os.path.islink(src_path):
+		if src_is_link:
 			symLinks[src_path] = dest_paths
 		else:
-			if not _can_open(src_path):
+			if not _can_open(src_path, src_st):
 				# No cp at all: cp -a takes away a destination with other names before it finds it cannot read.
 				_copy_failed(src_path, f'Copy failed: cannot open {src_path}, leaving {dest_paths} as they are')
 				return 0, time.monotonic() - start_time, symLinks
-			if not _can_make_node(src_path, dest_paths):
+			if not _can_make_node(src_path, dest_paths, src_st):
 				_copy_failed(src_path, f'Copy failed: cannot make a device node like {src_path} here, leaving {dest_paths} as they are')
 				return 0, time.monotonic() - start_time, symLinks
 			copied = False
 			copy_error_start = len(ERRORS)
-			cp_flags = _cp_flags(src_path)
+			cp_flags = _cp_flags(src_path, src_st)
 			# Why each destination failed, the last attempt's (the door's refusals first).
 			failures = dict(refused)
 			while (not copied) and dest_paths:
@@ -4150,7 +4959,8 @@ def copy_file(src_path, dest_paths, full_hash=False, verbose=False, concurrent_p
 				for sparse in [True] + ([False] if using_bak_paths else []):
 					try:
 						if os.name == 'posix':
-							copiedSize = _cp_once(src_path, dest_path, cp_flags, sparse, space)
+							# The first attempt at a destination acts on its look; a later one looks again.
+							copiedSize = _cp_once(src_path, dest_path, cp_flags, sparse, space, look=looks.pop(dest_path, None), src_st=src_st)
 						elif CONTENT_ONLY:
 							shutil.copy(src_path, dest_path, follow_symlinks=False)
 						else:
@@ -4201,7 +5011,8 @@ def copy_file(src_path, dest_paths, full_hash=False, verbose=False, concurrent_p
 				print(f'Copied {src_path} to {dest_path}')
 				print(f'Estimated remaining size: {format_bytes(dest_free_space - copiedSize)}B')
 	except Exception as e:
-		eprint(f'Copy process crashed: Fatal Error copying {src_path} to {inDests}: {e}')
+		# recorded as this source's failure (_CopyFailure): the copy check then leaves it out, as it does a failed copy
+		_copy_failed(src_path, f'Copy process crashed: Fatal Error copying {src_path} to {inDests}: {e}')
 		if verbose or not isinstance(e, OSError):
 			# a file that cannot be read or reached says so in one line; anything else is a bug and keeps its traceback
 			import traceback
@@ -4322,7 +5133,7 @@ def copy_file_list_parallel(file_list, links, src_path, dest_paths, max_workers,
 						futures[future] = src_files
 					file_list_iterator = None
 
-			done, _ = concurrent.futures.wait(futures.keys(), return_when=concurrent.futures.FIRST_COMPLETED,timeout=1)
+			done = _wait(futures, executor)
 
 			#print('\n',len(done) ,'\t', len(futures))
 			if file_list_iterator and len(done) > 1 and len(done) / len(futures) > 0.1:
@@ -4426,7 +5237,7 @@ def copy_file_list_parallel_batch(jobs, max_workers, full_hash=False, verbose=Fa
 						futures[future] = current_jobs
 					job_list_iterator = None
 
-			done, _ = concurrent.futures.wait(futures.keys(), return_when=concurrent.futures.FIRST_COMPLETED,timeout=1)
+			done = _wait(futures, executor)
 
 			#print('\n',len(done) ,'\t', len(futures))
 			if job_list_iterator and len(done) > 1 and len(done) / len(futures) > 0.1:
@@ -4503,6 +5314,53 @@ def copy_files_parallel(src_path, dest_paths, max_workers, full_hash=False, verb
 	print(f"Estimated size: {format_bytes(init_size)}B")
 	return copy_file_list_parallel(file_list=file_list,links=links,src_path=src_path, dest_paths=dest_paths, max_workers=max_workers, full_hash=full_hash, verbose=verbose,files_per_job=files_per_job,estimated_size = init_size)
 
+def _space_needed(file_list, src_path, dest_paths, max_workers):
+	"""The bytes a copy of file_list (src_path's files) into dest_paths will take, as -enes counts it: one lstat of each source
+	and of its landing at the first destination holding one. No landing: the source's allocated size; a regular file of the
+	same size whose time agrees (any time under -co): nothing, the copy skips it; one rewritten in place (a regular file with one
+	name, not under -wb): what the source takes beyond it; any other landing (a rewrite beside it, under -wb or for a file of
+	several names, or not a regular file): the source's allocated size. A source gone since the listing takes nothing."""
+	def look(chunk):
+		need = 0
+		for file in chunk:
+			try:
+				st = os.lstat(file)
+			except OSError:
+				continue
+			relative = os.path.relpath(file, src_path)
+			for dest_path in dest_paths:
+				try:
+					landing = os.lstat(dest_path if relative == '.' else os.path.join(dest_path, relative))
+					break
+				except OSError:
+					pass
+			else:
+				need += _allocated_size(st)
+				continue
+			regular = stat.S_ISREG(landing.st_mode)
+			if regular and landing.st_size == st.st_size and (CONTENT_ONLY or _mtimes_agree(st.st_mtime_ns, landing.st_mtime_ns)):
+				continue
+			if regular and landing.st_nlink == 1 and not WRITE_BESIDE:
+				need += max(0, _allocated_size(st) - _allocated_size(landing))
+			else:
+				need += _allocated_size(st)
+		return need
+	it = iter(file_list)
+	return sum(_looked_at(iter(lambda: list(itertools.islice(it, 1024)), []), look, max_workers))
+
+def _not_enough_space(file_list, src_path, dest_paths, listed_size, max_workers):
+	"""-enes: whether to skip src_path, whose copy into dest_paths does not fit their free space. Only where its listed size does
+	not fit is what the copy will write counted (_space_needed): a rerun that has little or nothing to copy goes on."""
+	free = sum(get_free_space_bytes(dest_path) for dest_path in dest_paths)
+	if free >= listed_size:
+		return False
+	need = _space_needed(file_list, src_path, dest_paths, max_workers)
+	if free >= need:
+		return False
+	eprint(f'Not enough space: free space on {dest_paths} too small, skipping copy {src_path}')
+	print(f'Free space: {format_bytes(free)}B, Required: {format_bytes(need)}B')
+	return True
+
 def copy_files_parallel_batch(jobs, max_workers, full_hash=False, verbose=False,files_per_job=1,parallel_file_listing=False,exclude=None,
 							  exit_not_enough_space=False,dropped=None):
 	newJobs = []
@@ -4520,15 +5378,10 @@ def copy_files_parallel_batch(jobs, max_workers, full_hash=False, verbose=False,
 		if exclude and is_excluded(src_path,exclude):
 			continue
 		file_list , links,init_size,folders  = get_file_list(src_path, max_workers=max_workers,exclude=exclude,parallel_file_listing=parallel_file_listing)
-		if exit_not_enough_space:
-			# check if there is enough space on all dest paths
-			dest_free_space = sum(get_free_space_bytes(dest_path) for dest_path in dest_paths)
-			if dest_free_space < init_size:
-				eprint(f'Not enough space: free space on {dest_paths} too small, skipping copy {src_path}')
-				print(f'Free space: {format_bytes(dest_free_space)}B, Required: {format_bytes(init_size)}B')
-				continue
 		if lost:
 			file_list, links = file_list - lost, links - lost
+		if exit_not_enough_space and _not_enough_space(file_list, src_path, dest_paths, init_size, max_workers):
+			continue
 		newJobs.append((src_path, dest_paths, file_list))
 		total_item_count += len(file_list)
 		total_size_count += init_size
@@ -4563,6 +5416,7 @@ def copy_files_serial(src_path, dest_paths, full_hash=False, verbose=False,exclu
 	start_time = time.monotonic()
 	apb = Adaptive_Progress_Bar(total_count=total_files,total_size=init_size,last_num_job_for_stats=1,process_word='Copied',suppress_all_output=verbose,bytes_rate_limit=BYTES_RATE_LIMIT,files_rate_limit=FILES_RATE_LIMIT)
 	for file in file_list:
+		_check_stop()
 		srcRelativePath = os.path.relpath(file, src_path)
 		size, cpTime ,rtnSymLinks = copy_file(file, [os.path.join(dest_path, srcRelativePath) for dest_path in dest_paths],full_hash = full_hash, verbose=verbose)
 		#update_progress_bar(copy_counter, copy_size_counter, total_files, start_time)
@@ -4600,6 +5454,7 @@ def copy_files_serial_batch(jobs, full_hash=False, verbose=False,exclude=None,ex
 		if not os.path.isdir(src_path) or os.path.islink(src_path):
 			if lost and src_path in lost:
 				continue
+			_check_stop()
 			src_size, _ , symLinks = copy_file(src_path, dest_paths,full_hash=full_hash, verbose=verbose)
 			#return 1, src_size , symLinks , frozenset([src_path])
 			copied_count += 1
@@ -4610,15 +5465,10 @@ def copy_files_serial_batch(jobs, full_hash=False, verbose=False,exclude=None,ex
 			total_files.append(src_path)
 			continue
 		file_list,links,init_size,_ = get_file_list(src_path,exclude=exclude,parallel_file_listing=False)
-		if exit_not_enough_space:
-			# check if there is enough space on all dest paths
-			dest_free_space = sum(get_free_space_bytes(dest_path) for dest_path in dest_paths)
-			if dest_free_space < init_size:
-				eprint(f'Not enough space: free space on {dest_paths} too small, skipping copy {src_path}')
-				print(f'Free space: {format_bytes(dest_free_space)}B, Required: {format_bytes(init_size)}B')
-				continue
 		if lost:
 			file_list, links = file_list - lost, links - lost
+		if exit_not_enough_space and _not_enough_space(file_list, src_path, dest_paths, init_size, 1):
+			continue
 		newJobs.append((src_path, dest_paths, file_list, set(links), init_size))
 		total_item_count += len(file_list)
 		total_size_count += init_size
@@ -4636,6 +5486,7 @@ def copy_files_serial_batch(jobs, full_hash=False, verbose=False,exclude=None,ex
 	apb.size_counter = copied_size
 	for src_path, dest_paths, file_list, links, init_size in newJobs:
 		for file in file_list:
+			_check_stop()
 			srcRelativePath = os.path.relpath(file, src_path)
 			size, cpTime ,rtnSymLinks = copy_file(file, [os.path.join(dest_path, srcRelativePath) for dest_path in dest_paths],full_hash = full_hash, verbose=verbose)
 			#update_progress_bar(copy_counter, copy_size_counter, total_files, start_time)
@@ -4664,6 +5515,8 @@ class copy_scheduler:
 		self.copy_size_counter = 0
 		self.total_sym_links = {}
 		self.total_file_list = []
+		# The directory sync's records, for the finish (finish_directories)
+		self.dir_records = []
 		self.exit_not_enough_space = exit_not_enough_space
 		# See _settle_destinations.
 		self.dropped = dropped
@@ -4675,9 +5528,11 @@ class copy_scheduler:
 		if self.dir_sync_job:
 			start_time = time.monotonic()
 			if self.max_workers == 1:
-				self.total_sym_links.update(sync_directories_serial_batch(self.dir_sync_job,exclude=self.exclude))
+				links, records = sync_directories_serial_batch(self.dir_sync_job,exclude=self.exclude)
 			else:
-				self.total_sym_links.update(sync_directories_parallel_batch(self.dir_sync_job, max_workers=self.max_workers,verbose=self.verbose,exclude=self.exclude,parallel_file_listing=self.parallel_file_listing))
+				links, records = sync_directories_parallel_batch(self.dir_sync_job, max_workers=self.max_workers,verbose=self.verbose,exclude=self.exclude,parallel_file_listing=self.parallel_file_listing)
+			self.total_sym_links.update(links)
+			self.dir_records += records
 			endTime = time.monotonic()
 			print(f"\nTime taken to sync directory: {endTime-start_time:0.4f} seconds")
 			self.dir_sync_job = []
@@ -4705,12 +5560,13 @@ class copy_scheduler:
 			self.total_sym_links.update(rtnSymLinks)
 			self.total_file_list.extend(file_list)
 			self.copy_job = []
-		return self.total_file_list, self.total_sym_links
+		return self.total_file_list, self.total_sym_links, self.dir_records
 	def clear(self,clear_pending_jobs=False):
 		self.copy_counter = 0
 		self.copy_size_counter = 0
 		self.total_sym_links = {}
 		self.total_file_list = []
+		self.dir_records = []
 		if clear_pending_jobs:
 			self.dir_sync_job = []
 			self.copy_job = []
@@ -4741,159 +5597,354 @@ def _make_dest_directory(src_path, dest_path):
 		print(f"Destination path {dest_path} maybe a mounted dir, known issue with os.path.exists\nContinuing without creating dest folder...", file=sys.stderr)
 	return True
 
-def sync_directory_metadata(src_path, dest_paths):
-	global CONTENT_ONLY
+def _sync_xattrs(src_path, dest):
+	"""Give the directory dest src_path's xattrs: stale portable ones removed (_remove_stale_xattrs' rule), and each of the
+	source's set where dest lacks it or holds another value, so a rerun sets none. The errors copystat ignores are ignored
+	(Python 3.14's set: a name the destination's filesystem or the runner may not have). Returns whether it tried to change
+	any (an ACL is an xattr, and setting one sets the mode's group bits)."""
+	if not hasattr(os, 'listxattr'):
+		return False
+	try:
+		src_names = os.listxattr(src_path)
+		dest_names = set(os.listxattr(dest))
+	except OSError as e:
+		if e.errno not in (errno.ENOTSUP, errno.ENODATA, errno.EINVAL):
+			raise
+		return False
+	changed = False
+	wanted = set(src_names)
+	for name in dest_names:
+		if name in wanted or not _is_portable_xattr(name):
+			continue
+		changed = True
+		try:
+			os.removexattr(dest, name)
+		except OSError as e:
+			if e.errno not in (errno.ENOTSUP, errno.EPERM, errno.ENODATA, errno.EACCES, errno.EINVAL, errno.ENOENT):
+				raise
+	for name in src_names:
+		try:
+			value = os.getxattr(src_path, name)
+			if name in dest_names and os.getxattr(dest, name) == value:
+				continue
+			changed = True
+			os.setxattr(dest, name, value)
+		except OSError as e:
+			if e.errno not in (errno.EPERM, errno.ENOTSUP, errno.ENODATA, errno.EINVAL, errno.EACCES):
+				raise
+	return changed
+
+def _start_directory(src_path, dest_path, st):
+	"""The directory sync's part of dest_path's metadata (src_path's lstat st): what does not stop the copy writing into it,
+	each made only where dest_path differs. Its xattrs, its owner and group (_chown_like_cp), and its mode, plus read, write
+	and search for its owner when the runner is not root and owns it (rsync's rule; root needs none): a 0555 source
+	directory still takes its files. Its times and BSD flags, and the exact mode, wait for the finish, after what goes in it
+	(finish_directories), as cp -a and rsync set a directory's last. Returns the finish's record: (src_path, dest_path, the
+	mode, atime_ns, mtime_ns, BSD flags or None); the mode is None under -co, which sets no directory metadata."""
+	if CONTENT_ONLY:
+		return (src_path, dest_path, None, None, None, None)
+	mode = stat.S_IMODE(st.st_mode)
+	now = os.stat(dest_path)
+	current = stat.S_IMODE(now.st_mode)
+	runner = os.geteuid() if hasattr(os, 'geteuid') else 0
+	if runner and now.st_uid == runner and current & stat.S_IRWXU != stat.S_IRWXU:
+		# A rerun meets the restrictive mode the finish gave it: opened before its xattrs, or its owner may not set them
+		# (EACCES, which copystat's rule ignores) and a source's changed xattr would never come.
+		current |= stat.S_IRWXU
+		os.chmod(dest_path, current)
+	if _sync_xattrs(src_path, dest_path):
+		now = os.stat(dest_path)
+		current = stat.S_IMODE(now.st_mode)
+	if os.name == 'posix':
+		if (now.st_uid, now.st_gid) != (st.st_uid, st.st_gid):
+			owner_kept, group_kept = _chown_like_cp(dest_path, st)
+			# chmod after chown: no set-user-ID / set-group-ID bit for an owner / group not kept (9.86's rule).
+			mode &= ~((0 if owner_kept else stat.S_ISUID) | (0 if group_kept else stat.S_ISGID))
+			now = os.stat(dest_path)
+			current = stat.S_IMODE(now.st_mode)
+		opened = mode
+		if runner and now.st_uid == runner:
+			opened |= stat.S_IRWXU
+		if current != opened:
+			os.chmod(dest_path, opened)
+	return (src_path, dest_path, mode, st.st_atime_ns, st.st_mtime_ns, getattr(st, 'st_flags', None))
+
+def _sync_directory(src_path, dest_paths):
+	"""The directory sync of src_path onto dest_paths: each made (_make_dest_directory) and given its start
+	(_start_directory). (count, seconds, {link: dests} for a source that is a link, the finish's records); a source that is
+	no directory is copied as a file (copy_file), with no records."""
+	start_time = time.monotonic()
 	dest_paths = _validate_paths(src_path, dest_paths)
 	if dest_paths is None:
-		return 0, 0 , set(), frozenset()
-	start_time = time.monotonic()
+		return 0, 0, {}, []
 	if os.path.islink(src_path):
-		return 0,time.monotonic()-start_time,{src_path: dest_paths}
+		return 0, time.monotonic() - start_time, {src_path: dest_paths}, []
 	if not os.path.lexists(src_path):
 		# A live tree: the directory went away after it was listed. The destination keeps what it has.
 		eprint(f'Directory sync error: {src_path} no longer exists')
-		return 1,time.monotonic()-start_time,frozenset()
+		return 1, time.monotonic() - start_time, {}, []
 	if not os.path.isdir(src_path):
-		return copy_file(src_path, dest_paths)
-	# Create the directory if it does not exist
+		return copy_file(src_path, dest_paths) + ([],)
 	try:
 		st = os.stat(src_path)
 	except OSError as e:
 		# A live tree: the directory went away (or became unreadable) after it was listed.
 		eprint(f'Directory sync error: {src_path}: {e}')
-		return 1,time.monotonic()-start_time,frozenset()
+		return 1, time.monotonic() - start_time, {}, []
+	records = []
 	for dest_path in dest_paths:
 		# One directory that cannot be created or synced is recorded; the others (and the other dests) go on.
 		try:
-			if not _make_dest_directory(src_path, dest_path):
-				continue
-			# Sync the metadata
-			if not CONTENT_ONLY:
-				_remove_stale_xattrs(src_path, dest_path)
-				shutil.copystat(src_path, dest_path)
-				if os.name == 'posix':
-					owner_kept, group_kept = _chown_like_cp(dest_path, st)
-					# copystat set the mode before the chown: no set-user-ID / set-group-ID bit for an owner / group not kept.
-					lost = (0 if owner_kept else stat.S_ISUID) | (0 if group_kept else stat.S_ISGID)
-					if st.st_mode & lost:
-						os.chmod(dest_path, stat.S_IMODE(st.st_mode) & ~lost)
-				os.utime(dest_path, ns=(st.st_atime_ns, st.st_mtime_ns))
+			if _make_dest_directory(src_path, dest_path):
+				records.append(_start_directory(src_path, dest_path, st))
 		except OSError as e:
 			eprint(f'Directory sync error: {src_path} to {dest_path}: {e}')
-	return 1,time.monotonic()-start_time,frozenset()
+	return 1, time.monotonic() - start_time, {}, records
+
+def sync_directory_metadata(src_path, dest_paths):
+	"""src_path's directory onto each of dest_paths, its metadata whole now: the sync and its finish at once, for a directory
+	whose contents are in place already (a patch's, an image's parents). (count, seconds, {link: dests})."""
+	count, seconds, links, records = _sync_directory(src_path, dest_paths)
+	for record in records:
+		_finish_directory(record)
+	return count, seconds, links
+
+def _shut_to_its_owner(mode):
+	"""Whether a non-root runner could not open a directory of this final mode again (no owner read): a move fsyncs it at the
+	finish, through the descriptor that set the mode (_finish_directory), and every other directory once they all are
+	finished (_sync_moved_directories)."""
+	return mode is not None and os.geteuid() != 0 and not mode & stat.S_IRUSR
+
+def _finish_directory(record, sync=False):
+	"""The rest of a synced directory's metadata, once what goes in it is in (_start_directory's record): its exact mode, its
+	times and its BSD flags, each set only where the directory differs, through one descriptor opened without following a
+	link (a link the operator named with -d is followed, as everywhere). sync (a move): a directory its mode now shuts to its
+	owner (_shut_to_its_owner) is fsynced through that descriptor, opened while the sync's mode still let its owner in; the
+	others are fsynced after the whole finish, once each (an fsync right after each change would commit the journal once per
+	directory). A failure is a Directory sync error, or the move's copy failure when only the fsync failed."""
+	src_path, dest_path, mode, atime_ns, mtime_ns, flags = record
+	if mode is None:
+		return  # -co: no directory metadata
+	if os.name != 'posix':
+		try:
+			os.chmod(dest_path, mode)
+			os.utime(dest_path, ns=(atime_ns, mtime_ns))
+		except OSError as e:
+			eprint(f'Directory sync error: {src_path} to {dest_path}: {e}')
+		return
+	how = os.O_RDONLY | getattr(os, 'O_CLOEXEC', 0) | getattr(os, 'O_DIRECTORY', 0)
+	if os.path.abspath(dest_path) not in NAMED_DESTS:
+		how |= getattr(os, 'O_NOFOLLOW', 0)
+	try:
+		fd = os.open(dest_path, how)
+	except OSError as e:
+		eprint(f'Directory sync error: {src_path} to {dest_path}: {e}')
+		return
+	try:
+		try:
+			now = os.fstat(fd)
+			if stat.S_IMODE(now.st_mode) != mode:
+				os.fchmod(fd, mode)
+			# The read time with the modification time, as cp -a gives both; one that alone differs is left, as a file's
+			# (_settle_identical): a read moves it where it is not after the change time, which any set makes now, so a rerun
+			# chasing it would set it and move the change time on every run (EL8, relatime: the rerun's own listing did).
+			if now.st_mtime_ns != mtime_ns:
+				os.utime(fd if os.utime in os.supports_fd else dest_path, ns=(atime_ns, mtime_ns))
+			if flags is not None and hasattr(os, 'chflags') and getattr(now, 'st_flags', flags) != flags:
+				os.chflags(dest_path, flags, follow_symlinks=False)
+		except OSError as e:
+			eprint(f'Directory sync error: {src_path} to {dest_path}: {e}')
+		if sync and _shut_to_its_owner(mode):
+			try:
+				os.fsync(fd)
+			except OSError as e:
+				if e.errno not in _NO_FSYNC:
+					eprint(f'Copy failed: the directory {dest_path} cannot be written to disk ({_why(e)})')
+	finally:
+		os.close(fd)
+
+def _finish_directories_job(records, sync):
+	"""A finish job in a pool worker: finish each record (_finish_directory). (count, 0, {})."""
+	for record in records:
+		_finish_directory(record, sync)
+	return len(records), 0, {}
+
+# A finish job's directories: the folder sync's folder_per_job default, for the same per-job overhead. A pass of at most one
+# job's directories runs in the parent: a pool would run it in one worker, after a pool start (about 23 ms).
+_FINISH_PER_JOB = 64
+
+def finish_directories(records, max_workers, sync=False):
+	"""Give each directory the copy synced the rest of its metadata (_finish_directory), deepest first, once what goes in it
+	(its files, links, subdirectories and -rme's removals) is in: a directory written into after its times were set keeps the
+	write's time, and a 0555 one would refuse its files. One pool for the whole pass, each depth done before the next starts,
+	so a child's times are set through its parent while the parent's own mode still lets its owner search it; in the parent
+	under -s or for one job's worth. sync (a move, M2): a directory its mode shuts to its owner is fsynced through the
+	descriptor that set it (_finish_directory); _sync_moved_directories fsyncs the rest."""
+	records = [record for record in records if record[2] is not None]
+	if not records:
+		return
+	by_depth = {}
+	for record in records:
+		by_depth.setdefault(os.path.abspath(record[1]).count(os.sep), []).append(record)
+	depths = sorted(by_depth, reverse=True)
+	if max_workers <= 1 or len(records) <= _FINISH_PER_JOB:
+		for depth in depths:
+			for record in by_depth[depth]:
+				_check_stop()
+				_finish_directory(record, sync)
+		return
+	with _pool(max(1, min(max_workers, -(-len(records) // _FINISH_PER_JOB)))) as executor:
+		for depth in depths:
+			level = by_depth[depth]
+			futures = {_submit_task(executor, _finish_directories_job, level[i:i + _FINISH_PER_JOB], sync)
+				for i in range(0, len(level), _FINISH_PER_JOB)}
+			while futures:
+				for future in _wait(futures, executor):
+					futures.discard(future)
+					_task_result(future, (0, 0, {}), 'Copy process crashed')
+
+def _sync_moved_directories(files, link_dirs, src_paths, dests, dest_image, records, max_workers):
+	"""A move's directory fsyncs, once the finish (finish_directories) is done: each directory the copy synced (records), but
+	those the finish fsynced (_shut_to_its_owner), the directory of every file landing (files: the copy's source paths, one
+	directory map per source directory, so a -nds move is covered), those a link was made in (link_dirs), and the parent of
+	each source's landing, once each. fsync(2) promises a new name only with its directory's fsync: on ext4 and XFS a file's
+	own fsync commits it, elsewhere not; there the first fsync here commits every change before it, so the rest cost little
+	(2,040 directories fsynced each right after its own change took 1.4 to 3.1 s on EL7 and EL8, against 9.86's 0.4 to 0.7 s
+	for the move). In max_workers threads: an fsync waits on the disk, not the CPU. A directory that is not there (a -nds landing directory in a destination its files did not go to)
+	has nothing to write, and another user's that this run may not read (a write-only drop box) is passed over (_fsync_file).
+	A failure is a failed copy: Copy failed: the directory DIR cannot be written to disk (why), and the move removes nothing.
+	Returns the directories it fsynced (or tried to)."""
+	by_source = _by_source(_src_to_dest_map(src_paths, dests, dest_image))
+	directories = set(link_dirs or ())
+	directories.update(record[1] for record in records)
+	finished = {os.path.abspath(record[1]) for record in records if _shut_to_its_owner(record[2])}
+	for parent in {os.path.dirname(path) for path in files}:
+		directories.update(_landings(parent, by_source))
+	for _, landings in _src_to_dest_map(src_paths, dests, dest_image):
+		directories.update(os.path.dirname(os.path.normpath(landing)) for landing in landings)
+	directories = {os.path.abspath(directory) for directory in directories}
+	# The directories between a destination and each landing directory: under -nds no folder sync made them records, and a
+	# name made in one is promised to disk only by its own fsync. With the folder sync each parent is a record already: one
+	# look each.
+	roots = [os.path.abspath(dest).rstrip(os.sep) + os.sep for dest in dests]
+	for directory in sorted(directories):
+		parent = os.path.dirname(directory)
+		while parent != directory and parent not in directories and any((parent + os.sep).startswith(root) for root in roots):
+			directories.add(parent)
+			directory, parent = parent, os.path.dirname(parent)
+	# One spelling each; a destination named as a link to a directory is fsynced where it leads (_fsync_file passes a link).
+	directories -= finished
+	directories = sorted({os.path.realpath(directory) if directory in NAMED_DESTS else directory for directory in directories})
+	def sync(directory):
+		if _STOPPED_PID is not None:
+			return  # stopped (the parent raises it): the rest is left, and the move removes nothing
+		try:
+			_fsync_file(directory)
+		except FileNotFoundError:
+			pass
+		except OSError as e:
+			eprint(f'Copy failed: the directory {directory} cannot be written to disk ({_why(e)})')
+	if max_workers <= 1 or len(directories) <= 1:
+		for directory in directories:
+			sync(directory)
+	else:
+		with concurrent.futures.ThreadPoolExecutor(min(max_workers, len(directories))) as threads:
+			for _ in threads.map(sync, directories):
+				pass
+	return directories
+
+# fcntl(F_FULLFSYNC)'s errors that say the drive cannot be asked (a filesystem without it, such as SMB or FUSE), not that the
+# flush failed
+_NO_FULL_FLUSH = frozenset(getattr(errno, name) for name in ('ENOTSUP', 'EOPNOTSUPP', 'EINVAL', 'ENOTTY', 'EBADF') if hasattr(errno, name))
+
+def _flush_drives(files, directories, src_paths, dests, dest_image):
+	"""A move's last write before its removal, where fcntl has F_FULLFSYNC (macOS): fsync there returns once the data is in
+	the drive's own cache, and F_FULLFSYNC "drains the entire queue of the device and acts as a barrier" (xnu's fcntl(2)), so
+	one call per destination filesystem the move wrote to (st_dev; one per filesystem is at least one per device) makes every
+	earlier fsync there durable. On one landing file there (SQLite's call), or on a directory the move fsynced (directories)
+	where no file landed. A drive that cannot be asked (_NO_FULL_FLUSH) gets a Note and the move goes on, as 9.86 never asked;
+	a failed flush is a failed copy (Copy failed: the drive under DIR could not flush its cache), and the move removes nothing."""
+	try:
+		import fcntl
+	except ImportError:
+		return
+	command = getattr(fcntl, 'F_FULLFSYNC', None)
+	if command is None:
+		return
+	by_source = _by_source(_src_to_dest_map(src_paths, dests, dest_image))
+	targets = {}
+	seen = set()
+	# One landing file per source directory: a directory's files are on its filesystem.
+	for path in files:
+		parent = os.path.dirname(path)
+		if parent in seen:
+			continue
+		seen.add(parent)
+		for landing in _landings(path, by_source):
+			with contextlib.suppress(OSError):
+				st = os.stat(landing)
+				if stat.S_ISREG(st.st_mode):
+					targets.setdefault(st.st_dev, landing)
+	for directory in sorted(directories):
+		with contextlib.suppress(OSError):
+			targets.setdefault(os.stat(directory).st_dev, directory)
+	for path in targets.values():
+		_check_stop()
+		where = path if os.path.isdir(path) else os.path.dirname(path)
+		try:
+			try:
+				fd = os.open(path, os.O_RDONLY | getattr(os, 'O_CLOEXEC', 0))
+			except PermissionError:
+				if where == path:
+					raise
+				# A landing its owner may not read (a copy of another user's file of mode 0044, which _fsync_file opens by a
+				# chmod): its directory is on the same filesystem, and the flush is the whole device's.
+				fd = os.open(where, os.O_RDONLY | getattr(os, 'O_CLOEXEC', 0))
+			try:
+				fcntl.fcntl(fd, command)
+			finally:
+				os.close(fd)
+		except OSError as e:
+			# PermissionError: neither that landing nor its directory opens for this run (another user's write-only drop box),
+			# so the drive cannot be asked through it, as the approved drop-box entry passes over its fsync.
+			if e.errno in _NO_FULL_FLUSH or isinstance(e, PermissionError):
+				print(f'Note: the drive under {where} could not be asked to flush its cache ({_why(e)}): a power cut soon after '
+					'this move can lose files whose sources are removed', file=sys.stderr)
+			else:
+				eprint(f'Copy failed: the drive under {where} could not flush its cache ({_why(e)})')
 
 def sync_directory_metadata_bulk(src_paths, dest_paths,src_path):
+	"""_sync_directory for each of src_paths (below src_path) onto its place below each of dest_paths: (count, seconds,
+	{link: dests}, the finish's records)."""
 	total_count = 0
 	total_time = 0
 	symLinks = {}
+	records = []
 	for src in src_paths:
 		source_relative_path = os.path.relpath(src, src_path)
 		dests = [_below(dest_path, source_relative_path) for dest_path in dest_paths]
-		count , cpTime , rtnSymLinks = sync_directory_metadata(src, dests)
+		count, cpTime, rtnSymLinks, done = _sync_directory(src, dests)
 		total_count += count
 		total_time += cpTime
 		symLinks.update(rtnSymLinks)
-	return total_count , total_time, symLinks
+		records += done
+	return total_count, total_time, symLinks, records
 
 def sync_directory_metadata_bulk_batch(jobs):
+	"""sync_directory_metadata_bulk for (src_path, folder, dest_paths) jobs."""
 	total_count = 0
 	total_time = 0
 	symLinks = {}
+	records = []
 	for (src_path,folder,dest_paths) in jobs:
 		source_relative_path = os.path.relpath(folder, src_path)
 		dests = [_below(dest_path, source_relative_path) for dest_path in dest_paths]
-		count , cpTime , rtnSymLinks = sync_directory_metadata(folder, dests)
+		count, cpTime, rtnSymLinks, done = _sync_directory(folder, dests)
 		total_count += count
 		total_time += cpTime
 		symLinks.update(rtnSymLinks)
-	return total_count , total_time, symLinks
-
-def sync_directories_parallel(src, dests, max_workers, verbose=False,folder_per_job=64,exclude=None,parallel_file_listing=False):
-	global FILES_RATE_LIMIT
-	global BYTES_RATE_LIMIT
-	if FILES_RATE_LIMIT or BYTES_RATE_LIMIT:
-		max_scheduled_jobs = max_workers
-	else:
-		max_scheduled_jobs = max_workers * 1.1
-	dests = _validate_paths(src, dests)
-	if dests is None:
-		return 0, 0, set(), frozenset()
-	symLinks = {}
-	if exclude and is_excluded(src,exclude):
-		return 0, 0 , set(), frozenset()
-	# 
-	if not os.path.isdir(src):
-		_, _ , symLinks = copy_file(src, dests)
-		return symLinks
-	sync_directory_metadata(src, dests)
-	_,_,_,folders  = get_file_list(src, max_workers=max_workers,exclude=exclude,parallel_file_listing=parallel_file_listing)
-	folder_list_iterator = iter(folders)
-	futures = {}
-	start_time = time.monotonic()
-	last_refresh_time = start_time
-	max_workers = max(2,int(max_workers / 4))
-	folder_per_job = max(1,folder_per_job)
-	num_folders_copied_this_job = 0
-
-	print(f"Syncing Dir from {src} to {dests} with {max_workers} workers")
-	apb = Adaptive_Progress_Bar(total_count=len(folders),total_size=len(folders),suppress_all_output=verbose,process_word='Synced',bytes_rate_limit=BYTES_RATE_LIMIT,files_rate_limit=FILES_RATE_LIMIT)
-	with _copy_pool(max_workers) as executor:
-		while folder_list_iterator or futures:
-			# counter = 0
-			while folder_list_iterator and len(futures) <  max_scheduled_jobs and apb.under_rate_limit():
-				src_folders = []
-				try:
-					for _ in range(folder_per_job):
-						src_folder = next(folder_list_iterator)
-						src_folders.append(src_folder)
-					future = _submit_task(executor, sync_directory_metadata_bulk, src_folders, dests,src)
-					futures[future] = src_folders
-					# counter += 1
-				except StopIteration:
-					if src_folders:
-						future = _submit_task(executor, sync_directory_metadata_bulk, src_folders, dests,src)
-						futures[future] = src_folders
-					folder_list_iterator = None
-
-			done, _ = concurrent.futures.wait(futures.keys(), return_when=concurrent.futures.FIRST_COMPLETED,timeout=1)
-			time_spent_this_iter = 0
-			for future in done:
-				src_folders = futures.pop(future)
-				num_folders_copied_this_job = len(src_folders)
-				cpSize, cpTime, rtnSymLinks = _task_result(future, (0, 0, {}), 'Copy process crashed')
-				time_spent_this_iter += cpTime
-				apb.update(num_files=num_folders_copied_this_job, cpSize=cpSize, cpTime=cpTime , files_per_job=folder_per_job)
-				symLinks.update(rtnSymLinks)
-			apb.scheduled_jobs = len(futures)
-			apb.print_progress()
-			if done:
-				if verbose:
-						print(f'\nAverage cptime is {time_spent_this_iter / len(done):0.2f} for {len(done)} jobs with {num_folders_copied_this_job} folders each')
-
-				if folder_list_iterator and num_folders_copied_this_job == folder_per_job and (time_spent_this_iter / len(done) > 5 or time.monotonic() - last_refresh_time > 5):
-					folder_per_job //= MAGIC_NUMBER
-					folder_per_job = round(folder_per_job)
-					if verbose:
-						print(f'\nCompletion time is long, changing folders per job to {folder_per_job}')
-				elif folder_list_iterator and num_folders_copied_this_job == folder_per_job and time_spent_this_iter / len(done) < 1:
-					folder_per_job *= MAGIC_NUMBER
-					folder_per_job = round(folder_per_job)
-					if verbose:
-						print(f'\nCompletion time is short, changing folders per job to {folder_per_job}')
-				if folder_per_job < 1:
-					folder_per_job = 1
-			else:
-				if not apb.under_rate_limit():
-					if verbose:
-						print('\nWe had hit the rate limit and no job is running currently, setting folders per job to 1')
-					folder_per_job = 1
-				time.sleep(apb.refresh_interval)
-			last_refresh_time = time.monotonic()
-
-	endTime = time.monotonic()
-	apb.stop()
-	_print_operation_summary(apb, endTime - start_time, unit='folder', show_bandwidth=True)
-	return symLinks
+		records += done
+	return total_count, total_time, symLinks, records
 
 def sync_directories_parallel_batch(jobs, max_workers, verbose=False,folder_per_job=64,exclude=None,parallel_file_listing=False):
 	global FILES_RATE_LIMIT
@@ -4903,6 +5954,7 @@ def sync_directories_parallel_batch(jobs, max_workers, verbose=False,folder_per_
 	else:
 		max_scheduled_jobs = max_workers * 1.1
 	symLinks = {}
+	records = []
 	allFolderToSync = []
 	for src, dests in jobs:
 		dests = _validate_paths(src, dests)
@@ -4914,11 +5966,11 @@ def sync_directories_parallel_batch(jobs, max_workers, verbose=False,folder_per_
 			_, _ , sl = copy_file(src, dests)
 			symLinks.update(sl)
 			continue
-		sync_directory_metadata(src, dests)
+		records += _sync_directory(src, dests)[3]
 		_,_,_,folders  = get_file_list(src, max_workers=max_workers,exclude=exclude,parallel_file_listing=parallel_file_listing)
 		allFolderToSync.extend([(src,folder,dests) for folder in folders])
 	if not allFolderToSync:
-		return symLinks
+		return symLinks, records
 	print(f"Syncing Dir for {len(allFolderToSync)} folders with {max_workers} workers")
 	apb = Adaptive_Progress_Bar(total_count=len(allFolderToSync),total_size=len(allFolderToSync),suppress_all_output=verbose,process_word='Synced',bytes_rate_limit=BYTES_RATE_LIMIT,files_rate_limit=FILES_RATE_LIMIT)
 	job_iterator = iter(allFolderToSync)
@@ -4944,15 +5996,16 @@ def sync_directories_parallel_batch(jobs, max_workers, verbose=False,folder_per_
 						futures[future] = currentJobs
 					job_iterator = None
 
-			done, _ = concurrent.futures.wait(futures.keys(), return_when=concurrent.futures.FIRST_COMPLETED,timeout=1)
+			done = _wait(futures, executor)
 			time_spent_this_iter = 0
 			for future in done:
 				currentJobs = futures.pop(future)
 				num_folders_copied_this_job = len(currentJobs)
-				cpSize, cpTime, rtnSymLinks = _task_result(future, (0, 0, {}), 'Copy process crashed')
+				cpSize, cpTime, rtnSymLinks, done_records = _task_result(future, (0, 0, {}, []), 'Copy process crashed')
 				time_spent_this_iter += cpTime
 				apb.update(num_files=num_folders_copied_this_job, cpSize=cpSize, cpTime=cpTime , files_per_job=folder_per_job)
 				symLinks.update(rtnSymLinks)
+				records += done_records
 			apb.scheduled_jobs = len(futures)
 			apb.print_progress()
 			if done:
@@ -4981,51 +6034,7 @@ def sync_directories_parallel_batch(jobs, max_workers, verbose=False,folder_per_
 	endTime = time.monotonic()
 	apb.stop()
 	_print_operation_summary(apb, endTime - start_time, unit='folder', show_bandwidth=True)
-	return symLinks
-
-def sync_directories_serial(src, dests,exclude=None):
-	"""
-	Synchronizes directories from source to destination in a single thread.
-
-	Args:
-		src (str): The source directory path.
-		dest (str): The destination directory path.
-		exclude (list, optional): A list of patterns to exclude from synchronization.
-
-	Returns:
-		tuple: A tuple containing:
-			- int: Number of directories synced (always 0 in this implementation).
-			- int: Total size of directories synced in bytes (always 0 in this implementation).
-			- set: Set of synchronized directories (always empty in this implementation).
-			- frozenset: Set of symbolic links (always empty in this implementation).
-
-	Notes:
-		- If the source or destination path length exceeds 4096 characters, the function will skip synchronization.
-		- If the source path is excluded based on the exclude patterns, the function will skip synchronization.
-		- The function prints progress information to the terminal, including the number of directories synced and the speed of synchronization.
-	"""
-	global FILES_RATE_LIMIT
-	global BYTES_RATE_LIMIT
-	dests = _validate_paths(src, dests)
-	if dests is None:
-		return 0, 0, set(), frozenset()
-	if exclude and is_excluded(src,exclude):
-		return 0, 0 , set(), frozenset()
-	symLinks = {}
-	if not os.path.isdir(src):
-		_, _ , symLinks = copy_file(src, dests)
-		return symLinks
-	#sync_directory_metadata(src, dest)
-	_,_,_,folders = get_file_list(src,exclude=exclude,parallel_file_listing=False)
-	print(f"Syncing Dir from {src} to {dests} in single thread")
-	apb = Adaptive_Progress_Bar(total_count=len(folders),total_size=len(folders),process_word='Synced',bytes_rate_limit=BYTES_RATE_LIMIT,files_rate_limit=FILES_RATE_LIMIT)
-	for folder in folders:
-		source_relative_path = os.path.relpath(folder, src)
-		count , cpTime , _ = sync_directory_metadata(folder, [_below(dest, source_relative_path) for dest in dests])
-		apb.update(num_files=1, cpSize=count, cpTime=cpTime , files_per_job=1)
-		apb.rate_limit()
-	apb.stop()
-	return symLinks
+	return symLinks, records
 
 def sync_directories_serial_batch(jobs,exclude=None):
 	global FILES_RATE_LIMIT
@@ -5033,6 +6042,7 @@ def sync_directories_serial_batch(jobs,exclude=None):
 	newJobs = []
 	# skip if src path or dest path is longer than 4096 characters
 	symLinks = {}
+	records = []
 	totalFolderCount = 0
 	srcFolders = []
 	for src,dests in jobs:
@@ -5050,17 +6060,18 @@ def sync_directories_serial_batch(jobs,exclude=None):
 		srcFolders.append(folders)
 		totalFolderCount += len(folders)
 	if totalFolderCount == 0:
-		return symLinks
+		return symLinks, records
 	print(f"Syncing Dir from {len(newJobs)} in single thread")
 	apb = Adaptive_Progress_Bar(total_count=totalFolderCount,total_size=totalFolderCount,process_word='Synced',bytes_rate_limit=BYTES_RATE_LIMIT,files_rate_limit=FILES_RATE_LIMIT)
 	for (src, dests), folders in zip(newJobs, srcFolders):
 		for folder in folders:
 			source_relative_path = os.path.relpath(folder, src)
-			count , cpTime , _ = sync_directory_metadata(folder, [_below(dest, source_relative_path) for dest in dests])
+			count, cpTime, _, done = _sync_directory(folder, [_below(dest, source_relative_path) for dest in dests])
+			records += done
 			apb.update(num_files=1, cpSize=count, cpTime=cpTime , files_per_job=1)
 			apb.rate_limit()
 	apb.stop()
-	return symLinks
+	return symLinks, records
 
 #%% ---- Compare Files ----
 def _compare_file_lists(file_list, file_list2, diff_file_list=None, tar_diff_file_list = False):
@@ -5326,18 +6337,45 @@ def _check_key(key):
 	if any(part in ('', '.', '..') for part in key.rstrip('/').split('/')):
 		raise ValueError(f'unsafe path {key!r}')
 
+def _open_names(path, mode):
+	"""A list of file names (changes.tsv, the manifest) opened as text that holds each name's own bytes (os.fsencode's: the
+	filesystem encoding and its error handler), under any locale, so a name read back is the name written and the file it names
+	is found. UTF-8 held other bytes than the file's under Latin-1, EUC-JP or KOI8-R, and an apply read them as names that are
+	no file's. disk.tsv holds tool output (labels, GPT names, which multiCMD decodes as UTF-8) and stays UTF-8."""
+	return open(path, mode, encoding=sys.getfilesystemencoding(), errors=sys.getfilesystemencodeerrors(), newline='\n')
+
+def _wrote_utf8_names(meta):
+	"""Whether the hpcp that made a patch (its manifest's hpcp_version) wrote its change list as UTF-8 whatever the locale:
+	every one before 9.87. A manifest without a version it can read is taken as written now."""
+	try:
+		return tuple(int(part) for part in str(meta.get('hpcp_version', '')).split('.')[:2]) < (9, 87)
+	except ValueError:
+		return False
+
+def _utf8_name_line(line):
+	"""A line of a change list hpcp wrote before 9.87 (UTF-8 whatever the locale), given as its bytes read by this locale
+	(_open_names): read as 9.86 read it (UTF-8, then spelled by this locale: under Latin-1, the name 9.86 applied), and where
+	this locale cannot spell that (LANG unset, where 9.86 stopped with a UnicodeEncodeError), as it stands: the line's own
+	bytes."""
+	try:
+		# through the name's bytes and back: the spelling a listing gives that name here
+		return os.fsdecode(os.fsencode(os.fsencode(line).decode('utf-8', 'surrogateescape')))
+	except UnicodeError:
+		return line
+
 def write_changes(target, rows):
 	"""Write rows to target in changes.tsv format (also the -dfl output format)."""
-	with open(target, 'w', encoding='utf-8', errors='surrogateescape', newline='\n') as f:
+	with _open_names(target, 'w') as f:
 		f.write(f'{CHANGES_HEADER}\t{CHANGES_VERSION}\n')
 		f.write('#op\tpath\told\tnew\n')
 		for row in sort_change_rows(rows):
 			f.write(f'{row.op}\t{_escape_field(row.path)}\t{row.old}\t{row.new}\n')
 
-def read_changes(source):
-	"""Read a changes.tsv file into ChangeRows. Raises RuntimeError('Patch format error: ...')."""
+def read_changes(source, utf8_names=False):
+	"""Read a changes.tsv file into ChangeRows. Raises RuntimeError('Patch format error: ...'). utf8_names: written by an hpcp
+	before 9.87 (_wrote_utf8_names), whose names are read as it read them (_utf8_name_line)."""
 	rows = []
-	with open(source, 'r', encoding='utf-8', errors='surrogateescape', newline='\n') as f:
+	with _open_names(source, 'r') as f:
 		header = f.readline().rstrip('\n').split('\t')
 		if len(header) != 2 or header[0] != CHANGES_HEADER:
 			raise RuntimeError(f'Patch format error: {source} is not an hpcp change list')
@@ -5351,6 +6389,8 @@ def read_changes(source):
 			line = line.rstrip('\n')
 			if not line or line.startswith('#'):
 				continue
+			if utf8_names:
+				line = _utf8_name_line(line)
 			fields = line.split('\t')
 			if len(fields) != 4 or fields[0] not in _OP_ORDER:
 				raise RuntimeError(f'Patch format error: {source} line {line_number} is malformed')
@@ -5375,7 +6415,7 @@ def write_manifest(target, meta):
 	'sections' is a list of (name, payload_dir, changes_file) and 'raws' a list of
 	(name, file, old_sha256, new_sha256, size); both are written as repeatable lines.
 	"""
-	with open(target, 'w', encoding='utf-8', errors='surrogateescape', newline='\n') as f:
+	with _open_names(target, 'w') as f:
 		for key, value in meta.items():
 			if key not in ('sections', 'raws'):
 				f.write(f'{key}\t{_escape_field(str(value))}\n')
@@ -5406,7 +6446,7 @@ def read_manifest(source):
 	"""
 	meta = {'sections': [], 'raws': []}
 	seen_keys = set()
-	with open(source, 'r', encoding='utf-8', errors='surrogateescape', newline='\n') as f:
+	with _open_names(source, 'r') as f:
 		for line in f:
 			line = line.rstrip('\n')
 			if not line or line.startswith('#'):
@@ -5483,6 +6523,7 @@ def write_disk_tsv(target, rows):
 def read_disk_tsv(source):
 	"""Read disk.tsv into DiskRows. Raises RuntimeError('Patch format error: ...')."""
 	rows = []
+	# Tool output (labels, GPT names) that multiCMD decoded as UTF-8, written as UTF-8: read the same way, not as names.
 	with open(source, 'r', encoding='utf-8', errors='surrogateescape', newline='\n') as f:
 		header = f.readline().rstrip('\n').split('\t')
 		if len(header) != 2 or header[0] != DISK_HEADER or not _ASCII_DIGITS_RE.fullmatch(header[1]):
@@ -5670,19 +6711,24 @@ def _states_for_paths(paths, full_hash=False, read_xattrs=True, max_workers=1, m
 			for path in paths}
 	chunk_size = max(64, len(paths) // (max_workers * 4) + 1)
 	states = {}
-	with ProcessPoolExecutor(max_workers=max_workers) as executor:
-		futures = []
+	with _pool(max_workers) as executor:
+		futures = set()
 		for index in range(0, len(paths), chunk_size):
 			chunk = paths[index:index + chunk_size]
-			futures.append(executor.submit(_states_chunk, chunk, full_hash, read_xattrs, HASH_SIZE,
+			futures.add(_submit_task(executor, _states_chunk, chunk, full_hash, read_xattrs, HASH_SIZE,
 				frozenset(path for path in chunk if path in marked),
 				frozenset(path for path in chunk if path in stat_paths) if stats is not None else None))
-		for future in concurrent.futures.as_completed(futures):
-			chunk_states, chunk_errors, chunk_stats = future.result()
-			states.update(chunk_states)
-			ERRORS.extend(chunk_errors)
-			if stats is not None:
-				stats.update(chunk_stats)
+		while futures:
+			for future in _wait(futures, executor):
+				futures.discard(future)
+				result, _, crash = _settled(future)
+				if crash is not None:
+					raise RuntimeError(f"General Exception: the entries' states could not be read: {crash}")
+				chunk_states, chunk_errors, chunk_stats = result
+				states.update(chunk_states)
+				ERRORS.extend(chunk_errors)
+				if stats is not None:
+					stats.update(chunk_stats)
 	return states
 
 def compute_changes(new_map, base_map, full_hash=False, max_workers=multiprocessing.cpu_count(), read_xattrs=True, metadata=True,
@@ -5745,7 +6791,7 @@ def report_changes(rows, diff_file_list=None, tar_diff_file_list=False):
 	"""
 	if diff_file_list:
 		if tar_diff_file_list:
-			with open(diff_file_list, 'w', encoding='utf-8', errors='surrogateescape', newline='\n') as f:
+			with _open_names(diff_file_list, 'w') as f:
 				for row in rows:
 					if (row.op == 'A' and row.path != './') or (row.op == 'M' and not row.path.endswith('/')):
 						f.write(row.path + '\n')
@@ -6367,7 +7413,7 @@ def _load_patch(volume_roots, volume_names=None):
 	meta = ordered[0][2]
 	sections = []
 	for name, payload_dir, changes_file in meta['sections']:
-		rows = read_changes(os.path.join(ordered[0][0], DIFF_DIR_NAME, changes_file))
+		rows = read_changes(os.path.join(ordered[0][0], DIFF_DIR_NAME, changes_file), _wrote_utf8_names(meta))
 		_validate_patch_rows(rows)
 		sections.append((name, payload_dir, rows))
 	return meta, sections, [entry[0] for entry in ordered]
@@ -6611,11 +7657,19 @@ def _replace_files(files, target_root, max_workers=1, verbose=False, full_hash=F
 			_finish_replace(job, target_root,
 				functools.partial(_call_raising_recorded_failures, copy, source, [tmp], full_hash, verbose), metadata)
 		return
-	with ProcessPoolExecutor(max_workers=max_workers) as executor:
-		futures = {_submit_task(executor, copy, source, [tmp], full_hash, verbose): (row, source, dest, tmp)
-			for row, source, dest, tmp in jobs}
-		for future in concurrent.futures.as_completed(futures):
-			_finish_replace(futures[future], target_root, functools.partial(_raise_task_failures, future), metadata)
+	futures = {}
+	try:
+		with _pool(max_workers) as executor:
+			for row, source, dest, tmp in jobs:
+				futures[_submit_task(executor, copy, source, [tmp], full_hash, verbose)] = (row, source, dest, tmp)
+			while futures:
+				for future in _wait(futures, executor):
+					_finish_replace(futures.pop(future), target_root, functools.partial(_raise_task_failures, future), metadata)
+	finally:
+		# A stop or a failure: the pool's exit has waited for its workers, so a temporary copy one of them made and this loop
+		# did not rename is discarded here (as _finish_replace discards its own).
+		for row, source, dest, tmp in futures.values():
+			_discard_temp(tmp)
 
 def _replace_with_symlink(row, link_target, dest, target_root):
 	"""Create the symlink at a temporary sibling of dest and rename it over dest."""
@@ -9178,13 +10232,33 @@ def _in_root_lost_and_found(path, dest_root):
 		path = os.path.dirname(path)
 	return False
 
-def remove_extra_dirs(src_paths, dests,exclude=None,dest_image=False,keep=(),dest_roots=None,listed=None,named=None):
+def _covered_directories(src_paths, dests, dest_image=False, exclude=None, max_workers=56, parallel_file_listing=True):
+	"""The destination directories a copy of src_paths into dests covers, as absolute paths, judged as -rme judges a file (by
+	where the copy put it, _landings): where each directory of a directory source landed (from the source's listing, which a
+	run's copy has cached), and each source's landing with every directory on the way to it (-di's parents, a list's)."""
+	mapping = _src_to_dest_map(src_paths, dests, dest_image)
+	by_source = _by_source(mapping)
+	covered = set()
+	for _, actual_dests in mapping:
+		for actual_dest in actual_dests:
+			covered.update(_path_and_parents(actual_dest))
+	for src in src_paths:
+		if not src or os.path.islink(src) or not os.path.isdir(src) or (exclude and is_excluded(_listed_root(os.path.abspath(src)), exclude)):
+			continue
+		# Spelled as the copy's job lists it (_copy_job: absolute, 'path/'), so a run's cached listing answers: no second walk.
+		folders = get_file_list(os.path.abspath(src) + os.sep, max_workers=max_workers, exclude=exclude, parallel_file_listing=parallel_file_listing)[3]
+		for folder in folders:
+			covered.update(_landings(os.path.abspath(folder), by_source))
+	return covered
+
+def remove_extra_dirs(src_paths, dests,exclude=None,dest_image=False,keep=(),dest_roots=None,named=None,covered=None):
 	"""
 	Removes extra directories in destination that are not present in the source paths.
 
-	A destination directory is kept when its source counterpart exists: dirname(src) + its path below dest, or with
-	dest_image (process_copy's -di layout: each source at dest + its absolute path) when '/' + its path below dest is
-	a source, a parent of one, or below one and still there.
+	A destination directory is the copy's when the copy covers it (covered: _covered_directories, which hpcp() takes from
+	the copy's listings before -rme's file removal clears them; else listed here): where a directory of a directory source
+	landed, or on the way to a source's landing. One under another spelling (case, normal form) is the copy's too, where
+	the destination reads both as one name. Judged only below where a directory source lands (all of a -di image).
 	Excluded directories, mount points and a filesystem's own lost+found, with everything below them, are left alone,
 	and so are symlinks and the link targets create_sym_links tracked (keep, see _kept_paths); a directory that still
 	holds entries (excluded files, say) is kept.
@@ -9210,23 +10284,14 @@ def remove_extra_dirs(src_paths, dests,exclude=None,dest_image=False,keep=(),des
 			eprint(f'All destination paths are too long: Skipping {src_paths}')
 		return 0, 0, set(), frozenset()
 	mapping = _src_to_dest_map(src_paths, dests, dest_image)
-	# With a list, only what its directories cover is judged (see remove_extra_files).
-	listed_scope = None
-	if _has_listed(src_paths) if listed is None else listed:
-		mapping = _directory_sources(mapping)
-		listed_scope = {}
-		for src_abs, actual_dests in mapping:
-			for actual_dest in actual_dests:
-				listed_scope.setdefault(actual_dest, []).append(src_abs)
-	# Positional sources too: only below where a directory source lands (see remove_extra_files); -di is judged whole.
-	scope = None if listed_scope is not None or dest_image else {actual_dest for _, actual_dests in _directory_sources(mapping) for actual_dest in actual_dests}
+	if covered is None:
+		covered = _covered_directories(src_paths, dests, dest_image, exclude)
+	# Only below where a directory source lands (a list's directories, as remove_extra_files); -di is judged whole.
+	scope = None if dest_image else {actual_dest for _, actual_dests in _directory_sources(mapping) for actual_dest in actual_dests}
 	guarded = _source_guard(src_paths if named is None else named)
 	kept = _kept_paths(keep, mapping)
 	copied_roots = {actual_dest for _, actual_dests in mapping for actual_dest in actual_dests}
 	excluded_roots = _excluded_roots(mapping, exclude)
-	# leave out excluded source paths (a filtered copy: the caller's list is not touched)
-	src_paths = [src_path for src_path in src_paths if not (exclude and is_excluded(src_path,exclude))]
-	source_roots = [os.path.abspath(src_path) for src_path in src_paths]
 	# {extra directory: (the destination root it lies below, its name as the walk spells it)}; each destination's
 	# identity before the walk (pinned before the copy when hpcp() runs it, see remove_extra_files): one that now leads
 	# elsewhere is not cleaned.
@@ -9235,8 +10300,6 @@ def remove_extra_dirs(src_paths, dests,exclude=None,dest_image=False,keep=(),des
 		dest_roots = _destination_roots(dests)
 	dests = [dest for dest in dests if os.path.abspath(dest) in dest_roots]
 	visible_mounts = _visible_mount_points()
-	source_listings = {}
-	places = _RealPlaces()
 	print(pformat(dests))
 	for dest in dests:
 		# Another filesystem below it (a mount or bind mount, another device), as remove_extra_files' listing.
@@ -9277,27 +10340,33 @@ def remove_extra_dirs(src_paths, dests,exclude=None,dest_image=False,keep=(),des
 					print(f"Skipping lost+found: {dest_dir_path}")
 					continue
 				walk_into.append(dirname)
-				relative_path = os.path.relpath(dest_dir_path, dest)
-				# Check if the directory exists in the source paths
-				if listed_scope is not None:
-					in_source = _in_listed_source(os.path.abspath(dest_dir_path), listed_scope)
-				elif dest_image:
-					# The image mirrors this run's sources at their absolute paths: a directory is theirs when it lies on
-					# the way to one (a parent process_copy created) or below one and still exists there.
-					live_path = os.path.join(os.path.sep, relative_path)
-					in_source = any(source == live_path or source.startswith(live_path.rstrip(os.sep) + os.sep)
-						or (live_path.startswith(source.rstrip(os.sep) + os.sep) and os.path.exists(live_path)) for source in source_roots)
-				else:
-					in_source = any(os.path.exists(os.path.join(os.path.dirname(src_path), relative_path)) or
-						_landing_in_other_spelling(os.path.dirname(src_path) or os.curdir, dest, relative_path, source_listings, places) for src_path in src_paths)
-				if (not in_source and not _is_kept(os.path.abspath(dest_dir_path), kept, os.path.abspath(dest), copied_roots)
-						and (scope is None or any(part in scope for part in _path_and_parents(os.path.abspath(dest_dir_path))))):
-					if guarded(dest_dir_path, 'dir'):
-						print(f"Not removing {dest_dir_path}: it is a source or lies in one")
-					else:
-						extraDirs[os.path.abspath(dest_dir_path)] = (os.path.abspath(dest), dest_dir_path)
+				path = os.path.abspath(dest_dir_path)
+				if (path not in covered and not _is_kept(path, kept, os.path.abspath(dest), copied_roots)
+						and (scope is None or any(part in scope for part in _path_and_parents(path)))):
+					extraDirs[path] = (os.path.abspath(dest), dest_dir_path)
 			# Excluded trees and other filesystems are never walked into.
 			dirnames[:] = walk_into
+	# A destination may read two spellings of a name (case, normal form) as one: a covered directory is then listed under the
+	# spelling that was there first. Asked of the destination (_RealPlaces: one probe a directory, for all its spellings); one
+	# that cannot be asked keeps it.
+	if extraDirs:
+		folds = {_folded(path): [] for path in extraDirs}
+		roots = tuple(os.path.abspath(dest).rstrip(os.sep) + os.sep for dest in dests)
+		for path in covered:
+			if path.startswith(roots):
+				kin = folds.get(_folded(path))
+				if kin is not None:
+					kin.append(path)
+		pairs = [(path, other) for path in extraDirs for other in folds[_folded(path)] if other != path]
+		if pairs:
+			places = _RealPlaces()
+			places.expect(itertools.chain.from_iterable(pairs))
+			for path in {path for path, other in pairs if places.same_place(path, other) is not False}:
+				del extraDirs[path]
+	for path, (_, name) in list(extraDirs.items()):
+		if guarded(name, 'dir'):
+			print(f"Not removing {name}: it is a source or lies in one")
+			del extraDirs[path]
 	# Once the walks have entered them all (one on another device then is no longer here).
 	for _, name in extraDirs.values():
 		print(f"Deleting extra directory: {name}")
@@ -9305,30 +10374,6 @@ def remove_extra_dirs(src_paths, dests,exclude=None,dest_image=False,keep=(),des
 	ordered = sorted(extraDirs, key=lambda path: (-len(pathlib.Path(path).parts), path))
 	_remove_listed_files(_items_below(((directory, extraDirs[directory][0]) for directory in ordered), dest_roots, sort=False), rmdir=True,
 		one_filesystem=True)
-
-def _landing_in_other_spelling(source, dest, relative, listings, places):
-	"""Does a directory below source land at dest/relative under another spelling of its name (case, normal form)? A destination
-	that reads both as one name has the one directory, and the source's own spelling is not extra. Asked of the destination
-	directory (places, a _RealPlaces), part by part, for the names that fold alike, all at once; one that cannot be asked
-	keeps it. Each directory the source has of that name is tried, as two that the destination merges both land there.
-	listings: {a source directory: its names by folded name}, read once."""
-	part, _, rest = relative.partition(os.sep)
-	if source not in listings:
-		listings[source] = {}
-		try:
-			for name in os.listdir(source):
-				listings[source].setdefault(_folded(name), []).append(name)
-		except OSError:
-			pass
-	names = listings[source].get(_folded(part), ())
-	landing = os.path.join(dest, part)
-	if names != [part]:
-		places.expect(os.path.join(dest, name) for name in itertools.chain(names, (part,)))
-	for name in names:
-		if os.path.isdir(os.path.join(source, name)) and (name == part or places.same_place(os.path.join(dest, name), landing) is not False):
-			if not rest or _landing_in_other_spelling(os.path.join(source, name), landing, rest, listings, places):
-				return True
-	return False
 
 def _source_guard(src_paths):
 	"""-rme's last word on a path it found extra: guarded(path, kind) is True when path (as the destination's walk spells
@@ -9410,17 +10455,6 @@ def _source_guard(src_paths):
 def _directory_sources(mapping):
 	"""The directory sources of _src_to_dest_map's mapping: what -rme cleans below when a source came from a list."""
 	return [(src_abs, actual_dests) for src_abs, actual_dests in mapping if os.path.isdir(src_abs) and not os.path.islink(src_abs)]
-
-def _in_listed_source(path, scope):
-	"""-rme with a list: False only when destination directory path lies below a listed directory's copy (scope:
-	{its destination: [its source]}) and no such source holds its counterpart. Anything else is not the list's to judge."""
-	judged = False
-	for part in _path_and_parents(path):
-		for src_abs in scope.get(part, ()):
-			judged = True
-			if os.path.lexists(os.path.normpath(os.path.join(src_abs, os.path.relpath(path, part)))):
-				return True
-	return not judged
 
 def _source_dest(src, dest, dest_image=False):
 	"""Where source src lands for destination dest, as an absolute path: the one rule the copy and -rme share.
@@ -9769,7 +10803,9 @@ _STDIN_HELD_LIST = False
 
 def _confirm(question, stop):
 	"""Ask question (y/n); anything but yes raises a 'User requested stop' with stop as its text. From stdin at a
-	terminal; when stdin held the list (find ... | hpcp -rme), from /dev/tty. With neither, the same stop, saying why."""
+	terminal; when stdin held the list (find ... | hpcp -rme), from /dev/tty. With neither, the same stop, saying why. A stop
+	not acted on yet is, first: no question is asked of a run that was stopped."""
+	_check_stop()
 	if _STDIN_HELD_LIST:
 		try:
 			# Unbuffered bytes: a terminal cannot seek, which a buffered read-write file needs.
@@ -9903,6 +10939,40 @@ def _without_covered_sources(src_paths):
 		kept.append(src)
 	return kept
 
+# shlex.quote's safe set: a word of only these needs no quotes
+_SHELL_SAFE = re.compile(r'[\w@%+=:,./-]', re.ASCII)
+
+def _shell_word(path):
+	"""path as one word a POSIX shell (bash, sh, zsh) reads back as path, for a hint's command that an operator pastes: as it
+	is when every character is shlex's safe set or a non-ASCII one the output's encoding shows; in single quotes (' as '\\'')
+	when nothing in it is a control character or a character the output cannot show; else in $'...' with each byte outside
+	printable ASCII as a three-digit octal escape (coreutils' shell-escape form; bash, ksh and zsh read it, dash 0.5.12 does
+	not). A name that is not UTF-8 is spelled by its own bytes, never by Python's \\udcXX escapes."""
+	encoding = getattr(sys.stdout, 'encoding', None) or 'ascii'
+	def shows(character):
+		if not character.isprintable():
+			return False
+		try:
+			character.encode(encoding)
+		except (UnicodeError, LookupError):
+			return False
+		return True
+	if path and all(_SHELL_SAFE.match(character) or (ord(character) > 127 and shows(character)) for character in path):
+		return path
+	if all(shows(character) for character in path):
+		return "'" + path.replace("'", "'\\''") + "'"
+	spelled = []
+	for byte in os.fsencode(path):
+		if byte == 0x27:
+			spelled.append("\\'")
+		elif byte == 0x5c:
+			spelled.append('\\\\')
+		elif 0x20 <= byte < 0x7f:
+			spelled.append(chr(byte))
+		else:
+			spelled.append('\\%03o' % byte)
+	return "$'" + ''.join(spelled) + "'"
+
 class _CannotSearch(RuntimeError):
 	"""A refusal: directory cannot be searched. link: the last link on the path that was asked about. It is named when the
 	directory is on the way to where it leads: the operator's way out is then the link, as the directory can belong to anyone."""
@@ -9913,9 +10983,9 @@ class _CannotSearch(RuntimeError):
 		if self.link and _same_or_below(os.path.realpath(self.link), self.directory):
 			return (f'Destination clash: {self.link} leads to {os.path.realpath(self.link)}, and {self.directory} on the way cannot be '
 				f'searched ({self.reason}), so a clash could hide there; nothing is copied or removed. '
-				f'To let it through: rm {self.link}, or, as its owner, chmod u+rx {self.directory}')
+				f'To let it through: rm {_shell_word(self.link)}, or, as its owner, chmod u+rx {_shell_word(self.directory)}')
 		return (f'Destination clash: {self.directory} cannot be searched ({self.reason}), so a link in it could hide a clash; '
-			f'nothing is copied or removed. To let it through: chmod u+rx {self.directory}')
+			f'nothing is copied or removed. To let it through: chmod u+rx {_shell_word(self.directory)}')
 
 def _last_link(path):
 	"""The last symlink on the way down the absolute path, as far as it can be followed, or None."""
@@ -10608,6 +11678,8 @@ def _remove_listed_files(items, rmdir=False, rate_limiter=None, one_filesystem=F
 			_report_rmdir_failed(path, e)
 	if not _DIR_FD_WALK:
 		for root, root_id, rel in items:
+			# A serial removal's stop not acted on yet is, before the next entry goes (a no-op in a pool's worker).
+			_check_stop()
 			if one_filesystem and rel not in ('', '.') and foreign(root, rel):
 				eprint(f'Other filesystem left: {os.path.dirname(os.path.join(root, rel))} is another filesystem below {root}: '
 					'nothing in it is removed')
@@ -10624,6 +11696,8 @@ def _remove_listed_files(items, rmdir=False, rate_limiter=None, one_filesystem=F
 	root_dev = None
 	try:
 		for root, root_id, rel in items:
+			# A serial removal's stop not acted on yet is, before the next entry goes (a no-op in a pool's worker).
+			_check_stop()
 			if rel in ('', '.'):
 				remove_one(root, root_id, rel)
 				continue
@@ -11088,38 +12162,25 @@ def _remove_trees_parallel(trees, max_workers, exclude=None, rate_limiter=None):
 	(_remove_directory_entries), queueing the subdirectories each job reports. With rate_limiter (-F), the jobs pace
 	each unlink from one shared count (_shared_rate_wait), and the count carries on into the walk after. Returns the
 	entries unlinked; the directories themselves are left for _remove_tree_fd."""
-	global _RATE_SHARE
 	queue = deque(trees)
 	futures = {}
 	removed = 0
-	pool = {}
-	inherited = False
+	share = None
 	if rate_limiter:
-		# Every job paces each unlink from one shared count (a wide directory too, not just the queueing of jobs).
+		# Every job paces each unlink from one shared count (a wide directory too, not just the queueing of jobs). Python 3.6's
+		# pool takes no initializer: its workers fork from this process at the first submit and inherit it (_pool).
 		counter = multiprocessing.Value('d', rate_limiter['count'])
 		share = (counter, rate_limiter['start_time'], rate_limiter['limit'])
-		if sys.version_info >= (3, 7):
-			pool = dict(initializer=_init_rate_share, initargs=share)
-		else:
-			# Python 3.6's pool takes no initializer: its workers fork from this process at the first submit (its
-			# start method outside Windows) and inherit the share instead.
-			_init_rate_share(*share)
-			inherited = True
-	try:
-		with ProcessPoolExecutor(max_workers=max_workers, **pool) as executor:
-			while queue or futures:
-				while queue and len(futures) < max_workers * 2:
-					path, identity = queue.popleft()
-					futures[_submit_task(executor, _remove_directory_entries, path, identity, exclude)] = path
-				done, _ = concurrent.futures.wait(futures, return_when=concurrent.futures.FIRST_COMPLETED)
-				for future in done:
-					futures.pop(future)
-					count, subdirectories = _task_result(future, (0, []), 'Remove process exception')
-					removed += count
-					queue.extend(subdirectories)
-	finally:
-		if inherited:
-			_RATE_SHARE = None
+	with _pool(max_workers, rate=share) as executor:
+		while queue or futures:
+			while queue and len(futures) < max_workers * 2:
+				path, identity = queue.popleft()
+				futures[_submit_task(executor, _remove_directory_entries, path, identity, exclude)] = path
+			for future in _wait(futures, executor):
+				futures.pop(future)
+				count, subdirectories = _task_result(future, (0, []), 'Remove process exception')
+				removed += count
+				queue.extend(subdirectories)
 	if rate_limiter:
 		rate_limiter['count'] = counter.value
 	return removed
@@ -11158,6 +12219,58 @@ def _same_contents(first, second):
 			if not chunk:
 				return True
 
+# Filesystems where a stat by name is a round trip to a server for each part of the path the client checks again: there
+# the copy check looks at a directory's landings relative to it, opened once (_lstat_below: one path walk a directory, not
+# one a landing). Measured on NFS only (an EL8 v4.1 loopback mounted actimeo=0, a rerun's copy check of 100,000 landings
+# in 10,000 directories: 2.4 times fewer GETATTRs, 2 to 2.4 times faster); the others are listed because their clients
+# ask the server along a path walk in the same way, not measured. On a local filesystem the opens cost more than the
+# path walks they save (about 10 to 25% slower, Docker), so there a landing is looked at by its path, as in 9.86.
+_NETWORK_FS = frozenset(('nfs', 'nfs4', 'lustre', 'gpfs', 'cifs', 'smb3', 'ceph', 'beegfs'))
+
+def _on_network_fs(paths):
+	"""True when one of paths (the destinations) is on a _NETWORK_FS: one stat a destination, its type from the mount table
+	(_mount_type, Linux; elsewhere never, and a destination that cannot be stat'ed is not)."""
+	for path in paths:
+		try:
+			if _mount_type(os.stat(path).st_dev) in _NETWORK_FS:
+				return True
+		except OSError:
+			pass
+	return False
+
+# A landing directory opened to look at the names in it (_lstat_below): on Linux by O_PATH, which needs no read permission.
+_LOOK_DIRECTORY_FLAGS = getattr(os, 'O_PATH', os.O_RDONLY) | getattr(os, 'O_DIRECTORY', 0) | getattr(os, 'O_CLOEXEC', 0)
+
+class _OpenedDirectories(dict):
+	"""{directory: its descriptor, None where it is not there, False where it is asked by path}: the landing directories one
+	chunk of the copy check opened (_lstat_below), closed at the chunk's end."""
+	def __enter__(self):
+		return self
+	def __exit__(self, *exc):
+		for fd in self.values():
+			if type(fd) is int:
+				os.close(fd)
+
+def _lstat_below(path, opened):
+	"""os.lstat(path), relative to its directory opened once for all the names in it (opened: _OpenedDirectories): one path
+	walk a directory, not one a name. The same answer: the kernel resolves the directory as the path walk does (a link to it
+	followed, an 8.3 alias of the name found), and a directory that is not there has no names. One that cannot be opened for
+	this (another error) is asked by path."""
+	directory, name = os.path.split(path)
+	if not name:
+		return os.lstat(path)
+	if directory not in opened:
+		try:
+			opened[directory] = os.open(directory, _LOOK_DIRECTORY_FLAGS)
+		except OSError as e:
+			opened[directory] = None if e.errno in (errno.ENOENT, errno.ENOTDIR) else False
+	fd = opened[directory]
+	if fd is None:
+		raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), path)
+	if fd is False or os.stat not in os.supports_dir_fd:
+		return os.lstat(path)
+	return os.lstat(name, dir_fd=fd)
+
 def _not_held(entries, src_paths, dests, dest_image=False, max_workers=1, move=True):
 	"""The files and links of a copy (entries: absolute source paths) that no landing holds, as {path: why}: a move keeps
 	them. A backstop that needs no rule on names: whatever the destination took for one name (an 8.3 alias, a legacy
@@ -11178,9 +12291,11 @@ def _not_held(entries, src_paths, dests, dest_image=False, max_workers=1, move=T
 	spelling a number of its own), the directory is asked by making both names (_ask_names). A landing that is one file
 	with the landing of another source (another file) holds neither: both stay, whatever the content each now shows. One
 	lstat of each source and each landing (a copy: of each landing), in max_workers threads where a stat waits; a file is
-	read only when its landing's time disagrees. entries is read twice when two landings may be one file (it is listed
-	first if it is an iterator). Memory: 8 bytes for each landing, and records only for what is reported or asked; the
-	stats are dropped once looked at."""
+	read only when its landing's time disagrees. Where a destination is on a network filesystem (_NETWORK_FS), the entries go
+	by source directory and each landing is lstat'ed relative to its directory, opened once a chunk (_lstat_below); elsewhere
+	by its path. Where two landings may be one file, only the entries whose fingerprint met another's are looked at again.
+	Memory: entries as a list, 16 bytes for each landing (and 8 for each entry, its place by directory, when grouped), and
+	records only for what is reported or asked; the stats are dropped once looked at."""
 	by_source = _by_source(_src_to_dest_map(src_paths, dests, dest_image))
 	# A file's landings are its directory's, with its name: each directory is mapped once (a source itself goes by _landings).
 	in_directory = {}
@@ -11220,12 +12335,13 @@ def _not_held(entries, src_paths, dests, dest_image=False, max_workers=1, move=T
 			return os.lstat(path)
 		except OSError:
 			return None
-	def landed(path, st):
-		"""(the source's lstat or None, [(landing, its stat, written through a link)] for each landing there)."""
+	def landed(path, st, lstat):
+		"""(the source's lstat or None, [(landing, its stat, written through a link)] for each landing there). lstat: os.lstat,
+		or _lstat_below with the chunk's opened directories."""
 		found = []
 		for landing in landings_of(path):
 			try:
-				lt = os.lstat(landing)
+				lt = lstat(landing)
 			except OSError:
 				continue
 			if stat.S_ISLNK(lt.st_mode) and st is None:
@@ -11247,47 +12363,63 @@ def _not_held(entries, src_paths, dests, dest_image=False, max_workers=1, move=T
 	# A landing file with other names was not written by this run (the copy replaces a file with other names by a new one,
 	# _cp_once): it was there, and held the source already (a destination deduplicated by hard links). Any other landing file is fingerprinted, (st_dev, st_ino) hashed, to find two that may be one file.
 	def look(chunk):
-		"""(the fingerprints of chunk's landing files, {path: why} not held, {directory: [(path, landing)]} to ask, and
-		{path: its held landings} for those asked about)."""
-		prints, not_held, ask, held = array.array('q'), {}, {}, {}
-		for path in chunk:
-			st = source_stat(path) if move else None
-			if move and st is None:
-				# Gone already: the removal has nothing to take.
-				continue
-			st, found = landed(path, st)
-			for _, lt, _ in found:
-				if lt.st_nlink < 2:
-					prints.append(hash((lt.st_dev, lt.st_ino)))
-			if not move:
-				# A copy whose landing is not there, though its source still is: lost (on vfat, beside an 8.3 alias of its
-				# name). A copy that failed has said so, and hpcp() leaves these out for its sources.
-				if not found and (st or source_stat(path)):
-					not_held[path] = f'it is at none of its landings ({", ".join(landings_of(path))})'
-				continue
-			why, mine, pairs = None, [], []
-			for landing, lt, through_link in found:
-				reason = judge(path, st, landing, lt, through_link)
-				if reason:
-					why = why or reason
+		"""(the fingerprints of chunk's landing files with the position of each one's entry, {path: why} not held, {directory:
+		[(path, landing)]} to ask, and {path: its held landings} for those asked about)."""
+		prints, owners, not_held, ask, held = array.array('q'), array.array('q'), {}, {}, {}
+		with _OpenedDirectories() as opened:
+			lstat = functools.partial(_lstat_below, opened=opened) if grouped else os.lstat
+			for position in chunk:
+				path = entries[position]
+				st = source_stat(path) if move else None
+				if move and st is None:
+					# Gone already: the removal has nothing to take.
 					continue
-				if os.path.dirname(landing) == os.path.dirname(path) and (lt.st_dev, lt.st_ino) != (st.st_dev, st.st_ino):
-					pairs.append((path, landing))
-				mine.append(landing)
-			if not mine:
-				not_held[path] = why or f'it is at none of its landings ({", ".join(landings_of(path))})'
-			elif pairs:
-				ask.setdefault(os.path.dirname(path), []).extend(pairs)
-				held[path] = mine
-		return prints, not_held, ask, held
-	if iter(entries) is entries:
-		entries = list(entries)
-	def chunks():
-		it = iter(entries)
+				st, found = landed(path, st, lstat)
+				for _, lt, _ in found:
+					if lt.st_nlink < 2:
+						prints.append(hash((lt.st_dev, lt.st_ino)))
+						owners.append(position)
+				if not move:
+					# A copy whose landing is not there, though its source still is: lost (on vfat, beside an 8.3 alias of its
+					# name). A copy that failed has said so, and hpcp() leaves these out for its sources.
+					if not found and (st or source_stat(path)):
+						not_held[path] = f'it is at none of its landings ({", ".join(landings_of(path))})'
+					continue
+				why, mine, pairs = None, [], []
+				for landing, lt, through_link in found:
+					reason = judge(path, st, landing, lt, through_link)
+					if reason:
+						why = why or reason
+						continue
+					if os.path.dirname(landing) == os.path.dirname(path) and (lt.st_dev, lt.st_ino) != (st.st_dev, st.st_ino):
+						pairs.append((path, landing))
+					mine.append(landing)
+				if not mine:
+					not_held[path] = why or f'it is at none of its landings ({", ".join(landings_of(path))})'
+				elif pairs:
+					ask.setdefault(os.path.dirname(path), []).extend(pairs)
+					held[path] = mine
+		return prints, owners, not_held, ask, held
+	entries = entries if isinstance(entries, list) else list(entries)
+	grouped = _on_network_fs(dests)
+	if grouped:
+		# The entries by source directory (a source directory's files share their landing directories, each opened once a
+		# chunk), as their positions.
+		by_directory = {}
+		for index, path in enumerate(entries):
+			by_directory.setdefault(path.rpartition(os.sep)[0], []).append(index)
+		order = array.array('q', itertools.chain.from_iterable(by_directory.values()))
+		del by_directory
+	else:
+		order = range(len(entries))
+	def chunks(positions):
+		# 1024 entries a chunk: _looked_at's thread handoff
+		it = iter(positions)
 		return iter(lambda: list(itertools.islice(it, 1024)), [])
-	prints, not_held, ask, held = array.array('q'), {}, {}, {}
-	for part_prints, part_not_held, part_ask, part_held in _looked_at(chunks(), look, max_workers):
+	prints, owners, not_held, ask, held = array.array('q'), array.array('q'), {}, {}, {}
+	for part_prints, part_owners, part_not_held, part_ask, part_held in _looked_at(chunks(order), look, max_workers):
 		prints.extend(part_prints)
+		owners.extend(part_owners)
 		not_held.update(part_not_held)
 		for directory, pairs in part_ask.items():
 			ask.setdefault(directory, []).extend(pairs)
@@ -11310,18 +12442,23 @@ def _not_held(entries, src_paths, dests, dest_image=False, max_workers=1, move=T
 		if fingerprint == previous:
 			shared.add(fingerprint)
 		previous = fingerprint
-	del prints
 	if not shared:
 		return not_held
+	# Only the entries whose fingerprint met another's are looked at again (by their positions).
+	again = sorted({owners[k] for k in range(len(prints)) if prints[k] in shared})
+	del prints, owners
 	def collect(chunk):
 		met = []
-		for path in chunk:
-			st, found = landed(path, None)
-			met.extend(((lt.st_dev, lt.st_ino), path, landing) for landing, lt, _ in found
-				if lt.st_nlink < 2 and hash((lt.st_dev, lt.st_ino)) in shared)
+		with _OpenedDirectories() as opened:
+			lstat = functools.partial(_lstat_below, opened=opened) if grouped else os.lstat
+			for position in chunk:
+				path = entries[position]
+				st, found = landed(path, None, lstat)
+				met.extend(((lt.st_dev, lt.st_ino), path, landing) for landing, lt, _ in found
+					if lt.st_nlink < 2 and hash((lt.st_dev, lt.st_ino)) in shared)
 		return met
 	by_file = {}
-	for met in _looked_at(chunks(), collect, max_workers):
+	for met in _looked_at(chunks(again), collect, max_workers):
 		for file_id, path, landing in met:
 			by_file.setdefault(file_id, []).append((path, landing))
 	identity = {}
@@ -11354,22 +12491,55 @@ def _looked_at(chunks, look, max_workers):
 	0.31 s in one thread and 0.55 s in 32 for a copy's check (3 us an entry), 0.72 s and 1.2 s for a move's (7 us); on NFS
 	mounted actimeo=0, 10,000 took 6.4 s in one and 3.0 s in 4. So chunks are looked at here while each takes under 20 us
 	an entry, and the rest in max_workers threads once one takes longer, with two chunks a thread in flight, so that the
-	chunks are never all held at once."""
-	for chunk in chunks:
-		started = time.monotonic()
-		yield look(chunk)
-		if max_workers > 1 and time.monotonic() - started > 20e-6 * len(chunk):
-			break
-	else:
-		return
-	with concurrent.futures.ThreadPoolExecutor(max_workers) as pool:
-		pending = deque()
+	chunks are never all held at once.
+
+	A pool region (_DEFER): a stop is acted on after each chunk, and within 1 s while a thread's chunk is awaited. Left by an
+	exception, the threads are not joined (_ABANDONED): an lstat on a dead NFS mount never returns, and the run ends by
+	os._exit (main())."""
+	global _DEFER, _ABANDONED
+	_DEFER += 1
+	try:
 		for chunk in chunks:
-			pending.append(pool.submit(look, chunk))
-			if len(pending) >= 2 * max_workers:
-				yield pending.popleft().result()
-		while pending:
-			yield pending.popleft().result()
+			started = time.monotonic()
+			result = look(chunk)
+			_check_stop()
+			yield result
+			if max_workers > 1 and time.monotonic() - started > 20e-6 * len(chunk):
+				break
+		else:
+			return
+		pool = concurrent.futures.ThreadPoolExecutor(max_workers)
+		def settled(future):
+			while True:
+				try:
+					return future.result(timeout=1)
+				except concurrent.futures.TimeoutError:
+					_check_stop()
+		try:
+			pending = deque()
+			for chunk in chunks:
+				pending.append(pool.submit(look, chunk))
+				if len(pending) >= 2 * max_workers:
+					result = settled(pending.popleft())
+					_check_stop()
+					yield result
+			while pending:
+				result = settled(pending.popleft())
+				_check_stop()
+				yield result
+		except BaseException:
+			_ABANDONED = True
+			if sys.version_info >= (3, 9):
+				pool.shutdown(wait=False, cancel_futures=True)
+			else:
+				pool.shutdown(wait=False)
+			_LEFT.append(pool)
+			raise
+		pool.shutdown(wait=True)
+		# Let go of it inside the region, as _pool does its executor.
+		del pool
+	finally:
+		_DEFER -= 1
 
 def remove_moved_sources(src_paths, file_list, sym_links, single_thread=False, max_workers=multiprocessing.cpu_count(),
 		verbose=False, files_per_job=1, remove_force=False, exclude=None, root_ids=None, dests=None, dest_image=False):
@@ -11419,6 +12589,8 @@ def remove_moved_sources(src_paths, file_list, sym_links, single_thread=False, m
 	print(f"Removing the {len(listed)} files and links copied from {_sources_text(roots)} with {max_workers if not single_thread else '1'} workers")
 	if not remove_force:
 		_confirm("Do you want to continue? (y/n)", "Not removing files")
+	# Nothing is removed for a run that was stopped.
+	_check_stop()
 	start_time = time.monotonic()
 	# A named link goes last, after the trees too: a path named through it (lb/x, lb/d/) is reached while it is there.
 	last = [item for item in listed if item[2] == '.' and item[0] not in holders and os.path.islink(item[0])]
@@ -11589,6 +12761,14 @@ def get_dests(dest_paths,dest_image,mount_points: list,loop_devices: list,src_pa
 			else:
 				expanded_dests = [os.path.expanduser(dest)]
 			for path in expanded_dests:
+				# Folded once, lexically, as the copy itself takes it (abspath): l/../out is out, whatever l leads to, so no
+				# directory is made where a link before '..' leads. A trailing separator (copy into) is kept. An empty one stays
+				# empty: no destination given (normpath would make it '.').
+				if path:
+					trailing = path.endswith(os.sep) or bool(os.altsep) and path.endswith(os.altsep)
+					path = os.path.normpath(path)
+					if trailing and not path.endswith(os.sep):
+						path += os.sep
 				pathDest = get_dest_from_path(path,src_paths,src_path,can_be_none=can_be_none)
 				if pathDest:
 					dests.append(pathDest)
@@ -11699,8 +12879,9 @@ def _sync_implied_parents(src, dests, synced):
 	"""Make the directories above a _ListedSource's landing in each of dests that are missing, top first, with their
 	sources' metadata, and those where a link, FIFO or node is (_dest_directory replaces it). A directory or a file that
 	exists is left as it is: it is not this run's to change.
-	synced: the landings looked at so far in this run (one look each)."""
+	synced: the landings looked at so far in this run (one look each). Returns the finish's records (finish_directories)."""
 	parents = []
+	records = []
 	for source, landing in _implied_parents(src):
 		if landing in synced:
 			break
@@ -11712,7 +12893,8 @@ def _sync_implied_parents(src, dests, synced):
 		missing = [path for path in missing if not (os.path.lexists(path) and stat.S_ISREG(os.lstat(path).st_mode))]
 		if missing:
 			# A link to a directory (lnk/f) is made from the directory it leads to: the link itself has no mode to keep.
-			sync_directory_metadata(os.path.realpath(source) if os.path.islink(source) and os.path.isdir(source) else source, missing)
+			records += _sync_directory(os.path.realpath(source) if os.path.islink(source) and os.path.isdir(source) else source, missing)[3]
+	return records
 
 def _copy_job(source, dests, dest_image=None):
 	"""(src, its destinations, the destinations it must not take) as a copy job names them: 'path/' for a directory, as is
@@ -11745,8 +12927,6 @@ def _roots_overlap(roots):
 	ordered = sorted(root.rstrip(os.path.sep) + os.path.sep for root in roots)
 	return any(below.startswith(root) for root, below in zip(ordered, ordered[1:]))
 
-# What stops a run (_stop), the watch's own signal too: held back while a probe exists (_ask_names).
-_STOPS = [getattr(signal, name) for name in _STOP_NAMES + ('SIGUSR2',) if hasattr(signal, name)]
 
 # What lets a probe be made, by why it could not be.
 _PROBE_FIXES = {errno.EACCES: 'make it writable', errno.EPERM: 'make it writable', errno.EROFS: 'mount it read-write',
@@ -12247,9 +13427,11 @@ def _settle_destinations(src_paths, dests, dest_image=None, directory_only=False
 def process_copy(src_paths: list, dests:list = [], single_thread = False, max_workers = multiprocessing.cpu_count(),verbose = False, 
 				directory_only = False,no_directory_sync = False, full_hash = False, files_per_job = 1, parallel_file_listing = False,
 				exclude=None,dest_image = None,batch = False, exit_not_enough_space = False, dropped = None, in_place = ()):
-	"""dropped, in_place: what _settle_destinations decided (hpcp() settles them first)."""
+	"""dropped, in_place: what _settle_destinations decided (hpcp() settles them first). Returns (the files, {link: dests},
+	the directory sync's records for the finish: finish_directories)."""
 	total_file_list = set()
 	total_sym_links = {}
+	dir_records = []
 	taskCtr = 0
 	argDest = dests.copy()
 	if batch:
@@ -12286,12 +13468,12 @@ def process_copy(src_paths: list, dests:list = [], single_thread = False, max_wo
 			srcParentDirs.reverse()
 			# create the parent dirs in dest
 			#destParentDirs = [ os.path.abspath(dest + srcParentDir + os.path.sep) for srcParentDir in srcParentDirs]
-			sync_directory_metadata_bulk(srcParentDirs,argDest,src_path='/')
+			dir_records += sync_directory_metadata_bulk(srcParentDirs,argDest,src_path='/')[3]
 		if isinstance(source, _ListedSource):
 			# The directories its path implies that are missing take its sources' mode and owner, so a private one stays
 			# private. (With dest_image, above.) Its parents may not exist yet, so nothing to check for being writable.
 			if not (dest_image or no_directory_sync or NO_CREATE_DIR or (exclude and is_excluded(src, exclude))):
-				_sync_implied_parents(source, argDest, synced_parents)
+				dir_records += _sync_implied_parents(source, argDest, synced_parents)
 		else:
 			# verify dest is writable
 			for dest in dests:
@@ -12323,19 +13505,21 @@ def process_copy(src_paths: list, dests:list = [], single_thread = False, max_wo
 			if not directory_only:
 				cs.add_copy(src, dests)
 		if not batch:
-			fl, sl = cs.process()
+			fl, sl, dr = cs.process()
 			total_file_list.update(fl)
 			total_sym_links.update(sl)
+			dir_records += dr
 			cs.clear()
 			print('-'*80)
 	if batch:
-		fl, sl = cs.process()
+		fl, sl, dr = cs.process()
 		total_file_list.update(fl)
 		total_sym_links.update(sl)
+		dir_records += dr
 		cs.clear()
 		print(f"Processed {len(total_file_list)} files and {len(total_sym_links)} symlinks in total")
 		print('-'*80)
-	return total_file_list, total_sym_links
+	return total_file_list, total_sym_links, dir_records
 
 def validate_dd_source_path(src_path,loop_devices = None):
 	# `is None`, not `if not loop_devices`: an empty list is falsy, so the old
@@ -12522,14 +13706,21 @@ def _sync_landing(dest_path):
 	descriptor of the copy's own file while its data is still dirty (a writeback error is kept only on the in-memory inode,
 	and one evicted under memory pressure takes it along; syncfs before Linux 5.8 reports none). Raises _NotOnDisk, naming the
 	landing and why, after removing the regular file there: its content cannot be trusted, and a rerun would take it for the
-	finished copy (same size and time). A block device named by -d is not fsynced (_fsync_file passes it): a move onto one writes it
-	and keeps every source (213: a landing that is another kind of entry holds no source), so nothing can be lost."""
+	finished copy (same size and time). Only the file the copy wrote is removed: the one at the name when the fsync began (one
+	lstat right after the copy); a file put at the name since is someone else's. A block device named by -d is not fsynced
+	(_fsync_file passes it): a move onto one writes it and keeps every source (213: a landing that is another kind of entry holds
+	no source), so nothing can be lost."""
 	target = _landing_of(dest_path)[0]
+	try:
+		written = os.lstat(target)
+	except OSError:
+		written = None
 	try:
 		_fsync_file(target)
 	except OSError as e:
 		try:
-			if stat.S_ISREG(os.lstat(target).st_mode):
+			now = os.lstat(target)
+			if written is not None and stat.S_ISREG(now.st_mode) and (now.st_dev, now.st_ino) == (written.st_dev, written.st_ino):
 				os.remove(target)
 		except OSError:
 			pass
@@ -12628,7 +13819,7 @@ def get_args(args = None):
 	parser = argparse.ArgumentParser(description='Copy files from source to destination',
 								  epilog=f'Found bins: {list(_binPaths.values())}\n Missing bins: {_binCalled - set(_binPaths.keys())}')
 	parser.add_argument('-s', '--single_thread', action='store_true', help='Use serial processing')
-	parser.add_argument('-j','-m','-t','--max_workers', type=int, default=multiprocessing.cpu_count(), help='Max workers for parallel processing. Default is 1 * CPU count. Use negative numbers to indicate {n} * CPU count, 0 means 1/2 CPU count.')
+	parser.add_argument('-j','-m','-t','--max_workers', type=int, default=None, help='Max workers for parallel processing. Default is 1 * CPU count, and at least 16 for -rm and -rf (a move, or a removal without -d), whose workers wait on their fsyncs. Use negative numbers to indicate {n} * CPU count, 0 means 1/2 CPU count.')
 	batch_group = parser.add_mutually_exclusive_group()
 	batch_group.add_argument('-b','--batch',action='store_true', help='Batch mode, process all files in one go',default=True)
 	batch_group.add_argument('-nb','--no_batch','--sequential',action='store_false', dest='batch', help='Do not use batch mode', default=False)
@@ -12675,7 +13866,7 @@ def get_args(args = None):
 	parser.add_argument('-wb', '--write_beside', '--write-beside', action='store_true', help='Write every rewrite to a new file beside the old one, write it to disk and rename it over the old one once whole: a source that fails, a full disk or a stop leave the old copy as it was. The file gets a new inode (a per-file Lustre or GPFS layout, chattr flags and a project id are not kept; NFS readers holding it open may get ESTALE). Needs a new name in the file\'s directory and room for a second copy: without either the old copy stays (exit 190). By default a rewrite is written in place, and only a file with other names, one that cannot be opened for writing, or a FIFO, device or link goes beside.')
 	parser.add_argument('-rbw', '--read_before_write', '--read-before-write', action='store_true', help='Before a file at the destination is written in place, read its source to the end: a source that fails on read leaves the old copy as it is (exit 190). Costs a second read of each rewritten file. Does nothing with -wb, which writes nothing in place.')
 	parser.add_argument('-ctl','--command_timeout_limit', type=int, default=0, help='Set the command timeout limit in seconds for external commands ( ex. cp / dd ). Default is 0: no timeout.')
-	parser.add_argument('-enes','--exit_not_enough_space', action='store_true', help='Exit if there is not enough space on the destination instead of continuing (Note: Default is continue as in compressed fs copy can be down even if source is bigger than free space; without it, a copy that may not fit is tried, with a warning on ext2/3/4, XFS and tmpfs).')
+	parser.add_argument('-enes','--exit_not_enough_space', action='store_true', help='Skip a source whose copy does not fit the destinations\' free space, counting only what the copy will write (files already there and the same are not counted, a rewrite only what it adds); the run exits 228. Without it, a copy that may not fit is tried, with a warning on ext2/3/4, XFS and tmpfs (a compressing filesystem can fit more than its free space).')
 	try:
 		args = parser.parse_intermixed_args(args)
 	except Exception:
@@ -12705,7 +13896,7 @@ def get_args(args = None):
 	return args
 
 #%% ---- Main Function ----
-def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = multiprocessing.cpu_count(),
+def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = None,
 			verbose = False, directory_only = False,no_directory_sync = False, full_hash = False, files_per_job = 1, target_file_list = "",
 			compare_file_list = False, diff_file_list = None, tar_diff_file_list = False, remove = False,remove_force = False, remove_extra = False, parallel_file_listing = False,
 			exclude=None,exclude_file = None,dest_image = None,dest_image_size = '0', no_link_tracking = False,link_tracking = False,src_image = None,dd = False,dd_resize = 0,
@@ -12730,6 +13921,12 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = multipr
 	READ_FIRST = read_before_write
 	MIRROR_FS_PARAMS = not no_fs_param_mirror
 	remove = remove or remove_force
+	if max_workers is None:
+		# A move's worker waits on each file's fsync before its next copy: at least 16 workers keep the disk busy (the 9.85
+		# review's -j 16 on 2- and 4-vCPU VMs: 2,000 files of 4 KiB in about half the time of -j 2 or 4). The fsyncs in flight are
+		# the disk's need, not the CPUs': on 32 CPUs and a fast disk, 4 a CPU (128 workers) made a 2,000-file move 20% (3.14) to
+		# 45% (3.6) slower than 32, and 3.6 to 3.8 start every worker of a pool at once (a 100-file move: 0.60 s against 0.32 s).
+		max_workers = max(16, multiprocessing.cpu_count()) if remove else multiprocessing.cpu_count()
 	if random_destination_selection:
 		RANDOM_DESTINATION_SELECTION = True
 		print("Random destination selection enabled.")
@@ -13055,29 +14252,39 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = multipr
 			pinned_dest_roots = _destination_roots(dests) if remove_extra else None
 			copy_error_start = len(ERRORS)
 			# What the operator named is followed and written through, as cp follows its destination; below it nothing is.
-			global NAMED_DESTS, RUN_ID, SYNC_COPIES
+			global NAMED_DESTS, RUN_ID, SYNC_COPIES, _BAR
 			NAMED_DESTS, RUN_ID = frozenset(os.path.abspath(dest) for dest in dests), uuid.uuid4().hex
 			SYNC_COPIES = bool(remove)
+			# -v turns the progress bars off (suppress_all_output)
+			_BAR = not verbose
 			# Refuses a clash before anything is copied or removed.
 			dropped, replaced, in_place = _settle_destinations(src_paths, dests, dest_image, directory_only, copy_exclude, 1 if single_thread else max_workers,
 				parallel_file_listing, remove=remove, places=places)
+			# Between the steps of a run, a stop not acted on yet is (_check_stop): one recorded inside a pool, or one whose
+			# KeyboardInterrupt Python dropped. Nothing after it runs: no copy, no -rme, no removal.
+			_check_stop()
 			if replaced:
 				print(f"Merged directories: {replaced} file(s) replaced by a later source")
-			total_file_list, total_sym_links = process_copy(src_paths, dests, single_thread=single_thread, max_workers=max_workers,
+			total_file_list, total_sym_links, dir_records = process_copy(src_paths, dests, single_thread=single_thread, max_workers=max_workers,
 																			verbose=verbose, directory_only=directory_only,no_directory_sync=no_directory_sync,
 																			full_hash=full_hash, files_per_job=files_per_job, parallel_file_listing=parallel_file_listing,
 																			exclude=copy_exclude,dest_image=dest_image,batch = batch,exit_not_enough_space = exit_not_enough_space,dropped = dropped,in_place = in_place)
+			_check_stop()
 			if verbose:
 				# sort file list and sym links
 				for file in natural_sort(total_file_list):
 					print(f"Copied File: {file}")
 				for link in total_sym_links:
 					print(f"Link: {link} -> {total_sym_links[link]}")
-			link_targets = create_sym_links(total_sym_links,exclude=exclude,link_tracking=link_tracking and not no_link_tracking)
+			# A move's link directories: a link has no data to fsync, and is made after every file, so no file's fsync commits it.
+			link_dirs = set() if SYNC_COPIES else None
+			link_targets = create_sym_links(total_sym_links,exclude=exclude,link_tracking=link_tracking and not no_link_tracking,link_dirs=link_dirs)
+			_check_stop()
 			if not remove:
 				# The move's backstop, at the end of a copy: two sources that landed in one file, where the destination took their
 				# names for one and no check on names could say so (an 8.3 alias, a legacy name read as UTF-8). The landing is left
-				# as it is: it holds one source whole, and the other content has no name of its own there. A move asks before removing.
+				# as it is: it holds one source whole, or after two cps wrote it at once (a parallel copy) a mix of both; the other content
+				# has no name of its own there. A move asks before removing.
 				# A file whose copy failed has said so: at none of its landings it says nothing more, and a clash is not said
 				# to follow a copy of it.
 				failed = {error.source for error in ERRORS[copy_error_start:] if isinstance(error, _CopyFailure)}
@@ -13087,6 +14294,7 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = multipr
 						eprint(f'Destination clash: copied {path}, but {why}')
 					elif not why.startswith('it is at none of its landings'):
 						eprint(f'Destination clash: {path} failed to copy, and {why}')
+				_check_stop()
 			# A copy that reported errors is incomplete: removing the sources (a move) would lose what was not copied,
 			# and an unlisted source subtree would make its destination counterpart look extra.
 			copy_failures = [error for error in ERRORS[copy_error_start:] if _is_failure(error)]
@@ -13111,11 +14319,29 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = multipr
 			elif remove_extra:
 				print('-'*80)
 				dest_roots = _checked_destination_roots(dests, pinned_dest_roots)
+				# The directories the copy covers, from its listings, before remove_extra_files clears them.
+				covered = _covered_directories(src_paths, dests, bool(dest_image), exclude, max_workers, parallel_file_listing)
 				remove_extra_files(total_file_list, dests,max_workers,verbose,files_per_job,single_thread,exclude=exclude,parallel_file_listing=parallel_file_listing,src_paths=src_paths,sym_links=total_sym_links,
 					dest_image=bool(dest_image),keep=link_targets,dest_roots=dest_roots,listed=listed,named=named_sources)
 				print('-'*80)
 				print("Removing extra directories...")
-				remove_extra_dirs(src_paths, dests,exclude=exclude,dest_image=bool(dest_image),keep=link_targets,dest_roots=dest_roots,listed=listed,named=named_sources)
+				remove_extra_dirs(src_paths, dests,exclude=exclude,dest_image=bool(dest_image),keep=link_targets,dest_roots=dest_roots,named=named_sources,covered=covered)
+			# Each synced directory's times, exact mode and flags, once what goes in it is in: its files, its links and -rme's
+			# removals (ran or skipped); in a move, each fsynced through the same descriptor, and then every other directory the
+			# move wrote into. Before a move's removal, which a directory either could not set or write to disk stops, as a
+			# failed copy does (9.86 counted a directory it could not set the same way).
+			_check_stop()
+			finish_start = len(ERRORS)
+			finish_directories(dir_records, 1 if single_thread else max_workers, sync=SYNC_COPIES)
+			if SYNC_COPIES:
+				_check_stop()
+				synced = _sync_moved_directories(total_file_list, link_dirs, src_paths, dests, bool(dest_image), dir_records,
+					1 if single_thread else max_workers)
+				_check_stop()
+				_flush_drives(total_file_list, set(synced).union(os.path.abspath(record[1]) for record in dir_records), src_paths,
+					dests, bool(dest_image))
+			copy_failures += [error for error in ERRORS[finish_start:] if _is_failure(error)]
+			_check_stop()
 			print('-'*80)
 			if len(src_paths) > 1:
 				print("Overall Summary:")
@@ -13133,13 +14359,18 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = multipr
 		elif remove and dests != ...:
 			# A move: only what the copy listed goes (see remove_moved_sources). Each copy was written to disk by its worker
 			# (_sync_landing), and one that could not be is a copy failure, which stopped this branch above.
+			_check_stop()
 			remove_moved_sources(src_paths, total_file_list, total_sym_links, single_thread=single_thread, max_workers=max_workers,
 						verbose=verbose, files_per_job=files_per_job, remove_force=remove_force, exclude=exclude, root_ids=source_ids,
 						dests=dests, dest_image=bool(dest_image))
 		elif remove:
+			_check_stop()
 			process_remove(src_paths,single_thread=single_thread, max_workers=max_workers,verbose=verbose,
 						files_per_job=files_per_job, remove_force=remove_force,exclude=exclude,batch=batch,parallel_file_listing=parallel_file_listing)
 	except KeyboardInterrupt:
+		# The stop is acted on: later checks (_check_stop) change nothing.
+		global _STOP_ACTED
+		_STOP_ACTED = True
 		eprint("Keyboard Interrupt: Signal received, cleaning up and exiting.")
 	except RuntimeError as e:
 		if str(e):
@@ -13152,7 +14383,7 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = multipr
 		track = traceback.format_exc()
 		eprint(f"General Exception: {e} \n{track}")
 	finally:
-		NAMED_DESTS, RUN_ID, SYNC_COPIES = frozenset(), None, False
+		NAMED_DESTS, RUN_ID, SYNC_COPIES, _BAR = frozenset(), None, False, False
 		_SPACE_WARNED = outer_space
 		clean_up(mount_points,loop_devices,delayed_commands)
 		get_partition_details.cache_clear()
@@ -13301,20 +14532,58 @@ def _escape_unencodable_stdout():
 		return
 	_STRICT_STDOUT = stdout
 
+def _end_now(rc):
+	"""End a run that was stopped, or that left a pool behind (_ABANDONED), without the interpreter's exit: that joins Python's
+	pool threads, and one may be stuck for good (on a lock a killed worker held, on a result it half sent, on an lstat of a
+	dead NFS mount). hpcp registers no atexit handler of its own. Of multiprocessing's exit work, what leaves something
+	behind is done here: its named semaphores (forkserver and spawn; else the resource tracker removes them and warns about
+	each) and its temporary directory (a fork server's socket). SIGTERM and SIGHUP end by their signal, Ctrl-C with 130, a
+	pool left without a stop with rc."""
+	with contextlib.suppress(Exception):
+		sys.stdout.flush()
+		sys.stderr.flush()
+	with contextlib.suppress(Exception):
+		# multiCMD's exit hook, which os._exit skips: a command of this process still running is stopped, as at exit (its
+		# approved limitations leave one 'running until kill_all() or the program's exit stops it').
+		multiCMD.kill_all()
+	with contextlib.suppress(Exception):
+		# The finalizers of exit priority 0: the semaphores' unlink. Not a queue's close (10): a pool's manager thread may be
+		# closing that queue itself (from 3.9 it is told to end at the pool's exit), and the two raced to close one pipe (EBADF,
+		# a traceback from the queue's feeder thread: 6 of 389 stops with a stuck worker on 3.14, 0 of 240 without the close).
+		# os._exit closes every descriptor anyway.
+		registry = multiprocessing.util._finalizer_registry
+		for key in sorted((key for key in list(registry) if key[0] == 0), reverse=True):
+			finalizer = registry.get(key)
+			if finalizer is not None:
+				finalizer()
+	with contextlib.suppress(Exception):
+		tempdir = multiprocessing.current_process()._config.get('tempdir')
+		if tempdir:
+			shutil.rmtree(tempdir, ignore_errors=True)
+	if _STOPPED is not None and _STOPPED != getattr(signal, 'SIGINT', None):
+		# Cleaned up: end by the signal, as 9.84 died by it, so timeout, a shell and systemd see what they sent.
+		_end_by(_STOPPED)
+	os._exit(ERROR_TO_RETURNCODE_TABLE['Keyboard Interrupt'] if _STOPPED is not None else rc)
+
 def main():
 	global RANDOM_DESTINATION_SELECTION, _MAIN_PID
-	_escape_unencodable_stdout()
-	args = get_args()
-	# after get_args: -h and -V print only what they are asked for
-	_warn_bad_overrides()
-	# we run gui if the current platform is windows and src_path is not specified
-	if os.name == 'nt' and len(args.src_path) == 0:
-		hpcp_gui()
-	else:
-		# A stop runs Ctrl-C's cleanup here too: a serial run copies in this process, and hpcp() cleans up mounts in a finally.
-		_MAIN_PID = os.getpid()
-		_register_worker_start()
+	# A stop runs Ctrl-C's cleanup here too: a serial run copies in this process, and hpcp() cleans up mounts in a finally.
+	# Installed first: a stop while the arguments are read ends the run quietly, as the signal asked (below).
+	_MAIN_PID = os.getpid()
+	rtnCode = 0
+	try:
+		# In the try: a stop landing while the later stops go in raises from the first one's handler (_stop), inside
+		# signal.signal, and ends the run quietly as any stop before hpcp() does.
 		_install_stops()
+		_escape_unencodable_stdout()
+		args = get_args()
+		# after get_args: -h and -V print only what they are asked for
+		_warn_bad_overrides()
+		# we run gui if the current platform is windows and src_path is not specified
+		if os.name == 'nt' and len(args.src_path) == 0:
+			hpcp_gui()
+			return
+		_register_worker_start()
 		rtnCode = hpcp(args.src_path, dest_paths = args.dest_path, single_thread = args.single_thread, max_workers = args.max_workers, verbose = args.verbose,
 			 directory_only =  args.directory_only, no_directory_sync = args.no_directory_sync,full_hash = args.full_hash, files_per_job = args.files_per_job,
 			 target_file_list = args.target_file_list, compare_file_list = args.compare_file_list , diff_file_list = args.diff_file_list, tar_diff_file_list = args.tar_diff_file_list,remove = args.remove, remove_force =args.remove_force,
@@ -13327,14 +14596,16 @@ def main():
 			 no_fs_param_mirror = args.no_fs_param_mirror, get_diff_image = args.get_diff_image,
 			 load_diff_image = args.load_diff_image, force_apply = args.force_apply, write_beside = args.write_beside,
 			 read_before_write = args.read_before_write)
-		if _STOPPED is not None:
-			# A worker forked after the stop was passed on (a stop while the pool was starting) would hold the exit.
-			_pass_stop_on(_STOPPED)
-		if _STOPPED is not None and _STOPPED != getattr(signal, 'SIGINT', None):
-			# Cleaned up: end by the signal, as 9.84 died by it, so timeout, a shell and systemd see what they sent. Ctrl-C keeps 130.
-			_end_by(_STOPPED)
-		if rtnCode:
-			exit(rtnCode)
+	except KeyboardInterrupt:
+		# A stop before hpcp() took it (the arguments, hpcp()'s first lines): nothing was started, nothing to clean up.
+		rtnCode = ERROR_TO_RETURNCODE_TABLE['Keyboard Interrupt']
+	if _STOPPED is not None:
+		# A worker forked after the stop was passed on (a stop while the pool was starting) ends too.
+		_pass_stop_on(_STOPPED)
+	if _STOPPED is not None or _ABANDONED:
+		_end_now(rtnCode)
+	if rtnCode:
+		exit(rtnCode)
 		
 
 if __name__ == '__main__':

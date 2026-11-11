@@ -6,6 +6,9 @@ what the operator named (-d) is followed. A stop runs the cleanup. A copy short 
 import contextlib
 import errno
 import os
+import random
+import re
+import shutil
 import signal
 import stat
 import subprocess
@@ -202,8 +205,10 @@ def test_a_landing_with_other_names_is_never_written_in_place(tmp_path, hpcp_mod
 	real = hpcp_mod.run_command_in_multicmd_with_path_check
 	refuse = []
 	def cp(command, *args, **kwargs):
-		assert not command[-1].startswith('/proc/'), command
-		if refuse and os.path.basename(command[-1]).startswith('.hpcp_tmp_'):
+		# cp writes the new file hpcp made beside the landing (/proc/self/fd/N, which names it), never the landing
+		target = os.readlink(command[-1]) if command[-1].startswith('/proc/self/fd/') else command[-1]
+		assert os.path.basename(target).startswith('.hpcp_tmp_'), command
+		if refuse:
 			raise RuntimeError('cp: cannot create regular file: Permission denied')
 		return real(command, *args, **kwargs)
 	monkeypatch.setattr(hpcp_mod, 'run_command_in_multicmd_with_path_check', cp)
@@ -229,7 +234,11 @@ def test_a_refused_rename_on_the_beside_route_keeps_the_old_copy(tmp_path, hpcp_
 	monkeypatch.setattr(hpcp_mod, 'WRITE_BESIDE', True)
 	cps = []
 	real = hpcp_mod.run_command_in_multicmd_with_path_check
-	monkeypatch.setattr(hpcp_mod, 'run_command_in_multicmd_with_path_check', lambda command, *a, **k: cps.append(command[-1]) or real(command, *a, **k))
+	def cp(command, *args, **kwargs):
+		# the beside route's new file, held by hpcp, is named by cp's /proc/self/fd/N
+		cps.append(os.readlink(command[-1]) if command[-1].startswith('/proc/self/fd/') else command[-1])
+		return real(command, *args, **kwargs)
+	monkeypatch.setattr(hpcp_mod, 'run_command_in_multicmd_with_path_check', cp)
 	real_rename = os.rename
 	def rename(source, target, **kwargs):
 		if os.path.basename(str(source)).startswith('.hpcp_tmp_'):
@@ -329,7 +338,7 @@ def test_a_link_swapped_in_after_the_open_is_not_written_through(tmp_path, hpcp_
 		return real(command, *args, **kwargs)
 	monkeypatch.setattr(hpcp_mod, 'run_command_in_multicmd_with_path_check', swap_then_cp)
 	assert hpcp_mod.copy_file(str(tmp_path / 'a/x'), [str(tmp_path / 'out/x')])[0] > 0 and not hpcp_mod.ERRORS
-	assert len(seen) == 1 and seen[0].startswith('/proc/%d/fd/' % os.getpid()), seen
+	assert len(seen) == 1 and seen[0].startswith('/proc/self/fd/'), seen
 	assert read(tmp_path / 't/f') == 'not yours' and os.path.islink(str(tmp_path / 'out/x'))
 	assert read(tmp_path / 'out/x.held') == 'new content' and os.stat(str(tmp_path / 'out/x.held')).st_ino == inode
 
@@ -379,7 +388,7 @@ def test_off_linux_the_landing_is_written_by_path(tmp_path, hpcp_mod, reset_hpcp
 	inode = os.stat(str(tmp_path / 'out/x')).st_ino
 	monkeypatch.setattr(hpcp_mod, 'CONTENT_ONLY', content_only)
 	monkeypatch.setattr(hpcp_mod, 'NAMED_DESTS', frozenset([str(tmp_path / 'out')]))
-	monkeypatch.setattr(hpcp_mod, '_reaches_held', lambda: False)
+	monkeypatch.setattr(hpcp_mod, '_held_route', lambda: None)
 	real = hpcp_mod.run_command_in_multicmd_with_path_check
 	seen = []
 	monkeypatch.setattr(hpcp_mod, 'run_command_in_multicmd_with_path_check', lambda command, *a, **k: seen.append(command[-1]) or real(command, *a, **k))
@@ -391,14 +400,14 @@ def test_off_linux_the_landing_is_written_by_path(tmp_path, hpcp_mod, reset_hpcp
 
 
 _NO_PROC_CP = '''#!/bin/sh
-# cp that may not open another process's /proc/PID/fd/N (hidepid, a worker that is not dumpable, an LSM): it fails, writing
-# nothing, as GNU cp fails its stat of the destination ("cannot stat ...: Permission denied"). PROBE=pass lets the held-file
-# probe (cp /dev/null onto a descriptor of /dev/zero) through, as if the refusal came only later.
+# cp that may not open the held file's /proc/self/fd/N (an LSM rule): it fails, writing nothing, as GNU cp fails its stat of
+# the destination ("cannot stat ...: Permission denied"). PROBE=pass lets the held-file probe (cp of a temporary file named
+# hpcp-held-probe-*) through, as if the refusal came only later.
 case "$1" in --version) exec cp "$@";; esac
 for last; do :; done
 case "$last" in
 /proc/*)
-	if [ "$1" = /dev/null ] && [ "$PROBE" = pass ]; then exec cp "$@"; fi
+	case "$2" in */hpcp-held-probe-*) if [ "$PROBE" = pass ]; then exec cp "$@"; fi;; esac
 	echo "cp: cannot stat '$last': Permission denied" >&2; exit 1;;
 esac
 exec cp "$@"
@@ -445,35 +454,25 @@ def test_a_cp_refused_the_held_file_after_the_probe_keeps_the_old_copy(tmp_path)
 
 @posix_only
 @pytest.mark.skipif(not sys.platform.startswith('linux'), reason='the held-file route is Linux only')
-def test_a_proc_of_another_pid_namespace_is_never_written_through(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
-	# unshare -p without a /proc of its own: /proc/PID there is another process, whose descriptor N could be any file. The
-	# held route is off (cp gets the name), and the probe is never run, so nothing is written through it.
-	monkeypatch.setattr(hpcp_mod, '_HELD', [None, False])
-	hpcp_mod.cp_supports_sparse()  # cp --version, asked once per process, is no probe
-	real = os.readlink
-	monkeypatch.setattr(hpcp_mod.os, 'readlink', lambda path, *a, **k: str(os.getpid() + 1) if path == '/proc/self' else real(path, *a, **k))
-	ran = []
-	monkeypatch.setattr(hpcp_mod.multiCMD, 'run_commands', lambda *a, **k: ran.append(a) or [])
-	assert hpcp_mod._reaches_held() is False and ran == []
-
-
-@posix_only
-@pytest.mark.skipif(not sys.platform.startswith('linux'), reason='the held-file route is Linux only')
 def test_the_held_file_probe_runs_once_per_process(hpcp_mod, monkeypatch):
-	# One probe however many rewrites in place; a forked worker (another pid) asks for itself.
-	monkeypatch.setattr(hpcp_mod, '_HELD', [None, False])
+	# One probe however many rewrites in place; a forked worker (another pid) asks for itself. cp gets the descriptor it
+	# inherits under its own process's name (/proc/self/fd/N): 9.86 named this process's (/proc/PID/fd/N), which hidepid, a
+	# worker /proc refuses and another PID namespace's /proc did not show to cp.
+	monkeypatch.setattr(hpcp_mod, '_HELD', [None, None])
 	probes = []
 	real_run = hpcp_mod.multiCMD.run_commands
 	def run_commands(commands, *args, **kwargs):
-		if commands[0][1:2] == [os.devnull]:
-			probes.append(commands[0])
+		if os.path.basename(str(commands[0][-2])).startswith('hpcp-held-probe-'):
+			probes.append((commands[0], kwargs.get('pass_fds')))
 		return real_run(commands, *args, **kwargs)
 	monkeypatch.setattr(hpcp_mod.multiCMD, 'run_commands', run_commands)
-	answers = [hpcp_mod._reaches_held() for _ in range(3)]
+	answers = [hpcp_mod._held_route() for _ in range(3)]
 	assert answers == [answers[0]] * 3 and len(probes) == 1, probes
-	assert probes[0][2].startswith('/proc/%d/fd/' % os.getpid())
-	monkeypatch.setattr(hpcp_mod, '_HELD', [os.getpid() + 1, not answers[0]])
-	assert hpcp_mod._reaches_held() == answers[0] and len(probes) == 2
+	command, pass_fds = probes[0]
+	assert command[-1] == '/proc/self/fd/%d' % pass_fds[0], probes
+	assert not os.path.exists(command[-2])  # the probe's source is gone
+	monkeypatch.setattr(hpcp_mod, '_HELD', [os.getpid() + 1, None])
+	assert hpcp_mod._held_route() == answers[0] and len(probes) == 2
 
 
 @posix_only
@@ -941,7 +940,7 @@ def test_a_rewrite_through_the_held_file_asks_for_the_source_s_label_only_on_a_p
 		reset_hpcp_globals, monkeypatch, content_only):
 	# Runs without SELinux too: a plain rewrite through the held file gives it the source's label (_label_like), and -co,
 	# which keeps the old label in every version, does not.
-	if not hpcp_mod._reaches_held():
+	if not hpcp_mod._held_route():
 		pytest.skip('cp cannot reach the held file here')
 	write(tmp_path / 'a/x', 'new content')
 	write(tmp_path / 'out/x', 'old')
@@ -1236,8 +1235,8 @@ def _warnings(output, where):
 
 _LOGGING_CP = '''#!/bin/sh
 # cp that notes each copy it starts in $LOG, then (after $PAUSE seconds, when set) runs the real cp. --version and the
-# held-file probe (cp /dev/null onto a descriptor of /dev/zero) are not copies.
-case "$1" in --version|/dev/null) exec cp "$@";; esac
+# held-file probe (cp of a temporary file named hpcp-held-probe-*) are not copies.
+case "$1 $2" in --version*|*/hpcp-held-probe-*) exec cp "$@";; esac
 echo CP-STARTED >> "$LOG"
 if [ -n "$PAUSE" ]; then sleep "$PAUSE"; fi
 exec cp "$@"
@@ -1554,13 +1553,15 @@ def test_a_root_copy_onto_an_ext4_full_for_users_gets_one_needless_warning(tmp_p
 # ---- rule 9: a stop is a cleanup ----
 
 _SLOW_CP = '''#!/bin/sh
-# cp, slowed: write a part of each copy into a temporary name, say so, and wait for the go file (or 60 s) before the real cp.
-case "$1" in --version) exec cp "$@";; esac
+# cp, slowed: write a part of each copy into a temporary name (by its name, or the held file hpcp made there, through
+# /proc/self/fd/N), say so, and wait for the go file (or 60 s) before the real cp.
+case "$1 $2" in --version*|*/hpcp-held-probe-*) exec cp "$@";; esac
 for last; do :; done
-case "$(basename "$last")" in
+name=$(basename "$(readlink "$last" 2>/dev/null || echo "$last")")
+case "$name" in
 .hpcp_tmp_*)
 	head -c 100 /etc/passwd > "$last"
-	touch "$MARKS/$(basename "$last")"
+	touch "$MARKS/$name"
 	waited=0
 	while [ ! -e "$GO" ] && [ $waited -lt 600 ]; do sleep 0.1; waited=$((waited + 1)); done;;
 esac
@@ -1569,10 +1570,10 @@ exec cp "$@"
 
 
 _SLOW_CP_IN_PLACE = '''#!/bin/sh
-# cp, slowed, for a rewrite in place: write a part of the copy into what it is given (the held file, /proc/PID/fd/N), say
-# so, and wait for the go file (or 60 s) before the real cp. --version and the held-file probe (cp /dev/null onto a
-# descriptor of /dev/zero) go straight to cp.
-case "$1" in --version|/dev/null) exec cp "$@";; esac
+# cp, slowed, for a rewrite in place: write a part of the copy into what it is given (the held file, /proc/self/fd/N), say
+# so, and wait for the go file (or 60 s) before the real cp. --version and the held-file probe (cp of a temporary file
+# named hpcp-held-probe-*) go straight to cp.
+case "$1 $2" in --version*|*/hpcp-held-probe-*) exec cp "$@";; esac
 for last; do :; done
 head -c 100 /etc/passwd > "$last"
 touch "$MARKS/$$"
@@ -1582,9 +1583,9 @@ exec cp "$@"
 '''
 
 
-def _slow_run(tmp_path, args, preexec=None, script=_SLOW_CP):
+def _slow_run(tmp_path, args, preexec=None, script=_SLOW_CP, env=None):
 	"""hpcp copying four files over old copies, each cp holding a part (beside its landing, or in it with _SLOW_CP_IN_PLACE)
-	until tmp_path/go exists."""
+	until tmp_path/go exists. env: more variables for the run."""
 	cp = tmp_path / 'slowcp'
 	cp.write_text(script)
 	os.chmod(str(cp), 0o755)
@@ -1593,7 +1594,7 @@ def _slow_run(tmp_path, args, preexec=None, script=_SLOW_CP):
 	for name in 'abcd':
 		write(tmp_path / 'src' / name, 'new ' + name)
 		write(tmp_path / 'out' / name, 'old ' + name)
-	env = dict(os.environ, CP_PATH=str(cp), MARKS=str(marks), GO=str(tmp_path / 'go'))
+	env = dict(os.environ, CP_PATH=str(cp), MARKS=str(marks), GO=str(tmp_path / 'go'), **(env or {}))
 	task = subprocess.Popen([sys.executable, HPCP, 'src/', '-d', 'out/'] + args, cwd=str(tmp_path), env=env,
 		stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True, preexec_fn=preexec)
 	return task, marks
@@ -1607,13 +1608,28 @@ def _wait_for(condition, timeout=60):
 
 
 def _group_gone(pgid):
+	'''No live process left in group pgid. One that ended and that nothing reaped (a zombie) counts as gone: a container whose
+	PID 1 reaps no orphan keeps a killed run's ended workers so (GitHub's job container runs `tail -f /dev/null`).'''
 	try:
 		os.killpg(pgid, 0)
 	except ProcessLookupError:
 		return True
 	except PermissionError:
 		return False
-	return False
+	if not os.path.isdir('/proc/self'):
+		return False
+	for entry in os.listdir('/proc'):
+		if not entry.isdigit():
+			continue
+		try:
+			with open('/proc/%s/stat' % entry) as handle:
+				# after the command's closing parenthesis: state, ppid, pgrp
+				state, _, group = handle.read().rsplit(')', 1)[1].split()[:3]
+		except (OSError, IndexError, ValueError):
+			continue
+		if int(group) == pgid and state != 'Z':
+			return False
+	return True
 
 
 def _each_old_or_new(tmp_path):
@@ -1841,10 +1857,38 @@ def test_a_stop_while_a_worker_ends_does_not_keep_it(hpcp_mod, monkeypatch):
 		seen.append(hpcp_mod._stop(signal.SIGTERM, None))
 	monkeypatch.setattr(hpcp_mod.sys.stdout, 'flush', flush)
 	monkeypatch.setattr(hpcp_mod.signal, 'signal', lambda signum, handler: None)
+	monkeypatch.setattr(hpcp_mod, '_block_stops', lambda: None)
 	monkeypatch.setattr(hpcp_mod.os, 'kill', lambda pid, signum: None)
 	monkeypatch.setattr(hpcp_mod.os, '_exit', lambda code: None)
 	hpcp_mod._end_by(signal.SIGINT)
 	assert seen == [None]
+
+
+_END_BY = '''
+import os, signal, sys
+sys.path.insert(0, %(root)r)
+import hpcp
+hpcp._install_stops()
+real = signal.signal
+def switch(signum, handler):
+	if handler is signal.SIG_DFL:
+		with open(%(seen)r, 'w') as f:
+			f.write(repr(signum in signal.pthread_sigmask(signal.SIG_BLOCK, [])))
+	return real(signum, handler)
+signal.signal = switch
+hpcp._end_by(signal.SIGINT)
+'''
+
+
+@posix_only
+def test_a_stop_cannot_land_while_the_ending_switches_to_the_default_action(tmp_path):
+	# test_an_early_stop_prints_no_traceback, about one run in 150 on 3.14: a worker in _end_by got the pool's pass-on of the
+	# Ctrl-C inside signal.signal(SIG_DFL), after Python's check for pending stops; Python then found it pending with the
+	# default action set and printed 'Exception ignored ... Signal 2 ignored due to race condition' with a traceback. The
+	# window is inside Python's C code, so this checks the stop is blocked there, and that the process still ends by it.
+	seen = tmp_path / 'seen'
+	code = subprocess.run([sys.executable, '-c', _END_BY % {'root': os.path.dirname(HPCP), 'seen': str(seen)}], timeout=60).returncode
+	assert (code, seen.read_text()) == (-signal.SIGINT, 'True')
 
 
 def test_a_second_stop_after_a_task_s_cleanup_ends_the_worker(hpcp_mod, monkeypatch):
@@ -1866,7 +1910,8 @@ def test_a_second_stop_after_a_task_s_cleanup_ends_the_worker(hpcp_mod, monkeypa
 	def task():
 		hpcp_mod._stop(signal.SIGTERM, None)
 	hpcp_mod._run_task({}, task)
-	assert ended == [signal.SIGTERM] and not hpcp_mod._IN_TASK
+	# The second stop ends the worker at once (_stop); this stub of _end_by returns, so _run_task's own _end_by follows.
+	assert ended and set(ended) == {signal.SIGTERM} and not hpcp_mod._IN_TASK
 
 
 def test_a_forked_worker_sets_itself_up_at_its_start_only_in_a_run(tmp_path):
@@ -1909,6 +1954,461 @@ def test_an_idle_worker_ends_on_its_own_stop_after_its_parent_s(hpcp_mod, monkey
 	monkeypatch.setattr(hpcp_mod, '_IN_TASK', False)
 	with pytest.raises(SystemExit):
 		hpcp_mod._stop(signal.SIGTERM, None)
+
+
+# ---- 9.87 group 1: stops end, and end cleanly (entries 16, 17, 18) ----
+
+_WRAP = '''import os, random, signal, struct, sys, time, weakref
+sys.path.insert(0, %(root)r)
+import hpcp
+# What a test puts here runs in every process of the run: forked workers inherit it, and forkserver and spawn ones import
+# this file as __mp_main__.
+%(inject)s
+if __name__ == '__main__':
+	%(before)s
+	sys.argv = [%(hpcp)r] + sys.argv[1:]
+	hpcp.main()
+'''
+
+
+def _wrapped(tmp_path, args, inject='', before='pass', env=None, cwd=None):
+	"""hpcp.main() through a wrapper script whose top level runs inject; in a session of its own."""
+	script = tmp_path / 'wrap.py'
+	script.write_text(_WRAP % {'root': os.path.dirname(HPCP), 'inject': inject, 'before': before, 'hpcp': HPCP})
+	return subprocess.Popen([sys.executable, str(script)] + args, cwd=str(cwd or tmp_path), env=dict(os.environ, **(env or {})),
+		stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, start_new_session=True)
+
+
+def _ended(task, timeout=60):
+	"""(return code, output, seconds it took from now); 'timeout' after 60 s, its session killed: a hang fails, never holds."""
+	started = time.monotonic()
+	try:
+		output = task.communicate(timeout=timeout)[0]
+	except subprocess.TimeoutExpired:
+		os.killpg(task.pid, signal.SIGKILL)
+		task.communicate()
+		return 'timeout', b'', time.monotonic() - started
+	return task.returncode, output, time.monotonic() - started
+
+
+def _files(root, count, prefix='f', content='x'):
+	for i in range(count):
+		write(root / ('%s%03d' % (prefix, i)), content)
+
+
+@posix_only
+def test_a_stop_inside_futures_wait_ends_the_run(tmp_path):
+	# r985d/probe/futlock.py: the parent's stop raised inside concurrent.futures.wait's _AcquireFutures.__enter__, after it
+	# took the first future's lock, left that lock held; the pool's shutdown then waited on it for good (9.86: hangs). In a
+	# pool the parent's stop is only recorded there, and the loop raises it once the wait returns.
+	_files(tmp_path / 'src', 8)
+	inject = '''
+from concurrent.futures import _base
+armed = [True]
+def enter(self):
+	for n, future in enumerate(sorted(self.futures, key=id)):
+		future._condition.acquire()
+		if n == 0 and armed[0] and os.getpid() == hpcp._MAIN_PID:
+			armed[0] = False
+			with open(os.environ['MARK'], 'w') as f:
+				f.write('%r' % time.time())
+			os.kill(os.getpid(), signal.SIGINT)
+_base._AcquireFutures.__enter__ = enter
+'''
+	task = _wrapped(tmp_path, ['src/', '-d', 'out/', '-j', '2'], inject, env={'MARK': str(tmp_path / 'mark')})
+	code, output, _ = _ended(task)
+	ended = time.time()
+	assert code == 130, output[-3000:]
+	# Within the loop's next pass (1 s), the workers' end (they had the stop at once), and slack for a loaded host.
+	assert ended - float((tmp_path / 'mark').read_text()) < 1 + _GRACE + 2 + 3, output[-3000:]
+	assert b'Traceback' not in output, output[-3000:]
+
+
+_GRACE = 4  # hpcp._WATCH_GRACE
+
+
+@posix_only
+@pytest.mark.skipif(not hasattr(signal, 'pthread_sigmask'), reason='pthread_sigmask')
+def test_a_worker_stuck_between_tasks_is_killed_after_the_grace(tmp_path):
+	# A worker that sticks after its task (as on the pool's queue lock: inferred from 9.85's hang dumps), its stops blocked
+	# so nothing but a kill ends it. 9.86's pool shutdown waited for it for good; 9.87 kills it 4 s after the stop: it holds
+	# nothing of a file (its slot reads 'between tasks').
+	_files(tmp_path / 'src', 8)
+	_files(tmp_path / 'out', 8, content='old')
+	inject = '''
+real_run_task = hpcp._run_task
+def run_task(*args, **kwargs):
+	result = real_run_task(*args, **kwargs)
+	try:
+		fd = os.open(os.environ['STUCK'], os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+	except FileExistsError:
+		return result
+	signal.pthread_sigmask(signal.SIG_BLOCK, hpcp._STOPS)
+	os.write(fd, str(os.getpid()).encode())
+	os.close(fd)
+	while True:
+		time.sleep(60)
+hpcp._run_task = run_task
+'''
+	stuck = tmp_path / 'stuck'
+	task = _wrapped(tmp_path, ['src/', '-d', 'out/', '-j', '4', '-wb'], inject, env={'STUCK': str(stuck)})
+	try:
+		_wait_for(lambda: stuck.exists() and stuck.read_text())
+		pid = int(stuck.read_text())
+		os.killpg(task.pid, signal.SIGINT)
+		code, output, took = _ended(task)
+	finally:
+		if task.poll() is None:
+			os.killpg(task.pid, signal.SIGKILL)
+	# The grace, the kill's 1 s join, and slack for a loaded host.
+	assert code == 130 and took < _GRACE + 1 + 5, (took, output[-3000:])
+	# Killed by the run, not by its own parent watch, which would end it 4.5 s after the run.
+	_wait_for(lambda: _dead(pid), timeout=1)
+	assert temporaries(tmp_path / 'out') == [] and b'Traceback' not in output, output[-3000:]
+
+
+def _dead(pid):
+	"""pid has exited (gone, or a zombie not reaped yet)."""
+	try:
+		with open('/proc/%d/stat' % pid) as f:
+			return f.read().rsplit(')', 1)[1].split()[0] == 'Z'
+	except FileNotFoundError:
+		return True
+	except OSError:
+		pass
+	try:
+		os.kill(pid, 0)
+	except ProcessLookupError:
+		return True
+	return False
+
+
+@posix_only
+@pytest.mark.skipif(not hasattr(signal, 'pthread_sigmask'), reason='pthread_sigmask')
+def test_a_worker_in_a_long_cleanup_is_waited_for_not_killed(tmp_path):
+	# A stop while a worker fsyncs a beside temporary file (-wb), made to take 8 s with the stops held back, as a real fsync
+	# is not cut by a signal: the run waits for it past the grace, says so once, and its cleanup removes the temporary file
+	# (the approved entries: SIGINT, SIGTERM and SIGHUP remove it).
+	write(tmp_path / 'src' / 'a', 'new')
+	write(tmp_path / 'out' / 'a', 'old')
+	inject = '''
+def slow(path):
+	if os.path.basename(path).startswith('.hpcp_tmp_'):
+		mask = signal.pthread_sigmask(signal.SIG_BLOCK, hpcp._STOPS)
+		open(os.environ['MARK'], 'w').close()
+		time.sleep(8)
+		open(os.environ['MARK'] + '.done', 'w').close()
+		signal.pthread_sigmask(signal.SIG_SETMASK, mask)
+real_fsync, real_os_fsync = hpcp._fsync_file, os.fsync
+def fsync_file(path):
+	slow(path)
+	return real_fsync(path)
+def os_fsync(fd):
+	# the beside route's new file, made and held by hpcp, is fsynced through its descriptor
+	slow(os.readlink('/proc/self/fd/%d' % fd) if os.path.isdir('/proc/self/fd') else '')
+	return real_os_fsync(fd)
+hpcp._fsync_file, os.fsync = fsync_file, os_fsync
+'''
+	mark = tmp_path / 'mark'
+	task = _wrapped(tmp_path, ['src/', '-d', 'out/', '-j', '2', '-wb'], inject, env={'MARK': str(mark)})
+	try:
+		_wait_for(mark.exists)
+		os.killpg(task.pid, signal.SIGINT)
+		code, output, took = _ended(task)
+	finally:
+		if task.poll() is None:
+			os.killpg(task.pid, signal.SIGKILL)
+	assert code == 130, output[-3000:]
+	assert output.count(b'Waiting for 1 worker(s) still finishing a file') == 1, output[-3000:]
+	assert (tmp_path / 'mark.done').exists() and took > _GRACE, (took, output[-3000:])
+	assert temporaries(tmp_path / 'out') == [] and read(tmp_path / 'out' / 'a') == 'old', output[-3000:]
+
+
+@posix_only
+def test_a_worker_killed_while_it_sends_a_big_result_ends_the_run(tmp_path):
+	# A worker killed after the first 16 KiB of a 200 KiB result reached the pipe (a listing of a wide directory, -pfl): the
+	# pool's manager thread waits for the rest for good, as the parent holds the pipe's write end too, and no future ever
+	# completes (9.86: hangs). The pool's watch ends the run: 191, and the move removes nothing.
+	wide = tmp_path / 'src' / 'wide'
+	os.makedirs(str(wide))
+	for i in range(3000):
+		open(str(wide / ('%04d-' % i + 'n' * 60)), 'w').close()
+	write(tmp_path / 'src' / 'top', 'top')
+	inject = '''
+import multiprocessing.connection
+real_send = multiprocessing.connection.Connection._send_bytes
+def send_bytes(self, buf):
+	if len(buf) > 100000 and os.getpid() != hpcp._MAIN_PID:
+		self._send(struct.pack('!i', len(buf)))
+		self._send(buf[:16384])
+		os.kill(os.getpid(), signal.SIGKILL)
+	return real_send(self, buf)
+multiprocessing.connection.Connection._send_bytes = send_bytes
+'''
+	task = _wrapped(tmp_path, ['src/', '-d', 'out/', '-j', '2', '-pfl', '-rf'], inject)
+	code, output, took = _ended(task)
+	assert code == 191, output[-3000:]
+	assert b'a pool worker died and its pool stopped answering' in output, output[-3000:]
+	# The watch's pass (1 s) and grace, then the exit's grace for a worker stuck on the lock the dead one held, a 1 s join,
+	# and slack for a loaded host.
+	assert took < 1 + _GRACE + _GRACE + 1 + 5, (took, output[-3000:])
+	assert len(os.listdir(str(wide))) == 3000 and read(tmp_path / 'src' / 'top') == 'top'
+
+
+_DROP_STOP = '''
+import weakref
+class Thing:
+	pass
+def drop_a_stop():
+	"""Python drops a KeyboardInterrupt raised in a weakref callback (every Python, 3.6 to 3.14): _stop's raise in there."""
+	def callback(ref):
+		os.kill(os.getpid(), signal.SIGINT)
+		for _ in range(1000):
+			pass
+	thing = Thing()
+	keep = weakref.ref(thing, callback)
+	del thing
+'''
+
+
+@posix_only
+@pytest.mark.filterwarnings('ignore::pytest.PytestUnraisableExceptionWarning')
+@pytest.mark.parametrize('how', ['move', 'rme'])
+def test_a_dropped_keyboardinterrupt_in_the_parent_is_acted_on(tmp_path, how):
+	# Entry 17: the parent's stop, its KeyboardInterrupt dropped by Python outside a pool (here as the links are made): 9.86
+	# went on, a move removing its sources (exit 0), -rme to its prompt. 9.87 acts on it at the next step: 130, nothing removed,
+	# no prompt.
+	_files(tmp_path / 'src', 6)
+	os.symlink('f000', str(tmp_path / 'src' / 'link'))
+	write(tmp_path / 'out' / 'extra', 'extra')
+	inject = _DROP_STOP + '''
+real_links = hpcp.create_sym_links
+def create_sym_links(*args, **kwargs):
+	drop_a_stop()
+	return real_links(*args, **kwargs)
+hpcp.create_sym_links = create_sym_links
+'''
+	args = ['src/', '-d', 'out/', '-j', '2'] + (['-rf'] if how == 'move' else ['-rme'])
+	code, output, _ = _ended(_wrapped(tmp_path, args, inject))
+	assert code == 130, output[-3000:]
+	assert sorted(os.listdir(str(tmp_path / 'src'))) == ['f%03d' % i for i in range(6)] + ['link']
+	assert b'Do you want to' not in output and read(tmp_path / 'out' / 'extra') == 'extra', output[-3000:]
+
+
+@posix_only
+def test_a_broken_pool_from_a_stop_ends_130_not_191(tmp_path):
+	# Entry 17 on 3.14 (r985d/probe/lostki.py): the parent's stop landed in a weakref callback as a pool ran; its workers ended
+	# on the pass-on, the pool read as broken, and the run ended 191, 'Copy process crashed'. Inside a pool the stop is only
+	# recorded, and the loop acts on it: 130.
+	_files(tmp_path / 'src', 40)
+	inject = _DROP_STOP + '''
+calls = [0]
+real_submit = hpcp._submit_task
+def submit_task(executor, func, *args, **kwargs):
+	calls[0] += 1
+	if calls[0] == 5 and os.getpid() == hpcp._MAIN_PID:
+		drop_a_stop()
+	return real_submit(executor, func, *args, **kwargs)
+hpcp._submit_task = submit_task
+'''
+	code, output, _ = _ended(_wrapped(tmp_path, ['src/', '-d', 'out/', '-j', '2'], inject))
+	assert code == 130 and b'Copy process crashed' not in output, output[-3000:]
+
+
+@posix_only
+def test_a_second_stop_is_ignored_and_names_ctrl_backslash(tmp_path):
+	# Later stops stay ignored, so the cleanup is never cut (a -di image stays mounted otherwise), and the first one says once
+	# how to end at once.
+	inject = '''
+real_clean_up = hpcp.clean_up
+def clean_up(*args, **kwargs):
+	open(os.environ['MARK'], 'w').close()
+	time.sleep(6)
+	real_clean_up(*args, **kwargs)
+	open(os.environ['MARK'] + '.done', 'w').close()
+hpcp.clean_up = clean_up
+'''
+	cp = tmp_path / 'slowcp'
+	cp.write_text(_SLOW_CP_IN_PLACE)
+	os.chmod(str(cp), 0o755)
+	marks, mark = tmp_path / 'marks', tmp_path / 'mark'
+	os.makedirs(str(marks))
+	_files(tmp_path / 'src', 4)
+	_files(tmp_path / 'out', 4, content='old')
+	task = _wrapped(tmp_path, ['src/', '-d', 'out/', '-j', '2'], inject,
+		env={'CP_PATH': str(cp), 'MARKS': str(marks), 'GO': str(tmp_path / 'go'), 'MARK': str(mark)})
+	try:
+		_wait_for(lambda: len(os.listdir(str(marks))) >= 1)
+		os.killpg(task.pid, signal.SIGINT)
+		_wait_for(mark.exists)
+		os.kill(task.pid, signal.SIGINT)
+		time.sleep(0.5)
+		os.kill(task.pid, signal.SIGTERM)
+		code, output, _ = _ended(task)
+	finally:
+		if task.poll() is None:
+			os.killpg(task.pid, signal.SIGKILL)
+	assert code == 130 and (tmp_path / 'mark.done').exists(), output[-3000:]
+	assert output.count(b'Stopping: cleaning up first') == 1 and b'Ctrl-\\ ends hpcp now' in output, output[-3000:]
+
+
+_SLOWER_CP = '''#!/bin/sh
+# cp, each copy 0.05 s slower: a run long enough to be stopped early in it.
+case "$1" in --version) exec cp "$@";; esac
+sleep 0.05
+exec cp "$@"
+'''
+
+
+def _start_methods():
+	import multiprocessing
+	return [method for method in ('fork', 'forkserver', 'spawn') if method in multiprocessing.get_all_start_methods()]
+
+
+# Python 3.6 and 3.7 have no sys.unraisablehook: a raise Python drops (a generator the collector closes, a weakref callback, a
+# __del__) is printed by the interpreter itself. limitations.md, "On Python 3.6 and 3.7 an early Ctrl-C can print an
+# `Exception ignored ... KeyboardInterrupt` block" (F8, about 1 early stop in 2,000). Only hpcp's own stop, raised by _stop
+# after it recorded it, so the run still acts on it (130). The block can follow a progress bar frame on its line.
+_DROPPED_STOP = re.compile(rb'Exception ignored in: [^\n]*\nTraceback \(most recent call last\):\n(?:  [^\n]*\n)*?'
+	rb'  File "[^"\n]*hpcp\.py", line \d+, in _stop\n    raise KeyboardInterrupt\nKeyboardInterrupt(?::[^\n]*)?\n')
+
+
+@posix_only
+@pytest.mark.parametrize('batch', range(4))
+@pytest.mark.parametrize('method', _start_methods())
+def test_an_early_stop_prints_no_traceback(tmp_path, method, batch):
+	# Entry 18: under forkserver (3.14's default) and spawn a worker started with Python's own SIGINT handler, and hpcp's went
+	# in only later: about one early Ctrl-C in three printed a KeyboardInterrupt traceback on 3.14. A worker now starts with
+	# the stops blocked and lets them in once set up. 10 runs a batch, 40 a start method; each stopped at a random 0 to 0.3 s
+	# after hpcp.main() was called, by SIGINT to the run's process group, as a terminal's Ctrl-C. On 3.6 and 3.7 Python's own
+	# block for hpcp's dropped stop is accepted (_DROPPED_STOP, a known limitation there).
+	if sys.version_info < (3, 8) and method != 'fork':
+		# 3.6's pools fork. On 3.7 a forkserver or spawn child (or the semaphore tracker it starts) can take the same Ctrl-C
+		# while Python itself starts or imports, which prints a traceback from Python's own code (importlib, initsite,
+		# multiprocessing.spawn; 3.7's semaphore tracker KeyError in cache.remove). That is the deferral "A Ctrl-C that lands
+		# while Python imports hpcp can be dropped" (docs/limitations.md, 9.88), and 9.86 prints it more (one round of 100 runs a
+		# method, 3.7, runs with a traceback, 9.86 against 9.87: forkserver 25 against 8, spawn 94 against 15; every 9.87 run
+		# exits 130. The README and the deferral give another, larger measure: 200 runs a method, forkserver 45 against 13, spawn
+		# 187 against 28).
+		pytest.skip('Python 3.6 pools fork; on 3.7 the child start-up prints its own traceback (the 9.88 deferral in docs/limitations.md)')
+	cp = tmp_path / 'slowcp'
+	cp.write_text(_SLOWER_CP)
+	os.chmod(str(cp), 0o755)
+	for d in range(10):
+		_files(tmp_path / 'src' / ('d%d' % d), 20)
+	ready = tmp_path / 'ready'
+	before = "import multiprocessing; multiprocessing.set_start_method(%r); open(os.environ['READY'], 'w').close()" % method
+	for run in range(10):
+		shutil.rmtree(str(tmp_path / 'out'), ignore_errors=True)
+		with contextlib.suppress(FileNotFoundError):
+			os.unlink(str(ready))
+		task = _wrapped(tmp_path, ['src/', '-d', 'out/', '-j', '8'], before=before, env={'CP_PATH': str(cp), 'READY': str(ready)})
+		try:
+			_wait_for(ready.exists)
+			time.sleep(random.uniform(0, 0.3))
+			os.killpg(task.pid, signal.SIGINT)
+			code, output, _ = _ended(task)
+		finally:
+			if task.poll() is None:
+				os.killpg(task.pid, signal.SIGKILL)
+		if code == 'timeout' and sys.version_info < (3, 7):
+			# Python 3.6's pool can hang in its first submit when the stop that ended a worker left the queue's write lock held:
+			# review A saw 5 hangs in 5,520 early stops (about 1 session in 28). Not this test's subject: limitations.md, "On
+			# Python 3.6 an early stop can rarely hang the run in a pool's submit" (F1, deferred to 9.88). A hang elsewhere fails.
+			pytest.xfail('the Python 3.6 submit hang, F1, deferred to 9.88 (docs/limitations.md)')
+		left = _DROPPED_STOP.sub(b'', output) if sys.version_info < (3, 8) else output
+		assert code == 130 and b'Traceback' not in left, (run, output[-3000:])
+
+
+_STOP_IN = '''
+import os, signal, sys, weakref
+sys.path.insert(0, %(root)r)
+import hpcp
+hpcp._MAIN_PID = os.getpid()
+hpcp._install_stops()
+def stop_in(name):
+	def trace(frame, event, arg):
+		if event == 'call' and frame.f_code.co_name == name:
+			sys.settrace(None)
+			os.kill(os.getpid(), signal.SIGINT)
+	return trace
+class Going:
+	def __del__(self):
+		pass
+class Item:
+	pass
+if sys.argv[1] == 'del':
+	sys.settrace(stop_in('__del__'))
+	Going()
+else:
+	items, item = weakref.WeakSet(), Item()
+	items.add(item)
+	sys.settrace(stop_in('_remove'))
+	del item
+sys.settrace(None)
+try:
+	hpcp._check_stop()
+except KeyboardInterrupt:
+	print('acted on')
+'''
+
+
+@posix_only
+@pytest.mark.parametrize('where', ['del', 'weakset'])
+def test_a_stop_in_a_call_python_drops_prints_nothing_and_is_acted_on(tmp_path, where):
+	# Python drops a raise in a __del__ or a weakref callback (a thread's, a pool worker's going), and 3.6 and 3.7, which have
+	# no sys.unraisablehook, printed hpcp's stop there as 'Exception ignored' with its traceback: about 1 early Ctrl-C in
+	# 100 under a loaded host (test_an_early_stop_prints_no_traceback, 3.6). There the stop is only recorded, and acted on.
+	script = tmp_path / 'stop_in.py'
+	script.write_text(_STOP_IN % {'root': os.path.dirname(HPCP)})
+	done = subprocess.run([sys.executable, str(script), where], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=60)
+	assert done.returncode == 0 and done.stdout.strip() == b'acted on', done.stdout
+
+
+@posix_only
+@pytest.mark.parametrize('signum', [signal.SIGINT, signal.SIGTERM], ids=['int', 'term'])
+def test_a_stopped_run_leaves_no_multiprocessing_files(tmp_path, signum):
+	# A stopped run ends by os._exit (or its signal), past multiprocessing's exit work: its temporary directory (a fork
+	# server's socket) and its named semaphores (forkserver, spawn) are removed first, so nothing is left in TMPDIR and the
+	# resource tracker has nothing to warn about.
+	import tempfile
+	# Short: a fork server's socket is made in it, and an AF_UNIX path holds at most 107 bytes (pytest's tmp_path can be longer).
+	tmpdir = tempfile.mkdtemp(prefix='hpcp-')
+	try:
+		task, marks = _slow_run(tmp_path, ['-j', '4', '-wb'], env={'TMPDIR': tmpdir})
+		try:
+			_wait_for(lambda: len(os.listdir(str(marks))) >= 4)
+			os.killpg(task.pid, signum)
+			code, output, _ = _ended(task)
+			_wait_for(lambda: _group_gone(task.pid), timeout=30)
+		finally:
+			if task.poll() is None:
+				os.killpg(task.pid, signal.SIGKILL)
+		assert code == (130 if signum == signal.SIGINT else -signum), output[-3000:]
+		assert os.listdir(tmpdir) == [] and b'leaked' not in output, (os.listdir(tmpdir), output[-3000:])
+	finally:
+		shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_every_pool_goes_through_one_door(tmp_path, hpcp_mod, reset_hpcp_globals):
+	# One door (_pool) for every process pool, one wait (_wait): what S1 and S2 do holds for each. In the parent, inside a pool
+	# region, nothing but the loop runs (no cp, no prompt): conftest's guard checks every in-process run of the suite, and
+	# these here.
+	with open(HPCP, encoding='utf-8') as f:  # hpcp.py is UTF-8 whatever the locale (LANG unset: ASCII on 3.6)
+		source = f.read()
+	assert source.count('ProcessPoolExecutor(') == 1 and source.count('concurrent.futures.wait(') == 1
+	assert 'as_completed(' not in source
+	for d in range(4):
+		_files(tmp_path / 'src' / ('d%d' % d), 100)
+	os.symlink('f000', str(tmp_path / 'src' / 'd0' / 'link'))
+	common = dict(single_thread=False, max_workers=2, files_per_job=4, batch=True)
+	# -pfl lists in a pool, the directories are synced and the files copied in pools, -rme lists the destination (nothing
+	# extra: no prompt), a move checks its copies (_looked_at) and removes in a pool.
+	assert hpcp_mod.hpcp([str(tmp_path / 'src') + os.sep], dest_paths=[str(tmp_path / 'out') + os.sep], parallel_file_listing=True,
+		remove_extra=True, **common) == 0
+	assert hpcp_mod.hpcp([str(tmp_path / 'src') + os.sep], dest_paths=[str(tmp_path / 'moved') + os.sep], remove=True,
+		remove_force=True, **common) == 0
+	assert len(os.listdir(str(tmp_path / 'moved' / 'd1'))) == 100 and not os.path.exists(str(tmp_path / 'src' / 'd1'))
 
 
 # ---- entry 6: a move of a link and a path through it ----
@@ -2283,7 +2783,9 @@ def test_a_move_fsyncs_a_landing_an_earlier_copy_left(tmp_path, hpcp_mod, reset_
 	assert hpcp_mod.hpcp([str(tmp_path / 'a') + os.sep], dest_paths=[str(tmp_path / 'out') + os.sep], single_thread=True) == 0
 	fsynced = []
 	real_fsync = os.fsync
-	monkeypatch.setattr(hpcp_mod.os, 'fsync', lambda fd: fsynced.append(os.fstat(fd).st_ino) or real_fsync(fd))
+	# files only: the move fsyncs its directories too (9.87's M2)
+	monkeypatch.setattr(hpcp_mod.os, 'fsync', lambda fd: (fsynced.append(os.fstat(fd).st_ino) if stat.S_ISREG(os.fstat(fd).st_mode)
+		else None) or real_fsync(fd))
 	assert _move(hpcp_mod, tmp_path) == 0
 	assert fsynced == [os.lstat(str(tmp_path / 'out/x')).st_ino] and not os.path.exists(str(tmp_path / 'a'))
 
@@ -2453,7 +2955,9 @@ def test_a_move_into_an_image_fsyncs_each_landing_in_it_before_the_source_goes(t
 		fsynced.append(os.readlink('/proc/self/fd/%d' % fd))
 		return real_fsync(fd)
 	def remove(*args, **kwargs):
-		assert sorted(os.path.basename(path) for path in fsynced) == ['x', 'y'] and os.path.exists(str(tmp_path / 'a/x')), fsynced
+		# each file landed in it (its directories are fsynced too, since 9.87's M2)
+		files = sorted(os.path.basename(path) for path in fsynced if os.path.isfile(path))
+		assert files == ['x', 'y'] and os.path.exists(str(tmp_path / 'a/x')), fsynced
 		return real_remove(*args, **kwargs)
 	monkeypatch.setattr(hpcp_mod.os, 'fsync', fsync)
 	monkeypatch.setattr(hpcp_mod, 'remove_moved_sources', remove)
@@ -2655,8 +3159,9 @@ def test_a_named_landing_that_turns_into_a_fifo_after_the_look_is_never_written_
 @pytest.mark.skipif(not sys.platform.startswith('linux'), reason='O_PATH and /proc/self/fd')
 @pytest.mark.parametrize('swap', ['link', 'hard link'])
 def test_content_only_carries_nothing_through_what_is_put_at_the_temporary_name(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch, swap):
-	# -co -wb: once cp has made the temporary file, a user who can write the directory puts a link (or another file's second
-	# name) there; the carry-over refuses it (190, the old copy kept), and the victim keeps its mode.
+	# -co -wb: once cp has written the temporary file, a user who can write the directory puts a link (or another file's
+	# second name) there. 9.86's carry-over refused it; 9.87's goes through the file hpcp made and holds, and the rename finds
+	# the name no longer leads to it: 190, the old copy kept, and the victim keeps its mode.
 	write(tmp_path / 'a/f', 'new')
 	write(tmp_path / 'out/f', 'old')
 	write(tmp_path / 'victim', 'victim')
@@ -2664,16 +3169,18 @@ def test_content_only_carries_nothing_through_what_is_put_at_the_temporary_name(
 	os.chmod(str(tmp_path / 'victim'), 0o600)
 	runner = hpcp_mod.run_command_in_multicmd_with_path_check
 	def swap_in(command, *args, **kwargs):
+		temp = os.readlink(command[-1]) if command[-1].startswith('/proc/self/fd/') else command[-1]
 		result = runner(command, *args, **kwargs)
-		if '.hpcp_tmp_' in command[-1]:
-			os.unlink(command[-1])
-			(os.symlink if swap == 'link' else os.link)(str(tmp_path / 'victim'), command[-1])
+		if '.hpcp_tmp_' in temp:
+			os.unlink(temp)
+			(os.symlink if swap == 'link' else os.link)(str(tmp_path / 'victim'), temp)
 		return result
 	monkeypatch.setattr(hpcp_mod, 'run_command_in_multicmd_with_path_check', swap_in)
 	hpcp_mod.CONTENT_ONLY = hpcp_mod.WRITE_BESIDE = True
 	hpcp_mod.copy_file(str(tmp_path / 'a/f'), [str(tmp_path / 'out/f')])
 	assert stat.S_IMODE(os.stat(str(tmp_path / 'victim')).st_mode) == 0o600 and read(tmp_path / 'out/f') == 'old'
-	assert any('cannot be given to the new copy' in error for error in hpcp_mod.ERRORS), hpcp_mod.ERRORS
+	assert any('cannot be given to the new copy' in error or 'something else was put at its name' in error
+		for error in hpcp_mod.ERRORS), hpcp_mod.ERRORS
 
 
 def _protected_symlinks():
@@ -2703,16 +3210,23 @@ def test_a_named_link_the_kernel_refuses_to_follow_is_kept(tmp_path):
 
 @posix_only
 @pytest.mark.skipif(not sys.platform.startswith('linux'), reason='the probe is Linux-only')
-@pytest.mark.parametrize('answers, asked, left', [([124, 0, 1], [False, True, True], [1]), ([1, 0], [False, False], [0]), ([127, 1], [False, False], [])],
+@pytest.mark.parametrize('answers, asked, left', [([124, 0, 1], [None, 'c', 'c'], [1]), ([1, 0], [None, None], [0]), ([127, 1], [None, None], [])],
 	ids=['timeout-then-yes', 'cp-refuses', 'could-not-start-then-no'])
 def test_the_held_file_probe_keeps_only_cp_s_own_answer(hpcp_mod, monkeypatch, answers, asked, left):
-	# A probe that timed out (124) or could not start cp (127) is no answer: the next rewrite asks again. cp's own exit (0: it
-	# can open /proc/PID/fd/N, 1: it cannot) is kept for the worker's life.
+	# A probe that timed out (124) or could not start cp (127) is no answer: the next rewrite asks again. cp's own answer (0, the
+	# held file then holding the source's byte: the route; 1: no route) is kept for the worker's life.
 	hpcp_mod.cp_supports_sparse()  # the real cp is asked before the stub stands in for the probe's
-	monkeypatch.setattr(hpcp_mod, '_HELD', [None, False])
+	monkeypatch.setattr(hpcp_mod, '_HELD', [None, None])
 	answers = list(answers)
-	monkeypatch.setattr(hpcp_mod.multiCMD, 'run_commands', lambda *args, **kwargs: [type('Task', (), {'returncode': answers.pop(0)})()])
-	assert [hpcp_mod._reaches_held() for _ in asked] == asked and answers == left
+	def run_commands(*args, **kwargs):
+		code = answers.pop(0)
+		if code == 0:
+			fd = kwargs['pass_fds'][0]
+			os.pwrite(fd, b'c', 0)
+			os.ftruncate(fd, 1)
+		return [type('Task', (), {'returncode': code})()]
+	monkeypatch.setattr(hpcp_mod.multiCMD, 'run_commands', run_commands)
+	assert [hpcp_mod._held_route() for _ in asked] == asked and answers == left
 
 
 @posix_only
@@ -2733,3 +3247,29 @@ def test_a_node_source_that_cannot_go_beside_keeps_the_old_file_and_says_why(tmp
 		os.chmod(str(tmp_path / 'out'), 0o755)
 	assert rc == 190 and read(tmp_path / 'out/p') == 'old' and b'-wb writes beside it; ' in output, output[-2000:]
 	assert b'it would be written in place' not in output, output[-2000:]
+
+
+_STOP_AS_STOPS_GO_IN = '''
+import os, signal, sys
+sys.path.insert(0, %(root)r)
+import hpcp
+real = signal.signal
+def switch(signum, handler):
+	result = real(signum, handler)
+	if signum == signal.SIGTERM and handler is hpcp._stop:
+		os.kill(os.getpid(), signal.SIGINT)
+	return result
+signal.signal = switch
+sys.argv = ['hpcp', '-V']
+hpcp.main()
+'''
+
+
+@posix_only
+def test_a_stop_as_the_stops_go_in_ends_quietly(tmp_path):
+	# A Ctrl-C landing once SIGINT's handler is in, while main() installs the next one: _stop raised it inside signal.signal,
+	# outside main()'s try, and Python printed a traceback and exited 1 (1 early Ctrl-C in 2,400 on 3.7 in the review's probe).
+	script = tmp_path / 'stops.py'
+	script.write_text(_STOP_AS_STOPS_GO_IN % {'root': os.path.dirname(HPCP)})
+	done = subprocess.run([sys.executable, str(script)], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=60)
+	assert done.returncode == 130 and b'Traceback' not in done.stdout, done.stdout
