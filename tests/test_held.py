@@ -998,14 +998,20 @@ def _swap_once_at(monkeypatch, name, directory, victim, when=lambda *args, **kwa
 
 @root_only
 @linux_only
+@pytest.mark.parametrize('route', ['proc', 'read'])
 @pytest.mark.parametrize('case', ['first', 'rewrite', 'beside', 'node-by-cp'])
-def test_w1_a_directory_swapped_after_the_door_never_leads_the_copy_elsewhere(tmp_path, fresh, monkeypatch, case):
+def test_w1_a_directory_swapped_after_the_door_never_leads_the_copy_elsewhere(tmp_path, fresh, monkeypatch, case, route):
 	# W1 case 1: out/a, a directory on the way to the landing out/a/x (out is uid 1000's: a user who can write it), is swapped
 	# for a link to victim/ after the door looked at it and before the file is made, opened or given to cp. 9.87 made,
 	# opened, renamed and gave cp the landing by path, through the link: the victim's x got the content (or was replaced).
 	# 9.88 writes relative to the directory the door holds, now out/a.away. node-by-cp: a FIFO source, which cp -a makes by
-	# name (_cp_to), given the landing below the held directory where cp writes a held file (GNU cp, /proc).
+	# name (_cp_to), given the landing below the held directory where cp writes a held file (GNU cp, /proc). route: read, the
+	# door's read descriptors of macOS and of Linux without /proc (where cp gets a node's full path: the known limitation).
 	_held_or_skip()
+	if route == 'read':
+		if case == 'node-by-cp':
+			pytest.skip('without /proc cp gets the full path (the known limitation)')
+		monkeypatch.setattr(hpcp, '_PATH_FDS', False)
 	victim = _Victim(tmp_path / 'victim')
 	out = str(tmp_path / 'out')
 	os.makedirs(os.path.join(out, 'a'))
@@ -1110,13 +1116,15 @@ def test_w1_a_directory_swapped_before_its_sync_never_leads_its_metadata_elsewhe
 
 @root_only
 @linux_only
+@pytest.mark.parametrize('route', ['proc', 'read'])
 @pytest.mark.parametrize('cursor', ['held', 'walked-again'])
-def test_w1_a_directory_swapped_before_its_finish_never_leads_its_metadata_elsewhere(tmp_path, fresh, monkeypatch, cursor):
+def test_w1_a_directory_swapped_before_its_finish_never_leads_its_metadata_elsewhere(tmp_path, fresh, monkeypatch, cursor, route):
 	# W1 case 4: out/a/b is synced, then out/a is swapped for a link to victim/ (which holds a b) before the finish sets b's
 	# exact mode and times. 9.87 opened out/a/b by path (O_NOFOLLOW only on b), through the link: victim/b took them. 9.88
 	# opens b in out/a as the door holds it (held: the process that synced it); a process whose door walks again
 	# (walked-again: a fresh pool worker) meets the link, replaces it by a directory (the door's rule for a link on the way)
 	# and finds no b there: a Directory sync error, nothing written to victim/.
+	monkeypatch.setattr(hpcp, '_PATH_FDS', route == 'proc')
 	victim = _Victim(tmp_path / 'victim')
 	os.mkdir(os.path.join(victim.path, 'b'))
 	os.chmod(os.path.join(victim.path, 'b'), 0o755)
@@ -1232,6 +1240,175 @@ def test_w1_a_named_destination_swapped_mid_run_is_written_no_more(tmp_path, wor
 		timeout=120)
 	output = task.stdout.decode(errors='replace') + task.stderr.decode(errors='replace')
 	assert victim.untouched(), (victim.before, victim.state(), output[-3000:])
-	lines = [line for line in output.splitlines() if 'now leads to another directory than the one this run started writing in' in line]
+	lines = [line for line in output.splitlines() if line.startswith('Destination clash:') and
+		'now leads to another directory than the one this run started writing in' in line]
 	assert task.returncode == 213 and 1 <= len(lines) <= 1 + workers, (task.returncode, lines, output[-3000:])
 	assert os.listdir(str(restore) + '.away') == [], output[-3000:]
+
+
+
+def _open_descriptors():
+	return len(os.listdir('/proc/self/fd' if os.path.isdir('/proc/self/fd') else '/dev/fd'))
+
+
+@posix_only
+@pytest.mark.parametrize('route', ['proc', 'read'])
+def test_w1_the_door_holds_only_the_levels_down_to_the_last_directory(tmp_path, fresh, monkeypatch, route):
+	# W1 risk 2: the door's descriptors never leave it (its answers are dups the caller closes): after each landing this
+	# process holds its baseline plus the named destination and one descriptor a level down to the landing's directory,
+	# nothing more; at the run's end (_close_cursors) its baseline.
+	if route == 'proc' and not hpcp._PATH_FDS:
+		pytest.skip('no /proc/self/fd here')
+	monkeypatch.setattr(hpcp, '_PATH_FDS', route == 'proc')
+	names = ['a/x', 'a/b/c/y', 'a/b/z', 'd/e/f/g/h/w', 'd/v', 'top']
+	for name in names:
+		write(tmp_path / 'src' / name, name)
+	out = str(tmp_path / 'out')
+	os.makedirs(out)
+	with contextlib.redirect_stdout(io.StringIO()):
+		hpcp.copy_file(str(tmp_path / 'src/top'), [str(tmp_path / 'warm')])  # cp's answers asked, outside a run
+	baseline = _open_descriptors()
+	_w1_run(monkeypatch, out)
+	with contextlib.redirect_stdout(io.StringIO()):
+		for name in sorted(names):
+			hpcp.copy_file(str(tmp_path / 'src' / name), [os.path.join(out, name)])
+			assert _open_descriptors() == baseline + 1 + name.count('/'), (name, baseline, _open_descriptors())
+	hpcp._close_cursors()
+	assert _open_descriptors() == baseline
+	assert all(read(os.path.join(out, name)) == name for name in names) and not hpcp.ERRORS, hpcp.ERRORS
+
+
+@posix_only
+@pytest.mark.parametrize('route', ['proc', 'read'])
+def test_w1_a_run_on_either_route_copies_and_reruns_as_9_87(tmp_path, monkeypatch, reset_hpcp_globals, route):
+	# W1 risk 3: on Linux without /proc an O_PATH descriptor takes no fchmod, fchown, futimens, fsync or flistxattr, so the
+	# door holds read descriptors there, as on macOS (read); on Linux with /proc, O_PATH ones (proc). A run of a tree with
+	# directories of several modes (one only its owner can enter, one read-only) and a link, as root and not: it copies
+	# whole, the directory metadata set, and a rerun copies nothing and leaves every mode and time (a link is made again, and
+	# a read-only directory a non-root runner owns opened and shut again, as in 9.87).
+	if route == 'proc' and not hpcp._PATH_FDS:
+		pytest.skip('no /proc/self/fd here')
+	monkeypatch.setattr(hpcp, '_PATH_FDS', route == 'proc')
+	src = tmp_path / 'src'
+	for name in ('a/x', 'a/b/y', 'c/z', 'd/w'):
+		write(src / name, name)
+	os.symlink('a/x', str(src / 'link'))
+	for name, mode in (('a/b', 0o700), ('c', 0o555), ('d', 0o750)):
+		os.chmod(str(src / name), mode)
+	opened = []
+	real = hpcp._door_step
+	def door_step(*args, **kwargs):
+		result = real(*args, **kwargs)
+		if isinstance(result, int):
+			opened.append(fcntl.fcntl(result, fcntl.F_GETFL) & getattr(os, 'O_PATH', 0))
+		return result
+	import fcntl
+	monkeypatch.setattr(hpcp, '_door_step', door_step)
+	out = str(tmp_path / 'out')
+	def state():
+		found = {}
+		for root, dirs, files in os.walk(out):
+			for name in dirs + files:
+				st = os.lstat(os.path.join(root, name))
+				found[os.path.relpath(os.path.join(root, name), out)] = (st.st_mode, st.st_ino if stat.S_ISREG(st.st_mode) else None,
+					st.st_mtime_ns if not stat.S_ISLNK(st.st_mode) else None)
+		return found
+	with contextlib.redirect_stdout(io.StringIO()):
+		assert hpcp.hpcp([str(src) + '/'], dest_paths=[out + '/'], single_thread=True) == 0
+	assert opened and all(bool(flag) == (route == 'proc') for flag in opened), opened
+	first = state()
+	for name in ('a/x', 'a/b/y', 'c/z', 'd/w'):
+		assert read(os.path.join(out, name)) == name
+	for name, mode in (('a/b', 0o700), ('c', 0o555), ('d', 0o750)):
+		st = os.stat(os.path.join(out, name))
+		assert stat.S_IMODE(st.st_mode) == mode and st.st_mtime_ns == os.stat(str(src / name)).st_mtime_ns, name
+	with contextlib.redirect_stdout(io.StringIO()):
+		assert hpcp.hpcp([str(src) + '/'], dest_paths=[out + '/'], single_thread=True) == 0
+	assert state() == first
+
+
+@not_root
+@posix_only
+def test_w1_a_directory_the_runner_cannot_read_is_walked_by_path(tmp_path, monkeypatch, reset_hpcp_globals):
+	# W1 risk 4: where the door holds read descriptors (macOS, Linux without /proc), a directory the runner may write and
+	# search but not read (0311) cannot be opened: the door finishes the way by path from there, as 9.87 did, and the copy
+	# completes. Under -co no directory metadata is set, so it stays 0311 throughout.
+	monkeypatch.setattr(hpcp, '_PATH_FDS', False)
+	for name in ('a/b/x', 'a/y'):
+		write(tmp_path / 'src' / name, name)
+	out = tmp_path / 'out'
+	(out / 'a').mkdir(parents=True)
+	os.chmod(str(out / 'a'), 0o311)
+	by_path = []
+	real = hpcp._door_by_path
+	monkeypatch.setattr(hpcp, '_door_by_path', lambda start, parts, *args: by_path.append((start, parts)) or real(start, parts, *args))
+	try:
+		with contextlib.redirect_stdout(io.StringIO()):
+			rc = hpcp.hpcp([str(tmp_path / 'src') + '/'], dest_paths=[str(out) + '/'], single_thread=True, content_only=True)
+		os.chmod(str(out / 'a'), 0o711)
+		assert rc == 0 and read(out / 'a/b/x') == 'a/b/x' and read(out / 'a/y') == 'a/y', hpcp.ERRORS
+		assert by_path and all(start == str(out) and parts[0] == 'a' for start, parts in by_path), by_path
+	finally:
+		os.chmod(str(out / 'a'), 0o711)
+
+
+_DEEP_RUN = """
+import os, resource, sys
+if __name__ == '__main__':
+	sys.path.insert(0, sys.argv[1])
+	import hpcp
+	# after the import, which raises the soft limit to the hard one: as macOS keeps its 256
+	resource.setrlimit(resource.RLIMIT_NOFILE, (64, resource.getrlimit(resource.RLIMIT_NOFILE)[1]))
+	if len(sys.argv) > 4:
+		hpcp._hold_budget = lambda: None
+	sys.exit(hpcp.hpcp([sys.argv[2] + '/'], dest_paths=[sys.argv[3] + '/'], single_thread=True))
+"""
+
+
+@posix_only
+def test_w1_a_tree_deeper_than_half_the_open_files_limit_is_copied(tmp_path):
+	# W1 risk 4: the door holds at most half the open-files limit (64 here, as macOS's 256 stays); the levels below go by
+	# path, so the other half stays for what each copy opens (its file, cp's pipes). A tree 50 levels deep, files on the way
+	# and at its bottom. Held to the limit, the copies at the bottom fail with "Too many open files" (budget-off).
+	path = tmp_path / 'src'
+	names = []
+	for level in range(50):
+		path = path / ('l%02d' % level)
+		if level % 10 == 9:
+			names.append(os.path.relpath(str(path / 'f'), str(tmp_path / 'src')))
+	for name in names:
+		write(tmp_path / 'src' / name, name)
+	script = write(tmp_path / 'deep.py', _DEEP_RUN)
+	for budget in ('half', 'budget-off'):
+		out = tmp_path / ('out-' + budget)
+		task = subprocess.run([sys.executable, script, os.path.dirname(HPCP), str(tmp_path / 'src'), str(out)] +
+			(['off'] if budget == 'budget-off' else []), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=300)
+		output = task.stdout.decode(errors='replace')
+		copied = [name for name in names if os.path.exists(str(out / name)) and read(out / name) == name]
+		if budget == 'half':
+			assert task.returncode == 0 and copied == names, output[-3000:]
+		else:
+			assert task.returncode != 0 and copied != names, output[-3000:]
+
+
+@not_root
+@linux_only
+def test_w1_a_failing_cp_s_message_names_the_landing_not_its_proc_path(tmp_path, fresh, monkeypatch):
+	# W1 risk 6: cp given the landing below the held directory (/proc/self/fd/D/NAME: a FIFO source, which cp -a makes) fails
+	# in a directory the runner may not write: what hpcp records names the landing, never the /proc path.
+	_held_or_skip()
+	os.makedirs(str(tmp_path / 'src'))
+	os.mkfifo(str(tmp_path / 'src/x'))
+	out = str(tmp_path / 'out')
+	os.makedirs(os.path.join(out, 'a'))
+	os.chmod(os.path.join(out, 'a'), 0o555)
+	seen = _record_cp(monkeypatch)
+	_w1_run(monkeypatch, out)
+	try:
+		with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+			hpcp.copy_file(str(tmp_path / 'src/x'), [os.path.join(out, 'a/x')])
+	finally:
+		os.chmod(os.path.join(out, 'a'), 0o755)
+	assert seen and all(target.startswith(_HELD_PREFIX) for target, _, _ in seen), seen
+	assert hpcp.ERRORS and not any('/proc/self/fd/' in error for error in hpcp.ERRORS), hpcp.ERRORS
+	assert any(os.path.join(out, 'a/x') in error for error in hpcp.ERRORS), hpcp.ERRORS

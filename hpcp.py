@@ -4122,6 +4122,23 @@ _HOLD_READ_FLAGS = os.O_RDONLY | getattr(os, 'O_NONBLOCK', 0) | getattr(os, 'O_D
 # the next door call may close them, and a number reused then would lead a stale holder's write elsewhere.
 _CURSORS = {}
 _CURSORS_RUN = [None]
+# How many directories the door may hold at once in a process: half its open-files limit, so the other half stays for what a
+# copy opens beside them (its held file, cp's pipes, the pool's, the skip check's reads). Deeper levels go by path (macOS
+# keeps its soft limit of 256: past 128 levels; Linux, where hpcp raises it to the hard limit at import, past 262,144, or
+# 2,048 on EL7, deeper than the 4,096 characters a listed path holds). (pid, the budget) per process.
+_HOLD_BUDGET = [None, None]
+
+def _hold_budget():
+	"""This process's _HOLD_BUDGET: half the soft open-files limit (none where it is unlimited or cannot be read)."""
+	if _HOLD_BUDGET[0] != os.getpid():
+		budget = None
+		with contextlib.suppress(ImportError, ValueError, OSError):
+			import resource
+			soft = resource.getrlimit(resource.RLIMIT_NOFILE)[0]
+			if soft != resource.RLIM_INFINITY and soft > 0:
+				budget = soft // 2
+		_HOLD_BUDGET[:] = [os.getpid(), budget]
+	return _HOLD_BUDGET[1]
 
 def _close_cursors():
 	"""Close every descriptor the door holds in this process (a new run, the run's end)."""
@@ -4363,8 +4380,11 @@ def _dest_directory(path, make=True, source=None):
 	while depth < len(parts) and depth + 1 < len(held) and held.names[depth + 1] == parts[depth]:
 		depth += 1
 	held.truncate(depth)
+	budget = _hold_budget()
 	for index in range(depth, len(parts)):
 		current = os.path.join(root, *parts[:index + 1])
+		if budget is not None and sum(len(other) for other in _CURSORS.values() if isinstance(other, _HeldDirs)) >= budget:
+			return _door_by_path(os.path.dirname(current), parts[index:], make, source)
 		try:
 			fd = _door_step(held.top(), parts[index], current, make, source, len(parts) - 1 - index)
 		except OSError as e:
