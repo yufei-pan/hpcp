@@ -1387,7 +1387,10 @@ if __name__ == '__main__':
 	resource.setrlimit(resource.RLIMIT_NOFILE, (64, resource.getrlimit(resource.RLIMIT_NOFILE)[1]))
 	if len(sys.argv) > 4:
 		hpcp._hold_budget = lambda: None
-	sys.exit(hpcp.hpcp([sys.argv[2] + '/'], dest_paths=[sys.argv[3] + '/'], single_thread=True))
+	# the CLI, whose output takes any locale (a direct hpcp() call printed its progress bar to a C locale's ASCII stdout
+	# on 3.6: UnicodeEncodeError, CentOS 7's image)
+	sys.argv = [hpcp.__file__, sys.argv[2] + '/', '-d', sys.argv[3] + '/', '-s']
+	sys.exit(hpcp.main())
 """
 
 
