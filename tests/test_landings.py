@@ -3296,55 +3296,6 @@ def test_a_named_landing_that_turns_into_a_fifo_after_the_look_is_never_written_
 	assert read(tmp_path / 'victim') == 'victim' and read(landing) == 'SECRET' and not os.path.islink(landing)
 
 
-# ---- review r986r: a node source, a landing changed after the look, and -co's carry-over ----
-
-@posix_only
-@pytest.mark.parametrize('flags, kind', [([], 'fifo'), (['-co'], 'fifo'), ([], 'socket')], ids=['plain', 'content-only', 'socket'])
-def test_a_node_source_replaces_a_file_at_its_landing(tmp_path, monkeypatch, flags, kind):
-	# cp -a makes a FIFO or socket anew, and cannot unlink a held file's /proc name: such a source goes beside, as in 9.85 (exit 0).
-	os.makedirs(str(tmp_path / 'a'))
-	if kind == 'fifo':
-		os.mkfifo(str(tmp_path / 'a/p'))
-	else:
-		monkeypatch.chdir(tmp_path)  # a socket's path is short (108 bytes at most)
-		import socket
-		with contextlib.closing(socket.socket(socket.AF_UNIX)) as sock:
-			sock.bind('a/p')
-	write(tmp_path / 'out/p', 'old')
-	rc, output = run(['a/p', '-d', 'out/'] + flags, tmp_path)
-	assert rc == 0 and (stat.S_ISFIFO if kind == 'fifo' else stat.S_ISSOCK)(os.lstat(str(tmp_path / 'out/p')).st_mode), output[-3000:]
-
-
-@posix_only
-def test_a_named_landing_that_turns_into_a_fifo_after_the_look_is_never_written_by_name(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
-	# A regular file at the look; a FIFO someone holds open at the open; a link to a victim when cp would open the name.
-	write(tmp_path / 'a/f', 'SECRET')
-	write(tmp_path / 'out/f', 'old')
-	write(tmp_path / 'victim', 'victim')
-	landing, readers = str(tmp_path / 'out/f'), []
-	claim, runner = hpcp_mod._claim_device, hpcp_mod.run_command_in_multicmd_with_path_check
-	def swap_to_fifo(target, st, named, src_path):
-		if target == landing and not readers:
-			os.rename(landing, landing + '.away')
-			os.mkfifo(landing)
-			readers.append(os.open(landing, os.O_RDONLY | os.O_NONBLOCK))
-		return claim(target, st, named, src_path)
-	def swap_to_link(command, *args, **kwargs):
-		if command[-1] == landing and stat.S_ISFIFO(os.lstat(landing).st_mode):
-			os.unlink(landing)
-			os.symlink(str(tmp_path / 'victim'), landing)
-		return runner(command, *args, **kwargs)
-	monkeypatch.setattr(hpcp_mod, '_claim_device', swap_to_fifo)
-	monkeypatch.setattr(hpcp_mod, 'run_command_in_multicmd_with_path_check', swap_to_link)
-	monkeypatch.setattr(hpcp_mod, 'NAMED_DESTS', frozenset({landing}))
-	try:
-		hpcp_mod._cp_once(str(tmp_path / 'a/f'), landing, '-af', True)
-	finally:
-		for fd in readers:
-			os.close(fd)
-	assert read(tmp_path / 'victim') == 'victim' and read(landing) == 'SECRET' and not os.path.islink(landing)
-
-
 @posix_only
 @pytest.mark.skipif(not sys.platform.startswith('linux'), reason='O_PATH and /proc/self/fd')
 @pytest.mark.parametrize('swap', ['link', 'hard link'])
