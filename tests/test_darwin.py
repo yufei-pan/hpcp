@@ -428,10 +428,10 @@ def _victim(path):
 	os.makedirs(path)
 	for name in ('x', 'y'):
 		write(os.path.join(path, name), 'victim ' + name, 0o600)
-	return path, _state(path)
+	return path, _tree_state(path)
 
 
-def _state(path):
+def _tree_state(path):
 	found = {}
 	for name in sorted(os.listdir(path)):
 		st = os.lstat(os.path.join(path, name))
@@ -495,7 +495,7 @@ def test_w1_a_directory_swapped_after_the_door_never_leads_the_copy_elsewhere_on
 	with contextlib.redirect_stdout(io.StringIO()):
 		hpcp.copy_file(src, [os.path.join(out, 'a/x')])
 	assert done and os.path.islink(os.path.join(out, 'a'))
-	assert _state(victim) == before, (before, _state(victim))
+	assert _tree_state(victim) == before, (before, _tree_state(victim))
 	assert read(os.path.join(out, 'a.away/x')) == 'NEW-CONTENT' and not hpcp.ERRORS, hpcp.ERRORS
 
 
@@ -513,6 +513,6 @@ def test_w1_a_directory_swapped_between_two_files_never_leads_the_second_elsewhe
 		hpcp.copy_file(os.path.join(root, 'src/a/x'), [os.path.join(out, 'a/x')])
 		_swap_for_link(os.path.join(out, 'a'), victim)
 		hpcp.copy_file(os.path.join(root, 'src/a/y'), [os.path.join(out, 'a/y')])
-	assert _state(victim) == before, (before, _state(victim))
+	assert _tree_state(victim) == before, (before, _tree_state(victim))
 	assert read(os.path.join(out, 'a.away/x')) == 'NEW x' and read(os.path.join(out, 'a.away/y')) == 'NEW y'
 	assert not hpcp.ERRORS, hpcp.ERRORS
