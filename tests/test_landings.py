@@ -1980,14 +1980,14 @@ def _wrapped(tmp_path, args, inject='', before='pass', env=None, cwd=None):
 
 
 def _ended(task, timeout=60):
-	"""(return code, output, seconds it took from now); 'timeout' after 60 s, its session killed: a hang fails, never holds."""
+	"""(return code, output, seconds it took from now); 'timeout' after 60 s, its session killed: a hang fails, never holds,
+	and keeps what the run printed before it was killed."""
 	started = time.monotonic()
 	try:
 		output = task.communicate(timeout=timeout)[0]
 	except subprocess.TimeoutExpired:
 		os.killpg(task.pid, signal.SIGKILL)
-		task.communicate()
-		return 'timeout', b'', time.monotonic() - started
+		return 'timeout', task.communicate()[0], time.monotonic() - started
 	return task.returncode, output, time.monotonic() - started
 
 
