@@ -257,3 +257,40 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - **Plan (9.89):** make the socket node at the landing as Linux's `cp -a` does (an `AF_UNIX` socket bound there, relative to the held directory), so a socket copies on macOS too.
 - **Revisit when:** 9.89.
 - **Noted:** 2026-11-11, found by the 9.88 A–C review's macOS run; the main session's decision, not asked (a deferral).
+
+### On Linux without /proc an identical node's xattrs and a vfat file's attribute bits go by path
+- **Kind:** deferred (9.89).
+- **What the operator sees:** on Linux with /proc not mounted, a root run into a tree another user can write: a directory on the way swapped for a link at the right microsecond, after hpcp opened it and before it settles an identical FIFO, socket or device node at a landing, leads that node's xattrs (listed, removed and set by the landing's full path) to the file of that name where the link leads; and, under `-co`, the same for the FAT attribute bits (`_set_fat_attributes`) of a rewritten file on a vfat. Regular files, directories and links, and an identical node's mode, are not affected (the last is in "On macOS a node copy and BSD flags, and on Linux without /proc an identical node's mode, go by name below the held directory"). With /proc they go through the held descriptor.
+- **Why:** these calls take a path (`_io`): with /proc the held directory's `/proc/self/fd/N/NAME` is one that cannot lead elsewhere, and without /proc there is no such name, so the logical path is used. Reaching a node's xattrs through a descriptor means opening a FIFO or device node, which needs care (a FIFO opened for reading waits for a writer without `O_NONBLOCK`), and the FAT attribute bits are an ioctl by path in `_set_fat_attributes`.
+- **Plan (9.89):** set them through the held descriptor: the node's xattrs through a descriptor opened `O_NONBLOCK` and `O_NOFOLLOW` (or `O_PATH` where the filesystem takes xattrs through one), and the FAT attribute bits through the file's descriptor.
+- **Revisit when:** 9.89.
+- **Noted:** 2026-11-11, the 9.88 W1 review's docs gap D1; the main session's decision, not asked (a deferral).
+
+### The door goes by path below half the open-files limit, after running out of descriptors, and in a directory the runner may not read (read route)
+- **Kind:** deferred (9.89).
+- **What the operator sees:** three places where the door (the directories a run holds by descriptor, 9.88) goes by path, as 9.87 did everywhere, so a directory swapped for a link there, in a root run into a tree another user can write (a non-root run for the third), leads the writes below it elsewhere:
+  - the levels deeper than half the soft open-files limit (the other half stays for what a copy opens): 128 levels on macOS, whose soft limit stays 256; on Linux hpcp raises the limit to the hard one at import (524,288 on systemd hosts, 4,096 on EL7), so the budget, half of it, is deeper than the 4,096 characters a listed path holds, except on EL7, where it is 2,048 levels;
+  - a process that has run out of descriptors (EMFILE or ENFILE);
+  - a directory the runner may not read, where the door holds read descriptors (macOS, Linux without /proc; with /proc an `O_PATH` open needs only search): the walk goes on by path from it.
+  The copy itself is whole in each, and what is written there is what 9.87 wrote.
+- **Why:** the budget keeps the descriptors a copy needs beside the held ones (its file, `cp`'s pipes, a pool's), and a read descriptor cannot be had on a directory the runner may not read.
+- **Plan (9.89):** raise the soft `RLIMIT_NOFILE` toward the hard limit at start (macOS), and hold such directories with `O_PATH` descriptors on Linux where /proc is there but a read is refused. Each goes by path as 9.87 did until then, so none is worse.
+- **Revisit when:** 9.89.
+- **Noted:** 2026-11-11, the 9.88 W1 review's docs gap D2; the main session's decision, not asked (a deferral).
+
+### On Python 3.6 and 3.7 an early stop with forkserver or spawn can print a worker's EOFError
+- **Kind:** deferred (9.89).
+- **What the operator sees:** on Python 3.6 (3.7 not measured) with the forkserver or spawn start method (EL7's and EL8's Python when a program sets one; hpcp's default on Linux is fork there), an early Ctrl-C now and then prints a worker's `Process Process-2:` traceback ending in `EOFError: Ran out of input`, from `concurrent/futures/process.py`'s `call_queue.get`. The run still ends 130 with its cleanup done and nothing lost. 9.87 printed it in 2 of 3,800 early stops, 9.88 in 0 of 3,800 (and 2 of 3,200 in the build's own probes): about 1 in 1,600 to 2,000 early stops. The early-stop test accepts that block, and only that block (`_OLD_EOF`).
+- **Why:** a stop's `SystemExit` lands in an idle worker between a queued job's length and its payload (`Connection._recv_bytes` reads the 4-byte length and then the payload in two calls), leaving the payload in the pipe; the next worker reads its first bytes as a negative length and unpickles nothing. hpcp raises it in an idle worker on purpose, so the queue's lock is let go.
+- **Plan (9.89):** a worker stopped inside `Connection._recv_bytes`, past its header, ends without unwinding (`os._exit`; the run is stopping anyway).
+- **Revisit when:** 9.89.
+- **Noted:** 2026-11-11, the 9.88 W1 review's item (b); the main session's decision, not asked (a deferral). The same in 9.87.
+
+### A library call to `hpcp.hpcp()` on Python 3.6 with an ASCII stdout crashes in the progress bar
+- **Kind:** deferred (multiCMD 1.62, then hpcp's next embed).
+- **What the operator sees:** `hpcp.hpcp(...)` called from a program on Python 3.6 whose stdout is ASCII (`LC_ALL=C`) copies a small run (30 files) and returns 70 (`General Exception`: `UnicodeEncodeError` in `multiCMD.print_progress_bar`); a larger run aborts at the first bar after the pool starts. The command line is not affected (`main()` escapes what stdout cannot encode). 9.87 does the same.
+- **Why:** multiCMD's `print_progress_bar` prints its non-ASCII bar again in its `except Exception` fallback, which fails the same way; hpcp does not reconfigure a library caller's `sys.stdout`.
+- **Plan:** multiCMD 1.62 falls back to an ASCII bar (or writes with the stream's encoding and `errors='replace'`); hpcp picks it up through the embed, as do mssh, statblk and statbtrfs.
+- **Revisit when:** multiCMD 1.62 ships.
+- **Noted:** 2026-11-11, the 9.88 W1 review's item (c); the main session's decision, not asked (a deferral). The same in 9.87.
+
