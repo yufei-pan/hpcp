@@ -447,6 +447,38 @@ def test_a_root_first_copy_into_a_default_acl_directory_is_written_as_root_too(t
 
 @linux_only
 @root_only
+@pytest.mark.parametrize('owner, group, by_name', [(0, 1234, True), (1234, 0, True), (1234, 1234, True), (0, 0, False)],
+	ids=['root-in-another-group', 'another-user-in-root-s-group', 'another-user-and-group', 'root-own'])
+def test_a_root_first_copy_of_another_group_s_file_into_a_default_acl_directory_is_written_as_root_too(
+		tmp_path, fresh, monkeypatch, owner, group, by_name):
+	# The group case of the test above: giving a root:G file its group first charges root's write to G's quota (XFS enforces a
+	# group's quota on a root write as an owner's), and on VM 901 a root:G file with G at its hard limit failed with Disk quota
+	# exceeded (exit 190) where 9.86 completed. cp makes the file by name unless it is root's own (root:root), which keeps
+	# the held route: nothing to give it, so nothing to charge differently.
+	_held_or_skip()
+	out = tmp_path / 'out'
+	out.mkdir()
+	if not _default_acl(str(out)):
+		pytest.skip('no POSIX ACLs here')
+	src = write(tmp_path / 'src/f', 'owned by someone else')
+	os.chown(src, owner, group)
+	seen = []
+	real = hpcp.run_command_in_multicmd_with_path_check
+	def cp(command, *args, **kwargs):
+		seen.append(command[-1])
+		return real(command, *args, **kwargs)
+	monkeypatch.setattr(hpcp, 'run_command_in_multicmd_with_path_check', cp)
+	_copy_file(monkeypatch, src, out / 'f')
+	made = os.stat(str(out / 'f'))
+	assert (made.st_uid, made.st_gid) == (owner, group), (made.st_uid, made.st_gid)
+	if by_name:
+		assert seen == [str(out / 'f')], seen
+	else:
+		assert len(seen) == 1 and seen[0].startswith(_HELD_PREFIX), seen
+
+
+@linux_only
+@root_only
 @pytest.mark.parametrize('content_only', [False, True], ids=['plain', 'content-only'])
 def test_a_first_copy_s_selinux_label_is_cp_by_name_s(tmp_path, fresh, monkeypatch, content_only):
 	# Plain: hpcp gives the new, empty file the source's label before cp writes it (cp -a sets an existing file's label by

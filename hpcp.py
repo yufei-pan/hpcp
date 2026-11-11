@@ -4372,10 +4372,11 @@ def _cp_made(command, src_path, target, src_st, space):
 	where a default ACL gave it entries beyond its mode: cp -a gives a file it did not make another owner only after
 	narrowing its mode and ACL to the owner's (the entries go), where a file it makes keeps them. Where they cannot be given
 	(not root) and the file has such entries: None, the file removed, for cp by name as in 9.86; and so for a root run of
-	another user's file, where giving it first charges root's write to that user's quota (below). Without such entries cp -a
-	gives the owner once it has written, as by name: given first, the data would be charged to the owner while it is written
-	(XFS enforces an owner's quota on a root write, not on root's chown: a user at the hard limit got Disk quota exceeded where
-	9.86 completed). A mode its owner cannot write (-co's 0444 source, a umask taking owner write) has owner write while cp
+	a file whose owner or group is not the made file's (another user's or another group's), where giving it first charges
+	root's write to that owner's or group's quota (below). A root run of a file in root's own owner and group gives nothing
+	and keeps the held route. Without such entries cp -a gives the owner once it has written, as by name: given first, the
+	data would be charged to the owner while it is written (XFS enforces an owner's or a group's quota on a root write, not
+	on root's chown: a user, or a group, at the hard limit got Disk quota exceeded where 9.86 completed). A mode its owner cannot write (-co's 0444 source, a umask taking owner write) has owner write while cp
 	writes, which cp's reopen needs; -co puts the mode back."""
 	global _MAKING
 	src_st = src_st or os.lstat(src_path)
@@ -4397,9 +4398,10 @@ def _cp_made(command, src_path, target, src_st, space):
 			if _has_acl(fd):
 				# Only where a default ACL gave the file entries, which cp -a would narrow away once it gives a file it did not
 				# make another owner. Elsewhere cp -a gives the owner once it has written, as by name. A root run does not give
-				# another user the file first: the data would be charged to that owner while root writes it (XFS enforces an
-				# owner's quota on a root write, not on root's chown), so there cp makes the file by name, as in 9.86.
-				by_name = os.geteuid() == 0 and made.st_uid != src_st.st_uid
+				# another user or another group the file first: the data would be charged to that owner's or group's quota while
+				# root writes it (XFS enforces both on a root write, not on root's chown), so there cp makes the file by name,
+				# as in 9.86. Only a change of owner or group is charged differently: root's own root:root file keeps the route.
+				by_name = os.geteuid() == 0 and (made.st_uid, made.st_gid) != (src_st.st_uid, src_st.st_gid)
 				if not by_name:
 					try:
 						os.fchown(fd, src_st.st_uid, src_st.st_gid)
