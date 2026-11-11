@@ -1212,7 +1212,8 @@ RUN_ID = None
 # The named destinations that are directories when the run's copy starts, as named (a link followed): {path (absolute):
 # (st_dev, st_ino)}, the run's pin. Each process checks a named destination against it as its door opens it
 # (_dest_directory): a worker that opens it later (a fresh one: forkserver, Python 3.14's default on Linux; spawn, macOS's)
-# never follows a swap of it for a link to another directory. One the run makes later is pinned by each process's open.
+# never follows a swap of it for a link to another directory. One the run makes later is pinned by each process's open. The
+# parent keeps each pin's descriptor open for the run (_named_ids), so a mount below a destination cannot expire meanwhile.
 NAMED_IDS = {}
 _TASK_SETTINGS = ('NAMED_DESTS', 'RUN_ID', 'NAMED_IDS', 'CONTENT_ONLY', 'WRITE_BESIDE', 'READ_FIRST', 'NO_CREATE_DIR', 'SYNC_COPIES', 'RANDOM_DESTINATION_SELECTION', 'HASH_SIZE', 'COMMAND_TIMEOUT',
 	'BYTES_RATE_LIMIT', 'FILES_RATE_LIMIT', 'MIRROR_FS_PARAMS', 'REMOVE_FILES_WHILE_LISTING', '_BAR')
@@ -4178,6 +4179,12 @@ def _close_cursors():
 		if isinstance(held, _HeldDirs):
 			held.close_all()
 
+def _cursors_of_run():
+	"""What the door holds and remembers is one run's (RUN_ID): a process that meets another run's first closes it."""
+	if _CURSORS_RUN[0] != RUN_ID:
+		_close_cursors()
+		_CURSORS_RUN[0] = RUN_ID
+
 def _close_base(base):
 	"""Close a door's result (_dest_directory) where it is a descriptor: the caller's, always in a finally."""
 	if isinstance(base, int):
@@ -4254,20 +4261,30 @@ def _by_path_error(e):
 def _named_ids(roots):
 	"""{root: (st_dev, st_ino)} for each of roots (absolute) that is a directory now, as named (a link followed): the run's pin
 	(NAMED_IDS). Opened as the door opens it, once a run: a stat does not mount an automount (an NFSv4 submount) and an
-	open does, so a pin taken by stat named the directory below the mount and refused the run's own destination (213)."""
+	open does, so a pin taken by stat named the directory below the mount and refused the run's own destination (213). The
+	descriptor stays open for the run, as its cursor's root (_dest_directory): an automount or NFS submount that expired
+	during a long listing would come back with another device number, and every file would be refused; held, the mount is
+	busy, and the workers that open the destination by name (forkserver, spawn) find the same one."""
+	_cursors_of_run()
 	ids = {}
 	for root in roots:
 		with contextlib.suppress(OSError):
 			if not _DIR_FD_WALK:
 				st = os.stat(root)  # the door compares a stat there too (no descriptor walk: Windows)
-			else:
-				fd = os.open(root, _HOLD_PATH_FLAGS if _PATH_FDS else _HOLD_READ_FLAGS)
-				try:
-					st = os.fstat(fd)
-				finally:
+				if stat.S_ISDIR(st.st_mode):
+					ids[root] = (st.st_dev, st.st_ino)
+				continue
+			fd = os.open(root, _HOLD_PATH_FLAGS if _PATH_FDS else _HOLD_READ_FLAGS)
+			kept = False
+			try:
+				st = os.fstat(fd)
+				if stat.S_ISDIR(st.st_mode):
+					ids[root] = (st.st_dev, st.st_ino)
+					kept = True  # before the cursor takes it: a stop between the two leaks a descriptor, never closes one twice
+					_CURSORS[root] = _HeldDirs(fd)
+			finally:
+				if not kept:
 					os.close(fd)
-			if stat.S_ISDIR(st.st_mode):
-				ids[root] = (st.st_dev, st.st_ino)
 	return ids
 
 def _door_step(base, name, current, make, source, below):
@@ -4374,8 +4391,9 @@ def _dest_directory(path, make=True, source=None):
 	is held (no named destination above it: a library call; no descriptor calls, _DIR_FD_WALK; _by_path_error); None when
 	path or a directory on its way is missing and make is False (not under -ncd for a file's parent). The destination the
 	operator named and what is above it are made as os.makedirs makes them, through links (it is named), and it is opened
-	once per process in a run, following a link, and checked against the run's pin (NAMED_IDS): one that leads to another
-	directory now is refused for everything below it (_Refused, said once a process). Below it each component is opened one level at a time without following a link (_door_step: its rules for
+	once per process in a run, following a link, and checked against the run's pin (NAMED_IDS; the parent's open is the pin's,
+	_named_ids): one that leads to another directory now is refused for everything below it (_Refused, said once a process).
+	Below it each component is opened one level at a time without following a link (_door_step: its rules for
 	what is there; source: the source directory that lands at path, to name the -d form in a note), and the levels shared
 	with the last path asked for are kept open (_HeldDirs): a directory swapped for a link after it was opened is no longer
 	on the way, as hpcp writes into the one it holds, wherever it is now."""
@@ -4386,9 +4404,7 @@ def _dest_directory(path, make=True, source=None):
 			_makedirs(path, exist_ok=True)
 			return path
 		return path if os.path.isdir(path) else None
-	if _CURSORS_RUN[0] != RUN_ID:
-		_close_cursors()
-		_CURSORS_RUN[0] = RUN_ID
+	_cursors_of_run()
 	parts = path[len(root.rstrip(os.sep)) + 1:].split(os.sep) if path != root else []
 	held = _CURSORS.get(root)
 	if isinstance(held, _Refused):

@@ -1227,6 +1227,8 @@ def test_w1_a_directory_swapped_at_a_link_s_copy_never_leads_it_elsewhere(tmp_pa
 _PIN_SWAP = '''
 import os, sys
 if __name__ == '__main__':  # (forkserver and spawn workers import this module again)
+	import multiprocessing
+	multiprocessing.set_start_method(os.environ['START_METHOD'])
 	sys.path.insert(0, sys.argv[1])
 	import hpcp
 	restore, victim = sys.argv[2], sys.argv[3]
@@ -1245,12 +1247,20 @@ if __name__ == '__main__':  # (forkserver and spawn workers import this module a
 
 @root_only
 @linux_only
+@pytest.mark.parametrize('method', ['fork', 'forkserver', 'spawn'])
 @pytest.mark.parametrize('workers', [1, 3], ids=['serial', 'pool'])
-def test_w1_a_named_destination_swapped_mid_run_is_written_no_more(tmp_path, workers):
+def test_w1_a_named_destination_swapped_mid_run_is_written_no_more(tmp_path, workers, method):
 	# Q2's pin: a root run into alice's destination, -d /home/alice/restore/; once the run has started alice swaps restore for
 	# a link to victim/. 9.87 followed the name whenever a process opened it, as named: its directory sync, files and links
-	# went into victim/. 9.88 pins the destination at the run's start: a process that finds it leading elsewhere writes
-	# nothing there and says so once (213), each file recorded (a move keeps its source).
+	# went into victim/. 9.88 pins the destination at the run's start, and the parent keeps the pin's descriptor open as its
+	# cursor's root (the review's F2): the parent, and a forked worker, which inherits it, write into the directory they hold,
+	# wherever it is now (restore.away: the one the operator named), and a worker that opens the destination by name
+	# (forkserver, spawn) finds it leading elsewhere, writes nothing there and says so once (213). victim/ is untouched
+	# whichever process it is; the run exits 213 (a worker's refusal, or the copy check: the name no longer leads to the
+	# landings), each file recorded (a move keeps its source).
+	import multiprocessing
+	if method not in multiprocessing.get_all_start_methods():
+		pytest.skip(method + ' is not available here')
 	victim = _Victim(tmp_path / 'victim')
 	src = tmp_path / 'src'
 	for name in ('a/x', 'a/y', 'b/z', 'top'):
@@ -1263,14 +1273,16 @@ def test_w1_a_named_destination_swapped_mid_run_is_written_no_more(tmp_path, wor
 	script = write(tmp_path / 'pin.py', _PIN_SWAP)
 	task = subprocess.run([sys.executable, script, os.path.dirname(HPCP), str(restore), victim.path, str(src) + '/', '-d',
 		str(restore) + '/'] + (['-s'] if workers == 1 else ['-j', str(workers)]), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-		timeout=120)
+		timeout=120, env=dict(os.environ, START_METHOD=method))
 	output = task.stdout.decode(errors='replace') + task.stderr.decode(errors='replace')
 	assert victim.untouched(), (victim.before, victim.state(), output[-3000:])
 	lines = [line for line in output.splitlines() if line.startswith('Destination clash:') and
 		'now leads to another directory than the one this run started writing in' in line]
-	assert task.returncode == 213 and 1 <= len(lines) <= 1 + workers, (task.returncode, lines, output[-3000:])
-	assert os.listdir(str(restore) + '.away') == [], output[-3000:]
-
+	assert task.returncode == 213, (task.returncode, lines, output[-3000:])
+	if workers > 1 and method != 'fork':
+		assert 1 <= len(lines) <= 1 + workers, (lines, output[-3000:])  # a worker's open by name met the swap (once a process)
+	elif workers == 1 or method == 'fork':
+		assert not lines and read(str(restore) + '.away/top') == 'new top', (lines, os.listdir(str(restore) + '.away'), output[-3000:])
 
 
 def _open_descriptors():
@@ -1541,5 +1553,130 @@ def test_f1_every_base_is_closed_even_when_one_close_fails():
 		for fd in (second, third):
 			with contextlib.suppress(OSError):
 				os.close(fd)
+
+
+_PIN_SEEN = '''
+import os, sys
+sys.path.insert(0, %(root)r)
+import hpcp
+real = hpcp._dest_directory
+seen = set()
+def door(path, *args, **kwargs):
+	# what this process finds of the pin's cursor at its first door call: 'held' (a root whose descriptor is open and leads to
+	# the pinned directory), 'none' (nothing: opened by name below), 'wrong' (anything else)
+	if os.getpid() not in seen:
+		seen.add(os.getpid())
+		root = hpcp._named_root(os.path.abspath(path))
+		held = hpcp._CURSORS.get(root)
+		answer = 'none'
+		if isinstance(held, hpcp._HeldDirs):
+			answer = 'wrong'
+			try:
+				st = os.fstat(held.fds[0])
+				if (st.st_dev, st.st_ino) == hpcp.NAMED_IDS.get(root) and len(held.fds) >= 1:
+					answer = 'held'
+			except OSError:
+				pass
+		with open(os.environ['PIN_LOG'], 'a') as f:
+			f.write('%%d %%s\\n' %% (os.getpid(), answer))
+	return real(path, *args, **kwargs)
+hpcp._dest_directory = door
+if __name__ == '__main__':
+	import multiprocessing
+	multiprocessing.set_start_method(os.environ['START_METHOD'])
+	sys.argv = [%(hpcp)r] + sys.argv[1:]
+	sys.exit(hpcp.main())
+'''
+
+
+@posix_only
+@pytest.mark.parametrize('workers', [1, 3], ids=['serial', 'pool'])
+@pytest.mark.parametrize('method', ['fork', 'forkserver', 'spawn'])
+def test_f2_the_pin_s_descriptor_stays_open_for_the_run_in_the_parent_and_is_valid_in_every_worker(tmp_path, method, workers):
+	# F2: the pin took the destination's identity and closed it. A mount below the destination that expired during a long
+	# listing (an NFS submount, autofs) came back with another device number, and every file was refused (213). The
+	# descriptor now stays open for the run as its cursor's root: the parent finds it at its first door call; a forked worker
+	# inherits it, and its fstat is the pin's; a forkserver or spawn worker starts without one and opens the destination by
+	# name, as before. No process finds a closed or another directory's descriptor.
+	import multiprocessing
+	if method not in multiprocessing.get_all_start_methods():
+		pytest.skip(method + ' is not available here')
+	for d in range(6):
+		for i in range(8):
+			write(tmp_path / 'src' / ('d%d' % d) / ('f%d' % i), 'x%d' % i)
+	script = write(tmp_path / 'pin.py', _PIN_SEEN % {'root': os.path.dirname(HPCP), 'hpcp': HPCP})
+	log = tmp_path / 'pin.log'
+	task = subprocess.Popen([sys.executable, script, 'src/', '-d', 'out/'] + (['-s'] if workers == 1 else ['-j', str(workers)]),
+		cwd=str(tmp_path), env=dict(os.environ, PIN_LOG=str(log), START_METHOD=method), stdin=subprocess.DEVNULL,
+		stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+	output = task.communicate(timeout=300)[0].decode(errors='replace')
+	assert task.returncode == 0 and all(read(tmp_path / 'out' / ('d%d' % d) / ('f%d' % i)) == 'x%d' % i for d in range(6) for i in range(8)), output[-3000:]
+	answers = {int(pid): answer for pid, answer in (line.split() for line in read(log).splitlines())}
+	assert answers.get(task.pid) == 'held', (task.pid, answers, output[-3000:])
+	workers_found = {answer for pid, answer in answers.items() if pid != task.pid}
+	assert workers_found <= ({'held'} if method == 'fork' else {'none'}), (answers, output[-3000:])
+	assert len(answers) > 1 or workers == 1, answers
+
+
+@posix_only
+@pytest.mark.parametrize('route', ['proc', 'read'])
+def test_f2_the_pin_is_held_by_the_cursor_until_the_run_ends(tmp_path, reset_hpcp_globals, monkeypatch, route):
+	# F2 in a serial run: while the run lists its sources (_settle_destinations, which touches no destination) the named
+	# destination's descriptor is the cursor's root, open and the pin's; at the run's end it is closed.
+	if route == 'proc' and not hpcp._PATH_FDS:
+		pytest.skip('no /proc/self/fd here')
+	monkeypatch.setattr(hpcp, '_PATH_FDS', route == 'proc')
+	for name in ('a/x', 'b/y'):
+		write(tmp_path / 'src' / name, name)
+	out = str(tmp_path / 'out')
+	os.makedirs(out)
+	seen = []
+	real = hpcp._settle_destinations
+	def settling(*args, **kwargs):
+		held = hpcp._CURSORS.get(out)
+		if held is not None:  # the warm-up run's destination is another
+			st = os.fstat(held.fds[0])
+			seen.append((len(held), (st.st_dev, st.st_ino) == hpcp.NAMED_IDS[out]))
+		return real(*args, **kwargs)
+	monkeypatch.setattr(hpcp, '_settle_destinations', settling)
+	with contextlib.redirect_stdout(io.StringIO()):
+		assert hpcp.hpcp([str(tmp_path / 'src') + '/'], dest_paths=[str(tmp_path / 'warm') + '/'], single_thread=True) == 0
+	seen.clear()
+	baseline = _open_descriptors()
+	with contextlib.redirect_stdout(io.StringIO()):
+		assert hpcp.hpcp([str(tmp_path / 'src') + '/'], dest_paths=[out + '/'], single_thread=True) == 0
+	assert seen == [(1, True)], seen
+	assert not hpcp._CURSORS and _open_descriptors() == baseline  # closed at the run's end (_close_cursors)
+	assert all(read(os.path.join(out, name)) == name for name in ('a/x', 'b/y'))
+
+
+@root_only
+@linux_only
+def test_f2_a_mount_below_the_destination_cannot_be_unmounted_during_the_run(tmp_path, reset_hpcp_globals):
+	# F2 with a real mount: the destination is a tmpfs; during the run's listing (before any file is written) the mount is
+	# asked to go, as an expiring automount or NFS submount is. Held by the pin's descriptor it is busy; a pin that closed its
+	# descriptor let it go, and a mount that came back had another device number. Root, a mount: VM 901's.
+	out = tmp_path / 'out'
+	out.mkdir()
+	if subprocess.run(['mount', '-t', 'tmpfs', 'hpcp-test', str(out)], stdout=subprocess.PIPE, stderr=subprocess.PIPE).returncode:
+		pytest.skip('cannot mount a tmpfs here')
+	try:
+		write(tmp_path / 'src' / 'a' / 'x', 'x')
+		results = []
+		real = hpcp._settle_destinations
+		def settling(*args, **kwargs):
+			task = subprocess.run(['umount', str(out)], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+			results.append((task.returncode, task.stderr.decode(errors='replace')))
+			return real(*args, **kwargs)
+		hpcp._settle_destinations = settling
+		try:
+			with contextlib.redirect_stdout(io.StringIO()):
+				rc = hpcp.hpcp([str(tmp_path / 'src') + '/'], dest_paths=[str(out) + '/'], single_thread=True)
+		finally:
+			hpcp._settle_destinations = real
+		assert results and results[0][0] != 0 and 'busy' in results[0][1], results
+		assert rc == 0 and read(out / 'a' / 'x') == 'x'
+	finally:
+		subprocess.run(['umount', '-l', str(out)], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
 
