@@ -180,6 +180,26 @@ def test_no_route_without_a_temporary_file(tmp_path, fresh, monkeypatch):
 
 
 @linux_only
+def test_a_full_candidate_sends_the_probe_to_the_next(tmp_path, fresh, monkeypatch):
+	# A full /tmp (a tmpfs any local user can fill) makes the probe's name but takes no byte: the probe goes on to the next
+	# candidate, as tempfile.gettempdir tries each by writing (9.87 went on to /var/tmp). 9.88's first build took the failed
+	# write for no route, for the whole run. Faked here (ENOSPC for files in the first); run for real in Docker with /tmp a
+	# filled 64 KiB tmpfs.
+	_gnu_cp_or_skip()
+	full, room = str(tmp_path / 'full'), str(tmp_path / 'room')
+	os.makedirs(full)
+	os.makedirs(room)
+	monkeypatch.setattr(hpcp, '_temp_candidates', lambda: [full, room])
+	real = os.write
+	def full_write(fd, data):
+		if os.readlink('/proc/self/fd/%d' % fd).startswith(full + os.sep):
+			raise OSError(errno.ENOSPC, os.strerror(errno.ENOSPC))
+		return real(fd, data)
+	monkeypatch.setattr(os, 'write', full_write)
+	assert hpcp._held_route() == 'c' and os.listdir(full) == [] and os.listdir(room) == []
+
+
+@linux_only
 def test_a_probe_that_times_out_keeps_no_answer(exec_dir, tmp_path, fresh, monkeypatch):
 	# A cp that hangs past the probe's timeout is no answer: the next copy asks again; the probe's files go all the same.
 	_fake_cp(exec_dir, monkeypatch, 'exec sleep 30\n')

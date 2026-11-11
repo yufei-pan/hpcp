@@ -4603,12 +4603,18 @@ def _held_route():
 			source = os.path.join(directory, 'hpcp-held-probe-%d-%s' % (pid, uuid.uuid4().hex[:16]))
 			try:
 				_create(directory, os.path.basename(source), _NEW_FILE_FLAGS, 0o600, sources)
+				# Written here: a full filesystem makes the name but takes no byte, and the next candidate is tried, as
+				# tempfile.gettempdir tries its candidates by writing (9.87 went on to /var/tmp where /tmp was full).
+				os.write(sources[-1], b'c')
 				break
 			except OSError:
+				if sources:
+					with contextlib.suppress(OSError):
+						os.unlink(source)
+					os.close(sources.pop())
 				continue
 		else:
 			return None  # no directory to make the probe's files in: no route
-		os.write(sources[0], b'c')
 		try:
 			helds.extend(map(functools.partial(os.open, flags=os.O_TMPFILE | os.O_RDWR | getattr(os, 'O_CLOEXEC', 0), mode=0o600),
 				(directory,)))
