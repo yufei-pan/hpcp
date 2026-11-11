@@ -298,7 +298,10 @@ def stop_alarms(monkeypatch, reset_hpcp_globals):
 	times its median unstopped run (timed first), as a stop: hpcp's handler (handler 'hpcp': _stop as the main process's, no
 	stop recorded before each call, none passed on) or Python's own ('python': signal.default_int_handler, as in a program
 	that imports hpcp). call stores its result in got by C (list.extend over map), so a stop after the call returned is not
-	taken for one inside it; settle(got) runs once the alarm is off. Returns the indexes of the calls that raised."""
+	taken for one inside it; settle(got) runs once the alarm is off. Returns the indexes of the calls that raised.
+	The handler acts only while the call runs (armed): Python runs a handler at its next check, not when the signal comes, so
+	an alarm that came as the call returned (or as setitimer disarmed it) could run its handler past the try, in settle or
+	the loop, and its KeyboardInterrupt ended the test session (3.12: once in a full suite; 38 of 120 runs, 8 side by side)."""
 	import random
 	import signal
 	import time
@@ -313,7 +316,12 @@ def stop_alarms(monkeypatch, reset_hpcp_globals):
 		window = sorted(timings)[len(timings) // 2] * 1.5
 		for name, value in (('_MAIN_PID', os.getpid()), ('_DEFER', 0), ('_pass_stop_on', lambda signum: None)):
 			monkeypatch.setattr(hpcp, name, value)
-		old = signal.signal(signal.SIGALRM, hpcp._stop if handler == 'hpcp' else signal.default_int_handler)
+		stop = hpcp._stop if handler == 'hpcp' else signal.default_int_handler
+		armed = []
+		def alarm(signum, frame):
+			if armed:
+				stop(signum, frame)
+		old = signal.signal(signal.SIGALRM, alarm)
 		stopped = []
 		try:
 			for index in range(count):
@@ -321,11 +329,13 @@ def stop_alarms(monkeypatch, reset_hpcp_globals):
 				hpcp._STOP_ACTED = hpcp._STOP_NOTED = False
 				got = []
 				try:
+					armed[:] = [True]
 					signal.setitimer(signal.ITIMER_REAL, random.uniform(1e-6, window))
 					call(index, got)
-					signal.setitimer(signal.ITIMER_REAL, 0)
+					armed[:] = []
 				except KeyboardInterrupt:
-					signal.setitimer(signal.ITIMER_REAL, 0)
+					armed[:] = []
+				signal.setitimer(signal.ITIMER_REAL, 0)
 				settle(got)
 				if not got:
 					stopped.append(index)

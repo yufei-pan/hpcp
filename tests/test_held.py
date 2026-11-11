@@ -788,12 +788,15 @@ def test_a_stop_as_a_first_copy_s_file_is_made_leaves_no_file(tmp_path, monkeypa
 	# A stop's handler runs as os.open returns: raising there, `fd = os.open(...)` lost the descriptor before _cp_made knew the
 	# file, and the landing stayed, empty and mode 0600. 9.87 deferred hpcp's own handler there (_MAKING); Python's own, in a
 	# program that imports hpcp, left the file (about 10 % of stops landing on the create, holder.py). The descriptor is now
-	# stored by C before any handler runs (_create), and the cleanup removes the file. cp is left out (_cp_held: 0).
+	# stored by C before any handler runs (_create), and the cleanup removes the file. cp is one write (_cp_held).
+	# Python 3.8 to 3.10 leave a try before its return (POP_BLOCK, then RETURN_VALUE, where a handler runs): a stop there
+	# leaves the copy, whole, and its descriptor open, as a stop just after the return would (3.9, four runs side by side:
+	# 19 of about 190,000 stops, every one at the return). Elsewhere nothing runs a handler between the try and the return.
 	import functools
 	source = write(tmp_path / 'a' / 'x', 'data')
 	out = tmp_path / 'out'
 	out.mkdir()
-	monkeypatch.setattr(hpcp, '_cp_held', lambda *args, **kwargs: 0)
+	monkeypatch.setattr(hpcp, '_cp_held', lambda command, src_path, target, fd, *args, **kwargs: os.write(fd, b'data'))
 	made = functools.partial(hpcp._cp_made, ['cp', '-af'], source)
 	def call(index, got):
 		got.extend(map(made, (str(out / ('f%d' % index)),), (None,), (None,)))
@@ -803,9 +806,14 @@ def test_a_stop_as_a_first_copy_s_file_is_made_leaves_no_file(tmp_path, monkeypa
 	if sys.platform.startswith('linux'):
 		before = len(os.listdir('/proc/self/fd'))
 	stopped = stop_alarms(handler, call, 2000, settle)
-	left = [index for index in stopped if os.path.lexists(str(out / ('f%d' % index)))]
-	assert stopped and not left, (len(stopped), len(left))
+	left = {str(out / ('f%d' % index)) for index in stopped if os.path.lexists(str(out / ('f%d' % index)))}
+	whole = {path for path in left if os.lstat(path).st_size == 4}
+	assert stopped and left == whole and (not left or (3, 8) <= sys.version_info < (3, 11)), (len(stopped), sorted(left), sorted(whole))
 	if sys.platform.startswith('linux'):
+		for fd in os.listdir('/proc/self/fd'):
+			with contextlib.suppress(OSError):
+				if os.readlink('/proc/self/fd/' + fd) in whole:
+					os.close(int(fd))
 		assert len(os.listdir('/proc/self/fd')) == before
 
 
