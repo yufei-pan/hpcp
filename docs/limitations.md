@@ -234,13 +234,15 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - **Revisit when:** 9.89.
 - **Noted:** 2026-11-10, the 9.88 plan; the main session's decision, not asked (a deferral).
 
-### A non-root rerun over a directory whose mode shuts its owner out can fail below it
+### A directory whose mode shuts its owner out (0607): a rerun over it can fail below it, and a move that leaves its source directory sets the mode all the same
 - **Kind:** deferred (9.89).
-- **What the operator sees:** a non-root copy or move gives a directory of mode 0607 (no search for its owner) that mode at its end. A later non-root copy or move of the same tree syncs that directory's subdirectories, and one synced before the directory's own start has opened it to its owner again fails: `Directory sync error: SRC/d/sub to OUT/d/sub: [Errno 13] Permission denied: 'OUT/d/sub'`, exit 193 (with `-rf` the sources stay; a retry may pass). Since 9.88 a job's folders are synced parents first, so it takes a parallel run and such a directory with more than one pool job's folders below it (64): with 200 subdirectories, 9.87 failed all 12 reruns on Python 3.6 and 3.14, 9.88 some on 3.6 and none on 3.14; with one subdirectory 9.87 failed some reruns, by hash order, and 9.88 none.
-- **Why:** the folder sync reaches a directory below its parent, and only the parent's own start gives the parent owner search; pool jobs run side by side. Not worse than 9.87.
-- **Plan (9.89):** where the door meets EACCES at a directory the runner owns that lacks owner search, give it owner search first, as `_start_directory` does for a rerun's own directory (the finish sets its exact mode again); or start each pool job's parents before it.
+- **What the operator sees:**
+  - **A rerun can fail below such a directory (P1).** A non-root copy or move gives a directory of mode 0607 (no search for its owner) that mode at its end. A later non-root copy or move of the same tree syncs that directory's subdirectories, and one synced before the directory's own start has opened it to its owner again fails: `Directory sync error: SRC/d/sub to OUT/d/sub: [Errno 13] Permission denied: 'OUT/d/sub'`, exit 193 (with `-rf` the sources stay; a retry may pass). Since 9.88 a job's folders are synced parents first, so it takes a parallel run and such a directory with more than one pool job's folders below it (64): with 200 subdirectories, 9.87 failed all 12 reruns on Python 3.6 and 3.14, 9.88 some on 3.6 and none on 3.14; with one subdirectory 9.87 failed some reruns, by hash order, and 9.88 none.
+  - **A move that leaves a source directory sets the exact mode anyway (N5).** A non-root move sets such a directory's exact mode after the removal step when the copy reported no errors, also where its source directory stays: a file replaced by a later merged source (`Remove skipped ... replaced by a later source`, exit 212), `Remove directory failed`, or `Move left entries`. Those messages ask for a rerun, and the rerun meets the first case. After a copy's errors, or a stop, only a directory whose source directory is gone gets its exact mode; the others keep owner read and search (0707) for the rerun. The first case left the directory 0607 in 9.87 too (and failed the move with `cannot be written to disk`).
+- **Why:** the folder sync reaches a directory below its parent, and only the parent's own start gives the parent owner search; pool jobs run side by side. The late pass keeps 0707 "for the rerun" only after a copy's errors (`removal_ended`, and a test of the source directory) because of the first case: a rerun over a 0607 directory can fail. Not worse than 9.87 in either.
+- **Plan (9.89):** the first case at its source: where the door meets EACCES at a directory the runner owns that lacks owner search, give it owner search first, as `_start_directory` does for a rerun's own directory (the finish sets its exact mode again); or start each pool job's parents before it. Then one rule for the late pass: the exact mode for every record on every path, with no `removal_ended` and no test of the source directory (the README's "until a rerun" goes). Not the other way round: setting the exact mode only where the source directory is gone, which the final review proposed for the second case, leaves 0707 for good after a move that succeeded with an excluded file (the source directory stays, the run exits 0, and `out/d` stays 0707 where 9.88 gives 0607; the design check ran it).
 - **Revisit when:** 9.89.
-- **Noted:** 2026-11-11, found by the 9.88 A–C review (P1); the main session's decision, not asked (a deferral).
+- **Noted:** 2026-11-11, P1 found by the 9.88 A–C review, N5 by the final review (the design check changed its fix); the main session's decision, not asked (a deferral).
 
 ### macOS: a rerun carries no changed xattr or ACL
 - **Kind:** deferred (9.89).
@@ -266,12 +268,13 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - **Revisit when:** 9.89.
 - **Noted:** 2026-11-11, the 9.88 W1 review's docs gap D1; the main session's decision, not asked (a deferral).
 
-### The door goes by path below half the open-files limit, after running out of descriptors, and in a directory the runner may not read (read route)
+### The door goes by path below half the open-files limit, after running out of descriptors, in a directory the runner may not read (read route), and on Windows
 - **Kind:** deferred (9.89).
 - **What the operator sees:** three places where the door (the directories a run holds by descriptor, 9.88) goes by path, as 9.87 did everywhere, so a directory swapped for a link there, in a root run into a tree another user can write (a non-root run for the third), leads the writes below it elsewhere:
   - the levels deeper than half the soft open-files limit (the other half stays for what a copy opens): 128 levels on macOS, whose soft limit stays 256; on Linux hpcp raises the limit to the hard one at import (524,288 on systemd hosts, 4,096 on EL7), so the budget, half of it, is deeper than the 4,096 characters a listed path holds, except on EL7, where it is 2,048 levels;
   - a process that has run out of descriptors (EMFILE or ENFILE);
   - a directory the runner may not read, where the door holds read descriptors (macOS, Linux without /proc; with /proc an `O_PATH` open needs only search): the walk goes on by path from it.
+  And one place the plan below does not reach: **Windows**, which has no descriptor calls, goes by path everywhere, each directory looked at once a process in a run, and a destination named with `-d` is checked against its pin once a process, as 9.87 did. Nothing is held there, so there is nothing to close; it is the same as 9.87 and not worse.
   The copy itself is whole in each, and what is written there is what 9.87 wrote.
 - **Why:** the budget keeps the descriptors a copy needs beside the held ones (its file, `cp`'s pipes, a pool's), and a read descriptor cannot be had on a directory the runner may not read.
 - **Plan (9.89):** raise the soft `RLIMIT_NOFILE` toward the hard limit at start (macOS), and hold such directories with `O_PATH` descriptors on Linux where /proc is there but a read is refused. Each goes by path as 9.87 did until then, so none is worse.
@@ -294,3 +297,69 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - **Revisit when:** multiCMD 1.62 ships.
 - **Noted:** 2026-11-11, the 9.88 W1 review's item (c); the main session's decision, not asked (a deferral). The same in 9.87.
 
+### macOS: a rerun of a tree of many directories with few files each takes a few percent longer than in 9.87
+- **Kind:** known limitation.
+- **What the operator sees:** on macOS (APFS) a rerun with nothing to copy of a tree of 10,000 directories of one file each takes about 3 to 8 % longer than 9.87's (Python 3.9.6, a Mac at load 12 to 32 from other work, the versions taking turns: median 3.36 s against 3.18 s in 11 rounds, and 2.83 s against 2.70 s with `-s` in 5; every rank of the sorted runs was slower). Other shapes are not: 50 directories of 1,000 files (5.31 s against 5.28 s, 5 rounds) and a first copy of 3,000 directories of one file each (19.28 s against 19.42 s, 3 rounds). The size is approximate, the host was loaded.
+- **Why:** the door opens and closes each directory a process enters (about 20 µs on APFS, against about 0.5 µs on Linux); that open is the guard (a directory swapped for a link is never followed), so it cannot go, and the read route macOS needs (no `O_PATH`) holds the directories by read descriptors. The rest of a rerun's extra cost, the per-landing Python code, is on Linux too and is the 9.89 deferral "A rerun costs about 6 µs more CPU a file than in 9.87".
+- **Revisit when:** an operator reports it, or the 9.89 trim of the per-landing cost ships and the Mac is measured again.
+- **Approved:** 2026-11-11, the user chose "Approve as KL (Recommended)". The user did not ask for it explicitly; the 9.88 final review found it (N3).
+
+### A rerun costs about 6 µs more CPU a file than in 9.87
+- **Kind:** deferred (9.89).
+- **What the operator sees:** a rerun with nothing to copy uses more CPU than 9.87's, in Python, on every platform: the 9.88 design check measured it on a tmpfs in Docker (Python 3.14, the versions taking turns, host load 8 to 70, so CPU seconds decide, not wall time):
+  - serial (`-s`): 50 directories of 1,000 files, CPU median of 11, 2.82 s against 2.52 s (+12 %, +6.1 µs a file); 10,000 directories of one file, 1.12 s against 1.01 s (+11 %);
+  - the default pool: wall time 0.810 s against 0.766 s on the 50-directory tree (9 rounds, +5.8 %; CPU of all processes +11 %), and 1.467 s against 1.462 s on the deep tree (+0.4 %; CPU +5 %); with `-j 2` the 50-directory tree took 1.227 s against 1.120 s (+9.5 %);
+  - a first copy is not slower (serial, 10,000 directories of one file, `cp` included: 6.48 s against 6.67 s CPU, 3 rounds).
+  On NFS mounted `actimeo=0` a rerun is 2 to 3 times faster in 9.88 in three of the build's four rounds (the README has the numbers). The macOS share of N3 is a known limitation of its own (above).
+- **Why:** it is ordinary Python on each landing's way, not the descriptor calls: the door's call is 1.95 µs for a landing in the directory just used and 4.6 µs when the directory changes, against 9.87's 0.4 µs, and the rest is spread over the calls made relative to the held directory (the skip check's open, `_settle_identical`, `_landing_of`, closing the held directories). A variant whose door goes by path cost the same (+5.6 µs a file against the descriptor route's +5.8 µs), so making W1 narrower would not win it back. The plan's bar for W1 was under 2 µs a file; the build's bars measured pool wall time on a tree of 10 files a directory on a 32-core host, where the parent's listing hides the workers' CPU. The build before W1 (c401f23) was level with 9.87 on the wide tree, so the cost is W1's.
+- **Plan (9.89):** profile a serial rerun and take the work out of the hot path (the dup and close of the held directory for each landing, a second look, closures made for each file) until its CPU a file is 9.87's within 2 %, measured as above, in CPU seconds serially and at `-j 2`, on Linux and on the Mac.
+- **Revisit when:** 9.89.
+- **Noted:** 2026-11-11, found by the 9.88 design check (X1), measured on c843e7e; the user chose "Ship, trim in 9.89 (Recommended)".
+
+### A device node copied by a non-root user onto a `-d` link: the message names the failed copy beside, not the refusal
+- **Kind:** deferred (9.89).
+- **What the operator sees:** `hpcp /dev/null -d out/l` as a non-root user, `out/l` a link to `../other/real`: the link and the file are untouched and the run exits 190, in 9.87 and 9.88 alike, but the message differs. 9.87: `Copy failed: cannot make a device node like /dev/null here, leaving [...] as they are`. 9.88: `Copy failed: cannot copy /dev/null to out/l, leaving out/l as it is: /dev/null is no regular file, which cp makes anew; the new copy beside it failed: cp: cannot create special file '.../other/.hpcp_tmp_...': Operation not permitted`, and two `Task return code error` records.
+- **Why (run):** `_can_make_node` asks by doing it (a node of the source's number is made under a name of its own beside a landing that exists, and removed again) and only for a destination it finds there. For a `-d` link the door's directory is the link target's (`other/`) and the lookup is by the link's own name (`l`): it finds nothing, so it does not ask, and `cp` is left to fail on the copy beside.
+- **Plan (9.89):** look the landing up by its target's name (`_landing_path`) in `_can_make_node`.
+- **Revisit when:** 9.89.
+- **Noted:** 2026-11-11, the 9.88 W1 fixer's call 5a, the final review's N4; the main session's decision, not asked (a deferral).
+
+### macOS: a directory's BSD flags are set through its logical path, so a `-d` link gets them
+- **Kind:** deferred (9.89).
+- **What the operator sees:** on macOS, `-d out/` with `out` a link to a directory: the finish of the destination directory sets the source directory's BSD flags (`os.chflags(dest_path, flags, follow_symlinks=False)`, `_finish_directory`) on the link itself, not on the directory it leads to. The same line in 9.87.
+- **Why:** Python has no `fchflags`, so the flags are set by name, and not following a link is what keeps a link put at the name from taking them.
+- **Plan (9.89):** set them through the held descriptor with ctypes `fchflags` (macOS and the BSDs), as the plan for the macOS xattrs does for its calls.
+- **Revisit when:** 9.89.
+- **Noted:** 2026-11-11, the 9.88 W1 fixer's call 5b, the final review's D1; the main session's decision, not asked (a deferral).
+
+### A move's directory fsyncs go by path
+- **Kind:** deferred (9.89).
+- **What the operator sees:** after a move, `_sync_moved_directories` fsyncs each directory by its path (`_fsync_file`), as 9.87 did: a directory on the way swapped for a link at the right moment in a root move into a tree another user can write has the fsync land on the directory the link leads to (a flush of a directory elsewhere, so the intended directory's new names are not committed by it; a power cut soon after could then lose them, with the sources gone).
+- **Why:** the 9.88 plan kept the by-path fsync; the other directory fsyncs of the move (the finish's, the file's) go through descriptors.
+- **Plan (9.89):** fsync each through the door's descriptor for it.
+- **Revisit when:** 9.89.
+- **Noted:** 2026-11-11, the 9.88 W1 fixer's call 5c, the final review's D1; the main session's decision, not asked (a deferral).
+
+### A pinned destination refused in one process says nothing when another destination takes the files
+- **Kind:** deferred (9.89).
+- **What the operator sees:** with two destinations (`-d B/ -d A/`) and `B` swapped for a link to another directory mid-run, a process that finds `B` leading elsewhere writes nothing below it (9.88's pin; 9.87 wrote into the victim). It says so only when every destination refuses it, so where the files go to `A` the refusal is mostly silent (root, Python 3.14, 60 files, the victim untouched in each): with forkserver the run exits 213 with 7 clash lines (the directory sync's), and with `-nds` it exits 0 with no line; with fork the workers hold the swapped-out directory and write there (exit 213).
+- **Why:** a refusal is reported only when every destination fails, as 9.87 treats every refusal. Better than 9.87 in each case, and the files are whole where they landed.
+- **Plan (9.89):** say a pin's refusal once a process even when the file goes elsewhere.
+- **Revisit when:** 9.89.
+- **Noted:** 2026-11-11, the final review's N7 (second opinion's lead 2); the main session's decision, not asked (a deferral).
+
+### `_fsync_file`'s chmod of a file its owner cannot open follows a link
+- **Kind:** deferred (9.89).
+- **What the operator sees:** a non-root move of a file of mode 0044 (its owner can neither read nor write it): hpcp gives the owner read for the fsync (`os.chmod(name, mode | 0400, dir_fd=...)`) and restores the mode. A link put at the name between hpcp's `lstat` and that chmod has the chmod land on the link's target if the runner owns it, and the restore then gives that file the copy's mode. Read, not run. The same in 9.87 (by full path).
+- **Why:** Linux has no `lchmod`: a chmod by name follows a link at the name.
+- **Plan (9.89):** chmod through an `O_PATH` descriptor checked against the `lstat`, as `_carry_over` does.
+- **Revisit when:** 9.89.
+- **Noted:** 2026-11-11, the final review's N8 (Grok's lead 1); the main session's decision, not asked (a deferral).
+
+### A rewrite of a file whose landing is held under a write lease goes beside it and gets a new inode
+- **Kind:** deferred (9.89).
+- **What the operator sees:** where a client holds a write lease on a landing (Samba with `kernel oplocks = yes`, an NFS server that gives write delegations, any program with an `fcntl` lease), a rerun of a changed file does not write the old copy in place: its open is non-blocking (`_LANDING_FLAGS`, since 9.86: never waiting on a FIFO or a lease), fails with EAGAIN, and the copy goes beside the old file and is renamed over it (0.3 s in the probe, Python 3.14, an `fcntl` lease): a new inode, and the lease holder keeps the old file. 9.87 and 9.88 alike. The skip check's read of an identical landing waits for the lease to be given up and keeps the inode (9.87; 9.88 again after the final review's N2).
+- **Why:** the open must not wait on a FIFO or a lease, so it is non-blocking, and a landing that cannot be opened for writing is rewritten beside. It meets the user's words "I would prefer the inode do not change if possible".
+- **Plan (9.89):** decide whether the rewrite's open may wait for a lease's break as the skip check's read does (the same question as N2's flag, with a FIFO swapped in at the landing the other case), then keep the inode.
+- **Revisit when:** 9.89.
+- **Noted:** 2026-11-11, found by the 9.88 design check; the main session's decision, not asked (a deferral).
