@@ -4329,7 +4329,7 @@ def _named_ids(roots):
 					os.close(fd)
 	return ids
 
-def _door_step(base, name, current, make, source, below):
+def _door_step(base, name, current, make, source, below, first=None):
 	"""One component of the way to a landing: name in base (a held directory's descriptor, or its path: _at), current its
 	path (messages), below how many components lie below it (the Note's source). Returns name's descriptor (base a
 	descriptor; the caller holds it) or current (base a path) once it is a directory; None when it is missing and make is
@@ -4339,13 +4339,18 @@ def _door_step(base, name, current, make, source, below):
 	directory refuses the unlink); a regular file raises NotADirectoryError, the clash it always was. Three attempts at it,
 	the race's bound since 9.85 (workers racing on one path: an unlink meeting ENOENT or EISDIR, a mkdir meeting EEXIST, are
 	fine when the next look says directory), and a descriptor's last open after them. An open meeting a link (O_NOFOLLOW) or
-	another kind of entry says ENOTDIR (Linux) or ELOOP (macOS): it is looked at by lstat."""
+	another kind of entry says ENOTDIR (Linux) or ELOOP (macOS): it is looked at by lstat. first: the error of the caller's own
+	open of name in base, taken as this first attempt's (a directory made here costs no second failed lookup: on NFS mounted
+	actimeo=0 it cost about two GETATTRs)."""
 	held = isinstance(base, int)
 	how = _fd_of(base)
 	for attempt in range(4):
 		missing = False
 		if held:
 			try:
+				if first is not None:
+					error, first = first, None
+					raise error
 				return os.open(name, (_HOLD_PATH_FLAGS if _PATH_FDS else _HOLD_READ_FLAGS) | _O_NOFOLLOW, dir_fd=base)
 			except OSError as e:
 				if e.errno not in (errno.ENOENT, errno.ENOTDIR, errno.ELOOP):
@@ -4534,11 +4539,11 @@ def _dest_directory(path, make=True, source=None, source_file=None):
 			return _door_by_path(os.path.join(root, *parts[:index]), parts[index:], make, source)
 		try:
 			fd = os.open(parts[index], flags, dir_fd=fds[-1])  # a directory there: what nearly every level is
-		except OSError:
-			# what is there, or the error, looked at by the rules (_door_step: it opens again, and a level made since is taken)
+		except OSError as e:
+			# what is there, or the error, looked at by the rules (_door_step, which takes this open as its first)
 			current = os.path.join(root, *parts[:index + 1])
 			try:
-				fd = _door_step(fds[-1], parts[index], current, make, source, len(parts) - 1 - index)
+				fd = _door_step(fds[-1], parts[index], current, make, source, len(parts) - 1 - index, first=e)
 			except OSError as e:
 				if _by_path_error(e):
 					return _door_by_path(os.path.dirname(current), parts[index:], make, source)
