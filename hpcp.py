@@ -4173,6 +4173,10 @@ class _Refused(Exception):
 	def text(self, path):
 		return f'Destination clash: {self.before}{path}{self.after}'
 
+# The refusals of one destination this process has said in a run (RUN_ID) as a note where another destination took the file
+# (_copy_file).
+_NOTED_REFUSALS = set()
+
 def _say_refused(refusal, what):
 	"""refusal's 213 line for what (eprint), or only its record where this process printed it already (refusal.said)."""
 	if refusal.said:
@@ -5484,6 +5488,12 @@ def _copy_file(src_path, dest_paths, full_hash, verbose, concurrent_processes, b
 			for refusal in refused.values():
 				_copy_failed(src_path, refusal.text(src_path), refusal.said)
 			return 0, time.monotonic() - start_time, symLinks
+		for refusal in refused.values():
+			# Another destination takes the file, so this is no failure; said once a process, as a note (a pinned destination
+			# that leads elsewhere now: 9.89 said nothing).
+			if (RUN_ID, refusal.before, refusal.after) not in _NOTED_REFUSALS:
+				_NOTED_REFUSALS.add((RUN_ID, refusal.before, refusal.after))
+				print(f'Note: {refusal.before}{src_path} there, which goes to another destination{refusal.after}')
 	looks = {dest: _look(dest, bases, landings[dest]) for dest in dest_paths}
 	if not src_is_link:
 		# cp would put the file inside a directory at its place (dest/x/x), and a move would then lose the source. A link there
@@ -14444,12 +14454,7 @@ def _fsync_file(path, base=None, name=None):
 					return
 				raise first
 			mode = stat.S_IMODE(st.st_mode)
-			os.chmod(*at, mode | stat.S_IRUSR, **how)
-			try:
-				fd = os.open(*at, os.O_RDONLY | flags, **how)
-			except BaseException:
-				os.chmod(*at, mode, **how)
-				raise
+			fd = _open_owner_read(at, how, st, mode, flags, path)
 			try:
 				os.fchmod(fd, mode)
 			except BaseException:
@@ -14462,6 +14467,36 @@ def _fsync_file(path, base=None, name=None):
 			raise
 	finally:
 		os.close(fd)
+
+def _open_owner_read(at, how, st, mode, flags, path):
+	"""A read descriptor of the file at (its lstat st, mode its mode), which its owner (the runner) may not read: owner read is
+	added for the open, and taken back here only if the open fails (_fsync_file puts the exact mode back through the
+	descriptor). Never through a link put at the name since the lstat: on Linux the name is held by an O_PATH descriptor
+	checked against st, and the chmod and the open go through its /proc/self/fd entry (Linux has no lchmod), a file that is not
+	st's refused (EEXIST); elsewhere the chmod does not follow a link where it can say so (macOS's lchmod), and the open, with
+	O_NOFOLLOW, refuses one. Without both (Linux without /proc) the chmod follows a link, as before 9.90."""
+	if _PATH_FDS:
+		held = os.open(*at, os.O_PATH | os.O_NOFOLLOW | getattr(os, 'O_CLOEXEC', 0), **how)
+		try:
+			now = os.fstat(held)
+			if (now.st_dev, now.st_ino) != (st.st_dev, st.st_ino) or not stat.S_ISREG(now.st_mode):
+				raise OSError(errno.EEXIST, 'it was replaced since it was looked at', path)
+			proc = '/proc/self/fd/%d' % held  # leads to the descriptor's file, and no further
+			os.chmod(proc, mode | stat.S_IRUSR)
+			try:
+				return os.open(proc, os.O_RDONLY | (flags & ~getattr(os, 'O_NOFOLLOW', 0)))
+			except BaseException:
+				os.chmod(proc, mode)
+				raise
+		finally:
+			os.close(held)
+	chmod_how = dict(how, follow_symlinks=False) if os.chmod in os.supports_follow_symlinks else how
+	os.chmod(*at, mode | stat.S_IRUSR, **chmod_how)
+	try:
+		return os.open(*at, os.O_RDONLY | flags, **how)
+	except BaseException:
+		os.chmod(*at, mode, **chmod_how)
+		raise
 
 class _NotOnDisk(Exception):
 	"""A move's copy that the filesystem failed to write to disk (_sync_landing): a failed copy, so no source is removed."""

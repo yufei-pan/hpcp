@@ -192,3 +192,60 @@ def test_990_a_serial_copy_draws_a_frame_at_most_each_refresh_and_the_last_at_th
 	assert len(os.listdir(str(tmp_path / 'out'))) == count
 	assert frames and frames[-1] == (count, count), frames[-3:]
 	assert len(frames) < count // 4, len(frames)
+
+
+# -- A pinned destination refused in one process while another destination takes the file ------------------------------------
+
+@posix_only
+def test_990_a_pin_refused_where_another_destination_takes_the_file_is_said_once(tmp_path, fresh, monkeypatch):
+	# -d B/ -d A/, B swapped for a link to another directory mid-run: a process that opens B anew (forkserver, spawn) finds it
+	# leading elsewhere and writes nothing below it (9.88's pin), and the files go to A. 9.89 said nothing then (exit 0 with
+	# -nds); 9.90 says it once a process, as a note: the files are whole where they went.
+	for name in ('f1', 'f2'):
+		write(tmp_path / 'src' / name, name)
+	B, A, victim = (str(tmp_path / name) for name in ('B', 'A', 'victim'))
+	for directory in (B, A, victim):
+		os.makedirs(directory)
+	_run_named(monkeypatch, B, A)
+	os.rename(B, B + '.away')
+	os.symlink(victim, B)
+	hpcp._close_cursors()  # a worker that opens the destinations itself
+	out = io.StringIO()
+	try:
+		with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+			for name in ('f1', 'f2'):
+				hpcp.copy_file(str(tmp_path / 'src' / name), [os.path.join(B, name), os.path.join(A, name)])
+	finally:
+		hpcp._close_cursors()
+	assert sorted(os.listdir(A)) == ['f1', 'f2'] and os.listdir(victim) == [] and os.listdir(B + '.away') == []
+	assert not hpcp.ERRORS, hpcp.ERRORS
+	notes = [line for line in out.getvalue().splitlines() if 'now leads to another directory' in line]
+	assert len(notes) == 1 and notes[0].startswith('Note: ') and 'goes to another destination' in notes[0], out.getvalue()
+
+
+# -- _fsync_file's chmod of a file its owner may not read --------------------------------------------------------------------
+
+@posix_only
+@not_root
+def test_990_the_fsync_of_a_0044_file_never_chmods_through_a_link_put_at_its_name(tmp_path, monkeypatch):
+	# A move's fsync of a file of mode 0044 gives its owner read for the open (a chmod by name) and takes it back. 9.89's chmod
+	# followed a link put at the name after its lstat: the link's target (the runner's own file) was made 0444, then 0044.
+	f, victim = str(tmp_path / 'f'), str(tmp_path / 'victim')
+	write(f, 'data', mode=0o044)
+	write(victim, 'mine', mode=0o600)
+	real_open, swapped = os.open, []
+	def opening(name, flags, *args, **kwargs):
+		try:
+			return real_open(name, flags, *args, **kwargs)
+		except PermissionError:
+			if name == f and flags & os.O_WRONLY and not swapped:
+				swapped.append(True)
+				os.unlink(f)
+				os.symlink(victim, f)
+			raise
+	monkeypatch.setattr(os, 'open', opening)
+	with pytest.raises(OSError):
+		hpcp._fsync_file(f)
+	monkeypatch.setattr(os, 'open', real_open)
+	assert swapped
+	assert stat.S_IMODE(os.stat(victim).st_mode) == 0o600
