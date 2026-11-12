@@ -2021,7 +2021,7 @@ def test_989_two_landings_below_one_named_destination_each_keep_their_directory(
 	# inside another (-d out -d out/x), a source's x/a/b/f lands at out/x/a/b/f and out/x/x/a/b/f, both below out/x: the
 	# second landing's door call closes out/x/a and out/x/a/b and opens out/x/x, a and b, which take the numbers the first
 	# landing's answer had. copy_file keeps a dup of each landing's answer when it has several (keep); with lent answers
-	# (keep patched to False) the build wrote the file into out/x/x/a.
+	# (`keep` set to False in the source) the build wrote the file into out/x/x/a.
 	if route == 'proc' and not hpcp._PATH_FDS:
 		pytest.skip('no /proc/self/fd here')
 	monkeypatch.setattr(hpcp, '_PATH_FDS', route == 'proc')
