@@ -4027,6 +4027,158 @@ def _chown_like_cp(path, st, **how):
 	now = os.stat(path, **how)
 	return now.st_uid == st.st_uid, now.st_gid == st.st_gid
 
+#%% -- macOS calls Python's os module lacks: fchflags, the xattr calls, ACLs (libc, through ctypes) --
+_LIBC = []
+
+def _libc():
+	"""The C library through ctypes on macOS and the BSDs, or None (elsewhere, or no ctypes); loaded on first use."""
+	if not _LIBC:
+		lib = None
+		if sys.platform == 'darwin' or 'bsd' in sys.platform:
+			with contextlib.suppress(Exception):
+				import ctypes
+				import ctypes.util
+				lib = ctypes.CDLL(ctypes.util.find_library('c'), use_errno=True)
+		_LIBC.append(lib)
+	return _LIBC[0]
+
+_LIBC_FUNCTIONS = {}
+
+def _libc_call(name, argtypes, restype, *args):
+	"""libc's name(*args), its C types given (set once a process); raises OSError for its errno where it returns -1 (or NULL
+	for a pointer), and ENOTSUP where libc or the call is not there."""
+	import ctypes
+	key = (name, argtypes)
+	function = _LIBC_FUNCTIONS.get(key)
+	if function is None:
+		lib = _libc()
+		function = getattr(lib, name, None) if lib is not None else None
+		if function is None:
+			raise OSError(errno.ENOTSUP, f'{name} is not available here')
+		function.argtypes, function.restype = argtypes, restype
+		_LIBC_FUNCTIONS[key] = function
+	result = function(*args)
+	if (result is None) if restype is ctypes.c_void_p else (result == -1):
+		number = ctypes.get_errno()
+		raise OSError(number, os.strerror(number))
+	return result
+
+def _fchflags(fd, flags):
+	"""Set the BSD flags of what fd holds (macOS and the BSDs; Python has no fchflags): never a link put at its name."""
+	import ctypes
+	_libc_call('fchflags', (ctypes.c_int, ctypes.c_uint), ctypes.c_int, fd, flags)
+
+_XATTR_NOFOLLOW = 0x0001  # <sys/xattr.h>
+
+def _mac_xattr_target(target, follow_symlinks):
+	"""(the f-call's prefix and first argument, the options) for target: a descriptor (flistxattr...) or a path, not followed
+	where follow_symlinks is False (XATTR_NOFOLLOW)."""
+	if isinstance(target, int):
+		return 'f', target, 0
+	return '', os.fsencode(target), 0 if follow_symlinks else _XATTR_NOFOLLOW
+
+def _mac_listxattr(target, follow_symlinks=True):
+	"""os.listxattr for macOS (libc's listxattr/flistxattr): the names of target's xattrs, as str."""
+	import ctypes
+	prefix, first, options = _mac_xattr_target(target, follow_symlinks)
+	kind = ctypes.c_int if prefix else ctypes.c_char_p
+	call = prefix + 'listxattr'
+	size = _libc_call(call, (kind, ctypes.c_char_p, ctypes.c_size_t, ctypes.c_int), ctypes.c_ssize_t, first, None, 0, options)
+	while True:
+		if not size:
+			return []  # none: one call, what nearly every file costs
+		buffer = ctypes.create_string_buffer(size)
+		try:
+			size = _libc_call(call, (kind, ctypes.c_char_p, ctypes.c_size_t, ctypes.c_int), ctypes.c_ssize_t, first, buffer, size, options)
+		except OSError as e:
+			if e.errno != errno.ERANGE:
+				raise
+			size = _libc_call(call, (kind, ctypes.c_char_p, ctypes.c_size_t, ctypes.c_int), ctypes.c_ssize_t, first, None, 0, options)
+			continue
+		return [os.fsdecode(name) for name in buffer.raw[:size].split(b'\0') if name]
+
+def _mac_getxattr(target, name, follow_symlinks=True):
+	"""os.getxattr for macOS: target's xattr name, its whole value (a resource fork too: position 0, its full size)."""
+	import ctypes
+	prefix, first, options = _mac_xattr_target(target, follow_symlinks)
+	kind = ctypes.c_int if prefix else ctypes.c_char_p
+	call = prefix + 'getxattr'
+	types = (kind, ctypes.c_char_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint32, ctypes.c_int)
+	key = os.fsencode(name)
+	while True:
+		size = _libc_call(call, types, ctypes.c_ssize_t, first, key, None, 0, 0, options)
+		buffer = ctypes.create_string_buffer(size or 1)
+		try:
+			size = _libc_call(call, types, ctypes.c_ssize_t, first, key, buffer, size, 0, options)
+		except OSError as e:
+			if e.errno == errno.ERANGE:
+				continue  # it grew since
+			raise
+		return buffer.raw[:size]
+
+def _mac_setxattr(target, name, value, follow_symlinks=True):
+	"""os.setxattr for macOS."""
+	import ctypes
+	prefix, first, options = _mac_xattr_target(target, follow_symlinks)
+	kind = ctypes.c_int if prefix else ctypes.c_char_p
+	_libc_call(prefix + 'setxattr', (kind, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_size_t, ctypes.c_uint32, ctypes.c_int),
+		ctypes.c_int, first, os.fsencode(name), value, len(value), 0, options)
+
+def _mac_removexattr(target, name, follow_symlinks=True):
+	"""os.removexattr for macOS."""
+	import ctypes
+	prefix, first, options = _mac_xattr_target(target, follow_symlinks)
+	kind = ctypes.c_int if prefix else ctypes.c_char_p
+	_libc_call(prefix + 'removexattr', (kind, ctypes.c_char_p, ctypes.c_int), ctypes.c_int, first, os.fsencode(name), options)
+
+# The xattr calls: Python's (Linux), or libc's through ctypes on macOS, which Python's os module lacks there; None elsewhere.
+if hasattr(os, 'listxattr'):
+	_XATTRS = (os.listxattr, os.getxattr, os.setxattr, os.removexattr)
+elif sys.platform == 'darwin':
+	_XATTRS = (_mac_listxattr, _mac_getxattr, _mac_setxattr, _mac_removexattr)
+else:
+	_XATTRS = None
+
+_ACL_TYPE_EXTENDED = 0x00000100  # <sys/acl.h>, macOS's only ACL type
+
+def _mac_acl_text(target):
+	"""macOS: target's extended ACL as acl_to_text gives it (a descriptor, or a path not followed), '' for none."""
+	import ctypes
+	try:
+		if isinstance(target, int):
+			acl = _libc_call('acl_get_fd_np', (ctypes.c_int, ctypes.c_int), ctypes.c_void_p, target, _ACL_TYPE_EXTENDED)
+		else:
+			acl = _libc_call('acl_get_link_np', (ctypes.c_char_p, ctypes.c_int), ctypes.c_void_p, os.fsencode(target), _ACL_TYPE_EXTENDED)
+	except OSError as e:
+		if e.errno == errno.ENOENT:
+			return ''  # none
+		raise
+	try:
+		text = _libc_call('acl_to_text', (ctypes.c_void_p, ctypes.c_void_p), ctypes.c_void_p, acl, None)
+		try:
+			return ctypes.string_at(text).decode('utf-8', 'surrogateescape')
+		finally:
+			_libc_call('acl_free', (ctypes.c_void_p,), ctypes.c_int, text)
+	finally:
+		_libc_call('acl_free', (ctypes.c_void_p,), ctypes.c_int, acl)
+
+def _mac_sync_acl(src, fd):
+	"""macOS: give what fd holds src's extended ACL (src a path, not followed) where its own differs (none: an empty one).
+	True when it set one."""
+	import ctypes
+	wanted = _mac_acl_text(src)
+	if _mac_acl_text(fd) == wanted:
+		return False
+	if wanted:
+		acl = _libc_call('acl_from_text', (ctypes.c_char_p,), ctypes.c_void_p, wanted.encode('utf-8', 'surrogateescape'))
+	else:
+		acl = _libc_call('acl_init', (ctypes.c_int,), ctypes.c_void_p, 0)
+	try:
+		_libc_call('acl_set_fd_np', (ctypes.c_int, ctypes.c_void_p, ctypes.c_int), ctypes.c_int, fd, acl, _ACL_TYPE_EXTENDED)
+	finally:
+		_libc_call('acl_free', (ctypes.c_void_p,), ctypes.c_int, acl)
+	return True
+
 def _flags_to_set(src_flags, now_flags):
 	"""The BSD flags (st_flags) a destination that has now_flags is given for a source's src_flags: all of them in a root run.
 	A non-root run sets only the user flags (UF_SETTABLE, the lower 16 bits) and keeps the system flags there, which only
@@ -5187,6 +5339,8 @@ def _judge_landing(dest_path, target, st, named):
 def _cp_landing(command, src_path, dest_path, target, st, named, space, src_st, base):
 	"""_cp_once's copy onto target, dest_path's landing, by what its look found there (st, named), relative to base (the door's
 	result for its directory). FileExistsError: a first copy's name taken since."""
+	if _CP_SKIPS_SOCKETS and stat.S_ISSOCK((src_st or os.lstat(src_path)).st_mode):
+		return _make_socket(src_path, src_st or os.lstat(src_path), target, st, base)
 	held = _claim_device(target, st, named, src_path)
 	try:
 		if not _written_beside(st, named):
@@ -5237,6 +5391,37 @@ def _open_after_lease(base, name, st):
 		return os.open(*_at(base, name), _LANDING_FLAGS & ~getattr(os, 'O_NONBLOCK', 0), **_fd_of(base))
 	except OSError:
 		return None
+
+# macOS's cp skips a named socket ("is a socket (not copied)", exit 1), where Linux's cp -a makes one: hpcp makes it there.
+_CP_SKIPS_SOCKETS = sys.platform == 'darwin'
+
+def _make_socket(src_path, src_st, target, st, base):
+	"""A copy of the socket src_path (its lstat src_st) at target, as Linux's cp -a makes one: what is at the landing (st, its
+	look) unlinked, an AF_UNIX socket bound there (closed at once: the node stays), then the source's owner (as cp -a keeps
+	it), mode and times, without following a link put at the name. Relative to base (the door's result for its directory)
+	but the bind: macOS has no bindat, so it names the landing's path (its node copies go by name below the held directory,
+	docs/limitations.md), and a path longer than a socket address holds (104 bytes) fails as cp did. Returns 0 (no data)."""
+	import socket
+	base = os.path.dirname(target) if base is None else base
+	name = os.path.basename(target)
+	at, how = _at(base, name), _fd_of(base)
+	if st is not None:
+		try:
+			os.unlink(*at, **how)
+		except FileNotFoundError:
+			pass
+	sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+	try:
+		sock.bind(target)
+	except OSError as e:
+		raise OSError(e.errno, f'cannot make the socket {target} ({e.strerror})', target)
+	finally:
+		sock.close()
+	owner_kept, group_kept = _chown_like_cp(at[0], src_st, follow_symlinks=False, **how)
+	mode = stat.S_IMODE(src_st.st_mode) & ~((0 if owner_kept else stat.S_ISUID) | (0 if group_kept else stat.S_ISGID))
+	os.chmod(*at, mode, follow_symlinks=False, **how)
+	os.utime(*at, ns=(src_st.st_atime_ns, src_st.st_mtime_ns), follow_symlinks=False, **how)
+	return 0
 
 def _regular_source(src_path, src_st=None):
 	"""False for a source that cp -a makes anew (a FIFO, socket or device node: it unlinks what is at the landing, and cannot
@@ -5377,7 +5562,9 @@ def _known_identical(src_path, dest_path, src_size, full_hash, src_st=None, dest
 		raise
 
 # The errors shutil.copystat's xattr copy ignores (3.6 to 3.14, together): a name the destination or the runner cannot have.
-_XATTR_SKIPPED = frozenset((errno.EPERM, errno.ENOTSUP, errno.EOPNOTSUPP, errno.ENODATA, errno.EINVAL, errno.EACCES))
+# macOS's "no such attribute" (ENOATTR, 93), which Linux calls ENODATA
+_ENOATTR = getattr(errno, 'ENOATTR', errno.ENODATA)
+_XATTR_SKIPPED = frozenset((errno.EPERM, errno.ENOTSUP, errno.EOPNOTSUPP, errno.ENODATA, errno.EINVAL, errno.EACCES, _ENOATTR))
 # How _settle_identical opens an identical landing: O_PATH on Linux with /proc (_PATH_FDS), elsewhere a regular file for reading.
 _SETTLE_PATH_FLAGS = getattr(os, 'O_PATH', 0) | _O_NOFOLLOW | getattr(os, 'O_CLOEXEC', 0)
 _SETTLE_READ_FLAGS = os.O_RDONLY | _O_NOFOLLOW | getattr(os, 'O_NONBLOCK', 0) | getattr(os, 'O_CLOEXEC', 0)
@@ -5427,10 +5614,11 @@ def _settle_identical(src_path, src_st, dest, look, base=None):
 			owner_kept, group_kept = _chown_like_cp(path, src_st, **how)
 		# xattrs after the owner, as cp -a: a chown clears a file capability (security.capability), and before the mode, which
 		# may make the file read-only
-		if hasattr(os, 'listxattr'):
+		if _XATTRS is not None:
+			listxattr, getxattr, setxattr, removexattr = _XATTRS
 			try:
-				src_names = os.listxattr(src_path, follow_symlinks=False)
-				dest_names = os.listxattr(xpath, **xhow)
+				src_names = listxattr(src_path, follow_symlinks=False)
+				dest_names = listxattr(xpath, **xhow)
 			except OSError as e:
 				if e.errno not in (errno.ENOTSUP, errno.EOPNOTSUPP):
 					raise
@@ -5438,15 +5626,22 @@ def _settle_identical(src_path, src_st, dest, look, base=None):
 			for name in dest_names:
 				if name not in src_names and _is_portable_xattr(name):
 					try:
-						os.removexattr(xpath, name, **xhow)
+						removexattr(xpath, name, **xhow)
 					except OSError as e:
-						if e.errno not in (errno.ENOTSUP, errno.EPERM, errno.ENODATA, errno.EACCES, errno.EINVAL, errno.ENOENT):
+						if e.errno not in (errno.ENOTSUP, errno.EPERM, errno.ENODATA, errno.EACCES, errno.EINVAL, errno.ENOENT, _ENOATTR):
 							raise
 			for name in src_names:
 				try:
-					value = os.getxattr(src_path, name, follow_symlinks=False)
-					if name not in dest_names or os.getxattr(xpath, name, **xhow) != value:
-						os.setxattr(xpath, name, value, **xhow)
+					value = getxattr(src_path, name, follow_symlinks=False)
+					if name not in dest_names or getxattr(xpath, name, **xhow) != value:
+						setxattr(xpath, name, value, **xhow)
+				except OSError as e:
+					if e.errno not in _XATTR_SKIPPED:
+						raise
+			if fd is not None and _XATTRS[0] is _mac_listxattr:
+				# macOS's ACL is no listed xattr: by its own calls, through the descriptor checked against the look
+				try:
+					_mac_sync_acl(src_path, fd)
 				except OSError as e:
 					if e.errno not in _XATTR_SKIPPED:
 						raise
@@ -5462,7 +5657,10 @@ def _settle_identical(src_path, src_st, dest, look, base=None):
 			os.utime(path, ns=(src_st.st_atime_ns, src_st.st_mtime_ns), **how)
 		if hasattr(os, 'chflags') and _flags_to_set(src_st.st_flags, now.st_flags) != now.st_flags:
 			try:
-				os.chflags(_io(base, leaf, dest), _flags_to_set(src_st.st_flags, now.st_flags), follow_symlinks=False)
+				if fd is not None and _libc() is not None:
+					_fchflags(fd, _flags_to_set(src_st.st_flags, now.st_flags))  # the descriptor checked against the look
+				else:
+					os.chflags(_io(base, leaf, dest), _flags_to_set(src_st.st_flags, now.st_flags), follow_symlinks=False)
 			except OSError as e:
 				if e.errno not in (errno.ENOTSUP, errno.EOPNOTSUPP):
 					raise
@@ -6342,13 +6540,14 @@ def _sync_xattrs(src_path, dest):
 	source's set where dest lacks it or holds another value, so a rerun sets none. The errors copystat ignores are ignored
 	(Python 3.14's set: a name the destination's filesystem or the runner may not have). Returns whether it tried to change
 	any (an ACL is an xattr, and setting one sets the mode's group bits)."""
-	if not hasattr(os, 'listxattr'):
+	if _XATTRS is None:
 		return False
+	listxattr, getxattr, setxattr, removexattr = _XATTRS
 	try:
-		src_names = os.listxattr(src_path)
-		dest_names = set(os.listxattr(dest))
+		src_names = listxattr(src_path)
+		dest_names = set(listxattr(dest))
 	except OSError as e:
-		if e.errno not in (errno.ENOTSUP, errno.ENODATA, errno.EINVAL):
+		if e.errno not in (errno.ENOTSUP, errno.ENODATA, errno.EINVAL, _ENOATTR):
 			raise
 		return False
 	changed = False
@@ -6358,19 +6557,26 @@ def _sync_xattrs(src_path, dest):
 			continue
 		changed = True
 		try:
-			os.removexattr(dest, name)
+			removexattr(dest, name)
 		except OSError as e:
-			if e.errno not in (errno.ENOTSUP, errno.EPERM, errno.ENODATA, errno.EACCES, errno.EINVAL, errno.ENOENT):
+			if e.errno not in (errno.ENOTSUP, errno.EPERM, errno.ENODATA, errno.EACCES, errno.EINVAL, errno.ENOENT, _ENOATTR):
 				raise
 	for name in src_names:
 		try:
-			value = os.getxattr(src_path, name)
-			if name in dest_names and os.getxattr(dest, name) == value:
+			value = getxattr(src_path, name)
+			if name in dest_names and getxattr(dest, name) == value:
 				continue
 			changed = True
-			os.setxattr(dest, name, value)
+			setxattr(dest, name, value)
 		except OSError as e:
-			if e.errno not in (errno.EPERM, errno.ENOTSUP, errno.ENODATA, errno.EINVAL, errno.EACCES):
+			if e.errno not in (errno.EPERM, errno.ENOTSUP, errno.ENODATA, errno.EINVAL, errno.EACCES, _ENOATTR):
+				raise
+	if isinstance(dest, int) and _XATTRS[0] is _mac_listxattr:
+		# macOS's ACL is no listed xattr: by its own calls, through the held descriptor
+		try:
+			changed = _mac_sync_acl(src_path, dest) or changed
+		except OSError as e:
+			if e.errno not in (errno.EPERM, errno.ENOTSUP, errno.EINVAL, errno.EACCES):
 				raise
 	return changed
 
@@ -6555,7 +6761,12 @@ def _finish_directory(record, sync=False, late=False):
 			if flags is not None and hasattr(os, 'chflags'):
 				flags = _flags_to_set(flags, now.st_flags)
 				if flags != now.st_flags:
-					os.chflags(dest_path, flags, follow_symlinks=False)
+					try:
+						_fchflags(fd, flags)  # the descriptor the mode and times went through: a -d link's directory, not the link
+					except OSError as e:
+						if e.errno != errno.ENOTSUP or _libc() is not None:
+							raise
+						os.chflags(dest_path, flags, follow_symlinks=False)  # no libc through ctypes: by name, as 9.89
 		except OSError as e:
 			eprint(f'Directory sync error: {src_path} to {dest_path}: ' + ("its mode, set after the move's removal: " if late else '') + str(e))
 		if sync and (late or _synced_at_finish(mode)):
@@ -7121,6 +7332,8 @@ def _is_portable_xattr(name):
 	Filesystem-synthesized names (system.nfs4_acl, lustre.*, trusted.*, security.selinux, ...)
 	are not portable and are ignored.
 	"""
+	if _XATTRS is not None and _XATTRS[0] is _mac_listxattr:
+		return not name.startswith('com.apple.system.')  # macOS: every name a program sets; the system's own are hidden
 	return name.startswith('user.') or name in _PORTABLE_SYSTEM_XATTRS
 
 def _xattr_digest(path):
@@ -12339,11 +12552,19 @@ _BELOW_FLAGS = _DIRECTORY_FLAGS | getattr(os, 'O_NOFOLLOW', 0)
 _PARENT_FLAGS = (getattr(os, 'O_PATH', 0) or os.O_RDONLY) | getattr(os, 'O_DIRECTORY', 0) | getattr(os, 'O_CLOEXEC', 0)
 # A descriptor walk or cursor holds one directory descriptor a level: a tree deeper than the soft open-files limit
 # (often 1024) needs more, so the soft limit is raised to the hard one (often 524288), where the platform allows.
+# macOS's hard limit is often RLIM_INFINITY, which its setrlimit refuses for the soft one: there the soft limit is raised to
+# OPEN_MAX (10240, <sys/syslimits.h>), the most macOS's setrlimit(2) takes for RLIMIT_NOFILE, where 9.89 kept 256 (the door's
+# budget, half of it: 128 levels).
 if resource is not None:  # (imported in the import header)
 	try:
 		_soft_nofile, _hard_nofile = resource.getrlimit(resource.RLIMIT_NOFILE)
 		if _soft_nofile < _hard_nofile:
-			resource.setrlimit(resource.RLIMIT_NOFILE, (_hard_nofile, _hard_nofile))
+			try:
+				resource.setrlimit(resource.RLIMIT_NOFILE, (_hard_nofile, _hard_nofile))
+			except (ValueError, OSError):
+				if sys.platform != 'darwin' or _soft_nofile >= 10240:
+					raise
+				resource.setrlimit(resource.RLIMIT_NOFILE, (min(10240, _hard_nofile), _hard_nofile))
 	except (ValueError, OSError):
 		pass
 

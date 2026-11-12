@@ -447,3 +447,102 @@ def test_990_a_rerun_over_a_0607_directory_with_many_jobs_below_it_completes(tmp
 				break
 	finally:
 		shutil.rmtree(work, ignore_errors=True)
+
+
+# -- macOS ------------------------------------------------------------------------------------------------------------------------
+
+darwin_only = pytest.mark.skipif(sys.platform != 'darwin', reason='macOS')
+
+
+def _hpcp_cli(args, cwd):
+	p = subprocess.run([sys.executable, HPCP] + args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True,
+		cwd=str(cwd))
+	return p.returncode, p.stdout
+
+
+@darwin_only
+def test_990_macos_raises_the_soft_open_files_limit():
+	# hpcp raises the soft limit to the hard one at import; where macOS refuses that (a hard limit of RLIM_INFINITY, which
+	# setrlimit takes for the soft one on macOS 26 but not everywhere), to OPEN_MAX (10240), not 256 (the door went by path
+	# below 128 levels). Guards what 9.89 already does on macOS 26.
+	p = subprocess.run([sys.executable, '-c', 'import resource, sys; sys.path.insert(0, %r); import hpcp; '
+		'print(resource.getrlimit(resource.RLIMIT_NOFILE)[0])' % os.path.dirname(HPCP)], stdout=subprocess.PIPE,
+		universal_newlines=True)
+	assert int(p.stdout.split()[-1]) >= 10240, p.stdout
+
+
+@darwin_only
+def test_990_macos_copies_a_named_socket(tmp_path):
+	# A socket the operator names (a walk skips one: 'Special file skipped'): macOS's cp skips it ("is a socket (not copied)"),
+	# and 9.89 reported a failed copy, exit 213; Linux's cp -a makes the node, exit 0. hpcp makes it on macOS.
+	import socket
+	os.makedirs(str(tmp_path / 'src'))
+	write(tmp_path / 'src' / 'f', 'x')
+	sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+	try:
+		sock.bind(str(tmp_path / 'src' / 's'))
+	finally:
+		sock.close()
+	os.chmod(str(tmp_path / 'src' / 's'), 0o640)
+	os.makedirs(str(tmp_path / 'out'))
+	for _ in range(2):  # a first copy, then a rerun that finds it identical
+		rc, output = _hpcp_cli(['src/s', '-d', 'out/'], tmp_path)
+		assert rc == 0, output[-3000:]
+		st = os.lstat(str(tmp_path / 'out' / 's'))
+		assert stat.S_ISSOCK(st.st_mode) and stat.S_IMODE(st.st_mode) == 0o640, oct(st.st_mode)
+
+
+@darwin_only
+def test_990_macos_a_link_named_with_d_gets_no_bsd_flags_its_directory_does(tmp_path):
+	# 9.88 and 9.89 set a directory's BSD flags by name with follow_symlinks=False: -d out/, out a link to real, gave the link
+	# the source's nodump and real none. Through the held descriptor (fchflags) they go to real.
+	os.makedirs(str(tmp_path / 'src'))
+	write(tmp_path / 'src' / 'f', 'x')
+	os.chflags(str(tmp_path / 'src'), stat.UF_NODUMP)
+	os.makedirs(str(tmp_path / 'real'))
+	os.symlink('real', str(tmp_path / 'out'))
+	try:
+		rc, output = _hpcp_cli(['src/', '-d', 'out/'], tmp_path)
+		assert rc == 0, output[-3000:]
+		assert os.stat(str(tmp_path / 'real')).st_flags & stat.UF_NODUMP
+		assert not os.lstat(str(tmp_path / 'out')).st_flags & stat.UF_NODUMP
+	finally:
+		os.chflags(str(tmp_path / 'src'), 0)
+
+
+def _mac_tag(path):
+	"""The org.example.tag xattr of path by macOS's xattr tool, or None."""
+	p = subprocess.run(['xattr', '-p', 'org.example.tag', path], stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+	return p.stdout.strip() if p.returncode == 0 else None
+
+
+def _mac_acl(path):
+	"""path's ACL entries as ls -led shows them (the lines after the first)."""
+	return subprocess.run(['ls', '-led', path], stdout=subprocess.PIPE, universal_newlines=True, check=True).stdout.splitlines()[1:]
+
+
+@darwin_only
+def test_990_macos_a_rerun_carries_changed_xattrs_and_acls(tmp_path):
+	# 9.89 read no xattr or ACL on macOS (no os.listxattr there): a rerun that found a landing identical left the source's
+	# changed xattrs and ACL behind, and a directory got none. Through libc they reach the file and its directory.
+	os.makedirs(str(tmp_path / 'src' / 'd'))
+	f = write(tmp_path / 'src' / 'd' / 'f', 'x')
+	rc, output = _hpcp_cli(['src/', '-d', 'out/'], tmp_path)
+	assert rc == 0, output[-3000:]
+	landing, landing_dir = str(tmp_path / 'out' / 'd' / 'f'), str(tmp_path / 'out' / 'd')
+	for path in (f, str(tmp_path / 'src' / 'd')):
+		subprocess.run(['xattr', '-w', 'org.example.tag', 'one', path], check=True)
+		subprocess.run(['chmod', '+a', 'everyone deny delete', path], check=True)
+	rc, output = _hpcp_cli(['src/', '-d', 'out/'], tmp_path)
+	assert rc == 0, output[-3000:]
+	for path in (landing, landing_dir):
+		assert _mac_tag(path) == 'one', path
+		assert any('deny delete' in line for line in _mac_acl(path)), (path, _mac_acl(path))
+	for path in (f, str(tmp_path / 'src' / 'd')):
+		subprocess.run(['xattr', '-d', 'org.example.tag', path], check=True)
+		subprocess.run(['chmod', '-N', path], check=True)
+	rc, output = _hpcp_cli(['src/', '-d', 'out/'], tmp_path)
+	assert rc == 0, output[-3000:]
+	for path in (landing, landing_dir):
+		assert _mac_tag(path) is None, path
+		assert _mac_acl(path) == [], (path, _mac_acl(path))
