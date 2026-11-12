@@ -268,13 +268,13 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - **Revisit when:** 9.89.
 - **Noted:** 2026-11-11, the 9.88 W1 review's docs gap D1; the main session's decision, not asked (a deferral).
 
-### The door goes by path below half the open-files limit, after running out of descriptors, in a directory the runner may not read (read route), and on Windows
+### The door goes by path below half the open-files limit, after running out of descriptors, and in a directory the runner may not read (read route)
 - **Kind:** deferred (9.89).
 - **What the operator sees:** three places where the door (the directories a run holds by descriptor, 9.88) goes by path, as 9.87 did everywhere, so a directory swapped for a link there, in a root run into a tree another user can write (a non-root run for the third), leads the writes below it elsewhere:
   - the levels deeper than half the soft open-files limit (the other half stays for what a copy opens): 128 levels on macOS, whose soft limit stays 256; on Linux hpcp raises the limit to the hard one at import (524,288 on systemd hosts, 4,096 on EL7), so the budget, half of it, is deeper than the 4,096 characters a listed path holds, except on EL7, where it is 2,048 levels;
   - a process that has run out of descriptors (EMFILE or ENFILE);
   - a directory the runner may not read, where the door holds read descriptors (macOS, Linux without /proc; with /proc an `O_PATH` open needs only search): the walk goes on by path from it.
-  And one place the plan below does not reach: **Windows**, which has no descriptor calls, goes by path everywhere, each directory looked at once a process in a run, and a destination named with `-d` is checked against its pin once a process, as 9.87 did. Nothing is held there, so there is nothing to close; it is the same as 9.87 and not worse.
+  (Windows goes by path everywhere: its own entry below.)
   The copy itself is whole in each, and what is written there is what 9.87 wrote.
 - **Why:** the budget keeps the descriptors a copy needs beside the held ones (its file, `cp`'s pipes, a pool's), and a read descriptor cannot be had on a directory the runner may not read.
 - **Plan (9.89):** raise the soft `RLIMIT_NOFILE` toward the hard limit at start (macOS), and hold such directories with `O_PATH` descriptors on Linux where /proc is there but a read is refused. Each goes by path as 9.87 did until then, so none is worse.
@@ -297,19 +297,26 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - **Revisit when:** multiCMD 1.62 ships.
 - **Noted:** 2026-11-11, the 9.88 W1 review's item (c); the main session's decision, not asked (a deferral). The same in 9.87.
 
+### Windows: directories on the way to a landing go by path, as in 9.87
+- **Kind:** known limitation.
+- **What the operator sees:** on Windows the door (9.88's walk that holds each directory on the way to a landing by descriptor) does not exist: hpcp goes by path everywhere, looks at each directory once a process in a run, and checks a destination named with `-d` against its pin once a process, as 9.87 did. So in a run by an administrator into a tree another user can write, a directory on the way swapped for a link or junction mid-run can lead the writes below it elsewhere. The copy itself is whole, and what is written is what 9.87 wrote: not worse than 9.87.
+- **Why:** Windows has no descriptor-relative calls (`dir_fd`, `O_PATH`, `/proc/self/fd`) for Python to use, and there is no Windows machine here to build and test another route on.
+- **Revisit when:** someone runs hpcp on Windows into trees other users can write.
+- **Approved:** 2026-11-11, the user chose "Approve as KL (Recommended)" (asked after the 9.88 fix round added Windows to a deferred entry that had no plan for it).
+
 ### macOS: a rerun of a tree of many directories with few files each takes longer than in 9.87
 - **Kind:** known limitation.
 - **What the operator sees:** on macOS (APFS, Python 3.9.6) a rerun with nothing to copy of a tree of 10,000 directories of one file each takes longer than 9.87's, the versions taking turns. On a loaded Mac (the final review: load 12 to 32 from other work): median 3.36 s against 3.18 s in 11 rounds (+6 %) and 2.83 s against 2.70 s with `-s` in 5 (+5 %). On a quiet one (the fix round: load 2 when it started): 3.26 s against 3.08 s in 11 rounds (+6 %) and 2.82 s against 2.47 s with `-s` in 5 (+14.5 %). Other shapes are close: 50 directories of 1,000 files 5.31 s against 5.28 s (loaded, 5 rounds) and 5.04 s against 4.91 s (quiet, +2.7 %); a first copy of 3,000 directories of one file each 19.28 s against 19.42 s (loaded) and 19.23 s against 18.74 s (quiet; 3 rounds each, one 9.87 round took 17.35 s).
-- **Why:** the door opens and closes each directory a process enters (about 20 µs on APFS, against about 0.5 µs on Linux: about 0.2 s for 10,000 directories, so most of the serial run's extra 0.35 s by this estimate); that open is the guard (a directory swapped for a link is never followed), so it cannot go, and the read route macOS needs (no `O_PATH`) holds the directories by read descriptors. The rest is the per-landing Python code, which Linux shows too (the 9.89 deferral "A rerun costs about 6 µs more CPU a file than in 9.87").
+- **Why:** the door opens and closes each directory a process enters (about 20 µs on APFS, against about 0.5 µs on Linux: about 0.2 s for 10,000 directories, so most of the serial run's extra 0.35 s by this estimate); that open is the guard (a directory swapped for a link is never followed), so it cannot go, and the read route macOS needs (no `O_PATH`) holds the directories by read descriptors. The rest is the per-landing Python code, which Linux shows too (the 9.89 deferral "A rerun costs about 6 to 14 µs more CPU a file than in 9.87").
 - **Revisit when:** an operator reports it, or the 9.89 trim of the per-landing cost ships and the Mac is measured again.
-- **Approved:** 2026-11-11, the user chose "Approve as KL (Recommended)". The user did not ask for it explicitly; the 9.88 final review found it (N3).
+- **Approved:** 2026-11-11, the user chose "Approve as KL (Recommended)" on the loaded Mac's "about 3 to 8 %", and, asked again with the quiet Mac's numbers (+6 % in the pool, +14.5 % with `-s`), "Keep the approval (Recommended)". The user did not ask for it explicitly; the 9.88 final review found it (N3).
 
-### A rerun costs about 6 µs more CPU a file than in 9.87
+### A rerun costs about 6 to 14 µs more CPU a file than in 9.87
 - **Kind:** deferred (9.89).
 - **What the operator sees:** a rerun with nothing to copy uses more CPU than 9.87's, in Python, on every platform. Measured on a tmpfs in Docker, Python 3.14, the versions taking turns, host load 8 to 35, so CPU seconds decide, not wall time:
-  - serial (`-s`), the final 9.88 build, medians of 11 (the design check's, on c843e7e, agree within 2 %): 50 directories of 1,000 files 2.69 s of CPU against 2.40 s (+12 %, +5.8 µs a file); 10,000 directories of one file 1.16 s against 1.02 s (+14 %);
+  - serial (`-s`), the final 9.88 build, medians of 11 (the design check's, on c843e7e: +12 % and +11 %): 50 directories of 1,000 files 2.69 s of CPU against 2.40 s (+12 %, +5.8 µs a file); 10,000 directories of one file 1.16 s against 1.02 s (+14 %, +14.5 µs a file);
   - the default pool, the design check on c843e7e: wall time 0.810 s against 0.766 s on the 50-directory tree (9 rounds, +5.8 %; CPU of all processes +11 %), and 1.467 s against 1.462 s on the deep tree (+0.4 %; CPU +5 %); with `-j 2` the 50-directory tree took 1.227 s against 1.120 s (+9.5 %);
-  - a first copy is not slower (serial, 10,000 directories of one file, `cp` included: 6.26 s against 6.60 s CPU, 11 rounds).
+  - a first copy is not slower (serial, 10,000 directories of one file, `cp` included: 6.26 s against 6.60 s CPU, 3 rounds, ranges apart).
   On NFS mounted `actimeo=0` a rerun is 2 to 3 times faster in 9.88 in three of the build's four rounds (the README has the numbers). The macOS share of N3 is a known limitation of its own (above).
 - **Why:** it is ordinary Python on each landing's way, not the descriptor calls: the door's call is 1.95 µs for a landing in the directory just used and 4.6 µs when the directory changes, against 9.87's 0.4 µs, and the rest is spread over the calls made relative to the held directory (the skip check's open, `_settle_identical`, `_landing_of`, closing the held directories). A variant whose door goes by path cost the same (+5.6 µs a file against the descriptor route's +5.8 µs), so making W1 narrower would not win it back. The plan's bar for W1 was under 2 µs a file; the build's bars measured pool wall time on a tree of 10 files a directory on a 32-core host, where the parent's listing hides the workers' CPU. The build before W1 (c401f23) was level with 9.87 on the wide tree, so the cost is W1's.
 - **Plan (9.89):** profile a serial rerun and take the work out of the hot path (the dup and close of the held directory for each landing, a second look, closures made for each file) until its CPU a file is 9.87's within 2 %, measured as above, in CPU seconds serially and at `-j 2`, on Linux and on the Mac.
