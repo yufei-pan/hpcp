@@ -4446,20 +4446,27 @@ def _door_step(base, name, current, make, source, below, first=None):
 			return current
 	raise OSError(errno.EAGAIN, 'it kept changing while it was made a directory', current)
 
-def _door_by_path(start, parts, make, source):
+def _door_by_path(start, parts, make, source, replace=True):
 	"""The door's walk by path (9.87's) from start, a directory, through parts: the last path, or None when one is missing and
-	make is False. Where no descriptor can be had (_DIR_FD_WALK, _by_path_error)."""
+	make is False. Where no descriptor can be had (_DIR_FD_WALK, _by_path_error). replace=False: None for anything on the way
+	that is not a directory, nothing changed (_dest_directory)."""
 	current = start
 	for index, part in enumerate(parts):
 		current = os.path.join(current, part)
 		if current in _BY_PATH:
 			continue  # looked at in this run: 9.87's per-process memo (_BY_PATH), so the walk costs its lstats once
-		if _door_step(os.path.dirname(current), part, current, make, source, len(parts) - 1 - index) is None:
+		if not replace:
+			try:
+				if not stat.S_ISDIR(os.lstat(current).st_mode):
+					return None
+			except (FileNotFoundError, NotADirectoryError):
+				return None
+		elif _door_step(os.path.dirname(current), part, current, make, source, len(parts) - 1 - index) is None:
 			return None
 		_BY_PATH[current] = True
 	return current
 
-def _dest_directory(path, make=True, source=None, source_file=None):
+def _dest_directory(path, make=True, source=None, source_file=None, replace=True):
 	"""The one door for a directory below a destination: path as a real directory, and where its names are made from: a
 	descriptor of it, lent (the cursor's own: valid until the door's next call in this process below the same named
 	destination, never closed by the caller; one that holds it across another door call keeps a dup, _kept), or path
@@ -4474,7 +4481,9 @@ def _dest_directory(path, make=True, source=None, source_file=None):
 	file that lands in path, whose directory that is, worked out only when the door walks), and the levels shared
 	with the last path asked for are kept open (_HeldDirs): a directory swapped for a link after it was opened is no longer
 	on the way, as hpcp writes into the one it holds, wherever it is now. Where nothing can be held the walk is 9.87's, by path,
-	each component looked at once a process in a run (_BY_PATH)."""
+	each component looked at once a process in a run (_BY_PATH).
+	replace=False (with make=False): a look that changes nothing: anything but a directory on the way (a link, a file, a node)
+	answers None, as a missing one does, where the walk would replace it (a move's directory fsyncs)."""
 	path = os.path.abspath(path)
 	root = _named_root(path)
 	if root is None:
@@ -4515,12 +4524,12 @@ def _dest_directory(path, make=True, source=None, source_file=None):
 						raise refusal
 				if is_dir:
 					_BY_PATH[root] = True
-			return _door_by_path(root, parts, make, source)
+			return _door_by_path(root, parts, make, source, replace)
 		try:
 			fd = os.open(root, _HOLD_PATH_FLAGS if _PATH_FDS else _HOLD_READ_FLAGS)
 		except OSError as e:
 			if _by_path_error(e):
-				return _door_by_path(root, parts, make, source)
+				return _door_by_path(root, parts, make, source, replace)
 			if not make and e.errno in (errno.ENOENT, errno.ENOTDIR):
 				return None
 			raise
@@ -4553,17 +4562,19 @@ def _dest_directory(path, make=True, source=None, source_file=None):
 		# the root and index levels held here (this cursor's, where it is the only one)
 		if budget is not None and (index + 1 if len(_CURSORS) == 1 else
 				sum(len(other.fds) for other in _CURSORS.values() if isinstance(other, _HeldDirs))) >= budget:
-			return _door_by_path(os.path.join(root, *parts[:index]), parts[index:], make, source)
+			return _door_by_path(os.path.join(root, *parts[:index]), parts[index:], make, source, replace)
 		try:
 			fd = os.open(parts[index], flags, dir_fd=fds[-1])  # a directory there: what nearly every level is
 		except OSError as e:
+			if not replace and e.errno in (errno.ENOENT, errno.ENOTDIR, errno.ELOOP):
+				return None  # missing, or something else there: a look changes nothing
 			# what is there, or the error, looked at by the rules (_door_step, which takes this open as its first)
 			current = os.path.join(root, *parts[:index + 1])
 			try:
 				fd = _door_step(fds[-1], parts[index], current, make, source, len(parts) - 1 - index, first=e)
 			except OSError as e:
 				if _by_path_error(e):
-					return _door_by_path(os.path.dirname(current), parts[index:], make, source)
+					return _door_by_path(os.path.dirname(current), parts[index:], make, source, replace)
 				if e.filename == parts[index]:
 					e.filename = current  # a call relative to the held directory names the component alone: messages name its path
 				raise
@@ -5109,11 +5120,14 @@ def _judge_landing(dest_path, target, st, named):
 		raise _KeptOld(f'{dest_path} is a link to {os.readlink(dest_path)}, which does not exist (cp writes through no dangling link)')
 	if named and st is not None and stat.S_ISLNK(st.st_mode):
 		# _landing_of left it: the kernel will not follow it for this run (another user's link in a sticky directory:
-		# fs.protected_symlinks), as cp's open meets it; a loop is replaced, as in 9.85.
+		# fs.protected_symlinks), as cp's open meets it; or it appeared at the name after copy_file worked the landing out
+		# (_cp_once's re-look: a dangling one is refused as at the first look); a loop is replaced, as in 9.85.
 		try:
 			os.stat(dest_path)
 		except PermissionError as e:
 			raise _KeptOld(f'{dest_path} is a link to {os.readlink(dest_path)}, which cannot be followed ({_why(e)})')
+		except FileNotFoundError:
+			raise _KeptOld(f'{dest_path} is a link to {os.readlink(dest_path)}, which does not exist (cp writes through no dangling link)')
 		except OSError:
 			pass
 	if st is not None and stat.S_ISDIR(st.st_mode):
@@ -6575,52 +6589,43 @@ def _sync_moved_directories(files, link_dirs, src_paths, dests, dest_image, reco
 		while parent != directory and parent not in directories and any((parent + os.sep).startswith(root) for root in roots):
 			directories.add(parent)
 			directory, parent = parent, os.path.dirname(parent)
-	# Each directory as the door holds it (a destination named as a link to a directory, where it leads; below it, never
-	# through a link put on the way since: _dest_directory, nothing made), opened for reading in this thread, in path order
-	# (the door's cursor walks), and fsynced in the threads.
+	# Each directory as the door holds it: a destination named as a link to a directory where it leads, and below it each
+	# name relative to its parent as the door holds that, never through a link on the way (one there, the move's own link or
+	# one put there since, is left as it is: the door's look, replace=False). Opened in this thread, in path order (the
+	# door's cursor walks), and fsynced in the threads.
 	directories = sorted(directories - finished)
 	def sync(item):
 		directory, fd = item
 		try:
-			if _STOPPED_PID is not None:
-				return  # stopped (the parent raises it): the rest is left, and the move removes nothing
-			if fd.__class__ is int:
+			if _STOPPED_PID is None:  # stopped (the parent raises it): the rest is left, and the move removes nothing
 				os.fsync(fd)
-			else:
-				_fsync_file(fd)  # no descriptor (no named destination above it; Windows): by its path, as 9.89 did
-		except FileNotFoundError:
-			pass
 		except OSError as e:
 			if e.errno not in _NO_FSYNC:
 				eprint(f'Copy failed: the directory {directory} cannot be written to disk ({_why(e)})')
 		finally:
-			if fd.__class__ is int:
-				os.close(fd)
+			os.close(fd)
 	def opened(directory):
-		"""(directory, a read descriptor of it as the door holds it, or its path where the door holds none), or None: gone,
-		or another user's that this run may not read (a write-only drop box: _fsync_file passes it over too)."""
+		"""(directory, a descriptor of it to fsync), or None: gone, not a directory reached without a link, or another
+		user's that this run may not read (a write-only drop box)."""
 		try:
-			held = _dest_directory(directory, make=False)
-			if held is None:
+			if directory in NAMED_DESTS:
+				base, name = _dest_directory(directory, make=False, replace=False), os.curdir
+			else:
+				base, name = _dest_directory(os.path.dirname(directory), make=False, replace=False), os.path.basename(directory)
+			if base is None:
 				return None
-			if held.__class__ is not int:
-				return directory, held
-			if not _PATH_FDS:
-				return directory, os.dup(held)  # a read descriptor already (macOS; Linux without /proc)
-			return directory, os.open('/proc/self/fd/%d' % held, os.O_RDONLY | getattr(os, 'O_CLOEXEC', 0) | getattr(os, 'O_DIRECTORY', 0))
+			fd = _open_for_fsync(directory, base, name)
+			return None if fd is None else (directory, fd)
 		except _Refused as e:
 			eprint(f'Copy failed: the directory {directory} cannot be written to disk ({e.before}its files{e.after})')
-		except FileNotFoundError:
+		except (FileNotFoundError, NotADirectoryError):
 			pass
-		except PermissionError as e:
-			with contextlib.suppress(OSError):
-				if os.stat(directory).st_uid != os.geteuid():
-					return None
-			eprint(f'Copy failed: the directory {directory} cannot be written to disk ({_why(e)})')
 		except OSError as e:
+			if e.errno == errno.ELOOP:
+				return None  # a link at its name: the move's own, or one put there since; never followed
 			eprint(f'Copy failed: the directory {directory} cannot be written to disk ({_why(e)})')
 		return None
-	# At most this many held open at once: the threads' work, several times over, and well inside the open-files budget.
+	# At most this many held open at once: the threads' work several times over, well inside the open-files budget.
 	chunk = max(64, 4 * max_workers)
 	threads = concurrent.futures.ThreadPoolExecutor(min(max_workers, len(directories))) if max_workers > 1 and len(directories) > 1 else None
 	try:
@@ -14477,11 +14482,26 @@ def _fsync_file(path, base=None, name=None):
 	the door's result for its directory (_dest_directory), and every call goes relative to it."""
 	if os.name != 'posix':
 		return  # Windows' fsync wants a descriptor open for writing, and nothing here has been run there
+	fd = _open_for_fsync(path, base, name)
+	if fd is None:
+		return
+	try:
+		os.fsync(fd)
+	except OSError as e:
+		if e.errno not in _NO_FSYNC:
+			raise
+	finally:
+		os.close(fd)
+
+def _open_for_fsync(path, base=None, name=None):
+	"""_fsync_file's descriptor of path (base, name: name in base, the door's result for its directory), for the caller to
+	fsync and close; None where there is nothing to fsync (not a directory or a regular file; another user's directory this
+	run may not read)."""
 	at, how = ((path,), {}) if base is None else (_at(base, name), _fd_of(base))
 	st = os.lstat(*at, **how)
 	directory = stat.S_ISDIR(st.st_mode)
 	if not (directory or stat.S_ISREG(st.st_mode)):
-		return
+		return None
 	flags = getattr(os, 'O_CLOEXEC', 0) | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NONBLOCK', 0)
 	try:
 		fd = os.open(*at, os.O_RDONLY | flags, **how)
@@ -14494,7 +14514,7 @@ def _fsync_file(path, base=None, name=None):
 			if st.st_uid != os.geteuid():
 				if directory:
 					# Another user's directory this run may not read (a write-only drop box): not this run's to open.
-					return
+					return None
 				raise first
 			mode = stat.S_IMODE(st.st_mode)
 			fd = _open_owner_read(at, how, st, mode, flags, path)
@@ -14503,13 +14523,7 @@ def _fsync_file(path, base=None, name=None):
 			except BaseException:
 				os.close(fd)
 				raise
-	try:
-		os.fsync(fd)
-	except OSError as e:
-		if e.errno not in _NO_FSYNC:
-			raise
-	finally:
-		os.close(fd)
+	return fd
 
 def _open_owner_read(at, how, st, mode, flags, path):
 	"""A read descriptor of the file at (its lstat st, mode its mode), which its owner (the runner) may not read: owner read is
@@ -14522,7 +14536,7 @@ def _open_owner_read(at, how, st, mode, flags, path):
 		held = os.open(*at, os.O_PATH | os.O_NOFOLLOW | getattr(os, 'O_CLOEXEC', 0), **how)
 		try:
 			now = os.fstat(held)
-			if (now.st_dev, now.st_ino) != (st.st_dev, st.st_ino) or not stat.S_ISREG(now.st_mode):
+			if (now.st_dev, now.st_ino, stat.S_IFMT(now.st_mode)) != (st.st_dev, st.st_ino, stat.S_IFMT(st.st_mode)):
 				raise OSError(errno.EEXIST, 'it was replaced since it was looked at', path)
 			proc = '/proc/self/fd/%d' % held  # leads to the descriptor's file, and no further
 			os.chmod(proc, mode | stat.S_IRUSR)
