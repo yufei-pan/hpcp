@@ -13198,6 +13198,13 @@ def _init_rate_share(counter, start_time, limit):
 	global _RATE_SHARE
 	_RATE_SHARE = (counter, start_time, limit)
 
+def _shared_clock():
+	"""Seconds on a clock every process of the host reads alike. time.monotonic() is not one on macOS with Python 3.7 to 3.9:
+	it counts from the interpreter's start (CPython's per-process t0), so a spawned pool worker's reads its own age."""
+	if hasattr(time, 'clock_gettime') and hasattr(time, 'CLOCK_MONOTONIC'):
+		return time.clock_gettime(time.CLOCK_MONOTONIC)
+	return time.monotonic()
+
 def _shared_rate_wait():
 	"""-F across pool jobs: take the next slot of the shared count and sleep until its time (a no-op without -F)."""
 	if _RATE_SHARE is None:
@@ -13206,7 +13213,7 @@ def _shared_rate_wait():
 	with counter.get_lock():
 		counter.value += 1
 		slot = counter.value
-	wait = slot / limit - (time.monotonic() - start_time)
+	wait = slot / limit - (_shared_clock() - start_time)
 	if wait > 0:
 		time.sleep(wait)
 
@@ -13282,7 +13289,9 @@ def _remove_trees_parallel(trees, max_workers, exclude=None, rate_limiter=None):
 		# Every job paces each unlink from one shared count (a wide directory too, not just the queueing of jobs). Python 3.6's
 		# pool takes no initializer: its workers fork from this process at the first submit and inherit it (_pool).
 		counter = multiprocessing.Value('d', rate_limiter['count'])
-		share = (counter, rate_limiter['start_time'], rate_limiter['limit'])
+		# The start on a clock every process reads alike (_shared_clock), not this process's time.monotonic(): on macOS with
+		# Python 3.7 to 3.9 a spawned worker's counts from its own start, and each unlink waited about the parent's age.
+		share = (counter, _shared_clock() - (time.monotonic() - rate_limiter['start_time']), rate_limiter['limit'])
 	with _pool(max_workers, rate=share) as executor:
 		while queue or futures:
 			while queue and len(futures) < max_workers * 2:

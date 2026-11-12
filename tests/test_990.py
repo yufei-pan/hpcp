@@ -576,3 +576,34 @@ def test_990_a_read_that_returned_bytes_counts_as_part_of_a_job(tmp_path):
 	first_read = [i for i, (name, _, names, _) in enumerate(answers) if name == '_recv' and 'chunk' in names][0]
 	assert not any(answer for _, _, _, answer in answers[:first_read]), answers[:first_read]
 	assert all(answer for _, _, _, answer in answers[first_read:]), [a for a in answers[first_read:] if not a[3]]
+
+
+# -- A paced parallel remove's clock across spawned workers --------------------------------------------------------------------
+
+@posix_only
+@pytest.mark.skipif(sys.version_info < (3, 7), reason="Python 3.6's pool takes no initializer: spawned workers get no share")
+def test_990_a_paced_parallel_remove_does_not_wait_out_the_parents_age(tmp_path, reset_hpcp_globals, monkeypatch):
+	# The Mac suite's hang (test_parallel_plain_remove_honours_the_file_rate_limit, 16+ minutes): -pfl -F handed the workers
+	# the parent's time.monotonic() start, and on macOS with Python 3.7 to 3.9 a spawned worker's monotonic counts from its
+	# own start, so each unlink slept about the parent's age. Here the parent's monotonic runs 20 s ahead of the workers'.
+	import multiprocessing
+	import time
+	src = tmp_path / 'src'
+	for index in range(6):
+		(src / ('d%d' % index)).mkdir(parents=True)
+		for number in range(10):
+			(src / ('d%d' % index) / ('f%d' % number)).write_text('x')
+	monkeypatch.setattr(hpcp, 'FILES_RATE_LIMIT', 50)
+	real = time.monotonic
+	monkeypatch.setattr(time, 'monotonic', lambda: real() + 20)
+	method = multiprocessing.get_start_method()
+	multiprocessing.set_start_method('spawn', force=True)
+	try:
+		start = real()
+		with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+			hpcp.process_remove([str(src)], single_thread=False, max_workers=2, parallel_file_listing=True, remove_force=True)
+		took = real() - start
+	finally:
+		multiprocessing.set_start_method(method, force=True)
+	assert not src.exists()
+	assert 0.7 <= took < 10, took  # 60 files at 50 a second: 1.2 s and the workers' start; 20 s more with the parent's clock
