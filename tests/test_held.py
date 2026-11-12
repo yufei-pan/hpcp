@@ -1451,10 +1451,12 @@ def test_w1_a_tree_deeper_than_half_the_open_files_limit_is_copied(tmp_path):
 def test_w1_a_directory_the_door_cannot_enter_is_named_by_its_path(tmp_path, monkeypatch, reset_hpcp_globals, route):
 	# W1 risk 6: the door opens each level relative to the one it holds, so the kernel's error names the component alone
 	# ("Permission denied: 'sub'"); 9.87's walk by path named the path, and so does the door's error now. Here out/d, the
-	# runner's, has no search for its owner (0607, a non-root move's exact mode).
+	# runner's, has no search for its owner (0607, a non-root move's exact mode), and (9.90) the door is kept from giving it
+	# owner search, as for another user's directory, which a non-root test cannot make.
 	if route == 'proc' and not hpcp._PATH_FDS:
 		pytest.skip('no /proc/self/fd here')
 	monkeypatch.setattr(hpcp, '_PATH_FDS', route == 'proc')
+	monkeypatch.setattr(hpcp, '_owner_search', lambda fd: False)
 	out = str(tmp_path / 'out')
 	os.makedirs(os.path.join(out, 'd', 'sub'))
 	os.chmod(os.path.join(out, 'd'), 0o607)

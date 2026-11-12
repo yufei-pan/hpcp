@@ -387,3 +387,63 @@ def test_990_a_worker_stopped_after_a_jobs_length_reads_the_rest(tmp_path):
 			reader.kill()
 			reader.wait()
 	assert 'got 1000' in output and reader.returncode == 0, (output, reader.returncode)
+
+
+# -- A directory whose mode shuts its owner out (0607) -------------------------------------------------------------------------
+
+@posix_only
+@not_root
+@pytest.mark.parametrize('route', ['proc', 'read'])
+def test_990_the_door_enters_the_runners_own_directory_shut_to_its_owner(tmp_path, fresh, monkeypatch, route):
+	# P1: a non-root copy or move gives a directory of mode 0607 that mode at its end; a rerun's folder sync of a subdirectory
+	# that ran before the directory's own start met EACCES opening below it (exit 193). The door gives the runner's own such
+	# directory owner search where it needs it (the finish sets the exact mode again).
+	if route == 'proc' and not hpcp._PATH_FDS:
+		pytest.skip('no /proc/self/fd here')
+	monkeypatch.setattr(hpcp, '_PATH_FDS', route == 'proc')
+	out = str(tmp_path / 'out')
+	os.makedirs(os.path.join(out, 'd', 'sub'))
+	os.chmod(os.path.join(out, 'd'), 0o607)
+	_w1_run(monkeypatch, out)
+	try:
+		held = hpcp._dest_directory(os.path.join(out, 'd', 'sub'), make=False)
+		assert isinstance(held, int) and os.path.samestat(os.fstat(held), os.stat(os.path.join(out, 'd', 'sub')))
+	finally:
+		hpcp._close_cursors()
+		mode = stat.S_IMODE(os.stat(os.path.join(out, 'd')).st_mode)
+		os.chmod(os.path.join(out, 'd'), 0o755)
+	assert mode == 0o707, oct(mode)
+
+
+_root_only = pytest.mark.skipif(not hasattr(os, 'geteuid') or os.geteuid() != 0, reason='needs root to make another user\'s tree')
+
+
+@posix_only
+@_root_only
+@pytest.mark.parametrize('remove', [False, True])
+def test_990_a_rerun_over_a_0607_directory_with_many_jobs_below_it_completes(tmp_path, remove):
+	# P1 as an operator meets it: src/d 0607, root's, with 200 subdirectories (more than one pool job's 64 folders); a copy as
+	# nobody gives out/d 0607, and the rerun's folder sync of a subdirectory before out/d's own start met EACCES (9.87 failed
+	# every rerun; 9.88 and 9.89 some, by the pool's order).
+	import shutil
+	from test_directories import _as_nobody, _shut_out_tree
+	work = _shut_out_tree()
+	try:
+		for index in range(200):
+			path = os.path.join(work, 'src', 'd', 's%03d' % index)
+			os.mkdir(path)
+			os.chmod(path, 0o777)
+			write(os.path.join(path, 'f'), 'x', mode=0o666)
+		args = ['src/', '-d', 'out/']
+		rc, output = _as_nobody(args, work)
+		assert rc == 0, output[-3000:]
+		out = os.path.join(work, 'out', 'd')
+		assert stat.S_IMODE(os.lstat(out).st_mode) == 0o607
+		for _ in range(3):
+			rc, output = _as_nobody(args + (['-rf'] if remove else []), work)
+			assert rc == 0, output[-3000:]
+			assert stat.S_IMODE(os.lstat(out).st_mode) == 0o607, oct(os.lstat(out).st_mode)
+			if remove:
+				break
+	finally:
+		shutil.rmtree(work, ignore_errors=True)

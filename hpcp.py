@@ -4406,6 +4406,8 @@ def _door_step(base, name, current, make, source, below, first=None):
 					raise error
 				return os.open(name, (_HOLD_PATH_FLAGS if _PATH_FDS else _HOLD_READ_FLAGS) | _O_NOFOLLOW, dir_fd=base)
 			except OSError as e:
+				if e.errno == errno.EACCES and attempt == 0 and _owner_search(base):
+					continue  # base was the runner's own, shut to its owner (0607): open again
 				if e.errno not in (errno.ENOENT, errno.ENOTDIR, errno.ELOOP):
 					raise
 				missing = e.errno == errno.ENOENT
@@ -4474,6 +4476,26 @@ def _door_step(base, name, current, make, source, below, first=None):
 		if not held:
 			return current
 	raise OSError(errno.EAGAIN, 'it kept changing while it was made a directory', current)
+
+def _owner_search(fd):
+	"""Give the directory fd holds owner read, write and search where it is the runner's own (not root) and lacks owner
+	search: a mode that shuts its owner out (0607), which a non-root copy or move gives a directory at its end, met by a
+	rerun's walk below it before that directory's own start opened it again (_start_directory gives the same); the finish sets
+	its exact mode again. True when it did."""
+	if not hasattr(os, 'geteuid') or os.geteuid() == 0:
+		return False
+	try:
+		st = os.fstat(fd)
+		if st.st_uid != os.geteuid() or st.st_mode & stat.S_IXUSR or not stat.S_ISDIR(st.st_mode):
+			return False
+		mode = stat.S_IMODE(st.st_mode) | stat.S_IRWXU
+		if _PATH_FDS:
+			os.chmod('/proc/self/fd/%d' % fd, mode)  # an O_PATH descriptor takes no fchmod
+		else:
+			os.fchmod(fd, mode)
+	except OSError:
+		return False
+	return True
 
 def _door_by_path(start, parts, make, source, replace=True):
 	"""The door's walk by path (9.87's) from start, a directory, through parts: the last path, or None when one is missing and
@@ -6469,8 +6491,8 @@ def _synced_at_finish(mode):
 	return first is not None and hasattr(os, 'geteuid') and os.geteuid() != 0 and not first & stat.S_IRUSR
 
 def _finish_late(records):
-	"""After a non-root move's removal step (ran, or skipped, but for the copy's errors, whose remedy is a rerun, and after a stop or
-	an error in it: hpcp() passes the records that fit): the exact mode of each directory _first_mode left open to its owner,
+	"""After a non-root move's removal step (ran, skipped, stopped, or ended by an error): the exact mode of each directory
+	_first_mode left open to its owner,
 	deepest first (each parent still searchable while its children are set), each fsynced through its own descriptor
 	(_finish_directory, late)."""
 	late = [record for record in records if record[2] is not None and _first_mode(record[2]) != record[2]]
@@ -15272,7 +15294,6 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = None,
 				print(f"Number of files / links: {len(total_file_list)}")
 				print(f"Number of links: {len(total_sym_links)}")
 				print(f"Total time taken: {time.monotonic()-programStartTime:0.4f} seconds")
-		removal_ended = False
 		try:
 			if remove and copy_failures:
 				eprint(f'Remove skipped: not removing {_sources_text(src_paths)}: the copy reported {len(copy_failures)} error(s); '
@@ -15293,16 +15314,13 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = None,
 				_check_stop()
 				process_remove(src_paths,single_thread=single_thread, max_workers=max_workers,verbose=verbose,
 							files_per_job=files_per_job, remove_force=remove_force,exclude=exclude,batch=batch,parallel_file_listing=parallel_file_listing)
-			# Skipped for the copy's errors, the move is not done: the message's remedy is a rerun (see below).
-			removal_ended = not copy_failures
 		finally:
 			if SYNC_COPIES:
 				# A non-root move's directories whose exact mode takes their owner's search (0607): set after the removal step
-				# that looked below them. After a stop or an error in it, or where it was skipped for the copy's errors (a rerun
-				# is their remedy), only those whose source directory it removed: no rerun reaches them; the others keep owner read
-				# and search for the rerun, whose folder sync looks below them (a rerun over a 0607 one can fail:
-				# docs/limitations.md).
-				_finish_late(dir_records if removal_ended else [record for record in dir_records if not os.path.lexists(record[0])])
+				# that looked below them, on every path (a stop, an error in it, a removal skipped for the copy's errors): a rerun
+				# over such a directory gives it owner search where it walks below it (_owner_search), and its finish sets the
+				# exact mode again.
+				_finish_late(dir_records)
 	except KeyboardInterrupt:
 		# The stop is acted on: later checks (_check_stop) change nothing.
 		global _STOP_ACTED
