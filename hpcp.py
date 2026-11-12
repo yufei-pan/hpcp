@@ -806,6 +806,8 @@ def _mtimes_agree(first_ns, second_ns):
 	rounds a time to its step, so a copy's time lies less than one step of the coarser time away (_mtime_step_ns). And a
 	time set through float seconds (os.utime with st_mtime, as many Python tools do) lands within half a float step of
 	where it was, so one float step at that time is the least difference: 238 ns from 2004 to 2038."""
+	if first_ns == second_ns:
+		return True  # what a rerun meets on nearly every file: no step to work out
 	float_step_ns = 2.0 ** (math.frexp(max(abs(first_ns), abs(second_ns)) / 1e9)[1] - 53) * 1e9
 	return abs(first_ns - second_ns) <= max(_mtime_step_ns(first_ns), _mtime_step_ns(second_ns), float_step_ns)
 
@@ -813,6 +815,8 @@ def _time_stored_as(stored_ns, wanted_ns):
 	"""Whether a destination that reads back stored_ns holds wanted_ns as well as it can: within the step it keeps (its own
 	time's, _mtime_step_ns) or one float step (_mtimes_agree). Not within the wanted time's step: a source time on an even
 	second (vfat's) is no reason to leave a finer destination's time 1.5 s off it."""
+	if stored_ns == wanted_ns:
+		return True  # what a rerun meets on nearly every directory: no step to work out
 	float_step_ns = 2.0 ** (math.frexp(max(abs(stored_ns), abs(wanted_ns)) / 1e9)[1] - 53) * 1e9
 	return abs(stored_ns - wanted_ns) <= max(_mtime_step_ns(stored_ns), float_step_ns)
 
@@ -3050,7 +3054,8 @@ def create_sym_links(symLinks,exclude=None,link_tracking=False,link_dirs=None):
 	start_time = time.monotonic()
 	for src, dests in symLinks.items():
 		_check_stop()
-		# The door's result for each destination's directory (none: missing, or refused, kept in refusals); closed below.
+		# The door's answer for each destination's directory (none: missing, or refused, kept in refusals), each a dup (_kept):
+		# a link whose target is tracked copies it (copy_files_serial) through the door while these are held. Closed below.
 		bases, refusals = {}, {}
 		try:
 			src = os.path.normpath(src)
@@ -3066,7 +3071,7 @@ def create_sym_links(symLinks,exclude=None,link_tracking=False,link_dirs=None):
 				if d in bases or d in refusals:
 					continue  # a destination given twice is asked once (copy_file)
 				try:
-					bases[d] = _dest_directory(os.path.dirname(d), make=False, source=os.path.dirname(os.path.abspath(src)))
+					bases[d] = _kept(_dest_directory(os.path.dirname(d), make=False, source_file=src))
 				except _Refused as e:
 					refusals[d] = e
 				except OSError:
@@ -3161,7 +3166,7 @@ def create_sym_links(symLinks,exclude=None,link_tracking=False,link_dirs=None):
 					if bases.get(dest) is None:
 						# The link's directory, made as a file's is (-nds, or a link reached through a linked directory, has none
 						# yet); under -ncd, a missing one by its path, which the link's make meets.
-						bases[dest] = _dest_directory(os.path.dirname(dest), make=not NO_CREATE_DIR, source=os.path.dirname(os.path.abspath(src)))
+						bases[dest] = _kept(_dest_directory(os.path.dirname(dest), make=not NO_CREATE_DIR, source_file=src))
 					base = bases[dest] if bases[dest] is not None else os.path.dirname(dest)
 					# A relative target is resolved from the link's directory (Windows makes directory and file links apart).
 					os.symlink(linkedTargetFile, *_at(base, os.path.basename(dest)),
@@ -3999,25 +4004,28 @@ def _named_root(path):
 			found = root
 	return found
 
-def _landing_of(dest_path, base):
+def _landing_of(dest_path, base, landing=None):
 	"""(where a copy to dest_path writes, its lstat or None, named). A destination the operator named (-d) is followed when it
 	is a link, as cp follows its destination argument (outside a run, every path counts as named); a landing below one is a
 	name of the tree and never followed: a link, FIFO, socket or device node there is replaced, never opened (_cp_once).
 	base: the door's result for the landing's directory (_dest_directory), which the landing is looked at relative to; None
-	where the door found that directory missing: nothing is there."""
-	target, named = _landing_path(dest_path)
+	where the door found that directory missing: nothing is there. landing: _landing_path(dest_path), where the caller has it."""
+	target, named = landing or _landing_path(dest_path)
 	if base is None:
 		return target, None, named
 	try:
-		return target, os.lstat(*_at(base, os.path.basename(target)), **_fd_of(base)), named
+		if base.__class__ is int:
+			return target, os.lstat(os.path.basename(target), dir_fd=base), named
+		return target, os.lstat(os.path.join(base, os.path.basename(target))), named
 	except OSError:
 		return target, None, named
 
 def _landing_path(dest_path):
 	"""(where a copy to dest_path writes, named), as _landing_of gives them, without its lstat of the landing: below a named
 	destination nothing is looked at."""
-	root = _named_root(os.path.abspath(dest_path))
-	named = root is None or root == os.path.abspath(dest_path)
+	absolute = os.path.abspath(dest_path)
+	root = _named_root(absolute)
+	named = root is None or root == absolute
 	target = dest_path
 	if named and os.path.islink(dest_path):
 		try:
@@ -4165,13 +4173,21 @@ def _why(e):
 # operator named it); each step below it adds O_NOFOLLOW (_door_step).
 _HOLD_PATH_FLAGS = getattr(os, 'O_PATH', 0) | getattr(os, 'O_DIRECTORY', 0) | getattr(os, 'O_CLOEXEC', 0)
 _HOLD_READ_FLAGS = os.O_RDONLY | getattr(os, 'O_NONBLOCK', 0) | getattr(os, 'O_DIRECTORY', 0) | getattr(os, 'O_CLOEXEC', 0)
+_O_NOFOLLOW = getattr(os, 'O_NOFOLLOW', 0)
 
 # Per process, in a run (RUN_ID): {named destination (absolute): the directories the door holds from it down to the last
 # one asked for (_HeldDirs), or the refusal of one that no longer leads to its pin (NAMED_IDS)}. A forked worker inherits
-# its parent's, whose descriptors stay valid in it. The cursor's own descriptors never leave it (the door hands out a dup):
-# the next door call may close them, and a number reused then would lead a stale holder's write elsewhere.
+# its parent's, whose descriptors stay valid in it. The door lends its answer, the cursor's own descriptor: its next call
+# below the same named destination may close it, and a number reused then would lead a stale holder's write elsewhere, so
+# a caller that holds an answer across another door call keeps a dup of it (_kept) and closes that.
 _CURSORS = {}
-_CURSORS_RUN = [None]
+# The door's last answer in this process, (the path as asked, its run, the descriptor): asked for the same path again with no
+# door call between (a wide directory's landings one after another, a finish's parent), it answers at once, as 9.87's door
+# answered from its memo. Every call that may move a cursor clears it first, as does _close_cursors.
+_DOOR_LAST = [None]
+# [the run whose cursors these are (RUN_ID), this process's budget for them (_hold_budget, taken at the run's start: a forked
+# worker inherits it with the limit it was taken from)]
+_CURSORS_RUN = [None, None]
 # The way by path (9.87's door), where nothing is held (no descriptor calls: Windows; the open-files limit; a directory the read
 # route cannot enter): the components this process has walked in the run, each looked at once, and the named destinations
 # whose pin it has checked. Cleared with the cursors.
@@ -4179,24 +4195,22 @@ _BY_PATH = {}
 # How many directories the door may hold at once in a process: half its open-files limit, so the other half stays for what a
 # copy opens beside them (its held file, cp's pipes, the pool's, the skip check's reads). Deeper levels go by path (macOS
 # keeps its soft limit of 256: past 128 levels; Linux, where hpcp raises it to the hard limit at import, past 262,144, or
-# 2,048 on EL7, deeper than the 4,096 characters a listed path holds). (pid, the budget) per process.
-_HOLD_BUDGET = [None, None]
+# 2,048 on EL7, deeper than the 4,096 characters a listed path holds). Taken once a run in each process (_cursors_of_run).
 
 def _hold_budget():
-	"""This process's _HOLD_BUDGET: half the soft open-files limit (none where it is unlimited or cannot be read)."""
-	if _HOLD_BUDGET[0] != os.getpid():
-		budget = None
-		with contextlib.suppress(ImportError, ValueError, OSError):
-			import resource
-			soft = resource.getrlimit(resource.RLIMIT_NOFILE)[0]
-			if soft != resource.RLIM_INFINITY and soft > 0:
-				budget = soft // 2
-		_HOLD_BUDGET[:] = [os.getpid(), budget]
-	return _HOLD_BUDGET[1]
+	"""How many directories the door may hold in this process: half the soft open-files limit (None where it is unlimited or
+	cannot be read)."""
+	with contextlib.suppress(ImportError, ValueError, OSError):
+		import resource
+		soft = resource.getrlimit(resource.RLIMIT_NOFILE)[0]
+		if soft != resource.RLIM_INFINITY and soft > 0:
+			return soft // 2
+	return None
 
 def _close_cursors():
 	"""Close every descriptor the door holds in this process, and forget what it walked by path (a new run, the run's end)."""
 	_BY_PATH.clear()
+	_DOOR_LAST[0] = None
 	while _CURSORS:
 		held = _CURSORS.popitem()[1]
 		if isinstance(held, _HeldDirs):
@@ -4206,15 +4220,20 @@ def _cursors_of_run():
 	"""What the door holds and remembers is one run's (RUN_ID): a process that meets another run's first closes it."""
 	if _CURSORS_RUN[0] != RUN_ID:
 		_close_cursors()
-		_CURSORS_RUN[0] = RUN_ID
+		_CURSORS_RUN[:] = [RUN_ID, _hold_budget()]
+
+def _kept(base):
+	"""A door's answer (_dest_directory) that its caller holds across another door call: a dup of it where it is a
+	descriptor (the caller's to close, _close_base, always in a finally), else itself."""
+	return os.dup(base) if base.__class__ is int else base
 
 def _close_base(base):
-	"""Close a door's result (_dest_directory) where it is a descriptor: the caller's, always in a finally."""
+	"""Close a door's answer kept by its caller (_kept) where it is a descriptor; never one the door lent."""
 	if isinstance(base, int):
 		os.close(base)
 
 def _close_bases(bases):
-	"""Close every door result in bases ({destination: the door's result}), each even when another's close raises; the first
+	"""Close every kept door answer in bases ({destination: _kept's result}), each even when another's close raises; the first
 	error is raised after the last close."""
 	error = None
 	for base in bases.values():
@@ -4327,7 +4346,7 @@ def _door_step(base, name, current, make, source, below):
 		missing = False
 		if held:
 			try:
-				return os.open(name, (_HOLD_PATH_FLAGS if _PATH_FDS else _HOLD_READ_FLAGS) | getattr(os, 'O_NOFOLLOW', 0), dir_fd=base)
+				return os.open(name, (_HOLD_PATH_FLAGS if _PATH_FDS else _HOLD_READ_FLAGS) | _O_NOFOLLOW, dir_fd=base)
 			except OSError as e:
 				if e.errno not in (errno.ENOENT, errno.ENOTDIR, errno.ELOOP):
 					raise
@@ -4411,19 +4430,27 @@ def _door_by_path(start, parts, make, source):
 		_BY_PATH[current] = True
 	return current
 
-def _dest_directory(path, make=True, source=None):
+def _dest_directory(path, make=True, source=None, source_file=None):
 	"""The one door for a directory below a destination: path as a real directory, and where its names are made from: a
-	descriptor of it (a dup of the cursor's, the caller's to close in a finally: _close_base), or path itself where nothing
-	is held (no named destination above it: a library call; no descriptor calls, _DIR_FD_WALK; _by_path_error); None when
-	path or a directory on its way is missing and make is False (not under -ncd for a file's parent). The destination the
-	operator named and what is above it are made as os.makedirs makes them, through links (it is named), and it is opened
-	once per process in a run, following a link, and checked against the run's pin (NAMED_IDS; the parent's open is the pin's,
-	_named_ids): one that leads to another directory now is refused for everything below it (_Refused, said once a process).
+	descriptor of it, lent (the cursor's own: valid until the door's next call in this process below the same named
+	destination, never closed by the caller; one that holds it across another door call keeps a dup, _kept), or path
+	itself where nothing is held (no named destination above it: a library call; no descriptor calls, _DIR_FD_WALK;
+	_by_path_error); None when path or a directory on its way is missing and make is False (not under -ncd for a file's
+	parent). The destination the operator named and what is above it are made as os.makedirs makes them, through links (it
+	is named), and it is opened once per process in a run, following a link, and checked against the run's pin (NAMED_IDS;
+	the parent's open is the pin's, _named_ids): one that leads to another directory now is refused for everything below it
+	(_Refused, said once a process).
 	Below it each component is opened one level at a time without following a link (_door_step: its rules for
-	what is there; source: the source directory that lands at path, to name the -d form in a note), and the levels shared
+	what is there; source: the source directory that lands at path, to name the -d form in a note, or source_file: a source
+	file that lands in path, whose directory that is, worked out only when the door walks), and the levels shared
 	with the last path asked for are kept open (_HeldDirs): a directory swapped for a link after it was opened is no longer
 	on the way, as hpcp writes into the one it holds, wherever it is now. Where nothing can be held the walk is 9.87's, by path,
 	each component looked at once a process in a run (_BY_PATH)."""
+	last = _DOOR_LAST[0]
+	if last is not None and last[0] == path and last[1] == RUN_ID:
+		return last[2]
+	_DOOR_LAST[0] = None
+	asked = path
 	path = os.path.abspath(path)
 	root = _named_root(path)
 	if root is None:
@@ -4431,11 +4458,21 @@ def _dest_directory(path, make=True, source=None):
 			_makedirs(path, exist_ok=True)
 			return path
 		return path if os.path.isdir(path) else None
-	_cursors_of_run()
+	if _CURSORS_RUN[0] != RUN_ID:
+		_cursors_of_run()
 	parts = path[len(root.rstrip(os.sep)) + 1:].split(os.sep) if path != root else []
+	count = len(parts)
 	held = _CURSORS.get(root)
-	if isinstance(held, _Refused):
+	if held.__class__ is _HeldDirs:
+		names = held.names
+		if len(names) == count + 1 and names[1:] == parts:
+			# the directory this cursor's last call answered with (the memo missed: another spelling, another destination's call)
+			_DOOR_LAST[0] = (asked, RUN_ID, held.fds[-1])
+			return held.fds[-1]
+	elif isinstance(held, _Refused):
 		raise _Refused(held.before, held.after, said=True)
+	if source_file is not None:
+		source = os.path.dirname(os.path.abspath(source_file))
 	if held is None:
 		pinned = NAMED_IDS.get(root)
 		if make and pinned is None:
@@ -4476,32 +4513,44 @@ def _dest_directory(path, make=True, source=None):
 					'in: not copying ', '; run hpcp again to write where it leads now')
 				raise refusal
 		held = _CURSORS[root] = _HeldDirs(fd)
-	depth = 0
-	while depth < len(parts) and depth + 1 < len(held) and held.names[depth + 1] == parts[depth]:
+	names, fds = held.names, held.fds
+	depth, below = 0, len(fds) - 1  # the levels held below the root
+	shared = count if count < below else below
+	while depth < shared and names[depth + 1] == parts[depth]:
 		depth += 1
-	held.truncate(depth)
-	budget = _hold_budget()
-	for index in range(depth, len(parts)):
-		current = os.path.join(root, *parts[:index + 1])
-		if budget is not None and sum(len(other) for other in _CURSORS.values() if isinstance(other, _HeldDirs)) >= budget:
-			return _door_by_path(os.path.dirname(current), parts[index:], make, source)
+	while below > depth:
+		os.close(fds.pop())  # held.truncate(depth), inline: the levels not shared with path
+		names.pop()
+		below -= 1
+	if depth == count:
+		_DOOR_LAST[0] = (asked, RUN_ID, fds[-1])
+		return fds[-1]
+	budget = _CURSORS_RUN[1]
+	flags = (_HOLD_PATH_FLAGS if _PATH_FDS else _HOLD_READ_FLAGS) | _O_NOFOLLOW
+	for index in range(depth, count):
+		# the root and index levels held here (this cursor's, where it is the only one)
+		if budget is not None and (index + 1 if len(_CURSORS) == 1 else
+				sum(len(other.fds) for other in _CURSORS.values() if isinstance(other, _HeldDirs))) >= budget:
+			return _door_by_path(os.path.join(root, *parts[:index]), parts[index:], make, source)
 		try:
-			fd = _door_step(held.top(), parts[index], current, make, source, len(parts) - 1 - index)
-		except OSError as e:
-			if _by_path_error(e):
-				return _door_by_path(os.path.dirname(current), parts[index:], make, source)
-			if e.filename == parts[index]:
-				e.filename = current  # a call relative to the held directory names the component alone: messages name its path
-			raise
-		if fd is None:
-			return None
-		held.push(parts[index], fd)
-	try:
-		return os.dup(held.top())
-	except OSError as e:
-		if e.errno in (errno.EMFILE, errno.ENFILE):
-			return path  # nothing to hold it with: by path, as 9.87
-		raise
+			fd = os.open(parts[index], flags, dir_fd=fds[-1])  # a directory there: what nearly every level is
+		except OSError:
+			# what is there, or the error, looked at by the rules (_door_step: it opens again, and a level made since is taken)
+			current = os.path.join(root, *parts[:index + 1])
+			try:
+				fd = _door_step(fds[-1], parts[index], current, make, source, len(parts) - 1 - index)
+			except OSError as e:
+				if _by_path_error(e):
+					return _door_by_path(os.path.dirname(current), parts[index:], make, source)
+				if e.filename == parts[index]:
+					e.filename = current  # a call relative to the held directory names the component alone: messages name its path
+				raise
+			if fd is None:
+				return None
+		fds.append(fd)  # held.push, inline; the descriptor first, so whatever is held is closed with the cursor
+		names.append(parts[index])
+	_DOOR_LAST[0] = (asked, RUN_ID, fd)
+	return fd
 
 def _read_through(path):
 	"""None when path, a regular file, reads to its end now (1 MiB reads, discarded), else the error: under -rbw a source that
@@ -5005,14 +5054,14 @@ def _cp_once(src_path, dest_path, cp_flags, sparse, space=None, look=None, src_s
 	a destination, never opened), anything the open finds changed since the look, and every rewrite under -wb: beside it,
 	renamed over it once whole (_cp_beside); never to cp by name. look: _landing_of(dest_path, base) when the caller just
 	took it (copy_file's first attempt); src_st: the source's lstat. base: the door's result for the landing's directory
-	(copy_file's, which closes it), every name below it made, looked at and written relative to it; None: the door is asked
-	here (made, not under -ncd), its result closed here. An OSError raised out names its file by the logical path."""
-	opened = None
+	(copy_file's), every name below it made, looked at and written relative to it; None: the door is asked here (made, not
+	under -ncd). An OSError raised out names its file by the logical path."""
 	try:
 		if base is None:
 			directory = os.path.dirname(_landing_path(dest_path)[0])
-			opened = _dest_directory(directory, make=not NO_CREATE_DIR, source=os.path.dirname(os.path.abspath(src_path)))
-			base = directory if opened is None else opened
+			base = _dest_directory(directory, make=not NO_CREATE_DIR, source_file=src_path)
+			if base is None:
+				base = directory
 		target, st, named = look or _landing_of(dest_path, base)
 		_judge_landing(dest_path, target, st, named)
 		command = ["cp", cp_flags] + (["--sparse=always"] if sparse and cp_supports_sparse() else [])
@@ -5027,8 +5076,6 @@ def _cp_once(src_path, dest_path, cp_flags, sparse, space=None, look=None, src_s
 		raise OSError(errno.EAGAIN, 'it kept changing while it was copied', target)
 	except OSError as e:
 		raise _shown(e, os.path.dirname(os.path.abspath(dest_path)), base)
-	finally:
-		_close_base(opened)
 
 def _judge_landing(dest_path, target, st, named):
 	"""What no look at a landing lets through (_cp_once), at every look: a dangling link the operator named (cp writes through
@@ -5200,7 +5247,11 @@ def _known_identical(src_path, dest_path, src_size, full_hash, src_st=None, dest
 	dest_open = None
 	if base is not None:
 		name = os.path.basename(dest_path)
-		dest_open = lambda: os.fdopen(os.open(*_at(base, name), _LANDING_READ_FLAGS, **_fd_of(base)), 'rb')
+		if base.__class__ is int:
+			dest_open = lambda: open(os.open(name, _LANDING_READ_FLAGS, dir_fd=base), 'rb')
+		else:
+			name = os.path.join(base, name)
+			dest_open = lambda: open(os.open(name, _LANDING_READ_FLAGS), 'rb')
 	try:
 		if CONTENT_ONLY and HASH_SIZE > 0:
 			src_st, dest_st = src_st or os.stat(src_path), dest_st or os.stat(dest_path)
@@ -5216,6 +5267,9 @@ def _known_identical(src_path, dest_path, src_size, full_hash, src_st=None, dest
 
 # The errors shutil.copystat's xattr copy ignores (3.6 to 3.14, together): a name the destination or the runner cannot have.
 _XATTR_SKIPPED = frozenset((errno.EPERM, errno.ENOTSUP, errno.EOPNOTSUPP, errno.ENODATA, errno.EINVAL, errno.EACCES))
+# How _settle_identical opens an identical landing: O_PATH on Linux with /proc (_PATH_FDS), elsewhere a regular file for reading.
+_SETTLE_PATH_FLAGS = getattr(os, 'O_PATH', 0) | _O_NOFOLLOW | getattr(os, 'O_CLOEXEC', 0)
+_SETTLE_READ_FLAGS = os.O_RDONLY | _O_NOFOLLOW | getattr(os, 'O_NONBLOCK', 0) | getattr(os, 'O_CLOEXEC', 0)
 
 def _settle_identical(src_path, src_st, dest, look, base=None):
 	"""Give dest, a landing the skip check found identical to src_path (look: its lstat then; src_st: the source's, taken before
@@ -5235,11 +5289,9 @@ def _settle_identical(src_path, src_st, dest, look, base=None):
 	leaf = os.path.basename(dest)
 	fd = None
 	try:
-		if _PATH_FDS:
-			fd = os.open(*_at(base, leaf), os.O_PATH | os.O_NOFOLLOW | getattr(os, 'O_CLOEXEC', 0), **_fd_of(base))
-		elif stat.S_ISREG(look.st_mode):
-			fd = os.open(*_at(base, leaf), os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NONBLOCK', 0) | getattr(os, 'O_CLOEXEC', 0),
-				**_fd_of(base))
+		if _PATH_FDS or stat.S_ISREG(look.st_mode):
+			how = _SETTLE_PATH_FLAGS if _PATH_FDS else _SETTLE_READ_FLAGS
+			fd = os.open(leaf, how, dir_fd=base) if base.__class__ is int else os.open(os.path.join(base, leaf), how)
 	except OSError as e:
 		if e.errno in (errno.ENOENT, errno.ELOOP):
 			return False  # gone, or a link put there (O_NOFOLLOW)
@@ -5342,16 +5394,32 @@ def copy_file(src_path, dest_paths, full_hash=False, verbose=False, concurrent_p
 	Returns:
 		tuple: A tuple containing the size of the copied file, the time taken for the copy operation, and a dictionary of symbolic links encountered during the copy.
 	"""
-	# The door's result for each landing's directory (_dest_directory): every name below a destination is looked at, made and
-	# written relative to it; closed here whatever happens.
-	bases = {}
+	# The door's answer for each landing's directory (_dest_directory): every name below a destination is looked at, made and
+	# written relative to it. Lent by the door, and nothing here asks it for another directory below the same destination
+	# while one is in use, except where two landings lie below one named destination (one -d inside another): there each
+	# is a dup (_kept), kept in owned and closed here whatever happens.
+	bases, owned = {}, {}
 	try:
-		return _copy_file(src_path, dest_paths, full_hash, verbose, concurrent_processes, bases)
+		return _copy_file(src_path, dest_paths, full_hash, verbose, concurrent_processes, bases, owned)
 	finally:
-		_close_bases(bases)
+		if owned:
+			_close_bases(owned)
 
-def _copy_file(src_path, dest_paths, full_hash, verbose, concurrent_processes, bases):
-	"""copy_file's body; bases: {dest: the door's result for its landing's directory}, filled here, closed by copy_file."""
+def _look(dest, bases, landing):
+	"""copy_file's look at dest (_landing_of; landing: its _landing_path), relative to the door's answer for its directory
+	(bases); where the door could not answer (a transient error: kept out of bases) by its path, as 9.87 looked: nothing
+	there is only what the door found missing (None)."""
+	return _landing_of(dest, bases[dest] if dest in bases else os.path.dirname(landing[0]), landing)
+
+def _share_a_destination(directories):
+	"""Whether two of directories (the landings' directories of one file) lie below one named destination, where the door's
+	answer for one can be closed by its call for the other."""
+	roots = [root for root in (_named_root(os.path.abspath(directory)) for directory in directories) if root is not None]
+	return len(set(roots)) < len(roots)
+
+def _copy_file(src_path, dest_paths, full_hash, verbose, concurrent_processes, bases, owned):
+	"""copy_file's body; bases: {dest: the door's answer for its landing's directory}, filled here; owned: those that are
+	dups (_kept), closed by copy_file."""
 	global RANDOM_DESTINATION_SELECTION
 	global NO_CREATE_DIR
 	global CONTENT_ONLY
@@ -5374,11 +5442,17 @@ def _copy_file(src_path, dest_paths, full_hash, verbose, concurrent_processes, b
 	# metadata, the node probe, the copy) goes relative to the directory it holds (bases). A destination the door refuses is
 	# left out, its refusal kept; one whose directory is missing (None) is made by the door at the copy (_cp_once).
 	refused = {}
+	# Each landing's path (_landing_path) once: the door's directory, the look and the copy act on it.
+	landings = {dest: _landing_path(dest) for dest in dest_paths}
+	keep = len(landings) > 1 and _share_a_destination([os.path.dirname(landing[0]) for landing in landings.values()])
 	for dest in dest_paths:
 		if dest in bases or dest in refused:
 			continue  # a destination given twice (-d out -d out) is asked once: a second answer would replace the first, never closed
 		try:
-			bases[dest] = _dest_directory(os.path.dirname(_landing_path(dest)[0]), make=False, source=os.path.dirname(os.path.abspath(src_path)))
+			base = _dest_directory(os.path.dirname(landings[dest][0]), make=False, source_file=src_path)
+			if keep and base.__class__ is int:
+				base = owned[dest] = os.dup(base)
+			bases[dest] = base
 		except _Refused as e:
 			refused[dest] = e
 		except OSError:
@@ -5389,11 +5463,7 @@ def _copy_file(src_path, dest_paths, full_hash, verbose, concurrent_processes, b
 			for refusal in refused.values():
 				_copy_failed(src_path, refusal.text(src_path), refusal.said)
 			return 0, time.monotonic() - start_time, symLinks
-	# A directory the door could not answer for (a transient error: kept out of bases above) is looked at by its path, as 9.87 did:
-	# nothing there is only what the door found missing (None).
-	def look_at(dest):
-		return _landing_of(dest, bases[dest] if dest in bases else os.path.dirname(_landing_path(dest)[0]))
-	looks = {dest: look_at(dest) for dest in dest_paths}
+	looks = {dest: _look(dest, bases, landings[dest]) for dest in dest_paths}
 	if not src_is_link:
 		# cp would put the file inside a directory at its place (dest/x/x), and a move would then lose the source. A link there
 		# is a name of the tree, replaced, unless the operator named it (_landing_of).
@@ -5407,6 +5477,7 @@ def _copy_file(src_path, dest_paths, full_hash, verbose, concurrent_processes, b
 		copiedSize = 0
 		src_kind = stat.S_IFMT(src_st.st_mode) if src_st is not None else None
 		for dest in dest_paths:
+			base = bases.get(dest)
 			# A landing that changed between the skip check's look and its settling is looked at and judged again, as the door
 			# bounds its own race.
 			for _ in range(3):
@@ -5416,22 +5487,22 @@ def _copy_file(src_path, dest_paths, full_hash, verbose, concurrent_processes, b
 				if src_st is None or src_is_link or dest_st is None or not (stat.S_ISREG(dest_st.st_mode) or
 						(not stat.S_ISDIR(dest_st.st_mode) and stat.S_IFMT(dest_st.st_mode) == src_kind)):
 					break
-				if not _known_identical(src_path, target, src_st.st_size, full_hash, src_st=src_st, dest_st=dest_st, base=bases.get(dest)):
+				if not _known_identical(src_path, target, src_st.st_size, full_hash, src_st=src_st, dest_st=dest_st, base=base):
 					break
 				try:
-					settled = CONTENT_ONLY or _settle_identical(src_path, src_st, target, dest_st, bases.get(dest))
+					settled = CONTENT_ONLY or _settle_identical(src_path, src_st, target, dest_st, base)
 				except OSError as e:
 					# Identical, but what the skip gives it cannot be set (a read-only mount, another user's file): a failed
 					# copy that names the landing.
 					_copy_failed(src_path, f'Copy failed: ERROR copying {src_path} to {target}: it holds the source\'s content, but its owner, mode, times or xattrs cannot be set ({_why(e)})')
 					return 0, time.monotonic() - start_time, symLinks
 				if not settled:
-					looks[dest] = look_at(dest)
+					looks[dest] = _look(dest, bases, landings[dest])
 					continue
 				if SYNC_COPIES:
 					# A copy an earlier run left (or a plain copy before this move) may still be in memory.
 					try:
-						_sync_landing(target, bases.get(dest))
+						_sync_landing(target, base)
 					except _NotOnDisk as e:
 						_copy_failed(src_path, f'Copy failed: ERROR copying {src_path} to {target}: {e}')
 						return 0, time.monotonic() - start_time, symLinks
@@ -5500,9 +5571,11 @@ def _copy_file(src_path, dest_paths, full_hash, verbose, concurrent_processes, b
 							if bases.get(dest_path) is None:
 								# Missing at the look: judged as the look is (a dangling link the operator named makes no directory),
 								# then the door makes it (not under -ncd) and holds it for the copy (one door call a landing otherwise).
-								_judge_landing(dest_path, *(looks.get(dest_path) or _landing_of(dest_path, None)))
-								bases[dest_path] = _dest_directory(os.path.dirname(_landing_path(dest_path)[0]), make=not NO_CREATE_DIR,
-									source=os.path.dirname(os.path.abspath(src_path)))
+								_judge_landing(dest_path, *(looks.get(dest_path) or _landing_of(dest_path, None, landings[dest_path])))
+								base = _dest_directory(os.path.dirname(landings[dest_path][0]), make=not NO_CREATE_DIR, source_file=src_path)
+								if keep and base.__class__ is int:
+									base = owned[dest_path] = os.dup(base)
+								bases[dest_path] = base
 							# The first attempt at a destination acts on its look; a later one looks again.
 							copiedSize = _cp_once(src_path, dest_path, cp_flags, sparse, space, look=looks.pop(dest_path, None), src_st=src_st,
 								base=bases[dest_path])
@@ -6131,9 +6204,9 @@ def _below(dest, relative):
 
 def _make_dest_directory(src_path, dest_path):
 	"""dest_path as the directory src_path lands on, made if missing, through the one door (_dest_directory): below a
-	named destination a link, FIFO or node there is replaced by the directory. Returns the door's result for it (a
-	descriptor the caller closes, _close_base, or its path); None when a file is in the way, or what is there cannot be
-	replaced, which is reported."""
+	named destination a link, FIFO or node there is replaced by the directory. Returns the door's answer for it (a
+	descriptor the door lends, valid until its next call below the same destination, or its path); None when a file is in
+	the way, or what is there cannot be replaced, which is reported."""
 	named = _landing_path(dest_path)[1]
 	if os.path.lexists(dest_path) and not os.path.isdir(dest_path) and (named or stat.S_ISREG(os.lstat(dest_path).st_mode)):
 		# A file (or a link to one the operator named) is no directory's to take: its mode and owner stay, and nothing can be
@@ -6215,9 +6288,10 @@ def _start_directory(src_path, dest_path, st, held=None):
 	if CONTENT_ONLY:
 		return (src_path, dest_path, None, None, None, None)
 	directory = _held_directory(held, dest_path)
+	looked = held if held.__class__ is int else directory  # a held descriptor's fstat: no walk through /proc/self/fd
 	try:
 		mode = stat.S_IMODE(st.st_mode)
-		now = os.stat(directory)
+		now = os.stat(looked)
 		current = stat.S_IMODE(now.st_mode)
 		runner = os.geteuid() if hasattr(os, 'geteuid') else 0
 		if runner and now.st_uid == runner and current & stat.S_IRWXU != stat.S_IRWXU:
@@ -6226,14 +6300,14 @@ def _start_directory(src_path, dest_path, st, held=None):
 			current |= stat.S_IRWXU
 			os.chmod(directory, current)
 		if _sync_xattrs(src_path, directory):
-			now = os.stat(directory)
+			now = os.stat(looked)
 			current = stat.S_IMODE(now.st_mode)
 		if os.name == 'posix':
 			if (now.st_uid, now.st_gid) != (st.st_uid, st.st_gid):
 				owner_kept, group_kept = _chown_like_cp(directory, st)
 				# chmod after chown: no set-user-ID / set-group-ID bit for an owner / group not kept (9.86's rule).
 				mode &= ~((0 if owner_kept else stat.S_ISUID) | (0 if group_kept else stat.S_ISGID))
-				now = os.stat(directory)
+				now = os.stat(looked)
 				current = stat.S_IMODE(now.st_mode)
 			opened = mode
 			if runner and now.st_uid == runner:
@@ -6269,16 +6343,14 @@ def _sync_directory(src_path, dest_paths):
 		return 1, time.monotonic() - start_time, {}, []
 	records = []
 	for dest_path in dest_paths:
-		# One directory that cannot be created or synced is recorded; the others (and the other dests) go on.
-		held = None
+		# One directory that cannot be created or synced is recorded; the others (and the other dests) go on. The door's answer
+		# is used before the next dest's door call.
 		try:
 			held = _make_dest_directory(src_path, dest_path)
 			if held is not None:
 				records.append(_start_directory(src_path, dest_path, st, held))
 		except OSError as e:
 			eprint(f'Directory sync error: {src_path} to {dest_path}: {e}')
-		finally:
-			_close_base(held)
 	return 1, time.monotonic() - start_time, {}, records
 
 def sync_directory_metadata(src_path, dest_paths):
@@ -6337,24 +6409,21 @@ def _finish_directory(record, sync=False, late=False):
 	path = os.path.abspath(dest_path)
 	base = None
 	try:
-		try:
-			if path in NAMED_DESTS:
-				# the named destination, followed as named, through the door's open of it
-				base, name = _dest_directory(path, make=False), os.curdir
-			else:
-				how |= getattr(os, 'O_NOFOLLOW', 0)
-				base, name = _dest_directory(os.path.dirname(path), make=False), os.path.basename(path)
-			if base is None:
-				raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), dest_path)
-			fd = os.open(*_at(base, name), how, **_fd_of(base))
-		except _Refused as e:
-			_say_refused(e, f'the directory {src_path}')
-			return
-		except OSError as e:
-			eprint(f'Directory sync error: {src_path} to {dest_path}: {_shown(e, os.path.dirname(path), base)}')
-			return
-	finally:
-		_close_base(base)
+		if path in NAMED_DESTS:
+			# the named destination, followed as named, through the door's open of it
+			base, name = _dest_directory(path, make=False), os.curdir
+		else:
+			how |= _O_NOFOLLOW
+			base, name = _dest_directory(os.path.dirname(path), make=False), os.path.basename(path)
+		if base is None:
+			raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), dest_path)
+		fd = os.open(name, how, dir_fd=base) if base.__class__ is int else os.open(os.path.join(base, name), how)
+	except _Refused as e:
+		_say_refused(e, f'the directory {src_path}')
+		return
+	except OSError as e:
+		eprint(f'Directory sync error: {src_path} to {dest_path}: {_shown(e, os.path.dirname(path), base)}')
+		return
 	try:
 		try:
 			now = os.fstat(fd)
@@ -14171,7 +14240,7 @@ def process_copy(src_paths: list, dests:list = [], single_thread = False, max_wo
 					if not NO_CREATE_DIR:
 						for dest in dests:
 							try:
-								_close_base(_make_dest_directory(src, dest))
+								_make_dest_directory(src, dest)
 							except OSError as e:
 								eprint(f'Directory sync error: {src} to {dest}: {e}')
 				else:
