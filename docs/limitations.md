@@ -383,3 +383,11 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - **Plan (9.90):** pass `landings[dest_path]` into `_cp_once` and give it to both `_landing_of` calls, so a file's landing is worked out once. Probe C is the test.
 - **Revisit when:** 9.90.
 - **Noted:** 2026-11-12, the 9.89 final review's second-opinion lead (part 3); the main session's decision, not asked (a deferral).
+
+### A rerun to several destinations costs 1 to 2 % more CPU than 9.87's
+- **Kind:** deferred (9.90).
+- **What the operator sees:** with `-d out/ -d out2/ -s` and nothing to copy, a rerun uses +1.4 % CPU against 9.87 for 10,000 directories of one file and +2.3 % for 50 directories of 1,000 files (13 rounds each, Python 3.14, tmpfs in Docker; the host's load 5 to 14: paired ratios +1.2 % and +2.4 %; 9.88 +13.9 % and +15.5 %). Counted instructions a file are fewer than 9.87's (−2.9 % and −2.5 %): the extra is time, by reading the duplicate and close of each landing's directory descriptor a file with several landings. With one destination a rerun is within 0.7 % of 9.87's.
+- **Why:** `copy_file` keeps a duplicate of each landing's answer from the door whenever a file has several landings, because the door's call for one can close what the other's answer names where two landings lie below one named destination (one `-d` inside another; a lent answer then wrote a file into the wrong directory, measured). Asking first whether they do (9.89's `_share_a_destination`, per file) cost more than the duplicate it saved.
+- **Plan (9.90):** decide it once a run, not a file: the named destinations are known at the run's start, and two landings of a file share a door cursor only when one of them lies below another; duplicate only then, and measure it with the 9.89 bench (`-d out/ -d out2/ -s`, the two trees).
+- **Revisit when:** 9.90.
+- **Noted:** 2026-11-12, the 9.89 final review's F1 remainder (the review's proposal: "Deferred (9.90)"); the fixer's call, not asked (a deferral).
