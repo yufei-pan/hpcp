@@ -525,6 +525,7 @@ class Adaptive_Progress_Bar:
 		self.quiet = suppress_all_output
 		self.bytes_rate_limit = bytes_rate_limit
 		self.files_rate_limit = files_rate_limit
+		self.last_frame = float('-inf')  # when rate_limit last drew a frame: the first call draws one
 	def print_progress_thread(self):
 		while not self.stop_flag:
 			# sleep for refresh_interval
@@ -607,7 +608,13 @@ class Adaptive_Progress_Bar:
 				return False
 		return True
 	def rate_limit(self):
-		self.print_progress()
+		# A serial loop calls this after every file: a frame at most every refresh_interval (what a terminal shows anyway), and
+		# always the one at the total, which ends the bar's line. Drawing one a file cost about a third of a serial rerun's
+		# instructions a file.
+		now = time.monotonic()
+		if now - self.last_frame >= self.refresh_interval or (self.total_count > 0 and self.item_counter >= self.total_count):
+			self.last_frame = now
+			self.print_progress()
 		while not self.under_rate_limit():
 			# sleep for 0.1 seconds
 			time.sleep(self.refresh_interval)
@@ -3033,16 +3040,19 @@ def get_mount_table():
 	return mount_table
 
 #%% -- Symbolic Links --
-def create_sym_links(symLinks,exclude=None,link_tracking=False,link_dirs=None):
+def create_sym_links(symLinks,exclude=None,link_tracking=False,link_dirs=None,_tracked=None):
 	"""Recreate symLinks ({src link: [dest paths]}). Returns a (target's destination path, target's source path, link's
 	destination path) triple for each relative link whose target is excluded, and with link tracking (-lt) for each one
 	whose target exists at the source (copied now or already there): -rme keeps those targets, except where the copy
 	itself covers them (_kept_paths). link_dirs (a set, in a move): each directory a link was made in is added, for the
 	move's directory fsyncs (_sync_moved_directories). Each link's directory goes through the door first (_dest_directory,
 	nothing made), and the link already there, its removal, the test for what holds its place and the new link go relative
-	to what the door holds."""
+	to what the door holds. _tracked: the (target, its destinations) pairs link tracking already copied, or tried to, in this
+	call and the nested ones it makes: each is copied once, so a target whose copy fails and that holds a link to itself
+	(src/k/a/a -> ../a) is not tried again for each link the attempt finds in it, until Python's recursion limit."""
 	global RANDOM_DESTINATION_SELECTION
 	tracked_targets = set()
+	_tracked = set() if _tracked is None else _tracked
 	if len(symLinks) == 0:
 		return tracked_targets
 	nestedSymLinks = {}
@@ -3143,10 +3153,13 @@ def create_sym_links(symLinks,exclude=None,link_tracking=False,link_dirs=None):
 					else:
 						keep_target = True
 						if not dest:
-							# we also copy the pointed file if the file doesn't exist
+							# we also copy the pointed file if the file doesn't exist; once (_tracked)
 							destLinkedFiles = [os.path.normpath(destLinkedFile) for destLinkedFile in destLinkedFiles]
-							_, _ , rtnSymLinks , _ = copy_files_serial(sourceLinkedFile, destLinkedFiles,exclude=exclude)
-							nestedSymLinks.update(rtnSymLinks)
+							key = (sourceLinkedFile, tuple(destLinkedFiles))
+							if key not in _tracked:
+								_tracked.add(key)
+								_, _ , rtnSymLinks , _ = copy_files_serial(sourceLinkedFile, destLinkedFiles,exclude=exclude)
+								nestedSymLinks.update(rtnSymLinks)
 							dest = next((d for d, destLinkedFile in zip(dests, destLinkedFiles) if os.path.lexists(destLinkedFile)), '')
 					# Only worth saying when the target is not already at a destination (a copy would have been tried).
 					if note and not dest:
@@ -3217,7 +3230,7 @@ Skipping...""")
 	print(f"Time taken:             {endTime-start_time:0.4f} seconds")
 	if len(nestedSymLinks) > 0:
 		print(f"\nNested Symbolic Links:   {len(nestedSymLinks)}")
-		tracked_targets |= create_sym_links(nestedSymLinks,exclude=exclude,link_tracking=link_tracking,link_dirs=link_dirs)
+		tracked_targets |= create_sym_links(nestedSymLinks,exclude=exclude,link_tracking=link_tracking,link_dirs=link_dirs,_tracked=_tracked)
 	return tracked_targets
 
 #%% -- File list --

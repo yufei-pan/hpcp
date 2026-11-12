@@ -153,3 +153,42 @@ def test_990_a_device_node_onto_a_named_link_says_it_cannot_make_the_node(tmp_pa
 	assert 'beside' not in p.stdout, p.stdout
 	assert read(tmp_path / 'other' / 'real') == 'keep' and os.readlink(str(tmp_path / 'out' / 'l')) == '../other/real'
 	assert sorted(os.listdir(str(tmp_path / 'other'))) == ['real']
+
+
+# -- -lt: a link whose target directory holds it, and whose copy fails ---------------------------------------------------------
+
+@posix_only
+def test_990_link_tracking_tries_a_failing_target_once(tmp_path):
+	# src/k/a/a -> ../a, and out/k/a a file, so the tracked target's copy fails every time: 9.89 found the link nested in the
+	# target again after each attempt and tracked it again, until Python's recursion limit (992 'Copy failed' lines here,
+	# about 20,000 lines in all). The target is tried once.
+	os.makedirs(str(tmp_path / 'src' / 'k' / 'a'))
+	os.symlink('../a', str(tmp_path / 'src' / 'k' / 'a' / 'a'))
+	write(tmp_path / 'src' / 'k' / 'a' / 'g', 'x')
+	write(tmp_path / 'out' / 'k' / 'a', 'file')
+	p = subprocess.run([sys.executable, HPCP, 'src/k', '-d', 'out/', '-lt'], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+		universal_newlines=True, cwd=str(tmp_path))
+	assert p.returncode == 213, p.stdout[-2000:]
+	failed = [line for line in p.stdout.splitlines() if line.startswith('Copy failed')]
+	assert 1 <= len(failed) <= 3, (len(failed), p.stdout[-2000:])
+	assert read(tmp_path / 'out' / 'k' / 'a') == 'file'
+
+
+# -- A serial run's progress bar ------------------------------------------------------------------------------------------------
+
+@posix_only
+def test_990_a_serial_copy_draws_a_frame_at_most_each_refresh_and_the_last_at_the_total(tmp_path, fresh, monkeypatch):
+	# 9.89 drew a frame after every file of a serial run (rate_limit), a third of a serial rerun's instructions a file; one
+	# every 0.1 s is what a terminal shows anyway. The frame at the total is always drawn: it ends the bar's line.
+	count = 300
+	for index in range(count):
+		write(tmp_path / 'src' / ('f%03d' % index), 'x')
+	frames, real = [], hpcp.multiCMD.print_progress_bar
+	def frame(*args, **kwargs):
+		frames.append(args[:2])
+	monkeypatch.setattr(hpcp.multiCMD, 'print_progress_bar', frame)
+	with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+		hpcp.copy_files_serial(str(tmp_path / 'src'), [str(tmp_path / 'out')])
+	assert len(os.listdir(str(tmp_path / 'out'))) == count
+	assert frames and frames[-1] == (count, count), frames[-3:]
+	assert len(frames) < count // 4, len(frames)
