@@ -3,9 +3,9 @@
 # requires-python = ">=3.6"
 # dependencies = [
 #     "xxhash; python_version >= '3.7'",
-#     "multiCMD>=1.56",
 # ]
 # ///
+# No multiCMD: hpcp carries its own copy and runs it wherever an installed one is older, missing or does not import (setup.py).
 # A Ctrl-C while Python imports this module: Python's own handler can raise it inside importlib's weak-reference callbacks,
 # which drop it, and the run went on (a move to its removal). SIGINT is held in the importing thread for every import of
 # the module (_signal: a builtin, loaded before any module runs), and the finally lets it in on every path, a failed import

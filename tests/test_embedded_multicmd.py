@@ -52,18 +52,22 @@ print(hpcp.multiCMD.version, task.returncode, os.read(r, 100).decode().strip())"
 	assert _run_with_embedded_multicmd(tmp_path, code).split() == ['1.61', '0', 'through']
 
 
-def test_the_import_gate_tracks_the_embedded_copy_and_the_floor_is_one_number():
-	# The package floor stays below the gate: stock pip 9.0.3 on EL7 and EL8 cannot upgrade multiCMD, so a raised floor fails
-	# `pip3 install -U hpcp`, and an older installed multiCMD costs nothing, because the embedded copy runs instead.
+def test_the_import_gate_tracks_the_embedded_copy_and_no_installer_is_asked_for_multicmd():
+	# hpcp runs its embedded copy wherever an installed multiCMD is older than it, missing or does not import, so neither
+	# setup.py nor the script header (PEP 723: uv run, pipx run) asks for one: a requirement guaranteed nothing, and stock pip
+	# 9.0.3 on EL7 and EL8 upgrading an old multiCMD for it stopped `pip3 install -U hpcp` (9.89, docs/lessons.md 2026-11-11).
 	import re
 	with open(os.path.join(_ROOT, 'hpcp.py'), encoding='utf-8') as f:
 		source = f.read()
 	# the embed sits one tab in, inside the import's signal mask (9.88)
 	gate = re.search(r"\) < \((\d+), (\d+)\):\n\t\t\traise ImportError\('multiCMD too old'\)", source)
 	assert '%s.%s' % gate.groups() == '1.61'
+	header = source[:source.index('# ///\n', source.index('# /// script\n') + 1)]
+	assert 'xxhash' in header and 'multicmd' not in header.lower()
 	with open(os.path.join(_ROOT, 'setup.py'), encoding='utf-8') as f:
-		assert "'multiCMD>=1.56'" in f.read()
-	assert '"multiCMD>=1.56"' in source
+		requires = f.read().split('install_requires=[', 1)[1].split(']', 1)[0]
+	assert 'xxhash' in requires and not [line for line in requires.splitlines()
+		if 'multicmd' in line.lower() and not line.strip().startswith('#')]
 
 
 def test_xxhash_is_not_required_where_stock_pip_cannot_install_it():
