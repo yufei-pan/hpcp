@@ -6575,25 +6575,68 @@ def _sync_moved_directories(files, link_dirs, src_paths, dests, dest_image, reco
 		while parent != directory and parent not in directories and any((parent + os.sep).startswith(root) for root in roots):
 			directories.add(parent)
 			directory, parent = parent, os.path.dirname(parent)
-	# One spelling each; a destination named as a link to a directory is fsynced where it leads (_fsync_file passes a link).
-	directories -= finished
-	directories = sorted({os.path.realpath(directory) if directory in NAMED_DESTS else directory for directory in directories})
-	def sync(directory):
-		if _STOPPED_PID is not None:
-			return  # stopped (the parent raises it): the rest is left, and the move removes nothing
+	# Each directory as the door holds it (a destination named as a link to a directory, where it leads; below it, never
+	# through a link put on the way since: _dest_directory, nothing made), opened for reading in this thread, in path order
+	# (the door's cursor walks), and fsynced in the threads.
+	directories = sorted(directories - finished)
+	def sync(item):
+		directory, fd = item
 		try:
-			_fsync_file(directory)
+			if _STOPPED_PID is not None:
+				return  # stopped (the parent raises it): the rest is left, and the move removes nothing
+			if fd.__class__ is int:
+				os.fsync(fd)
+			else:
+				_fsync_file(fd)  # no descriptor (no named destination above it; Windows): by its path, as 9.89 did
 		except FileNotFoundError:
 			pass
 		except OSError as e:
+			if e.errno not in _NO_FSYNC:
+				eprint(f'Copy failed: the directory {directory} cannot be written to disk ({_why(e)})')
+		finally:
+			if fd.__class__ is int:
+				os.close(fd)
+	def opened(directory):
+		"""(directory, a read descriptor of it as the door holds it, or its path where the door holds none), or None: gone,
+		or another user's that this run may not read (a write-only drop box: _fsync_file passes it over too)."""
+		try:
+			held = _dest_directory(directory, make=False)
+			if held is None:
+				return None
+			if held.__class__ is not int:
+				return directory, held
+			if not _PATH_FDS:
+				return directory, os.dup(held)  # a read descriptor already (macOS; Linux without /proc)
+			return directory, os.open('/proc/self/fd/%d' % held, os.O_RDONLY | getattr(os, 'O_CLOEXEC', 0) | getattr(os, 'O_DIRECTORY', 0))
+		except _Refused as e:
+			eprint(f'Copy failed: the directory {directory} cannot be written to disk ({e.before}its files{e.after})')
+		except FileNotFoundError:
+			pass
+		except PermissionError as e:
+			with contextlib.suppress(OSError):
+				if os.stat(directory).st_uid != os.geteuid():
+					return None
 			eprint(f'Copy failed: the directory {directory} cannot be written to disk ({_why(e)})')
-	if max_workers <= 1 or len(directories) <= 1:
-		for directory in directories:
-			sync(directory)
-	else:
-		with concurrent.futures.ThreadPoolExecutor(min(max_workers, len(directories))) as threads:
-			for _ in threads.map(sync, directories):
-				pass
+		except OSError as e:
+			eprint(f'Copy failed: the directory {directory} cannot be written to disk ({_why(e)})')
+		return None
+	# At most this many held open at once: the threads' work, several times over, and well inside the open-files budget.
+	chunk = max(64, 4 * max_workers)
+	threads = concurrent.futures.ThreadPoolExecutor(min(max_workers, len(directories))) if max_workers > 1 and len(directories) > 1 else None
+	try:
+		for start in range(0, len(directories), chunk):
+			if _STOPPED_PID is not None:
+				break
+			items = [item for item in map(opened, directories[start:start + chunk]) if item is not None]
+			if threads is None:
+				for item in items:
+					sync(item)
+			else:
+				for _ in threads.map(sync, items):
+					pass
+	finally:
+		if threads is not None:
+			threads.shutdown()
 	return directories
 
 # fcntl(F_FULLFSYNC)'s errors that say the drive cannot be asked (a filesystem without it, such as SMB or FUSE), not that the

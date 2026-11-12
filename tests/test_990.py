@@ -249,3 +249,37 @@ def test_990_the_fsync_of_a_0044_file_never_chmods_through_a_link_put_at_its_nam
 	monkeypatch.setattr(os, 'open', real_open)
 	assert swapped
 	assert stat.S_IMODE(os.stat(victim).st_mode) == 0o600
+
+
+# -- A move's directory fsyncs ---------------------------------------------------------------------------------------------------
+
+@posix_only
+def test_990_a_moves_directory_fsync_never_goes_through_a_link_on_the_way(tmp_path, fresh, monkeypatch):
+	# 9.89 fsynced each directory a move wrote into by its path (_fsync_file): out/a swapped for a link to another directory
+	# after the copy, the fsync of out/a/b went to the link's target's b. Through the door (_dest_directory, nothing made) a
+	# link on the way is never followed: as everywhere below a destination, it is a name of the tree, replaced by a directory.
+	os.makedirs(str(tmp_path / 'src'))
+	out, victim = str(tmp_path / 'out'), str(tmp_path / 'victim')
+	os.makedirs(os.path.join(out, 'a', 'b'))
+	os.makedirs(os.path.join(victim, 'b'))
+	_run_named(monkeypatch, out)
+	os.rename(os.path.join(out, 'a'), os.path.join(out, 'a.away'))
+	os.symlink(victim, os.path.join(out, 'a'))
+	synced, real = [], os.fsync
+	def fsync(fd):
+		st = os.fstat(fd)
+		synced.append((st.st_dev, st.st_ino))
+		return real(fd)
+	monkeypatch.setattr(os, 'fsync', fsync)
+	try:
+		with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+			hpcp._sync_moved_directories([], {os.path.join(out, 'a', 'b')}, [str(tmp_path / 'src') + os.sep], [out + os.sep], False, [], 1)
+	finally:
+		monkeypatch.setattr(os, 'fsync', real)
+		hpcp._close_cursors()
+	for directory in (victim, os.path.join(victim, 'b')):
+		st = os.stat(directory)
+		assert (st.st_dev, st.st_ino) not in synced, (directory, synced)
+	assert os.listdir(victim) == ['b'] and os.listdir(os.path.join(victim, 'b')) == []
+	out_st = os.stat(out)
+	assert (out_st.st_dev, out_st.st_ino) in synced
