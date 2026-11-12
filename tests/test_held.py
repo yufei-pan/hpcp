@@ -2020,8 +2020,8 @@ def test_989_two_landings_below_one_named_destination_each_keep_their_directory(
 	# 9.89's trim: the door lends its own descriptor, valid until its next call below the same named destination. With one -d
 	# inside another (-d out -d out/x), a source's x/a/b/f lands at out/x/a/b/f and out/x/x/a/b/f, both below out/x: the
 	# second landing's door call closes out/x/a and out/x/a/b and opens out/x/x, a and b, which take the numbers the first
-	# landing's answer had. copy_file keeps a dup of each there (_share_a_destination); with lent answers (that check
-	# patched to say no) the build wrote the file into out/x/x/a.
+	# landing's answer had. copy_file keeps a dup of each landing's answer when it has several (keep); with lent answers
+	# (keep patched to False) the build wrote the file into out/x/x/a.
 	if route == 'proc' and not hpcp._PATH_FDS:
 		pytest.skip('no /proc/self/fd here')
 	monkeypatch.setattr(hpcp, '_PATH_FDS', route == 'proc')
@@ -2044,9 +2044,9 @@ def test_989_two_landings_below_one_named_destination_each_keep_their_directory(
 @posix_only
 @pytest.mark.parametrize('route', ['proc', 'read'])
 def test_989_the_door_answers_for_each_directory_however_the_calls_alternate(tmp_path, fresh, monkeypatch, route):
-	# The door's memo of its last answer (_DOOR_LAST): asked again for the directory it just answered for, it gives the same
-	# descriptor; asked for another in between, it walks, and each answer is the directory asked for. A new run (RUN_ID) or
-	# _close_cursors forgets it.
+	# Asked again for the directory it just answered for, the door gives the same descriptor, nothing opened; asked for another
+	# in between, it walks, and each answer is the directory asked for. Within a run a directory swapped away after it was opened
+	# is still the one answered (W1: the door writes into the one it holds); a new run (RUN_ID) opens what is there now.
 	if route == 'proc' and not hpcp._PATH_FDS:
 		pytest.skip('no /proc/self/fd here')
 	monkeypatch.setattr(hpcp, '_PATH_FDS', route == 'proc')
@@ -2062,23 +2062,27 @@ def test_989_the_door_answers_for_each_directory_however_the_calls_alternate(tmp
 			answer = hpcp._dest_directory(directory, make=False)
 			assert isinstance(answer, int) and os.path.samestat(os.fstat(answer), os.stat(directory)), directory
 			answers.append(answer)
-		assert answers[-1] == answers[-2]  # the memo: the same descriptor, nothing opened
+		assert answers[-1] == answers[-2]  # the same descriptor, nothing opened
 		assert _open_descriptors() == baseline + 2  # out, a: one a level down to the last directory
+		held_a = os.stat(directories[0])
+		os.rename(directories[0], directories[0] + '.away')
+		os.mkdir(directories[0])
+		same_run = hpcp._dest_directory(directories[0], make=False)
+		assert os.path.samestat(os.fstat(same_run), held_a) and not os.path.samestat(os.fstat(same_run), os.stat(directories[0]))
 		monkeypatch.setattr(hpcp, 'RUN_ID', 'w1-%d' % next(_RUNS))
 		again = hpcp._dest_directory(directories[0], make=False)
-		assert os.path.samestat(os.fstat(again), os.stat(directories[0]))
+		assert os.path.samestat(os.fstat(again), os.stat(directories[0])) and not os.path.samestat(os.fstat(again), held_a)
 	finally:
 		hpcp._close_cursors()
-	assert hpcp._DOOR_LAST == [None] and _open_descriptors() == baseline
+	assert _open_descriptors() == baseline
 
 
 @root_only
 @linux_only
 @pytest.mark.parametrize('route', ['proc', 'read'])
 def test_989_a_directory_swapped_between_two_of_its_landings_never_leads_the_second(tmp_path, fresh, monkeypatch, route):
-	# W1 with the memo: out/a's first file goes through the door, which holds out/a; out/a is then swapped for a link to a victim
-	# directory, and its second file is asked for: the door answers from its memo with the directory it holds (out/a.away now),
-	# never through the link. As 9.88, whose door answered from its cursor.
+	# W1: out/a's first file goes through the door, which holds out/a; out/a is then swapped for a link to a victim directory,
+	# and its second file is asked for: the door answers with the directory it holds (out/a.away now), never through the link.
 	monkeypatch.setattr(hpcp, '_PATH_FDS', route == 'proc')
 	for name in ('f1', 'f2'):
 		write(tmp_path / 'src' / 'a' / name, name)

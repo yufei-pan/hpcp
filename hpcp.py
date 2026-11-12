@@ -4181,10 +4181,6 @@ _O_NOFOLLOW = getattr(os, 'O_NOFOLLOW', 0)
 # below the same named destination may close it, and a number reused then would lead a stale holder's write elsewhere, so
 # a caller that holds an answer across another door call keeps a dup of it (_kept) and closes that.
 _CURSORS = {}
-# The door's last answer in this process, (the path as asked, its run, the descriptor): asked for the same path again with no
-# door call between (a wide directory's landings one after another, a finish's parent), it answers at once, as 9.87's door
-# answered from its memo. Every call that may move a cursor clears it first, as does _close_cursors.
-_DOOR_LAST = [None]
 # [the run whose cursors these are (RUN_ID), this process's budget for them (_hold_budget, taken at the run's start: a forked
 # worker inherits it with the limit it was taken from)]
 _CURSORS_RUN = [None, None]
@@ -4210,7 +4206,6 @@ def _hold_budget():
 def _close_cursors():
 	"""Close every descriptor the door holds in this process, and forget what it walked by path (a new run, the run's end)."""
 	_BY_PATH.clear()
-	_DOOR_LAST[0] = None
 	while _CURSORS:
 		held = _CURSORS.popitem()[1]
 		if isinstance(held, _HeldDirs):
@@ -4451,11 +4446,6 @@ def _dest_directory(path, make=True, source=None, source_file=None):
 	with the last path asked for are kept open (_HeldDirs): a directory swapped for a link after it was opened is no longer
 	on the way, as hpcp writes into the one it holds, wherever it is now. Where nothing can be held the walk is 9.87's, by path,
 	each component looked at once a process in a run (_BY_PATH)."""
-	last = _DOOR_LAST[0]
-	if last is not None and last[0] == path and last[1] == RUN_ID:
-		return last[2]
-	_DOOR_LAST[0] = None
-	asked = path
 	path = os.path.abspath(path)
 	root = _named_root(path)
 	if root is None:
@@ -4471,8 +4461,7 @@ def _dest_directory(path, make=True, source=None, source_file=None):
 	if held.__class__ is _HeldDirs:
 		names = held.names
 		if len(names) == count + 1 and names[1:] == parts:
-			# the directory this cursor's last call answered with (the memo missed: another spelling, another destination's call)
-			_DOOR_LAST[0] = (asked, RUN_ID, held.fds[-1])
+			# the cursor already stands at path (a wide directory's landings one after another, a finish's parent): no walk
 			return held.fds[-1]
 	elif isinstance(held, _Refused):
 		raise _Refused(held.before, held.after, said=True)
@@ -4528,7 +4517,6 @@ def _dest_directory(path, make=True, source=None, source_file=None):
 		names.pop()
 		below -= 1
 	if depth == count:
-		_DOOR_LAST[0] = (asked, RUN_ID, fds[-1])
 		return fds[-1]
 	budget = _CURSORS_RUN[1]
 	flags = (_HOLD_PATH_FLAGS if _PATH_FDS else _HOLD_READ_FLAGS) | _O_NOFOLLOW
@@ -4554,7 +4542,6 @@ def _dest_directory(path, make=True, source=None, source_file=None):
 				return None
 		fds.append(fd)  # held.push, inline; the descriptor first, so whatever is held is closed with the cursor
 		names.append(parts[index])
-	_DOOR_LAST[0] = (asked, RUN_ID, fd)
 	return fd
 
 def _read_through(path):
@@ -5401,8 +5388,9 @@ def copy_file(src_path, dest_paths, full_hash=False, verbose=False, concurrent_p
 	"""
 	# The door's answer for each landing's directory (_dest_directory): every name below a destination is looked at, made and
 	# written relative to it. Lent by the door, and nothing here asks it for another directory below the same destination
-	# while one is in use, except where two landings lie below one named destination (one -d inside another): there each
-	# is a dup (_kept), kept in owned and closed here whatever happens.
+	# while one is in use, except with several landings (-d repeated), which may lie below one named destination (one -d inside
+	# another): the call for one closes the other's levels and their numbers are reused. There each is a dup (_kept), kept in
+	# owned and closed here whatever happens.
 	bases, owned = {}, {}
 	try:
 		return _copy_file(src_path, dest_paths, full_hash, verbose, concurrent_processes, bases, owned)
@@ -5415,12 +5403,6 @@ def _look(dest, bases, landing):
 	(bases); where the door could not answer (a transient error: kept out of bases) by its path, as 9.87 looked: nothing
 	there is only what the door found missing (None)."""
 	return _landing_of(dest, bases[dest] if dest in bases else os.path.dirname(landing[0]), landing)
-
-def _share_a_destination(directories):
-	"""Whether two of directories (the landings' directories of one file) lie below one named destination, where the door's
-	answer for one can be closed by its call for the other."""
-	roots = [root for root in (_named_root(os.path.abspath(directory)) for directory in directories) if root is not None]
-	return len(set(roots)) < len(roots)
 
 def _copy_file(src_path, dest_paths, full_hash, verbose, concurrent_processes, bases, owned):
 	"""copy_file's body; bases: {dest: the door's answer for its landing's directory}, filled here; owned: those that are
@@ -5449,7 +5431,7 @@ def _copy_file(src_path, dest_paths, full_hash, verbose, concurrent_processes, b
 	refused = {}
 	# Each landing's path (_landing_path) once: the door's directory, the look and the copy act on it.
 	landings = {dest: _landing_path(dest) for dest in dest_paths}
-	keep = len(landings) > 1 and _share_a_destination([os.path.dirname(landing[0]) for landing in landings.values()])
+	keep = len(landings) > 1  # the door's call for one landing may close another's levels (both below one named destination)
 	for dest in dest_paths:
 		if dest in bases or dest in refused:
 			continue  # a destination given twice (-d out -d out) is asked once: a second answer would replace the first, never closed
