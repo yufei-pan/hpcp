@@ -546,3 +546,33 @@ def test_990_macos_a_rerun_carries_changed_xattrs_and_acls(tmp_path):
 	for path in (landing, landing_dir):
 		assert _mac_tag(path) is None, path
 		assert _mac_acl(path) == [], (path, _mac_acl(path))
+
+
+@linux_only
+def test_990_a_read_that_returned_bytes_counts_as_part_of_a_job(tmp_path):
+	# The window the first 9.90 build missed (2 'EOFError' blocks in 2,400 early stops on Python 3.6 spawn): a stop is
+	# handled after a read returns, before its bytes are counted, so a worker that has just read the 4-byte length (or some of
+	# the payload) is mid-message although nothing else in its frames says so yet. Asked at every line of the read.
+	import multiprocessing.connection
+	import struct
+	import threading
+	readable, writable = multiprocessing.Pipe(duplex=False)
+	answers = []
+	recv, recv_bytes = hpcp._RECV_CODE, hpcp._RECV_BYTES_CODE
+	def tracer(frame, event, arg):
+		if frame.f_code in (recv, recv_bytes):
+			if event == 'line':
+				answers.append((frame.f_code.co_name, frame.f_lineno, sorted(frame.f_locals), hpcp._in_message_read(frame)))
+			return tracer
+		return None
+	writable.send_bytes(b'x' * 100)
+	sys.settrace(tracer)
+	try:
+		data = readable.recv_bytes()
+	finally:
+		sys.settrace(None)
+	assert data == b'x' * 100
+	# Before the first read of the length nothing is consumed; from the moment that read returned, everything is.
+	first_read = [i for i, (name, _, names, _) in enumerate(answers) if name == '_recv' and 'chunk' in names][0]
+	assert not any(answer for _, _, _, answer in answers[:first_read]), answers[:first_read]
+	assert all(answer for _, _, _, answer in answers[first_read:]), [a for a in answers[first_read:] if not a[3]]

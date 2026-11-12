@@ -1079,15 +1079,17 @@ _RECV_BYTES_CODE, _RECV_CODE = _connection_codes()
 
 def _in_message_read(frame):
 	"""Whether the code a stop interrupted (frame) is reading a message part of which it has read: inside
-	Connection._recv_bytes once its length is read ('size' set), or inside its _recv once some bytes came."""
+	Connection._recv_bytes once its length is read ('buf', then 'size' set), or inside its _recv once a read returned bytes
+	('chunk' set: a stop is handled after the read returns, before they are counted). A stop that lands in the first read
+	itself (the read is interrupted, and the handler runs inside it) has consumed nothing."""
 	partial = False
 	while frame is not None and _RECV_BYTES_CODE is not None:
 		code = frame.f_code
 		if code is _RECV_CODE:
-			found = frame.f_locals
-			partial = partial or found.get('remaining', found.get('size')) != found.get('size')
+			partial = partial or 'chunk' in frame.f_locals
 		elif code is _RECV_BYTES_CODE:
-			return partial or 'size' in frame.f_locals
+			found = frame.f_locals
+			return partial or 'buf' in found or 'size' in found
 		frame = frame.f_back
 	return False
 
