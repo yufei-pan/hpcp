@@ -306,15 +306,15 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 
 ### A rerun costs about 6 µs more CPU a file than in 9.87
 - **Kind:** deferred (9.89).
-- **What the operator sees:** a rerun with nothing to copy uses more CPU than 9.87's, in Python, on every platform: the 9.88 design check measured it on a tmpfs in Docker (Python 3.14, the versions taking turns, host load 8 to 70, so CPU seconds decide, not wall time):
-  - serial (`-s`): 50 directories of 1,000 files, CPU median of 11, 2.82 s against 2.52 s (+12 %, +6.1 µs a file); 10,000 directories of one file, 1.12 s against 1.01 s (+11 %);
-  - the default pool: wall time 0.810 s against 0.766 s on the 50-directory tree (9 rounds, +5.8 %; CPU of all processes +11 %), and 1.467 s against 1.462 s on the deep tree (+0.4 %; CPU +5 %); with `-j 2` the 50-directory tree took 1.227 s against 1.120 s (+9.5 %);
-  - a first copy is not slower (serial, 10,000 directories of one file, `cp` included: 6.48 s against 6.67 s CPU, 3 rounds).
+- **What the operator sees:** a rerun with nothing to copy uses more CPU than 9.87's, in Python, on every platform. Measured on a tmpfs in Docker, Python 3.14, the versions taking turns, host load 8 to 35, so CPU seconds decide, not wall time:
+  - serial (`-s`), the final 9.88 build, medians of 11 (the design check's, on c843e7e, agree within 2 %): 50 directories of 1,000 files 2.69 s of CPU against 2.40 s (+12 %, +5.8 µs a file); 10,000 directories of one file 1.16 s against 1.02 s (+14 %);
+  - the default pool, the design check on c843e7e: wall time 0.810 s against 0.766 s on the 50-directory tree (9 rounds, +5.8 %; CPU of all processes +11 %), and 1.467 s against 1.462 s on the deep tree (+0.4 %; CPU +5 %); with `-j 2` the 50-directory tree took 1.227 s against 1.120 s (+9.5 %);
+  - a first copy is not slower (serial, 10,000 directories of one file, `cp` included: 6.26 s against 6.60 s CPU, 11 rounds).
   On NFS mounted `actimeo=0` a rerun is 2 to 3 times faster in 9.88 in three of the build's four rounds (the README has the numbers). The macOS share of N3 is a known limitation of its own (above).
 - **Why:** it is ordinary Python on each landing's way, not the descriptor calls: the door's call is 1.95 µs for a landing in the directory just used and 4.6 µs when the directory changes, against 9.87's 0.4 µs, and the rest is spread over the calls made relative to the held directory (the skip check's open, `_settle_identical`, `_landing_of`, closing the held directories). A variant whose door goes by path cost the same (+5.6 µs a file against the descriptor route's +5.8 µs), so making W1 narrower would not win it back. The plan's bar for W1 was under 2 µs a file; the build's bars measured pool wall time on a tree of 10 files a directory on a 32-core host, where the parent's listing hides the workers' CPU. The build before W1 (c401f23) was level with 9.87 on the wide tree, so the cost is W1's.
 - **Plan (9.89):** profile a serial rerun and take the work out of the hot path (the dup and close of the held directory for each landing, a second look, closures made for each file) until its CPU a file is 9.87's within 2 %, measured as above, in CPU seconds serially and at `-j 2`, on Linux and on the Mac.
 - **Revisit when:** 9.89.
-- **Noted:** 2026-11-11, found by the 9.88 design check (X1), measured on c843e7e; the user chose "Ship, trim in 9.89 (Recommended)".
+- **Noted:** 2026-11-11, found by the 9.88 design check (X1); the user chose "Ship, trim in 9.89 (Recommended)".
 
 ### A device node copied by a non-root user onto a `-d` link: the message names the failed copy beside, not the refusal
 - **Kind:** deferred (9.89).
