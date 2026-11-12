@@ -15,6 +15,14 @@ if _ROOT not in sys.path:
 
 import hpcp
 
+# ctypes before any test (hpcp imports it on first use): where libffi is linked into the interpreter with its static
+# trampolines (python-build-standalone, which uv installs), importing it opens the interpreter's own binary and holds that
+# descriptor for the process's life, so the first test to import it failed _a_test_closes_what_it_opens (VM 901, 3.14.10).
+try:
+	import ctypes  # noqa: F401
+except ImportError:  # a Python built without _ctypes
+	pass
+
 if sys.version_info < (3, 7):
 	# The tests' own subprocess calls use capture_output and text (Python 3.7). Translated for calls from the tests
 	# only, so one in hpcp would still fail here, as it would for a user.

@@ -1705,7 +1705,7 @@ def test_f3_the_door_by_path_looks_at_each_level_once_a_run(tmp_path, monkeypatc
 	else:
 		real_open = os.open
 		def no_descriptors(path, flags, *args, **kwargs):
-			if sys._getframe(1).f_code.co_name == '_door_step':  # the door's open of a level, nothing else of the run's
+			if sys._getframe(1).f_code.co_name in ('_dest_directory', '_door_step'):  # the door's opens of a level, nothing else of the run's
 				raise OSError(errno.EMFILE, os.strerror(errno.EMFILE), path)
 			return real_open(path, flags, *args, **kwargs)
 		monkeypatch.setattr(os, 'open', no_descriptors)
@@ -2004,11 +2004,98 @@ def test_n6_the_look_after_a_landing_changed_is_made_the_way_the_first_was(tmp_p
 		return real_settle(*args, **kwargs)
 	monkeypatch.setattr(hpcp, '_settle_identical', changed_once)
 	real_landing, bases_given = hpcp._landing_of, []
-	def landing(dest_path, base):
+	def landing(dest_path, base, *rest):
 		bases_given.append(base)
-		return real_landing(dest_path, base)
+		return real_landing(dest_path, base, *rest)
 	monkeypatch.setattr(hpcp, '_landing_of', landing)
 	with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
 		hpcp.copy_file(str(tmp_path / 'src'), [os.path.join(out, 'f')])
 	assert said_changed and len(bases_given) >= 2
 	assert bases_given[0] == out and bases_given[1] == out, bases_given[:2]  # its directory's path both times, never None (nothing there)
+
+
+@posix_only
+@pytest.mark.parametrize('route', ['proc', 'read'])
+def test_989_two_landings_below_one_named_destination_each_keep_their_directory(tmp_path, fresh, monkeypatch, route):
+	# 9.89's trim: the door lends its own descriptor, valid until its next call below the same named destination. With one -d
+	# inside another (-d out -d out/x), a source's x/a/b/f lands at out/x/a/b/f and out/x/x/a/b/f, both below out/x: the
+	# second landing's door call closes out/x/a and out/x/a/b and opens out/x/x, a and b, which take the numbers the first
+	# landing's answer had. copy_file keeps a dup of each landing's answer when it has several (keep); with lent answers
+	# (`keep` set to False in the source) the build wrote the file into out/x/x/a.
+	if route == 'proc' and not hpcp._PATH_FDS:
+		pytest.skip('no /proc/self/fd here')
+	monkeypatch.setattr(hpcp, '_PATH_FDS', route == 'proc')
+	write(tmp_path / 'src' / 'x' / 'a' / 'b' / 'f', 'F')
+	out = str(tmp_path / 'out')
+	for directory in ('x/a/b', 'x/x/a/b'):
+		os.makedirs(os.path.join(out, directory))
+	monkeypatch.setattr(hpcp, 'NAMED_DESTS', frozenset([out, os.path.join(out, 'x')]))
+	monkeypatch.setattr(hpcp, 'RUN_ID', 'w1-%d' % next(_RUNS))
+	baseline = _open_descriptors()
+	with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+		hpcp.copy_file(str(tmp_path / 'src' / 'x' / 'a' / 'b' / 'f'), [os.path.join(out, 'x/a/b/f'), os.path.join(out, 'x/x/a/b/f')])
+	held = _open_descriptors() - baseline
+	hpcp._close_cursors()
+	found = sorted(os.path.relpath(os.path.join(d, name), out) for d, _, names in os.walk(out) for name in names)
+	assert found == ['x/a/b/f'] and read(os.path.join(out, 'x/a/b/f')) == 'F' and not hpcp.ERRORS, (found, hpcp.ERRORS)
+	assert held == 4  # out/x's cursor (both landings lie below it): its root, x, a and b; no dup left open
+
+
+@posix_only
+@pytest.mark.parametrize('route', ['proc', 'read'])
+def test_989_the_door_answers_for_each_directory_however_the_calls_alternate(tmp_path, fresh, monkeypatch, route):
+	# Asked again for the directory it just answered for, the door gives the same descriptor, nothing opened; asked for another
+	# in between, it walks, and each answer is the directory asked for. Within a run a directory swapped away after it was opened
+	# is still the one answered (W1: the door writes into the one it holds); a new run (RUN_ID) opens what is there now.
+	if route == 'proc' and not hpcp._PATH_FDS:
+		pytest.skip('no /proc/self/fd here')
+	monkeypatch.setattr(hpcp, '_PATH_FDS', route == 'proc')
+	out = str(tmp_path / 'out')
+	directories = [os.path.join(out, name) for name in ('a', 'a/b', 'c', 'a/b/d')]
+	for directory in directories:
+		os.makedirs(directory, exist_ok=True)
+	_w1_run(monkeypatch, out)
+	baseline = _open_descriptors()
+	try:
+		answers = []
+		for directory in directories + directories[::-1] + [directories[0], directories[0]]:
+			answer = hpcp._dest_directory(directory, make=False)
+			assert isinstance(answer, int) and os.path.samestat(os.fstat(answer), os.stat(directory)), directory
+			answers.append(answer)
+		assert answers[-1] == answers[-2]  # the same descriptor, nothing opened
+		assert _open_descriptors() == baseline + 2  # out, a: one a level down to the last directory
+		held_a = os.stat(directories[0])
+		os.rename(directories[0], directories[0] + '.away')
+		os.mkdir(directories[0])
+		same_run = hpcp._dest_directory(directories[0], make=False)
+		assert os.path.samestat(os.fstat(same_run), held_a) and not os.path.samestat(os.fstat(same_run), os.stat(directories[0]))
+		monkeypatch.setattr(hpcp, 'RUN_ID', 'w1-%d' % next(_RUNS))
+		again = hpcp._dest_directory(directories[0], make=False)
+		assert os.path.samestat(os.fstat(again), os.stat(directories[0])) and not os.path.samestat(os.fstat(again), held_a)
+	finally:
+		hpcp._close_cursors()
+	assert _open_descriptors() == baseline
+
+
+@root_only
+@linux_only
+@pytest.mark.parametrize('route', ['proc', 'read'])
+def test_989_a_directory_swapped_between_two_of_its_landings_never_leads_the_second(tmp_path, fresh, monkeypatch, route):
+	# W1: out/a's first file goes through the door, which holds out/a; out/a is then swapped for a link to a victim directory,
+	# and its second file is asked for: the door answers with the directory it holds (out/a.away now), never through the link.
+	monkeypatch.setattr(hpcp, '_PATH_FDS', route == 'proc')
+	for name in ('f1', 'f2'):
+		write(tmp_path / 'src' / 'a' / name, name)
+	out = str(tmp_path / 'out')
+	os.makedirs(os.path.join(out, 'a'))
+	victim = _Victim(tmp_path / 'victim')
+	_w1_run(monkeypatch, out)
+	try:
+		with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+			hpcp.copy_file(str(tmp_path / 'src/a/f1'), [os.path.join(out, 'a/f1')])
+			_swap_for_link(os.path.join(out, 'a'), victim.path)
+			hpcp.copy_file(str(tmp_path / 'src/a/f2'), [os.path.join(out, 'a/f2')])
+	finally:
+		hpcp._close_cursors()
+	assert victim.untouched(), (victim.before, victim.state())
+	assert sorted(os.listdir(os.path.join(out, 'a.away'))) == ['f1', 'f2'] and not hpcp.ERRORS, hpcp.ERRORS

@@ -470,7 +470,7 @@ def test_the_door_holds_read_descriptors_on_macos(root, fresh, monkeypatch):
 		with pytest.raises(OSError):
 			os.stat('/dev/fd/%d/x' % base)
 	finally:
-		hpcp._close_base(base)
+		hpcp._close_cursors()  # the answer is the cursor's own descriptor (lent), closed with the cursors
 
 
 @pytest.mark.macos988
