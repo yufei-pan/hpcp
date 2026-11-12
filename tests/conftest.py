@@ -112,8 +112,10 @@ def _clear_hpcp_transient_state():
 	hpcp._STDIN_HELD_LIST = False
 	# A task run in this process (_run_task) leaves its parent's handed answer (_held_route) behind.
 	hpcp._HELD_GIVEN = None
-	# The door's per-process cache (_DOORS, by RUN_ID: None outside hpcp()) would remember a directory pytest has removed.
-	if hasattr(hpcp, '_DOORS'):
+	# The door's descriptors (by RUN_ID: None outside hpcp()) would hold a directory pytest has removed.
+	if hasattr(hpcp, '_close_cursors'):
+		hpcp._close_cursors()
+	elif hasattr(hpcp, '_DOORS'):
 		hpcp._DOORS.clear()
 	hash_file = getattr(hpcp, 'hash_file', None)
 	if hash_file is not None and hasattr(hash_file, 'cache_clear'):
@@ -290,3 +292,59 @@ def exec_dir(tmp_path):
 			return
 		shutil.rmtree(directory, ignore_errors=True)
 	pytest.skip('no writable directory allows executing scripts (every candidate is mounted noexec)')
+
+
+@pytest.fixture
+def stop_alarms(monkeypatch, reset_hpcp_globals):
+	"""run(handler, call, count, settle=None): call(index, got) count times, each with SIGALRM at a random moment over 1.5
+	times its median unstopped run (timed first), as a stop: hpcp's handler (handler 'hpcp': _stop as the main process's, no
+	stop recorded before each call, none passed on) or Python's own ('python': signal.default_int_handler, as in a program
+	that imports hpcp). call stores its result in got by C (list.extend over map), so a stop after the call returned is not
+	taken for one inside it; settle(got) runs once the alarm is off. Returns the indexes of the calls that raised.
+	The handler acts only while the call runs (armed): Python runs a handler at its next check, not when the signal comes, so
+	an alarm that came as the call returned (or as setitimer disarmed it) could run its handler past the try, in settle or
+	the loop, and its KeyboardInterrupt ended the test session (3.12: once in a full suite; 38 of 120 runs, 8 side by side)."""
+	import random
+	import signal
+	import time
+	def run(handler, call, count, settle=lambda got: None):
+		timings = []
+		for index in range(50):
+			got = []
+			started = time.perf_counter()
+			call(-1 - index, got)
+			timings.append(time.perf_counter() - started)
+			settle(got)
+		window = sorted(timings)[len(timings) // 2] * 1.5
+		for name, value in (('_MAIN_PID', os.getpid()), ('_DEFER', 0), ('_pass_stop_on', lambda signum: None)):
+			monkeypatch.setattr(hpcp, name, value)
+		stop = hpcp._stop if handler == 'hpcp' else signal.default_int_handler
+		armed = []
+		def alarm(signum, frame):
+			if armed:
+				stop(signum, frame)
+		old = signal.signal(signal.SIGALRM, alarm)
+		stopped = []
+		try:
+			for index in range(count):
+				hpcp._STOPPED = hpcp._STOPPED_PID = None
+				hpcp._STOP_ACTED = hpcp._STOP_NOTED = False
+				got = []
+				try:
+					armed[:] = [True]
+					signal.setitimer(signal.ITIMER_REAL, random.uniform(1e-6, window))
+					call(index, got)
+					armed[:] = []
+				except KeyboardInterrupt:
+					armed[:] = []
+				signal.setitimer(signal.ITIMER_REAL, 0)
+				settle(got)
+				if not got:
+					stopped.append(index)
+		finally:
+			signal.setitimer(signal.ITIMER_REAL, 0)
+			signal.signal(signal.SIGALRM, old)
+			hpcp._STOPPED = hpcp._STOPPED_PID = None
+			hpcp._STOP_ACTED = hpcp._STOP_NOTED = False
+		return stopped
+	return run

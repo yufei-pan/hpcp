@@ -355,3 +355,164 @@ def test_the_cli_copies_reruns_and_moves(tmp_path):
 	assert read(tmp_path / 'dst/a.txt') == 'a' and read(tmp_path / 'dst/Sub/b.txt') == 'b'
 	run('src/', '-d', 'moved/', '-rf')
 	assert read(tmp_path / 'moved/Sub/b.txt') == 'b' and not os.path.exists(str(tmp_path / 'src/a.txt'))
+
+
+# ---- 9.88 (macos988: added in 9.88 and not yet run on macOS; select them with -m macos988)
+
+@pytest.mark.macos988
+@pytest.mark.parametrize('handler', ['hpcp', 'python'])
+def test_a_stop_anywhere_in_the_probe_leaves_nothing_on_macos(tmp_path, fresh, monkeypatch, stop_alarms, handler):
+	# S6: macOS has no O_TMPFILE, so the probe's held file is made with a name and unlinked at once. Each of the probe's files
+	# is held by C as it is made (_create), and each name goes whatever a stop does (9.87 used tempfile, whose own files a stop
+	# could leave). cp is left out: the runner answers at once.
+	probes = os.path.realpath(str(tmp_path / 'probe-tmp'))
+	os.makedirs(probes)
+	monkeypatch.setattr(tempfile, 'tempdir', probes)
+	class Done:
+		returncode = 0
+	monkeypatch.setattr(hpcp.multiCMD, 'run_commands', lambda *args, **kwargs: [Done()])
+	def call(index, got):
+		hpcp._HELD[:] = [None, None]
+		got.extend(map(lambda _: hpcp._held_route() or True, (None,)))
+	stopped = stop_alarms(handler, call, 2000)
+	assert stopped and os.listdir(probes) == [], (len(stopped), os.listdir(probes)[:10])
+
+
+@pytest.mark.macos988
+def test_a_link_swapped_at_an_identical_fifo_gets_no_owner_or_mode(root, fresh, monkeypatch):
+	# N1: _settle_identical sets an identical FIFO's metadata by name (no descriptor for a node off Linux's /proc): a link put
+	# at the name after its look took the source's mode (9.87's chmod followed it). lchmod and lchown now change the link.
+	source, landing, victim = (os.path.join(root, name) for name in ('p', 'q', 'victim'))
+	os.mkfifo(source, 0o644)
+	os.mkfifo(landing, 0o600)
+	write(victim, 'victim', mode=0o600)
+	look = os.lstat(landing)
+	real_lstat = os.lstat
+	def swapped(path, *args, **kwargs):
+		result = real_lstat(path, *args, **kwargs)
+		if path == landing and stat.S_ISFIFO(result.st_mode):
+			os.unlink(landing)
+			os.symlink(victim, landing)  # after the look _settle_identical takes
+		return result
+	monkeypatch.setattr(os, 'lstat', swapped)
+	hpcp._settle_identical(source, real_lstat(source), landing, look)
+	monkeypatch.setattr(os, 'lstat', real_lstat)
+	assert stat.S_IMODE(os.stat(victim).st_mode) == 0o600 and read(victim) == 'victim'
+
+
+@pytest.mark.macos988
+@pytest.mark.skipif(not hasattr(os, 'geteuid') or os.geteuid() == 0, reason='root sets system flags')
+def test_a_list_of_paths_below_a_directory_with_a_system_flag_copies_and_moves_as_non_root(root):
+	# P2: a list-mode copy spells each source in full, so the copy syncs every directory on its way (/Users, /private) into the
+	# destination, and their finish gave the copies the source's flags: sunlnk (SF_NOUNLINK) is root's to set, chflags was
+	# EPERM for the whole call, "Directory sync error: /Users to out/Users: [Errno 1] Operation not permitted", exit 193, and
+	# a move (-rf) never removed its sources. Now the user flags are set, the system ones left (_flags_to_set).
+	parts = root.split(os.sep)
+	flagged = [path for path in (os.sep.join(parts[:end]) or os.sep for end in range(1, len(parts)))
+		if getattr(os.lstat(path), 'st_flags', 0) & ~0xffff]
+	if not flagged:
+		pytest.skip('no directory above the test directory has a system flag here')
+	source = write(os.path.join(root, 'src/a/x.txt'), 'x')
+	for args in (['-d', 'out'], ['-d', 'out'], ['-d', 'moved', '-rf']):
+		task = subprocess.run([sys.executable, HPCP] + args, cwd=root, input=source + '\n', stdout=subprocess.PIPE,
+			stderr=subprocess.STDOUT, universal_newlines=True, timeout=300)
+		assert task.returncode == 0 and 'Operation not permitted' not in task.stdout, (args, task.stdout[-3000:])
+	assert read(os.path.join(root, 'out' + source)) == 'x' and read(os.path.join(root, 'moved' + source)) == 'x'
+	assert not os.path.exists(source)
+
+
+# ---- W1 (9.88) on macOS: the door holds read descriptors (no O_PATH, and /dev/fd/D/NAME names nothing below D)
+
+def _victim(path):
+	'''A directory a run must never write: (path, its state now). The runner's own here (no root on the Mac).'''
+	os.makedirs(path)
+	for name in ('x', 'y'):
+		write(os.path.join(path, name), 'victim ' + name, 0o600)
+	return path, _tree_state(path)
+
+
+def _tree_state(path):
+	found = {}
+	for name in sorted(os.listdir(path)):
+		st = os.lstat(os.path.join(path, name))
+		found[name] = (st.st_mode, st.st_mtime_ns, st.st_ino, read(os.path.join(path, name)))
+	st = os.lstat(path)
+	return found, (st.st_mode, st.st_mtime_ns)
+
+
+def _w1_run(monkeypatch, out):
+	'''One run's settings: out named (-d), a run of its own (RUN_ID).'''
+	monkeypatch.setattr(hpcp, 'NAMED_DESTS', frozenset([os.path.abspath(out)]))
+	monkeypatch.setattr(hpcp, 'RUN_ID', 'w1-mac-%d' % next(_RUNS))
+
+
+def _swap_for_link(directory, target):
+	os.rename(directory, directory + '.away')
+	os.symlink(target, directory)
+
+
+@pytest.mark.macos988
+def test_the_door_holds_read_descriptors_on_macos(root, fresh, monkeypatch):
+	# macOS has no O_PATH, and /dev/fd/D/NAME is no path below the directory D holds (ENOENT or ENOTDIR, macOS 26): the door
+	# holds read descriptors, and every call goes relative to them (dir_fd), or by name where Python has no such form.
+	out = os.path.join(root, 'out')
+	os.makedirs(os.path.join(out, 'a'))
+	write(os.path.join(out, 'a/x'), 'x')
+	assert hpcp._PATH_FDS is False
+	_w1_run(monkeypatch, out)
+	base = hpcp._dest_directory(os.path.join(out, 'a'), make=False)
+	try:
+		assert isinstance(base, int)
+		import fcntl
+		assert fcntl.fcntl(base, fcntl.F_GETFL) & os.O_ACCMODE == os.O_RDONLY
+		assert os.lstat('x', dir_fd=base).st_size == 1
+		with pytest.raises(OSError):
+			os.stat('/dev/fd/%d/x' % base)
+	finally:
+		hpcp._close_base(base)
+
+
+@pytest.mark.macos988
+@pytest.mark.parametrize('case', ['first', 'rewrite', 'beside'])
+def test_w1_a_directory_swapped_after_the_door_never_leads_the_copy_elsewhere_on_macos(root, fresh, monkeypatch, case):
+	# W1 case 1 on the read route: out/a is swapped for a link to victim/ after the door looked at it and before the file is
+	# made, opened or renamed. 9.87 made, opened and renamed the landing by path, through the link.
+	victim, before = _victim(os.path.join(root, 'victim'))
+	out = os.path.join(root, 'out')
+	os.makedirs(os.path.join(out, 'a'))
+	src = write(os.path.join(root, 'src/a/x'), 'NEW-CONTENT')
+	if case != 'first':
+		write(os.path.join(out, 'a/x'), 'old')
+	monkeypatch.setattr(hpcp, 'WRITE_BESIDE', case == 'beside')
+	_w1_run(monkeypatch, out)
+	real, done = hpcp._claim_device, []
+	def swapping(*args, **kwargs):
+		if not done:
+			done.append(True)
+			_swap_for_link(os.path.join(out, 'a'), victim)
+		return real(*args, **kwargs)
+	monkeypatch.setattr(hpcp, '_claim_device', swapping)
+	with contextlib.redirect_stdout(io.StringIO()):
+		hpcp.copy_file(src, [os.path.join(out, 'a/x')])
+	assert done and os.path.islink(os.path.join(out, 'a'))
+	assert _tree_state(victim) == before, (before, _tree_state(victim))
+	assert read(os.path.join(out, 'a.away/x')) == 'NEW-CONTENT' and not hpcp.ERRORS, hpcp.ERRORS
+
+
+@pytest.mark.macos988
+def test_w1_a_directory_swapped_between_two_files_never_leads_the_second_elsewhere_on_macos(root, fresh, monkeypatch):
+	# W1 case 2 on the read route: out/a/x is copied, out/a is swapped for a link to victim/, then out/a/y is copied. 9.87
+	# looked at out/a once a process and wrote y by path, through the link.
+	victim, before = _victim(os.path.join(root, 'victim'))
+	out = os.path.join(root, 'out')
+	os.makedirs(os.path.join(out, 'a'))
+	for name in 'xy':
+		write(os.path.join(root, 'src/a', name), 'NEW ' + name)
+	_w1_run(monkeypatch, out)
+	with contextlib.redirect_stdout(io.StringIO()):
+		hpcp.copy_file(os.path.join(root, 'src/a/x'), [os.path.join(out, 'a/x')])
+		_swap_for_link(os.path.join(out, 'a'), victim)
+		hpcp.copy_file(os.path.join(root, 'src/a/y'), [os.path.join(out, 'a/y')])
+	assert _tree_state(victim) == before, (before, _tree_state(victim))
+	assert read(os.path.join(out, 'a.away/x')) == 'NEW x' and read(os.path.join(out, 'a.away/y')) == 'NEW y'
+	assert not hpcp.ERRORS, hpcp.ERRORS

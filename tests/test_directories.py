@@ -5,6 +5,7 @@ import errno
 import functools
 import os
 import pathlib
+import shutil
 import signal
 import stat
 import subprocess
@@ -321,7 +322,10 @@ def test_directory_calls_stay_within_9_86_s(monkeypatch, reset_hpcp_globals):
 		# p3's tree carried no extended attributes; each one a directory carries is read on both sides, in 9.86 too (SELinux
 		# labels every directory: EL8 counts 18.1 a first copy, the 2 reads of the label over Docker's 16.1)
 		labels = 2 * _attribute_count(str(src / 'd0'))
-		assert _calls_per_directory(base, monkeypatch, 'first') <= 17.1 + labels
+		# 9.88's door (W1) holds each directory on the way by descriptor: here 2.34 more calls a directory than 9.87 (18.46
+		# against 16.12 on 3.6, 3.12 and 3.14; its two door results' closes, the levels it opens and closes, less the lstats
+		# of 9.87's door and mount check; a result's dup is not counted here)
+		assert _calls_per_directory(base, monkeypatch, 'first') <= 17.1 + 2.34 + labels
 		# 3.7 to 3.12 were not in p3: 9.86 counts 21.8 a rerun there, in this test's tree (Docker; 9.87 20.0), and 3.13 and
 		# later make fewer lstats a path, in both
 		rerun = 23.0 if sys.version_info < (3, 7) else 21.8 if sys.version_info < (3, 13) else 18.1
@@ -611,13 +615,13 @@ def test_a_failed_fsync_removes_only_the_landing_it_wrote(tmp_path, monkeypatch,
 	(tmp_path / 'src').mkdir()
 	(tmp_path / 'src' / 'f').write_text('source')
 	real = hpcp._fsync_file
-	def fsync_file(path):
+	def fsync_file(path, *args):
 		if os.path.basename(path) == 'f' and os.path.isfile(path):
 			os.rename(path, path + '.away')
 			with open(path, 'w') as other:
 				other.write('someone else')
 			raise OSError(errno.EIO, os.strerror(errno.EIO))
-		return real(path)
+		return real(path, *args)
 	monkeypatch.setattr(hpcp, '_fsync_file', fsync_file)
 	rc = hpcp.hpcp([str(tmp_path / 'src') + os.sep], dest_paths=[str(tmp_path / 'out') + os.sep], single_thread=True,
 		max_workers=1, remove=True, remove_force=True)
@@ -690,3 +694,372 @@ def test_a_rerun_gives_a_restrictive_directory_its_source_s_changed_xattr(tmp_pa
 		for root in (src, tmp_path / 'out'):
 			if os.path.isdir(str(root / 'ro')):
 				os.chmod(str(root / 'ro'), 0o755)
+
+
+# ---- 9.88 D3: a destination directory several sources share is synced once, from the later source
+
+T1, T2 = 1600000000 * 10**9, 1650000000 * 10**9
+
+
+def _shared(path, name, mode, mtime_ns):
+	'''path/name, a directory holding a file of its own (name.f), of mode and modification time mtime_ns.'''
+	path.mkdir(parents=True)
+	(path / (name + '.f')).write_text(name)
+	os.chmod(str(path), mode)
+	os.utime(str(path), ns=(mtime_ns, mtime_ns))
+
+
+@posix_only
+@pytest.mark.parametrize('workers', [['-s'], ['-j', '4']], ids=['serial', 'pool'])
+def test_merged_sources_sync_a_shared_directory_once_from_the_later(tmp_path, workers):
+	# 9.87: out/x got a sync and a finish record from each source, so every rerun set its mode and times twice (its ctime moved
+	# each run), and in a pool which source's metadata won was not fixed. The later source's, as merged files go.
+	_shared(tmp_path / 'a' / 'x', 'a', 0o750, T1)
+	_shared(tmp_path / 'b' / 'x', 'b', 0o700, T2)
+	rc, output = run(['a/', 'b/', '-d', 'out/'] + workers, tmp_path)
+	landed = os.lstat(str(tmp_path / 'out' / 'x'))
+	assert rc == 0 and (stat.S_IMODE(landed.st_mode), landed.st_mtime_ns) == (0o700, T2), output[-3000:]
+	rc, output = run(['a/', 'b/', '-d', 'out/'] + workers, tmp_path)
+	again = os.lstat(str(tmp_path / 'out' / 'x'))
+	assert rc == 0 and again.st_ctime_ns == landed.st_ctime_ns and again.st_mtime_ns == T2, output[-3000:]
+
+
+@posix_only
+@pytest.mark.parametrize('workers', [['-s'], ['-j', '4']], ids=['serial', 'pool'])
+def test_a_merged_source_s_root_wins_over_an_earlier_source_s_folder(tmp_path, workers):
+	# hpcp a/ b -d out/ with a/b/ there: out/b is a/b's folder and b's root. 9.87 synced b's root first and a/b in the pool
+	# after it, so the earlier source's metadata won, and a rerun set it twice.
+	_shared(tmp_path / 'a' / 'b', 'a', 0o750, T1)
+	_shared(tmp_path / 'b', 'b', 0o700, T2)
+	rc, output = run(['a/', 'b', '-d', 'out/'] + workers, tmp_path)
+	landed = os.lstat(str(tmp_path / 'out' / 'b'))
+	assert rc == 0 and (stat.S_IMODE(landed.st_mode), landed.st_mtime_ns) == (0o700, T2), output[-3000:]
+	rc, output = run(['a/', 'b', '-d', 'out/'] + workers, tmp_path)
+	again = os.lstat(str(tmp_path / 'out' / 'b'))
+	assert rc == 0 and again.st_ctime_ns == landed.st_ctime_ns, output[-3000:]
+
+
+@posix_only
+@pytest.mark.parametrize('batch', ['parallel', 'serial'])
+def test_the_folder_sync_batches_give_one_record_per_destination(tmp_path, monkeypatch, reset_hpcp_globals, batch):
+	# The public batches: a destination directory two jobs share, and each job's root (also in its own listing), synced once,
+	# from the last job that has it; one record each. 9.87 returned one per job and the roots twice (parallel).
+	_shared(tmp_path / 'a' / 'x', 'a', 0o750, T1)
+	_shared(tmp_path / 'b' / 'x', 'b', 0o700, T2)
+	out = str(tmp_path / 'out')
+	jobs = [(str(tmp_path / 'a'), [out]), (str(tmp_path / 'b'), [out])]
+	syncs = []
+	real = hpcp._sync_directory
+	def sync(src_path, dest_paths):
+		syncs.append((src_path, tuple(dest_paths)))
+		return real(src_path, dest_paths)
+	monkeypatch.setattr(hpcp, '_sync_directory', sync)
+	if batch == 'parallel':
+		_, records = hpcp.sync_directories_parallel_batch(jobs, 2)
+	else:
+		_, records = hpcp.sync_directories_serial_batch(jobs)
+	destinations = sorted(record[1] for record in records)
+	assert destinations == [out, os.path.join(out, 'x')], records
+	assert {record[1]: record[0] for record in records} == {out: str(tmp_path / 'b'), os.path.join(out, 'x'): str(tmp_path / 'b' / 'x')}
+	if batch == 'serial':  # the pool's syncs run in its workers
+		assert len(syncs) == 2, syncs
+
+
+@posix_only
+def test_a_directory_finish_takes_times_within_the_filesystem_step(tmp_path, monkeypatch, reset_hpcp_globals):
+	# A directory on vfat keeps its time in 2 s steps: the finish compared the source's time exactly and set it again on each
+	# rerun. Within the step the destination keeps (_time_stored_as), nothing is set.
+	directory = tmp_path / 'd'
+	directory.mkdir()
+	on_disk = 1600000000 * 10**9  # a 2 s step's time, as vfat keeps it
+	os.utime(str(directory), ns=(on_disk, on_disk))
+	mode = stat.S_IMODE(os.lstat(str(directory)).st_mode)
+	set_times = []
+	real = os.utime
+	monkeypatch.setattr(os, 'utime', lambda *args, **kwargs: set_times.append(args) or real(*args, **kwargs))
+	hpcp._finish_directory((str(tmp_path / 'src'), str(directory), mode, on_disk, on_disk + 10**9 + 7, None))
+	assert set_times == [] and not hpcp.ERRORS, (set_times, hpcp.ERRORS)
+	hpcp._finish_directory((str(tmp_path / 'src'), str(directory), mode, on_disk, on_disk + 3 * 10**9, None))
+	assert len(set_times) == 1, set_times
+
+
+def test_a_non_root_run_sets_only_the_user_bsd_flags(monkeypatch):
+	# macOS gives /Users, /private and /var/folders sunlnk (SF_NOUNLINK), a system flag only root can set: a non-root list-mode
+	# copy of a path below /Users synced /Users to out/Users, and chflags with the source's flags was EPERM for the whole call
+	# (exit 193; a move never ended). A non-root run sets the user flags (UF_*, the lower 16 bits) and keeps the system ones
+	# the destination has, as an owner it cannot keep is no error; root sets them all.
+	hidden, nodump, sunlnk, archived = 0x8000, 0x1, 0x100000, 0x10000
+	monkeypatch.setattr(os, 'geteuid', lambda: 1000, raising=False)
+	assert hpcp._flags_to_set(sunlnk | hidden, 0) == hidden
+	assert hpcp._flags_to_set(sunlnk, archived | nodump) == archived
+	assert hpcp._flags_to_set(0, archived) == archived
+	monkeypatch.setattr(os, 'geteuid', lambda: 0, raising=False)
+	assert hpcp._flags_to_set(sunlnk | hidden, archived | nodump) == sunlnk | hidden
+
+
+@posix_only
+def test_a_directory_finish_sets_an_even_second_source_time_exactly_on_a_fine_filesystem(tmp_path, reset_hpcp_globals):
+	# The tolerance is the step the destination keeps, not the source's: a source time on an even second (vfat's, or a
+	# whole-second tool's) onto a directory this filesystem (tmpfs, ext4, XFS: 1 ns) last wrote 1.5 s later. 9.88's first
+	# build took the coarser step of the two (2 s) and left it 1.5 s off; 9.87 set it exactly.
+	directory = tmp_path / 'd'
+	directory.mkdir()
+	source_ns = 1700000000 * 10**9
+	os.utime(str(directory), ns=(source_ns + 1523456789, source_ns + 1523456789))
+	mode = stat.S_IMODE(os.lstat(str(directory)).st_mode)
+	hpcp._finish_directory((str(tmp_path / 'src'), str(directory), mode, source_ns, source_ns, None))
+	assert os.lstat(str(directory)).st_mtime_ns == source_ns and not hpcp.ERRORS, hpcp.ERRORS
+
+
+@posix_only
+@pytest.mark.skipif(not sys.platform.startswith('linux') or not hasattr(os, 'geteuid') or os.geteuid() != 0,
+	reason='needs root to mount a vfat image (VM 901)')
+def test_a_merged_rerun_on_vfat_sets_no_directory_again(tmp_path, monkeypatch, reset_hpcp_globals):
+	# vfat keeps times in 2 s steps: 9.87's finish compared them exactly, and with merged sources gave a shared directory two
+	# records, so every rerun set its times again (twice). The modes are ones vfat can hold (its default dmask, 022). The
+	# copy goes below the mount: vfat's root directory keeps no times (it reads 1970 after a touch: VM 901, Linux 6.1), so
+	# a run sets them on every rerun, as 9.87 did.
+	mkfs = shutil.which('mkfs.vfat') or shutil.which('/usr/sbin/mkfs.vfat') or shutil.which('/sbin/mkfs.vfat')
+	if not mkfs:
+		pytest.skip('needs mkfs.vfat')
+	image, mount = tmp_path / 'fat.img', tmp_path / 'fat'
+	image.write_bytes(b'')
+	os.truncate(str(image), 32 << 20)
+	if subprocess.run([mkfs, str(image)], stdout=subprocess.PIPE, stderr=subprocess.STDOUT).returncode:
+		pytest.skip('mkfs.vfat refused')
+	mount.mkdir()
+	if subprocess.run(['mount', '-o', 'loop', str(image), str(mount)], stdout=subprocess.PIPE, stderr=subprocess.STDOUT).returncode:
+		pytest.skip('this kernel does not mount vfat')
+	try:
+		_shared(tmp_path / 'a' / 'x', 'a', 0o755, T1 + 1)
+		_shared(tmp_path / 'b' / 'x', 'b', 0o755, T2 + 1)
+		_shared(tmp_path / 'b' / 'y', 'b', 0o755, T2 + 3)
+		sources = [str(tmp_path / 'a') + os.sep, str(tmp_path / 'b') + os.sep]
+		dest = str(mount / 'out') + os.sep
+		assert hpcp.hpcp(sources, dest_paths=[dest], single_thread=True, batch=True) == 0, hpcp.ERRORS
+		assert abs(os.lstat(str(mount / 'out' / 'x')).st_mtime_ns - T2) <= 2 * 10**9
+		changes = []
+		for name in ('utime', 'chmod', 'fchmod'):
+			real = getattr(os, name)
+			def spy(target, *args, _real=real, _name=name, **kwargs):
+				where = os.readlink('/proc/self/fd/%d' % target) if isinstance(target, int) else os.path.abspath(target)
+				if os.path.isdir(where) and where.startswith(str(mount)):
+					changes.append((_name, where))
+				return _real(target, *args, **kwargs)
+			monkeypatch.setattr(os, name, spy)
+		assert hpcp.hpcp(sources, dest_paths=[dest], single_thread=True, batch=True) == 0, hpcp.ERRORS
+		assert changes == [], changes
+	finally:
+		subprocess.run(['umount', '-l', str(mount)], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+
+
+# ---- 9.88 D2: a non-root move of a directory whose mode shuts its owner out
+
+root_only = pytest.mark.skipif(not hasattr(os, 'geteuid') or os.geteuid() != 0, reason='needs root to make another user\'s tree')
+NOBODY = 65534
+
+
+def _shut_out_tree():
+	'''f5's tree, made as root in a work directory nobody can use (0777, not sticky, so a move may remove the source root):
+	src/d of mode 0607 owned by root (no search for its owner; nobody, the runner, reaches it as "other", and owns the copy),
+	holding sub/f and g; out owned by nobody.'''
+	import tempfile
+	work = tempfile.mkdtemp(prefix='hpcp-d2-')
+	os.chmod(work, 0o777)
+	src = os.path.join(work, 'src')
+	os.makedirs(os.path.join(src, 'd', 'sub'))
+	for path, text in ((os.path.join(src, 'd', 'sub', 'f'), 'hi'), (os.path.join(src, 'd', 'g'), 'top')):
+		with open(path, 'w') as handle:
+			handle.write(text)
+		os.chmod(path, 0o666)
+	os.chmod(src, 0o777)
+	os.chmod(os.path.join(src, 'd', 'sub'), 0o777)
+	os.chmod(os.path.join(src, 'd'), 0o607)
+	os.mkdir(os.path.join(work, 'out'))
+	os.chown(os.path.join(work, 'out'), NOBODY, NOBODY)
+	return work
+
+
+def _as_nobody(args, cwd, script=None):
+	'''hpcp (or script, a wrapper that runs hpcp.main()) as nobody: (return code, output). Skips where nobody cannot reach
+	Python or hpcp.py (the EL VMs keep the checkout and the venv in a home directory of mode 0700); a venv's Python is
+	run by its real path, which hpcp needs nothing beyond.'''
+	python = os.path.realpath(sys.executable)
+	for path in (python, HPCP, script or HPCP):
+		above = os.path.dirname(path)
+		while above != os.path.dirname(above):
+			if not os.stat(above).st_mode & stat.S_IXOTH:
+				pytest.skip(f'nobody cannot reach {path}: {above} is not searchable by others')
+			above = os.path.dirname(above)
+	def demote():
+		os.setgroups([])
+		os.setgid(NOBODY)
+		os.setuid(NOBODY)
+	task = subprocess.run([python, script or HPCP] + args, cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+		stderr=subprocess.STDOUT, preexec_fn=demote, timeout=120, env=dict(os.environ, HOME=cwd))
+	return task.returncode, task.stdout.decode(errors='replace')
+
+
+@posix_only
+@root_only
+def test_a_non_root_move_of_a_directory_its_owner_cannot_search_completes(tmp_path):
+	# 9.87: exit 212, 'Copy failed: the directory OUT/d/sub cannot be written to disk (Permission denied)', every source kept:
+	# the finish gave out/d 0607, and the move's fsync of d/sub (by path) met EACCES. Its mode is now set after the removal.
+	work = _shut_out_tree()
+	try:
+		rc, output = _as_nobody(['src/', '-d', 'out/', '-rf'], work)
+		out = os.path.join(work, 'out', 'd')
+		assert rc == 0 and not os.path.exists(os.path.join(work, 'src', 'd')), output[-3000:]
+		assert stat.S_IMODE(os.lstat(out).st_mode) == 0o607, oct(os.lstat(out).st_mode)
+		with open(os.path.join(out, 'sub', 'f')) as f, open(os.path.join(out, 'g')) as g:
+			assert (f.read(), g.read()) == ('hi', 'top')
+	finally:
+		shutil.rmtree(work, ignore_errors=True)
+
+
+_STOPPED_AT_REMOVAL = '''import sys
+sys.path.insert(0, %(root)r)
+import hpcp
+def stopped(*args, **kwargs):
+	raise KeyboardInterrupt  # a stop as the move's removal starts: the late pass never runs
+hpcp.remove_moved_sources = stopped
+if __name__ == '__main__':  # forkserver and spawn workers import this file as __mp_main__
+	sys.argv = [%(hpcp)r] + sys.argv[1:]
+	hpcp.main()
+'''
+
+
+@posix_only
+@root_only
+def test_a_stopped_move_leaves_owner_search_until_a_rerun(tmp_path):
+	# A stop before the late pass (here as the removal starts) leaves such a directory with owner read and search (0707): a
+	# rerun of the move sets its exact mode.
+	work = _shut_out_tree()
+	try:
+		script = os.path.join(work, 'stopped.py')
+		with open(script, 'w') as handle:
+			handle.write(_STOPPED_AT_REMOVAL % {'root': os.path.dirname(HPCP), 'hpcp': HPCP})
+		out = os.path.join(work, 'out', 'd')
+		rc, output = _as_nobody(['src/', '-d', 'out/', '-rf'], work, script)
+		assert rc == 130 and stat.S_IMODE(os.lstat(out).st_mode) == 0o707, (oct(os.lstat(out).st_mode), output[-3000:])
+		rc, output = _as_nobody(['src/', '-d', 'out/', '-rf'], work)
+		assert rc == 0 and stat.S_IMODE(os.lstat(out).st_mode) == 0o607, (oct(os.lstat(out).st_mode), output[-3000:])
+		assert not os.path.exists(os.path.join(work, 'src', 'd'))
+	finally:
+		shutil.rmtree(work, ignore_errors=True)
+
+
+_STOPPED_AFTER_REMOVAL = '''import os, signal, sys
+sys.path.insert(0, %(root)r)
+import hpcp
+removal = hpcp.remove_moved_sources
+def stopped(*args, **kwargs):
+	removal(*args, **kwargs)
+	# a stop as the move's removal ends: every source directory is gone. Raised as a test raises one, or as a person's Ctrl-C
+	# comes (the handler, _stop: it records the stop and raises, and nothing has acted on it, so a _check_stop would raise again)
+	if %(signal)r:
+		os.kill(os.getpid(), signal.SIGINT)
+	raise KeyboardInterrupt
+hpcp.remove_moved_sources = stopped
+if __name__ == '__main__':  # forkserver and spawn workers import this file as __mp_main__
+	sys.argv = [%(hpcp)r] + sys.argv[1:]
+	hpcp.main()
+'''
+
+
+@posix_only
+@root_only
+@pytest.mark.parametrize('how', ['raised', 'signal'])
+def test_a_move_stopped_as_its_removal_ends_still_gets_the_exact_mode(tmp_path, how):
+	# A stop at the end of the removal (a big tree's removal takes long, so a Ctrl-C there is likely): out/d's source is gone,
+	# so no rerun reaches it (one exits 240, the source does not exist), and 9.88's first build left it 0707 for good. The late
+	# pass now runs however the removal ended, for each directory whose source it removed.
+	work = _shut_out_tree()
+	try:
+		script = os.path.join(work, 'stopped.py')
+		with open(script, 'w') as handle:
+			handle.write(_STOPPED_AFTER_REMOVAL % {'root': os.path.dirname(HPCP), 'hpcp': HPCP, 'signal': how == 'signal'})
+		out = os.path.join(work, 'out', 'd')
+		rc, output = _as_nobody(['src/', '-d', 'out/', '-rf'], work, script)
+		assert rc == 130 and not os.path.exists(os.path.join(work, 'src', 'd')), output[-3000:]
+		assert stat.S_IMODE(os.lstat(out).st_mode) == 0o607, (oct(os.lstat(out).st_mode), output[-3000:])
+	finally:
+		shutil.rmtree(work, ignore_errors=True)
+
+
+@posix_only
+@root_only
+def test_a_move_whose_removal_was_skipped_for_a_failed_copy_keeps_owner_search_for_the_rerun(tmp_path):
+	# One file of the tree cannot be read (root's, 0600; nobody moves it): the copy reports it, the removal is skipped ("Remove
+	# skipped ... fix them and re-run") and every source stays. The remedy is a rerun, whose folder sync looks below out/d, and
+	# a rerun over a 0607 directory can fail there (docs/limitations.md): out/d keeps owner read and search (0707), as after a
+	# stop before the removal. 9.88's first build gave it 0607 here. The rerun, the file readable, completes and sets 0607.
+	work = _shut_out_tree()
+	try:
+		unreadable = os.path.join(work, 'src', 'd', 'h')
+		with open(unreadable, 'w') as handle:
+			handle.write('secret')
+		os.chmod(unreadable, 0o600)
+		out = os.path.join(work, 'out', 'd')
+		rc, output = _as_nobody(['src/', '-d', 'out/', '-rf'], work)
+		assert rc != 0 and 'Remove skipped' in output and os.path.exists(os.path.join(work, 'src', 'd', 'sub', 'f')), (rc, output[-3000:])
+		assert stat.S_IMODE(os.lstat(out).st_mode) == 0o707, (oct(os.lstat(out).st_mode), output[-3000:])
+		os.chmod(unreadable, 0o666)
+		rc, output = _as_nobody(['src/', '-d', 'out/', '-rf'], work)
+		assert rc == 0 and stat.S_IMODE(os.lstat(out).st_mode) == 0o607 and not os.path.exists(os.path.join(work, 'src', 'd')), (
+			oct(os.lstat(out).st_mode), output[-3000:])
+	finally:
+		shutil.rmtree(work, ignore_errors=True)
+
+
+_REMOVAL_FAILS_AND_THE_LATE_MODE_FAILS = '''import os, sys
+sys.path.insert(0, %(root)r)
+import hpcp
+removal = hpcp.remove_moved_sources
+after = []
+def failing(*args, **kwargs):
+	removal(*args, **kwargs)
+	after.append(True)
+	raise RuntimeError('the removal failed after it ran')  # what the run reports when its removal step raises
+hpcp.remove_moved_sources = failing
+real_fchmod = os.fchmod
+def fchmod(fd, mode):
+	if after:
+		raise PermissionError(1, 'Operation not permitted')  # the late pass's mode
+	return real_fchmod(fd, mode)
+os.fchmod = fchmod
+if __name__ == '__main__':  # forkserver and spawn workers import this file as __mp_main__
+	sys.argv = [%(hpcp)r] + sys.argv[1:]
+	hpcp.main()
+'''
+
+
+@posix_only
+@root_only
+def test_a_late_mode_that_cannot_be_set_never_hides_the_removal_s_own_error(tmp_path):
+	# The late pass runs in a finally, after an error in the removal step: its own failure is a Directory sync error it
+	# prints (every OSError of the pass is taken inside it), so what the removal raised is still reported, and the exit is
+	# not 0. A second stop cannot cut it short either (_stop returns for every stop after the first).
+	work = _shut_out_tree()
+	try:
+		script = os.path.join(work, 'failing.py')
+		with open(script, 'w') as handle:
+			handle.write(_REMOVAL_FAILS_AND_THE_LATE_MODE_FAILS % {'root': os.path.dirname(HPCP), 'hpcp': HPCP})
+		rc, output = _as_nobody(['src/', '-d', 'out/', '-rf'], work, script)
+		assert rc != 0 and 'the removal failed after it ran' in output, (rc, output[-3000:])
+		assert "its mode, set after the move's removal: [Errno 1] Operation not permitted" in output and 'Traceback' not in output, output[-3000:]
+	finally:
+		shutil.rmtree(work, ignore_errors=True)
+
+
+@posix_only
+def test_a_move_off_posix_does_not_ask_for_an_euid(tmp_path, monkeypatch, reset_hpcp_globals):
+	# Windows has no os.geteuid: 9.87's _shut_to_its_owner called it for every directory a move synced (an AttributeError
+	# out of _sync_moved_directories; reasoned, no Windows machine here). Off POSIX the finish sets no mode first.
+	out = tmp_path / 'out'
+	out.mkdir()
+	monkeypatch.setattr(hpcp, 'SYNC_COPIES', True)
+	monkeypatch.delattr(os, 'geteuid', raising=False)
+	record = (str(tmp_path / 'src'), str(out), 0o600, 0, 0, None)
+	hpcp._sync_moved_directories([], set(), [str(tmp_path / 'src') + os.sep], [str(out) + os.sep], False, [record], 1)
+	assert hpcp._first_mode(0o600) == 0o600 and hpcp._synced_at_finish(0o600) is False

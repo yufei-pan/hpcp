@@ -1980,14 +1980,14 @@ def _wrapped(tmp_path, args, inject='', before='pass', env=None, cwd=None):
 
 
 def _ended(task, timeout=60):
-	"""(return code, output, seconds it took from now); 'timeout' after 60 s, its session killed: a hang fails, never holds."""
+	"""(return code, output, seconds it took from now); 'timeout' after 60 s, its session killed: a hang fails, never holds,
+	and keeps what the run printed before it was killed."""
 	started = time.monotonic()
 	try:
 		output = task.communicate(timeout=timeout)[0]
 	except subprocess.TimeoutExpired:
 		os.killpg(task.pid, signal.SIGKILL)
-		task.communicate()
-		return 'timeout', b'', time.monotonic() - started
+		return 'timeout', task.communicate()[0], time.monotonic() - started
 	return task.returncode, output, time.monotonic() - started
 
 
@@ -2100,9 +2100,9 @@ def slow(path):
 		open(os.environ['MARK'] + '.done', 'w').close()
 		signal.pthread_sigmask(signal.SIG_SETMASK, mask)
 real_fsync, real_os_fsync = hpcp._fsync_file, os.fsync
-def fsync_file(path):
+def fsync_file(path, *args):
 	slow(path)
-	return real_fsync(path)
+	return real_fsync(path, *args)
 def os_fsync(fd):
 	# the beside route's new file, made and held by hpcp, is fsynced through its descriptor
 	slow(os.readlink('/proc/self/fd/%d' % fd) if os.path.isdir('/proc/self/fd') else '')
@@ -2272,6 +2272,43 @@ def _start_methods():
 _DROPPED_STOP = re.compile(rb'Exception ignored in: [^\n]*\nTraceback \(most recent call last\):\n(?:  [^\n]*\n)*?'
 	rb'  File "[^"\n]*hpcp\.py", line \d+, in _stop\n    raise KeyboardInterrupt\nKeyboardInterrupt(?::[^\n]*)?\n')
 
+# Item (b), 9.89's deferral (docs/limitations.md "On Python 3.6 and 3.7 an early stop with forkserver or spawn can print a worker's
+# EOFError"): a stop's SystemExit lands in an idle worker between a queued job's length and its payload, and the next worker reads
+# the payload as a length: 2 early stops in 3,800 on 3.6 in 9.87, 0 in 3,800 in 9.88's review; old, and the run still ends 130.
+# Only that worker's traceback is accepted: _process_worker's call_queue.get ending in EOFError. The line can follow a bar frame.
+_OLD_EOF = re.compile(rb'Process [^\n]*:\nTraceback \(most recent call last\):\n(?:  [^\n]*\n)*?'
+	rb'  File "[^"\n]*process\.py", line \d+, in _process_worker\n    call_item = call_queue\.get\(block=True\)\n'
+	rb'(?:  [^\n]*\n)*?EOFError: Ran out of input\n')
+
+
+def _without_old_blocks(output):
+	"""output with the known blocks of Python 3.6 and 3.7 (_DROPPED_STOP, _OLD_EOF) taken out."""
+	return _OLD_EOF.sub(b'', _DROPPED_STOP.sub(b'', output))
+
+
+def _expected_old_blocks(output):
+	"""What an early stop's output may not hold: it, less the known blocks on 3.6 and 3.7; whole on 3.8 and later."""
+	return _without_old_blocks(output) if sys.version_info < (3, 8) else output
+
+
+_EOF_BLOCK = (b'1 F Synced | 0 Scheduled |\xe2\x96\x88|100.0% | 0sProcess Process-2:\n'
+	b'Traceback (most recent call last):\n'
+	b'  File "/usr/local/lib/python3.6/multiprocessing/process.py", line 258, in _bootstrap\n    self.run()\n'
+	b'  File "/usr/local/lib/python3.6/multiprocessing/process.py", line 93, in run\n    self._target(*self._args, **self._kwargs)\n'
+	b'  File "/usr/local/lib/python3.6/concurrent/futures/process.py", line 169, in _process_worker\n'
+	b'    call_item = call_queue.get(block=True)\n'
+	b'  File "/usr/local/lib/python3.6/multiprocessing/queues.py", line 113, in get\n    return _ForkingPickler.loads(res)\n'
+	b'EOFError: Ran out of input\n')
+
+
+def test_only_the_old_eoferror_block_is_taken_out_of_an_early_stop_s_output():
+	# the block as the 9.88 review saw it (3.6 forkserver and spawn), after a bar frame, is accepted; no other traceback is
+	assert _without_old_blocks(b'Copying\n' + _EOF_BLOCK + b'Done\n') == b'Copying\n1 F Synced | 0 Scheduled |\xe2\x96\x88|100.0% | 0sDone\n'
+	for other in (_EOF_BLOCK.replace(b'EOFError: Ran out of input', b'BrokenPipeError: [Errno 32] Broken pipe'),
+			_EOF_BLOCK.replace(b'call_queue.get(block=True)', b'result_queue.put(item)'),
+			b'Traceback (most recent call last):\n  File "x.py", line 1, in <module>\nEOFError: Ran out of input\n'):
+		assert b'Traceback' in _without_old_blocks(b'Copying\n' + other), other
+
 
 @posix_only
 @pytest.mark.parametrize('batch', range(4))
@@ -2281,16 +2318,10 @@ def test_an_early_stop_prints_no_traceback(tmp_path, method, batch):
 	# in only later: about one early Ctrl-C in three printed a KeyboardInterrupt traceback on 3.14. A worker now starts with
 	# the stops blocked and lets them in once set up. 10 runs a batch, 40 a start method; each stopped at a random 0 to 0.3 s
 	# after hpcp.main() was called, by SIGINT to the run's process group, as a terminal's Ctrl-C. On 3.6 and 3.7 Python's own
-	# block for hpcp's dropped stop is accepted (_DROPPED_STOP, a known limitation there).
-	if sys.version_info < (3, 8) and method != 'fork':
-		# 3.6's pools fork. On 3.7 a forkserver or spawn child (or the semaphore tracker it starts) can take the same Ctrl-C
-		# while Python itself starts or imports, which prints a traceback from Python's own code (importlib, initsite,
-		# multiprocessing.spawn; 3.7's semaphore tracker KeyError in cache.remove). That is the deferral "A Ctrl-C that lands
-		# while Python imports hpcp can be dropped" (docs/limitations.md, 9.88), and 9.86 prints it more (one round of 100 runs a
-		# method, 3.7, runs with a traceback, 9.86 against 9.87: forkserver 25 against 8, spawn 94 against 15; every 9.87 run
-		# exits 130. The README and the deferral give another, larger measure: 200 runs a method, forkserver 45 against 13, spawn
-		# 187 against 28).
-		pytest.skip('Python 3.6 pools fork; on 3.7 the child start-up prints its own traceback (the 9.88 deferral in docs/limitations.md)')
+	# block for hpcp's dropped stop is accepted (_DROPPED_STOP, a known limitation there). 9.88: on 3.6 and 3.7 with
+	# forkserver or spawn (skipped in 9.87), the semaphore tracker they start at the run's first SemLock starts with the stops
+	# blocked, as 3.8's resource tracker blocks them itself: before, a Ctrl-C there printed the tracker's traceback (13 and 28
+	# of 200 runs on 3.7 in the 9.87 docs round).
 	cp = tmp_path / 'slowcp'
 	cp.write_text(_SLOWER_CP)
 	os.chmod(str(cp), 0o755)
@@ -2311,12 +2342,9 @@ def test_an_early_stop_prints_no_traceback(tmp_path, method, batch):
 		finally:
 			if task.poll() is None:
 				os.killpg(task.pid, signal.SIGKILL)
-		if code == 'timeout' and sys.version_info < (3, 7):
-			# Python 3.6's pool can hang in its first submit when the stop that ended a worker left the queue's write lock held:
-			# review A saw 5 hangs in 5,520 early stops (about 1 session in 28). Not this test's subject: limitations.md, "On
-			# Python 3.6 an early stop can rarely hang the run in a pool's submit" (F1, deferred to 9.88). A hang elsewhere fails.
-			pytest.xfail('the Python 3.6 submit hang, F1, deferred to 9.88 (docs/limitations.md)')
-		left = _DROPPED_STOP.sub(b'', output) if sys.version_info < (3, 8) else output
+		left = _expected_old_blocks(output)
+		if code != 130 or b'Traceback' in left:
+			print(output.decode(errors='replace'))  # whole, in the failure's captured stdout: an assertion message is cut short
 		assert code == 130 and b'Traceback' not in left, (run, output[-3000:])
 
 
@@ -2363,6 +2391,205 @@ def test_a_stop_in_a_call_python_drops_prints_nothing_and_is_acted_on(tmp_path, 
 	script.write_text(_STOP_IN % {'root': os.path.dirname(HPCP)})
 	done = subprocess.run([sys.executable, str(script), where], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=60)
 	assert done.returncode == 0 and done.stdout.strip() == b'acted on', done.stdout
+
+
+_SUBMIT_HELD = '''
+import os, signal, sys, threading, time
+sys.path.insert(0, %(root)r)
+import hpcp
+case = sys.argv[1]
+if case == 'ignored':
+	signal.signal(signal.SIGHUP, signal.SIG_IGN)  # as nohup starts a run: _install_stops leaves it so
+hpcp._MAIN_PID = os.getpid()
+hpcp._install_stops()
+hpcp._register_worker_start()
+signum = signal.SIGHUP if case == 'ignored' else signal.SIGINT
+sent = []
+def send():
+	if case != 'recorded':
+		signal.pthread_sigmask(signal.SIG_BLOCK, [signum])  # every thread blocks it: it stays pending
+	time.sleep(0.3)
+	sent.append(time.monotonic())
+	os.kill(os.getpid(), signum)
+def release(lock):
+	# the dead holder's lock, let go of by another process after 1 s
+	signal.pthread_sigmask(signal.SIG_BLOCK, [signum])
+	time.sleep(1)
+	pid = os.fork()
+	if pid == 0:
+		lock.release()
+		os._exit(0)
+	os.waitpid(pid, 0)
+try:
+	with hpcp._pool(2) as pool:
+		pool.submit(os.getpid).result(timeout=30)
+		lock = pool.executor._result_queue._wlock
+		pid = os.fork()
+		if pid == 0:
+			lock.acquire()  # a worker that ended holding the result queue's write lock
+			os._exit(0)
+		os.waitpid(pid, 0)
+		threading.Thread(target=send, daemon=True).start()
+		if case == 'ignored':
+			threading.Thread(target=release, args=(lock,), daemon=True).start()
+		pool.submit(os.getpid).result(timeout=30)
+	print('returned', flush=True)
+except KeyboardInterrupt:
+	print('KeyboardInterrupt %%.1f s after the signal' %% (time.monotonic() - sent[0]), flush=True)
+# Python 3.6's exit wakes each pool's manager thread through that lock: not waited on here
+os._exit(0)
+'''
+
+
+@posix_only
+@pytest.mark.skipif(sys.version_info >= (3, 7), reason="Python 3.6's own submit")
+@pytest.mark.parametrize('case', ['pending', 'recorded', 'ignored'])
+def test_a_stop_ends_a_3_6_submit_that_waits_on_a_dead_worker_s_lock(tmp_path, case):
+	# Python 3.6's submit wakes the pool's manager thread under the result queue's write lock, which a worker ended inside its
+	# acquire leaves held: 9.87's parent waited on it for good, its stops blocked, and a second Ctrl-C printed nothing (about 3
+	# early stops in 2,000). hpcp's own submit takes the lock in 0.1 s steps and acts on a stop _stop handles: pending (every
+	# thread blocks it, as a real run's do while a submit runs) or recorded (another thread took it). An ignored one (nohup's
+	# SIGHUP) stays pending while blocked and is no stop: the submit waits for the lock and returns.
+	script = tmp_path / 'submit_held.py'
+	script.write_text(_SUBMIT_HELD % {'root': os.path.dirname(HPCP)})
+	try:
+		done = subprocess.run([sys.executable, str(script), case], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=60)
+	except subprocess.TimeoutExpired:
+		pytest.fail('the submit waited on the held lock for good (60 s)')
+	output = done.stdout.decode(errors='replace')
+	if case == 'ignored':
+		assert done.returncode == 0 and output.strip() == 'returned', output
+	else:
+		said = re.match(r'KeyboardInterrupt ([0-9.]+) s after the signal$', output.strip())
+		assert done.returncode == 0 and said and float(said.group(1)) < 5, output
+
+
+def test_a_3_6_submit_without_a_write_lock_is_the_stock_one():
+	# Python 3.6 on Windows makes the result queue with no write lock (_wlock None: a pipe message is written whole there), so
+	# its submit cannot hang on one; hpcp's own submit took the lock unconditionally and raised AttributeError on every pooled
+	# task (9.87 used the stock submit). Faked: no Windows machine here.
+	import hpcp
+	class _Queue:
+		_wlock = None
+	class _Executor:
+		_result_queue = _Queue()
+		def submit(self, fn, *args, **kwargs):
+			return ('stock', fn, args, kwargs)
+	assert hpcp._submit_36(_Executor(), None, max, (1, 2), {'key': len}) == ('stock', max, (1, 2), {'key': len})
+
+
+# ---- a Ctrl-C while Python imports hpcp ----
+
+_IMPORT_STOP = '''
+import os, signal, sys
+sys.path.insert(0, %(root)r)
+VERSION_LINE = %(version_line)d
+seen = {'line': None, 'sent': None}
+def module_lines(frame, event, arg):
+	if event == 'line':
+		seen['line'] = frame.f_lineno
+	return module_lines
+def trace(frame, event, arg):
+	code = frame.f_code
+	if event != 'call':
+		return None
+	if code.co_name == '<module>' and os.path.basename(code.co_filename) == 'hpcp.py':
+		return module_lines
+	# importlib's weak-reference callbacks (a module lock's cb; 3.12+ also KeyedRef.remove), while hpcp's import header runs
+	if (seen['sent'] is None and seen['line'] is not None and seen['line'] < VERSION_LINE and code.co_name in ('cb', 'remove')
+			and code.co_filename.startswith('<frozen importlib')):
+		seen['sent'] = (code.co_name, seen['line'])
+		os.kill(os.getpid(), signal.SIGINT)
+	return None
+sys.settrace(trace)
+try:
+	import hpcp
+finally:
+	sys.settrace(None)
+	print('sent in', seen['sent'], flush=True)
+print('continued', flush=True)
+'''
+
+
+def _version_line():
+	with open(HPCP, encoding='utf-8') as f:
+		return next(number for number, line in enumerate(f, 1) if line.startswith('version = '))
+
+
+@posix_only
+def test_a_ctrl_c_in_an_import_callback_is_not_dropped():
+	# Python's own SIGINT handler raised a Ctrl-C that came while Python imported hpcp inside importlib's weak-reference
+	# callbacks, which drop it ('Exception ignored in: ...cb'), and the run went on, with -rf to its removal (1 in 3,000 early
+	# Ctrl-Cs through pip's launcher, 3.7 and 3.14). SIGINT is held for hpcp's imports, and raised once they are done.
+	done = subprocess.run([sys.executable, '-c', _IMPORT_STOP % {'root': os.path.dirname(HPCP), 'version_line': _version_line()}],
+		stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
+	out, err = done.stdout.decode(errors='replace'), done.stderr.decode(errors='replace')
+	assert 'sent in None' not in out, (out, err)  # the callback ran inside the header, and the Ctrl-C was sent there
+	assert 'continued' not in out and 'KeyboardInterrupt' in err and 'Exception ignored' not in err, (out, err)
+
+
+_IMPORT_MASKS = '''
+import signal, sys
+sys.path.insert(0, %(root)r)
+case = sys.argv[1]
+if case == 'blocked':
+	signal.pthread_sigmask(signal.SIG_BLOCK, [signal.SIGINT])
+elif case != 'plain':
+	sys.modules[case] = None  # an import of hpcp's that fails
+	sys.modules['multiCMD'] = None  # the embedded one is used
+try:
+	import hpcp
+	print('imported')
+except ImportError:
+	print('ImportError')
+print('SIGINT blocked' if signal.SIGINT in signal.pthread_sigmask(signal.SIG_BLOCK, []) else 'SIGINT open')
+'''
+
+
+def _embed_codec():
+	with open(HPCP, encoding='utf-8') as f:
+		return re.search(r'exec\((\w+)\.decompress\(', f.read()).group(1)
+
+
+@posix_only
+@pytest.mark.parametrize('case', ['plain', 'blocked', 'uuid', 'codec'])
+def test_the_import_mask_is_released_on_every_path(case):
+	# The mask covers hpcp's import header only, released by a finally on every path: a failed import (one of its imports,
+	# or the embedded multiCMD's codec, missing) leaves SIGINT open, as it was; one blocked before the import stays blocked.
+	if case == 'codec':
+		case = _embed_codec()
+	done = subprocess.run([sys.executable, '-c', _IMPORT_MASKS % {'root': os.path.dirname(HPCP)}, case],
+		stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=120)
+	expected = {'plain': 'imported\nSIGINT open', 'blocked': 'imported\nSIGINT blocked'}.get(case, 'ImportError\nSIGINT open')
+	assert done.stdout.decode(errors='replace').strip() == expected, done.stdout
+
+
+_IMPORT_POPENS = '''
+import os, subprocess, sys
+sys.path.insert(0, %(root)r)
+started = []
+real = subprocess.Popen.__init__
+def spy(self, args, *rest, **kwargs):
+	# whose module's import started it: the innermost module frame (uuid's own ldconfig on 3.6 is uuid's)
+	frame = sys._getframe(1)
+	while frame is not None and frame.f_code.co_name != '<module>':
+		frame = frame.f_back
+	started.append((args, frame and os.path.basename(frame.f_code.co_filename)))
+	return real(self, args, *rest, **kwargs)
+subprocess.Popen.__init__ = spy
+import hpcp
+print([args for args, whose in started if whose == 'hpcp.py'])
+'''
+
+
+@posix_only
+def test_importing_hpcp_runs_no_subprocess():
+	# On Python 3.6 to 3.8 platform.machine() runs `uname -p` (platform.uname() computes the processor there), which
+	# _fat_ioctl_numbers called as hpcp's module ran: a fork and exec each import, and a Ctrl-C was dropped in its Popen.__del__
+	# once the import mask had ended. os.uname() asks the kernel.
+	done = subprocess.run([sys.executable, '-c', _IMPORT_POPENS % {'root': os.path.dirname(HPCP)}],
+		stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=120)
+	assert done.returncode == 0 and done.stdout.decode(errors='replace').strip() == '[]', done.stdout
 
 
 @posix_only
@@ -2613,7 +2840,7 @@ def _spy_fsync_and_renames(hpcp_mod, monkeypatch, fsync_error=None):
 		return real_fsync(fd)
 	def renamer(real):
 		def rename(src, dst, *args, **kwargs):
-			events.append(('rename', os.lstat(src).st_ino))
+			events.append(('rename', os.lstat(src, dir_fd=kwargs.get('src_dir_fd')).st_ino))
 			return real(src, dst, *args, **kwargs)
 		return rename
 	monkeypatch.setattr(hpcp_mod.os, 'fsync', fsync)
@@ -2675,7 +2902,7 @@ def test_a_rewrite_in_place_outside_a_move_is_not_fsynced(tmp_path, hpcp_mod, re
 	monkeypatch.setattr(hpcp_mod, 'NAMED_DESTS', frozenset([str(tmp_path / 'out')]))
 	events = _spy_fsync_and_renames(hpcp_mod, monkeypatch)
 	synced = []
-	monkeypatch.setattr(hpcp_mod, '_fsync_file', synced.append)
+	monkeypatch.setattr(hpcp_mod, '_fsync_file', lambda path, *args: synced.append(path))
 	hpcp_mod.copy_file(str(tmp_path / 'a/x'), [str(tmp_path / 'out/x')])
 	assert read(tmp_path / 'out/x') == 'new content' and os.stat(str(tmp_path / 'out/x')).st_ino == inode
 	assert synced == [] and events == [] and not hpcp_mod.ERRORS
@@ -2864,7 +3091,7 @@ def test_a_landing_that_cannot_be_opened_by_anyone_here_is_a_failed_fsync(tmp_pa
 @not_root
 def test_a_move_whose_landing_cannot_be_opened_is_a_failed_copy_not_a_removed_source(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch, capsys):
 	write(tmp_path / 'a/x', 'X')
-	def refuse(path):
+	def refuse(path, *args):
 		raise PermissionError(errno.EACCES, os.strerror(errno.EACCES), path)
 	monkeypatch.setattr(hpcp_mod, '_fsync_file', refuse)
 	assert _move(hpcp_mod, tmp_path) != 0
@@ -3055,55 +3282,6 @@ def test_a_move_fsyncs_the_directory_a_link_to_a_directory_named_by_d_leads_to(t
 	assert os.readlink(str(tmp_path / 'real/l')) == 'x'
 	before = {event[1] for event in events[:events.index(('remove',))]}
 	assert os.lstat(str(tmp_path / 'real')).st_ino in before
-
-
-# ---- review r986r: a node source, a landing changed after the look, and -co's carry-over ----
-
-@posix_only
-@pytest.mark.parametrize('flags, kind', [([], 'fifo'), (['-co'], 'fifo'), ([], 'socket')], ids=['plain', 'content-only', 'socket'])
-def test_a_node_source_replaces_a_file_at_its_landing(tmp_path, monkeypatch, flags, kind):
-	# cp -a makes a FIFO or socket anew, and cannot unlink a held file's /proc name: such a source goes beside, as in 9.85 (exit 0).
-	os.makedirs(str(tmp_path / 'a'))
-	if kind == 'fifo':
-		os.mkfifo(str(tmp_path / 'a/p'))
-	else:
-		monkeypatch.chdir(tmp_path)  # a socket's path is short (108 bytes at most)
-		import socket
-		with contextlib.closing(socket.socket(socket.AF_UNIX)) as sock:
-			sock.bind('a/p')
-	write(tmp_path / 'out/p', 'old')
-	rc, output = run(['a/p', '-d', 'out/'] + flags, tmp_path)
-	assert rc == 0 and (stat.S_ISFIFO if kind == 'fifo' else stat.S_ISSOCK)(os.lstat(str(tmp_path / 'out/p')).st_mode), output[-3000:]
-
-
-@posix_only
-def test_a_named_landing_that_turns_into_a_fifo_after_the_look_is_never_written_by_name(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
-	# A regular file at the look; a FIFO someone holds open at the open; a link to a victim when cp would open the name.
-	write(tmp_path / 'a/f', 'SECRET')
-	write(tmp_path / 'out/f', 'old')
-	write(tmp_path / 'victim', 'victim')
-	landing, readers = str(tmp_path / 'out/f'), []
-	claim, runner = hpcp_mod._claim_device, hpcp_mod.run_command_in_multicmd_with_path_check
-	def swap_to_fifo(target, st, named, src_path):
-		if target == landing and not readers:
-			os.rename(landing, landing + '.away')
-			os.mkfifo(landing)
-			readers.append(os.open(landing, os.O_RDONLY | os.O_NONBLOCK))
-		return claim(target, st, named, src_path)
-	def swap_to_link(command, *args, **kwargs):
-		if command[-1] == landing and stat.S_ISFIFO(os.lstat(landing).st_mode):
-			os.unlink(landing)
-			os.symlink(str(tmp_path / 'victim'), landing)
-		return runner(command, *args, **kwargs)
-	monkeypatch.setattr(hpcp_mod, '_claim_device', swap_to_fifo)
-	monkeypatch.setattr(hpcp_mod, 'run_command_in_multicmd_with_path_check', swap_to_link)
-	monkeypatch.setattr(hpcp_mod, 'NAMED_DESTS', frozenset({landing}))
-	try:
-		hpcp_mod._cp_once(str(tmp_path / 'a/f'), landing, '-af', True)
-	finally:
-		for fd in readers:
-			os.close(fd)
-	assert read(tmp_path / 'victim') == 'victim' and read(landing) == 'SECRET' and not os.path.islink(landing)
 
 
 # ---- review r986r: a node source, a landing changed after the look, and -co's carry-over ----

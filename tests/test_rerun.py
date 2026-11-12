@@ -436,7 +436,8 @@ def test_the_second_pass_stats_only_the_entries_met_twice(tmp_path, reset_hpcp_g
 	looked = []
 	real = os.lstat
 	def counted(path, *args, **kwargs):
-		if str(path).startswith(str(out) + os.sep):
+		# by path, or by name relative to its directory (the route on a network filesystem)
+		if kwargs.get('dir_fd') is not None or str(path).startswith(str(out) + os.sep):
 			looked.append(path)
 		return real(path, *args, **kwargs)
 	monkeypatch.setattr(hpcp.os, 'lstat', counted)
