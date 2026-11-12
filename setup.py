@@ -34,7 +34,9 @@ setup(
     install_requires=[
 		# not on 3.6: stock pip on EL7 and EL8 takes no xxhash wheel, and building one needs a compiler; hpcp runs without it
 		"xxhash; python_version >= '3.7'",
-		'multiCMD>=1.56',
+		# No multiCMD: hpcp carries its own copy (the embedded block in hpcp.py) and runs it wherever an installed one is
+		# older than that copy, missing or does not import, so a requirement would guarantee nothing; and pip 9 (stock on EL7
+		# and EL8) upgrading an old multiCMD for it stopped `pip3 install -U hpcp` (docs/lessons.md, 2026-11-11).
     ],
     classifiers=classifiers,
     python_requires='>=3.6',

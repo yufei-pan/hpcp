@@ -284,7 +284,7 @@ finally:
 	if _IMPORT_MASK is not None and _signal.SIGINT not in _IMPORT_MASK:
 		_signal.pthread_sigmask(_signal.SIG_UNBLOCK, (_signal.SIGINT,))
 
-version = '9.88'
+version = '9.89'
 __version__ = version
 COMMIT_DATE = '2026-11-11'
 
