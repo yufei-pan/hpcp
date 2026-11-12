@@ -1928,7 +1928,7 @@ def test_n2_a_landing_under_a_write_lease_is_waited_for_and_kept(tmp_path):
 		output = task.stdout.decode(errors='replace')
 		assert task.returncode == 0 and 'crashed' not in output and 'Errno' not in output, (task.returncode, output[-2000:])
 		assert os.path.exists(marker), 'the run never opened the landing: nothing was tested'
-		assert waited >= hold * 0.9, waited  # it waited for the lease to go
+		assert waited >= hold * 0.9, waited  # it waited for the lease to go (the holder's sleep, less 10 % for the clocks' difference)
 		assert os.stat(landing).st_ino == inode and read(landing) == 'same content'  # not copied beside and renamed over it
 	finally:
 		holder.kill()
@@ -1959,11 +1959,11 @@ def test_n2_a_fifo_put_at_the_landing_since_the_look_is_waited_on_as_in_9_87(tmp
 	thread = threading.Thread(target=check, daemon=True)
 	thread.start()
 	try:
-		thread.join(1.0)
+		thread.join(1.0)  # the open answered in microseconds at c843e7e (O_NONBLOCK); a second is long enough to see that it waits
 		waiting = thread.is_alive()
 		assert waiting, ('the open did not wait for a writer: it answered', answers)
 	finally:
-		deadline = time.monotonic() + 10
+		deadline = time.monotonic() + 10  # the reader's open is in within milliseconds once the thread runs; 10 s is only the bound for a loaded host
 		while thread.is_alive() and time.monotonic() < deadline:
 			try:
 				os.close(os.open(fifo, os.O_WRONLY | os.O_NONBLOCK))  # a writer: ENXIO until the reader's open is in

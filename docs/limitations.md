@@ -297,10 +297,10 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - **Revisit when:** multiCMD 1.62 ships.
 - **Noted:** 2026-11-11, the 9.88 W1 review's item (c); the main session's decision, not asked (a deferral). The same in 9.87.
 
-### macOS: a rerun of a tree of many directories with few files each takes a few percent longer than in 9.87
+### macOS: a rerun of a tree of many directories with few files each takes longer than in 9.87
 - **Kind:** known limitation.
-- **What the operator sees:** on macOS (APFS) a rerun with nothing to copy of a tree of 10,000 directories of one file each takes about 3 to 8 % longer than 9.87's (Python 3.9.6, a Mac at load 12 to 32 from other work, the versions taking turns: median 3.36 s against 3.18 s in 11 rounds, and 2.83 s against 2.70 s with `-s` in 5; every rank of the sorted runs was slower). Other shapes are not: 50 directories of 1,000 files (5.31 s against 5.28 s, 5 rounds) and a first copy of 3,000 directories of one file each (19.28 s against 19.42 s, 3 rounds). The size is approximate, the host was loaded.
-- **Why:** the door opens and closes each directory a process enters (about 20 µs on APFS, against about 0.5 µs on Linux); that open is the guard (a directory swapped for a link is never followed), so it cannot go, and the read route macOS needs (no `O_PATH`) holds the directories by read descriptors. The rest of a rerun's extra cost, the per-landing Python code, is on Linux too and is the 9.89 deferral "A rerun costs about 6 µs more CPU a file than in 9.87".
+- **What the operator sees:** on macOS (APFS, Python 3.9.6) a rerun with nothing to copy of a tree of 10,000 directories of one file each takes longer than 9.87's, the versions taking turns. On a loaded Mac (the final review: load 12 to 32 from other work): median 3.36 s against 3.18 s in 11 rounds (+6 %) and 2.83 s against 2.70 s with `-s` in 5 (+5 %). On a quiet one (the fix round: load 2 when it started): 3.26 s against 3.08 s in 11 rounds (+6 %) and 2.82 s against 2.47 s with `-s` in 5 (+14.5 %). Other shapes are close: 50 directories of 1,000 files 5.31 s against 5.28 s (loaded, 5 rounds) and 5.04 s against 4.91 s (quiet, +2.7 %); a first copy of 3,000 directories of one file each 19.28 s against 19.42 s (loaded) and 19.23 s against 18.74 s (quiet; 3 rounds each, one 9.87 round took 17.35 s).
+- **Why:** the door opens and closes each directory a process enters (about 20 µs on APFS, against about 0.5 µs on Linux: about 0.2 s for 10,000 directories, so most of the serial run's extra 0.35 s by this estimate); that open is the guard (a directory swapped for a link is never followed), so it cannot go, and the read route macOS needs (no `O_PATH`) holds the directories by read descriptors. The rest is the per-landing Python code, which Linux shows too (the 9.89 deferral "A rerun costs about 6 µs more CPU a file than in 9.87").
 - **Revisit when:** an operator reports it, or the 9.89 trim of the per-landing cost ships and the Mac is measured again.
 - **Approved:** 2026-11-11, the user chose "Approve as KL (Recommended)". The user did not ask for it explicitly; the 9.88 final review found it (N3).
 
@@ -326,7 +326,7 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 
 ### macOS: a directory's BSD flags are set through its logical path, so a `-d` link gets them
 - **Kind:** deferred (9.89).
-- **What the operator sees:** on macOS, `-d out/` with `out` a link to a directory: the finish of the destination directory sets the source directory's BSD flags (`os.chflags(dest_path, flags, follow_symlinks=False)`, `_finish_directory`) on the link itself, not on the directory it leads to. The same line in 9.87.
+- **What the operator sees:** on macOS, `-d out/` with `out` a link to a directory: the finish of the destination directory sets the source directory's BSD flags (`os.chflags(dest_path, flags, follow_symlinks=False)`, `_finish_directory`) on the link itself, not on the directory it leads to. Run on macOS 26 (Python 3.9): `src` with the user flag `nodump` copied with `src/ -d out/`, `out` a link to `real`: `out` (the link) gets `nodump` and `real` none, in 9.87 and 9.88 alike.
 - **Why:** Python has no `fchflags`, so the flags are set by name, and not following a link is what keeps a link put at the name from taking them.
 - **Plan (9.89):** set them through the held descriptor with ctypes `fchflags` (macOS and the BSDs), as the plan for the macOS xattrs does for its calls.
 - **Revisit when:** 9.89.
