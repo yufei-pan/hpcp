@@ -1,3 +1,4 @@
+import contextlib
 import os
 import sys
 import shutil
@@ -32,6 +33,63 @@ if sys.version_info < (3, 7):
 
 
 _REAL_SCANDIR_FD = hpcp._SCANDIR_FD
+
+
+def open_descriptors():
+	"""{descriptor: the path it leads to} for the files, directories and terminals this process holds open (not pipes, sockets
+	or other kernel objects: they have no path; Linux's readlink gives them a name that is no path, macOS's F_GETPATH
+	fails). Linux asks /proc/self/fd, macOS /dev/fd; {} where neither exists (Windows)."""
+	found = {}
+	if os.path.isdir('/proc/self/fd'):
+		for name in os.listdir('/proc/self/fd'):
+			try:
+				where = os.readlink('/proc/self/fd/' + name)  # the descriptor listdir itself held is gone: ENOENT
+			except OSError:
+				continue
+			if where.startswith('/'):
+				found[int(name)] = where
+	elif os.path.isdir('/dev/fd'):
+		import fcntl
+		for name in os.listdir('/dev/fd'):
+			try:
+				found[int(name)] = fcntl.fcntl(int(name), fcntl.F_GETPATH, bytes(1024)).split(b'\0')[0].decode('utf-8', 'replace')
+			except (OSError, ValueError, AttributeError):
+				continue
+	return found
+
+
+def descriptors_opened_since(before):
+	"""{descriptor: path} of what this process holds open now that it did not at before (open_descriptors()), except the
+	arenas of multiprocessing's allocator: it makes them when a process first shares memory with a pool (pym-PID-N, deleted),
+	and keeps them for the process's life, as it does its pipes and sockets."""
+	return {fd: where for fd, where in open_descriptors().items()
+		if before.get(fd) != where and not os.path.basename(where).startswith('pym-')}
+
+
+def close_descriptors(found):
+	"""Close each descriptor of found ({descriptor: path}) that still leads where it did."""
+	now = open_descriptors()
+	for fd, where in found.items():
+		if now.get(fd) == where:
+			with contextlib.suppress(OSError):
+				os.close(fd)
+
+
+@pytest.fixture(autouse=True)
+def _a_test_closes_what_it_opens():
+	"""A file, directory or terminal a test opens is closed when it ends. One that leaves them holds them for the rest of the run,
+	and later tests meet them far from the cause: 9.88's stop tests left about 100 each (374 in one run here), and on CI's
+	Python 3.14 job the process then held over a thousand, so the pty of test_list_sources's helper got a number select() refuses
+	(39 failures of 'filedescriptor out of range in select()'). What a test left is closed here, so the test that left it is the
+	one that fails. The first of the autouse fixtures (pytest sets them up in name order), so it is the last torn down."""
+	before = open_descriptors()
+	yield
+	left = descriptors_opened_since(before)
+	if left:
+		# the door's cursors forgotten before their descriptors are closed: the next test's reset would close them a second time
+		getattr(hpcp, '_CURSORS', {}).clear()
+		close_descriptors(left)
+	assert not left, 'the test left %d descriptors open: %s' % (len(left), sorted(left.items())[:10])
 
 
 @pytest.fixture(autouse=hasattr(os, 'sync'))  # Windows has no os.sync
@@ -303,11 +361,14 @@ def stop_alarms(monkeypatch, reset_hpcp_globals):
 	taken for one inside it; settle(got) runs once the alarm is off. Returns the indexes of the calls that raised.
 	The handler acts only while the call runs (armed): Python runs a handler at its next check, not when the signal comes, so
 	an alarm that came as the call returned (or as setitimer disarmed it) could run its handler past the try, in settle or
-	the loop, and its KeyboardInterrupt ended the test session (3.12: once in a full suite; 38 of 120 runs, 8 side by side)."""
+	the loop, and its KeyboardInterrupt ended the test session (3.12: once in a full suite; 38 of 120 runs, 8 side by side).
+	close_left: a stop that lands in a cleanup that closes descriptors cuts it, and what follows stays open, as in a process
+	that is ending; the descriptors the calls left are closed at the end (a test that checks for them itself leaves it off)."""
 	import random
 	import signal
 	import time
-	def run(handler, call, count, settle=lambda got: None):
+	def run(handler, call, count, settle=lambda got: None, close_left=False):
+		before = open_descriptors()
 		timings = []
 		for index in range(50):
 			got = []
@@ -346,5 +407,7 @@ def stop_alarms(monkeypatch, reset_hpcp_globals):
 			signal.signal(signal.SIGALRM, old)
 			hpcp._STOPPED = hpcp._STOPPED_PID = None
 			hpcp._STOP_ACTED = hpcp._STOP_NOTED = False
+			if close_left:
+				close_descriptors(descriptors_opened_since(before))
 		return stopped
 	return run

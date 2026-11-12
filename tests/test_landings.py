@@ -840,8 +840,12 @@ def test_the_door_looks_again_when_another_worker_makes_the_directory(tmp_path, 
 	monkeypatch.setattr(hpcp_mod.os, 'mkdir', mkdir)
 	monkeypatch.setattr(hpcp_mod, 'NAMED_DESTS', frozenset([out]))
 	monkeypatch.setattr(hpcp_mod, 'RUN_ID', object())
-	hpcp_mod._dest_directory(d)
-	assert os.path.isdir(d) and not os.path.islink(d)
+	base = hpcp_mod._dest_directory(d)  # the caller's descriptor, and the cursors the door keeps for the run
+	try:
+		assert os.path.isdir(d) and not os.path.islink(d)
+	finally:
+		hpcp_mod._close_base(base)
+		hpcp_mod._close_cursors()
 
 
 @posix_only
