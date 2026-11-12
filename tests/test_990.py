@@ -284,3 +284,106 @@ def test_990_a_moves_directory_fsync_never_goes_through_a_link_on_the_way(tmp_pa
 	assert os.readlink(os.path.join(out, 'a')) == victim
 	out_st = os.stat(out)
 	assert (out_st.st_dev, out_st.st_ino) in synced
+
+
+# -- A landing held under a write lease ---------------------------------------------------------------------------------------
+
+_LEASE_HOLDER = r'''
+import fcntl, os, signal, sys, time
+fd = os.open(sys.argv[1], os.O_RDONLY)
+def give_up(signum, frame):
+	fcntl.fcntl(fd, fcntl.F_SETLEASE, fcntl.F_UNLCK)
+	sys.stdout.write('released\n')
+	sys.stdout.flush()
+signal.signal(signal.SIGIO, give_up)
+try:
+	fcntl.fcntl(fd, fcntl.F_SETLEASE, fcntl.F_RDLCK)
+except OSError as e:
+	sys.stdout.write('no lease: %s\n' % e)
+	sys.exit(0)
+sys.stdout.write('held\n')
+sys.stdout.flush()
+time.sleep(30)
+'''
+
+
+@linux_only
+def test_990_a_rewrite_of_a_leased_landing_waits_for_the_break_and_keeps_the_inode(tmp_path, fresh, monkeypatch):
+	# 9.86 to 9.89 opened the landing non-blocking (never waiting on a FIFO), met EAGAIN where another program held a lease on
+	# it (Samba's oplocks, an NFS server's delegation), and rewrote it beside: a new inode, the lease holder keeping the old
+	# file. The open now waits for the lease's break and writes in place.
+	if not hasattr(__import__('fcntl'), 'F_SETLEASE'):
+		pytest.skip('no fcntl leases here')
+	write(tmp_path / 'src' / 'f', 'new content')
+	landing = write(tmp_path / 'out' / 'f', 'old')
+	os.utime(landing, ns=(1_000_000_000, 1_000_000_000))
+	before = os.stat(landing)
+	holder = subprocess.Popen([sys.executable, '-c', _LEASE_HOLDER, landing], stdout=subprocess.PIPE, universal_newlines=True)
+	try:
+		first = holder.stdout.readline().strip()
+		if first != 'held':
+			pytest.skip('a lease cannot be taken here: %s' % first)
+		_w1_run(monkeypatch, str(tmp_path / 'out'))
+		try:
+			_copy(tmp_path / 'src' / 'f', [landing])
+		finally:
+			hpcp._close_cursors()
+		assert holder.stdout.readline().strip() == 'released'
+	finally:
+		holder.kill()
+		holder.wait()
+	after = os.stat(landing)
+	assert read(landing) == 'new content' and not hpcp.ERRORS, hpcp.ERRORS
+	assert (after.st_dev, after.st_ino) == (before.st_dev, before.st_ino)
+
+
+# -- A pool worker stopped while it reads a queued job --------------------------------------------------------------------------
+
+_READER = r'''
+import os, signal, sys
+sys.path.insert(0, sys.argv[2])
+import hpcp
+from multiprocessing.connection import Connection
+reader = Connection(int(sys.argv[1]), writable=False)
+hpcp._MAIN_PID = -1  # this process is a pool worker to hpcp's handler, outside a task
+signal.signal(signal.SIGINT, hpcp._stop)
+sys.stdout.write('ready\n')
+sys.stdout.flush()
+data = reader.recv_bytes()
+sys.stdout.write('got %d\n' % len(data))
+sys.stdout.flush()
+'''
+
+
+@linux_only
+def test_990_a_worker_stopped_after_a_jobs_length_reads_the_rest(tmp_path):
+	# A stop's SystemExit landed in an idle worker between a queued job's 4-byte length and its payload (Connection._recv_bytes
+	# reads them in two calls), leaving the payload in the pipe; the next worker read its first bytes as a length and printed
+	# 'EOFError: Ran out of input' (Python 3.6, forkserver or spawn, about 1 in 1,600 early stops). Past the length, the stop
+	# is recorded and the read finishes (the worker then ends at the job's start, _run_task).
+	import fcntl
+	import struct
+	import termios
+	import time
+	readable, writable = os.pipe()
+	reader = subprocess.Popen([sys.executable, '-c', _READER, str(readable), os.path.dirname(HPCP)], pass_fds=(readable,),
+		stdout=subprocess.PIPE, universal_newlines=True)
+	try:
+		assert reader.stdout.readline().strip() == 'ready'
+		os.write(writable, struct.pack('!i', 1000))
+		deadline = time.monotonic() + 30  # milliseconds on an idle host; the bound is for a loaded one
+		while struct.unpack('i', fcntl.ioctl(readable, termios.FIONREAD, b'\0\0\0\0'))[0] and time.monotonic() < deadline:
+			time.sleep(0.01)  # until the reader has taken the length
+		time.sleep(0.05)
+		reader.send_signal(2)
+		time.sleep(0.2)
+		os.write(writable, b'x' * 1000)
+		os.close(writable)
+		output = reader.stdout.read()
+		reader.wait(30)
+	finally:
+		os.close(readable)
+		if reader.poll() is None:
+			reader.kill()
+			reader.wait()
+	assert 'got 1000' in output and reader.returncode == 0, (output, reader.returncode)

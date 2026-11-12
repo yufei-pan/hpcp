@@ -991,6 +991,8 @@ def _stop(signum, frame):
 		return
 	if not _IN_TASK and os.getpid() != _MAIN_PID:
 		if _STOPPED_PID == os.getpid():
+			if _in_message_read(frame):
+				return  # reading the rest of a job, as below
 			# Stopped already, outside a task: on its way out (_run_task's _end_by, whose first lines a stop raising here would
 			# cut, and the pool's loop would keep the worker, idle for good), or kept by the pool's loop. Either way it ends here.
 			_end_by(_STOPPED)
@@ -1005,6 +1007,12 @@ def _stop(signum, frame):
 		# is nothing of the pool's to let go of, and the worker ends at once, quietly.
 		if _STOPPED_PID != os.getpid():
 			_STOPPED, _STOPPED_PID = signum, os.getpid()
+		if _in_message_read(frame):
+			# Part of a queued job is read (its length, or some of its bytes): a raise would leave the rest in the pipe for the
+			# next worker, which reads it as a length and unpickles nothing ('EOFError: Ran out of input'), and an end here would
+			# keep the queue's read lock. Recorded only: the read ends, the lock is let go, and _run_task ends the worker at the
+			# job's start (a shutdown's None ends it in the pool's loop).
+			return
 		if not _in_pool_loop(frame):
 			_end_by(_STOPPED)
 		raise SystemExit(128 + signum)
@@ -1059,6 +1067,27 @@ def _in_pool_loop(frame):
 	while frame is not None:
 		if frame.f_code is _POOL_LOOP:
 			return True
+		frame = frame.f_back
+	return False
+
+def _connection_codes():
+	"""The code objects of multiprocessing's Connection._recv_bytes and _recv (POSIX), or Nones where they are not there."""
+	connection = getattr(sys.modules.get('multiprocessing.connection'), 'Connection', None)
+	return tuple(getattr(getattr(connection, name, None), '__code__', None) for name in ('_recv_bytes', '_recv'))
+
+_RECV_BYTES_CODE, _RECV_CODE = _connection_codes()
+
+def _in_message_read(frame):
+	"""Whether the code a stop interrupted (frame) is reading a message part of which it has read: inside
+	Connection._recv_bytes once its length is read ('size' set), or inside its _recv once some bytes came."""
+	partial = False
+	while frame is not None and _RECV_BYTES_CODE is not None:
+		code = frame.f_code
+		if code is _RECV_CODE:
+			found = frame.f_locals
+			partial = partial or found.get('remaining', found.get('size')) != found.get('size')
+		elif code is _RECV_BYTES_CODE:
+			return partial or 'size' in frame.f_locals
 		frame = frame.f_back
 	return False
 
@@ -5150,6 +5179,12 @@ def _cp_landing(command, src_path, dest_path, target, st, named, space, src_st, 
 				if _held_route():
 					return _cp_new(command, src_path, target, src_st, space, base)
 				return _cp_to(command, src_path, target, space, base)
+			except BlockingIOError as e:
+				# A lease another program holds on it (Samba's oplocks, an NFS server's delegation, fcntl's F_SETLEASE): the open
+				# waits for its break, as the skip check's read does, so the inode stays.
+				fd = _open_after_lease(base, os.path.basename(target), st)
+				if fd is None:
+					return _cp_beside(command, src_path, target, st, f'it cannot be opened for writing ({_why(e)})', space, src_st, base)
 			except OSError as e:
 				return _cp_beside(command, src_path, target, st, f'it cannot be opened for writing ({_why(e)})', space, src_st, base)
 			try:
@@ -5167,6 +5202,19 @@ def _cp_landing(command, src_path, dest_path, target, st, named, space, src_st, 
 	finally:
 		if held is not None:
 			os.close(held)
+
+def _open_after_lease(base, name, st):
+	"""The landing name in base opened for writing as _cp_landing opens it, but waiting: its non-blocking open met EAGAIN, a
+	lease another program holds on the file. Only while the name is still the regular file st (one lstat first), so what the
+	open could wait on is the lease's break (its holder's release, or the kernel's lease-break-time, 45 s by default), never a
+	FIFO's writer; None where it is not, or the open fails (the caller goes beside)."""
+	try:
+		now = os.lstat(*_at(base, name), **_fd_of(base))
+		if not stat.S_ISREG(now.st_mode) or (now.st_dev, now.st_ino) != (st.st_dev, st.st_ino):
+			return None
+		return os.open(*_at(base, name), _LANDING_FLAGS & ~getattr(os, 'O_NONBLOCK', 0), **_fd_of(base))
+	except OSError:
+		return None
 
 def _regular_source(src_path, src_st=None):
 	"""False for a source that cp -a makes anew (a FIFO, socket or device node: it unlinks what is at the landing, and cannot
