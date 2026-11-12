@@ -18,6 +18,8 @@ import time
 
 import pytest
 
+from conftest import descriptors_opened_since, open_descriptors
+
 import hpcp
 
 HPCP = hpcp.__file__
@@ -840,18 +842,22 @@ def test_a_stop_as_a_first_copy_s_file_is_made_leaves_no_file(tmp_path, monkeypa
 	def settle(got):
 		if got:
 			os.close(got[0][0])
+	# the files and directories open now (conftest: Linux and macOS), and on Linux every descriptor, pipes too
+	before = open_descriptors()
 	if sys.platform.startswith('linux'):
-		before = len(os.listdir('/proc/self/fd'))
+		count = len(os.listdir('/proc/self/fd'))
 	stopped = stop_alarms(handler, call, 2000, settle)
 	left = {str(out / ('f%d' % index)) for index in stopped if os.path.lexists(str(out / ('f%d' % index)))}
 	whole = {path for path in left if os.lstat(path).st_size == 4}
 	assert stopped and left == whole and (not left or (3, 8) <= sys.version_info < (3, 11)), (len(stopped), sorted(left), sorted(whole))
+	# the whole copies' descriptors (the stop at the return, above) are closed here; any other file left open is a leak
+	whole_real = {os.path.realpath(path) for path in whole}
+	for fd, where in descriptors_opened_since(before).items():
+		if where in whole_real:
+			os.close(fd)
+	assert descriptors_opened_since(before) == {}
 	if sys.platform.startswith('linux'):
-		for fd in os.listdir('/proc/self/fd'):
-			with contextlib.suppress(OSError):
-				if os.readlink('/proc/self/fd/' + fd) in whole:
-					os.close(int(fd))
-		assert len(os.listdir('/proc/self/fd')) == before
+		assert len(os.listdir('/proc/self/fd')) == count
 
 
 @posix_only

@@ -1,9 +1,11 @@
 import contextlib
+import gc
 import os
 import sys
 import shutil
 import subprocess
 import tempfile
+import warnings
 import pytest
 
 # Repo root on path for `import hpcp` if pythonpath not honored
@@ -35,10 +37,16 @@ if sys.version_info < (3, 7):
 _REAL_SCANDIR_FD = hpcp._SCANDIR_FD
 
 
+def _can_list_descriptors():
+	"""Whether open_descriptors can look: Linux's /proc/self/fd, or macOS's /dev/fd with fcntl's F_GETPATH (Python 3.9's)."""
+	return os.path.isdir('/proc/self/fd') or (os.path.isdir('/dev/fd') and hasattr(__import__('fcntl'), 'F_GETPATH'))
+
+
 def open_descriptors():
 	"""{descriptor: the path it leads to} for the files, directories and terminals this process holds open (not pipes, sockets
 	or other kernel objects: they have no path; Linux's readlink gives them a name that is no path, macOS's F_GETPATH
-	fails). Linux asks /proc/self/fd, macOS /dev/fd; {} where neither exists (Windows)."""
+	fails; an unlinked file keeps its last path on both). Linux asks /proc/self/fd, macOS /dev/fd; {} where it cannot look
+	(_can_list_descriptors: Windows, a macOS Python before 3.9, a Linux with no /proc)."""
 	found = {}
 	if os.path.isdir('/proc/self/fd'):
 		for name in os.listdir('/proc/self/fd'):
@@ -48,12 +56,12 @@ def open_descriptors():
 				continue
 			if where.startswith('/'):
 				found[int(name)] = where
-	elif os.path.isdir('/dev/fd'):
+	elif _can_list_descriptors():
 		import fcntl
 		for name in os.listdir('/dev/fd'):
 			try:
 				found[int(name)] = fcntl.fcntl(int(name), fcntl.F_GETPATH, bytes(1024)).split(b'\0')[0].decode('utf-8', 'replace')
-			except (OSError, ValueError, AttributeError):
+			except (OSError, ValueError):
 				continue
 	return found
 
@@ -66,6 +74,16 @@ def descriptors_opened_since(before):
 		if before.get(fd) != where and not os.path.basename(where).startswith('pym-')}
 
 
+def descriptors_left_since(before):
+	"""descriptors_opened_since(before), after a garbage collection where there are any: a file object that a reference cycle
+	still holds closes with it, and is no leak."""
+	left = descriptors_opened_since(before)
+	if left:
+		gc.collect()
+		left = descriptors_opened_since(before)
+	return left
+
+
 def close_descriptors(found):
 	"""Close each descriptor of found ({descriptor: path}) that still leads where it did."""
 	now = open_descriptors()
@@ -75,20 +93,32 @@ def close_descriptors(found):
 				os.close(fd)
 
 
+def warn_if_descriptors_cannot_be_listed():
+	"""A check that cannot look says so: where open_descriptors cannot (_can_list_descriptors), every test passes the guard
+	below, and the run says that, once."""
+	if not _can_list_descriptors():
+		warnings.warn('open_descriptors cannot list the descriptors this process holds here (no /proc/self/fd, and no /dev/fd with '
+			'fcntl.F_GETPATH): the guard that fails a test that leaves a file open (_a_test_closes_what_it_opens) checks nothing',
+			RuntimeWarning)
+
+
+@pytest.fixture(scope='session', autouse=True)
+def _say_when_descriptors_cannot_be_listed():
+	warn_if_descriptors_cannot_be_listed()
+
+
 @pytest.fixture(autouse=True)
 def _a_test_closes_what_it_opens():
 	"""A file, directory or terminal a test opens is closed when it ends. One that leaves them holds them for the rest of the run,
 	and later tests meet them far from the cause: 9.88's stop tests left about 100 each (374 in one run here), and on CI's
 	Python 3.14 job the process then held over a thousand, so the pty of test_list_sources's helper got a number select() refuses
-	(39 failures of 'filedescriptor out of range in select()'). What a test left is closed here, so the test that left it is the
-	one that fails. The first of the autouse fixtures (pytest sets them up in name order), so it is the last torn down."""
+	(39 failures of 'filedescriptor out of range in select()'). The test that left them is the one that fails here. They are
+	not closed here: the number would be the next test's, and what still owns the descriptor (a file object a failed test's
+	traceback keeps alive, a scandir iterator, the door's cursors) would close that test's file when it let go. The first of
+	the autouse fixtures (pytest sets them up in name order), so it is the last torn down."""
 	before = open_descriptors()
 	yield
-	left = descriptors_opened_since(before)
-	if left:
-		# the door's cursors forgotten before their descriptors are closed: the next test's reset would close them a second time
-		getattr(hpcp, '_CURSORS', {}).clear()
-		close_descriptors(left)
+	left = descriptors_left_since(before)
 	assert not left, 'the test left %d descriptors open: %s' % (len(left), sorted(left.items())[:10])
 
 
