@@ -4020,6 +4020,18 @@ def _landing_of(dest_path, base, landing=None):
 	except OSError:
 		return target, None, named
 
+def _nested_named():
+	"""Whether one destination the operator named (NAMED_DESTS) lies inside another, by path: then two landings of one file
+	can share a door cursor (_named_root) and copy_file keeps a dup of each answer. Decided once a run in each process (the
+	memo is keyed by the NAMED_DESTS object), from the names alone: where a link leads is never read here."""
+	if _NESTED_MEMO[0] is not NAMED_DESTS:
+		roots = sorted(NAMED_DESTS)
+		_NESTED_MEMO[:] = [NAMED_DESTS, any(other != root and other.startswith(root.rstrip(os.sep) + os.sep)
+			for root in roots for other in roots)]
+	return _NESTED_MEMO[1]
+
+_NESTED_MEMO = [None, False]
+
 def _landing_path(dest_path):
 	"""(where a copy to dest_path writes, named), as _landing_of gives them, without its lstat of the landing: below a named
 	destination nothing is looked at."""
@@ -5037,7 +5049,7 @@ def _cp_beside(command, src_path, target, st, why, space, src_st=None, base=None
 		if not renamed:
 			_discard_temp(temp, base)
 
-def _cp_once(src_path, dest_path, cp_flags, sparse, space=None, look=None, src_st=None, base=None):
+def _cp_once(src_path, dest_path, cp_flags, sparse, space=None, look=None, src_st=None, base=None, landing=None):
 	"""One attempt at copying src_path to dest_path (copy_file); the size copied. Raises _Refused for what this run will not
 	write, _KeptOld for a rewrite that kept what is there. space: (free, need) when the room is short (_space_warning). By
 	what is at the landing (_landing_of): nothing, or a FIFO or device the operator named: cp writes the name (_cp_to). A
@@ -5047,14 +5059,17 @@ def _cp_once(src_path, dest_path, cp_flags, sparse, space=None, look=None, src_s
 	renamed over it once whole (_cp_beside); never to cp by name. look: _landing_of(dest_path, base) when the caller just
 	took it (copy_file's first attempt); src_st: the source's lstat. base: the door's result for the landing's directory
 	(copy_file's), every name below it made, looked at and written relative to it; None: the door is asked here (made, not
-	under -ncd). An OSError raised out names its file by the logical path."""
+	under -ncd). landing: _landing_path(dest_path) as copy_file worked it out once for the file, so a retry's look and a
+	re-look go where the first attempt went (a -d link retargeted since is not followed again). An OSError raised out names
+	its file by the logical path."""
 	try:
+		landing = landing or _landing_path(dest_path)
 		if base is None:
-			directory = os.path.dirname(_landing_path(dest_path)[0])
+			directory = os.path.dirname(landing[0])
 			base = _dest_directory(directory, make=not NO_CREATE_DIR, source_file=src_path)
 			if base is None:
 				base = directory
-		target, st, named = look or _landing_of(dest_path, base)
+		target, st, named = look or _landing_of(dest_path, base, landing)
 		_judge_landing(dest_path, target, st, named)
 		command = ["cp", cp_flags] + (["--sparse=always"] if sparse and cp_supports_sparse() else [])
 		# A name that appears at a first copy's landing between the look and hpcp's create is looked at again, judged as the
@@ -5063,7 +5078,7 @@ def _cp_once(src_path, dest_path, cp_flags, sparse, space=None, look=None, src_s
 			try:
 				return _cp_landing(command, src_path, dest_path, target, st, named, space, src_st, base)
 			except FileExistsError:
-				target, st, named = _landing_of(dest_path, base)
+				target, st, named = _landing_of(dest_path, base, landing)
 				_judge_landing(dest_path, target, st, named)
 		raise OSError(errno.EAGAIN, 'it kept changing while it was copied', target)
 	except OSError as e:
@@ -5151,27 +5166,30 @@ def _can_open(path, st=None):
 		pass
 	return True
 
-def _can_make_node(src_path, dest_paths, src_st=None, bases=None):
+def _can_make_node(src_path, dest_paths, src_st=None, bases=None, landings=None):
 	"""False when src_path is a device node that this user cannot make, and a destination holds something. cp -a unlinks
 	what is there before its mknod, so a user who may not make nodes (not root) would lose the old file and get nothing.
 	Asked by doing it: a node of src_path's kind and number is made under a name of its own beside a destination that
 	exists, and removed again; PermissionError is the answer. Any other error (EROFS, say) is no answer: the next existing
 	destination is asked, and when none answers it is cp's to answer. Nothing is made for a
 	source that is no device, or when no destination exists (cp then has nothing to lose). bases: {dest: the door's result
-	for its directory} (copy_file's), which each is looked at and asked in."""
+	for its landing's directory} (copy_file's), which each is looked at and asked in; landings: {dest: _landing_path(dest)}
+	(copy_file's), whose name is looked up there (a -d link's landing is its target, in the target's directory)."""
 	try:
 		st = src_st or os.lstat(src_path)
 	except OSError:
 		return True
 	if not (stat.S_ISBLK(st.st_mode) or stat.S_ISCHR(st.st_mode)):
 		return True
-	bases = bases or {}
+	bases, landings = bases or {}, landings or {}
+	def target(dest):
+		return landings[dest][0] if dest in landings else dest
 	def held(dest):
-		return bases.get(dest) if bases.get(dest) is not None else os.path.dirname(dest)
+		return bases.get(dest) if bases.get(dest) is not None else os.path.dirname(target(dest))
 	existing = []
 	for dest in dest_paths:
 		with contextlib.suppress(OSError):
-			os.lstat(*_at(held(dest), os.path.basename(dest)), **_fd_of(held(dest)))
+			os.lstat(*_at(held(dest), os.path.basename(target(dest))), **_fd_of(held(dest)))
 			existing.append(dest)
 	if not existing:
 		return True
@@ -5182,9 +5200,9 @@ def _can_make_node(src_path, dest_paths, src_st=None, bases=None):
 			# Relative to the directory's descriptor where it can be (_ask_names): the name costs its own length. The door's
 			# own is never closed here: a dup of it.
 			if _PROBE_BY_FD and os.mknod in os.supports_dir_fd:
-				base = os.dup(held(dest)) if isinstance(held(dest), int) else os.open(os.path.dirname(dest) or os.curdir, _PARENT_FLAGS)
+				base = os.dup(held(dest)) if isinstance(held(dest), int) else os.open(os.path.dirname(target(dest)) or os.curdir, _PARENT_FLAGS)
 			else:
-				base = held(dest) if not isinstance(held(dest), int) else os.path.dirname(dest)
+				base = held(dest) if not isinstance(held(dest), int) else os.path.dirname(target(dest))
 			os.mknod(*_at(base, name), 0o600 | stat.S_IFMT(st.st_mode), st.st_rdev, **_fd_of(base))
 		except PermissionError:
 			return False
@@ -5431,7 +5449,10 @@ def _copy_file(src_path, dest_paths, full_hash, verbose, concurrent_processes, b
 	refused = {}
 	# Each landing's path (_landing_path) once: the door's directory, the look and the copy act on it.
 	landings = {dest: _landing_path(dest) for dest in dest_paths}
-	keep = len(landings) > 1  # the door's call for one landing may close another's levels (both below one named destination)
+	# The door's call for one landing may close another's levels where both lie below one named destination: one -d inside
+	# another (_nested_named, once a run), or a landing that is a named destination itself (a -d link to a file is followed at
+	# the copy, to wherever it leads then, maybe below another -d). Only there is each answer a dup.
+	keep = len(landings) > 1 and (_nested_named() or any(named for _, named in landings.values()))
 	for dest in dest_paths:
 		if dest in bases or dest in refused:
 			continue  # a destination given twice (-d out -d out) is asked once: a second answer would replace the first, never closed
@@ -5507,7 +5528,7 @@ def _copy_file(src_path, dest_paths, full_hash, verbose, concurrent_processes, b
 				# No cp at all: cp -a takes away a destination with other names before it finds it cannot read.
 				_copy_failed(src_path, f'Copy failed: cannot open {src_path}, leaving {dest_paths} as they are')
 				return 0, time.monotonic() - start_time, symLinks
-			if not _can_make_node(src_path, dest_paths, src_st, bases):
+			if not _can_make_node(src_path, dest_paths, src_st, bases, landings):
 				_copy_failed(src_path, f'Copy failed: cannot make a device node like {src_path} here, leaving {dest_paths} as they are')
 				return 0, time.monotonic() - start_time, symLinks
 			copied = False
@@ -5565,7 +5586,7 @@ def _copy_file(src_path, dest_paths, full_hash, verbose, concurrent_processes, b
 								bases[dest_path] = base
 							# The first attempt at a destination acts on its look; a later one looks again.
 							copiedSize = _cp_once(src_path, dest_path, cp_flags, sparse, space, look=looks.pop(dest_path, None), src_st=src_st,
-								base=bases[dest_path])
+								base=bases[dest_path], landing=landings[dest_path])
 						elif CONTENT_ONLY:
 							shutil.copy(src_path, dest_path, follow_symlinks=False)
 						else:
