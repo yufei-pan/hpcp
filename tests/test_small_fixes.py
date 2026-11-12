@@ -193,14 +193,17 @@ def test_on_a_terminal_an_error_line_clears_the_bar_first(tmp_path, workers):
 		os.chdir(str(tmp_path))
 		os.execv(sys.executable, [sys.executable, HPCP, 'src/', '-d', 'out/'] + workers)
 	chunks = []
-	while True:
-		try:
-			chunk = os.read(fd, 65536)
-		except OSError:
-			break
-		if not chunk:
-			break
-		chunks.append(chunk)
+	try:
+		while True:
+			try:
+				chunk = os.read(fd, 65536)
+			except OSError:
+				break
+			if not chunk:
+				break
+			chunks.append(chunk)
+	finally:
+		os.close(fd)
 	os.waitpid(pid, 0)
 	output = b''.join(chunks).replace(b'\r\n', b'\n')
 	# (the run's last line, 'Error occurred: [...]', quotes them)

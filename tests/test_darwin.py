@@ -374,7 +374,8 @@ def test_a_stop_anywhere_in_the_probe_leaves_nothing_on_macos(tmp_path, fresh, m
 	def call(index, got):
 		hpcp._HELD[:] = [None, None]
 		got.extend(map(lambda _: hpcp._held_route() or True, (None,)))
-	stopped = stop_alarms(handler, call, 2000)
+	# A stop in the cleanup's closing loop leaves a descriptor open (the process is ending); the names are what must go.
+	stopped = stop_alarms(handler, call, 2000, close_left=True)
 	assert stopped and os.listdir(probes) == [], (len(stopped), os.listdir(probes)[:10])
 
 
