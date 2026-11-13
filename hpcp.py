@@ -5737,7 +5737,7 @@ def _settle_identical(src_path, src_st, dest, look, base=None):
 			owner_kept, group_kept = _chown_like_cp(path, src_st, **how)
 		# xattrs after the owner, as cp -a: a chown clears a file capability (security.capability), and before the mode, which
 		# may make the file read-only. None to a node on macOS: no xattr call there takes a dir_fd, so they would go by the
-		# landing's full path, which a directory on the way swapped for a link leads elsewhere (9.89 carried none there; 9.92).
+		# landing's full path, which a directory on the way swapped for a link leads elsewhere (9.89 carried none there; 9.93).
 		if _XATTRS is not None and (fd is not None or _XATTRS[0] is not _mac_listxattr):
 			listxattr, getxattr, setxattr, removexattr = _XATTRS
 			try:
@@ -5901,7 +5901,7 @@ def _copy_file(src_path, dest_paths, full_hash, verbose, concurrent_processes, b
 			# already. A directory source's pin refusal is its directory sync's own 213 line (said, so no file prints the Note;
 			# 9.89 does the same), and a link's is its own (_say_refused). Any other refusal here was said by the directory sync
 			# too, except under -nds, which has none: an -ncd refusal there is said by nothing, as in 9.89 (docs/limitations.md,
-			# deferred to 9.92).
+			# deferred to 9.93).
 			if refusal.note is not None and not refusal.said:
 				print('Note: ' + refusal.note)
 	looks = {dest: _look(dest, bases, landings[dest]) for dest in dest_paths}
