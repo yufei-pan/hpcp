@@ -298,14 +298,6 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - **Revisit when:** an operator needs socket nodes carried on macOS. A bind relative to a held directory works there without its path (`pthread_fchdir_np`, or a `/.vol/DEV/INO/name` path on APFS: both ran on macOS 26.6.2), but the node's owner, mode and times still go by name, in a directory that must be made private, its ACL too.
 - **Approved:** 2026-11-13, the user chose "Skip with a note (Recommended)". The user did not ask for it; the 9.90 final review and its design check found it (the final review found security holes in the socket 9.90's builds made, and the design check found the part not needed).
 
-### With multiCMD 1.64 installed, a reader of stdout that quits cuts the cleanup's delayed e2fsck and tune2fs
-- **Kind:** deferred (hpcp's next version).
-- **What the operator sees:** hpcp 9.89, 9.90 and 9.91 with multiCMD 1.64 or later installed beside it (hpcp imports an installed multiCMD before its embedded copy), when the reader of its stdout quits during a disk clone with an ext2, ext3 or ext4 partition (`hpcp -dd src dst | head`): `clean_up()`'s delayed `e2fsck -f -y` and `tune2fs -U` print as they work, so multiCMD stops them once their output keeps coming, their call raises `BrokenPipeError`, and `clean_up()` ends before it detaches the loop devices. With multiCMD 1.63 they ran unseen once an earlier shown call had raised. A silent `umount` and `losetup`'s one line are not affected. Ran in a Debian 12 VM (`-dd` of a one-partition ext4 image under `| head -K`, 14 cut points): both loop devices were left behind in 11 (1.63: 6, one with a mount; 1.62: 7). Making an image (`-di`) is not affected: 0 of 30 (1.63: 8).
-- **Why:** multiCMD 1.64 stops a shown command whose output keeps coming after stdout's reader quit (the user's pick for multiCMD, 2026-11-13); hpcp runs its cleanup steps shown, and one step's exception ends `clean_up()`.
-- **Plan:** every cleanup step runs with `quiet=True`, and no step's exception skips the steps after it; ship it before or with hpcp's embed of multiCMD 1.64.
-- **Revisit when:** hpcp's next version.
-- **Noted:** 2026-11-13, the multiCMD 1.64 review; the user accepted this consequence for hpcp 9.89 when picking the rule; a deferral, not asked.
-
 ### macOS: a lean binding of the xattr and ACL calls
 - **Kind:** deferred (9.92).
 - **What the operator sees:** on macOS a rerun carries xattrs and ACLs (since 9.90) at about 11 µs a file or directory: a serial rerun (`-s`) of 10,000 directories of one file each is 2.47 s with it and about 2.2 s without it (−11 %). In the default pool the carry showed nothing in the review's nine rounds (3.08 s without it against 3.09 to 3.15 s with it) and +3 to +6 % paired in three of the build's four runs of 11 rounds, +13 % in the fourth, on a loaded Mac (see the pooled rerun's entry below). A leaner binding of the three read helpers (no per-call `import ctypes` or helper calls, one reused 4 KiB buffer, errno read directly) measured about 3 µs less an object, about a third of the carry (4.5 µs against 7.2 to 7.9 µs for one identical file with neither xattrs nor an ACL; the bare libc calls about 3.5 µs), and 5 to 7 % less in the serial rerun; it helps `-s` only.
@@ -374,14 +366,6 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - **Plan (9.92):** hold such a directory by a search-only descriptor: `O_PATH` on Linux without /proc (its fsync and xattr calls then by the logical path), and on macOS `O_SEARCH` for a mode with owner search and no read (0300: ran on macOS 26.6.2, 2026-11-13, where it opens and `fstat` and `fchmod` work; whether `fsync` does is still to try). A mode with neither owner read nor search (0207, 0007, 0047) cannot be opened by its owner with any flag there (`O_RDONLY`, `O_SEARCH`, `O_EXEC|O_DIRECTORY`, `O_EVTONLY`: ran), so its chmod by name stays: see "macOS: a directory of the runner's own with no owner read can be left 0700". Until then it goes by path, as 9.87 did.
 - **Revisit when:** 9.92.
 - **Noted:** 2026-11-11, the 9.88 W1 review's docs gap D2; the main session's decision, not asked (a deferral). Moved to 9.90 on 2026-11-11: 9.89 took only the rerun trim and the multiCMD requirement. Moved to 9.91 on 2026-11-12 (the 9.90 builder), after the macOS limit was found raised already. Split on 2026-11-12 by the 9.90 fix round: EL7's 2,048 levels and the run out of descriptors are known limitations of their own, above; the owner read, write and search of the runner's own directory is the 9.90 review's lead 4. Moved to 9.92 on 2026-11-13: 9.91 is the name probe's fix alone.
-
-### A library call to `hpcp.hpcp()` on Python 3.6 with an ASCII stdout crashes in the progress bar
-- **Kind:** deferred (multiCMD 1.62, then hpcp's next embed).
-- **What the operator sees:** `hpcp.hpcp(...)` called from a program on Python 3.6 whose stdout is ASCII (`LC_ALL=C`) copies a small run (30 files) and returns 70 (`General Exception`: `UnicodeEncodeError` in `multiCMD.print_progress_bar`); a larger run aborts at the first bar after the pool starts. The command line is not affected (`main()` escapes what stdout cannot encode). 9.87 does the same.
-- **Why:** multiCMD's `print_progress_bar` prints its non-ASCII bar again in its `except Exception` fallback, which fails the same way; hpcp does not reconfigure a library caller's `sys.stdout`.
-- **Plan:** multiCMD 1.62 falls back to an ASCII bar (or writes with the stream's encoding and `errors='replace'`); hpcp picks it up through the embed, as do mssh, statblk and statbtrfs.
-- **Revisit when:** multiCMD 1.62 ships.
-- **Noted:** 2026-11-11, the 9.88 W1 review's item (c); the main session's decision, not asked (a deferral). The same in 9.87.
 
 ### Windows: directories on the way to a landing go by path, as in 9.87
 - **Kind:** known limitation.
