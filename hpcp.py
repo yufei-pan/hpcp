@@ -5688,7 +5688,7 @@ def _settle_identical(src_path, src_st, dest, look, base=None):
 			owner_kept, group_kept = _chown_like_cp(path, src_st, **how)
 		# xattrs after the owner, as cp -a: a chown clears a file capability (security.capability), and before the mode, which
 		# may make the file read-only. None to a node on macOS: no xattr call there takes a dir_fd, so they would go by the
-		# landing's full path, which a directory on the way swapped for a link leads elsewhere (9.89 carried none there; 9.91).
+		# landing's full path, which a directory on the way swapped for a link leads elsewhere (9.89 carried none there; 9.92).
 		if _XATTRS is not None and (fd is not None or _XATTRS[0] is not _mac_listxattr):
 			listxattr, getxattr, setxattr, removexattr = _XATTRS
 			try:
@@ -5852,7 +5852,7 @@ def _copy_file(src_path, dest_paths, full_hash, verbose, concurrent_processes, b
 			# already. A directory source's pin refusal is its directory sync's own 213 line (said, so no file prints the Note;
 			# 9.89 does the same), and a link's is its own (_say_refused). Any other refusal here was said by the directory sync
 			# too, except under -nds, which has none: an -ncd refusal there is said by nothing, as in 9.89 (docs/limitations.md,
-			# deferred to 9.91).
+			# deferred to 9.92).
 			if refusal.note is not None and not refusal.said:
 				print('Note: ' + refusal.note)
 	looks = {dest: _look(dest, bases, landings[dest]) for dest in dest_paths}
@@ -14112,6 +14112,11 @@ _PROBE_FIXES = {errno.EACCES: 'make it writable', errno.EPERM: 'make it writable
 # Why a directory cannot hold a name: no other place fixes that.
 _REFUSED_NAME = (errno.EINVAL, errno.EILSEQ, errno.ENAMETOOLONG)
 
+class _NotTheProbe(OSError):
+	"""What was opened at the probe's name is not the directory _ask_names made: it is left as it is."""
+	def __init__(self):
+		super().__init__(errno.EEXIST, 'the directory made to ask it was replaced by another')
+
 def _ask_names(directory, names):
 	"""Which of names, spellings that fold alike (_folded), does directory take for one name? ({name: the first of names it is
 	one name with, itself when there is none}, {name: why that cannot be asked}), each name in one of them. Nothing else answers
@@ -14121,10 +14126,11 @@ def _ask_names(directory, names):
 	parent: each name in turn is made with O_EXCL and holds its place among those made; a name that is there already is one
 	name with the file that holds it. Only where nothing can be made does a listing answer: it has each name once, so the
 	names in it are names of their own. The directory keeps its times (its owner's: a group member who may write it changes
-	them). The probe is held by a descriptor and must be empty when opened: where it is not, another directory has taken its
-	place, and the pair cannot be asked. It goes by path only where no descriptor can hold it (Windows, a macOS directory the
-	runner may write and not read). SIGINT, SIGTERM and SIGHUP wait until the probe is gone. SIGKILL cannot wait, and a signal
-	sent while another thread of the process exists may still reach that thread."""
+	them). The probe is held by a descriptor; it must be empty when opened, and the first file made in it must get its owner
+	(_make_names): where either fails, another directory has taken its place, the pair cannot be asked, and that directory is
+	left as it is. It goes by path only where no descriptor can hold it (Windows; macOS under a Python without os.O_SEARCH, in
+	a directory the runner may not read). SIGINT, SIGTERM and SIGHUP wait until the probe is gone. SIGKILL cannot wait, and a
+	signal sent while another thread of the process exists may still reach that thread."""
 	answers, why = {}, {}
 	probe = '.hpcp-case-probe-%d-%s' % (os.getpid(), uuid.uuid4().hex)
 	held = signal.pthread_sigmask(signal.SIG_BLOCK, _STOPS) if hasattr(signal, 'pthread_sigmask') else None
@@ -14134,9 +14140,10 @@ def _ask_names(directory, names):
 			st = os.stat(directory)
 			# Relative to descriptors where the platform can (Linux, macOS, the BSDs): a name then costs its own length, never the
 			# probe's full path (a landing near PATH_MAX), and the probe is the directory just made, not what stands at its name
-			# later. The directory's by O_PATH where there is one: search permission is enough. Without it (macOS) the open reads,
-			# and a directory the runner may write and not read (0311, 0207, 0007, 0047) is asked by path: nothing can hold it
-			# (docs/limitations.md, "The name probe by path").
+			# later. The directory's by O_PATH where there is one: search permission is enough. Without it (macOS) the open reads;
+			# a directory the runner may search and not read (0311, another user's drop box) is held by O_SEARCH, and one of the
+			# runner's own with neither (0207, 0007, 0047) once the probe has given it its owner bits, below. By path only where
+			# neither opens (a Python without os.O_SEARCH; docs/limitations.md, "The name probe by path").
 			base = directory
 			if _ASK_BY_FD:
 				try:
@@ -14144,6 +14151,10 @@ def _ask_names(directory, names):
 				except PermissionError:
 					if _PARENT_FLAGS & getattr(os, 'O_PATH', 0):
 						raise
+					try:
+						base = os.open(directory, os.O_SEARCH | getattr(os, 'O_DIRECTORY', 0) | getattr(os, 'O_CLOEXEC', 0))
+					except (AttributeError, OSError):
+						pass
 			try:
 				os.mkdir(*_at(base, probe), 0o700, **_fd_of(base))
 			except PermissionError:
@@ -14158,35 +14169,48 @@ def _ask_names(directory, names):
 					parent, leaf = os.path.split(os.path.abspath(directory))
 					if _PATH_FDS or not _owner_read(parent, leaf):
 						raise
+					if _ASK_BY_FD and not isinstance(base, int):
+						base = os.open(directory, _PARENT_FLAGS)  # its owner may read it now: held from here on
 				os.mkdir(*_at(base, probe), 0o700, **_fd_of(base))
 		except OSError as e:
 			failed = e
 		else:
 			made = []
+			failed = None
 			try:
 				try:
 					probe_base = os.open(probe, _BELOW_FLAGS, dir_fd=base) if isinstance(base, int) else os.path.join(directory, probe)
 					if isinstance(probe_base, int) and os.listdir(probe_base):
 						# What was just made is empty. Another directory has been put at its name since (a link is refused by
-						# the open): nothing is made in it, and the undo, which removes what it lists, never meets it.
-						os.close(probe_base)
-						probe_base = None
-						raise OSError(errno.EEXIST, 'the directory made to ask it was replaced by another', os.path.join(directory, probe))
+						# the open): nothing is made in it.
+						raise _NotTheProbe()
 				except OSError as e:
 					failed = e
 				else:
 					failed = _make_names(probe_base, directory, names, made, answers, why)
 			finally:
+				# Another's directory at the probe's name is left as it is: the undo, which removes what it lists and then
+				# the probe, never meets it.
+				ours = not isinstance(failed, _NotTheProbe)
 				left = set(made)
-				if probe_base is not None:
+				if ours and probe_base is not None:
 					try:
 						left.update(os.listdir(probe_base))
 					except OSError:
 						pass
 				undoing = [functools.partial(os.unlink, *_at(probe_base, name), **_fd_of(probe_base)) for name in left if probe_base is not None]
-				undoing.append(functools.partial(os.rmdir, *_at(base, probe), **_fd_of(base)))
-				# By path: futimens on an O_PATH descriptor fails.
-				undoing.append(functools.partial(os.utime, directory, ns=(st.st_atime_ns, st.st_mtime_ns)))
+				if ours:
+					undoing.append(functools.partial(os.rmdir, *_at(base, probe), **_fd_of(base)))
+				# The times of the directory held, not of what stands at its name by now: through /proc for an O_PATH descriptor
+				# (futimens refuses one), through a read or search descriptor itself. By path where nothing is held, and on
+				# Linux without /proc.
+				if isinstance(base, int) and _PATH_FDS:
+					timed = '/proc/self/fd/%d' % base
+				elif isinstance(base, int) and not _PARENT_FLAGS & getattr(os, 'O_PATH', 0) and os.utime in os.supports_fd:
+					timed = base
+				else:
+					timed = directory
+				undoing.append(functools.partial(os.utime, timed, ns=(st.st_atime_ns, st.st_mtime_ns)))
 				for undo in undoing:
 					try:
 						undo()
@@ -14229,8 +14253,8 @@ def _fd_of(base):
 
 def _make_names(probe, directory, names, made, answers, why):
 	"""Make each of names in probe (a descriptor or a path: _at), the new directory _ask_names made in directory, filling
-	answers and why, and made with what was made, in order; each file holds its place in made. The error that stopped it,
-	or None."""
+	answers and why, and made with what was made, in order; each file holds its place in made. The error that stopped it
+	(_NotTheProbe when the first file made does not get the owner of probe, a descriptor: nothing is left in it), or None."""
 	for name in names:
 		try:
 			fd = os.open(*_at(probe, name), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, **_fd_of(probe))
@@ -14248,6 +14272,15 @@ def _make_names(probe, directory, names, made, answers, why):
 				continue
 			return e
 		try:
+			# The first file made: in the directory the runner made it gets that directory's owner, whatever owner the mount
+			# shows (vfat's uid=, NFS root_squash: so it is not asked of geteuid()). Where it does not, another's directory,
+			# empty when it was opened, stands at the probe's name: this name goes, and nothing else of it is touched.
+			if not made and isinstance(probe, int) and os.fstat(fd).st_uid != os.fstat(probe).st_uid:
+				try:
+					os.unlink(name, dir_fd=probe)
+				except OSError:
+					pass
+				return _NotTheProbe()
 			os.write(fd, b'%d' % len(made))
 		except OSError:
 			pass
@@ -14262,7 +14295,9 @@ def _holder(probe, directory, name, made):
 	that could not say could not: (the name or None, reasons). The file says; where it cannot (a lookup that misses the
 	spelling it refused, a write that found no space), each one is asked on its own."""
 	try:
-		fd = os.open(*_at(probe, name), os.O_RDONLY, **_fd_of(probe))
+		# Never followed and never waited for (the stop signals are blocked here): a link or a FIFO at the name is not a file
+		# the probe made, and says nothing.
+		fd = os.open(*_at(probe, name), os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NONBLOCK', 0), **_fd_of(probe))
 		try:
 			return made[int(os.read(fd, 32))], ()
 		finally:
