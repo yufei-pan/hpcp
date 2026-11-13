@@ -2680,13 +2680,14 @@ def test_a_move_of_a_link_and_a_directory_through_it_moves_that_directory(tmp_pa
 @posix_only
 @pytest.mark.skipif(not hasattr(__import__('socket'), 'AF_UNIX'), reason='unix sockets')
 @pytest.mark.parametrize('flags', [[], ['-s'], ['-rf']], ids=['parallel', 'serial', 'move'])
-def test_a_named_socket_and_fifo_are_copied_as_cp_copies_them(tmp_path, flags):
+def test_a_named_socket_and_fifo_are_copied_as_cp_copies_them(tmp_path, monkeypatch, flags):
 	# 9.80 to 9.84 made the node and exited 200 ("Source path type error"), and -rf kept every source (212); -s exited 0.
 	import socket
+	monkeypatch.chdir(tmp_path)  # the bind is relative: an address holds 103 bytes on macOS, 107 on Linux, and pytest's paths are longer
 	os.makedirs(str(tmp_path / 'a'))
 	os.mkfifo(str(tmp_path / 'a/p'))
 	sock = socket.socket(socket.AF_UNIX)
-	sock.bind(str(tmp_path / 'a/s'))
+	sock.bind('a/s')
 	sock.close()
 	write(tmp_path / 'a/f', 'F')
 	rc, output = run(['a/p', 'a/s', 'a/f', '-d', 'out/'] + flags, tmp_path, timeout=60)
