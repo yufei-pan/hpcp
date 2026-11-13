@@ -82,7 +82,7 @@ def test_every_command_of_the_cleanup_runs_quiet_and_its_failure_is_still_said(t
 
 	def run_commands(commands, **kwargs):
 		calls.append((os.path.basename(commands[0][0]), kwargs.get('quiet')))
-		return [SimpleNamespace(command=' '.join(command), returncode=4 if command[0] == 'e2fsck' else 0, stdout=[], stderr=['/img: bad superblock'])
+		return [SimpleNamespace(command=' '.join(command), returncode=4 if os.path.basename(command[0]) == 'e2fsck' else 0, stdout=[], stderr=['/img: bad superblock'])
 			for command in commands]
 
 	monkeypatch.setattr(hpcp.multiCMD, 'run_commands', run_commands)
