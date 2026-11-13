@@ -1650,11 +1650,11 @@ def test_a_move_into_a_new_path_fsyncs_each_directory_it_made_and_their_parent(t
 	(tmp_path / 'src' / 'sub' / 'g').write_text('g')
 	monkeypatch.chdir(str(tmp_path))
 	synced = []
-	real = hpcp_mod._open_for_fsync  # 9.90: what _fsync_file and the move's directory pass both open by
+	real = hpcp_mod._fsync_file
 	def fsync(path, *args, **kwargs):
 		synced.append(os.path.abspath(path))
 		return real(path, *args, **kwargs)
-	monkeypatch.setattr(hpcp_mod, '_open_for_fsync', fsync)
+	monkeypatch.setattr(hpcp_mod, '_fsync_file', fsync)
 	assert hpcp_mod.hpcp(['src/'], dest_paths=[dest], remove=True, remove_force=True, single_thread=True) == 0, hpcp_mod.ERRORS
 	assert (tmp_path / 'new1' / 'new2' / 'sub' / 'g').read_text() == 'g' and not (tmp_path / 'src' / 'f').exists()
 	wanted = {str(tmp_path), str(tmp_path / 'new1'), str(tmp_path / 'new1' / 'new2')}

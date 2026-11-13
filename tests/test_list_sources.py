@@ -2203,7 +2203,12 @@ def test_a_named_file_that_is_the_destination_is_not_landed_on(tmp_path):
 	write(tmp_path / 'a/x', 'A')
 	os.symlink('a', tmp_path / 'ldir')
 	rc, output = run(['a/x', 'ldir/', '-d', 'a/x'], tmp_path)
-	assert rc == 213 and b'Destination clash' in output
+	if sys.platform == 'darwin':
+		# macOS refuses at the destination check, 202, where Linux's landing check says 213 (docs/limitations.md): nothing is
+		# written in either.
+		assert rc in (202, 213), output[-2000:]
+	else:
+		assert rc == 213 and b'Destination clash' in output
 	assert files(tmp_path) == {b'a/x': b'A', b'ldir': b'-> a'}
 
 
@@ -4656,6 +4661,10 @@ def test_a_move_onto_itself_under_another_spelling_that_cannot_be_asked_about_is
 def test_a_rename_in_case_on_a_directory_that_keeps_both_names_still_moves(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
 	monkeypatch.chdir(tmp_path)
 	write(tmp_path / 'X', 'data')
+	if os.path.lexists(tmp_path / 'x'):
+		# A case-insensitive filesystem (macOS's default APFS): X and x are one file, and the move is refused, 241, as it must
+		# be where each name is not its own (docs/limitations.md, "a case-only rename by a move is refused").
+		pytest.skip('this directory takes X and x for one name')
 	assert _move(hpcp_mod, ['X'], ['x']) == 0
 	assert os.listdir(tmp_path) == ['x'] and (tmp_path / 'x').read_text() == 'data'
 

@@ -921,7 +921,7 @@ _STOPPED_AT_REMOVAL = '''import sys
 sys.path.insert(0, %(root)r)
 import hpcp
 def stopped(*args, **kwargs):
-	raise KeyboardInterrupt  # a stop as the move's removal starts: the late pass never runs
+	raise KeyboardInterrupt  # a stop as the move's removal starts: the late pass still runs (a finally) and sets the exact mode
 hpcp.remove_moved_sources = stopped
 if __name__ == '__main__':  # forkserver and spawn workers import this file as __mp_main__
 	sys.argv = [%(hpcp)r] + sys.argv[1:]

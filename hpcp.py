@@ -4366,16 +4366,20 @@ _PATH_FDS = hasattr(os, 'O_PATH') and os.path.isdir('/proc/self/fd')
 class _Refused(Exception):
 	"""A landing this run will not write, for each file it would hold: a 'Destination clash' (213) naming what is there and
 	the fix. text(file) is the message for one file. said: this process has printed it (a pinned destination that leads
-	elsewhere, _dest_directory): recorded for each file, printed once (_say_refused)."""
-	def __init__(self, before, after, said=False):
+	elsewhere, _dest_directory): recorded for each file, printed once (_say_refused). note: what a process says once where
+	another destination takes the file (_copy_file), or None where nothing is said then."""
+	def __init__(self, before, after, said=False, note=None):
 		super().__init__(before + '...' + after)
-		self.before, self.after, self.said = before, after, said
+		self.before, self.after, self.said, self.note = before, after, said, note
 	def text(self, path):
 		return f'Destination clash: {self.before}{path}{self.after}'
 
-# The refusals of one destination this process has said in a run (RUN_ID) as a note where another destination took the file
-# (_copy_file).
-_NOTED_REFUSALS = set()
+def _pin_refused(root):
+	"""The refusal of a named destination root that no longer leads to the directory this run pinned at its start (NAMED_IDS)."""
+	return _Refused(f'{root} now leads to another directory than the one this run started writing in: not copying ',
+		'; run hpcp again to write where it leads now',
+		note=f'{root} now leads to another directory than the one this run started writing in; nothing is written below it, and '
+			'the other destinations take its files. Run hpcp again to write where it leads now')
 
 def _say_refused(refusal, what):
 	"""refusal's 213 line for what (eprint), or only its record where this process printed it already (refusal.said)."""
@@ -4418,9 +4422,10 @@ _CURSORS_RUN = [None, None]
 # whose pin it has checked. Cleared with the cursors.
 _BY_PATH = {}
 # How many directories the door may hold at once in a process: half its open-files limit, so the other half stays for what a
-# copy opens beside them (its held file, cp's pipes, the pool's, the skip check's reads). Deeper levels go by path (macOS
-# keeps its soft limit of 256: past 128 levels; Linux, where hpcp raises it to the hard limit at import, past 262,144, or
-# 2,048 on EL7, deeper than the 4,096 characters a listed path holds). Taken once a run in each process (_cursors_of_run).
+# copy opens beside them (its held file, cp's pipes, the pool's, the skip check's reads). Deeper levels go by path (Linux,
+# where hpcp raises the soft limit to the hard one at import, past 262,144, or 2,048 on EL7, deeper than the 4,096 characters a
+# listed path holds; macOS 26 takes that raise to unlimited, which has no budget, and where macOS refuses it the soft limit is
+# raised to 10240: past 5,120 levels). Taken once a run in each process (_cursors_of_run).
 
 def _hold_budget():
 	"""How many directories the door may hold in this process: half the soft open-files limit (None where it is unlimited or
@@ -4568,6 +4573,7 @@ def _door_step(base, name, current, make, source, below, first=None):
 	actimeo=0 it cost about two GETATTRs)."""
 	held = isinstance(base, int)
 	how = _fd_of(base)
+	widened = set()  # what the runner's own mode was widened for here, once each (_owner_search, _owner_read)
 	for attempt in range(4):
 		missing = False
 		if held:
@@ -4577,8 +4583,13 @@ def _door_step(base, name, current, make, source, below, first=None):
 					raise error
 				return os.open(name, (_HOLD_PATH_FLAGS if _PATH_FDS else _HOLD_READ_FLAGS) | _O_NOFOLLOW, dir_fd=base)
 			except OSError as e:
-				if e.errno == errno.EACCES and attempt == 0 and _owner_search(base):
-					continue  # base was the runner's own, shut to its owner (0607): open again
+				if e.errno == errno.EACCES:
+					if 'search' not in widened and _owner_search(base):
+						widened.add('search')
+						continue  # base was the runner's own, shut to its owner (0607): open again
+					if not _PATH_FDS and 'read' not in widened and _owner_read(base, name):
+						widened.add('read')
+						continue  # name was, and the read route opens it to read (0207, 0007, 0047): open again
 				if e.errno not in (errno.ENOENT, errno.ENOTDIR, errno.ELOOP):
 					raise
 				missing = e.errno == errno.ENOENT
@@ -4668,27 +4679,53 @@ def _owner_search(fd):
 		return False
 	return True
 
-def _door_by_path(start, parts, make, source, replace=True):
+def _owner_read(base, name):
+	"""Give the directory name in base (a held descriptor) owner read, write and search where it is the runner's own (not root)
+	and lacks owner read and search both: the read route (macOS, Linux without /proc) holds a directory by a read descriptor,
+	which a mode like 0207, 0007 or 0047 (what the finish of a non-root copy or move can give one) refuses its owner, and the
+	walk by path that goes on from there needs search, so _owner_search never reaches it and the copy fails. A mode with search
+	(0311, a directory the runner may write and search but not read) is walked by path and left as it is. By name relative to
+	base, without following a link (lchmod: macOS's; Linux without /proc has none, and nothing changes there). The finish sets
+	the exact mode again (where it sets one: not under -nds or -co). True when it did."""
+	if not hasattr(os, 'geteuid') or os.geteuid() == 0:
+		return False
+	try:
+		st = os.lstat(name, dir_fd=base)
+		if st.st_uid != os.geteuid() or st.st_mode & (stat.S_IRUSR | stat.S_IXUSR) or not stat.S_ISDIR(st.st_mode):
+			return False
+		os.chmod(name, stat.S_IMODE(st.st_mode) | stat.S_IRWXU, dir_fd=base, follow_symlinks=False)
+	except (OSError, NotImplementedError, ValueError):  # (Python 3.6 on Linux: ValueError where it cannot do both)
+		return False
+	return True
+
+def _owner_search_of(base, path):
+	"""_owner_search of the directory at path, which base (a descriptor of it, or path itself) holds: through the descriptor
+	where there is one, else one opened to read it (a mode with no owner read leaves none: False)."""
+	if isinstance(base, int):
+		return _owner_search(base)
+	try:
+		fd = os.open(path, _DIRECTORY_FLAGS)
+	except OSError:
+		return False
+	try:
+		return _owner_search(fd)
+	finally:
+		os.close(fd)
+
+def _door_by_path(start, parts, make, source):
 	"""The door's walk by path (9.87's) from start, a directory, through parts: the last path, or None when one is missing and
-	make is False. Where no descriptor can be had (_DIR_FD_WALK, _by_path_error). replace=False: None for anything on the way
-	that is not a directory, nothing changed (_dest_directory)."""
+	make is False. Where no descriptor can be had (_DIR_FD_WALK, _by_path_error)."""
 	current = start
 	for index, part in enumerate(parts):
 		current = os.path.join(current, part)
 		if current in _BY_PATH:
 			continue  # looked at in this run: 9.87's per-process memo (_BY_PATH), so the walk costs its lstats once
-		if not replace:
-			try:
-				if not stat.S_ISDIR(os.lstat(current).st_mode):
-					return None
-			except (FileNotFoundError, NotADirectoryError):
-				return None
-		elif _door_step(os.path.dirname(current), part, current, make, source, len(parts) - 1 - index) is None:
+		if _door_step(os.path.dirname(current), part, current, make, source, len(parts) - 1 - index) is None:
 			return None
 		_BY_PATH[current] = True
 	return current
 
-def _dest_directory(path, make=True, source=None, source_file=None, replace=True):
+def _dest_directory(path, make=True, source=None, source_file=None):
 	"""The one door for a directory below a destination: path as a real directory, and where its names are made from: a
 	descriptor of it, lent (the cursor's own: valid until the door's next call in this process below the same named
 	destination, never closed by the caller; one that holds it across another door call keeps a dup, _kept), or path
@@ -4703,9 +4740,7 @@ def _dest_directory(path, make=True, source=None, source_file=None, replace=True
 	file that lands in path, whose directory that is, worked out only when the door walks), and the levels shared
 	with the last path asked for are kept open (_HeldDirs): a directory swapped for a link after it was opened is no longer
 	on the way, as hpcp writes into the one it holds, wherever it is now. Where nothing can be held the walk is 9.87's, by path,
-	each component looked at once a process in a run (_BY_PATH).
-	replace=False (with make=False): a look that changes nothing: anything but a directory on the way (a link, a file, a node)
-	answers None, as a missing one does, where the walk would replace it (a move's directory fsyncs)."""
+	each component looked at once a process in a run (_BY_PATH)."""
 	path = os.path.abspath(path)
 	root = _named_root(path)
 	if root is None:
@@ -4724,7 +4759,7 @@ def _dest_directory(path, make=True, source=None, source_file=None, replace=True
 			# the cursor already stands at path (a wide directory's landings one after another, a finish's parent): no walk
 			return held.fds[-1]
 	elif isinstance(held, _Refused):
-		raise _Refused(held.before, held.after, said=True)
+		raise _Refused(held.before, held.after, said=True, note=held.note)
 	if source_file is not None:
 		source = os.path.dirname(os.path.abspath(source_file))
 	if held is None:
@@ -4741,17 +4776,16 @@ def _dest_directory(path, make=True, source=None, source_file=None, replace=True
 				if pinned is not None and is_dir:
 					st = os.stat(root)
 					if (st.st_dev, st.st_ino) != pinned:
-						refusal = _CURSORS[root] = _Refused(f'{root} now leads to another directory than the one this run started writing '
-							'in: not copying ', '; run hpcp again to write where it leads now')
+						refusal = _CURSORS[root] = _pin_refused(root)
 						raise refusal
 				if is_dir:
 					_BY_PATH[root] = True
-			return _door_by_path(root, parts, make, source, replace)
+			return _door_by_path(root, parts, make, source)
 		try:
 			fd = os.open(root, _HOLD_PATH_FLAGS if _PATH_FDS else _HOLD_READ_FLAGS)
 		except OSError as e:
 			if _by_path_error(e):
-				return _door_by_path(root, parts, make, source, replace)
+				return _door_by_path(root, parts, make, source)
 			if not make and e.errno in (errno.ENOENT, errno.ENOTDIR):
 				return None
 			raise
@@ -4763,8 +4797,7 @@ def _dest_directory(path, make=True, source=None, source_file=None, replace=True
 				raise
 			if (st.st_dev, st.st_ino) != pinned:
 				os.close(fd)
-				refusal = _CURSORS[root] = _Refused(f'{root} now leads to another directory than the one this run started writing '
-					'in: not copying ', '; run hpcp again to write where it leads now')
+				refusal = _CURSORS[root] = _pin_refused(root)
 				raise refusal
 		held = _CURSORS[root] = _HeldDirs(fd)
 	names, fds = held.names, held.fds
@@ -4784,19 +4817,17 @@ def _dest_directory(path, make=True, source=None, source_file=None, replace=True
 		# the root and index levels held here (this cursor's, where it is the only one)
 		if budget is not None and (index + 1 if len(_CURSORS) == 1 else
 				sum(len(other.fds) for other in _CURSORS.values() if isinstance(other, _HeldDirs))) >= budget:
-			return _door_by_path(os.path.join(root, *parts[:index]), parts[index:], make, source, replace)
+			return _door_by_path(os.path.join(root, *parts[:index]), parts[index:], make, source)
 		try:
 			fd = os.open(parts[index], flags, dir_fd=fds[-1])  # a directory there: what nearly every level is
 		except OSError as e:
-			if not replace and e.errno in (errno.ENOENT, errno.ENOTDIR, errno.ELOOP):
-				return None  # missing, or something else there: a look changes nothing
 			# what is there, or the error, looked at by the rules (_door_step, which takes this open as its first)
 			current = os.path.join(root, *parts[:index + 1])
 			try:
 				fd = _door_step(fds[-1], parts[index], current, make, source, len(parts) - 1 - index, first=e)
 			except OSError as e:
 				if _by_path_error(e):
-					return _door_by_path(os.path.dirname(current), parts[index:], make, source, replace)
+					return _door_by_path(os.path.dirname(current), parts[index:], make, source)
 				if e.filename == parts[index]:
 					e.filename = current  # a call relative to the held directory names the component alone: messages name its path
 				raise
@@ -5400,46 +5431,86 @@ def _cp_landing(command, src_path, dest_path, target, st, named, space, src_st, 
 
 def _open_after_lease(base, name, st):
 	"""The landing name in base opened for writing as _cp_landing opens it, but waiting: its non-blocking open met EAGAIN, a
-	lease another program holds on the file. Only while the name is still the regular file st (one lstat first), so what the
-	open could wait on is the lease's break (its holder's release, or the kernel's lease-break-time, 45 s by default), never a
-	FIFO's writer; None where it is not, or the open fails (the caller goes beside)."""
+	lease another program holds on the file. What waits is the lease's break (its holder's release, or the kernel's
+	lease-break-time, 45 s by default), never a FIFO's writer: the name is held by an O_PATH descriptor, checked to be the
+	regular file st looked at, and opened again through its /proc/self/fd entry, which leads to that file and no further, so a
+	FIFO put at the name since is never opened. None where it is not that file, the open fails, or there is no /proc (Linux's
+	leases are all there is; the caller goes beside, as 9.89 did)."""
+	if not _PATH_FDS:
+		return None
 	try:
-		now = os.lstat(*_at(base, name), **_fd_of(base))
-		if not stat.S_ISREG(now.st_mode) or (now.st_dev, now.st_ino) != (st.st_dev, st.st_ino):
-			return None
-		return os.open(*_at(base, name), _LANDING_FLAGS & ~getattr(os, 'O_NONBLOCK', 0), **_fd_of(base))
+		held = os.open(*_at(base, name), os.O_PATH | os.O_NOFOLLOW | getattr(os, 'O_CLOEXEC', 0), **_fd_of(base))
 	except OSError:
 		return None
+	try:
+		now = os.fstat(held)
+		if not stat.S_ISREG(now.st_mode) or (now.st_dev, now.st_ino) != (st.st_dev, st.st_ino):
+			return None
+		return os.open('/proc/self/fd/%d' % held, _LANDING_FLAGS & ~getattr(os, 'O_NONBLOCK', 0) & ~getattr(os, 'O_NOFOLLOW', 0))
+	except OSError:
+		return None
+	finally:
+		os.close(held)
 
 # macOS's cp skips a named socket ("is a socket (not copied)", exit 1), where Linux's cp -a makes one: hpcp makes it there.
 _CP_SKIPS_SOCKETS = sys.platform == 'darwin'
 
+# What a socket address holds (sun_path, <sys/un.h>: 104 bytes on macOS, 108 on Linux; the last is the NUL), so the longest path a
+# bind takes.
+_SOCKET_PATH_MAX = 103 if sys.platform == 'darwin' else 107
+
 def _make_socket(src_path, src_st, target, st, base):
-	"""A copy of the socket src_path (its lstat src_st) at target, as Linux's cp -a makes one: what is at the landing (st, its
-	look) unlinked, an AF_UNIX socket bound there (closed at once: the node stays), then the source's owner (as cp -a keeps
-	it), mode and times, without following a link put at the name. Relative to base (the door's result for its directory)
-	but the bind: macOS has no bindat, so it names the landing's path (its node copies go by name below the held directory,
-	docs/limitations.md), and a path longer than a socket address holds (104 bytes) fails as cp did. Returns 0 (no data)."""
+	"""A copy of the socket src_path (its lstat src_st) at target, as Linux's cp -a makes one: an AF_UNIX socket bound
+	(closed at once: the node stays), given the source's owner (as cp -a keeps it), mode and times, and renamed over what is at
+	the landing (st, its look). All of it but the last step in a directory of the run's own made for it in target's directory
+	(base: the door's result for it, a path where it has none), mode 0700 and held by its descriptor, so nobody else can reach
+	the socket before it is whole: a name put at the landing meanwhile gets neither the owner nor the mode, and a bind that
+	fails (a path past the socket address, 103 bytes on macOS: ENAMETOOLONG) leaves the old file as it is. macOS has no
+	bindat: the bind names the directory by its path (its node copies go by name below the held directory,
+	docs/limitations.md; the socket is looked for in the held directory after it). Returns 0 (no data)."""
 	import socket
 	base = os.path.dirname(target) if base is None else base
 	name = os.path.basename(target)
-	at, how = _at(base, name), _fd_of(base)
-	if st is not None:
+	how = _fd_of(base)
+	for _ in range(3):  # a name in use: another, as the door's bound for a race in its own directory
+		holder = '.hs' + uuid.uuid4().hex[:6]  # short: the bind's path holds it, and a socket address is short
 		try:
-			os.unlink(*at, **how)
-		except FileNotFoundError:
-			pass
-	sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+			os.mkdir(*_at(base, holder), 0o700, **how)
+			break
+		except FileExistsError:
+			continue
+	else:
+		raise OSError(errno.EAGAIN, 'it kept changing while it was made', target)
+	held = None
 	try:
-		sock.bind(target)
-	except OSError as e:
-		raise OSError(e.errno, f'cannot make the socket {target} ({e.strerror})', target)
+		held = os.open(*_at(base, holder), _DIRECTORY_FLAGS | getattr(os, 'O_NOFOLLOW', 0), **how)
+		now = os.fstat(held)
+		if now.st_uid != os.geteuid() or not stat.S_ISDIR(now.st_mode):
+			raise OSError(errno.EEXIST, 'something else was put at its name', os.path.join(os.path.dirname(target), holder))
+		os.fchmod(held, 0o700)
+		path = os.path.join(os.path.dirname(target), holder, 's')
+		sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+		try:
+			sock.bind(path)
+		except OSError as e:
+			number = e.errno or errno.ENAMETOOLONG  # Python's "AF_UNIX path too long" has no errno
+			raise OSError(number, f'cannot make the socket {target} (' + (e.strerror or
+				f'a socket address holds {_SOCKET_PATH_MAX} bytes, and its path here is {len(os.fsencode(path))}') + ')', target)
+		finally:
+			sock.close()
+		os.lstat('s', dir_fd=held)  # made where the held directory is: not where a link on the way to it led the bind
+		owner_kept, group_kept = _chown_like_cp('s', src_st, dir_fd=held)
+		mode = stat.S_IMODE(src_st.st_mode) & ~((0 if owner_kept else stat.S_ISUID) | (0 if group_kept else stat.S_ISGID))
+		os.chmod('s', mode, dir_fd=held)
+		os.utime('s', ns=(src_st.st_atime_ns, src_st.st_mtime_ns), dir_fd=held)
+		os.rename('s', *_at(base, name), src_dir_fd=held, **({'dst_dir_fd': base} if isinstance(base, int) else {}))
 	finally:
-		sock.close()
-	owner_kept, group_kept = _chown_like_cp(at[0], src_st, follow_symlinks=False, **how)
-	mode = stat.S_IMODE(src_st.st_mode) & ~((0 if owner_kept else stat.S_ISUID) | (0 if group_kept else stat.S_ISGID))
-	os.chmod(*at, mode, follow_symlinks=False, **how)
-	os.utime(*at, ns=(src_st.st_atime_ns, src_st.st_mtime_ns), follow_symlinks=False, **how)
+		if held is not None:
+			with contextlib.suppress(OSError):
+				os.unlink('s', dir_fd=held)
+			os.close(held)
+		with contextlib.suppress(OSError):
+			os.rmdir(*_at(base, holder), **how)
 	return 0
 
 def _regular_source(src_path, src_st=None):
@@ -5580,10 +5651,14 @@ def _known_identical(src_path, dest_path, src_size, full_hash, src_st=None, dest
 			return False  # a link (O_NOFOLLOW) or a socket put at the landing since the look, or the landing gone: the copy looks again
 		raise
 
-# The errors shutil.copystat's xattr copy ignores (3.6 to 3.14, together): a name the destination or the runner cannot have.
-# macOS's "no such attribute" (ENOATTR, 93), which Linux calls ENODATA
+# The errors shutil.copystat's xattr copy ignores (3.6 to 3.14, together): a name the destination or the runner cannot have; and
+# EOPNOTSUPP, which a filesystem that has no xattrs or ACLs may answer with (Linux's ENOTSUP is the same number; macOS's are 45
+# and 102). One set at every xattr and ACL call of the copy and the skip check. macOS's "no such attribute" (ENOATTR, 93) is
+# what Linux calls ENODATA.
 _ENOATTR = getattr(errno, 'ENOATTR', errno.ENODATA)
 _XATTR_SKIPPED = frozenset((errno.EPERM, errno.ENOTSUP, errno.EOPNOTSUPP, errno.ENODATA, errno.EINVAL, errno.EACCES, _ENOATTR))
+# A removal also meets a name gone since the listing.
+_XATTR_NOT_REMOVED = _XATTR_SKIPPED | {errno.ENOENT}
 # How _settle_identical opens an identical landing: O_PATH on Linux with /proc (_PATH_FDS), elsewhere a regular file for reading.
 _SETTLE_PATH_FLAGS = getattr(os, 'O_PATH', 0) | _O_NOFOLLOW | getattr(os, 'O_CLOEXEC', 0)
 _SETTLE_READ_FLAGS = os.O_RDONLY | _O_NOFOLLOW | getattr(os, 'O_NONBLOCK', 0) | getattr(os, 'O_CLOEXEC', 0)
@@ -5647,7 +5722,7 @@ def _settle_identical(src_path, src_st, dest, look, base=None):
 					try:
 						removexattr(xpath, name, **xhow)
 					except OSError as e:
-						if e.errno not in (errno.ENOTSUP, errno.EPERM, errno.ENODATA, errno.EACCES, errno.EINVAL, errno.ENOENT, _ENOATTR):
+						if e.errno not in _XATTR_NOT_REMOVED:
 							raise
 			for name in src_names:
 				try:
@@ -5790,11 +5865,12 @@ def _copy_file(src_path, dest_paths, full_hash, verbose, concurrent_processes, b
 				_copy_failed(src_path, refusal.text(src_path), refusal.said)
 			return 0, time.monotonic() - start_time, symLinks
 		for refusal in refused.values():
-			# Another destination takes the file, so this is no failure; said once a process, as a note (a pinned destination
-			# that leads elsewhere now: 9.89 said nothing).
-			if (RUN_ID, refusal.before, refusal.after) not in _NOTED_REFUSALS:
-				_NOTED_REFUSALS.add((RUN_ID, refusal.before, refusal.after))
-				print(f'Note: {refusal.before}{src_path} there, which goes to another destination{refusal.after}')
+			# Another destination takes the file, so this is no failure; a pinned destination that leads elsewhere now is said
+			# once a process, as a note (9.89 said nothing): the door's first answer is the one that is not said yet, the
+			# later ones are (_dest_directory), as is one this process printed already. Any other refusal here was said by the
+			# directory sync's own (213).
+			if refusal.note is not None and not refusal.said:
+				print('Note: ' + refusal.note)
 	looks = {dest: _look(dest, bases, landings[dest]) for dest in dest_paths}
 	if not src_is_link:
 		# cp would put the file inside a directory at its place (dest/x/x), and a move would then lose the source. A link there
@@ -6566,7 +6642,7 @@ def _sync_xattrs(src_path, dest):
 		src_names = listxattr(src_path)
 		dest_names = set(listxattr(dest))
 	except OSError as e:
-		if e.errno not in (errno.ENOTSUP, errno.ENODATA, errno.EINVAL, _ENOATTR):
+		if e.errno not in _XATTR_SKIPPED:
 			raise
 		return False
 	changed = False
@@ -6578,7 +6654,7 @@ def _sync_xattrs(src_path, dest):
 		try:
 			removexattr(dest, name)
 		except OSError as e:
-			if e.errno not in (errno.ENOTSUP, errno.EPERM, errno.ENODATA, errno.EACCES, errno.EINVAL, errno.ENOENT, _ENOATTR):
+			if e.errno not in _XATTR_NOT_REMOVED:
 				raise
 	for name in src_names:
 		try:
@@ -6588,14 +6664,14 @@ def _sync_xattrs(src_path, dest):
 			changed = True
 			setxattr(dest, name, value)
 		except OSError as e:
-			if e.errno not in (errno.EPERM, errno.ENOTSUP, errno.ENODATA, errno.EINVAL, errno.EACCES, _ENOATTR):
+			if e.errno not in _XATTR_SKIPPED:
 				raise
 	if isinstance(dest, int) and _XATTRS[0] is _mac_listxattr:
 		# macOS's ACL is no listed xattr: by its own calls, through the held descriptor
 		try:
 			changed = _mac_sync_acl(src_path, dest) or changed
 		except OSError as e:
-			if e.errno not in (errno.EPERM, errno.ENOTSUP, errno.EINVAL, errno.EACCES):
+			if e.errno not in _XATTR_SKIPPED:
 				raise
 	return changed
 
@@ -6734,7 +6810,8 @@ def _finish_directory(record, sync=False, late=False):
 	directory). A failure is a Directory sync error, or the move's copy failure when only the fsync failed. Below a named
 	destination the directory is opened by its name in its parent as the door holds it (_dest_directory, nothing made), the
 	named destination itself through the door (its pin), so a directory on the way swapped for a link since is not followed;
-	BSD flags (macOS: no descriptor form in Python) still go by name."""
+	BSD flags (macOS) go through that descriptor too (fchflags, by libc through ctypes: Python has none), by name only where
+	libc cannot be reached."""
 	src_path, dest_path, mode, atime_ns, mtime_ns, flags = record
 	if mode is None:
 		return  # -co: no directory metadata
@@ -6889,59 +6966,25 @@ def _sync_moved_directories(files, link_dirs, src_paths, dests, dest_image, reco
 		while parent != directory and parent not in directories and any((parent + os.sep).startswith(root) for root in roots):
 			directories.add(parent)
 			directory, parent = parent, os.path.dirname(parent)
-	# Each directory as the door holds it: a destination named as a link to a directory where it leads, and below it each
-	# name relative to its parent as the door holds that, never through a link on the way (one there, the move's own link or
-	# one put there since, is left as it is: the door's look, replace=False). Opened in this thread, in path order (the
-	# door's cursor walks), and fsynced in the threads.
-	directories = sorted(directories - finished)
-	def sync(item):
-		directory, fd = item
+	# One spelling each; a destination named as a link to a directory is fsynced where it leads (_fsync_file passes a link).
+	directories -= finished
+	directories = sorted({os.path.realpath(directory) if directory in NAMED_DESTS else directory for directory in directories})
+	def sync(directory):
+		if _STOPPED_PID is not None:
+			return  # stopped (the parent raises it): the rest is left, and the move removes nothing
 		try:
-			if _STOPPED_PID is None:  # stopped (the parent raises it): the rest is left, and the move removes nothing
-				os.fsync(fd)
-		except OSError as e:
-			if e.errno not in _NO_FSYNC:
-				eprint(f'Copy failed: the directory {directory} cannot be written to disk ({_why(e)})')
-		finally:
-			os.close(fd)
-	def opened(directory):
-		"""(directory, a descriptor of it to fsync), or None: gone, not a directory reached without a link, or another
-		user's that this run may not read (a write-only drop box)."""
-		try:
-			if directory in NAMED_DESTS:
-				base, name = _dest_directory(directory, make=False, replace=False), os.curdir
-			else:
-				base, name = _dest_directory(os.path.dirname(directory), make=False, replace=False), os.path.basename(directory)
-			if base is None:
-				return None
-			fd = _open_for_fsync(directory, base, name)
-			return None if fd is None else (directory, fd)
-		except _Refused as e:
-			eprint(f'Copy failed: the directory {directory} cannot be written to disk ({e.before}its files{e.after})')
-		except (FileNotFoundError, NotADirectoryError):
+			_fsync_file(directory)
+		except FileNotFoundError:
 			pass
 		except OSError as e:
-			if e.errno == errno.ELOOP:
-				return None  # a link at its name: the move's own, or one put there since; never followed
 			eprint(f'Copy failed: the directory {directory} cannot be written to disk ({_why(e)})')
-		return None
-	# At most this many held open at once: the threads' work several times over, well inside the open-files budget.
-	chunk = max(64, 4 * max_workers)
-	threads = concurrent.futures.ThreadPoolExecutor(min(max_workers, len(directories))) if max_workers > 1 and len(directories) > 1 else None
-	try:
-		for start in range(0, len(directories), chunk):
-			if _STOPPED_PID is not None:
-				break
-			items = [item for item in map(opened, directories[start:start + chunk]) if item is not None]
-			if threads is None:
-				for item in items:
-					sync(item)
-			else:
-				for _ in threads.map(sync, items):
-					pass
-	finally:
-		if threads is not None:
-			threads.shutdown()
+	if max_workers <= 1 or len(directories) <= 1:
+		for directory in directories:
+			sync(directory)
+	else:
+		with concurrent.futures.ThreadPoolExecutor(min(max_workers, len(directories))) as threads:
+			for _ in threads.map(sync, directories):
+				pass
 	return directories
 
 # fcntl(F_FULLFSYNC)'s errors that say the drive cannot be asked (a filesystem without it, such as SMB or FUSE), not that the
@@ -7345,6 +7388,11 @@ def _new_hasher():
 
 _PORTABLE_SYSTEM_XATTRS = frozenset(('system.posix_acl_access', 'system.posix_acl_default', 'security.capability'))
 
+# The xattrs macOS puts on a file by itself: Gatekeeper's quarantine, the Launch Services' last-use date, the provenance tag of
+# the app that made it, and the sandbox's access list (com.apple.macl, which SIP guards). A rerun carries the source's, and never
+# removes a landing's.
+_MAC_OWN_XATTRS = frozenset(('com.apple.quarantine', 'com.apple.lastuseddate#PS', 'com.apple.provenance', 'com.apple.macl'))
+
 def _is_portable_xattr(name):
 	"""True for xattrs a copy or a patch image can carry: user.*, POSIX ACLs and file capabilities.
 
@@ -7352,7 +7400,9 @@ def _is_portable_xattr(name):
 	are not portable and are ignored.
 	"""
 	if _XATTRS is not None and _XATTRS[0] is _mac_listxattr:
-		return not name.startswith('com.apple.system.')  # macOS: every name a program sets; the system's own are hidden
+		# macOS: every name a program sets, but the marks the system keeps on a file by itself (it puts some back on a written
+		# file, and guards others): a rerun that removed one would only fight it. And its own hidden names
+		return not name.startswith('com.apple.system.') and name not in _MAC_OWN_XATTRS
 	return name.startswith('user.') or name in _PORTABLE_SYSTEM_XATTRS
 
 def _xattr_digest(path):
@@ -12571,9 +12621,9 @@ _BELOW_FLAGS = _DIRECTORY_FLAGS | getattr(os, 'O_NOFOLLOW', 0)
 _PARENT_FLAGS = (getattr(os, 'O_PATH', 0) or os.O_RDONLY) | getattr(os, 'O_DIRECTORY', 0) | getattr(os, 'O_CLOEXEC', 0)
 # A descriptor walk or cursor holds one directory descriptor a level: a tree deeper than the soft open-files limit
 # (often 1024) needs more, so the soft limit is raised to the hard one (often 524288), where the platform allows.
-# macOS's hard limit is often RLIM_INFINITY, which its setrlimit refuses for the soft one: there the soft limit is raised to
-# OPEN_MAX (10240, <sys/syslimits.h>), the most macOS's setrlimit(2) takes for RLIMIT_NOFILE, where 9.89 kept 256 (the door's
-# budget, half of it: 128 levels).
+# macOS's hard limit is often RLIM_INFINITY: macOS 26 takes that for the soft limit too (measured on 9.89), and where a macOS
+# refuses it (setrlimit(2) says the soft limit may not pass kern.maxfilesperproc) the soft limit is raised to OPEN_MAX (10240,
+# <sys/syslimits.h>), not left at its default 256 (the door's budget, half of it: 128 levels).
 if resource is not None:  # (imported in the import header)
 	try:
 		_soft_nofile, _hard_nofile = resource.getrlimit(resource.RLIMIT_NOFILE)
@@ -14097,7 +14147,15 @@ def _ask_names(directory, names):
 			# Relative to descriptors where the platform can (Linux, the BSDs): a name then costs its own length, never the
 			# probe's full path (a landing near PATH_MAX). The directory's by O_PATH: search permission is enough.
 			base = os.open(directory, _PARENT_FLAGS) if _PROBE_BY_FD else directory
-			os.mkdir(*_at(base, probe), 0o700, **_fd_of(base))
+			try:
+				os.mkdir(*_at(base, probe), 0o700, **_fd_of(base))
+			except PermissionError:
+				# The runner's own directory shut to its owner (0607, which a non-root move gives one at its end and leaves
+				# after a skipped or stopped removal): owner search for the probe, as the door gives it (_owner_search); the
+				# finish sets the exact mode again. Another user's, or one with search (0555), stays refused.
+				if not _owner_search_of(base, directory):
+					raise
+				os.mkdir(*_at(base, probe), 0o700, **_fd_of(base))
 		except OSError as e:
 			failed = e
 		else:
@@ -14801,26 +14859,11 @@ def _fsync_file(path, base=None, name=None):
 	the door's result for its directory (_dest_directory), and every call goes relative to it."""
 	if os.name != 'posix':
 		return  # Windows' fsync wants a descriptor open for writing, and nothing here has been run there
-	fd = _open_for_fsync(path, base, name)
-	if fd is None:
-		return
-	try:
-		os.fsync(fd)
-	except OSError as e:
-		if e.errno not in _NO_FSYNC:
-			raise
-	finally:
-		os.close(fd)
-
-def _open_for_fsync(path, base=None, name=None):
-	"""_fsync_file's descriptor of path (base, name: name in base, the door's result for its directory), for the caller to
-	fsync and close; None where there is nothing to fsync (not a directory or a regular file; another user's directory this
-	run may not read)."""
 	at, how = ((path,), {}) if base is None else (_at(base, name), _fd_of(base))
 	st = os.lstat(*at, **how)
 	directory = stat.S_ISDIR(st.st_mode)
 	if not (directory or stat.S_ISREG(st.st_mode)):
-		return None
+		return
 	flags = getattr(os, 'O_CLOEXEC', 0) | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NONBLOCK', 0)
 	try:
 		fd = os.open(*at, os.O_RDONLY | flags, **how)
@@ -14833,7 +14876,7 @@ def _open_for_fsync(path, base=None, name=None):
 			if st.st_uid != os.geteuid():
 				if directory:
 					# Another user's directory this run may not read (a write-only drop box): not this run's to open.
-					return None
+					return
 				raise first
 			mode = stat.S_IMODE(st.st_mode)
 			fd = _open_owner_read(at, how, st, mode, flags, path)
@@ -14842,7 +14885,13 @@ def _open_for_fsync(path, base=None, name=None):
 			except BaseException:
 				os.close(fd)
 				raise
-	return fd
+	try:
+		os.fsync(fd)
+	except OSError as e:
+		if e.errno not in _NO_FSYNC:
+			raise
+	finally:
+		os.close(fd)
 
 def _open_owner_read(at, how, st, mode, flags, path):
 	"""A read descriptor of the file at (its lstat st, mode its mode), which its owner (the runner) may not read: owner read is
