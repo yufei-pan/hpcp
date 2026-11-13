@@ -106,11 +106,14 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 
 ### The name probe by path
 - **Kind:** deferred (9.92).
-- **What the operator sees:** a pair of names that fold alike (`Makefile`, `makefile`) landing in a directory that nothing can hold (on macOS, a non-root run in a directory it may write and not read: 0207, 0007, 0047, 0311; and Windows, see "Windows: directories on the way to a landing go by path, as in 9.87") is still asked by path, as 9.89 and 9.90 asked everywhere. Another local user who can list and write that directory (not sticky) can put a link at the probe's name before the probe's undo, and the undo then deletes the files in the directory the link leads to. Elsewhere the probe is held by a descriptor and must be empty when opened (9.91); in 9.89 and 9.90 a directory renamed over it was emptied on Linux and a link was followed on macOS (20 s races: 62 of 61,327 probes on Linux, 98 of 36,607 on macOS).
-- **Why:** macOS opens a directory only to read it, or with `O_SEARCH` where it has search and no read, and a directory with neither (0207, 0007, 0047) cannot be opened by its owner at all (see "The door goes by path in a directory the runner may not read (read route)"). Answering "cannot be asked" there instead would refuse pairs 9.90 copies, on every rerun: the probe gives such a directory its owner access, so a copy of a source directory of that mode can be rerun.
-- **Plan (9.92):** hold the directory as that entry plans to; until then, on this route, undo only the names the probe made.
+- **What the operator sees:**
+  - Where Python has no descriptor calls (Windows: see "Windows: directories on the way to a landing go by path, as in 9.87"), a pair of names that fold alike (`Makefile`, `makefile`) is still asked by path, as 9.83 to 9.90 asked on macOS. Another local user who can write the directory asked can put a link at the probe's name before the probe's undo, and the undo then deletes the files in the directory the link leads to. The same holds on macOS under a Python without `os.O_SEARCH`, in a directory the runner may search and not read (0311, a drop box); the 3.9.6 and 3.14 tested on macOS 26 have `os.O_SEARCH`.
+  - Everywhere else the probe works through descriptors (9.91): of the directory asked (on macOS by `O_SEARCH` where the runner may not read it, and one of the runner's own with neither read nor search once the probe has given it its owner bits), and of the probe, which must be empty when opened and whose first file must get its owner.
+  - The directory asked is itself opened by its path, once. A link another user puts at its name before that (he must be able to write its parent) moves the question, and the probe with its names for a moment, to the directory the link leads to. Nothing there is removed but what the probe made.
+- **Why:** Windows has no `dir_fd` calls for Python to use. Handing the probe the door's own descriptor of the directory asked changes the check that asks (`_RealPlaces`), which works on paths: a design of its own.
+- **Plan (9.92):** on the by-path route, undo only the names the probe made (that narrows the loss to files of those names; it does not end it); hand the probe the door's descriptor where the door holds one.
 - **Revisit when:** 9.92.
-- **Noted:** 2026-11-13, the 9.90 final review's T1; the 9.91 fix leaves this part (a deferral, not asked). Not run against a second user: the Mac we test on has one.
+- **Noted:** 2026-11-13, the 9.90 final review's T1 and the 9.91 final review (a deferral, not asked). Not run against a second user: the Mac we test on has one.
 
 ### A directory hpcp opened to its owner keeps owner read, write and search where the run sets no mode on it
 - **Kind:** known limitation.
