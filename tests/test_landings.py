@@ -2691,7 +2691,13 @@ def test_a_named_socket_and_fifo_are_copied_as_cp_copies_them(tmp_path, flags):
 	write(tmp_path / 'a/f', 'F')
 	rc, output = run(['a/p', 'a/s', 'a/f', '-d', 'out/'] + flags, tmp_path, timeout=60)
 	assert rc == 0 and b'Source path type error' not in output, output[-2000:]
-	assert stat.S_ISFIFO(os.lstat(str(tmp_path / 'out/p')).st_mode) and stat.S_ISSOCK(os.lstat(str(tmp_path / 'out/s')).st_mode)
+	assert stat.S_ISFIFO(os.lstat(str(tmp_path / 'out/p')).st_mode)
+	if sys.platform == 'darwin':
+		# macOS copies no socket (its cp skips one): noted, not copied, and left in place by a move (9.90).
+		assert b'Special file skipped' in output and not os.path.lexists(str(tmp_path / 'out/s')), output[-2000:]
+		assert os.path.lexists(str(tmp_path / 'a/s')) and all(os.path.lexists(str(tmp_path / 'a' / name)) != (flags == ['-rf']) for name in 'pf')
+		return
+	assert stat.S_ISSOCK(os.lstat(str(tmp_path / 'out/s')).st_mode)
 	assert all(os.path.lexists(str(tmp_path / 'a' / name)) != (flags == ['-rf']) for name in 'psf')
 
 
@@ -3293,6 +3299,8 @@ def test_a_move_fsyncs_the_directory_a_link_to_a_directory_named_by_d_leads_to(t
 @pytest.mark.parametrize('flags, kind', [([], 'fifo'), (['-co'], 'fifo'), ([], 'socket')], ids=['plain', 'content-only', 'socket'])
 def test_a_node_source_replaces_a_file_at_its_landing(tmp_path, monkeypatch, flags, kind):
 	# cp -a makes a FIFO or socket anew, and cannot unlink a held file's /proc name: such a source goes beside, as in 9.85 (exit 0).
+	if kind == 'socket' and sys.platform == 'darwin':
+		pytest.skip('macOS copies no socket (9.90: a named one is skipped with a note)')
 	os.makedirs(str(tmp_path / 'a'))
 	if kind == 'fifo':
 		os.mkfifo(str(tmp_path / 'a/p'))

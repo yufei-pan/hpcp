@@ -921,7 +921,7 @@ _STOPPED_AT_REMOVAL = '''import sys
 sys.path.insert(0, %(root)r)
 import hpcp
 def stopped(*args, **kwargs):
-	raise KeyboardInterrupt  # a stop as the move's removal starts: the late pass never runs
+	raise KeyboardInterrupt  # a stop as the move's removal starts: the late pass still runs (a finally) and sets the exact mode
 hpcp.remove_moved_sources = stopped
 if __name__ == '__main__':  # forkserver and spawn workers import this file as __mp_main__
 	sys.argv = [%(hpcp)r] + sys.argv[1:]
@@ -931,9 +931,10 @@ if __name__ == '__main__':  # forkserver and spawn workers import this file as _
 
 @posix_only
 @root_only
-def test_a_stopped_move_leaves_owner_search_until_a_rerun(tmp_path):
-	# A stop before the late pass (here as the removal starts) leaves such a directory with owner read and search (0707): a
-	# rerun of the move sets its exact mode.
+def test_a_stopped_move_still_gets_the_exact_mode_and_a_rerun_completes(tmp_path):
+	# A stop as the removal starts: 9.88 and 9.89 left such a directory with owner read and search (0707) for the rerun, whose
+	# walk below it could fail on 0607. 9.90's door gives a rerun owner search where it needs it (_owner_search), so the late
+	# pass sets the exact mode on every path, and the rerun of the move completes.
 	work = _shut_out_tree()
 	try:
 		script = os.path.join(work, 'stopped.py')
@@ -941,7 +942,7 @@ def test_a_stopped_move_leaves_owner_search_until_a_rerun(tmp_path):
 			handle.write(_STOPPED_AT_REMOVAL % {'root': os.path.dirname(HPCP), 'hpcp': HPCP})
 		out = os.path.join(work, 'out', 'd')
 		rc, output = _as_nobody(['src/', '-d', 'out/', '-rf'], work, script)
-		assert rc == 130 and stat.S_IMODE(os.lstat(out).st_mode) == 0o707, (oct(os.lstat(out).st_mode), output[-3000:])
+		assert rc == 130 and stat.S_IMODE(os.lstat(out).st_mode) == 0o607, (oct(os.lstat(out).st_mode), output[-3000:])
 		rc, output = _as_nobody(['src/', '-d', 'out/', '-rf'], work)
 		assert rc == 0 and stat.S_IMODE(os.lstat(out).st_mode) == 0o607, (oct(os.lstat(out).st_mode), output[-3000:])
 		assert not os.path.exists(os.path.join(work, 'src', 'd'))
@@ -989,11 +990,11 @@ def test_a_move_stopped_as_its_removal_ends_still_gets_the_exact_mode(tmp_path, 
 
 @posix_only
 @root_only
-def test_a_move_whose_removal_was_skipped_for_a_failed_copy_keeps_owner_search_for_the_rerun(tmp_path):
+def test_a_move_whose_removal_was_skipped_for_a_failed_copy_gets_the_exact_mode_and_the_rerun_completes(tmp_path):
 	# One file of the tree cannot be read (root's, 0600; nobody moves it): the copy reports it, the removal is skipped ("Remove
-	# skipped ... fix them and re-run") and every source stays. The remedy is a rerun, whose folder sync looks below out/d, and
-	# a rerun over a 0607 directory can fail there (docs/limitations.md): out/d keeps owner read and search (0707), as after a
-	# stop before the removal. 9.88's first build gave it 0607 here. The rerun, the file readable, completes and sets 0607.
+	# skipped ... fix them and re-run") and every source stays. 9.88 and 9.89 left out/d 0707 for the rerun, whose folder sync
+	# looks below it; 9.90's rerun gives it owner search there (_owner_search), so it gets 0607 now (the README's "until a
+	# rerun" is gone). The rerun, the file readable, completes and sets 0607 again.
 	work = _shut_out_tree()
 	try:
 		unreadable = os.path.join(work, 'src', 'd', 'h')
@@ -1003,7 +1004,7 @@ def test_a_move_whose_removal_was_skipped_for_a_failed_copy_keeps_owner_search_f
 		out = os.path.join(work, 'out', 'd')
 		rc, output = _as_nobody(['src/', '-d', 'out/', '-rf'], work)
 		assert rc != 0 and 'Remove skipped' in output and os.path.exists(os.path.join(work, 'src', 'd', 'sub', 'f')), (rc, output[-3000:])
-		assert stat.S_IMODE(os.lstat(out).st_mode) == 0o707, (oct(os.lstat(out).st_mode), output[-3000:])
+		assert stat.S_IMODE(os.lstat(out).st_mode) == 0o607, (oct(os.lstat(out).st_mode), output[-3000:])
 		os.chmod(unreadable, 0o666)
 		rc, output = _as_nobody(['src/', '-d', 'out/', '-rf'], work)
 		assert rc == 0 and stat.S_IMODE(os.lstat(out).st_mode) == 0o607 and not os.path.exists(os.path.join(work, 'src', 'd')), (
