@@ -284,7 +284,7 @@ finally:
 	if _IMPORT_MASK is not None and _signal.SIGINT not in _IMPORT_MASK:
 		_signal.pthread_sigmask(_signal.SIG_UNBLOCK, (_signal.SIGINT,))
 
-version = '9.90'
+version = '9.91'
 __version__ = version
 COMMIT_DATE = '2026-11-13'
 
@@ -3737,8 +3737,8 @@ def get_file_list_serial(root,exclude=None,append_hash=False,full_hash=False,rec
 			file_list.add(get_file_repr(current,append_hash,full_hash))
 			continue
 		if not (is_dir or (is_dir is None and os.path.isdir(current))):
-			# A FIFO, socket or device the operator named is a source, copied as cp -a copies it (one met in a tree is
-			# skipped by the walk); never hashed: opening it is an act of its own.
+			# A FIFO, socket or device the operator named is a source (not a socket on macOS: _skipped_socket), copied as cp -a
+			# copies it (one met in a tree is skipped by the walk); never hashed: opening it is an act of its own.
 			if not (current == root and _named_special(current)):
 				eprint(f'Source path type error: {current} is not a file or directory')
 			file_list.add(current)
@@ -14106,7 +14106,8 @@ def _roots_overlap(roots):
 
 # What lets a probe be made, by why it could not be.
 _PROBE_FIXES = {errno.EACCES: 'make it writable', errno.EPERM: 'make it writable', errno.EROFS: 'mount it read-write',
-	errno.ENOSPC: 'free some space there', errno.EDQUOT: 'free some of the quota'}
+	errno.ENOSPC: 'free some space there', errno.EDQUOT: 'free some of the quota',
+	errno.EEXIST: 'see who else writes there'}  # (_ask_names: the directory it made was replaced)
 
 # Why a directory cannot hold a name: no other place fixes that.
 _REFUSED_NAME = (errno.EINVAL, errno.EILSEQ, errno.ENAMETOOLONG)
@@ -14120,8 +14121,10 @@ def _ask_names(directory, names):
 	parent: each name in turn is made with O_EXCL and holds its place among those made; a name that is there already is one
 	name with the file that holds it. Only where nothing can be made does a listing answer: it has each name once, so the
 	names in it are names of their own. The directory keeps its times (its owner's: a group member who may write it changes
-	them). SIGINT, SIGTERM and SIGHUP wait until the probe is gone. SIGKILL cannot wait, and a signal sent while another
-	thread of the process exists may still reach that thread."""
+	them). The probe is held by a descriptor and must be empty when opened: where it is not, another directory has taken its
+	place, and the pair cannot be asked. It goes by path only where no descriptor can hold it (Windows, a macOS directory the
+	runner may write and not read). SIGINT, SIGTERM and SIGHUP wait until the probe is gone. SIGKILL cannot wait, and a signal
+	sent while another thread of the process exists may still reach that thread."""
 	answers, why = {}, {}
 	probe = '.hpcp-case-probe-%d-%s' % (os.getpid(), uuid.uuid4().hex)
 	held = signal.pthread_sigmask(signal.SIG_BLOCK, _STOPS) if hasattr(signal, 'pthread_sigmask') else None
@@ -14129,9 +14132,18 @@ def _ask_names(directory, names):
 		base = probe_base = None
 		try:
 			st = os.stat(directory)
-			# Relative to descriptors where the platform can (Linux, the BSDs): a name then costs its own length, never the
-			# probe's full path (a landing near PATH_MAX). The directory's by O_PATH: search permission is enough.
-			base = os.open(directory, _PARENT_FLAGS) if _PROBE_BY_FD else directory
+			# Relative to descriptors where the platform can (Linux, macOS, the BSDs): a name then costs its own length, never the
+			# probe's full path (a landing near PATH_MAX), and the probe is the directory just made, not what stands at its name
+			# later. The directory's by O_PATH where there is one: search permission is enough. Without it (macOS) the open reads,
+			# and a directory the runner may write and not read (0311, 0207, 0007, 0047) is asked by path: nothing can hold it
+			# (docs/limitations.md, "The name probe by path").
+			base = directory
+			if _ASK_BY_FD:
+				try:
+					base = os.open(directory, _PARENT_FLAGS)
+				except PermissionError:
+					if _PARENT_FLAGS & getattr(os, 'O_PATH', 0):
+						raise
 			try:
 				os.mkdir(*_at(base, probe), 0o700, **_fd_of(base))
 			except PermissionError:
@@ -14153,7 +14165,13 @@ def _ask_names(directory, names):
 			made = []
 			try:
 				try:
-					probe_base = os.open(probe, _BELOW_FLAGS, dir_fd=base) if _PROBE_BY_FD else os.path.join(directory, probe)
+					probe_base = os.open(probe, _BELOW_FLAGS, dir_fd=base) if isinstance(base, int) else os.path.join(directory, probe)
+					if isinstance(probe_base, int) and os.listdir(probe_base):
+						# What was just made is empty. Another directory has been put at its name since (a link is refused by
+						# the open): nothing is made in it, and the undo, which removes what it lists, never meets it.
+						os.close(probe_base)
+						probe_base = None
+						raise OSError(errno.EEXIST, 'the directory made to ask it was replaced by another', os.path.join(directory, probe))
 				except OSError as e:
 					failed = e
 				else:
@@ -14196,9 +14214,11 @@ def _ask_names(directory, names):
 			signal.pthread_sigmask(signal.SIG_SETMASK, held)
 	return answers, why
 
-# A probe is made relative to descriptors where every call it makes takes one.
-_PROBE_BY_FD = (os.mkdir in os.supports_dir_fd and os.open in os.supports_dir_fd and os.unlink in os.supports_dir_fd and
-	os.rmdir in os.supports_dir_fd and os.listdir in os.supports_fd and bool(getattr(os, 'O_PATH', 0)))
+# The name probe is made relative to descriptors where every call it makes takes one (not Windows).
+_ASK_BY_FD = (os.mkdir in os.supports_dir_fd and os.open in os.supports_dir_fd and os.unlink in os.supports_dir_fd and
+	os.rmdir in os.supports_dir_fd and os.listdir in os.supports_fd)
+# The node probe's (_settle_identical's): the same, and only with O_PATH, which holds a directory the runner may write and not read.
+_PROBE_BY_FD = _ASK_BY_FD and bool(getattr(os, 'O_PATH', 0))
 
 def _at(base, name):
 	"""(name,) relative to base, a directory's descriptor, or (its path,) below base, a path."""
