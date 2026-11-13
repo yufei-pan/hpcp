@@ -102,7 +102,7 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - **What the operator sees:** two names that fold alike (`X` and `x`), at least one of them new, landing in a directory where nothing can be made, such as an owned mode 555 directory, are refused with 213: `may be one name, and the destination cannot be asked: nothing can be made in DIR to ask it (Permission denied): make it writable and run again` (a read-only mount or a full disk names its own fix). On a case-sensitive filesystem the refusal is false: 9.82 opened an owned directory and landed both. No file is lost. Where nothing can be made, the directory's listing answers: both names in it are two names, so a rerun with both names there passes. A directory of the runner's own that lacks only owner search (mode 0607, which a non-root move leaves after a skipped or stopped removal) is no case of it since 9.90: the probe gives it owner search, as the door does, and the finish sets its mode again.
 - **Why:** it takes that exact mix, and opening a directory the operator set read-only (555) for the probe means another chmod and restore in the path that writes to destinations, for a mode someone chose. A directory that only lacks search was made so by hpcp's own finish, so giving it search for the probe is the repair the door already does (9.90's first build was refused there on every rerun of a skipped move, 213, until the operator changed the mode by hand).
 - **Revisit when:** someone hits it.
-- **Approved:** 2026-11-06, the user chose "Known limitation (Recommended)". Narrowed 2026-11-13: the user chose "Probe adds owner search (Recommended)" (a directory of the runner's own without owner search is given it; a 0555 directory stays refused). The earlier text declined a chmod in the probe.
+- **Approved:** 2026-11-06, the user chose "Known limitation (Recommended)". Narrowed 2026-11-12: the user chose "Probe adds owner search (Recommended)" (a directory of the runner's own without owner search is given it; a 0555 directory stays refused). The earlier text declined a chmod in the probe.
 
 ### A legacy name read as UTF-8 or ASCII, against its other case
 - **Kind:** known limitation.
@@ -135,7 +135,7 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - **What the operator sees:** on Python 3.6 (3.7 not measured) with the forkserver or spawn start method (EL7's and EL8's Python when a program sets one; hpcp's default on Linux is fork there), an early Ctrl-C now and then prints a worker's `Process Process-2:` traceback ending in `EOFError: Ran out of input`, from `concurrent/futures/process.py`'s `call_queue.get`. The run still ends 130 with its cleanup done and nothing lost. 9.87 printed it in 2 of 3,800 early stops, 9.88 in 0 of 3,800 (and 2 of 3,200 in the build's own probes): about 1 in 1,600 to 2,000 early stops. Since 9.90 a worker stopped while it reads a job lets the read finish, which closes the long window (between the 4-byte length and the payload), and the 9.90 review's probe, which sends the stop at the one instant left, lost the length in 184 of 200 trials on Python 3.14 and 145 of 200 on 3.6, against 200 of 200 on 9.89 (the 3.14 run measures the window only: the printed block was measured on 3.6). So it is rarer than in 9.89, by an amount not measured on real early stops. The early-stop test accepts that block, and only that block (`_OLD_EOF`).
 - **Why:** a stop handled in the instant right after a read returns, before Python stores the bytes, cannot be told from one that consumed nothing: no frame holds the bytes then, and the check is at the eval loop's step after the call. The `SystemExit` hpcp raises there leaves the payload in the pipe, and the next worker reads its first bytes as a negative length and unpickles nothing. A full close would wrap the call queue's read (wait while readable with stops unblocked, then read with them blocked): more monkeypatching of multiprocessing, for Python 3.6 and 3.7, which are end of life.
 - **Revisit when:** it is seen on Python 3.8 or later, or hpcp drops Python 3.6 and 3.7.
-- **Approved:** 2026-11-13, the user chose "Known limitation below 3.8 (Recommended)". The user did not ask for it explicitly; the 9.88 W1 review's item (b) found it, and the 9.90 review found that 9.90's fix leaves one instant open.
+- **Approved:** 2026-11-12, the user chose "Known limitation below 3.8 (Recommended)". The user did not ask for it explicitly; the 9.88 W1 review's item (b) found it, and the 9.90 review found that 9.90's fix leaves one instant open.
 
 ### A stopped run waits for a worker whose file operation never returns
 - **Kind:** known limitation.
@@ -302,7 +302,7 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - **What the operator sees:** a non-root move on macOS of a file of mode 0044 (its owner can neither read nor write it), into a directory another user can write: a hard link to another file of the runner's own, put at the name between hpcp's `lstat` and its chmod (macOS has no `fs.protected_hardlinks`), gets owner read for the open and is then set to 0044: readable by group and others. A symbolic link put there is never followed (`lchmod`, then an open with `O_NOFOLLOW`). Not worse than 9.89, whose chmod followed even a symbolic link. Linux with /proc is whole: the `O_PATH` hold is checked by inode.
 - **Why:** macOS has no `O_PATH` to hold the name and check it by identity before the chmod, and a check of the opened file against the look cannot undo a chmod that already landed.
 - **Revisit when:** an operator moves 0044 files into directories others can write on macOS, or a descriptor route is found (`O_EVTONLY`, not tried).
-- **Approved:** 2026-11-13, the user chose "Known limitation (Recommended)". The user did not ask for it explicitly; the 9.90 review found it.
+- **Approved:** 2026-11-12, the user chose "Known limitation (Recommended)". The user did not ask for it explicitly; the 9.90 review found it.
 
 ### On EL7 the door goes by path below 2,048 levels
 - **Kind:** known limitation.
@@ -369,12 +369,12 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - **What the operator sees:** on a case-insensitive APFS (the default), `hpcp X -d x -rf` exits 241: `-rm would move X onto itself (x is it or lies inside it); nothing is copied or removed`. Nothing is lost, and `mv X x` renames it. On a case-sensitive filesystem the move runs. The same in 9.89.
 - **Why:** the check that stops a move from removing its own source judges by identity, and there `X` and `x` are one file. Treating a case-only rename as a rename would be a route of its own for a rare ask.
 - **Revisit when:** an operator needs a case-only rename by `hpcp -rf` on macOS.
-- **Approved:** 2026-11-13, the user chose "Keep the refusal (Recommended)". The user did not ask for it explicitly; the 9.90 Mac health check found it.
+- **Approved:** 2026-11-12, the user chose "Keep the refusal (Recommended)". The user did not ask for it explicitly; the 9.90 Mac health check found it.
 
 ### `hpcp a/x ldir/ -d a/x`: exit 213 on Linux, 202 on macOS
 - **Kind:** known limitation.
 - **What the operator sees:** with `ldir` a link to `a`, `hpcp a/x ldir/ -d a/x` (a source is also the destination, and `ldir/` holds it again through the link): Linux exits 213 (`Destination clash`) at the landing check; macOS exits 202 at the destination check. Nothing is written in either.
 - **Why:** both refuse before anything is written; which check reaches the case first differs by platform (not traced further, as the refusal is the same).
 - **Revisit when:** an operator's script depends on the exit code there.
-- **Approved:** 2026-11-13, the user chose "Accept either (Recommended)". The user did not ask for it explicitly; the 9.90 Mac health check found it.
+- **Approved:** 2026-11-12, the user chose "Accept either (Recommended)". The user did not ask for it explicitly; the 9.90 Mac health check found it.
 
