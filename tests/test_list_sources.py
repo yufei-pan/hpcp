@@ -4328,6 +4328,18 @@ def test_a_refused_named_fifo_is_reported_once(tmp_path):
 
 # ---- 9.83: a destination that folds case ----
 
+def _fd_path(fd):
+	"""Where the directory fd holds leads: Linux's /proc/self/fd, macOS's F_GETPATH (Python 3.9; the probe holds its directories by
+	descriptor there since 9.91). OSError where neither can say."""
+	try:
+		return os.readlink('/proc/self/fd/%d' % fd)
+	except OSError:
+		import fcntl
+		if not hasattr(fcntl, 'F_GETPATH'):
+			raise
+		return fcntl.fcntl(fd, fcntl.F_GETPATH, bytes(1024)).split(b'\0')[0].decode('utf-8', 'surrogateescape')
+
+
 def _spelled(path, kwargs):
 	"""path as a full path: one relative to a dir_fd (the probe makes its names so since 9.85) joined to where it leads."""
 	path = os.fspath(path)
@@ -4335,7 +4347,7 @@ def _spelled(path, kwargs):
 	if dir_fd is None or os.path.isabs(path):
 		return path
 	try:
-		return os.path.join(os.readlink('/proc/self/fd/%d' % dir_fd), path)
+		return os.path.join(_fd_path(dir_fd), path)
 	except OSError:
 		return path
 
@@ -4349,7 +4361,7 @@ def _fold_probes(monkeypatch):
 		directory, name = os.path.split(os.fspath(path))
 		if dir_fd is not None and not directory:
 			try:
-				directory = os.readlink('/proc/self/fd/%d' % dir_fd)
+				directory = _fd_path(dir_fd)
 			except OSError:
 				return path
 			if os.path.basename(directory).startswith('.hpcp-case-probe-'):

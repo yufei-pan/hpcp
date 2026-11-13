@@ -1576,7 +1576,7 @@ def test_dd_roundtrip_uses_defaults_with_no_fs_param_mirror(tmp_path):
 
 
 def test_version_bumped():
-	assert hpcp.version == '9.90'
+	assert hpcp.version == '9.91'
 	assert hpcp.__version__ == hpcp.version
 	# The release commit sets the date: only its form is checked, a real YYYY-MM-DD (a fixed date broke 9.85's own suite).
 	import datetime

@@ -508,8 +508,8 @@ def _cli_as_macos_takes_a_socket(args, cwd, stdin=None):
 
 @contextlib.contextmanager
 def _a_short_tree():
-	'''A directory under /tmp to work in (a socket's address holds 103 bytes on macOS, 107 on Linux: pytest's own are longer),
-	holding src/s (a socket, 0640), src/f and out/; removed afterwards.'''
+	'''A directory under /tmp to work in, holding src/s (a socket, 0640), src/f and out/; removed afterwards. The socket is bound by a
+	relative path (an address holds 103 bytes on macOS, 107 on Linux), so the directory's own length does not matter.'''
 	import shutil
 	import tempfile
 	work = tempfile.mkdtemp(prefix='s', dir='/tmp')
@@ -692,7 +692,7 @@ def _can_lchmod_by_path():
 
 @posix_only
 @not_root
-@pytest.mark.parametrize('route', ['proc', 'path', 'no-proc'])
+@pytest.mark.parametrize('route', ['proc', 'path', 'no-proc', 'read'])
 @pytest.mark.parametrize('mode', [0o607, 0o407, 0o207, 0o007, 0o047])
 def test_990_the_name_probe_gives_the_runners_own_directory_shut_to_its_owner_search_on_every_route(tmp_path, monkeypatch, route,
 		mode):
@@ -701,10 +701,11 @@ def test_990_the_name_probe_gives_the_runners_own_directory_shut_to_its_owner_se
 	# and 0047): the probe makes its names in the directory, and met EACCES ("nothing can be made in DIR to ask it (Permission
 	# denied): make it writable and run again") on every rerun, where 9.89 had left 0707. The probe gives the directory owner
 	# search as the door does. The routes: Linux with /proc (the probe holds the directory by O_PATH, and chmods through /proc);
-	# macOS's (no O_PATH, the probe by path: opened by path for a mode with owner read, and lchmod by name for one without it, as
-	# the door does); Linux without /proc (an O_PATH descriptor that fchmod refuses: by path, as macOS's; no lchmod there, which a
-	# container's glibc still has through /proc). The finish sets the exact mode again where it sets one: after the probe the
-	# directory has owner rwx.
+	# macOS's (9.91: no O_PATH, a read descriptor for a mode with owner read, which the probe gives owner search by the path it
+	# opened; by path, with lchmod by name, for one without it, as the door does); Linux without /proc (an O_PATH descriptor that
+	# fchmod refuses: by path, as macOS's; no lchmod there, which a container's glibc still has through /proc); and the probe by
+	# path throughout (Windows). The finish sets the exact mode again where it sets one: after the probe the directory has owner
+	# rwx.
 	if route == 'proc' and not (hpcp._PATH_FDS and hpcp._PROBE_BY_FD):
 		pytest.skip('no /proc/self/fd here')
 	if route == 'no-proc' and not hpcp._PROBE_BY_FD:
@@ -712,7 +713,9 @@ def test_990_the_name_probe_gives_the_runners_own_directory_shut_to_its_owner_se
 	if route != 'proc' and not mode & 0o400 and not _can_lchmod_by_path():
 		pytest.skip('no chmod by name that does not follow a link here: the probe is refused (docs/limitations.md)')
 	monkeypatch.setattr(hpcp, '_PATH_FDS', route == 'proc')
-	monkeypatch.setattr(hpcp, '_PROBE_BY_FD', route != 'path')
+	monkeypatch.setattr(hpcp, '_ASK_BY_FD', route != 'path')
+	if route == 'read':
+		monkeypatch.setattr(hpcp, '_PARENT_FLAGS', os.O_RDONLY | os.O_DIRECTORY | getattr(os, 'O_CLOEXEC', 0))
 	directory = tmp_path / 'd'
 	directory.mkdir()
 	os.chmod(str(directory), mode)
@@ -734,7 +737,8 @@ def test_990_the_name_probe_of_a_directory_named_by_a_relative_path_gives_it_own
 	if not _can_lchmod_by_path():
 		pytest.skip('no chmod by name that does not follow a link here')
 	monkeypatch.setattr(hpcp, '_PATH_FDS', False)
-	monkeypatch.setattr(hpcp, '_PROBE_BY_FD', False)
+	monkeypatch.setattr(hpcp, '_ASK_BY_FD', True)
+	monkeypatch.setattr(hpcp, '_PARENT_FLAGS', os.O_RDONLY | os.O_DIRECTORY | getattr(os, 'O_CLOEXEC', 0))
 	monkeypatch.chdir(tmp_path)
 	os.mkdir('d')
 	os.chmod('d', 0o007)
@@ -841,7 +845,7 @@ def test_990_the_owner_read_gives_a_hard_link_put_at_the_name_nothing_others_can
 def test_990_a_worker_that_meets_a_shut_directory_another_worker_has_just_opened_to_its_owner_opens_again(tmp_path, monkeypatch):
 	# The pool's order: two workers walk below out/d, the runner's own and 0607. One's open of a name below it meets EACCES; by
 	# the time it asks _owner_search the other has given out/d owner search, so _owner_search finds nothing to do (False) and the
-	# walk raised EACCES for a directory that is open now (the rerun of a tree with 200 subdirectories, 193 about one run in ten
+	# walk raised EACCES for a directory that is open now (the rerun of a tree with 200 subdirectories exited 193 about one run in ten
 	# on 3.11: the root-only test of that rerun below). It opens again, once.
 	directory = tmp_path / 'd'
 	os.makedirs(str(directory / 'sub'))
@@ -871,7 +875,7 @@ def test_990_the_owner_read_leaves_a_directory_put_at_the_name_after_its_chmod_a
 	# What reaches _owner_read's (device, inode) check: after the chmod of out/d to 0700, another directory is at its name by the
 	# time of the open (the O_DIRECTORY open takes it). Without the check the full mode (the look's group and other bits and the
 	# owner's rwx: 0707, 0747) is given to that directory, which is not the one looked at; with it, it keeps its own mode, and
-	# out/d stays 0700 (the known limitation "a directory of the runner's own with no owner read can be left 0700").
+	# out/d.away, the one looked at, stays 0700 (the known limitation "a directory of the runner's own with no owner read can be left 0700").
 	if not _can_chmod_by_name_without_following():
 		pytest.skip('no chmod by name that does not follow a link here: nothing changes')
 	out = tmp_path / 'out'
