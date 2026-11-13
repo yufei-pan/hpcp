@@ -159,10 +159,11 @@ def test_991_a_directory_the_runner_may_write_and_not_read_is_still_asked(tmp_pa
 	# Guards what 9.90 does on macOS: there the directory is held by a read descriptor, which a directory the runner may write and
 	# search and not read (0311) refuses. It is held by O_SEARCH where Python has one (macOS), and asked by path where it has
 	# none (this route on Linux; docs/limitations.md, "The name probe by path"). The pair is answered and the probe is gone; the
-	# directory keeps its mode.
+	# directory keeps its mode and its times (put back through the O_SEARCH descriptor on macOS, where a failure would be silent).
 	_macs_route(monkeypatch)
 	directory = str(tmp_path / 'd')
 	os.mkdir(directory)
+	os.utime(directory, (1500000000, 1500000000))
 	os.chmod(directory, 0o311)
 	try:
 		answers, why = hpcp._ask_names(directory, ['X', 'x'])
@@ -171,6 +172,7 @@ def test_991_a_directory_the_runner_may_write_and_not_read_is_still_asked(tmp_pa
 		os.chmod(directory, 0o755)
 	assert not why and set(answers) == {'X', 'x'}, (answers, why)
 	assert now == 0o311, oct(now)
+	assert os.stat(directory).st_mtime == 1500000000, 'the directory did not keep its times'
 	assert _names(directory) == []  # the probe's own directory is gone
 
 
@@ -191,6 +193,7 @@ def test_991_a_link_put_at_the_probe_in_a_directory_the_runner_may_not_read_cost
 	out, victim = str(tmp_path / 'out'), str(tmp_path / 'victim')
 	os.mkdir(out)
 	_fill(victim)
+	os.utime(out, (1500000000, 1500000000))
 	os.chmod(out, mode)
 	try:
 		with _swap(out, 'link-late', victim, None) as state:
@@ -200,6 +203,7 @@ def test_991_a_link_put_at_the_probe_in_a_directory_the_runner_may_not_read_cost
 	assert state['done'], 'the link was never put at the probe'
 	assert _names(victim) == KEPT, 'the directory a link at the probe led to lost files: %r' % _names(victim)
 	assert not why and set(answers) == {'X', 'x'}, (answers, why)
+	assert os.stat(out).st_mtime == 1500000000, 'the directory asked did not keep its times'
 
 
 @posix_only
@@ -252,15 +256,18 @@ def test_991_an_empty_directory_of_anothers_put_over_the_probe_is_left_as_it_is(
 
 
 @posix_only
-@pytest.mark.parametrize('route', ['native', 'macos'])
+@pytest.mark.parametrize('route', ['native', 'macos', 'no-proc'])
 def test_991_the_probe_sets_the_times_of_the_directory_it_holds_not_of_what_stands_at_its_name(tmp_path, monkeypatch, route):
 	# The probe's last call puts the directory's times back. 9.91's first build and every version before it did that by path:
 	# with the directory renamed away and a link put at its name while the probe ran (forced at the probe's rmdir), the link's
-	# target got those times, in a root run any file's. They go through the descriptor the probe holds.
+	# target got those times, in a root run any file's. They go through the descriptor the probe holds; 'no-proc' is Linux's
+	# O_PATH route without /proc, which the first fix round still did by path.
 	if route == 'macos':
 		_macs_route(monkeypatch)
-	elif hpcp._PROBE_BY_FD and not hpcp._PATH_FDS:
-		pytest.skip('Linux without /proc: no call sets times through an O_PATH descriptor, the probe goes by path')
+	elif route == 'no-proc':
+		if not hpcp._PROBE_BY_FD:
+			pytest.skip('no O_PATH here')
+		monkeypatch.setattr(hpcp, '_PATH_FDS', False)
 	top, victim = str(tmp_path / 'top'), str(tmp_path / 'victim-file')
 	out = os.path.join(top, 'out')
 	os.makedirs(out)
@@ -289,43 +296,131 @@ def test_991_the_probe_sets_the_times_of_the_directory_it_holds_not_of_what_stan
 @pytest.mark.parametrize('what', ['fifo', 'link'])
 @pytest.mark.parametrize('route', ['native', 'macos'])
 def test_991_a_fifo_or_a_link_at_a_name_in_the_probe_is_never_waited_for_or_followed(tmp_path, monkeypatch, route, what):
-	# A name that is there already when the probe makes it is opened to read which made name holds it (_holder). Every version
-	# to 9.91's first build opened it with O_RDONLY alone: a FIFO put there by whoever may write the probe (on macOS an
-	# inheritable ACL entry of the destination gives its owner that; on Linux an empty directory of his own renamed over the
-	# probe did) was waited for, for ever, with SIGINT, SIGTERM and SIGHUP blocked, and a link was followed. The open neither
-	# waits nor follows; such a name says nothing, and is one "it cannot say which" holds. Forced right after the probe's look at
-	# its empty directory. An open that would wait or follow is refused here instead of made, so the old code fails, not hangs.
+	# A name that is there already when the probe makes it, once two names are made, is opened to read which made name holds it
+	# (_holder). Every version to 9.91's first build opened it with O_RDONLY alone: a FIFO put there by whoever may write the
+	# probe (on macOS an inheritable ACL entry of the destination gives its owner that; until 9.91 an empty directory of his own
+	# renamed over the probe did) was waited for, for ever, with SIGINT, SIGTERM and SIGHUP blocked, and a link was followed. The
+	# open neither waits nor follows; such a name says nothing, and is one "it cannot say which" holds. Forced right after the
+	# second name is made (P, Q and R: no filesystem folds them together, so two are made everywhere). An open that would wait
+	# or follow is refused here instead of made, so the old code fails, not hangs.
 	if route == 'macos':
 		_macs_route(monkeypatch)
 	out, zero = str(tmp_path / 'out'), str(tmp_path / 'zero')
 	os.mkdir(out)
 	with open(zero, 'w') as fh:
 		fh.write('0')
-	real_listdir, real_open = os.listdir, os.open
+	real_open = os.open
 	planted, flags_seen = [], []
 
-	def listdir(path='.'):
-		names = real_listdir(path)
-		if isinstance(path, int) and not planted:
-			probe = [name for name in real_listdir(out) if name.startswith(PROBE)][0]
-			planted.append(os.path.join(out, probe, 'X'))
+	def open_(path, flags, *args, **kwargs):
+		if planted and not flags & os.O_CREAT and os.path.basename(str(path)) == 'R':
+			flags_seen.append(flags)
+			if not (flags & os.O_NONBLOCK and flags & os.O_NOFOLLOW):
+				raise OSError(errno.EIO, 'this open would wait for a FIFO or follow a link', str(path))
+		fd = real_open(path, flags, *args, **kwargs)
+		if flags & os.O_CREAT and os.path.basename(str(path)) == 'Q' and not planted:
+			probe = [name for name in os.listdir(out) if name.startswith(PROBE)][0]
+			planted.append(os.path.join(out, probe, 'R'))
 			if what == 'fifo':
 				os.mkfifo(planted[0])
 			else:
 				os.symlink(zero, planted[0])
+		return fd
+	monkeypatch.setattr(os, 'open', open_)
+	answers, why = hpcp._ask_names(out, ['P', 'Q', 'R'])
+	assert planted and flags_seen, 'the name that was there already was never opened'
+	assert all(flags & os.O_NONBLOCK and flags & os.O_NOFOLLOW for flags in flags_seen), [oct(flags) for flags in flags_seen]
+	assert 'R' in why and 'cannot say which' in why['R'], (answers, why)
+	assert answers.get('P') == 'P' and answers.get('Q') == 'Q', (answers, why)
+	assert _names(out) == []  # the probe is gone, with what was put in it
+
+
+@posix_only
+@pytest.mark.parametrize('what', ['names-there', 'first-create-fails'])
+@pytest.mark.parametrize('route', ['native', 'macos'])
+def test_991_the_undo_removes_nothing_it_lists_before_a_file_made_in_the_probe_passed_the_check(tmp_path, monkeypatch, route, what):
+	# The undo lists the probe and removes what it finds. Until a file the probe made there has passed the owner check, what
+	# stands at the probe's name may be another's directory that was empty when opened. 9.91's first round still listed and
+	# emptied it when no file was made: every name was there already (made by someone else right after the probe's look; a
+	# root run then removed what a third user had put in that directory meanwhile), or the first create failed (no space). What
+	# was put there (forced right after the probe's look) stays, and so does the directory while it holds anything.
+	if route == 'macos':
+		_macs_route(monkeypatch)
+	out = str(tmp_path / 'out')
+	os.mkdir(out)
+	real_listdir, real_open = os.listdir, os.open
+	state = {'probe': None}
+
+	def listdir(path='.'):
+		names = real_listdir(path)
+		if isinstance(path, int) and state['probe'] is None:
+			state['probe'] = [name for name in real_listdir(out) if name.startswith(PROBE)][0]
+			for name in ['precious'] + (['X', 'x'] if what == 'names-there' else []):
+				with open(os.path.join(out, state['probe'], name), 'w') as fh:
+					fh.write('someone else made this')
 		return names
 
 	def open_(path, flags, *args, **kwargs):
-		if planted and not flags & os.O_CREAT and os.path.basename(str(path)) in ('X', 'x'):
-			flags_seen.append(flags)
-			if not (flags & os.O_NONBLOCK and flags & os.O_NOFOLLOW):
-				raise OSError(errno.EIO, 'this open would wait for a FIFO or follow a link', str(path))
+		if what == 'first-create-fails' and state['probe'] and flags & os.O_CREAT and os.path.basename(str(path)) in ('X', 'x'):
+			raise OSError(errno.ENOSPC, 'No space left on device', str(path))
 		return real_open(path, flags, *args, **kwargs)
 	monkeypatch.setattr(os, 'listdir', listdir)
 	monkeypatch.setattr(os, 'open', open_)
 	answers, why = hpcp._ask_names(out, ['X', 'x'])
-	assert planted and flags_seen, 'the name that was there already was never opened'
-	assert all(flags & os.O_NONBLOCK and flags & os.O_NOFOLLOW for flags in flags_seen), [oct(flags) for flags in flags_seen]
-	assert 'X' in why and 'cannot say which' in why['X'], (answers, why)
-	assert set(answers) | set(why) == {'X', 'x'}, (answers, why)
-	assert _names(out) == []  # the probe is gone, with what was put in it
+	assert state['probe'], 'the probe was never looked at'
+	kept = os.path.join(out, state['probe'])
+	assert os.path.isdir(kept) and 'precious' in real_listdir(kept), 'what was put in the probe was removed'
+	assert answers == {} and set(why) == {'X', 'x'}, (answers, why)
+
+
+@posix_only
+@pytest.mark.parametrize('route', ['native', 'macos'])
+def test_991_a_probe_whose_files_show_an_owner_other_than_the_runner_is_answered(tmp_path, monkeypatch, route):
+	# Guards the form of the owner check (9.90 had none). A mount that shows its own owner for everything (vfat or exFAT with
+	# uid=, NFS root_squash in a root run) gives the probe and its files an owner other than geteuid(). The check asks whether
+	# the first file made got the probe's owner, as the mount shows both, so the pair is answered there; a check against
+	# geteuid() would refuse it on every run. Stood in for by an os.fstat that shows one owner higher for all but the directory.
+	if route == 'macos':
+		_macs_route(monkeypatch)
+	out = str(tmp_path / 'out')
+	os.mkdir(out)
+	its, real_fstat = os.stat(out), os.fstat
+
+	def fstat(fd):
+		st = real_fstat(fd)
+		if (st.st_dev, st.st_ino) == (its.st_dev, its.st_ino):
+			return st
+		return os.stat_result(tuple(st[:4]) + (st.st_uid + 1,) + tuple(st[5:10]))
+	monkeypatch.setattr(os, 'fstat', fstat)
+	answers, why = hpcp._ask_names(out, ['X', 'x'])
+	assert not why and set(answers) == {'X', 'x'}, (answers, why)
+	assert _names(out) == []  # the probe is gone
+
+
+@posix_only
+@pytest.mark.parametrize('route', ['native', 'macos'])
+def test_991_a_directory_a_link_at_the_asked_name_leads_to_keeps_its_own_times(tmp_path, monkeypatch, route):
+	# The directory asked is found by its path (docs/limitations.md, "The name probe by path"). 9.91's first round took its times
+	# by path before it opened it and put them back on what it held, so a link put at its name in between gave the directory it
+	# led to (in a root run any directory) the times of the one asked. They are taken from what is held. Forced at that open.
+	if route == 'macos':
+		_macs_route(monkeypatch)
+	out, other = str(tmp_path / 'top' / 'out'), str(tmp_path / 'other')
+	os.makedirs(out)
+	os.mkdir(other)
+	os.utime(out, (1500000000, 1500000000))
+	os.utime(other, (1100000000, 1100000000))
+	real_open, swapped = os.open, []
+
+	def open_(path, flags, *args, **kwargs):
+		if not swapped and str(path) == out:
+			swapped.append(True)
+			os.rename(out, out + '.away')
+			os.symlink(other, out)
+		return real_open(path, flags, *args, **kwargs)
+	monkeypatch.setattr(os, 'open', open_)
+	answers, why = hpcp._ask_names(out, ['X', 'x'])
+	assert swapped, 'the directory asked was never opened'
+	assert not why and set(answers) == {'X', 'x'}, (answers, why)
+	assert os.stat(other).st_mtime == 1100000000, 'the directory a link at the name led to got the times of the one asked'
+	assert _names(other) == []  # the probe made there is gone

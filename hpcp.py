@@ -14127,9 +14127,10 @@ def _ask_names(directory, names):
 	name with the file that holds it. Only where nothing can be made does a listing answer: it has each name once, so the
 	names in it are names of their own. The directory keeps its times (its owner's: a group member who may write it changes
 	them). The probe is held by a descriptor; it must be empty when opened, and the first file made in it must get its owner
-	(_make_names): where either fails, another directory has taken its place, the pair cannot be asked, and that directory is
-	left as it is. It goes by path only where no descriptor can hold it (Windows; macOS under a Python without os.O_SEARCH, in
-	a directory the runner may not read). SIGINT, SIGTERM and SIGHUP wait until the probe is gone. SIGKILL cannot wait, and a
+	(_make_names): where either fails, another directory has taken its place, the pair cannot be asked, and nothing of that
+	directory is removed but that one file; until a file made in it has passed, the undo removes nothing it lists. It goes by
+	path only where no descriptor can hold it (Windows; macOS under a Python without os.O_SEARCH, in a directory the runner may
+	not read). SIGINT, SIGTERM and SIGHUP wait until the probe is gone. SIGKILL cannot wait, and a
 	signal sent while another thread of the process exists may still reach that thread."""
 	answers, why = {}, {}
 	probe = '.hpcp-case-probe-%d-%s' % (os.getpid(), uuid.uuid4().hex)
@@ -14137,13 +14138,14 @@ def _ask_names(directory, names):
 	try:
 		base = probe_base = None
 		try:
-			st = os.stat(directory)
 			# Relative to descriptors where the platform can (Linux, macOS, the BSDs): a name then costs its own length, never the
 			# probe's full path (a landing near PATH_MAX), and the probe is the directory just made, not what stands at its name
 			# later. The directory's by O_PATH where there is one: search permission is enough. Without it (macOS) the open reads;
-			# a directory the runner may search and not read (0311, another user's drop box) is held by O_SEARCH, and one of the
-			# runner's own with neither (0207, 0007, 0047) once the probe has given it its owner bits, below. By path only where
-			# neither opens (a Python without os.O_SEARCH; docs/limitations.md, "The name probe by path").
+			# a directory the runner may search and not read (the runner's own 0311, another user's drop box 0733) is held by
+			# O_SEARCH, and one of the runner's own with neither (0207, 0007, 0047) once the probe has given it its owner bits,
+			# below. By path only where neither opens (a Python without os.O_SEARCH; docs/limitations.md, "The name probe by
+			# path"). The times it keeps are those of what it holds: a link put at its name before the open leads to a
+			# directory that keeps its own.
 			base = directory
 			if _ASK_BY_FD:
 				try:
@@ -14155,6 +14157,7 @@ def _ask_names(directory, names):
 						base = os.open(directory, os.O_SEARCH | getattr(os, 'O_DIRECTORY', 0) | getattr(os, 'O_CLOEXEC', 0))
 					except (AttributeError, OSError):
 						pass
+			st = os.fstat(base) if isinstance(base, int) else os.stat(directory)
 			try:
 				os.mkdir(*_at(base, probe), 0o700, **_fd_of(base))
 			except PermissionError:
@@ -14171,6 +14174,7 @@ def _ask_names(directory, names):
 						raise
 					if _ASK_BY_FD and not isinstance(base, int):
 						base = os.open(directory, _PARENT_FLAGS)  # its owner may read it now: held from here on
+						st = os.fstat(base)
 				os.mkdir(*_at(base, probe), 0o700, **_fd_of(base))
 		except OSError as e:
 			failed = e
@@ -14189,11 +14193,13 @@ def _ask_names(directory, names):
 				else:
 					failed = _make_names(probe_base, directory, names, made, answers, why)
 			finally:
-				# Another's directory at the probe's name is left as it is: the undo, which removes what it lists and then
-				# the probe, never meets it.
+				# The undo removes what it lists in the probe only once a file made there has shown it is the probe
+				# (_make_names: made is empty until one has): before that, what stands at its name may be another's directory,
+				# empty when opened, and only its name goes, by an rmdir that removes nothing but an empty directory (whoever
+				# could put one there could remove it). One found to be another's keeps even its name.
 				ours = not isinstance(failed, _NotTheProbe)
 				left = set(made)
-				if ours and probe_base is not None:
+				if made and probe_base is not None:
 					try:
 						left.update(os.listdir(probe_base))
 					except OSError:
@@ -14201,16 +14207,12 @@ def _ask_names(directory, names):
 				undoing = [functools.partial(os.unlink, *_at(probe_base, name), **_fd_of(probe_base)) for name in left if probe_base is not None]
 				if ours:
 					undoing.append(functools.partial(os.rmdir, *_at(base, probe), **_fd_of(base)))
-				# The times of the directory held, not of what stands at its name by now: through /proc for an O_PATH descriptor
-				# (futimens refuses one), through a read or search descriptor itself. By path where nothing is held, and on
-				# Linux without /proc.
-				if isinstance(base, int) and _PATH_FDS:
-					timed = '/proc/self/fd/%d' % base
-				elif isinstance(base, int) and not _PARENT_FLAGS & getattr(os, 'O_PATH', 0) and os.utime in os.supports_fd:
-					timed = base
+				# The times of the directory held, not of what stands at its name by now: relative to its descriptor ('.', which
+				# an O_PATH descriptor serves without /proc, where futimens refuses one). By path where nothing is held.
+				if isinstance(base, int) and os.utime in os.supports_dir_fd:
+					undoing.append(functools.partial(os.utime, '.', dir_fd=base, ns=(st.st_atime_ns, st.st_mtime_ns)))
 				else:
-					timed = directory
-				undoing.append(functools.partial(os.utime, timed, ns=(st.st_atime_ns, st.st_mtime_ns)))
+					undoing.append(functools.partial(os.utime, directory, ns=(st.st_atime_ns, st.st_mtime_ns)))
 				for undo in undoing:
 					try:
 						undo()
