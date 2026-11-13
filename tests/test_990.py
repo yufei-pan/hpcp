@@ -785,7 +785,7 @@ def _can_chmod_by_name_without_following():
 
 @posix_only
 @not_root
-@pytest.mark.parametrize('when', ['before the chmod', 'before the open'])
+@pytest.mark.parametrize('when', ['before the chmod', 'before the open'], ids=['before the chmod', 'before the open (a guard)'])
 @pytest.mark.parametrize('mode', [0o007, 0o207, 0o047])
 def test_990_the_owner_read_gives_a_hard_link_put_at_the_name_nothing_others_can_use(tmp_path, monkeypatch, mode, when):
 	# N1: on the read route (macOS) out/d, the runner's own, has a mode without owner read (0007, 0207, 0047), and _owner_read
@@ -794,7 +794,9 @@ def test_990_the_owner_read_gives_a_hard_link_put_at_the_name_nothing_others_can
 	# not follow it, but a hard link is the file itself, so it got the directory's mode plus owner rwx, 0707 or 0747, and
 	# others could write it. The name is given owner rwx alone first and the group and other bits go back through a descriptor
 	# checked against the lstat, so a file swapped in has at most 0700. (Linux's glibc takes AT_SYMLINK_NOFOLLOW through /proc:
-	# the route runs here with _PATH_FDS off.)
+	# the route runs here with _PATH_FDS off.) "Before the open" is a guard, not a test of the fix: the open's O_DIRECTORY refuses a
+	# file put at the name, so it passes on b7e892b's single chmod too; what reaches the (device, inode) check is a directory put
+	# there, in the next test.
 	if not _can_chmod_by_name_without_following():
 		pytest.skip('no chmod by name that does not follow a link here: nothing changes')
 	monkeypatch.setattr(hpcp, '_PATH_FDS', False)
@@ -832,6 +834,53 @@ def test_990_the_owner_read_gives_a_hard_link_put_at_the_name_nothing_others_can
 	assert state['swapped'], state
 	assert stat.S_IMODE(os.stat(victim).st_mode) & 0o077 == 0, oct(os.stat(victim).st_mode)
 	assert read(victim) == 'mine'
+
+
+@posix_only
+@not_root
+@pytest.mark.parametrize('base_is', ['descriptor', 'path'])
+@pytest.mark.parametrize('mode', [0o007, 0o207, 0o047])
+def test_990_the_owner_read_leaves_a_directory_put_at_the_name_after_its_chmod_as_it_is(tmp_path, mode, base_is):
+	# What reaches _owner_read's (device, inode) check: after the chmod of out/d to 0700, another directory is at its name by the
+	# time of the open (the O_DIRECTORY open takes it). Without the check the full mode (the look's group and other bits and the
+	# owner's rwx: 0707, 0747) is given to that directory, which is not the one looked at; with it, it keeps its own mode, and
+	# out/d stays 0700 (the known limitation "a directory of the runner's own with no owner read can be left 0700").
+	if not _can_chmod_by_name_without_following():
+		pytest.skip('no chmod by name that does not follow a link here: nothing changes')
+	out = tmp_path / 'out'
+	os.makedirs(str(out / 'd'))
+	os.makedirs(str(out / 'other'))
+	os.chmod(str(out / 'other'), 0o755)
+	os.chmod(str(out / 'd'), mode)
+	fd = os.open(str(out), os.O_RDONLY | os.O_DIRECTORY)
+	base = fd if base_is == 'descriptor' else str(out)
+	real_chmod, real_open, state = os.chmod, os.open, {'chmodded': False, 'swapped': False}
+	def at_the_name(path, kwargs):
+		return (path == 'd' and kwargs.get('dir_fd') == fd) or path == str(out / 'd')
+	def chmod(path, new, *args, **kwargs):
+		result = real_chmod(path, new, *args, **kwargs)
+		state['chmodded'] = state['chmodded'] or at_the_name(path, kwargs)
+		return result
+	def opening(path, flags, *args, **kwargs):
+		if state['chmodded'] and not state['swapped'] and at_the_name(path, kwargs):
+			state['swapped'] = True
+			os.rename(str(out / 'd'), str(out / 'd.away'))  # the other user's renames
+			os.rename(str(out / 'other'), str(out / 'd'))
+		return real_open(path, flags, *args, **kwargs)
+	os.chmod, os.open = chmod, opening
+	try:
+		done = hpcp._owner_read(base, 'd')
+	finally:
+		os.chmod, os.open = real_chmod, real_open
+		os.close(fd)
+	try:
+		assert state['swapped'], state
+		assert not done
+		assert stat.S_IMODE(os.stat(str(out / 'd')).st_mode) == 0o755, oct(os.stat(str(out / 'd')).st_mode)
+		assert stat.S_IMODE(os.stat(str(out / 'd.away')).st_mode) == 0o700, oct(os.stat(str(out / 'd.away')).st_mode)
+	finally:
+		with contextlib.suppress(OSError):
+			os.chmod(str(out / 'd.away'), 0o700)
 
 
 @posix_only

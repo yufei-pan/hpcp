@@ -5621,8 +5621,8 @@ def _known_identical(src_path, dest_path, src_size, full_hash, src_st=None, dest
 
 # The errors shutil.copystat's xattr copy ignores (3.6 to 3.14, together): a name the destination or the runner cannot have; and
 # EOPNOTSUPP, which a filesystem that has no xattrs or ACLs may answer with (Linux's ENOTSUP is the same number; macOS's are 45
-# and 102). One set at every xattr and ACL call of the copy and the skip check (the image state's _xattr_digest, Linux only, keeps
-# its own). macOS's "no such attribute" (ENOATTR, 93) is what Linux calls ENODATA.
+# and 102). One set at every xattr and ACL call of the copy and the skip check (the image state's _xattr_digest, Linux only, and
+# -co's carry, _co_carry and _carry_over, keep their own). macOS's "no such attribute" (ENOATTR, 93) is what Linux calls ENODATA.
 _ENOATTR = getattr(errno, 'ENOATTR', errno.ENODATA)
 _XATTR_SKIPPED = frozenset((errno.EPERM, errno.ENOTSUP, errno.EOPNOTSUPP, errno.ENODATA, errno.EINVAL, errno.EACCES, _ENOATTR))
 # A removal also meets a name gone since the listing.
@@ -15600,7 +15600,8 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = None,
 		finally:
 			if SYNC_COPIES:
 				# A non-root move's directories whose exact mode takes their owner's search (0607): set after the removal step
-				# that looked below them, on every path (a stop, an error in it, a removal skipped for the copy's errors): a rerun
+				# that looked below them, once that step is reached (a stop or an error in it, a removal skipped for the copy's
+				# errors; not a stop between the finish above and this try): a rerun
 				# over such a directory gives it owner search where it walks below it (_owner_search), and its finish sets the
 				# exact mode again (where it sets one: not under -nds or -co).
 				_finish_late(dir_records)
