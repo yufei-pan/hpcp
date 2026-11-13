@@ -4039,30 +4039,40 @@ def _libc():
 		if sys.platform == 'darwin' or 'bsd' in sys.platform:
 			with contextlib.suppress(Exception):
 				import ctypes
-				import ctypes.util
-				lib = ctypes.CDLL(ctypes.util.find_library('c'), use_errno=True)
+				if sys.platform == 'darwin':
+					lib = ctypes.CDLL(None, use_errno=True)  # libSystem, already loaded: find_library costs about 8 ms a process
+				else:
+					import ctypes.util
+					lib = ctypes.CDLL(ctypes.util.find_library('c'), use_errno=True)
 		_LIBC.append(lib)
 	return _LIBC[0]
 
 _LIBC_FUNCTIONS = {}
 
-def _libc_call(name, argtypes, restype, *args):
-	"""libc's name(*args), its C types given (set once a process); raises OSError for its errno where it returns -1 (or NULL
-	for a pointer), and ENOTSUP where libc or the call is not there."""
-	import ctypes
-	key = (name, argtypes)
-	function = _LIBC_FUNCTIONS.get(key)
+def _libc_fn(name, argtypes, restype):
+	"""libc's name with its C types set, once a process (a skip check calls some for every file); OSError ENOTSUP where libc
+	or the call is not there."""
+	function = _LIBC_FUNCTIONS.get(name)
 	if function is None:
 		lib = _libc()
 		function = getattr(lib, name, None) if lib is not None else None
 		if function is None:
 			raise OSError(errno.ENOTSUP, f'{name} is not available here')
 		function.argtypes, function.restype = argtypes, restype
-		_LIBC_FUNCTIONS[key] = function
-	result = function(*args)
+		_LIBC_FUNCTIONS[name] = function
+	return function
+
+def _libc_error():
+	import ctypes
+	number = ctypes.get_errno()
+	return OSError(number, os.strerror(number))
+
+def _libc_call(name, argtypes, restype, *args):
+	"""libc's name(*args), its C types given; raises OSError for its errno where it returns -1 (or NULL for a pointer)."""
+	import ctypes
+	result = _libc_fn(name, argtypes, restype)(*args)
 	if (result is None) if restype is ctypes.c_void_p else (result == -1):
-		number = ctypes.get_errno()
-		raise OSError(number, os.strerror(number))
+		raise _libc_error()
 	return result
 
 def _fchflags(fd, flags):
@@ -4079,44 +4089,51 @@ def _mac_xattr_target(target, follow_symlinks):
 		return 'f', target, 0
 	return '', os.fsencode(target), 0 if follow_symlinks else _XATTR_NOFOLLOW
 
+# One read of this many bytes answers a list of names or a value nearly always (com.apple.provenance is 11 bytes, a Finder
+# tag list some dozens); a larger one is asked its size and read again.
+_MAC_XATTR_BUFFER = 4096
+
 def _mac_listxattr(target, follow_symlinks=True):
-	"""os.listxattr for macOS (libc's listxattr/flistxattr): the names of target's xattrs, as str."""
+	"""os.listxattr for macOS (libc's listxattr/flistxattr): the names of target's xattrs, as str. One call where they fit
+	_MAC_XATTR_BUFFER."""
 	import ctypes
 	prefix, first, options = _mac_xattr_target(target, follow_symlinks)
 	kind = ctypes.c_int if prefix else ctypes.c_char_p
-	call = prefix + 'listxattr'
-	size = _libc_call(call, (kind, ctypes.c_char_p, ctypes.c_size_t, ctypes.c_int), ctypes.c_ssize_t, first, None, 0, options)
+	function = _libc_fn(prefix + 'listxattr', (kind, ctypes.c_char_p, ctypes.c_size_t, ctypes.c_int), ctypes.c_ssize_t)
+	size = _MAC_XATTR_BUFFER
 	while True:
-		if not size:
-			return []  # none: one call, what nearly every file costs
 		buffer = ctypes.create_string_buffer(size)
-		try:
-			size = _libc_call(call, (kind, ctypes.c_char_p, ctypes.c_size_t, ctypes.c_int), ctypes.c_ssize_t, first, buffer, size, options)
-		except OSError as e:
-			if e.errno != errno.ERANGE:
-				raise
-			size = _libc_call(call, (kind, ctypes.c_char_p, ctypes.c_size_t, ctypes.c_int), ctypes.c_ssize_t, first, None, 0, options)
-			continue
-		return [os.fsdecode(name) for name in buffer.raw[:size].split(b'\0') if name]
+		got = function(first, buffer, size, options)
+		if got != -1:
+			return [os.fsdecode(name) for name in buffer.raw[:got].split(b'\0') if name]
+		e = _libc_error()
+		if e.errno != errno.ERANGE:
+			raise e
+		size = function(first, None, 0, options)
+		if size == -1:
+			raise _libc_error()
 
 def _mac_getxattr(target, name, follow_symlinks=True):
-	"""os.getxattr for macOS: target's xattr name, its whole value (a resource fork too: position 0, its full size)."""
+	"""os.getxattr for macOS: target's xattr name, its whole value (a resource fork too: position 0, its full size). One
+	call where it fits _MAC_XATTR_BUFFER."""
 	import ctypes
 	prefix, first, options = _mac_xattr_target(target, follow_symlinks)
 	kind = ctypes.c_int if prefix else ctypes.c_char_p
-	call = prefix + 'getxattr'
-	types = (kind, ctypes.c_char_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint32, ctypes.c_int)
+	function = _libc_fn(prefix + 'getxattr', (kind, ctypes.c_char_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint32,
+		ctypes.c_int), ctypes.c_ssize_t)
 	key = os.fsencode(name)
+	size = _MAC_XATTR_BUFFER
 	while True:
-		size = _libc_call(call, types, ctypes.c_ssize_t, first, key, None, 0, 0, options)
-		buffer = ctypes.create_string_buffer(size or 1)
-		try:
-			size = _libc_call(call, types, ctypes.c_ssize_t, first, key, buffer, size, 0, options)
-		except OSError as e:
-			if e.errno == errno.ERANGE:
-				continue  # it grew since
-			raise
-		return buffer.raw[:size]
+		buffer = ctypes.create_string_buffer(size)
+		got = function(first, key, buffer, size, 0, options)
+		if got != -1:
+			return buffer.raw[:got]
+		e = _libc_error()
+		if e.errno != errno.ERANGE:
+			raise e
+		size = function(first, key, None, 0, 0, options)  # larger: its size, then read again (it may grow meanwhile)
+		if size == -1:
+			raise _libc_error()
 
 def _mac_setxattr(target, name, value, follow_symlinks=True):
 	"""os.setxattr for macOS."""
@@ -4146,15 +4163,15 @@ _ACL_TYPE_EXTENDED = 0x00000100  # <sys/acl.h>, macOS's only ACL type
 def _mac_acl_text(target):
 	"""macOS: target's extended ACL as acl_to_text gives it (a descriptor, or a path not followed), '' for none."""
 	import ctypes
-	try:
-		if isinstance(target, int):
-			acl = _libc_call('acl_get_fd_np', (ctypes.c_int, ctypes.c_int), ctypes.c_void_p, target, _ACL_TYPE_EXTENDED)
-		else:
-			acl = _libc_call('acl_get_link_np', (ctypes.c_char_p, ctypes.c_int), ctypes.c_void_p, os.fsencode(target), _ACL_TYPE_EXTENDED)
-	except OSError as e:
+	if isinstance(target, int):
+		acl = _libc_fn('acl_get_fd_np', (ctypes.c_int, ctypes.c_int), ctypes.c_void_p)(target, _ACL_TYPE_EXTENDED)
+	else:
+		acl = _libc_fn('acl_get_link_np', (ctypes.c_char_p, ctypes.c_int), ctypes.c_void_p)(os.fsencode(target), _ACL_TYPE_EXTENDED)
+	if acl is None:
+		e = _libc_error()
 		if e.errno == errno.ENOENT:
-			return ''  # none
-		raise
+			return ''  # none: what nearly every file has
+		raise e
 	try:
 		text = _libc_call('acl_to_text', (ctypes.c_void_p, ctypes.c_void_p), ctypes.c_void_p, acl, None)
 		try:
