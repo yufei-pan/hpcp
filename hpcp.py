@@ -3325,6 +3325,45 @@ def format_bytes(size, use_1024_bytes=None, to_int=False, to_str=False,str_forma
 	"""
 	return multiCMD.format_bytes(size, use_1024_bytes=use_1024_bytes, to_int=to_int, to_str=to_str,str_format=str_format)
 
+# A size that multiCMD's format_bytes reads, in ASCII only (it takes any Unicode digit, and a Kelvin sign for k): a number (digits first, a fraction after a point), then a unit or none: a letter
+# of its unit_labels (K to Y), an i after it for 1024s (a bare letter is 1000s), a B at the end. What else it is given, it
+# answers a word with 0 and an unknown unit with None (multiCMD 1.64; 1.65 says the unit on stderr and answers 0): hpcp took
+# `-ddr one` for a 0-byte partition and wiped the destination's partition table, `-L fast` for no limit, and `-L 5foo` ended in a
+# TypeError at the first progress bar. It must not depend on that answer: the text is judged here, before the run touches anything.
+_SIZE_TEXT = re.compile(r'\d+(?:\.\d+)?\s*(?:[kmgtpezy]i?)?b?', re.IGNORECASE | re.ASCII)
+
+def _clean_size(value):
+	"""value as format_bytes reads it, or None when it is no size: a string of _SIZE_TEXT (surrounding blanks dropped), or a
+	number that is not negative. A size that is nothing is no size either (0 is: it means no limit and no split)."""
+	if isinstance(value, str):
+		value = value.strip()
+		return value if _SIZE_TEXT.fullmatch(value) else None
+	if isinstance(value, bool) or not isinstance(value, (int, float)):
+		return None
+	return value if 0 <= value < float('inf') else None
+
+def _unreadable_sizes(bytes_rate_limit, files_rate_limit, dest_image_size, dd_resize):
+	"""(the four options' sizes, cleaned; what is wrong with them, a line each). Unset (None) stays unset; -ddr takes a list
+	(a lone size is a list of one) and each of its sizes sets a partition, so a 0 there is no size."""
+	bad = []
+	cleaned = []
+	for option, value in (('-L', bytes_rate_limit), ('-F', files_rate_limit), ('-dis', dest_image_size)):
+		clean = value if value is None else _clean_size(value)
+		if clean is None and value is not None:
+			bad.append(f"{option} {value!r} is not a size (a number and an optional unit, such as 512, 10M or 1.5GiB)")
+		cleaned.append(clean)
+	if dd_resize:
+		sizes = []
+		for size in (dd_resize if isinstance(dd_resize, (list, tuple)) else [dd_resize]):
+			clean = _clean_size(size)
+			if clean is None:
+				bad.append(f"-ddr {size!r} is not a size (a number and an optional unit, such as 100G or 1.5GiB)")
+			elif not format_bytes(clean, to_int=True):
+				bad.append(f"-ddr {size!r} is no partition size (it must be above 0)")
+			sizes.append(clean)
+		dd_resize = sizes
+	return (*cleaned, dd_resize), bad
+
 def format_time(seconds):
 	"""
 	Format the time in seconds to a short, human-readable format.
@@ -15211,6 +15250,11 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = None,
 			bytes_rate_limit = None, files_rate_limit = None,target_file_system = None, no_create_dir = False, content_only = False, command_timeout_limit = 0,
 			exit_not_enough_space = False,do_not_remove_files_while_listing = False,no_fs_param_mirror = False,
 			get_diff_image = None, load_diff_image = None, force_apply = False, write_beside = False, read_before_write = False):
+	# First of all, before any state or destination is touched: a size that is none ends the run as a usage error (241).
+	(bytes_rate_limit, files_rate_limit, dest_image_size, dd_resize), bad = _unreadable_sizes(bytes_rate_limit, files_rate_limit, dest_image_size, dd_resize)
+	if bad:
+		eprint(f"Invalid arguments: {'; '.join(bad)}")
+		return get_rc_from_error()
 	global HASH_SIZE
 	global RANDOM_DESTINATION_SELECTION
 	global BYTES_RATE_LIMIT
