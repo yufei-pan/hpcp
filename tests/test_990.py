@@ -482,12 +482,7 @@ def test_990_a_worker_stopped_after_a_jobs_length_reads_the_rest(tmp_path):
 	assert 'got 1000' in output and reader.returncode == 0, (output, reader.returncode)
 
 
-# -- A copied socket: made apart and renamed over the landing -------------------------------------------------------------------
-
-def _make_socket(src, target, base):
-	'''hpcp._make_socket for the socket at src, onto target (a file there already), base as the door gives it.'''
-	return hpcp._make_socket(src, os.lstat(src), target, base)
-
+# -- A socket the operator names, where cp copies none (macOS): skipped with a note, as one met in a tree is ----------------------
 
 def _a_socket(path, mode=0o640):
 	'''A socket at path (a short, relative one: a socket address holds about 100 bytes), of mode.'''
@@ -501,159 +496,80 @@ def _a_socket(path, mode=0o640):
 	return path
 
 
-@posix_only
-def test_990_a_socket_that_cannot_be_bound_leaves_the_landing_as_it_is(tmp_path, monkeypatch):
-	# The socket is made where a path holds: past 107 bytes on Linux, 103 on macOS the bind fails. 9.90's first build unlinked what
-	# was at the landing first, so the old file was gone, and the error read '[Errno None] cannot make the socket X (None)':
-	# Python's "AF_UNIX path too long" carries no errno.
-	monkeypatch.chdir(tmp_path)
-	src = _a_socket('s')
-	deep = str(tmp_path / ('d' * 120))
-	os.makedirs(deep)
-	target = write(os.path.join(deep, 'f'), 'the old file')
-	with pytest.raises(OSError) as raised:
-		_make_socket(str(tmp_path / src), target, None)
-	assert raised.value.errno == errno.ENAMETOOLONG, raised.value
-	assert 'cannot make the socket' in str(raised.value) and 'None' not in str(raised.value), str(raised.value)
-	assert read(target) == 'the old file' and os.listdir(deep) == ['f']  # and no directory of the socket's is left
+def _cli_as_macos_takes_a_socket(args, cwd, stdin=None):
+	'''hpcp's command line in cwd where cp copies no socket: macOS itself, and elsewhere with _CP_SKIPS_SOCKETS set in the
+	run's own process (the main process decides what is a source). (return code, stdout and stderr together).'''
+	code = ('import sys; sys.path.insert(0, %r); import hpcp; hpcp._CP_SKIPS_SOCKETS = True; sys.argv[0] = "hpcp"; hpcp.main()'
+		% os.path.dirname(HPCP))
+	p = subprocess.run([sys.executable, '-c', code] + list(args), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+		universal_newlines=True, cwd=str(cwd), timeout=RUN_TIMEOUT, **({'stdin': subprocess.DEVNULL} if stdin is None else {'input': stdin}))
+	return p.returncode, p.stdout
 
 
-@posix_only
-@pytest.mark.parametrize('by', ['descriptor', 'path'])
-def test_990_a_socket_is_made_apart_and_replaces_what_is_at_the_landing(tmp_path, monkeypatch, by):
-	# Guards 9.89's and 9.90's first build's result (a socket of the source's mode and times at the landing, what was there
-	# replaced); what is new is only how: in a directory of the run's own beside the landing, removed again.
-	monkeypatch.chdir(tmp_path)
-	src = _a_socket('s', 0o640)
-	os.utime(src, ns=(1_000_000_000, 2_000_000_000))
-	out = tmp_path / 'out'
-	target = write(out / 'f', 'old')
-	base = os.open(str(out), os.O_RDONLY | os.O_DIRECTORY) if by == 'descriptor' else str(out)
-	try:
-		_make_socket(str(tmp_path / src), target, base)
-	finally:
-		if by == 'descriptor':
-			os.close(base)
-	st = os.lstat(target)
-	assert stat.S_ISSOCK(st.st_mode) and stat.S_IMODE(st.st_mode) == 0o640 and st.st_mtime_ns == 2_000_000_000, st
-	assert os.listdir(str(out)) == ['f']
-
-
-@posix_only
-def test_990_a_name_put_at_the_landing_while_the_socket_is_made_gets_neither_its_mode_nor_its_times(tmp_path, monkeypatch):
-	# The socket's owner, mode and times were set by name after the bind: a hard link to another file put at the name
-	# in between (macOS has no protected_hardlinks) got them, so a root run made another user's file writable. They are set in
-	# the private directory the socket is made in, and renamed over whatever is at the landing then.
-	monkeypatch.chdir(tmp_path)
-	src = _a_socket('s', 0o666)
-	out = tmp_path / 'out'
-	target = write(out / 'f', 'old')
-	victim = write(tmp_path / 'victim', 'mine', mode=0o600)
-	os.utime(victim, ns=(1_000_000_000, 1_000_000_000))
-	os.link(victim, str(tmp_path / 'link'))
-	real_chmod, swapped = os.chmod, []
-	def chmod(*args, **kwargs):
-		if not swapped:
-			swapped.append(True)
-			os.rename(str(tmp_path / 'link'), target)  # the other user's move, right before the mode is set
-		return real_chmod(*args, **kwargs)
-	monkeypatch.setattr(os, 'chmod', chmod)
-	_make_socket(str(tmp_path / src), target, str(out))
-	monkeypatch.setattr(os, 'chmod', real_chmod)
-	assert swapped
-	st = os.stat(victim)
-	assert stat.S_IMODE(st.st_mode) == 0o600 and st.st_mtime_ns == 1_000_000_000 and read(victim) == 'mine', st
-	assert stat.S_ISSOCK(os.lstat(target).st_mode)
-
-
-def _short_directory(length):
-	'''A new directory whose path is exactly length bytes (a socket address is short: pytest's own are too long), and what to
-	remove.'''
-	import tempfile
-	root = tempfile.mkdtemp(prefix='k', dir='/tmp')
-	pad = length - len(root) - 1
-	assert pad > 0, root
-	deep = os.path.join(root, 'd' * pad)
-	os.mkdir(deep)
-	assert len(os.fsencode(deep)) == length
-	return root, deep
-
-
-@posix_only
-def test_990_a_socket_names_the_limit_on_the_landings_directory_and_binds_up_to_it(tmp_path, monkeypatch):
-	# The bind's path is the landing's directory plus 12 bytes ('/.hpcpXXXX/s'), so a directory may be a socket address (103
-	# bytes on macOS, 107 on Linux) less 12 long: 91 and 95. A longer one is refused naming that number and the directory's own
-	# length, where the first fix round's message gave the bind's path (12 bytes more than anything the operator wrote), and
-	# README said 'File name too long', which never appears. The old file stays.
+@contextlib.contextmanager
+def _a_short_tree():
+	'''A directory under /tmp to work in (a socket's address holds 103 bytes on macOS, 107 on Linux: pytest's own are longer),
+	holding src/s (a socket, 0640), src/f and out/; removed afterwards.'''
 	import shutil
-	monkeypatch.chdir(tmp_path)
-	src = str(tmp_path / _a_socket('s'))
-	limit = hpcp._SOCKET_PATH_MAX - 12
-	made = []
+	import tempfile
+	work = tempfile.mkdtemp(prefix='s', dir='/tmp')
+	here = os.getcwd()
 	try:
-		for length in (limit, limit + 1):
-			root, deep = _short_directory(length)
-			made.append(root)
-			target = write(os.path.join(deep, 'f'), 'the old file')
-			if length == limit:
-				_make_socket(src, target, None)  # the longest that binds
-				assert stat.S_ISSOCK(os.lstat(target).st_mode), os.lstat(target)
-				continue
-			with pytest.raises(OSError) as raised:
-				_make_socket(src, target, None)
-			text = str(raised.value)
-			assert raised.value.errno == errno.ENAMETOOLONG and 'cannot make the socket' in text, raised.value
-			assert 'at most %d bytes' % limit in text and 'it is %d' % length in text, text
-			assert read(target) == 'the old file' and os.listdir(deep) == ['f']
+		os.chdir(work)
+		os.mkdir('src')
+		os.mkdir('out')
+		_a_socket('src/s')
+		write(os.path.join(work, 'src', 'f'), 'x')
+		yield work
 	finally:
-		for root in made:
-			shutil.rmtree(root, ignore_errors=True)
+		os.chdir(here)
+		shutil.rmtree(work, ignore_errors=True)
 
 
 @posix_only
-def test_990_a_socket_is_made_in_a_hidden_hpcp_directory_of_four_hex_digits(tmp_path, monkeypatch):
-	# N4: the private directory (a hidden name beside the landing, left only by SIGKILL or Ctrl-\\ in the moment of the copy) says
-	# whose it is: '.hpcp' and 4 hex digits, the same 9 bytes of the bind's path as the first fix round's '.hs' and 6.
-	import re
-	monkeypatch.chdir(tmp_path)
-	src = str(tmp_path / _a_socket('s'))
-	target = write(tmp_path / 'out' / 'f', 'old')
-	real_mkdir, names = os.mkdir, []
-	def mkdir(path, *args, **kwargs):
-		names.append(path)
-		return real_mkdir(path, *args, **kwargs)
-	monkeypatch.setattr(os, 'mkdir', mkdir)
-	_make_socket(src, target, str(tmp_path / 'out'))
-	monkeypatch.setattr(os, 'mkdir', real_mkdir)
-	assert len(names) == 1 and re.fullmatch(r'\.hpcp[0-9a-f]{4}', os.path.basename(names[0])), names
+@pytest.mark.parametrize('run', ['copy', 'move', 'list'])
+def test_990_a_named_socket_is_skipped_with_a_note_where_cp_copies_none(run):
+	# macOS's cp copies no socket ("cp: X is a socket (not copied)", exit 0), and 9.89 then reported a copy that is at none of its
+	# landings: exit 213, and a move kept every source (212). 9.90's builds made the socket themselves, by a bind in a directory
+	# of their own known by its name, which another user who could write the landing's directory could swap, or enter through an
+	# inherited ACL: the reviews found the socket's owner, mode and times given to another file, entries deleted, a socket left
+	# elsewhere. Now a socket the operator names is what one met in a tree is on every platform: noted, no error, not copied,
+	# and left in place by a move; what is at its landing stays, and nothing is made for it.
+	with _a_short_tree() as work:
+		landing = 'out/src/s' if run == 'list' else 'out/s'
+		if run != 'list':
+			write(os.path.join(work, 'out', 's'), 'the old file')
+		args = {'copy': ['src/s', 'src/f', '-d', 'out/'], 'move': ['src/s', 'src/f', '-d', 'out/', '-rf'], 'list': ['-d', 'out/']}[run]
+		rc, output = _cli_as_macos_takes_a_socket(args, work, stdin='src/s\nsrc/f\n' if run == 'list' else None)
+		assert rc == 0, output[-3000:]
+		notes = [line for line in output.splitlines() if line.startswith('Special file skipped:')]
+		assert len(notes) == 1 and 'src/s is a socket' in notes[0], output[-3000:]
+		assert stat.S_ISSOCK(os.lstat('src/s').st_mode)  # a move leaves it
+		if run == 'list':
+			assert not os.path.lexists(landing) and read(os.path.join(work, 'out', 'src', 'f')) == 'x'
+			assert sorted(os.listdir('out')) == ['src'] and os.listdir('out/src') == ['f']
+		else:
+			assert read(os.path.join(work, landing)) == 'the old file' and read(os.path.join(work, 'out', 'f')) == 'x'
+			assert sorted(os.listdir('out')) == ['f', 's']  # nothing made beside them
+		assert os.path.lexists('src/f') != (run == 'move')
 
 
 @posix_only
-def test_990_a_socket_directory_that_is_not_the_runs_own_is_one_failure_not_a_retried_race(tmp_path, fresh, monkeypatch):
-	# R5: a root run on an NFS export with root_squash makes a directory the anonymous user's; the owner check stops the bind in
-	# it (right: nobody else's directory gets the socket). It raised EEXIST, which _cp_once takes for a name that appeared at the
-	# landing: it looked again and tried 3 times, then said 'it kept changing while it was copied'. One failure now, naming the
-	# cause, the old landing kept and no private directory left behind.
-	monkeypatch.chdir(tmp_path)
-	src = str(tmp_path / _a_socket('sock'))
-	out = tmp_path / 'out'
-	target = write(out / 'sock', 'the old file')
-	monkeypatch.setattr(hpcp, '_CP_SKIPS_SOCKETS', True)
-	real, calls = hpcp._make_socket, []
-	def make(*args):
-		calls.append(1)
-		with monkeypatch.context() as other:
-			other.setattr(os, 'geteuid', lambda: os.getuid() + 1)  # the directory is its owner's, not this run's
-			return real(*args)
-	monkeypatch.setattr(hpcp, '_make_socket', make)
-	_run_named(monkeypatch, out)
-	try:
-		_copy(src, [target])
-	finally:
-		hpcp._close_cursors()
-	assert hpcp.ERRORS and 'is not this run' in hpcp.ERRORS[0] and 'kept changing' not in hpcp.ERRORS[0], hpcp.ERRORS
-	assert len(calls) <= 3, calls  # copy_file's own three attempts; each one made the socket up to 3 times itself before
-	assert read(target) == 'the old file' and os.listdir(str(out)) == ['sock']
+def test_990_a_run_whose_sources_are_all_sockets_copies_nothing_where_cp_copies_none():
+	with _a_short_tree() as work:
+		os.unlink('src/f')
+		rc, output = _cli_as_macos_takes_a_socket(['src/s', '-d', 'out/', '-rf'], work)
+		assert rc == 0 and 'Nothing to copy: every source is a socket' in output, output[-3000:]
+		assert os.listdir('out') == [] and stat.S_ISSOCK(os.lstat('src/s').st_mode)
+
+
+@posix_only
+def test_990_a_named_socket_is_still_removed_by_a_delete_where_cp_copies_none():
+	# Guards what 9.89 and 9.90's builds do: -rm with no destination deletes what is named, a socket too (only a copy leaves
+	# one out).
+	with _a_short_tree() as work:
+		rc, output = _cli_as_macos_takes_a_socket(['src/s', '-rf'], work)
+		assert rc == 0 and not os.path.lexists('src/s') and os.path.lexists('src/f'), output[-3000:]
 
 
 # -- A directory's xattrs and ACL: every call skips the same errors -------------------------------------------------------------
@@ -1027,34 +943,16 @@ def test_990_macos_raises_the_soft_open_files_limit():
 
 
 @darwin_only
-def test_990_macos_copies_a_named_socket(monkeypatch):
-	# A socket the operator names (a walk skips one: 'Special file skipped'): macOS's cp skips it ("is a socket (not copied)"),
-	# and 9.89 reported a failed copy, exit 213; Linux's cp -a makes the node, exit 0. hpcp makes it on macOS. A socket's path holds
-	# 103 bytes there, and pytest's directory under /private/var/folders is longer: the test's tree is a short one under /tmp,
-	# and the source is bound by a relative name.
-	import shutil
-	import socket
-	import tempfile
-	work = tempfile.mkdtemp(prefix='s', dir='/tmp')
-	try:
-		monkeypatch.chdir(work)
-		os.makedirs('src')
-		write(os.path.join(work, 'src', 'f'), 'x')
-		sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-		try:
-			sock.bind('src/s')
-		finally:
-			sock.close()
-		os.chmod('src/s', 0o640)
-		os.makedirs('out')
-		for _ in range(2):  # a first copy, then a rerun that finds it identical
-			rc, output = _cli(['src/s', '-d', 'out/'], work)
-			assert rc == 0, output[-3000:]
-			st = os.lstat('out/s')
-			assert stat.S_ISSOCK(st.st_mode) and stat.S_IMODE(st.st_mode) == 0o640, oct(st.st_mode)
-		assert os.listdir('out') == ['s']  # the directory the socket is made in is gone
-	finally:
-		shutil.rmtree(work, ignore_errors=True)
+def test_990_macos_skips_a_named_socket_as_its_cp_does():
+	# The run itself on macOS, in the pool as by default: the socket is noted and not copied, exit 0 (9.89: 213), the file
+	# beside it is copied, and a move leaves the socket where it is.
+	with _a_short_tree() as work:
+		rc, output = _cli(['src/s', 'src/f', '-d', 'out/'], work)
+		assert rc == 0 and 'Special file skipped: src/s is a socket' in output, output[-3000:]
+		assert os.listdir('out') == ['f']
+		rc, output = _cli(['src/s', 'src/f', '-d', 'out/', '-rf'], work)
+		assert rc == 0 and stat.S_ISSOCK(os.lstat('src/s').st_mode) and not os.path.lexists('src/f'), output[-3000:]
+		assert os.listdir('out') == ['f']
 
 
 @darwin_only

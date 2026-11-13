@@ -5405,8 +5405,6 @@ def _judge_landing(dest_path, target, st, named):
 def _cp_landing(command, src_path, dest_path, target, st, named, space, src_st, base):
 	"""_cp_once's copy onto target, dest_path's landing, by what its look found there (st, named), relative to base (the door's
 	result for its directory). FileExistsError: a first copy's name taken since."""
-	if _CP_SKIPS_SOCKETS and stat.S_ISSOCK((src_st or os.lstat(src_path)).st_mode):
-		return _make_socket(src_path, src_st or os.lstat(src_path), target, base)
 	held = _claim_device(target, st, named, src_path)
 	try:
 		if not _written_beside(st, named):
@@ -5468,77 +5466,20 @@ def _open_after_lease(base, name, st):
 	finally:
 		os.close(held)
 
-# macOS's cp skips a named socket ("is a socket (not copied)", exit 1), where Linux's cp -a makes one: hpcp makes it there.
+# macOS's cp copies no socket ("cp: X is a socket (not copied)", exit 0; Linux's cp -a makes one, by mknod), and macOS has no call
+# that makes one below a held directory (no bindat, and mknod makes no socket for a user there): hpcp copies none on macOS.
 _CP_SKIPS_SOCKETS = sys.platform == 'darwin'
 
-# What a socket address holds (sun_path, <sys/un.h>: 104 bytes on macOS, 108 on Linux; the last is the NUL), so the longest path a
-# bind takes.
-_SOCKET_PATH_MAX = 103 if sys.platform == 'darwin' else 107
-
-# The path a socket's bind names is the landing's directory, a separator, the private directory (.hpcp and 4 hex digits: 9 bytes),
-# a separator and the socket's name (s): 12 bytes more than the directory's path.
-_SOCKET_BIND_EXTRA = 12
-
-def _make_socket(src_path, src_st, target, base):
-	"""A copy of the socket src_path (its lstat src_st) at target, as Linux's cp -a makes one: an AF_UNIX socket bound
-	(closed at once: the node stays), given the source's owner (as cp -a keeps it), mode and times, and renamed over what is at
-	the landing. All of it but the last step in a directory of the run's own made for it in target's directory (base: the
-	door's result for it, a path where it has none), mode 0700 and held by its descriptor, so nobody else can reach the socket
-	before it is whole: a name put at the landing meanwhile gets neither the owner nor the mode, and a bind that fails (a
-	landing directory whose path is past what a socket address holds less the 12 bytes of the bind's own path, 91 on macOS:
-	ENAMETOOLONG) leaves the old file as it is. macOS has no bindat: the bind names the directory by its path (its node copies
-	go by name below the held directory, docs/limitations.md; the socket is looked for in the held directory after it). The
-	directory is made and removed in the moment of the copy: SIGKILL there leaves a hidden .hpcpXXXX directory (docs/limitations.md,
-	"A temporary file left by SIGKILL or Ctrl-\\ (SIGQUIT)"). Returns 0 (no data)."""
-	import socket
-	base = os.path.dirname(target) if base is None else base
-	name = os.path.basename(target)
-	how = _fd_of(base)
-	for _ in range(3):  # a name in use: another, as the door's bound for a race in its own directory
-		holder = '.hpcp' + uuid.uuid4().hex[:4]  # short: the bind's path holds it, and a socket address is short
-		try:
-			os.mkdir(*_at(base, holder), 0o700, **how)
-			break
-		except FileExistsError:
-			continue
-	else:
-		raise OSError(errno.EAGAIN, 'it kept changing while it was made', target)
-	held = None
+def _skipped_socket(path):
+	"""True, with the note a walk gives a socket it meets in a tree ('Special file skipped', no error), for a socket the operator
+	named where the platform's cp copies none (_CP_SKIPS_SOCKETS): it is no source of a copy, and a move leaves it in place."""
 	try:
-		held = os.open(*_at(base, holder), _DIRECTORY_FLAGS | getattr(os, 'O_NOFOLLOW', 0), **how)
-		now = os.fstat(held)
-		if now.st_uid != os.geteuid() or not stat.S_ISDIR(now.st_mode):
-			# Not EEXIST, which the copy takes for a name that appeared at the landing and tries again: this stays so (an NFS
-			# export that makes every directory its anonymous user's, root_squash, gives a root run's directory another owner).
-			raise OSError(errno.EPERM, f'the directory made for the socket is not this run\'s own (its owner is {now.st_uid})',
-				os.path.join(os.path.dirname(target), holder))
-		os.fchmod(held, 0o700)
-		directory = os.path.dirname(target)
-		path = os.path.join(directory, holder, 's')
-		sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-		try:
-			sock.bind(path)
-		except OSError as e:
-			number = e.errno or errno.ENAMETOOLONG  # Python's "AF_UNIX path too long" has no errno
-			raise OSError(number, f'cannot make the socket {target} (' + (e.strerror or
-				f'the landing\'s directory path may be at most {_SOCKET_PATH_MAX - _SOCKET_BIND_EXTRA} bytes for a socket here, and '
-				f'it is {len(os.fsencode(directory))}') + ')', target)
-		finally:
-			sock.close()
-		os.lstat('s', dir_fd=held)  # made where the held directory is: not where a link on the way to it led the bind
-		owner_kept, group_kept = _chown_like_cp('s', src_st, dir_fd=held)
-		mode = stat.S_IMODE(src_st.st_mode) & ~((0 if owner_kept else stat.S_ISUID) | (0 if group_kept else stat.S_ISGID))
-		os.chmod('s', mode, dir_fd=held)
-		os.utime('s', ns=(src_st.st_atime_ns, src_st.st_mtime_ns), dir_fd=held)
-		os.rename('s', *_at(base, name), src_dir_fd=held, **({'dst_dir_fd': base} if isinstance(base, int) else {}))
-	finally:
-		if held is not None:
-			with contextlib.suppress(OSError):
-				os.unlink('s', dir_fd=held)
-			os.close(held)
-		with contextlib.suppress(OSError):
-			os.rmdir(*_at(base, holder), **how)
-	return 0
+		if not stat.S_ISSOCK(os.lstat(path).st_mode):
+			return False
+	except OSError:
+		return False
+	eprint(f'Special file skipped: {path} is a socket; macOS copies no socket (its cp skips one too), and a move leaves it in place')
+	return True
 
 def _regular_source(src_path, src_st=None):
 	"""False for a source that cp -a makes anew (a FIFO, socket or device node: it unlinks what is at the landing, and cannot
@@ -15510,6 +15451,12 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = None,
 			holding = left_out = None
 			# -rme never removes a source: the ones left in place inside a destination too (_source_guard).
 			named_sources = list(src_paths)
+			if _CP_SKIPS_SOCKETS:
+				# A socket the operator named: noted and left out, as one met in a tree is on every platform.
+				src_paths[:] = [src for src in src_paths if not _skipped_socket(src)]
+				if not src_paths:
+					print('Nothing to copy: every source is a socket')
+					return get_rc_from_error()
 			if listed or not dest_image:
 				src_paths[:], skipped, holding, left_out = _inside_destinations(src_paths, dests, places)
 				if skipped:
