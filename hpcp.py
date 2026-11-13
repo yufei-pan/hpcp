@@ -4662,8 +4662,9 @@ def _door_step(base, name, current, make, source, below, first=None):
 def _owner_search(fd):
 	"""Give the directory fd holds owner read, write and search where it is the runner's own (not root) and lacks owner
 	search: a mode that shuts its owner out (0607), which a non-root copy or move gives a directory at its end, met by a
-	rerun's walk below it before that directory's own start opened it again (_start_directory gives the same); the finish sets
-	its exact mode again. True when it did."""
+	rerun's walk below it before that directory's own start opened it again (_start_directory gives the same). The mode stays
+	wider (0707) where no finish sets the directory's exact mode again: under -nds and -co, and in a destination named with -d
+	that no source directory lands on. True when it did."""
 	if not hasattr(os, 'geteuid') or os.geteuid() == 0:
 		return False
 	try:
@@ -4680,20 +4681,35 @@ def _owner_search(fd):
 	return True
 
 def _owner_read(base, name):
-	"""Give the directory name in base (a held descriptor) owner read, write and search where it is the runner's own (not root)
-	and lacks owner read and search both: the read route (macOS, Linux without /proc) holds a directory by a read descriptor,
-	which a mode like 0207, 0007 or 0047 (what the finish of a non-root copy or move can give one) refuses its owner, and the
-	walk by path that goes on from there needs search, so _owner_search never reaches it and the copy fails. A mode with search
-	(0311, a directory the runner may write and search but not read) is walked by path and left as it is. By name relative to
-	base, without following a link (lchmod: macOS's; Linux without /proc has none, and nothing changes there). The finish sets
-	the exact mode again (where it sets one: not under -nds or -co). True when it did."""
+	"""Give the directory name in base (a held descriptor, or a directory's path) owner read, write and search where it is the
+	runner's own (not root) and lacks owner read and search both: the read route (macOS, Linux without /proc) holds a directory
+	by a read descriptor, which a mode like 0207, 0007 or 0047 (what the finish of a non-root copy or move can give one)
+	refuses its owner, and the walk by path that goes on from there needs search, so _owner_search never reaches it and the
+	copy fails. A mode with search (0311, a directory the runner may write and search but not read) is walked by path and left
+	as it is. By name relative to base, without following a link (lchmod: macOS's; Linux without /proc has none, and nothing
+	changes there). The finish sets the exact mode again where it sets one (not under -nds or -co, nor in a destination named
+	with -d that no source directory lands on: the directory keeps owner rwx).
+
+	The name is given owner rwx alone first, and the group and other bits it had are put back through a descriptor opened
+	without following a link and checked to be what was looked at: a hard link to another file of the runner's own put at the
+	name meanwhile (macOS has no protected_hardlinks) gets 0700, the owner's, never the directory's group and other bits. True
+	when it did."""
 	if not hasattr(os, 'geteuid') or os.geteuid() == 0:
 		return False
+	at, how = _at(base, name), _fd_of(base)
 	try:
-		st = os.lstat(name, dir_fd=base)
+		st = os.lstat(*at, **how)
 		if st.st_uid != os.geteuid() or st.st_mode & (stat.S_IRUSR | stat.S_IXUSR) or not stat.S_ISDIR(st.st_mode):
 			return False
-		os.chmod(name, stat.S_IMODE(st.st_mode) | stat.S_IRWXU, dir_fd=base, follow_symlinks=False)
+		os.chmod(*at, stat.S_IRWXU, follow_symlinks=False, **how)
+		fd = os.open(*at, os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0) | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_CLOEXEC', 0), **how)
+		try:
+			now = os.fstat(fd)
+			if (now.st_dev, now.st_ino) != (st.st_dev, st.st_ino):
+				return False  # another file's name by now: it keeps the owner's 0700, nothing more
+			os.fchmod(fd, stat.S_IMODE(st.st_mode) | stat.S_IRWXU)
+		finally:
+			os.close(fd)
 	except (OSError, NotImplementedError, ValueError):  # (Python 3.6 on Linux: ValueError where it cannot do both)
 		return False
 	return True
@@ -5390,7 +5406,7 @@ def _cp_landing(command, src_path, dest_path, target, st, named, space, src_st, 
 	"""_cp_once's copy onto target, dest_path's landing, by what its look found there (st, named), relative to base (the door's
 	result for its directory). FileExistsError: a first copy's name taken since."""
 	if _CP_SKIPS_SOCKETS and stat.S_ISSOCK((src_st or os.lstat(src_path)).st_mode):
-		return _make_socket(src_path, src_st or os.lstat(src_path), target, st, base)
+		return _make_socket(src_path, src_st or os.lstat(src_path), target, base)
 	held = _claim_device(target, st, named, src_path)
 	try:
 		if not _written_beside(st, named):
@@ -5459,21 +5475,27 @@ _CP_SKIPS_SOCKETS = sys.platform == 'darwin'
 # bind takes.
 _SOCKET_PATH_MAX = 103 if sys.platform == 'darwin' else 107
 
-def _make_socket(src_path, src_st, target, st, base):
+# The path a socket's bind names is the landing's directory, a separator, the private directory (.hpcp and 4 hex digits: 9 bytes),
+# a separator and the socket's name (s): 12 bytes more than the directory's path.
+_SOCKET_BIND_EXTRA = 12
+
+def _make_socket(src_path, src_st, target, base):
 	"""A copy of the socket src_path (its lstat src_st) at target, as Linux's cp -a makes one: an AF_UNIX socket bound
 	(closed at once: the node stays), given the source's owner (as cp -a keeps it), mode and times, and renamed over what is at
-	the landing (st, its look). All of it but the last step in a directory of the run's own made for it in target's directory
-	(base: the door's result for it, a path where it has none), mode 0700 and held by its descriptor, so nobody else can reach
-	the socket before it is whole: a name put at the landing meanwhile gets neither the owner nor the mode, and a bind that
-	fails (a path past the socket address, 103 bytes on macOS: ENAMETOOLONG) leaves the old file as it is. macOS has no
-	bindat: the bind names the directory by its path (its node copies go by name below the held directory,
-	docs/limitations.md; the socket is looked for in the held directory after it). Returns 0 (no data)."""
+	the landing. All of it but the last step in a directory of the run's own made for it in target's directory (base: the
+	door's result for it, a path where it has none), mode 0700 and held by its descriptor, so nobody else can reach the socket
+	before it is whole: a name put at the landing meanwhile gets neither the owner nor the mode, and a bind that fails (a
+	landing directory whose path is past what a socket address holds less the 12 bytes of the bind's own path, 91 on macOS:
+	ENAMETOOLONG) leaves the old file as it is. macOS has no bindat: the bind names the directory by its path (its node copies
+	go by name below the held directory, docs/limitations.md; the socket is looked for in the held directory after it). The
+	directory is made and removed in the moment of the copy: SIGKILL there leaves a hidden .hpcpXXXX directory (docs/limitations.md,
+	"A temporary file left by SIGKILL or Ctrl-\\ (SIGQUIT)"). Returns 0 (no data)."""
 	import socket
 	base = os.path.dirname(target) if base is None else base
 	name = os.path.basename(target)
 	how = _fd_of(base)
 	for _ in range(3):  # a name in use: another, as the door's bound for a race in its own directory
-		holder = '.hs' + uuid.uuid4().hex[:6]  # short: the bind's path holds it, and a socket address is short
+		holder = '.hpcp' + uuid.uuid4().hex[:4]  # short: the bind's path holds it, and a socket address is short
 		try:
 			os.mkdir(*_at(base, holder), 0o700, **how)
 			break
@@ -5486,16 +5508,21 @@ def _make_socket(src_path, src_st, target, st, base):
 		held = os.open(*_at(base, holder), _DIRECTORY_FLAGS | getattr(os, 'O_NOFOLLOW', 0), **how)
 		now = os.fstat(held)
 		if now.st_uid != os.geteuid() or not stat.S_ISDIR(now.st_mode):
-			raise OSError(errno.EEXIST, 'something else was put at its name', os.path.join(os.path.dirname(target), holder))
+			# Not EEXIST, which the copy takes for a name that appeared at the landing and tries again: this stays so (an NFS
+			# export that makes every directory its anonymous user's, root_squash, gives a root run's directory another owner).
+			raise OSError(errno.EPERM, f'the directory made for the socket is not this run\'s own (its owner is {now.st_uid})',
+				os.path.join(os.path.dirname(target), holder))
 		os.fchmod(held, 0o700)
-		path = os.path.join(os.path.dirname(target), holder, 's')
+		directory = os.path.dirname(target)
+		path = os.path.join(directory, holder, 's')
 		sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 		try:
 			sock.bind(path)
 		except OSError as e:
 			number = e.errno or errno.ENAMETOOLONG  # Python's "AF_UNIX path too long" has no errno
 			raise OSError(number, f'cannot make the socket {target} (' + (e.strerror or
-				f'a socket address holds {_SOCKET_PATH_MAX} bytes, and its path here is {len(os.fsencode(path))}') + ')', target)
+				f'the landing\'s directory path may be at most {_SOCKET_PATH_MAX - _SOCKET_BIND_EXTRA} bytes for a socket here, and '
+				f'it is {len(os.fsencode(directory))}') + ')', target)
 		finally:
 			sock.close()
 		os.lstat('s', dir_fd=held)  # made where the held directory is: not where a link on the way to it led the bind
@@ -5653,8 +5680,8 @@ def _known_identical(src_path, dest_path, src_size, full_hash, src_st=None, dest
 
 # The errors shutil.copystat's xattr copy ignores (3.6 to 3.14, together): a name the destination or the runner cannot have; and
 # EOPNOTSUPP, which a filesystem that has no xattrs or ACLs may answer with (Linux's ENOTSUP is the same number; macOS's are 45
-# and 102). One set at every xattr and ACL call of the copy and the skip check. macOS's "no such attribute" (ENOATTR, 93) is
-# what Linux calls ENODATA.
+# and 102). One set at every xattr and ACL call of the copy and the skip check (the image state's _xattr_digest, Linux only, keeps
+# its own). macOS's "no such attribute" (ENOATTR, 93) is what Linux calls ENODATA.
 _ENOATTR = getattr(errno, 'ENOATTR', errno.ENODATA)
 _XATTR_SKIPPED = frozenset((errno.EPERM, errno.ENOTSUP, errno.EOPNOTSUPP, errno.ENODATA, errno.EINVAL, errno.EACCES, _ENOATTR))
 # A removal also meets a name gone since the listing.
@@ -5674,8 +5701,8 @@ def _settle_identical(src_path, src_st, dest, look, base=None):
 
 	On Linux an O_PATH descriptor, reached by its /proc/self/fd name (as _carry_over); elsewhere a regular file opened for
 	reading without following a link (the check just read it), and a node by its name in base, its owner, times and (where
-	chmod can be told so) mode set relative to base without following a link put at it, its xattrs (Linux without /proc)
-	and BSD flags (macOS) by name (no dir_fd form). base: the door's result for dest's directory (None: its path), which the
+	chmod can be told so) mode set relative to base without following a link put at it, its xattrs (Linux without /proc; none
+	on macOS) and BSD flags (macOS) by name (no dir_fd form). base: the door's result for dest's directory (None: its path), which the
 	landing is opened in."""
 	base = os.path.dirname(dest) if base is None else base
 	leaf = os.path.basename(dest)
@@ -5707,14 +5734,15 @@ def _settle_identical(src_path, src_st, dest, look, base=None):
 		if chowned:
 			owner_kept, group_kept = _chown_like_cp(path, src_st, **how)
 		# xattrs after the owner, as cp -a: a chown clears a file capability (security.capability), and before the mode, which
-		# may make the file read-only
-		if _XATTRS is not None:
+		# may make the file read-only. None to a node on macOS: no xattr call there takes a dir_fd, so they would go by the
+		# landing's full path, which a directory on the way swapped for a link leads elsewhere (9.89 carried none there; 9.91).
+		if _XATTRS is not None and (fd is not None or _XATTRS[0] is not _mac_listxattr):
 			listxattr, getxattr, setxattr, removexattr = _XATTRS
 			try:
 				src_names = listxattr(src_path, follow_symlinks=False)
 				dest_names = listxattr(xpath, **xhow)
 			except OSError as e:
-				if e.errno not in (errno.ENOTSUP, errno.EOPNOTSUPP):
+				if e.errno not in _XATTR_SKIPPED:
 					raise
 				src_names = dest_names = ()
 			for name in dest_names:
@@ -5866,9 +5894,12 @@ def _copy_file(src_path, dest_paths, full_hash, verbose, concurrent_processes, b
 			return 0, time.monotonic() - start_time, symLinks
 		for refusal in refused.values():
 			# Another destination takes the file, so this is no failure; a pinned destination that leads elsewhere now is said
-			# once a process, as a note (9.89 said nothing): the door's first answer is the one that is not said yet, the
-			# later ones are (_dest_directory), as is one this process printed already. Any other refusal here was said by the
-			# directory sync's own (213).
+			# once a process, as a note (9.89 said nothing), where no directory sync reached its directory first: the door's
+			# first answer is the one that is not said yet, the later ones are (_dest_directory), as is one this process printed
+			# already. A directory source's pin refusal is its directory sync's own 213 line (said, so no file prints the Note;
+			# 9.89 does the same), and a link's is its own (_say_refused). Any other refusal here was said by the directory sync
+			# too, except under -nds, which has none: an -ncd refusal there is said by nothing, as in 9.89 (docs/limitations.md,
+			# deferred to 9.91).
 			if refusal.note is not None and not refusal.said:
 				print('Note: ' + refusal.note)
 	looks = {dest: _look(dest, bases, landings[dest]) for dest in dest_paths}
@@ -7401,7 +7432,8 @@ def _is_portable_xattr(name):
 	"""
 	if _XATTRS is not None and _XATTRS[0] is _mac_listxattr:
 		# macOS: every name a program sets, but the marks the system keeps on a file by itself (it puts some back on a written
-		# file, and guards others): a rerun that removed one would only fight it. And its own hidden names
+		# file, and guards others): a rerun that removed one would only fight it. The first test leaves out its own hidden names
+		# (com.apple.system.*), the second those marks.
 		return not name.startswith('com.apple.system.') and name not in _MAC_OWN_XATTRS
 	return name.startswith('user.') or name in _PORTABLE_SYSTEM_XATTRS
 
@@ -7482,7 +7514,7 @@ def _remove_stale_xattrs(src, dest):
 		try:
 			os.removexattr(dest, name, **how)
 		except OSError as e:
-			if e.errno not in (errno.ENOTSUP, errno.EPERM, errno.ENODATA, errno.EACCES, errno.EINVAL, errno.ENOENT):
+			if e.errno not in _XATTR_NOT_REMOVED:
 				raise
 
 _OP_ORDER = {'D': 0, 'A': 1, 'M': 2}
@@ -14150,11 +14182,17 @@ def _ask_names(directory, names):
 			try:
 				os.mkdir(*_at(base, probe), 0o700, **_fd_of(base))
 			except PermissionError:
-				# The runner's own directory shut to its owner (0607, which a non-root move gives one at its end and leaves
-				# after a skipped or stopped removal): owner search for the probe, as the door gives it (_owner_search); the
-				# finish sets the exact mode again. Another user's, or one with search (0555), stays refused.
-				if not _owner_search_of(base, directory):
-					raise
+				# The runner's own directory shut to its owner (0607, which a non-root copy or move gives one at its end and
+				# leaves after a skipped or stopped removal; on the read route also 0207, 0007 and 0047): owner search for the
+				# probe, as the door gives it (_owner_search, _owner_read), the finish setting the exact mode again where it
+				# sets one (not under -nds or -co, nor in a destination named with -d that no source directory lands on: it
+				# keeps owner rwx). By path where no /proc turns an O_PATH descriptor into one that fchmod takes (macOS: base is
+				# its path; Linux without /proc: an O_PATH descriptor, which fchmod refuses). Another user's directory, or one
+				# with search (0555), stays refused, and so does a mode without owner read on Linux without /proc (no lchmod).
+				if not _owner_search_of(base if _PATH_FDS else directory, directory):
+					parent, leaf = os.path.split(os.path.abspath(directory))
+					if _PATH_FDS or not _owner_read(parent, leaf):
+						raise
 				os.mkdir(*_at(base, probe), 0o700, **_fd_of(base))
 		except OSError as e:
 			failed = e
@@ -15617,7 +15655,7 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = None,
 				# A non-root move's directories whose exact mode takes their owner's search (0607): set after the removal step
 				# that looked below them, on every path (a stop, an error in it, a removal skipped for the copy's errors): a rerun
 				# over such a directory gives it owner search where it walks below it (_owner_search), and its finish sets the
-				# exact mode again.
+				# exact mode again (where it sets one: not under -nds or -co).
 				_finish_late(dir_records)
 	except KeyboardInterrupt:
 		# The stop is acted on: later checks (_check_stop) change nothing.

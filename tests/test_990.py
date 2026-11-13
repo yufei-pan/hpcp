@@ -484,6 +484,11 @@ def test_990_a_worker_stopped_after_a_jobs_length_reads_the_rest(tmp_path):
 
 # -- A copied socket: made apart and renamed over the landing -------------------------------------------------------------------
 
+def _make_socket(src, target, base):
+	'''hpcp._make_socket for the socket at src, onto target (a file there already), base as the door gives it.'''
+	return hpcp._make_socket(src, os.lstat(src), target, base)
+
+
 def _a_socket(path, mode=0o640):
 	'''A socket at path (a short, relative one: a socket address holds about 100 bytes), of mode.'''
 	import socket
@@ -507,7 +512,7 @@ def test_990_a_socket_that_cannot_be_bound_leaves_the_landing_as_it_is(tmp_path,
 	os.makedirs(deep)
 	target = write(os.path.join(deep, 'f'), 'the old file')
 	with pytest.raises(OSError) as raised:
-		hpcp._make_socket(str(tmp_path / src), os.lstat(src), target, os.lstat(target), None)
+		_make_socket(str(tmp_path / src), target, None)
 	assert raised.value.errno == errno.ENAMETOOLONG, raised.value
 	assert 'cannot make the socket' in str(raised.value) and 'None' not in str(raised.value), str(raised.value)
 	assert read(target) == 'the old file' and os.listdir(deep) == ['f']  # and no directory of the socket's is left
@@ -525,7 +530,7 @@ def test_990_a_socket_is_made_apart_and_replaces_what_is_at_the_landing(tmp_path
 	target = write(out / 'f', 'old')
 	base = os.open(str(out), os.O_RDONLY | os.O_DIRECTORY) if by == 'descriptor' else str(out)
 	try:
-		hpcp._make_socket(str(tmp_path / src), os.lstat(src), target, os.lstat(target), base)
+		_make_socket(str(tmp_path / src), target, base)
 	finally:
 		if by == 'descriptor':
 			os.close(base)
@@ -553,7 +558,7 @@ def test_990_a_name_put_at_the_landing_while_the_socket_is_made_gets_neither_its
 			os.rename(str(tmp_path / 'link'), target)  # the other user's move, right before the mode is set
 		return real_chmod(*args, **kwargs)
 	monkeypatch.setattr(os, 'chmod', chmod)
-	hpcp._make_socket(str(tmp_path / src), os.lstat(src), target, os.lstat(target), str(out))
+	_make_socket(str(tmp_path / src), target, str(out))
 	monkeypatch.setattr(os, 'chmod', real_chmod)
 	assert swapped
 	st = os.stat(victim)
@@ -561,27 +566,111 @@ def test_990_a_name_put_at_the_landing_while_the_socket_is_made_gets_neither_its
 	assert stat.S_ISSOCK(os.lstat(target).st_mode)
 
 
+def _short_directory(length):
+	'''A new directory whose path is exactly length bytes (a socket address is short: pytest's own are too long), and what to
+	remove.'''
+	import tempfile
+	root = tempfile.mkdtemp(prefix='k', dir='/tmp')
+	pad = length - len(root) - 1
+	assert pad > 0, root
+	deep = os.path.join(root, 'd' * pad)
+	os.mkdir(deep)
+	assert len(os.fsencode(deep)) == length
+	return root, deep
+
+
+@posix_only
+def test_990_a_socket_names_the_limit_on_the_landings_directory_and_binds_up_to_it(tmp_path, monkeypatch):
+	# The bind's path is the landing's directory plus 12 bytes ('/.hpcpXXXX/s'), so a directory may be a socket address (103
+	# bytes on macOS, 107 on Linux) less 12 long: 91 and 95. A longer one is refused naming that number and the directory's own
+	# length, where the first fix round's message gave the bind's path (12 bytes more than anything the operator wrote), and
+	# README said 'File name too long', which never appears. The old file stays.
+	import shutil
+	monkeypatch.chdir(tmp_path)
+	src = str(tmp_path / _a_socket('s'))
+	limit = hpcp._SOCKET_PATH_MAX - 12
+	made = []
+	try:
+		for length in (limit, limit + 1):
+			root, deep = _short_directory(length)
+			made.append(root)
+			target = write(os.path.join(deep, 'f'), 'the old file')
+			if length == limit:
+				_make_socket(src, target, None)  # the longest that binds
+				assert stat.S_ISSOCK(os.lstat(target).st_mode), os.lstat(target)
+				continue
+			with pytest.raises(OSError) as raised:
+				_make_socket(src, target, None)
+			text = str(raised.value)
+			assert raised.value.errno == errno.ENAMETOOLONG and 'cannot make the socket' in text, raised.value
+			assert 'at most %d bytes' % limit in text and 'it is %d' % length in text, text
+			assert read(target) == 'the old file' and os.listdir(deep) == ['f']
+	finally:
+		for root in made:
+			shutil.rmtree(root, ignore_errors=True)
+
+
+@posix_only
+def test_990_a_socket_is_made_in_a_hidden_hpcp_directory_of_four_hex_digits(tmp_path, monkeypatch):
+	# N4: the private directory (a hidden name beside the landing, left only by SIGKILL or Ctrl-\\ in the moment of the copy) says
+	# whose it is: '.hpcp' and 4 hex digits, the same 9 bytes of the bind's path as the first fix round's '.hs' and 6.
+	import re
+	monkeypatch.chdir(tmp_path)
+	src = str(tmp_path / _a_socket('s'))
+	target = write(tmp_path / 'out' / 'f', 'old')
+	real_mkdir, names = os.mkdir, []
+	def mkdir(path, *args, **kwargs):
+		names.append(path)
+		return real_mkdir(path, *args, **kwargs)
+	monkeypatch.setattr(os, 'mkdir', mkdir)
+	_make_socket(src, target, str(tmp_path / 'out'))
+	monkeypatch.setattr(os, 'mkdir', real_mkdir)
+	assert len(names) == 1 and re.fullmatch(r'\.hpcp[0-9a-f]{4}', os.path.basename(names[0])), names
+
+
+@posix_only
+def test_990_a_socket_directory_that_is_not_the_runs_own_is_one_failure_not_a_retried_race(tmp_path, fresh, monkeypatch):
+	# R5: a root run on an NFS export with root_squash makes a directory the anonymous user's; the owner check stops the bind in
+	# it (right: nobody else's directory gets the socket). It raised EEXIST, which _cp_once takes for a name that appeared at the
+	# landing: it looked again and tried 3 times, then said 'it kept changing while it was copied'. One failure now, naming the
+	# cause, the old landing kept and no private directory left behind.
+	monkeypatch.chdir(tmp_path)
+	src = str(tmp_path / _a_socket('sock'))
+	out = tmp_path / 'out'
+	target = write(out / 'sock', 'the old file')
+	monkeypatch.setattr(hpcp, '_CP_SKIPS_SOCKETS', True)
+	real, calls = hpcp._make_socket, []
+	def make(*args):
+		calls.append(1)
+		with monkeypatch.context() as other:
+			other.setattr(os, 'geteuid', lambda: os.getuid() + 1)  # the directory is its owner's, not this run's
+			return real(*args)
+	monkeypatch.setattr(hpcp, '_make_socket', make)
+	_run_named(monkeypatch, out)
+	try:
+		_copy(src, [target])
+	finally:
+		hpcp._close_cursors()
+	assert hpcp.ERRORS and 'is not this run' in hpcp.ERRORS[0] and 'kept changing' not in hpcp.ERRORS[0], hpcp.ERRORS
+	assert len(calls) <= 3, calls  # copy_file's own three attempts; each one made the socket up to 3 times itself before
+	assert read(target) == 'the old file' and os.listdir(str(out)) == ['sock']
+
+
 # -- A directory's xattrs and ACL: every call skips the same errors -------------------------------------------------------------
 
 _SKIPPED_ERRORS = ['EPERM', 'EACCES', 'EINVAL', 'ENODATA', 'ENOTSUP', 'EOPNOTSUPP']
 
 
-@posix_only
-@pytest.mark.parametrize('error', _SKIPPED_ERRORS)
-@pytest.mark.parametrize('site', ['list', 'set', 'remove', 'acl', 'settle'])
-def test_990_every_xattr_and_acl_call_skips_the_same_errors(tmp_path, monkeypatch, site, error):
-	# Five calls each had an errno list of their own, and macOS answers EOPNOTSUPP (102) where ENOTSUP is 45. They share
-	# hpcp._XATTR_SKIPPED now. Linux has one number for both, so here it fails on 9.89's and the first 9.90 build's lists only for
-	# the errors one lacked (EPERM and EACCES at the listing, ENODATA at the ACL); the rest are guards, and the Mac's run of this
-	# file is where EOPNOTSUPP differs.
-	code = getattr(errno, error)
+def _xattr_site(tmp_path, monkeypatch, site, code):
+	'''One xattr or ACL call of the copy (site) failing with errno code: the call that meets it must go on. 'settle-list' is the
+	skip check's listing of an identical landing (_settle_identical), 'settle' its removal.'''
 	src, dest = str(write(tmp_path / 'src', 'x')), str(write(tmp_path / 'dest', 'x'))
 	def failing(*args, **kwargs):
 		raise OSError(code, os.strerror(code))
 	def nothing(*args, **kwargs):
 		return None
 	def listing(path, **kwargs):
-		if site == 'list':
+		if site in ('list', 'settle-list'):
 			failing()
 		# 'set': the source has a name the landing lacks; 'remove' and 'settle': the landing has one the source lacks
 		if site == 'set':
@@ -591,7 +680,7 @@ def test_990_every_xattr_and_acl_call_skips_the_same_errors(tmp_path, monkeypatc
 	monkeypatch.setattr(hpcp, '_XATTRS', (listing, lambda path, name, **kwargs: b'v', failing if site == 'set' else nothing,
 		failing if site in ('remove', 'settle') else nothing))
 	monkeypatch.setattr(hpcp, '_mac_sync_acl', failing if site == 'acl' else lambda src, fd: False)
-	if site == 'settle':
+	if site in ('settle', 'settle-list'):
 		hpcp._settle_identical(src, os.lstat(src), dest, os.lstat(dest))
 		return
 	fd = os.open(dest, os.O_RDONLY)
@@ -599,6 +688,26 @@ def test_990_every_xattr_and_acl_call_skips_the_same_errors(tmp_path, monkeypatc
 		hpcp._sync_xattrs(src, fd if site == 'acl' else dest)
 	finally:
 		os.close(fd)
+
+
+@posix_only
+@pytest.mark.parametrize('error', _SKIPPED_ERRORS)
+@pytest.mark.parametrize('site', ['list', 'set', 'remove', 'acl', 'settle', 'settle-list'])
+def test_990_every_xattr_and_acl_call_skips_the_same_errors(tmp_path, monkeypatch, site, error):
+	# Five calls each had an errno list of their own, and macOS answers EOPNOTSUPP (102) where ENOTSUP is 45. They share
+	# hpcp._XATTR_SKIPPED now. Linux has one number for both, so here it fails on 9.89's and the first 9.90 build's lists only for
+	# the errors one lacked (EPERM and EACCES at the listing, ENODATA at the ACL); the rest are guards, and the Mac's run of this
+	# file is where EOPNOTSUPP differs. The skip check's listing of an identical landing (settle-list) skipped only ENOTSUP and
+	# EOPNOTSUPP until the second fix round: macOS's listxattr answers EACCES for a file its owner may not read, so a rerun under
+	# -hs 0 raised an error for it every time, where _sync_xattrs skips the same error for a directory.
+	_xattr_site(tmp_path, monkeypatch, site, getattr(errno, error))
+
+
+@posix_only
+@pytest.mark.parametrize('site', ['remove', 'settle'])
+def test_990_an_xattr_removal_skips_a_name_that_is_gone_since_the_listing(tmp_path, monkeypatch, site):
+	# The removals also meet ENOENT (the shared set _XATTR_NOT_REMOVED); no case had it.
+	_xattr_site(tmp_path, monkeypatch, site, errno.ENOENT)
 
 
 @posix_only
@@ -619,30 +728,107 @@ def test_990_macos_marks_are_not_portable_names_a_rerun_removes(monkeypatch):
 		assert hpcp._is_portable_xattr(name), name
 
 
+@posix_only
+@pytest.mark.parametrize('kind', ['fifo', 'regular'])
+def test_990_an_identical_node_gets_no_xattrs_by_the_landings_full_path_on_macos(tmp_path, monkeypatch, kind):
+	# R6: no xattr call on macOS takes a dir_fd, so an identical FIFO, socket or device node's xattrs went by the landing's full
+	# path (_io gives dest where /proc is not there), through a directory on the way that another user swapped for a link in a
+	# root run: they were removed from, and the source's set on, the file of that name where the link leads, while everything
+	# else of its settle goes relative to the held directory. 9.89 carried no xattrs on macOS. A node gets none; a regular file
+	# keeps getting them, through the descriptor hpcp checked. (macOS's shape here: _PATH_FDS off, macOS's listing.)
+	src, dest = str(tmp_path / 'src'), str(tmp_path / 'dest')
+	for path in (src, dest):
+		if kind == 'fifo':
+			os.mkfifo(path, 0o600)
+		else:
+			write(path, 'x', mode=0o600)
+		os.utime(path, ns=(1_000_000_000, 2_000_000_000))
+	listed = []
+	def listing(path, **kwargs):
+		listed.append(path)
+		return []
+	monkeypatch.setattr(hpcp, '_PATH_FDS', False)
+	monkeypatch.setattr(hpcp, '_mac_listxattr', listing)
+	monkeypatch.setattr(hpcp, '_XATTRS', (listing, lambda *args, **kwargs: b'', lambda *args, **kwargs: None,
+		lambda *args, **kwargs: None))
+	monkeypatch.setattr(hpcp, '_mac_sync_acl', lambda src, fd: False)
+	assert hpcp._settle_identical(src, os.lstat(src), dest, os.lstat(dest))
+	assert dest not in listed, listed  # never by the landing's path
+	if kind == 'fifo':
+		assert listed == [], listed
+	else:
+		assert [type(path) for path in listed] == [str, int], listed  # the source by its path, the landing by its descriptor
+
+
 # -- The name probe before a copy, in a directory the runner's own mode shuts it out of ---------------------------------------------
+
+def _can_lchmod_by_path():
+	'''Whether this platform's chmod takes a path and says not to follow a link (macOS; glibc 2.32's fchmodat through /proc on
+	Python 3.11 and later; not Python 3.6 on Linux).'''
+	import tempfile
+	with tempfile.TemporaryDirectory() as work:
+		try:
+			os.chmod(work, 0o700, follow_symlinks=False)
+			return True
+		except (OSError, NotImplementedError, ValueError):
+			return False
+
 
 @posix_only
 @not_root
-@pytest.mark.parametrize('by_descriptor', [True, False])
-def test_990_the_name_probe_gives_the_runners_own_directory_shut_to_its_owner_search(tmp_path, monkeypatch, by_descriptor):
-	# Two names that fold alike (a and A) landing in a directory of mode 0607, which a non-root move leaves after a skipped or
-	# stopped removal: the probe makes its names in the directory, and met EACCES ("nothing can be made in DIR to ask it
-	# (Permission denied): make it writable and run again"), on every rerun, where 9.89 had left 0707. The probe gives the
-	# directory owner search as the door does (the finish sets the exact mode again).
-	if by_descriptor and not hpcp._PROBE_BY_FD:
-		pytest.skip('this platform probes by path')
-	monkeypatch.setattr(hpcp, '_PROBE_BY_FD', by_descriptor)
+@pytest.mark.parametrize('route', ['proc', 'path', 'no-proc'])
+@pytest.mark.parametrize('mode', [0o607, 0o407, 0o207, 0o007, 0o047])
+def test_990_the_name_probe_gives_the_runners_own_directory_shut_to_its_owner_search_on_every_route(tmp_path, monkeypatch, route,
+		mode):
+	# Two names that fold alike (a and A) landing in a directory of the runner's own with a mode that shuts its owner out (0607,
+	# which a non-root move gives one at its end and leaves after a skipped or stopped removal; on the read route also 0207, 0007
+	# and 0047): the probe makes its names in the directory, and met EACCES ("nothing can be made in DIR to ask it (Permission
+	# denied): make it writable and run again") on every rerun, where 9.89 had left 0707. The probe gives the directory owner
+	# search as the door does. The routes: Linux with /proc (the probe holds the directory by O_PATH, and chmods through /proc);
+	# macOS's (no O_PATH, the probe by path: opened by path for a mode with owner read, and lchmod by name for one without it, as
+	# the door does); Linux without /proc (an O_PATH descriptor that fchmod refuses: by path, as macOS's; no lchmod there, which a
+	# container's glibc still has through /proc). The finish sets the exact mode again where it sets one: after the probe the
+	# directory has owner rwx.
+	if route == 'proc' and not (hpcp._PATH_FDS and hpcp._PROBE_BY_FD):
+		pytest.skip('no /proc/self/fd here')
+	if route == 'no-proc' and not hpcp._PROBE_BY_FD:
+		pytest.skip('this platform has no O_PATH')
+	if route != 'proc' and not mode & 0o400 and not _can_lchmod_by_path():
+		pytest.skip('no chmod by name that does not follow a link here: the probe is refused (docs/limitations.md)')
+	monkeypatch.setattr(hpcp, '_PATH_FDS', route == 'proc')
+	monkeypatch.setattr(hpcp, '_PROBE_BY_FD', route != 'path')
 	directory = tmp_path / 'd'
 	directory.mkdir()
-	os.chmod(str(directory), 0o607)
+	os.chmod(str(directory), mode)
 	try:
 		answers, why = hpcp._ask_names(str(directory), ['a', 'A'])
 	finally:
 		now = stat.S_IMODE(os.stat(str(directory)).st_mode)
 		os.chmod(str(directory), 0o755)
 	assert not why and set(answers) == {'a', 'A'}, (answers, why)
-	assert now == 0o707, oct(now)
+	assert now == mode | 0o700, oct(now)
 	assert os.listdir(str(directory)) == []  # the probe's own directory is gone
+
+
+@posix_only
+@not_root
+def test_990_the_name_probe_of_a_directory_named_by_a_relative_path_gives_it_owner_read_by_name(tmp_path, monkeypatch):
+	# The probe's directory can be a relative path (the destination as the operator typed it): its parent and name come from its
+	# absolute path. macOS's route, a mode without owner read.
+	if not _can_lchmod_by_path():
+		pytest.skip('no chmod by name that does not follow a link here')
+	monkeypatch.setattr(hpcp, '_PATH_FDS', False)
+	monkeypatch.setattr(hpcp, '_PROBE_BY_FD', False)
+	monkeypatch.chdir(tmp_path)
+	os.mkdir('d')
+	os.chmod('d', 0o007)
+	try:
+		answers, why = hpcp._ask_names('d', ['a', 'A'])
+	finally:
+		now = stat.S_IMODE(os.stat('d').st_mode)
+		os.chmod('d', 0o755)
+	assert not why and set(answers) == {'a', 'A'}, (answers, why)
+	assert now == 0o707, oct(now)
 
 
 @posix_only
@@ -679,6 +865,57 @@ def _can_chmod_by_name_without_following():
 			return False
 		finally:
 			os.close(fd)
+
+
+@posix_only
+@not_root
+@pytest.mark.parametrize('when', ['before the chmod', 'before the open'])
+@pytest.mark.parametrize('mode', [0o007, 0o207, 0o047])
+def test_990_the_owner_read_gives_a_hard_link_put_at_the_name_nothing_others_can_use(tmp_path, monkeypatch, mode, when):
+	# N1: on the read route (macOS) out/d, the runner's own, has a mode without owner read (0007, 0207, 0047), and _owner_read
+	# gave it its owner's rwx by a chmod by name. Another user who can write out/ swaps a hard link to one of the runner's files
+	# in at the name (macOS has no protected_hardlinks; one renamex_np, or two renames, does it) after the lstat: the chmod did
+	# not follow it, but a hard link is the file itself, so it got the directory's mode plus owner rwx, 0707 or 0747, and
+	# others could write it. The name is given owner rwx alone first and the group and other bits go back through a descriptor
+	# checked against the lstat, so a file swapped in has at most 0700. (Linux's glibc takes AT_SYMLINK_NOFOLLOW through /proc:
+	# the route runs here with _PATH_FDS off.)
+	if not _can_chmod_by_name_without_following():
+		pytest.skip('no chmod by name that does not follow a link here: nothing changes')
+	monkeypatch.setattr(hpcp, '_PATH_FDS', False)
+	out = tmp_path / 'out'
+	os.makedirs(str(out / 'd' / 'sub'))
+	victim = write(tmp_path / 'victim', 'mine', mode=0o600)
+	os.link(victim, str(out / 'lnk'))
+	os.chmod(str(out / 'd'), mode)
+	base = os.open(str(out), os.O_RDONLY | os.O_DIRECTORY)
+	real_chmod, real_open, state = os.chmod, os.open, {'swapped': False, 'chmodded': False}
+	def swap():
+		state['swapped'] = True
+		os.rename(str(out / 'd'), str(out / 'd.away'))  # the other user's renames
+		os.rename(str(out / 'lnk'), str(out / 'd'))
+	def chmod(path, new, *args, **kwargs):
+		if kwargs.get('dir_fd') == base and not state['swapped'] and when == 'before the chmod':
+			swap()
+		result = real_chmod(path, new, *args, **kwargs)
+		state['chmodded'] = state['chmodded'] or kwargs.get('dir_fd') == base
+		return result
+	def opening(path, flags, *args, **kwargs):
+		if kwargs.get('dir_fd') == base and state['chmodded'] and not state['swapped'] and when == 'before the open':
+			swap()
+		return real_open(path, flags, *args, **kwargs)
+	monkeypatch.setattr(os, 'chmod', chmod)
+	monkeypatch.setattr(os, 'open', opening)
+	try:
+		with contextlib.suppress(OSError):
+			hpcp._door_step(base, 'd', str(out / 'd'), False, None, 0)
+	finally:
+		monkeypatch.setattr(os, 'chmod', real_chmod)
+		monkeypatch.setattr(os, 'open', real_open)
+		os.close(base)
+		os.chmod(str(out / 'd.away'), 0o700)
+	assert state['swapped'], state
+	assert stat.S_IMODE(os.stat(victim).st_mode) & 0o077 == 0, oct(os.stat(victim).st_mode)
+	assert read(victim) == 'mine'
 
 
 @posix_only
