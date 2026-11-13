@@ -838,6 +838,33 @@ def test_990_the_owner_read_gives_a_hard_link_put_at_the_name_nothing_others_can
 
 @posix_only
 @not_root
+def test_990_a_worker_that_meets_a_shut_directory_another_worker_has_just_opened_to_its_owner_opens_again(tmp_path, monkeypatch):
+	# The pool's order: two workers walk below out/d, the runner's own and 0607. One's open of a name below it meets EACCES; by
+	# the time it asks _owner_search the other has given out/d owner search, so _owner_search finds nothing to do (False) and the
+	# walk raised EACCES for a directory that is open now (the rerun of a tree with 200 subdirectories, 193 about one run in ten
+	# on 3.11: the root-only test of that rerun below). It opens again, once.
+	directory = tmp_path / 'd'
+	os.makedirs(str(directory / 'sub'))
+	os.chmod(str(directory), 0o607)
+	flags = (hpcp._HOLD_PATH_FLAGS if hpcp._PATH_FDS else hpcp._HOLD_READ_FLAGS) | hpcp._O_NOFOLLOW
+	base = os.open(str(directory), flags)
+	real_search, state = hpcp._owner_search, {'calls': 0}
+	def other_worker_first(fd):
+		state['calls'] += 1
+		os.chmod(str(directory), 0o707)  # the other worker's chmod, after this one's failed open
+		return real_search(fd)
+	monkeypatch.setattr(hpcp, '_owner_search', other_worker_first)
+	try:
+		sub = hpcp._door_step(base, 'sub', str(directory / 'sub'), False, None, 0)
+		os.close(sub)
+	finally:
+		os.close(base)
+		os.chmod(str(directory), 0o700)
+	assert state['calls'] == 1, state
+
+
+@posix_only
+@not_root
 @pytest.mark.parametrize('base_is', ['descriptor', 'path'])
 @pytest.mark.parametrize('mode', [0o007, 0o207, 0o047])
 def test_990_the_owner_read_leaves_a_directory_put_at_the_name_after_its_chmod_as_it_is(tmp_path, mode, base_is):

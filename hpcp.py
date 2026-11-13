@@ -4584,9 +4584,10 @@ def _door_step(base, name, current, make, source, below, first=None):
 				return os.open(name, (_HOLD_PATH_FLAGS if _PATH_FDS else _HOLD_READ_FLAGS) | _O_NOFOLLOW, dir_fd=base)
 			except OSError as e:
 				if e.errno == errno.EACCES:
-					if 'search' not in widened and _owner_search(base):
+					if 'search' not in widened and (_owner_search(base) or _owner_has_search(base)):
 						widened.add('search')
-						continue  # base was the runner's own, shut to its owner (0607): open again
+						continue  # base was the runner's own, shut to its owner (0607), and is open to it, by this call or by another
+						# worker's between the open and now (the pool's order): open again
 					if not _PATH_FDS and 'read' not in widened and _owner_read(base, name):
 						widened.add('read')
 						continue  # name was, and the read route opens it to read (0207, 0007, 0047): open again
@@ -4679,6 +4680,17 @@ def _owner_search(fd):
 	except OSError:
 		return False
 	return True
+
+def _owner_has_search(fd):
+	"""True when the directory fd holds is the runner's own (not root) and its owner can search it: what _owner_search finds
+	where another worker gave it owner search between the open that met EACCES and the call, so the open is tried again."""
+	if not hasattr(os, 'geteuid') or os.geteuid() == 0:
+		return False
+	try:
+		st = os.fstat(fd)
+	except OSError:
+		return False
+	return st.st_uid == os.geteuid() and stat.S_ISDIR(st.st_mode) and bool(st.st_mode & stat.S_IXUSR)
 
 def _owner_read(base, name):
 	"""Give the directory name in base (a held descriptor, or a directory's path) owner read, write and search where it is the
