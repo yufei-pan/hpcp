@@ -4516,10 +4516,12 @@ class _Refused(Exception):
 	"""A landing this run will not write, for each file it would hold: a 'Destination clash' (213) naming what is there and
 	the fix. text(file) is the message for one file. said: this process has printed it (a pinned destination that leads
 	elsewhere, _dest_directory): recorded for each file, printed once (_say_refused). note: what a process says once where
-	another destination takes the file (_copy_file), or None where nothing is said then."""
-	def __init__(self, before, after, said=False, note=None):
+	another destination takes the file (_copy_file), or None where nothing is said then. key: what the note is said once a
+	process for (_NOTED), where the door keeps no record of the refusal to mark it said (-ncd's, by directory); None: said
+	marks it."""
+	def __init__(self, before, after, said=False, note=None, key=None):
 		super().__init__(before + '...' + after)
-		self.before, self.after, self.said, self.note = before, after, said, note
+		self.before, self.after, self.said, self.note, self.key = before, after, said, note, key
 	def text(self, path):
 		return f'Destination clash: {self.before}{path}{self.after}'
 
@@ -4531,7 +4533,10 @@ def _pin_refused(root):
 			'the other destinations take its files. Run hpcp again to write where it leads now')
 
 def _say_refused(refusal, what):
-	"""refusal's 213 line for what (eprint), or only its record where this process printed it already (refusal.said)."""
+	"""refusal's 213 line for what (eprint), or only its record where this process printed it already (refusal.said). A
+	refusal with a key is said for this process: no file's note repeats it (_NOTED)."""
+	if refusal.key is not None:
+		_NOTED.add(refusal.key)
 	if refusal.said:
 		ERRORS.append(refusal.text(what))
 	else:
@@ -4563,6 +4568,9 @@ _O_NOFOLLOW = getattr(os, 'O_NOFOLLOW', 0)
 # below the same named destination may close it, and a number reused then would lead a stale holder's write elsewhere, so
 # a caller that holds an answer across another door call keeps a dup of it (_kept) and closes that.
 _CURSORS = {}
+# The keys of the refusals this process has said (_Refused.key): a directory sync's 213 line, or a file's note (_copy_file).
+# Cleared with the cursors.
+_NOTED = set()
 # [the run whose cursors these are (RUN_ID), this process's budget for them (_hold_budget, taken at the run's start: a forked
 # worker inherits it with the limit it was taken from)]
 _CURSORS_RUN = [None, None]
@@ -4589,6 +4597,7 @@ def _hold_budget():
 def _close_cursors():
 	"""Close every descriptor the door holds in this process, and forget what it walked by path (a new run, the run's end)."""
 	_BY_PATH.clear()
+	_NOTED.clear()
 	while _CURSORS:
 		held = _CURSORS.popitem()[1]
 		if isinstance(held, _HeldDirs):
@@ -4787,8 +4796,9 @@ def _door_step(base, name, current, make, source, below, first=None):
 			above = above and os.path.dirname(above.rstrip(os.sep))
 		named_form = f'name it with -d {_shell_word(current + os.sep)} to write through it' if link is not None else f'remove {current}'
 		if NO_CREATE_DIR:
-			raise _Refused(f'{current} is a {kind}' + (f' to {link}' if link is not None else '') +
-				' and -ncd makes no directory in its place: not copying ', f' below it; {named_form}')
+			what = f'{current} is a {kind}' + (f' to {link}' if link is not None else '') + ' and -ncd makes no directory in its place'
+			raise _Refused(f'{what}: not copying ', f' below it; {named_form}', key=('-ncd', current),
+				note=f'{what}; nothing is written below it, and the other destinations take its files ({named_form})')
 		try:
 			os.unlink(*_at(base, name), **how)
 		except (FileNotFoundError, IsADirectoryError):
@@ -6005,10 +6015,12 @@ def _copy_file(src_path, dest_paths, full_hash, verbose, concurrent_processes, b
 			# once a process, as a note (9.89 said nothing), where no directory sync reached its directory first: the door's
 			# first answer is the one that is not said yet, the later ones are (_dest_directory), as is one this process printed
 			# already. A directory source's pin refusal is its directory sync's own 213 line (said, so no file prints the Note;
-			# 9.89 does the same), and a link's is its own (_say_refused). Any other refusal here was said by the directory sync
-			# too, except under -nds, which has none: an -ncd refusal there is said by nothing, as in 9.89 (docs/limitations.md,
-			# deferred to 9.93).
-			if refusal.note is not None and not refusal.said:
+			# 9.89 does the same), and a link's is its own (_say_refused). An -ncd refusal is said the same way, once a process
+			# for each directory (its key) where no directory sync said it (_NOTED): under -nds, which has none, it was said by
+			# nothing before 9.94. Any other refusal here was said by the directory sync too.
+			if refusal.note is not None and not refusal.said and refusal.key not in _NOTED:
+				if refusal.key is not None:
+					_NOTED.add(refusal.key)
 				print('Note: ' + refusal.note)
 	looks = {dest: _look(dest, bases, landings[dest]) for dest in dest_paths}
 	if not src_is_link:

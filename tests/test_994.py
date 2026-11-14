@@ -255,3 +255,28 @@ def test_994_a_pool_s_worker_table_can_be_walked_while_a_worker_is_added(reset_h
 			processes[-2] = None  # the main thread's submit, adding a worker meanwhile
 		assert walked == [None] and sorted(processes) == [-2, -1]
 		del processes[-1], processes[-2]
+
+
+@posix_only
+@pytest.mark.parametrize('sync', ['-nds', 'synced'])
+def test_994_an_ncd_refusal_another_destination_takes_is_said(tmp_path, sync):
+	# hpcp src/ -d A/ -d B/ -ncd -nds -s, B/sub a link: the door refuses to make a directory in the link's place (-ncd), A
+	# takes src/sub's files, and 9.93 said nothing of B (exit 0, no line): -nds has no directory sync to say it. 9.94 notes it
+	# once a process for each refused directory (two files below it, one note). With a directory sync (synced) its own 213 line
+	# says it, and in this serial run no file's note repeats it (a guard: 9.93 printed the 213 line too).
+	for name in ('f', 'g'):
+		_write(str(tmp_path / 'src' / 'sub' / name), name)
+	os.makedirs(str(tmp_path / 'A' / 'sub'))
+	os.makedirs(str(tmp_path / 'B'))
+	os.makedirs(str(tmp_path / 'elsewhere'))
+	os.symlink(str(tmp_path / 'elsewhere'), str(tmp_path / 'B' / 'sub'))
+	args = ['src/', '-d', 'A/', '-d', 'B/', '-ncd', '-s'] + (['-nds'] if sync == '-nds' else [])
+	rc, output = _cli(args, tmp_path)
+	notes = [line for line in output.splitlines() if line.startswith('Note: ') and 'B/sub is a link' in line]
+	assert _read(str(tmp_path / 'A' / 'sub' / 'f')) == 'f' and _read(str(tmp_path / 'A' / 'sub' / 'g')) == 'g'
+	assert os.listdir(str(tmp_path / 'elsewhere')) == []
+	if sync == '-nds':
+		assert rc == 0 and len(notes) == 1, output[-3000:]
+		assert '-ncd makes no directory in its place; nothing is written below it, and the other destinations take its files' in notes[0]
+	else:
+		assert rc == 213 and not notes and 'B/sub is a link' in output, output[-3000:]

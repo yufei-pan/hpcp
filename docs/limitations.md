@@ -263,14 +263,6 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - **Revisit when:** 9.94.
 - **Noted:** 2026-11-10, the 9.88 plan; the main session's decision, not asked (a deferral). Moved to 9.90 on 2026-11-11: 9.89 took only the rerun trim and the multiCMD requirement. Moved to 9.91 on 2026-11-12 (the 9.90 builder): the two rules on links disagree, so this is a design, not a rewire. Moved to 9.92 on 2026-11-13: 9.91 is the name probe's fix alone. Moved to 9.93 on 2026-11-13: 9.92 is the docs pass, the quiet cleanup, the multiCMD 1.64 embed and the size check; the main session's call (a deferral, not asked). Moved to 9.94 on 2026-11-13: 9.93 is the name probe's redesign and the `-co` set-user-ID cause; the main session's call (a deferral, not asked).
 
-### `-nds` with `-ncd`: a destination refused for a link below it is said by nothing when another destination takes the file
-- **Kind:** deferred (9.94).
-- **What the operator sees:** with `-nds` (no directory sync) and `-ncd` (no directory made in place of anything), `hpcp src/ -d A/ -d B/ -ncd -nds -s` with `B/sub` a link: the door refuses to replace the link by a directory (`-ncd`), the file below it goes to `A/sub/f`, and nothing says the refusal: exit 0 and no line for `B`. (With a directory sync, its own 213 line says it, and a pinned destination's refusal is noted once a process where no directory sync reached it first.) 9.89 does the same (probed with both: exit 0, silent, `A/sub/f` copied).
-- **Why:** the `-ncd` refusal carries no note of its own, and `-nds` has no directory sync to print it.
-- **Plan (9.94):** give the door's `-ncd` refusal a note, and have `_copy_file` print it once a process for each refused directory where no directory sync said it: a set kept with the cursors and cleared with them.
-- **Revisit when:** 9.94.
-- **Noted:** 2026-11-12, the 9.90 re-review's second-opinion triage (code2 #2, D1); the main session's decision, not asked (a deferral). The same in 9.89. Moved to 9.93 on 2026-11-13: 9.92 is the docs pass, the quiet cleanup, the multiCMD 1.64 embed and the size check; the main session's call (a deferral, not asked). Moved to 9.94 on 2026-11-13: 9.93 is the name probe's redesign and the `-co` set-user-ID cause; the main session's call (a deferral, not asked).
-
 ### A move's directory fsyncs go by path
 - **Kind:** deferred (9.94).
 - **What the operator sees:** after a move, `_sync_moved_directories` fsyncs each directory it wrote into by its path (`_fsync_file`, in threads), as 9.87 and 9.89 do: a directory on the way swapped for a link at the right moment, in a root move into a tree another user can write, has the fsync land on the directory the link leads to (a flush of a directory elsewhere, so the intended directory's new names are not committed by it; a power cut soon after could then lose them, with the sources gone).
