@@ -31,6 +31,7 @@ try:
 	import multiprocessing
 	import multiprocessing.connection
 	import multiprocessing.util
+	import numbers
 	import os
 	import pathlib
 	import platform
@@ -683,6 +684,14 @@ _binCalled = {'lsblk', 'losetup', 'sgdisk', 'blkid', 'umount', 'mount','dd','cp'
 # and the user's locale stays for every command whose output is shown or not read.
 _C_LOCALE = {'LC_ALL': 'C'}
 
+def _print_or_drop(*lines):
+	"""Print the lines, or nothing where stdout cannot take them (its reader has quit): this never raises. For the cleanup,
+	whose steps must not end at a print."""
+	try:
+		print('\n'.join(lines))
+	except Exception:
+		pass
+
 def run_command_in_multicmd_with_path_check(command, timeout=...,max_threads=1,quiet=False,strict=False,extra_env=None,pass_fds=(),show_errors=None):
 	"""run_commands_in_multicmd_with_path_check for one command: its stdout lines."""
 	return run_commands_in_multicmd_with_path_check([command], timeout=timeout, max_threads=max_threads, quiet=quiet, strict=strict, extra_env=extra_env, pass_fds=pass_fds, show_errors=show_errors)[0]
@@ -692,10 +701,11 @@ def run_commands_in_multicmd_with_path_check(commands, timeout=...,max_threads=1
 	Run commands (lists, or strings split on whitespace) with multiCMD, each tool as _bin finds it.
 
 	A missing tool, a timeout (COMMAND_TIMEOUT unless timeout is given) and a non-zero exit are recorded in ERRORS
-	(the exit code) and printed unless quiet (a missing tool always is; show_errors=True prints them whatever quiet says, so
-	quiet hides only what the commands print); e2fsck's exit 1-3 is a success. strict raises on each of them. extra_env:
-	variables set for these commands only, on top of the inherited ones (a None value
-	removes one); pass _C_LOCALE for a tool whose output is parsed. pass_fds: descriptors the commands inherit, at the same
+	(the exit code) and printed unless quiet (a missing tool always is); e2fsck's exit 1-3 is a success. show_errors=True
+	(the cleanup's) prints them whatever quiet says, and with quiet it also prints, once the command has ended, what a command
+	that did not end 0 wrote to stdout (e2fsck's 1-3 too: what it repaired), so quiet hides only what a command that ended 0
+	printed. strict raises on each of them. extra_env: variables set for these commands only, on top of the inherited ones (a
+	None value removes one); pass _C_LOCALE for a tool whose output is parsed. pass_fds: descriptors the commands inherit, at the same
 	numbers (multiCMD 1.59, as subprocess's pass_fds).
 
 	Returns:
@@ -720,6 +730,9 @@ def run_commands_in_multicmd_with_path_check(commands, timeout=...,max_threads=1
 		newCommands.append([_bin(tool)] + command[1:])
 	tasks = multiCMD.run_commands(newCommands, timeout=timeout, max_threads=max_threads, quiet=quiet, return_object=True, extra_env=extra_env, pass_fds=pass_fds)
 	for tool, task in zip(tools, tasks):
+		if quiet and show_errors and task.returncode != 0 and task.stdout:
+			command = task.command if isinstance(task.command, str) else ' '.join(map(str, task.command))
+			_print_or_drop(f"{command} ended {task.returncode} and printed:", *task.stdout)
 		# multiCMD appends 'Timeout!' and then sends SIGINT, so whatever the tool prints while dying lands after it
 		if task.returncode == 124 and any(line.strip() == 'Timeout!' for line in task.stderr):
 			error = f"Command timeout: Command '{task.command}' timed out after {timeout} seconds."
@@ -3325,44 +3338,91 @@ def format_bytes(size, use_1024_bytes=None, to_int=False, to_str=False,str_forma
 	"""
 	return multiCMD.format_bytes(size, use_1024_bytes=use_1024_bytes, to_int=to_int, to_str=to_str,str_format=str_format)
 
-# A size that multiCMD's format_bytes reads, in ASCII only (it takes any Unicode digit, and a Kelvin sign for k): a number (digits first, a fraction after a point), then a unit or none: a letter
-# of its unit_labels (K to Y), an i after it for 1024s (a bare letter is 1000s), a B at the end. What else it is given, it
-# answers a word with 0 and an unknown unit with None (multiCMD 1.64; 1.65 says the unit on stderr and answers 0): hpcp took
-# `-ddr one` for a 0-byte partition and wiped the destination's partition table, `-L fast` for no limit, and `-L 5foo` ended in a
-# TypeError at the first progress bar. It must not depend on that answer: the text is judged here, before the run touches anything.
-_SIZE_TEXT = re.compile(r'\d+(?:\.\d+)?\s*(?:[kmgtpezy]i?)?b?', re.IGNORECASE | re.ASCII)
+# A size as hpcp takes one, in ASCII only: a number (at most 27 digits before a point, then a fraction; a leading + or - and a
+# leading point are number syntax), then a unit or none: a letter K to Y (1000s; an i after it for 1024s), a B at the end. The
+# text is judged here, by hpcp's own rule, before the run touches anything, and converted once: multiCMD's format_bytes answers
+# what it cannot read with a 0, a None or a message, by version, and reads the front of a text with anything after it (hpcp
+# took `-ddr one` for a 0-byte partition and wiped the destination's partition table, and `-L 5foo` ended in a TypeError at the
+# first progress bar).
+_SIZE_TEXT = re.compile(r'([+-]?)(\d{1,27}(?:\.\d+)?|\.\d+)(\s*(?:[kmgtpezy]i?)?b?)', re.IGNORECASE | re.ASCII)
+# A rate written as one (-L 10MB/s, -F 100/s): the /s says nothing more.
+_PER_SECOND = re.compile(r'\s*/\s*s\Z', re.IGNORECASE | re.ASCII)
+# The first size that is too large, 1000 Y: the units end at Y, and the progress bar has no label for more (a KeyError at its
+# first frame, from 1024 Yi for -L and from 1000 Y for -F).
+_SIZE_END = 1000 ** 9
+# What -L, -F and -dis do with a value that holds no number, as before 9.92: no limit and no split. -ddr is not here: each of
+# its sizes sets a partition.
+_WITHOUT_A_SIZE = {'-L': 'no rate limit', '-F': 'no rate limit', '-dis': 'no split'}
 
-def _clean_size(value):
-	"""value as format_bytes reads it, or None when it is no size: a string of _SIZE_TEXT (surrounding blanks dropped), or a
-	number that is not negative. A size that is nothing is no size either (0 is: it means no limit and no split)."""
+def _read_size(option, value):
+	"""One size option's value as (its size in whole bytes or files, or None when unset; a note to print; what is wrong with
+	it): at most one of the last two. Unset is None or False. A text that holds a digit is a number: it is a size by _SIZE_TEXT
+	(surrounding blanks dropped, and for a rate a /s at its end), or it is wrong. A number is a size when it is finite. For -L,
+	-F and -dis a text with no digit (an empty one, a word), a negative number and a size below 1 mean no limit and no split,
+	with a note that says so; a size of _SIZE_END or more and, for -ddr, everything that is not a size above 0 are wrong."""
+	without = _WITHOUT_A_SIZE.get(option)
+	no_size = f"{option} {value!r} is not a size (a number and an optional unit, such as {'512, 10M' if without else '100G'} or 1.5GiB)"
+	if value is None or value is False:
+		return (None, None, None) if without else (None, None, no_size)
+	why = None
 	if isinstance(value, str):
-		value = value.strip()
-		return value if _SIZE_TEXT.fullmatch(value) else None
-	if isinstance(value, bool) or not isinstance(value, (int, float)):
-		return None
-	return value if 0 <= value < float('inf') else None
+		text = value.strip()
+		if option in ('-L', '-F'):
+			text = _PER_SECOND.sub('', text)
+		if not any(char.isdecimal() for char in text):
+			size, why = 0, 'has no number'
+		else:
+			match = _SIZE_TEXT.fullmatch(text)
+			if not match:
+				return None, None, no_size
+			sign, number, unit = match.groups()
+			if number.startswith('.'):
+				number = '0' + number   # format_bytes wants a digit before the point
+			if sign == '-' and float(number):
+				size, why = 0, 'is below 0'
+			else:
+				size = format_bytes(number + unit, to_int=True)
+				if not size and float(number):
+					why = 'is below 1'
+	elif isinstance(value, bool) or not isinstance(value, numbers.Real):
+		return None, None, no_size
+	else:
+		try:
+			finite = math.isfinite(value)
+		except OverflowError:   # an int or a Fraction too large for a float
+			finite = True
+		if not finite:
+			return None, None, no_size
+		if value < 0:
+			size, why = 0, 'is below 0'
+		else:
+			size = int(value)
+			if not size and value:
+				why = 'is below 1'
+	if size >= _SIZE_END:
+		return None, None, f"{option} {value!r} is too large (a size is below 1000Y)"
+	if not without:
+		if why == 'has no number':
+			return None, None, no_size
+		return (size, None, None) if size else (None, None, f"{option} {value!r} is no partition size (it must be above 0)")
+	return size, f"Note: {option} {value!r} {why}: {without}" if why else None, None
 
-def _unreadable_sizes(bytes_rate_limit, files_rate_limit, dest_image_size, dd_resize):
-	"""(the four options' sizes, cleaned; what is wrong with them, a line each). Unset (None) stays unset; -ddr takes a list
-	(a lone size is a list of one) and each of its sizes sets a partition, so a 0 there is no size."""
-	bad = []
-	cleaned = []
+def _read_sizes(bytes_rate_limit, files_rate_limit, dest_image_size, dd_resize):
+	"""((the -L, -F and -dis sizes and the list of -ddr's, each read by _read_size), the notes, what is wrong, a line each).
+	-ddr takes a list; a lone size is a list of one."""
+	sizes, notes, bad = [], [], []
+	def read(option, value):
+		size, note, wrong = _read_size(option, value)
+		if note:
+			notes.append(note)
+		if wrong:
+			bad.append(wrong)
+		return size
 	for option, value in (('-L', bytes_rate_limit), ('-F', files_rate_limit), ('-dis', dest_image_size)):
-		clean = value if value is None else _clean_size(value)
-		if clean is None and value is not None:
-			bad.append(f"{option} {value!r} is not a size (a number and an optional unit, such as 512, 10M or 1.5GiB)")
-		cleaned.append(clean)
+		sizes.append(read(option, value))
 	if dd_resize:
-		sizes = []
-		for size in (dd_resize if isinstance(dd_resize, (list, tuple)) else [dd_resize]):
-			clean = _clean_size(size)
-			if clean is None:
-				bad.append(f"-ddr {size!r} is not a size (a number and an optional unit, such as 100G or 1.5GiB)")
-			elif not format_bytes(clean, to_int=True):
-				bad.append(f"-ddr {size!r} is no partition size (it must be above 0)")
-			sizes.append(clean)
-		dd_resize = sizes
-	return (*cleaned, dd_resize), bad
+		dd_resize = [read('-ddr', size) for size in (dd_resize if isinstance(dd_resize, (list, tuple)) else [dd_resize])]
+	return (*sizes, dd_resize), notes, bad
 
 def format_time(seconds):
 	"""
@@ -15104,12 +15164,10 @@ def detach_loop_device(loop_device, retries=5, delay=0.5):
 def _cleanup_step(what, message=None):
 	"""One step of clean_up, with the line it prints first. What the step raises is said on stderr and the steps after it still
 	run: once stdout's reader has quit (`hpcp -dd src dst | head`), a print or a shown command's call raises, and 9.89 to 9.91
-	with multiCMD 1.64 left the loop devices attached. The line has nowhere to go then and is dropped, not the step."""
+	left the loop devices attached. The line has nowhere to go then and is dropped, not the step. A stop (KeyboardInterrupt)
+	is not caught: it ends the cleanup, as before 9.92 (docs/limitations.md)."""
 	if message:
-		try:
-			print(message)
-		except Exception:
-			pass
+		_print_or_drop(message)
 	try:
 		yield
 	except Exception as e:
@@ -15120,8 +15178,10 @@ def _cleanup_step(what, message=None):
 
 def clean_up(mount_points: list,loop_devices: list, delayed_commands: list = None):
 	# clean up loop devices and mount points if we are using a image
-	# Every command runs quiet (its failure is still said, on stderr): a shown command's output stops it, and its call raises,
-	# once stdout's reader has quit (multiCMD 1.64). Each step is its own try (_cleanup_step).
+	# Every command runs quiet: a shown command's output stops it, and its call raises, once stdout's reader has quit (multiCMD
+	# 1.61 to 1.63 at its first line, 1.64 when it prints for over a second). Its failure is still said, on stderr, and what one
+	# that did not end 0 printed is shown once it has ended (show_errors: what e2fsck repaired). Each step is its own try
+	# (_cleanup_step).
 	if delayed_commands is None:
 		delayed_commands = []
 	# Last mount first. A mount made after a bind of a live filesystem, with its directory on that filesystem, also lands
@@ -15150,7 +15210,8 @@ def clean_up(mount_points: list,loop_devices: list, delayed_commands: list = Non
 			remaining_commands.append(cmd)
 	delayed_commands.clear()
 	if remaining_commands:
-		with _cleanup_step("delayed commands", "Running delayed commands"):
+		# Named: they run unseen, and an e2fsck of a large filesystem takes minutes.
+		with _cleanup_step("delayed commands", "Running delayed commands: " + '; '.join(' '.join(map(str, cmd)) for cmd in remaining_commands)):
 			# Serial on purpose: write_partition_info queues e2fsck then tune2fs -U
 			# as ordered pairs, and a parallel run would let tune2fs race the fsck.
 			run_commands_in_multicmd_with_path_check(remaining_commands,strict=False,max_threads=1,quiet=True,show_errors=True)
@@ -15197,12 +15258,12 @@ def get_args(args = None):
 	parser.add_argument('-d','-C','--dest_path',action='append', type=str, help='Destination Path. Repeat it to spill over: each file goes to one destination, the first with room, not to all of them.')
 	parser.add_argument('-rds','--random_dest_selection', action='store_true', help='Randomly select destination path from the list of destination paths instead of the first with room. Can speed up transfer if dests are on different devices. Warning: can cause unable to fit in big files as dests are filled up by smaller files.')
 	parser.add_argument('-di','--dest_image', type=str, help='Base name for destination Image, create a image file and copy the files into it.')
-	parser.add_argument('-dis','--dest_image_size', type=str, help='Destination Image Size, specify the size of the destination image to split into. Default is 0 (No split). Example: {10TiB} or {1G}', default='0')
+	parser.add_argument('-dis','--dest_image_size', type=str, help='Destination Image Size, specify the size of the destination image to split into. Default is 0 (No split). Example: 10TiB or 1G', default='0')
 	parser.add_argument('-diff', '--get_diff_image', type=str, nargs='?', const='auto', default=None, help='Generate a patch image that updates the base (-d / -di) to the source (src_path / -si): added and modified files in full plus a change list under .hpcp_diff/. Optionally name the output; default DIFF_<src>_TO_<base>_<time>.img. Honors -dis, -fh, -hs and -e. With -dd, compares whole GPT disks: the new disk as the path and the old disk with -d.')
 	parser.add_argument('-fa', '--force_apply', action='store_true', help='With -siff, apply even when the target differs from the state the patch expects. Conflicts are still printed as warnings.')
 	parser.add_argument('-dd', '--disk_dump', action='store_true', help='Disk to Disk mirror, use this if you are backuping / deploying an OS from / to a disk. \
 					 Require 1 source, can be 1 src_path or 1 -si src_image, require 1 -di dest_image. Note: will only actually use dd if unable to mount / create a partition.')
-	parser.add_argument('-ddr', '--dd_resize', action='append', type=str, help='Resize the destination image to the specified size with -dd. Applies to biggest partiton first. Specify multiple -ddr to resize subsequent sized partitions. Example: {100GiB} or {200G}')
+	parser.add_argument('-ddr', '--dd_resize', action='append', type=str, help='Resize the destination image to the specified size with -dd. Applies to biggest partiton first. Specify multiple -ddr to resize subsequent sized partitions. Example: 100GiB or 200G')
 	parser.add_argument('-nfp','--no_fs_param_mirror', action='store_true', help='Do not mirror source filesystem parameters (geometry, features) in -dd mode. Create destination filesystems with mkfs defaults, preserving only label and UUID.')
 	parser.add_argument('-L','-rl','--rate_limit', type=str, default=None, help='Approximate a rate limit the copy speed in bytes/second. Example: 10M for 10 MB/s, 1Gi for 1 GiB/s. Default is 0: no rate limit.')
 	parser.add_argument('-F','-frl','--file_rate_limit', type=str, default=None, help='Approximate a rate limit the copy speed in files/second. Example: 10K for 10000 files/s, 1Ki for 1024 files/s. Default is 0: no rate limit.')
@@ -15250,11 +15311,15 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = None,
 			bytes_rate_limit = None, files_rate_limit = None,target_file_system = None, no_create_dir = False, content_only = False, command_timeout_limit = 0,
 			exit_not_enough_space = False,do_not_remove_files_while_listing = False,no_fs_param_mirror = False,
 			get_diff_image = None, load_diff_image = None, force_apply = False, write_beside = False, read_before_write = False):
-	# First of all, before any state or destination is touched: a size that is none ends the run as a usage error (241).
-	(bytes_rate_limit, files_rate_limit, dest_image_size, dd_resize), bad = _unreadable_sizes(bytes_rate_limit, files_rate_limit, dest_image_size, dd_resize)
+	# First of all, before any state or destination is touched: the sizes are read once (_read_size), and one that cannot be
+	# read ends the run as a usage error (241). From here on each is a whole number, or None when unset.
+	(bytes_rate_limit, files_rate_limit, dest_image_size, dd_resize), notes, bad = _read_sizes(bytes_rate_limit, files_rate_limit, dest_image_size, dd_resize)
 	if bad:
 		eprint(f"Invalid arguments: {'; '.join(bad)}")
 		return get_rc_from_error()
+	for note in notes:
+		# not eprint: a note is no error
+		print(note, file=sys.stderr)
 	global HASH_SIZE
 	global RANDOM_DESTINATION_SELECTION
 	global BYTES_RATE_LIMIT
@@ -15283,10 +15348,10 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = None,
 		print("Random destination selection enabled.")
 	else:
 		RANDOM_DESTINATION_SELECTION = False
-	if bytes_rate_limit:
-		BYTES_RATE_LIMIT = format_bytes(bytes_rate_limit,to_int=True)
-	if files_rate_limit:
-		FILES_RATE_LIMIT = format_bytes(files_rate_limit,to_int=True)
+	if bytes_rate_limit is not None:
+		BYTES_RATE_LIMIT = bytes_rate_limit
+	if files_rate_limit is not None:
+		FILES_RATE_LIMIT = files_rate_limit
 	if hash_size != ...:
 		try:
 			HASH_SIZE = int(hash_size)
@@ -15296,11 +15361,7 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = None,
 		HASH_SIZE = 0
 	if HASH_SIZE == 0:
 		print("Warning: Hash size set to 0, will not check file content for skipping.")
-	try:
-		dest_image_size = format_bytes(dest_image_size,to_int=True)
-	except Exception:
-		print(f"Invalid destination image size {dest_image_size}, using default size 0")
-		dest_image_size = 0
+	dest_image_size = dest_image_size or 0
 	COMMAND_TIMEOUT = command_timeout_limit if command_timeout_limit > 0 else 0
 	REMOVE_FILES_WHILE_LISTING = not do_not_remove_files_while_listing
 	print('-'*80)
