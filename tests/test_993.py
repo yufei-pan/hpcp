@@ -1,0 +1,488 @@
+'''hpcp 9.93: the name probe makes only directories and removes only with rmdir (docs/lessons-full.md, 2026-11-13, "An undo
+that cannot destroy needs no proof"). Each test fails on 9.92 (a22d721) unless it says it guards what 9.92 already gets
+right. Every swap is forced before or after the call it is timed by, in this process: no sleeps, no random sweep.
+
+A test that stands in for an os call adds its stand-in to the sets that held the real one (os.supports_dir_fd,
+os.supports_fd, os.supports_follow_symlinks: _stand_in): hpcp asks them as it calls (os.utime in os.supports_dir_fd), and
+would go another way than it goes for real.'''
+import errno
+import os
+import types
+
+import pytest
+
+import hpcp
+
+posix_only = pytest.mark.skipif(os.name != 'posix', reason='POSIX')
+
+PROBE = '.hpcp-case-probe-'
+# What the probe may never call: anything that removes, renames or writes a file, or makes something that is no directory.
+NEVER = ('unlink', 'remove', 'rename', 'replace', 'removedirs', 'write', 'truncate', 'ftruncate', 'symlink', 'link', 'mkfifo',
+	'mknod')
+# Every call the probe makes (and the ones above, to catch them): what the counter numbers.
+COUNTED = ('open', 'close', 'mkdir', 'rmdir', 'stat', 'lstat', 'fstat', 'utime', 'listdir', 'scandir', 'chmod') + NEVER
+
+
+def _stand_in(monkeypatch, name, call):
+	'''os.NAME replaced by call, which the sets of the calls that take dir_fd, a descriptor or follow_symlinks then hold where
+	they held the real one.'''
+	real = getattr(os, name)
+	monkeypatch.setattr(os, name, call)
+	for group in ('supports_dir_fd', 'supports_fd', 'supports_follow_symlinks'):
+		if real in getattr(os, group):
+			monkeypatch.setattr(os, group, getattr(os, group) | {call})
+
+
+def _route(monkeypatch, route):
+	'''fd: the platform's own descriptor route. path: by path throughout (Windows; forced). macos: no O_PATH and no /proc, a
+	read descriptor holds the directory (macOS's route, on any platform).'''
+	if route != 'path' and not hpcp._ASK_BY_FD:
+		pytest.skip('no descriptor calls here: the probe goes by path')
+	if route == 'path':
+		monkeypatch.setattr(hpcp, '_ASK_BY_FD', False)
+	elif route == 'macos':
+		monkeypatch.setattr(hpcp, '_PATH_FDS', False)
+		monkeypatch.setattr(hpcp, '_PROBE_BY_FD', False)
+		monkeypatch.setattr(hpcp, '_PARENT_FLAGS', os.O_RDONLY | os.O_DIRECTORY | getattr(os, 'O_CLOEXEC', 0))
+
+
+class _Counter:
+	'''Numbers every os call in COUNTED while on, and runs before(k, name) and after(k, name) around call k. Hooks run with
+	the counter off; they call the real functions (self.real).'''
+
+	def __init__(self, monkeypatch):
+		self.real = {name: getattr(os, name) for name in COUNTED if hasattr(os, name)}
+		self.calls = []
+		self.on = False
+		self.before = self.after = None
+		for name, real in self.real.items():
+			_stand_in(monkeypatch, name, self._wrap(name, real))
+
+	def _hook(self, hook, k, name):
+		if hook:
+			self.on = False
+			try:
+				hook(k, name)
+			finally:
+				self.on = True
+
+	def _wrap(self, name, real):
+		def call(*args, **kwargs):
+			if not self.on:
+				return real(*args, **kwargs)
+			k = len(self.calls)
+			self.calls.append((name, args, kwargs))
+			self._hook(self.before, k, name)
+			try:
+				return real(*args, **kwargs)
+			finally:
+				self._hook(self.after, k, name)
+		return call
+
+	def ask(self, directory, names):
+		self.on = True
+		try:
+			return hpcp._ask_names(directory, names)
+		finally:
+			self.on = False
+
+
+def _folding(monkeypatch, lookup='number'):
+	'''A directory that folds case, stood in for: names made, removed and looked up in a probe directory are lowercased (so
+	'X' and 'x' are one directory, 'x'). lookup: 'number' (stat finds it, one number for both spellings, as most filesystems);
+	'own' (each spelling stats with a number of its own: exFAT through FUSE); 'miss' (stat finds no name there: vfat with
+	iocharset=utf8 looks up only the spelling it made).'''
+	real = {name: getattr(os, name) for name in ('mkdir', 'rmdir', 'stat')}
+	def in_probe(path, kwargs):
+		if not isinstance(path, str):
+			return None
+		directory, name = os.path.split(path)
+		if not directory and kwargs.get('dir_fd') is not None:
+			directory = _fd_path(kwargs['dir_fd'])
+		return name if os.path.basename(directory).startswith(PROBE) else None
+
+	def lowered(name, call):
+		def standing_in(path, *args, **kwargs):
+			spelled = in_probe(path, kwargs)
+			if spelled is None:
+				return call(path, *args, **kwargs)
+			if name == 'stat' and lookup == 'miss':
+				raise FileNotFoundError(errno.ENOENT, 'No such file or directory', path)
+			result = call(os.path.join(os.path.dirname(path), spelled.lower()), *args, **kwargs)
+			if name == 'stat' and lookup == 'own':
+				ino = (hash(spelled) & 0xffffffff) | 1
+				result = os.stat_result((result.st_mode, ino, result.st_dev) + tuple(result[3:10]))
+			return result
+		return standing_in
+	for name in ('mkdir', 'rmdir', 'stat'):
+		_stand_in(monkeypatch, name, lowered(name, real[name]))
+
+
+def _fd_path(fd):
+	if os.path.isdir('/proc/self/fd'):
+		return os.readlink('/proc/self/fd/%d' % fd)
+	import fcntl
+	return fcntl.fcntl(fd, fcntl.F_GETPATH, bytes(1024)).split(b'\0')[0].decode('utf-8', 'surrogateescape')
+
+
+def _owned(path):
+	'''In a root run another user's, mode 0700 (anyone's files are what is lost there); the runner's own otherwise.'''
+	if os.geteuid() == 0:
+		for root, dirs, files in os.walk(path):
+			for name in dirs + files:
+				os.lchown(os.path.join(root, name), 1234, 1234)
+		os.chown(path, 1234, 1234)
+		os.chmod(path, 0o700)
+
+
+def _fill(directory):
+	'''A directory of another's holding files: X and x (the asked names, where the filesystem keeps them apart), keep, a
+	link, and a subdirectory with a file. {relative path: content} of its files.'''
+	os.makedirs(os.path.join(directory, 'sub'))
+	held = {}
+	for name in ('X', 'x', 'keep', os.path.join('sub', 'f')):
+		try:
+			with open(os.path.join(directory, name), 'x') as fh:
+				fh.write('theirs: ' + name)
+			held[name] = 'theirs: ' + name
+		except FileExistsError:  # x on a filesystem that folds: it is X
+			pass
+	os.symlink('keep', os.path.join(directory, 'lnk'))
+	_owned(directory)
+	return held
+
+
+def _held(directory):
+	found = {}
+	for root, dirs, files in os.walk(directory):
+		for name in files:
+			path = os.path.join(root, name)
+			if not os.path.islink(path):
+				with open(path) as fh:
+					found[os.path.relpath(path, directory)] = fh.read()
+	return found
+
+
+@posix_only
+@pytest.mark.parametrize('names', [['X', 'x'], ['a', 'A', 'K', 'k', 'K']], ids=['pair', 'group'])
+@pytest.mark.parametrize('route', ['fd', 'path', 'macos'])
+def test_993_the_probe_makes_directories_and_removes_with_rmdir_and_nothing_else(tmp_path, monkeypatch, route, names):
+	# 9.83 to 9.92 made each name as a file (O_CREAT | O_EXCL), wrote its place into it, and the undo unlinked: on every route
+	# the probe could remove a file, and only the checks around the undo (9.91) said which. 9.93 makes each name with mkdir and
+	# undoes with rmdir: no call that can remove, rename or write a file, and no open that can make or write one. The group, in
+	# a directory that folds (stood in for), also finds which made name holds a spelling (a stat of each).
+	_route(monkeypatch, route)
+	if len(names) > 2:
+		_folding(monkeypatch)
+	counter = _Counter(monkeypatch)
+	out = str(tmp_path / 'out')
+	os.mkdir(out)
+	answers, why = counter.ask(out, names)
+	assert not why and set(answers) == set(names), (answers, why)
+	called = [name for name, args, kwargs in counter.calls]
+	assert not set(called) & set(NEVER), called
+	writes = os.O_CREAT | os.O_WRONLY | os.O_RDWR | os.O_TRUNC | os.O_APPEND
+	opens = [args[1] for name, args, kwargs in counter.calls if name == 'open']
+	assert not [flags for flags in opens if flags & writes], [oct(flags) for flags in opens]
+	# One rmdir for each name made (one for each answer) and one for the probe.
+	assert 'mkdir' in called and called.count('rmdir') == len(set(answers.values())) + 1, called
+	assert os.listdir(out) == []
+
+
+@posix_only
+@pytest.mark.parametrize('what', ['their-directory', 'a-link-to-it', 'an-empty-directory-then-a-file'])
+@pytest.mark.parametrize('route', ['fd', 'path', 'macos'])
+def test_993_whatever_stands_at_the_probes_name_keeps_its_files(tmp_path, monkeypatch, route, what):
+	# Another user who may write the directory asked (not sticky) puts something at the probe's name, before any one call of the
+	# probe (the probe's own directory, once made, renamed aside first): a directory of his holding files, the asked names among
+	# them; a link to such a directory elsewhere (by path, the Windows route, the probe's calls go where it leads); an empty
+	# directory he makes a file in right after that call. 9.92 listed what stood at the name and unlinked it (by path, through
+	# the link). 9.93's undo is rmdir alone: every file stays, wherever it is, and so does a directory while it holds anything,
+	# and a link put at the probe's name. Each call k of an honest probe (the one iteration past its end plants nothing: a
+	# control). The fd and macos routes guard what 9.92 gets right through its checks (empty when opened, the owner of its
+	# first file); by path it fails.
+	_route(monkeypatch, route)
+	monkeypatch.setattr(hpcp.uuid, 'uuid4', lambda: types.SimpleNamespace(hex='0' * 32))
+	probe_name = '%s%d-%s' % (PROBE, os.getpid(), '0' * 32)
+	counter = _Counter(monkeypatch)
+	real = counter.real
+	honest = str(tmp_path / 'honest')
+	os.mkdir(honest)
+	assert counter.ask(honest, ['X', 'x'])[1] == {}
+	total = len(counter.calls)
+	assert total >= 5, counter.calls
+	planted = 0
+	for k in range(total + 1):
+		top = str(tmp_path / ('k%d' % k))
+		out, victim = os.path.join(top, 'out'), os.path.join(top, 'victim')
+		os.makedirs(out)
+		os.chmod(out, 0o777)
+		with open(os.path.join(out, 'mine'), 'w') as fh:
+			fh.write('the runner\'s')
+		theirs = os.path.join(out, 'T')
+		held = _fill(victim if what == 'a-link-to-it' else theirs) if what != 'an-empty-directory-then-a-file' else {}
+		if what == 'an-empty-directory-then-a-file':
+			os.mkdir(theirs)
+			_owned(theirs)
+		at = os.path.join(out, probe_name)
+		state = {'planted': False, 'late': False}
+
+		def before(i, name):
+			if i != k or state['planted']:
+				return
+			state['planted'] = True
+			if os.path.lexists(at):
+				real['rename'](at, at + '.away')
+			if what == 'a-link-to-it':
+				os.symlink(victim, at)
+			else:
+				real['rename'](theirs, at)
+
+		def after(i, name):
+			if what == 'an-empty-directory-then-a-file' and i == k and state['planted'] and os.path.isdir(at) and not os.path.islink(at):
+				with open(os.path.join(at, 'late'), 'w') as fh:
+					fh.write('theirs: late')
+				state['late'] = True
+		counter.calls = []
+		counter.before, counter.after = before, after
+		try:
+			counter.ask(out, ['X', 'x'])
+		finally:
+			counter.before = counter.after = None
+		where = victim if what == 'a-link-to-it' else at if state['planted'] else theirs
+		if what == 'an-empty-directory-then-a-file':
+			if state['late']:
+				assert _held(at) == {'late': 'theirs: late'}, (k, _held(at))
+		else:
+			assert _held(where) == held, (k, counter.calls[:k + 1], _held(where))
+			assert os.path.islink(os.path.join(where, 'lnk')), k
+			if what == 'a-link-to-it' and state['planted']:
+				assert os.path.islink(at), k  # the link itself stays: rmdir takes none (POSIX)
+		with open(os.path.join(out, 'mine')) as fh:
+			assert fh.read() == 'the runner\'s', k
+		planted += state['planted']
+	assert planted >= total, (planted, total)
+
+
+@pytest.mark.parametrize('lookup', ['number', 'own', 'miss'], ids=['by-number', 'a-number-for-each-spelling', 'a-lookup-that-misses'])
+def test_993_a_group_in_a_directory_that_folds_finds_each_holder(tmp_path, monkeypatch, lookup):
+	# Five spellings, two names, in a directory that folds (stood in for: mkdir, rmdir and stat lowercase what is made in a
+	# probe). Which made name holds a spelling that is there already is read from the numbers (9.92 read it from the file the
+	# name held): equal numbers prove one directory, so no further probe is made. Where each spelling stats with a number of its
+	# own (exFAT through FUSE) or the lookup misses (vfat with iocharset=utf8), numbers prove nothing, and each made name is
+	# asked alone, as 9.92 did: the same answers, and nothing left.
+	_folding(monkeypatch, lookup)
+	asked = []
+	ask = hpcp._ask_names
+	monkeypatch.setattr(hpcp, '_ask_names', lambda directory, names: asked.append(list(names)) or ask(directory, names))
+	names = ['a', 'A', 'K', 'k', 'K']
+	answers, why = hpcp._ask_names(str(tmp_path), names)
+	assert (answers, why) == ({'a': 'a', 'A': 'a', 'K': 'K', 'k': 'K', 'K': 'K'}, {}), (answers, why)
+	if lookup == 'number':
+		assert asked == [names], asked
+	else:
+		assert len(asked) > 1 and asked[0] == names, asked
+	assert os.listdir(str(tmp_path)) == []
+
+
+@pytest.mark.parametrize('which', ['first', 'second'])
+@pytest.mark.parametrize('number,fix', [(errno.ENOSPC, 'free some space there'), (errno.EDQUOT, 'free some of the quota')], ids=['nospace', 'quota'])
+def test_993_a_name_that_cannot_be_made_for_space_or_quota_says_the_fix_and_leaves_nothing(tmp_path, monkeypatch, number, fix, which):
+	# A full disk or a quota at its limit refuses the mkdir of a name in the probe: both names get the line that names the fix,
+	# and the probe goes with what it made. (9.91 and 9.92: a quota error at a probe file's close ended the run with exit 70, or
+	# left the probe and that file.)
+	real, made = os.mkdir, []
+
+	def mkdir(path, *args, **kwargs):
+		if isinstance(path, str) and not os.path.basename(path).startswith(PROBE):
+			made.append(path)
+			if len(made) == (1 if which == 'first' else 2):
+				raise OSError(number, os.strerror(number), path)
+		return real(path, *args, **kwargs)
+	_stand_in(monkeypatch, 'mkdir', mkdir)
+	directory = str(tmp_path)
+	answers, why = hpcp._ask_names(directory, ['X', 'x'])
+	line = 'nothing can be made in %s to ask it (%s): %s and run again' % (directory, os.strerror(number), fix)
+	assert made and (answers, why) == ({}, {'X': line, 'x': line}), (made, answers, why)
+	assert os.listdir(directory) == []
+
+
+# ---- -co and set-ID bits ----
+
+not_root = pytest.mark.skipif(not hasattr(os, 'geteuid') or os.geteuid() == 0, reason='a write by root keeps set-ID bits')
+
+
+def _plain_write_leaves(directory, mode):
+	'''The mode a plain write by the runner leaves on a file of mode in directory: the kernel's answer, by doing it.'''
+	path = os.path.join(directory, 'plain-%o' % mode)
+	with open(path, 'w') as fh:
+		fh.write('old')
+	os.chown(path, -1, os.getegid())  # (a set-group-ID chmod by an owner outside the file's group is dropped)
+	os.chmod(path, mode)
+	fd = os.open(path, os.O_WRONLY)
+	try:
+		os.write(fd, b'new')
+	finally:
+		os.close(fd)
+	return os.stat(path).st_mode & 0o7777
+
+
+def _co_rewrite(tmp_path, monkeypatch, mode, route):
+	'''A -co rewrite of out/x (mode, the runner's) from x through copy_file, by route ('default': in place; '-wb': beside),
+	with cp stood in for by cp and then the mode out/x had put back by name, as macOS's cp does through its descriptor. The
+	mode out/x ends with.'''
+	src, out = str(tmp_path / 'x'), str(tmp_path / 'out')
+	os.mkdir(out)
+	for path, text in ((src, 'new'), (os.path.join(out, 'x'), 'old')):
+		with open(path, 'w') as fh:
+			fh.write(text)
+	# In the runner's own group: -wb's new file could not be given another (BSD: a new file takes /tmp's, wheel).
+	os.chown(os.path.join(out, 'x'), -1, os.getegid())
+	os.chmod(os.path.join(out, 'x'), mode)
+	monkeypatch.setattr(hpcp, 'CONTENT_ONLY', True)
+	monkeypatch.setattr(hpcp, 'WRITE_BESIDE', route == '-wb')
+	real = hpcp.run_command_in_multicmd_with_path_check
+
+	def cp_then_put_back(command, *args, **kwargs):
+		result = real(command, *args, **kwargs)
+		if route == 'default':
+			os.chmod(os.path.join(out, 'x'), mode)
+		return result
+	monkeypatch.setattr(hpcp, 'run_command_in_multicmd_with_path_check', cp_then_put_back)
+	assert hpcp.copy_file(src, [os.path.join(out, 'x')])[0] > 0 and not hpcp.ERRORS, hpcp.ERRORS
+	with open(os.path.join(out, 'x')) as fh:
+		assert fh.read() == 'new'
+	return os.stat(os.path.join(out, 'x')).st_mode & 0o7777
+
+
+@posix_only
+@not_root
+@pytest.mark.parametrize('mode', [0o4700, 0o6755, 0o2755, 0o2745])
+@pytest.mark.parametrize('route', ['default', '-wb'])
+def test_993_a_content_only_rewrite_ends_with_the_set_id_bits_a_plain_write_leaves(tmp_path, monkeypatch, reset_hpcp_globals, route, mode):
+	# A -co rewrite by the file's owner (not root) keeps its mode, less the set-ID bits the kernel clears on a write by that
+	# user, as a plain write leaves them (asked here by doing one). macOS's cp (copyfile's data copy, also through the held
+	# descriptor) puts back the mode it found once its own writes have cleared them, so 9.92's rewrite in place kept 4700 and
+	# 6755 there (ran on macOS 26.6.2: 0700 during the copy, 4700 at its end, even after a chmod by hand during it). Stood in
+	# for on any platform: the default route fails on 9.92 for 4700, 6755 and 2755 (2745 is what Linux keeps: a guard); -wb
+	# guards what 9.92 gets right on Linux.
+	plain = _plain_write_leaves(str(tmp_path), mode)
+	assert plain & 0o4000 == 0, oct(plain)
+	assert _co_rewrite(tmp_path, monkeypatch, mode, route) == plain
+
+
+@posix_only
+@not_root
+@pytest.mark.parametrize('route', ['default', '-wb'])
+def test_993_where_set_group_id_runs_without_group_execute_a_rewrite_clears_it_too(tmp_path, monkeypatch, reset_hpcp_globals, route):
+	# macOS runs a 2745 program with its file's group (a set-group-ID program without group execute: ran on 26.6.2), and its
+	# write clears that bit (2745 became 0745); Linux runs it as any other and keeps the bit on a write. 9.92's beside route
+	# applied Linux's rule everywhere, so on macOS a -wb rewrite of 2745 was still a set-group-ID program. Forced here: the
+	# platform as macOS has it.
+	monkeypatch.setattr(hpcp, '_SETGID_NEEDS_GROUP_EXECUTE', False)
+	assert _co_rewrite(tmp_path, monkeypatch, 0o2745, route) == 0o745
+
+
+@posix_only
+@pytest.mark.parametrize('what', ['a-file', 'a-link', 'a-full-directory'])
+@pytest.mark.parametrize('when', ['before-the-names', 'after-the-first-name'])
+@pytest.mark.parametrize('route', ['fd', 'path', 'macos'])
+def test_993_what_stands_at_a_name_in_the_probe_stays(tmp_path, monkeypatch, route, when, what):
+	# Whoever may write the probe (the owner of a directory put at its name; on macOS one the asked directory's inheritable ACL
+	# lets) puts something at a name the probe makes: before the names are made (the name is then there already), or right
+	# after the first is made, that one renamed aside. A file, a link to another's directory, a directory holding a file. The
+	# undo is rmdir of the names made and of the probe: what was put there stays, with what it holds and what the link leads
+	# to, and so does a file made beside it. An undo that unlinked where rmdir is refused, or that removed what it found in
+	# the probe (9.92's, by path), would take them; before the names, the fd and macos routes guard what 9.92 gets right.
+	_route(monkeypatch, route)
+	out, victim = str(tmp_path / 'out'), str(tmp_path / 'victim')
+	os.mkdir(out)
+	held = _fill(victim)
+	real, state = os.mkdir, {'probe': None, 'planted': None}
+
+	def plant(at):
+		if what == 'a-file':
+			with open(at, 'w') as fh:
+				fh.write('theirs')
+		elif what == 'a-link':
+			os.symlink(victim, at)
+		else:
+			real(at)
+			with open(os.path.join(at, 'inside'), 'w') as fh:
+				fh.write('theirs')
+		with open(os.path.join(os.path.dirname(at), 'beside'), 'w') as fh:
+			fh.write('theirs')
+		state['planted'] = at
+
+	def mkdir(path, *args, **kwargs):
+		name = os.path.basename(path)
+		if state['probe'] is None and name.startswith(PROBE):
+			result = real(path, *args, **kwargs)
+			state['probe'] = os.path.join(out, name)
+			if when == 'before-the-names':
+				plant(os.path.join(state['probe'], 'X'))
+			return result
+		result = real(path, *args, **kwargs)
+		if state['probe'] and state['planted'] is None and name == 'X':
+			at = os.path.join(state['probe'], 'X')
+			os.rename(at, at + '.aside')
+			plant(at)
+		return result
+	_stand_in(monkeypatch, 'mkdir', mkdir)
+	hpcp._ask_names(out, ['X', 'x'])
+	at = state['planted']
+	assert at, 'nothing was put in the probe'
+	if what == 'a-file':
+		with open(at) as fh:
+			assert fh.read() == 'theirs'
+	elif what == 'a-link':
+		assert os.path.islink(at)
+	else:
+		assert _held(at) == {'inside': 'theirs'}
+	with open(os.path.join(state['probe'], 'beside')) as fh:
+		assert fh.read() == 'theirs'
+	assert _held(victim) == held and os.path.islink(os.path.join(victim, 'lnk'))
+
+
+@posix_only
+@pytest.mark.parametrize('when', ['before-its-open', 'after-the-first-name'])
+@pytest.mark.parametrize('route', ['fd', 'path', 'macos'])
+def test_993_a_file_at_the_probes_name_stays(tmp_path, monkeypatch, route, when):
+	# The probe's own directory renamed aside and a plain file put at its name, right after the probe is made or right after
+	# its first name: the last rmdir is refused (a file is no directory) and the file stays. An undo that unlinked where rmdir
+	# is refused would take it. Nothing is asserted of the answer. Before its open, it guards what 9.92 gets right.
+	_route(monkeypatch, route)
+	out = str(tmp_path / 'out')
+	os.mkdir(out)
+	real, state = os.mkdir, {'probe': None, 'planted': False}
+
+	def swap():
+		os.rename(state['probe'], state['probe'] + '.aside')
+		with open(state['probe'], 'w') as fh:
+			fh.write('theirs')
+		state['planted'] = True
+
+	def mkdir(path, *args, **kwargs):
+		result = real(path, *args, **kwargs)
+		name = os.path.basename(path)
+		if state['probe'] is None and name.startswith(PROBE):
+			state['probe'] = os.path.join(out, name)
+			if when == 'before-its-open':
+				swap()
+		elif state['probe'] and not state['planted']:
+			swap()
+		return result
+	_stand_in(monkeypatch, 'mkdir', mkdir)
+	hpcp._ask_names(out, ['X', 'x'])
+	assert state['planted'], 'the file was never put at the probe\'s name'
+	with open(state['probe']) as fh:
+		assert fh.read() == 'theirs'
+
+
+@posix_only
+@pytest.mark.skipif(not hasattr(os, 'geteuid') or os.geteuid() != 0, reason='needs root')
+@pytest.mark.parametrize('route', ['default', '-wb'])
+def test_993_a_content_only_rewrite_by_root_keeps_the_set_id_bits(tmp_path, monkeypatch, reset_hpcp_globals, route):
+	# A write by root clears no set-ID bit, so a root -co rewrite keeps the mode whole, in place and beside, also where cp
+	# (stood in for, as macOS's) put the mode back. It guards what 9.92 gets right.
+	assert _co_rewrite(tmp_path, monkeypatch, 0o6755, route) == 0o6755

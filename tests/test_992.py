@@ -99,6 +99,7 @@ def test_a_print_into_a_stdout_that_cannot_take_it_does_not_skip_its_step(tmp_pa
 	assert [step[1] for step in steps if step[0] == 'run'] == ['umount', 'e2fsck', 'tune2fs']
 	assert [step for step in steps if step[0] == 'detach'] == [('detach', '/dev/loop5'), ('detach', '/dev/loop7')]
 	assert not os.path.exists(mount)
+	assert hpcp.ERRORS == []   # a line that could not be printed is dropped: it fails no step (get_rc_from_error prints)
 
 
 def test_a_mount_still_busy_is_unmounted_once_more_quiet_too(tmp_path, reset_hpcp_globals, monkeypatch):
@@ -167,13 +168,14 @@ def test_the_cleanup_shows_what_a_command_that_did_not_end_0_printed(reset_hpcp_
 	assert capsys.readouterr().out == ''
 
 
-def test_what_a_command_printed_has_nowhere_to_go_once_the_reader_quit_and_the_cleanup_goes_on(reset_hpcp_globals, monkeypatch):
+@pytest.mark.parametrize('error', STDOUT_ERRORS, ids=lambda error: type(error).__name__)
+def test_what_a_command_printed_has_nowhere_to_go_once_the_reader_quit_and_the_cleanup_goes_on(reset_hpcp_globals, monkeypatch, error):
 	monkeypatch.setattr(hpcp.multiCMD, 'run_commands', lambda commands, **kwargs: [
 		SimpleNamespace(command=list(command), returncode=1, stdout=['fixed'], stderr=[]) for command in commands])
 	monkeypatch.setattr(hpcp, 'check_path', lambda program: True)
 	detached = []
 	monkeypatch.setattr(hpcp, 'detach_loop_device', lambda device: detached.append(device) or True)
-	monkeypatch.setattr(sys, 'stdout', _GoneReader())
+	monkeypatch.setattr(sys, 'stdout', _GoneReader(error))
 	hpcp.clean_up([], ['/dev/loop5'], [['e2fsck', '-f', '-y', '/img']])
 	assert detached == ['/dev/loop5'] and hpcp.ERRORS == []   # no 'cleanup step failed', and e2fsck's 1 is a success
 
