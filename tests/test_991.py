@@ -71,13 +71,13 @@ def _swap(out, what, victim, moved, then=None):
 
 	def swap(name):
 		assert not state['done']
-		state['done'] = True
 		path = os.path.join(out, name)
 		if what == 'dir-early':
 			os.rename(moved, path)
 		else:
 			os.rename(path, path + '.away')
 			os.symlink(victim, path)
+		state['done'] = True  # once done: a swap that raised is taken by the probe for its own error
 
 	def mkdir(path, *args, **kwargs):
 		result = real_mkdir(path, *args, **kwargs)
@@ -319,6 +319,38 @@ def test_991_a_fifo_or_a_link_at_a_name_in_the_probe_is_never_waited_for_or_foll
 	assert answers.get('P') == 'P' and answers.get('Q') == 'Q', (answers, why)
 	probe = os.path.dirname(planted[0])
 	assert _names(out) == [os.path.basename(probe)] and _names(probe) == ['R'], (_names(out), _names(probe))
+
+
+@posix_only
+@pytest.mark.parametrize('route', ['native', 'macos'])
+def test_991_a_probe_whose_names_show_an_owner_other_than_the_runner_is_answered(tmp_path, monkeypatch, route):
+	# A mount that shows one owner for everything (vfat or exFAT with uid=, NFS root_squash in a root run, an NFSv3 export
+	# that shows one owner) gives the probe and its names an owner other than geteuid(), so a check against geteuid() would
+	# refuse the pair there on every run. 9.91 and 9.92 compared the owner of the probe's first file with the probe's, and 9.93
+	# asks no owner: the pair is answered (it guards what 9.90 and 9.92 get right). Stood in for by fstat and stat showing one
+	# owner higher for all but the directory asked.
+	if route == 'macos':
+		_macs_route(monkeypatch)
+	out = str(tmp_path / 'out')
+	os.mkdir(out)
+	its = os.stat(out)
+
+	def another_owner(real):
+		def call(*args, **kwargs):
+			st = real(*args, **kwargs)
+			if (st.st_dev, st.st_ino) == (its.st_dev, its.st_ino):
+				return st
+			return os.stat_result(tuple(st[:4]) + (st.st_uid + 1,) + tuple(st[5:10]))
+		return call
+	for name in ('fstat', 'stat'):
+		real = getattr(os, name)
+		monkeypatch.setattr(os, name, another_owner(real))
+		for group in ('supports_dir_fd', 'supports_fd', 'supports_follow_symlinks'):
+			if real in getattr(os, group):
+				monkeypatch.setattr(os, group, getattr(os, group) | {getattr(os, name)})
+	answers, why = hpcp._ask_names(out, ['X', 'x'])
+	assert not why and set(answers) == {'X', 'x'}, (answers, why)
+	assert _names(out) == []  # the probe is gone
 
 
 @posix_only
