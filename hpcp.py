@@ -4438,37 +4438,48 @@ def _write_clears(mode):
 		return mode & (stat.S_ISUID | stat.S_ISGID)
 	return mode & stat.S_ISUID
 
-def _carry_over(st, temp, carried, held=None):
+def _carry_over(st, temp, carried, held=None, base=None):
 	"""Give temp, the new file of a -co rewrite, exactly what the old file (st, carried: _co_carry) had: its carried xattrs
 	(each set, and any such name temp gained, as an ACL inherited from a default ACL, removed), owner and group, and mode, less
 	the set-ID bits a write clears (_write_clears) when the runner is not root, as a write in place leaves them. A label the
-	filesystem gives itself (setting security.selinux fails with EOPNOTSUPP: vfat, a context= mount) is skipped. Anything else that fails raises. On Linux each step reaches what cp
-	made through an O_PATH descriptor of it (never opened: a node made of a device is not acted on): a link or another file
-	put at its name since (a user who can write the directory) is refused, so no chown or chmod goes through a link. held: the
-	descriptor hpcp made temp by (_cp_beside), which every step goes through instead."""
-	fd = os.open(temp, os.O_PATH | os.O_NOFOLLOW | getattr(os, 'O_CLOEXEC', 0)) if _PATH_FDS and held is None else None
+	filesystem gives itself (setting security.selinux fails with EOPNOTSUPP: vfat, a context= mount) is skipped. Anything else
+	that fails raises. Every step goes through a descriptor, never temp's name: held, the one hpcp made temp by (_cp_beside);
+	else one opened at temp's name without following a link (on Linux with /proc an O_PATH one, reached by its /proc/self/fd
+	name and never opened for data, so a node made of a device is not acted on; elsewhere one opened for reading). What that
+	opens must be a regular file with one name, owned by the runner or already by the old file's owner: a link, a node or
+	another user's file put at the name since cp made it (a user who can write the directory) is refused, so no chown, chmod
+	or xattr reaches the file a link leads to, and a root run gives no other user's file this one's owner and mode. base: the
+	door's result for temp's directory (_cp_beside), which temp's name is opened in; None: temp, a path."""
+	fd = None
+	if held is None:
+		try:
+			fd = os.open(*(_at(base, os.path.basename(temp)) if base is not None else (temp,)),
+				_CARRY_PATH_FLAGS if _PATH_FDS else _CARRY_READ_FLAGS, **_fd_of(base))
+		except OSError as e:
+			if e.errno in (errno.ELOOP, errno.EMLINK):  # a link at the name: O_NOFOLLOW (EMLINK: FreeBSD's word for it)
+				raise OSError(errno.EEXIST, 'it was replaced since cp made it', temp) from None
+			raise
 	try:
 		if fd is not None:
 			now = os.fstat(fd)
-			if stat.S_ISLNK(now.st_mode) or now.st_nlink != 1:
+			if not stat.S_ISREG(now.st_mode) or now.st_nlink != 1 or now.st_uid not in (os.geteuid(), st.st_uid):
 				raise OSError(errno.EEXIST, 'it was replaced since cp made it', temp)
-			temp = '/proc/self/fd/%d' % fd  # leads to the descriptor's file, and no further
-		elif held is not None:
+			temp = '/proc/self/fd/%d' % fd if _PATH_FDS else fd  # the first leads to the descriptor's file, and no further
+		else:
 			temp = held
-		how = {} if fd is not None or held is not None else {'follow_symlinks': False}
 		if hasattr(os, 'listxattr'):
 			try:
-				gained = os.listxattr(temp, **how)
+				gained = os.listxattr(temp)
 			except OSError as e:
 				if e.errno not in (errno.ENOTSUP, errno.EOPNOTSUPP):
 					raise
 				gained = []
 			for name in gained:
 				if name not in carried and (name.startswith('user.') or name in _CO_CARRIED[:2]):
-					os.removexattr(temp, name, **how)
+					os.removexattr(temp, name)
 			for name, value in carried.items():
 				try:
-					os.setxattr(temp, name, value, **how)
+					os.setxattr(temp, name, value)
 				except OSError as e:
 					if not (name == 'security.selinux' and e.errno in (errno.ENOTSUP, errno.EOPNOTSUPP)):
 						raise
@@ -4483,6 +4494,12 @@ def _carry_over(st, temp, carried, held=None):
 
 # Linux: a file reached through an O_PATH descriptor's /proc/self/fd/N name, never through a link at its own name.
 _PATH_FDS = hasattr(os, 'O_PATH') and os.path.isdir('/proc/self/fd')
+# How _carry_over opens a new file that cp made by name, never following a link at it: O_PATH on Linux with /proc (it acts on
+# nothing it opens); elsewhere (Linux without /proc, macOS, the BSDs) for reading, which fchown, fchmod and the xattr calls
+# take, O_NONBLOCK so a FIFO put there is not waited on, O_NOCTTY so a terminal is not taken.
+_CARRY_PATH_FLAGS = getattr(os, 'O_PATH', 0) | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_CLOEXEC', 0)
+_CARRY_READ_FLAGS = (os.O_RDONLY | getattr(os, 'O_NONBLOCK', 0) | getattr(os, 'O_NOCTTY', 0) | getattr(os, 'O_NOFOLLOW', 0)
+	| getattr(os, 'O_CLOEXEC', 0))
 
 class _Refused(Exception):
 	"""A landing this run will not write, for each file it would hold: a 'Destination clash' (213) naming what is there and
@@ -5447,7 +5464,7 @@ def _cp_beside(command, src_path, target, st, why, space, src_st=None, base=None
 			attributes = None
 			if carried is not None:
 				what = 'its owner, group or an xattr cannot be given to the new copy (%s)'
-				_carry_over(st, _io(base, tname, temp), carried, fd)
+				_carry_over(st, temp, carried, fd, base)
 				attributes = _fat_attributes(_io(base, name, target))
 			elif not CONTENT_ONLY:
 				_remove_stale_xattrs(src_path, _io(base, tname, temp) if fd is None else fd)
