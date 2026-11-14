@@ -17,6 +17,14 @@ Block-image functionality is in **beta**. Only available on Linux. Possible use 
 
 hpcp.bat available on github: simple old tk based GUI intended for basic windows functionality.
 
+## Upgrading to 9.93 from 9.92
+
+Nothing needs doing to upgrade. What changed:
+
+- **The name probe can no longer remove a file:** to ask a destination whether two names that fold alike (`Makefile`, `makefile`) are one name there, hpcp now makes each as an empty directory in its hidden `.hpcp-case-probe-...` directory and removes them only with `rmdir`, which takes nothing but an empty directory, whatever another user puts at those names (the 213 line `the directory made to ask it was replaced by another` is gone). 9.83 to 9.92 made files and unlinked what they found, so on Windows, where the probe goes by path, a link put at its name could have it delete the files of the directory the link led to; 9.93 cannot.
+- **Planned for 9.94** (see [docs/limitations.md](docs/limitations.md)): the deferred entries.
+- **Known** (see [docs/limitations.md](docs/limitations.md)): another user who may write the directory asked (not sticky) can decide the name probe's answer, as in 9.83 to 9.90 (9.91 and 9.92 refused most of these cases); the probe removes no file of theirs.
+
 ## Upgrading to 9.92 from 9.91
 
 Nothing needs doing to upgrade, unless a script gives `-L`, `-F` or `-dis` a text that holds a digit but is no size, or `-ddr` anything but a size (the third change below). What changed:
@@ -32,7 +40,7 @@ Nothing needs doing to upgrade, unless a script gives `-L`, `-F` or `-dis` a tex
 
 Nothing needs doing to upgrade. What changed:
 
-- **The name probe no longer empties, follows or waits for what another user puts at its name:** a copy with two names that fold alike (`Makefile`, `makefile`) asks the destination by making a hidden `.hpcp-case-probe-...` directory in it, and from 9.83 to 9.90 another local user who could write that destination could have it delete the files of another directory (in a root run, anyone's), stop the run for good with a FIFO, or have a file's times set. The probe now works through descriptors of the directories it holds, and a pair it cannot ask about in that run is refused (213) unless the destination's listing already holds both names; Windows still asks by path, and so does macOS in a directory the runner may write and search but not read, under a Python without `os.O_SEARCH` or where that open fails (see [docs/limitations.md](docs/limitations.md), "The name probe by path").
+- **The name probe no longer empties, follows or waits for what another user puts at its name:** a copy with two names that fold alike (`Makefile`, `makefile`) asks the destination by making a hidden `.hpcp-case-probe-...` directory in it, and from 9.83 to 9.90 another local user who could write that destination could have it delete the files of another directory (in a root run, anyone's), stop the run for good with a FIFO, or have a file's times set. The probe now works through descriptors of the directories it holds, and a pair it cannot ask about in that run is refused (213) unless the destination's listing already holds both names; Windows still asks by path, and so does macOS in a directory the runner may write and search but not read, under a Python without `os.O_SEARCH` or where that open fails (9.93 makes the probe safe there too: see above).
 
 ## Upgrading to 9.90 from 9.89
 
