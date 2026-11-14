@@ -15628,8 +15628,15 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = None,
 						if destfs and destfs.lower() != target_file_system.lower():
 							eprint(f"Destination fs type mismatch: Expected {target_file_system}, got {destfs}, ignoring {dest}.")
 							dests_to_remove.append(dest)
-			except FileExistsError :
-				eprint(f"Destination path {dest} may be a mounted dir, known issue with os.path.exists\nContinuing without creating dest folder...")
+			except FileExistsError:
+				# Something is at the name that isdir did not take for a directory: a file, a FIFO or a link to no directory is
+				# left to the copy, which names it; the hint is for a name that cannot be looked at (a dead mount).
+				try:
+					there = os.lstat(dest.rstrip(os.sep) or dest)
+				except OSError:
+					there = None
+				if there is None or stat.S_ISDIR(there.st_mode):
+					eprint(f"Destination path {dest} may be a mounted dir, known issue with os.path.exists\nContinuing without creating dest folder...")
 			except OSError as e:
 				# A destination that cannot be made (no permission, a read-only or full filesystem, a file in its path, a name the
 				# filesystem refuses such as 'x.' on exFAT mounted iocharset=cp1251): that destination is out, and the rest go on.

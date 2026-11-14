@@ -385,14 +385,6 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - **Revisit when:** 9.94.
 - **Noted:** 2026-11-13, found by the 9.92 round 1 fixer while checking the `-tfs` entry above (a deferral, not asked). Moved to 9.94 on 2026-11-13: 9.93 is the name probe's redesign and the `-co` set-user-ID cause; the main session's call (a deferral, not asked).
 
-### `hpcp a/x ldir/ -d a/x` prints a false "may be a mounted dir" hint
-- **Kind:** deferred (9.94).
-- **What the operator sees:** with `ldir` a link to `a`, `hpcp a/x ldir/ -d a/x` (see the known limitation below: exit 213 on Linux) prints `Destination path a/x/ may be a mounted dir, known issue with os.path.exists` and `Continuing without creating dest folder...` before the 213 (ran 2026-11-13), though `a/x` is a plain file there, not a mounted directory. The exit code is right. The same in 9.92.
-- **Why:** with more than one source the destination gets a trailing separator (`get_dest_from_path`), so making `a/x/` where `a/x` is a file raises `FileExistsError`, whose branch in `hpcp()`'s destinations loop prints the hint.
-- **Plan (9.94):** print the hint only when the destination is a directory.
-- **Revisit when:** 9.94.
-- **Noted:** 2026-11-13, the 9.93 final review's second opinion (h993-lim2 3); the main session's call (a deferral, not asked).
-
 ### macOS: the test suite assumes Linux in about 175 tests
 - **Kind:** deferred (9.94).
 - **What the operator sees:** (a developer running the suite on macOS) main's full serial suite on macOS 26, Python 3.9.6, fails 180 tests (2,134 passed, 512 skipped; 9.90: 175 failed, 2,156 passed, 518 skipped; a Python 3.14 run: 163 failed, 2,136 passed, 511 skipped, 16 deselected), never run whole there before. All but a few are the tests' own Linux assumptions: names that differ only in case or Unicode form on a case-insensitive APFS (56), the held file looked up through `/proc/self/fd` where macOS hands `cp` `/dev/fd/N` (34, 15 of them 60-s timeouts), names that are not UTF-8, which APFS refuses (33), Linux's `os.*xattr` calls (27), macOS's 1,024-byte path limit in the deep-tree tests (15), and smaller groups (setgid inheritance, `/proc/mounts`, `os.makedev`, a gc-timed descriptor count, the C locale). The code bugs in it were the paced remove's clock (fixed in 9.90) and the socket (fixed in 9.90); `-tfs` is its own entry above.

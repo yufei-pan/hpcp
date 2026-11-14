@@ -22,6 +22,7 @@ hpcp.bat available on github: simple old tk based GUI intended for basic windows
 Nothing needs doing to upgrade. What changed:
 
 - **`-co` gives a new file its owner, mode and xattrs through a descriptor everywhere:** where `cp` makes a `-co` rewrite's new file by name (Linux without /proc, the BSDs, a `cp` other than GNU `cp`), hpcp opens that name without following a link and sets them through what it opened, which must be a regular file with one name, the runner's or already the old file's owner's; anything else keeps the old copy (190, `it was replaced since cp made it`). 9.93 set them by name there, so a link another user put at that name passed them to the file it led to (in a root run, its owner and its whole mode, set-ID bits included).
+- **No false "may be a mounted dir" hint:** where a destination given more than one source is a file (`hpcp y z -d f`, or `hpcp a/x ldir/ -d a/x` with `ldir` a link to `a`), hpcp no longer prints `Destination path ... may be a mounted dir` and `Continuing without creating dest folder...`; what comes after names the problem, with the same exit code as before.
 
 ## Upgrading to 9.93 from 9.92
 
