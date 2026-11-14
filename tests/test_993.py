@@ -314,6 +314,7 @@ def _plain_write_leaves(directory, mode):
 	path = os.path.join(directory, 'plain-%o' % mode)
 	with open(path, 'w') as fh:
 		fh.write('old')
+	os.chown(path, -1, os.getegid())  # (a set-group-ID chmod by an owner outside the file's group is dropped)
 	os.chmod(path, mode)
 	fd = os.open(path, os.O_WRONLY)
 	try:
@@ -332,6 +333,8 @@ def _co_rewrite(tmp_path, monkeypatch, mode, route):
 	for path, text in ((src, 'new'), (os.path.join(out, 'x'), 'old')):
 		with open(path, 'w') as fh:
 			fh.write(text)
+	# In the runner's own group: -wb's new file could not be given another (BSD: a new file takes /tmp's, wheel).
+	os.chown(os.path.join(out, 'x'), -1, os.getegid())
 	os.chmod(os.path.join(out, 'x'), mode)
 	monkeypatch.setattr(hpcp, 'CONTENT_ONLY', True)
 	monkeypatch.setattr(hpcp, 'WRITE_BESIDE', route == '-wb')
