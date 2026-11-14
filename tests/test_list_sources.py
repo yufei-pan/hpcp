@@ -5611,6 +5611,21 @@ def test_paths_in_different_buckets_are_never_one_place(tmp_path, hpcp_mod, monk
 				assert places.same_place(first, second) is False, (first, second)
 
 
+def test_a_filesystem_that_gives_no_numbers_does_not_make_every_name_one(tmp_path, hpcp_mod, monkeypatch):
+	# A folding directory whose entries all stat with the number 0 (a filesystem that gives none): 0 is no number, so equal
+	# zeros prove nothing and each made name is asked alone. Taken for a number, y would be answered as X, the first made.
+	_probes_folding_case(monkeypatch)
+	real = os.stat
+	def numberless(path, *args, **kwargs):
+		st = real(path, *args, **kwargs)
+		if isinstance(path, str) and os.path.basename(os.path.dirname(_spelled(path, kwargs))).startswith('.hpcp-case-probe-'):
+			return os.stat_result((st.st_mode, 0) + tuple(st[2:10]))
+		return st
+	_stand_in(monkeypatch, 'stat', numberless)
+	assert hpcp_mod._ask_names(str(tmp_path), ['X', 'Y', 'x', 'y']) == ({'X': 'X', 'Y': 'Y', 'x': 'X', 'y': 'Y'}, {})
+	assert os.listdir(tmp_path) == []
+
+
 def test_a_name_that_is_there_already_but_alone_with_none_is_one_that_cannot_be_asked(tmp_path, hpcp_mod, monkeypatch):
 	# The directory takes z for a name it holds once a and b are made, and for neither of them alone: no answer is a guess.
 	real = os.mkdir

@@ -2,7 +2,7 @@
 9.90 (b4dc027) unless it says it guards a case 9.90 already gets right (the 'nothing' cases are the controls: no swap). Every
 swap is forced at the call it is timed by, in this process (no sleeps, no random sweep): another user who can write the
 directory acts once. 9.93 made the probe's names directories and its undo rmdir alone: the tests that timed a swap by a
-file's write or the undo's listing are timed by the probe's mkdir now, and the rest of the probe's tests are in test_993.py.'''
+file's write or the undo's listing are timed by the probe's mkdir now; 9.93's own tests are in test_993.py.'''
 import contextlib
 import errno
 import os
@@ -111,7 +111,8 @@ def test_991_a_probe_replaced_by_a_directory_or_a_link_costs_nobody_a_file(tmp_p
 	# the probe and emptied of its files (Linux's descriptor route, 9.89 and 9.90); a link put there (macOS's route, the probe by
 	# path) sent the undo's listing and unlinks wherever it led. 9.91 refused a directory that was not empty when opened. 9.93
 	# makes only directories and removes only with rmdir: a directory put there early is asked (what it holds decides the
-	# answer: docs/limitations.md), and a link is refused by the open's own error. 'native' is the platform's own route;
+	# answer: docs/limitations.md), and a link is refused by the open's own error (both routes here hold the probe by a
+	# descriptor; by path a link is followed: test_993.py). 'native' is the platform's own route;
 	# 'macos' is macOS's, on any platform. Nothing of what is put at the probe's name may be lost.
 	if route == 'macos':
 		_macs_route(monkeypatch)
@@ -123,6 +124,7 @@ def test_991_a_probe_replaced_by_a_directory_or_a_link_costs_nobody_a_file(tmp_p
 	with _swap(out, what, victim, moved) as state:
 		answers, why = hpcp._ask_names(out, ['X', 'x'])
 	assert state['probe'], 'the probe was never made'
+	assert state['done'], 'the swap never ran'
 	assert _names(victim) == KEPT, 'the directory a link at the probe led to lost files: %r' % _names(victim)
 	kept = os.path.join(out, state['probe']) if what == 'dir-early' else moved
 	assert _names(kept) == KEPT, 'the directory put over the probe lost files: %r' % _names(kept)
@@ -132,6 +134,9 @@ def test_991_a_probe_replaced_by_a_directory_or_a_link_costs_nobody_a_file(tmp_p
 	elif what == 'dir-early':
 		# The directory put there is asked: its X is a name the probe did not make, so which made name holds it cannot be said.
 		assert 'X' in why and 'cannot say which' in why['X'] and 'replaced by another' not in why['X'], (answers, why)
+	elif what == 'link-early':
+		# Not followed (the open's O_NOFOLLOW): nothing is asked in the directory the link leads to, and both names are refused.
+		assert not answers and set(why) == {'X', 'x'}, (answers, why)
 
 
 @posix_only
@@ -314,30 +319,6 @@ def test_991_a_fifo_or_a_link_at_a_name_in_the_probe_is_never_waited_for_or_foll
 	assert answers.get('P') == 'P' and answers.get('Q') == 'Q', (answers, why)
 	probe = os.path.dirname(planted[0])
 	assert _names(out) == [os.path.basename(probe)] and _names(probe) == ['R'], (_names(out), _names(probe))
-
-
-@posix_only
-@pytest.mark.parametrize('route', ['native', 'macos'])
-def test_991_a_probe_whose_files_show_an_owner_other_than_the_runner_is_answered(tmp_path, monkeypatch, route):
-	# 9.91's owner check asked whether the first file made got the probe's owner, as the mount shows both: a mount that shows
-	# its own owner for everything (vfat or exFAT with uid=, NFS root_squash in a root run) gives the probe and its names an
-	# owner other than geteuid(), and a check against geteuid() would refuse the pair on every run. 9.93 asks no owner; the
-	# pair is still answered there. Stood in for by an os.fstat that shows one owner higher for all but the directory.
-	if route == 'macos':
-		_macs_route(monkeypatch)
-	out = str(tmp_path / 'out')
-	os.mkdir(out)
-	its, real_fstat = os.stat(out), os.fstat
-
-	def fstat(fd):
-		st = real_fstat(fd)
-		if (st.st_dev, st.st_ino) == (its.st_dev, its.st_ino):
-			return st
-		return os.stat_result(tuple(st[:4]) + (st.st_uid + 1,) + tuple(st[5:10]))
-	monkeypatch.setattr(os, 'fstat', fstat)
-	answers, why = hpcp._ask_names(out, ['X', 'x'])
-	assert not why and set(answers) == {'X', 'x'}, (answers, why)
-	assert _names(out) == []  # the probe is gone
 
 
 @posix_only

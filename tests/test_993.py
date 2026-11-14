@@ -197,9 +197,10 @@ def test_993_whatever_stands_at_the_probes_name_keeps_its_files(tmp_path, monkey
 	# probe (the probe's own directory, once made, renamed aside first): a directory of his holding files, the asked names among
 	# them; a link to such a directory elsewhere (by path, the Windows route, the probe's calls go where it leads); an empty
 	# directory he makes a file in right after that call. 9.92 listed what stood at the name and unlinked it (by path, through
-	# the link; on any route, a directory put there after its check). 9.93's undo is rmdir alone: every file stays, wherever
-	# it is, and so does a directory while it holds anything. Each call k of an honest probe, and one more. The fd and macos
-	# routes guard what 9.92 gets right through its checks (empty when opened, the owner of its first file); by path it fails.
+	# the link). 9.93's undo is rmdir alone: every file stays, wherever
+	# it is, and so does a directory while it holds anything. Each call k of an honest probe (the one iteration past its end
+	# plants nothing: a control). The fd and macos routes guard what 9.92 gets right through its checks (empty when opened,
+	# the owner of its first file); by path it fails.
 	_route(monkeypatch, route)
 	monkeypatch.setattr(hpcp.uuid, 'uuid4', lambda: types.SimpleNamespace(hex='0' * 32))
 	probe_name = '%s%d-%s' % (PROBE, os.getpid(), '0' * 32)
@@ -361,7 +362,8 @@ def test_993_a_content_only_rewrite_ends_with_the_set_id_bits_a_plain_write_leav
 	# user, as a plain write leaves them (asked here by doing one). macOS's cp (copyfile's data copy, also through the held
 	# descriptor) puts back the mode it found once its own writes have cleared them, so 9.92's rewrite in place kept 4700 and
 	# 6755 there (ran on macOS 26.6.2: 0700 during the copy, 4700 at its end, even after a chmod by hand during it). Stood in
-	# for on any platform: the default route fails on 9.92 everywhere; -wb guards what 9.92 gets right on Linux.
+	# for on any platform: the default route fails on 9.92 for 4700, 6755 and 2755 (2745 is what Linux keeps: a guard); -wb
+	# guards what 9.92 gets right on Linux.
 	plain = _plain_write_leaves(str(tmp_path), mode)
 	assert plain & 0o4000 == 0, oct(plain)
 	assert _co_rewrite(tmp_path, monkeypatch, mode, route) == plain
@@ -377,3 +379,108 @@ def test_993_where_set_group_id_runs_without_group_execute_a_rewrite_clears_it_t
 	# platform as macOS has it.
 	monkeypatch.setattr(hpcp, '_SETGID_NEEDS_GROUP_EXECUTE', False)
 	assert _co_rewrite(tmp_path, monkeypatch, 0o2745, route) == 0o745
+
+
+@posix_only
+@pytest.mark.parametrize('what', ['a-file', 'a-link', 'a-full-directory'])
+@pytest.mark.parametrize('when', ['before-the-names', 'after-the-first-name'])
+@pytest.mark.parametrize('route', ['fd', 'path', 'macos'])
+def test_993_what_stands_at_a_name_in_the_probe_stays(tmp_path, monkeypatch, route, when, what):
+	# Whoever may write the probe (the owner of a directory put at its name; on macOS one the asked directory's inheritable ACL
+	# lets) puts something at a name the probe makes: before the names are made (the name is then there already), or right
+	# after the first is made, that one renamed aside. A file, a link to another's directory, a directory holding a file. The
+	# undo is rmdir of the names made and of the probe: what was put there stays, with what it holds and what the link leads
+	# to, and so does a file made beside it. An undo that unlinked where rmdir is refused, or that removed what it found in
+	# the probe (9.92's), would take them.
+	_route(monkeypatch, route)
+	out, victim = str(tmp_path / 'out'), str(tmp_path / 'victim')
+	os.mkdir(out)
+	held = _fill(victim)
+	real, state = os.mkdir, {'probe': None, 'planted': None}
+
+	def plant(at):
+		if what == 'a-file':
+			with open(at, 'w') as fh:
+				fh.write('theirs')
+		elif what == 'a-link':
+			os.symlink(victim, at)
+		else:
+			real(at)
+			with open(os.path.join(at, 'inside'), 'w') as fh:
+				fh.write('theirs')
+		with open(os.path.join(os.path.dirname(at), 'beside'), 'w') as fh:
+			fh.write('theirs')
+		state['planted'] = at
+
+	def mkdir(path, *args, **kwargs):
+		name = os.path.basename(path)
+		if state['probe'] is None and name.startswith(PROBE):
+			result = real(path, *args, **kwargs)
+			state['probe'] = os.path.join(out, name)
+			if when == 'before-the-names':
+				plant(os.path.join(state['probe'], 'X'))
+			return result
+		result = real(path, *args, **kwargs)
+		if state['probe'] and state['planted'] is None and name == 'X':
+			at = os.path.join(state['probe'], 'X')
+			os.rename(at, at + '.aside')
+			plant(at)
+		return result
+	_stand_in(monkeypatch, 'mkdir', mkdir)
+	hpcp._ask_names(out, ['X', 'x'])
+	at = state['planted']
+	assert at, 'nothing was put in the probe'
+	if what == 'a-file':
+		with open(at) as fh:
+			assert fh.read() == 'theirs'
+	elif what == 'a-link':
+		assert os.path.islink(at)
+	else:
+		assert _held(at) == {'inside': 'theirs'}
+	with open(os.path.join(state['probe'], 'beside')) as fh:
+		assert fh.read() == 'theirs'
+	assert _held(victim) == held and os.path.islink(os.path.join(victim, 'lnk'))
+
+
+@posix_only
+@pytest.mark.parametrize('when', ['before-its-open', 'after-the-first-name'])
+@pytest.mark.parametrize('route', ['fd', 'path', 'macos'])
+def test_993_a_file_at_the_probes_name_stays(tmp_path, monkeypatch, route, when):
+	# The probe's own directory renamed aside and a plain file put at its name, right after the probe is made or right after
+	# its first name: the last rmdir is refused (a file is no directory) and the file stays. An undo that unlinked where rmdir
+	# is refused would take it. Nothing is asserted of the answer.
+	_route(monkeypatch, route)
+	out = str(tmp_path / 'out')
+	os.mkdir(out)
+	real, state = os.mkdir, {'probe': None, 'planted': False}
+
+	def swap():
+		os.rename(state['probe'], state['probe'] + '.aside')
+		with open(state['probe'], 'w') as fh:
+			fh.write('theirs')
+		state['planted'] = True
+
+	def mkdir(path, *args, **kwargs):
+		result = real(path, *args, **kwargs)
+		name = os.path.basename(path)
+		if state['probe'] is None and name.startswith(PROBE):
+			state['probe'] = os.path.join(out, name)
+			if when == 'before-its-open':
+				swap()
+		elif state['probe'] and not state['planted']:
+			swap()
+		return result
+	_stand_in(monkeypatch, 'mkdir', mkdir)
+	hpcp._ask_names(out, ['X', 'x'])
+	assert state['planted'], 'the file was never put at the probe\'s name'
+	with open(state['probe']) as fh:
+		assert fh.read() == 'theirs'
+
+
+@posix_only
+@pytest.mark.skipif(not hasattr(os, 'geteuid') or os.geteuid() != 0, reason='needs root')
+@pytest.mark.parametrize('route', ['default', '-wb'])
+def test_993_a_content_only_rewrite_by_root_keeps_the_set_id_bits(tmp_path, monkeypatch, reset_hpcp_globals, route):
+	# A write by root clears no set-ID bit, so a root -co rewrite keeps the mode whole, in place and beside, also where cp
+	# (stood in for, as macOS's) put the mode back.
+	assert _co_rewrite(tmp_path, monkeypatch, 0o6755, route) == 0o6755

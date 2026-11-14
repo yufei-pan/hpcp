@@ -449,3 +449,17 @@ def stop_alarms(monkeypatch, reset_hpcp_globals):
 				close_descriptors(descriptors_opened_since(before))
 		return stopped
 	return run
+
+_REAL_HELD = hpcp._HELD
+
+
+@pytest.fixture(autouse=True)
+def _no_route_does_not_outlive_its_test():
+	"""_held_route keeps its answer for the process. A test that got "no route" because of what it stood in for (hpcp.tempfile
+	replaced by a namespace with no tempdir: test_dd_errors.py; cp_supports_sparse answering False: test_copy.py), as the first
+	of its process to ask, handed it to every later test of its xdist worker: the ones that assert cp got /proc/self/fd/N then
+	failed (test_landings.py::test_a_link_swapped_in_after_the_open_is_not_written_through, once under -n 24; never in the
+	serial run, where an earlier file has asked). "No route" is asked again by the next test."""
+	yield
+	if _REAL_HELD[0] == os.getpid() and _REAL_HELD[1] is None:
+		_REAL_HELD[:] = [None, None]
