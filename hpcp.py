@@ -1490,6 +1490,8 @@ class _pool:
 					space = _SPACE_WARNED[2] if self.space and _SPACE_WARNED is not None else None
 					kwargs = {'initializer': _pool_worker_start, 'initargs': (handed, space, self.rate)}
 				self.executor = ProcessPoolExecutor(max_workers=self.max_workers, **kwargs)
+				if (3, 9) <= sys.version_info < (3, 12):
+					self.executor._processes = _Workers()  # before the first submit, which hands it to the manager thread
 			finally:
 				_restore_stops(mask)
 		except BaseException:
@@ -1610,6 +1612,15 @@ class _pool:
 						'Ctrl-\\ ends hpcp now, which may leave a temporary file or a torn file there')
 			if alive:
 				multiprocessing.connection.wait([child.sentinel for child in alive], timeout=1)
+
+class _Workers(dict):
+	"""A pool's {pid: worker process} (ProcessPoolExecutor._processes) on Python 3.9 to 3.11, whose values() is a copy. From
+	3.9 a forkserver or spawn pool starts its workers as work comes, in submit, under the lock that the manager thread does not
+	take on a worker's death before 3.12 (terminate_broken): its walk over the workers met one being added, and its thread's
+	`RuntimeError: dictionary changed size during iteration` traceback was printed after an early Ctrl-C (EL7, Python 3.11,
+	spawn: 8 of 12 batches of the early-stop test). A copy is taken in C, which no other thread can cut."""
+	def values(self):
+		return list(dict.values(self))
 
 _QUIETED_36 = []
 

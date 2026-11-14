@@ -237,3 +237,21 @@ def test_994_a_destination_that_is_a_file_gets_no_mounted_dir_hint(tmp_path, cas
 	assert 'may be a mounted dir' not in output and 'Continuing without creating dest folder' not in output, output[-2000:]
 	assert rc in ((202, 213) if case == 'link-to-the-file-s-directory' else (190,)), output[-2000:]
 	assert _read(str(tmp_path / 'a/x')) == 'A' and _read(str(tmp_path / 'f')) == 'F'
+
+
+@pytest.mark.skipif(not (3, 9) <= __import__('sys').version_info < (3, 12), reason='3.9 to 3.11: a forkserver or spawn pool '
+	'adds its workers in submit, and its manager thread walks them without the lock (3.12 takes it; 3.6 to 3.8 start all at once)')
+def test_994_a_pool_s_worker_table_can_be_walked_while_a_worker_is_added(reset_hpcp_globals):
+	# On EL7 (Python 3.11, spawn) an early Ctrl-C printed the pool manager thread's `RuntimeError: dictionary changed size
+	# during iteration` in 8 of 12 batches of the early-stop test (9.88 to 9.93): a worker died, and the manager thread's
+	# terminate_broken walked the workers (get_n_children_alive, then p.terminate() and p.join()) while the main thread's
+	# submit added one. Forced here at that instant: an add inside the walk. 9.93's table is a plain dict.
+	with hpcp._pool(1) as pool:
+		processes = pool.executor._processes
+		processes[-1] = None
+		walked = []
+		for process in processes.values():  # the manager thread's walk
+			walked.append(process)
+			processes[-2] = None  # the main thread's submit, adding a worker meanwhile
+		assert walked == [None] and sorted(processes) == [-2, -1]
+		del processes[-1], processes[-2]
