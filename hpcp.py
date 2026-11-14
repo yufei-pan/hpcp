@@ -3338,15 +3338,16 @@ def format_bytes(size, use_1024_bytes=None, to_int=False, to_str=False,str_forma
 	"""
 	return multiCMD.format_bytes(size, use_1024_bytes=use_1024_bytes, to_int=to_int, to_str=to_str,str_format=str_format)
 
-# A size as hpcp takes one, in ASCII only: a number (at most 27 digits before a point, then a fraction; a leading + or - and a
-# leading point are number syntax), then a unit or none: a letter K to Y (1000s; an i after it for 1024s), a B at the end. The
-# text is judged here, by hpcp's own rule, before the run touches anything, and converted once: multiCMD's format_bytes answers
-# what it cannot read with a 0, a None or a message, by version, and reads the front of a text with anything after it (hpcp
-# took `-ddr one` for a 0-byte partition and wiped the destination's partition table, and `-L 5foo` ended in a TypeError at the
-# first progress bar).
-_SIZE_TEXT = re.compile(r'([+-]?)(\d{1,27}(?:\.\d+)?|\.\d+)(\s*(?:[kmgtpezy]i?)?b?)', re.IGNORECASE | re.ASCII)
-# A rate written as one (-L 10MB/s, -F 100/s): the /s says nothing more.
-_PER_SECOND = re.compile(r'\s*/\s*s\Z', re.IGNORECASE | re.ASCII)
+# A size as hpcp takes one, in ASCII only: a number (at most 27 digits before a point, as a 28th makes it 1000Y or more and a
+# few hundred overflow the converter's float; a leading + or -, and a point at either end, are number syntax), then a unit or
+# none: a letter K to Y (1000s; an i after it for 1024s), a B at the end. The text is judged here, by hpcp's own rule, before
+# the run touches anything, and converted once: multiCMD's format_bytes answers what it cannot read with a 0, a None or a
+# message, by version, and reads the front of a text with anything after it (hpcp took `-ddr one` for a 0-byte partition and
+# wiped the destination's partition table, and `-L 5foo` ended in a TypeError at the first progress bar).
+_SIZE_TEXT = re.compile(r'([+-]?)(\d{1,27}(?:\.\d*)?|\.\d+)(\s*(?:[kmgtpezy]i?)?b?)', re.IGNORECASE | re.ASCII)
+# A rate written as one (-L 10MB/s, -F 100/sec): the /s says nothing more. It starts at the slash, so a long run of blanks
+# costs one pass (a leading \s* tried again from every blank: 19 s for 128 KiB of them); the blanks before it go by rstrip.
+_PER_SECOND = re.compile(r'/\s*s(?:ec(?:ond)?)?\Z', re.IGNORECASE | re.ASCII)
 # The first size that is too large, 1000 Y: the units end at Y, and the progress bar has no label for more (a KeyError at its
 # first frame, from 1024 Yi for -L and from 1000 Y for -F).
 _SIZE_END = 1000 ** 9
@@ -3357,9 +3358,9 @@ _WITHOUT_A_SIZE = {'-L': 'no rate limit', '-F': 'no rate limit', '-dis': 'no spl
 def _read_size(option, value):
 	"""One size option's value as (its size in whole bytes or files, or None when unset; a note to print; what is wrong with
 	it): at most one of the last two. Unset is None or False. A text that holds a digit is a number: it is a size by _SIZE_TEXT
-	(surrounding blanks dropped, and for a rate a /s at its end), or it is wrong. A number is a size when it is finite. For -L,
-	-F and -dis a text with no digit (an empty one, a word), a negative number and a size below 1 mean no limit and no split,
-	with a note that says so; a size of _SIZE_END or more and, for -ddr, everything that is not a size above 0 are wrong."""
+	(surrounding blanks dropped, and for a rate a /s or /sec at its end), or it is wrong. A number is a size when it is finite.
+	For -L, -F and -dis a text with no digit (an empty one, a word), a negative number and a size below 1 mean no limit and no
+	split, with a note that says so; a size of _SIZE_END or more and, for -ddr, everything that is not a size above 0 are wrong."""
 	without = _WITHOUT_A_SIZE.get(option)
 	no_size = f"{option} {value!r} is not a size (a number and an optional unit, such as {'512, 10M' if without else '100G'} or 1.5GiB)"
 	if value is None or value is False:
@@ -3368,7 +3369,7 @@ def _read_size(option, value):
 	if isinstance(value, str):
 		text = value.strip()
 		if option in ('-L', '-F'):
-			text = _PER_SECOND.sub('', text)
+			text = _PER_SECOND.sub('', text).rstrip()
 		if not any(char.isdecimal() for char in text):
 			size, why = 0, 'has no number'
 		else:
@@ -3378,6 +3379,7 @@ def _read_size(option, value):
 			sign, number, unit = match.groups()
 			if number.startswith('.'):
 				number = '0' + number   # format_bytes wants a digit before the point
+			number = number.rstrip('.')   # and reads 5.G as 5
 			if sign == '-' and float(number):
 				size, why = 0, 'is below 0'
 			else:

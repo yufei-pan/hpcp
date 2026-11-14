@@ -1,7 +1,8 @@
-'''hpcp 9.92: the cleanup after an image run runs every step, quiet, and shows what a command that did not end 0 printed. Every
-failure is forced at the step it is timed by, in this process: once the reader of stdout has quit, a shown command's call raises
-BrokenPipeError (multiCMD 1.61 to 1.63 at its first line, 1.64 when it prints for over a second) and a print raises it too.
-The tests named "real" run real commands through the embedded multiCMD; none needs root or a loop device.'''
+'''hpcp 9.92: the cleanup after an image run runs every step, quiet, and shows what a command that did not end 0 printed on
+stdout. Most tests force each failure in this process, at the step it meets it: a stdout whose reader quit raises
+BrokenPipeError at a write that reaches it (a shown command's output, a flushed print), a full one OSError, a closed one
+ValueError. The tests named "real" run real commands through the embedded multiCMD; none needs root or a loop device.'''
+import errno
 import os
 import subprocess
 import sys
@@ -12,22 +13,33 @@ import pytest
 import hpcp
 
 DELAYED = [['e2fsck', '-f', '-y', '/img'], ['tune2fs', '-U', 'random', '/img'], ['losetup', '--detach', '/dev/loop7']]
+# what a write to stdout can raise: its reader quit (`hpcp -dd src dst | head`), a full disk under `> log`, a library caller
+# that closed sys.stdout
+STDOUT_ERRORS = [BrokenPipeError(errno.EPIPE, 'Broken pipe'), OSError(errno.ENOSPC, 'No space left on device'),
+	ValueError('I/O operation on closed file.')]
+
+
+def _raise(error):
+	raise type(error)(*error.args)
 
 
 class _GoneReader:
-	'''A stdout whose reader quit: every write and flush raises BrokenPipeError, as `hpcp -dd src dst | head` gives it.'''
+	'''A stdout that cannot be written: every write and flush raises the error it is given.'''
 	encoding = 'utf-8'
 
+	def __init__(self, error=STDOUT_ERRORS[0]):
+		self.error = error
+
 	def write(self, text):
-		raise BrokenPipeError(32, 'Broken pipe')
+		_raise(self.error)
 
 	def flush(self):
-		raise BrokenPipeError(32, 'Broken pipe')
+		_raise(self.error)
 
 
-def _record(monkeypatch, fail=(), mounted=()):
+def _record(monkeypatch, fail=(), mounted=(), error=STDOUT_ERRORS[0]):
 	'''clean_up's three kinds of step recorded in order: a command call (its tool), a loop device's detach. A tool or a loop
-	device in fail raises BrokenPipeError when it is called, as a shown call or a print does once stdout's reader has quit.
+	device in fail raises error when it is called, as a shown call or a print does once stdout cannot be written.
 	mounted: what _is_mount_point answers, call by call (then False).'''
 	steps = []
 	mounted = list(mounted)
@@ -36,7 +48,7 @@ def _record(monkeypatch, fail=(), mounted=()):
 		for command in commands:
 			steps.append(('run', command[0], kwargs.get('quiet'), kwargs.get('show_errors')))
 			if command[0] in fail:
-				raise BrokenPipeError(32, 'Broken pipe')
+				_raise(error)
 		return [[] for _ in commands]
 
 	monkeypatch.setattr(hpcp, 'run_commands_in_multicmd_with_path_check', run)
@@ -44,7 +56,7 @@ def _record(monkeypatch, fail=(), mounted=()):
 	def detach(device):
 		steps.append(('detach', device))
 		if device in fail:
-			raise BrokenPipeError(32, 'Broken pipe')
+			_raise(error)
 		return True
 
 	monkeypatch.setattr(hpcp, 'detach_loop_device', detach)
@@ -52,15 +64,16 @@ def _record(monkeypatch, fail=(), mounted=()):
 	return steps
 
 
+@pytest.mark.parametrize('error', STDOUT_ERRORS, ids=lambda error: type(error).__name__)
 @pytest.mark.parametrize('raising, ran', [
 	# the delayed pair is one call: tune2fs is skipped with the e2fsck that raised, the detaches are not
 	('e2fsck', ['umount', 'umount', 'e2fsck']),
 	('umount', ['umount', 'umount', 'e2fsck', 'tune2fs']),
 	('/dev/loop5', ['umount', 'umount', 'e2fsck', 'tune2fs']),   # a detach that raises (its own print): the next devices are still detached
 ])
-def test_a_step_that_raises_broken_pipe_does_not_skip_the_steps_after_it(tmp_path, reset_hpcp_globals, monkeypatch, capsys, raising, ran):
+def test_a_step_that_raises_does_not_skip_the_steps_after_it(tmp_path, reset_hpcp_globals, monkeypatch, capsys, raising, ran, error):
 	# 9.91: the call raised out of clean_up, so the later mounts, the delayed commands and every loop device were skipped
-	steps = _record(monkeypatch, fail=(raising,))
+	steps = _record(monkeypatch, fail=(raising,), error=error)
 	mounts = [str(tmp_path / 'first'), str(tmp_path / 'second')]
 	for mount in mounts:
 		os.mkdir(mount)
@@ -71,14 +84,15 @@ def test_a_step_that_raises_broken_pipe_does_not_skip_the_steps_after_it(tmp_pat
 	assert os.listdir(str(tmp_path)) == []
 	assert loops == []
 	said = capsys.readouterr().err
-	assert 'General Exception: cleanup step' in said and 'BrokenPipeError' in said
+	assert 'General Exception: cleanup step' in said and type(error).__name__ in said
 	assert hpcp.get_rc_from_error() == 70   # the step that failed counts in the run's exit code
 
 
-def test_a_print_into_a_stdout_nobody_reads_does_not_skip_its_step(tmp_path, reset_hpcp_globals, monkeypatch):
+@pytest.mark.parametrize('error', STDOUT_ERRORS, ids=lambda error: type(error).__name__)
+def test_a_print_into_a_stdout_that_cannot_take_it_does_not_skip_its_step(tmp_path, reset_hpcp_globals, monkeypatch, error):
 	# 9.91: print raised first in each step, before its umount, rmdir and detach
 	steps = _record(monkeypatch)
-	monkeypatch.setattr(sys, 'stdout', _GoneReader())
+	monkeypatch.setattr(sys, 'stdout', _GoneReader(error))
 	mount = str(tmp_path / 'mount')
 	os.mkdir(mount)
 	hpcp.clean_up([mount], ['/dev/loop5'], [list(command) for command in DELAYED])
@@ -102,7 +116,7 @@ def test_every_command_of_the_cleanup_runs_quiet_and_its_failure_is_still_said(t
 
 	def run_commands(commands, **kwargs):
 		calls.append((os.path.basename(commands[0][0]), kwargs.get('quiet')))
-		return [SimpleNamespace(command=' '.join(command), returncode=4 if os.path.basename(command[0]) == 'e2fsck' else 0, stdout=[], stderr=['/img: bad superblock'])
+		return [SimpleNamespace(command=list(command), returncode=4 if os.path.basename(command[0]) == 'e2fsck' else 0, stdout=[], stderr=['/img: bad superblock'])
 			for command in commands]
 
 	monkeypatch.setattr(hpcp.multiCMD, 'run_commands', run_commands)
@@ -181,16 +195,22 @@ def test_real_cleanup_with_stdout_closed_runs_a_command_that_prints_for_seconds_
 	code = ('import sys; sys.path.insert(0, %r); import hpcp\n'
 		'hpcp.clean_up([], [], [["sh", "-c", "i=0; while [ $i -lt 25 ]; do echo line $i; sleep 0.1; i=$((i+1)); done; touch done-mark"]])\n'
 		'sys.stderr.write("clean_up returned\\n")\n' % os.path.dirname(os.path.abspath(hpcp.__file__)))
-	task = subprocess.Popen([sys.executable, '-c', code], stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=str(tmp_path))
-	task.stdout.close()
-	said = task.stderr.read().decode('utf-8', 'replace')
-	task.wait(timeout=120)
+	reader, writer = os.pipe()
+	os.close(reader)   # quit before the child starts: its first write that reaches the pipe meets no reader
+	try:
+		task = subprocess.Popen([sys.executable, '-c', code], stdout=writer, stderr=subprocess.PIPE, cwd=str(tmp_path))
+	finally:
+		os.close(writer)
+	try:
+		said = task.communicate(timeout=120)[1].decode('utf-8', 'replace')   # a hang fails here, not the whole run
+	finally:
+		task.kill()
 	assert 'clean_up returned' in said and os.path.exists(str(tmp_path / 'done-mark')), said[-2000:]
 
 
 def test_a_library_call_with_an_ascii_stdout_draws_its_progress_bar(tmp_path):
 	# multiCMD 1.61's print_progress_bar printed its non-ASCII bar again in its except branch: 9.91's library call on Python 3.6
-	# under LC_ALL=C returned 70 after half the files (any Python, with an ASCII stdout forced); 1.62's falls back to ASCII
+	# under LC_ALL=C returned 70, its files copied (any Python, with an ASCII stdout forced); 1.62's falls back to ASCII
 	src, dst = tmp_path / 'src', tmp_path / 'dst'
 	src.mkdir()
 	dst.mkdir()

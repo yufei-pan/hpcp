@@ -6,6 +6,7 @@ a digit and is no size ends the run as a usage error (241), and so does everythi
 import os
 import subprocess
 import sys
+import time
 
 import pytest
 
@@ -17,7 +18,7 @@ HPCP = os.path.abspath(hpcp.__file__)
 REFUSED = [
 	('-ddr', ['one']), ('-ddr', ['5foo']), ('-ddr', ['100G', '5foo']), ('-ddr', ['']), ('-ddr', ['-1']), ('-ddr', ['10G/s']),
 	('-L', '5foo'), ('-L', '1e3'), ('-L', '1,5M'), ('-L', '10M per second'), ('-L', '{10TiB}'), ('-F', '5foo'), ('-dis', '5foo'),
-	('-dis', '10G/s'), ('-dis', '{10TiB}'),
+	('-dis', '10G/s'), ('-dis', '10G/sec'), ('-dis', '{10TiB}'),
 ]
 # run with no limit or no split, and said: (option, value, the note)
 WITHOUT = [
@@ -31,8 +32,8 @@ KEYWORD = {'-ddr': 'dd_resize', '-L': 'bytes_rate_limit', '-F': 'files_rate_limi
 
 
 def _dd_recorders(monkeypatch):
-	'''-dd's outside-world steps (the source's partition table, the image resize, the partition table write, a loop device) as
-	recorders: no test here reaches losetup, also when the refusal is undone.'''
+	'''-dd's outside-world steps (the source's partition table, the image resize, the partition table write, a loop device's
+	attach and detach, the partition list) as recorders: no test here reaches losetup or lsblk, also when the refusal is undone.'''
 	steps = []
 	infos = {'src': {'size': 300 * G, 'disk_identifier': 'x', 'sector_size': 512}, '1': {'size': 100 * G, 'sector_size': 512},
 		'2': {'size': 50 * G, 'sector_size': 512}}
@@ -46,6 +47,8 @@ def _dd_recorders(monkeypatch):
 	monkeypatch.setattr(hpcp, 'resize_image', lambda name, size: steps.append(('resize_image', size)))
 	monkeypatch.setattr(hpcp, 'create_partition_table', lambda *a, **k: steps.append('create_partition_table') or ([], None))
 	monkeypatch.setattr(hpcp, 'create_loop_device', lambda *a, **k: steps.append('create_loop_device') or '/dev/null')
+	monkeypatch.setattr(hpcp, 'detach_loop_device', lambda *a, **k: steps.append('detach_loop_device') or True)
+	monkeypatch.setattr(hpcp, 'get_partitions', lambda *a, **k: steps.append('get_partitions') or [])
 	return steps
 
 
@@ -91,7 +94,22 @@ def test_a_size_that_cannot_be_read_ends_the_command_line_with_241(tmp_path, opt
 	task = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60, cwd=str(tmp_path))
 	assert task.returncode == 241, (task.returncode, task.stdout[-800:], task.stderr[-800:])
 	assert b'Invalid arguments: ' + option.encode() + b' ' in task.stderr
+	assert b'Continuing in 5 seconds' not in task.stdout + task.stderr   # refused before -dd's root warning
 	assert dst.read_text() == 'keep' and sorted(os.listdir(str(tmp_path))) == ['dst', 'src']
+
+
+def test_a_bad_ddr_before_a_good_one_is_refused_too(tmp_path, reset_hpcp_globals, monkeypatch, capsys):
+	steps = _dd_recorders(monkeypatch)
+	assert hpcp.hpcp(['src'], dest_paths=[str(tmp_path / 'img')], dd=True, dd_resize=['one', '100G']) == 241
+	assert "-ddr 'one' is not a size" in capsys.readouterr().err and steps == []
+
+
+def test_a_valid_limit_beside_a_refused_one_is_not_set(tmp_path, reset_hpcp_globals):
+	# every size is read before any is set: a library caller's limits stay as they were
+	src, dst = _tree(tmp_path)
+	before = (hpcp.BYTES_RATE_LIMIT, hpcp.FILES_RATE_LIMIT)
+	assert hpcp.hpcp([str(src) + '/'], dest_paths=[str(dst)], single_thread=True, bytes_rate_limit='10M', files_rate_limit='5foo') == 241
+	assert (hpcp.BYTES_RATE_LIMIT, hpcp.FILES_RATE_LIMIT) == before and not dst.exists()
 
 
 @pytest.mark.parametrize('option, value, note', WITHOUT)
@@ -118,9 +136,10 @@ def test_a_value_with_no_number_runs_through_the_command_line_too(tmp_path):
 
 
 @pytest.mark.parametrize('value, limit', [('10MB/s', 10 ** 7), ('10M/s', 10 ** 7), ('10 MiB / S', 10 * 1024 ** 2), (' 512 ', 512), ('0', 0), ('.5G', 5 * 10 ** 8), ('+5G', 5 * 10 ** 9),
-	('+.5K/s', 500)])
+	('+.5K/s', 500), ('10MB/sec', 10 ** 7), ('10 MiB/Second', 10 * 1024 ** 2), ('5.M/s', 5 * 10 ** 6)])
 def test_a_rate_written_as_a_rate_is_read(tmp_path, reset_hpcp_globals, capsys, value, limit):
-	# 9.91 read the front of the text, and a .5G or a +5G as no number; 9.92's first build refused the /s (241)
+	# 9.91 read the front of the text (10MB/sec as 10 MB, 5.M as 5), and a .5G or a +5G as no number; 9.92's first build
+	# refused the /s (241), and its second the /sec
 	src, dst = _tree(tmp_path)
 	assert hpcp.hpcp([str(src) + '/'], dest_paths=[str(dst)], single_thread=True, bytes_rate_limit=value, files_rate_limit='100/s') == 0
 	assert (hpcp.BYTES_RATE_LIMIT, hpcp.FILES_RATE_LIMIT) == (limit, 100)
@@ -129,7 +148,7 @@ def test_a_rate_written_as_a_rate_is_read(tmp_path, reset_hpcp_globals, capsys, 
 
 def test_a_rate_written_as_a_rate_is_read_through_the_command_line(tmp_path):
 	src, dst = _tree(tmp_path)
-	task = subprocess.run([sys.executable, HPCP, str(src) + '/', '-d', str(dst) + '/', '-s', '-L', '10MB/s', '-F', '100/s'],
+	task = subprocess.run([sys.executable, HPCP, str(src) + '/', '-d', str(dst) + '/', '-s', '-L', '10MB/s', '-F', '100/sec'],
 		stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60, cwd=str(tmp_path))
 	assert task.returncode == 0, (task.returncode, task.stdout[-800:], task.stderr[-800:])
 	assert (dst / 'f').read_text() == 'data'
@@ -145,7 +164,7 @@ def test_every_size_the_help_shows_is_taken_with_the_value_multicmd_reads(text):
 
 
 @pytest.mark.parametrize('text', ['5foo', '5 G B', '1e3', '5GG', '5Gx', '5Gib!', '5ib', '1,5G', '5 GiB extra', '0x10', '٥', '１０',
-	'5.', '10M10', '{10TiB}', '-5foo', '+5foo', '.5.5G', '- 5', '+ 5G', '1' * 28, '9' * 400, '1000Y', '2000Y', True, float('nan'), float('inf'), [], {}, b'10'])
+	'1.5.', '5..G', '10M/secs', '10M10', '{10TiB}', '-5foo', '+5foo', '.5.5G', '- 5', '+ 5G', '1' * 28, '9' * 400, '1000Y', '2000Y', True, float('nan'), float('inf'), [], {}, b'10'])
 def test_what_holds_a_digit_and_is_no_size_is_refused_for_every_option(text):
 	# 9.91: '9' * 400 was an OverflowError's traceback and -L 2000Y a KeyError at the first progress bar (exit 70)
 	for option in ('-L', '-F', '-dis', '-ddr'):
@@ -174,11 +193,21 @@ def test_unset_zero_and_numbers_are_taken_without_a_note(value, size):
 		assert hpcp._read_size(option, value) == (size, None, None)
 
 
-@pytest.mark.parametrize('text, size', [('.5G', 5 * 10 ** 8), ('+5G', 5 * 10 ** 9), ('+.5K', 500), ('+5', 5), ('.5Ki', 512)])
-def test_a_leading_plus_or_point_is_number_syntax(text, size):
-	# 9.91 found no number in these and ran with no limit; -ddr read .5G as a 0-byte partition
+@pytest.mark.parametrize('text, size', [('.5G', 5 * 10 ** 8), ('+5G', 5 * 10 ** 9), ('+.5K', 500), ('+5', 5), ('.5Ki', 512), ('5.', 5),
+	('5.G', 5 * 10 ** 9), ('1. KiB', 1024)])
+def test_a_leading_plus_and_a_point_at_either_end_are_number_syntax(text, size):
+	# 9.91 found no number in .5G and +5G and ran with no limit (-ddr: a 0-byte partition), read 5. as 5 and 5.G as 5 bytes
 	for option in ('-L', '-F', '-dis', '-ddr'):
 		assert hpcp._read_size(option, text) == (size, None, None), option
+
+
+def test_a_long_run_of_blanks_is_judged_at_once():
+	# round 1's rate rule (blanks, then /s) was tried again from each blank: 19 s for 128 KiB of them, the longest argument
+	# Linux takes; one pass takes about a millisecond, and 5 s leaves a loaded host room
+	start = time.monotonic()
+	for option in ('-L', '-F'):
+		assert hpcp._read_size(option, '1' + ' ' * 131072 + 'x')[2] is not None
+	assert time.monotonic() - start < 5
 
 
 def test_a_number_too_large_for_a_float_is_refused_not_a_traceback():
@@ -201,7 +230,7 @@ def test_a_number_that_is_no_int_or_float_is_taken_as_its_number(tmp_path, reset
 
 def test_the_unit_letters_are_the_ones_multicmd_reads():
 	# format_bytes' unit_labels are local to it: what it reads as a size, a letter at a time, is what hpcp takes (but for
-	# an i with no letter before it, which it reads as nothing and hpcp does not take)
+	# an i with no letter before it, which it drops and hpcp does not take)
 	import string
 	for letter in string.ascii_lowercase.replace('i', ''):
 		for text in ('1' + letter, '1' + letter.upper() + 'iB'):
