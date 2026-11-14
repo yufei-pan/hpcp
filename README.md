@@ -19,19 +19,20 @@ hpcp.bat available on github: simple old tk based GUI intended for basic windows
 
 ## Upgrading to 9.92 from 9.91
 
-Nothing needs doing to upgrade. What changed:
+Nothing needs doing to upgrade, unless a script gives `-L`, `-F` or `-dis` a text that holds a digit but is no size, or `-ddr` anything but a size (the third change below). What changed:
 
-- **The cleanup after an image run runs every step, quiet:** its commands (`umount`, the delayed `e2fsck` and `tune2fs`, `losetup`) run without showing their output (one that fails is still said, on stderr), and a step that fails no longer skips the steps after it. With multiCMD 1.64 installed beside hpcp 9.89 to 9.91, `hpcp -dd src dst | head` could cut an `e2fsck` that printed for over a second, and leave the loop devices attached.
+- **The cleanup after an image run runs every step, quiet:** its commands (`umount`, the delayed `e2fsck` and `tune2fs`, `losetup`) run without showing their output, and a step that fails no longer skips the steps after it. The delayed commands are named before they run; one that fails is still said on stderr, and what a command that did not end 0 printed is shown once it has ended (an `e2fsck` that repaired something ends 1: its report is shown). With multiCMD 1.64 installed beside hpcp 9.89 to 9.91, `hpcp -dd src dst | head` could cut an `e2fsck` that printed for over a second, and leave the loop devices attached.
 - **The embedded multiCMD is 1.64 (1.61 before):** an installed multiCMD is used when it is 1.64 or later (9.89 to 9.91 used 1.61 or later). A library call `hpcp.hpcp()` on Python 3.6 with an ASCII stdout (`LC_ALL=C`) no longer ends 70 in the progress bar (multiCMD 1.62).
-- **A size hpcp cannot read is refused (241) before anything is touched:** `-ddr`, `-L`, `-F` and `-dis` take a number with an optional unit (`512`, `10M`, `1.5GiB`: K to Y are 1000s, with an `i` 1024s, and a `B` may follow), and `0` where the help says it is the default; a `-ddr` size must be above 0. Before, `-ddr one` went on to wipe the destination's partition table and `-L fast` copied with no limit.
-- **Planned for 9.93** (see [docs/limitations.md](docs/limitations.md)): the name probe's redesign ("The name probe by path"); a move's directory fsyncs through the held directories, in the pool; a root `-siff` apply into a target a user can write, through a door of its own; on macOS the copy check by directory on network mounts, a leaner xattr and ACL binding, xattrs and an ACL for identical nodes and an ACL for directories reached by path, an identical FIFO's owner, mode and times through a descriptor, `-tfs`, `-co` keeping a set-user-ID bit (the cause first: it may be a security issue) and a case-only rename patch's summary; on Linux without /proc an identical node's xattrs, a vfat file's attribute bits and a 0044 file's chmod by descriptor; the door in a directory the runner may not read; `-nds` with `-ncd` saying a refusal when another destination takes the file; and the test suite's Linux assumptions on macOS.
+- **A size hpcp cannot read is refused (241) before anything is touched:** `-ddr`, `-L`, `-F` and `-dis` take a number with an optional unit (`512`, `10M`, `1.5GiB`: K to Y are 1000s, with an `i` 1024s, and a `B` may follow; a rate may end in `/s`; a leading `+` or point is read), below 1000Y, whether or not the run uses the option. A text with a digit that is no size (`5foo`, `1e3`, `1,5M`, `{10TiB}`) is refused, and `-ddr` takes nothing but a size above 0. Before, `-ddr one` went on to wipe the destination's partition table, `-L 5foo` ended in a `TypeError`, `-L 1,5M` limited the copy to 1 byte a second, and `-L .5G` ran with no limit (it is 0.5 GB a second now).
+- **`-L`, `-F` and `-dis` with no number still mean no limit and no split, and now say so:** a text with no digit (an empty one, as from an unset shell variable, a word), a negative number (`-1`) and a size below 1 (`-F 0.5`) run as before, with a line on stderr (`Note: -L 'none' has no number: no rate limit`). `0` is the way to write it, and says nothing.
+- **Planned for 9.93** (see [docs/limitations.md](docs/limitations.md)): the name probe's redesign ("The name probe by path") and the cause of `-co` keeping a set-user-ID bit on macOS (it may be a security issue); the other deferred entries come after it.
 - **Known** (see [docs/limitations.md](docs/limitations.md)): on EL7 (hard open-files limit 4,096) the levels of a destination tree deeper than 2,048, and a process out of descriptors, are walked by path, as 9.87 did (a symbolic link made with no free descriptor at all is not made: `Failed to create symbolic link: All destinations failed, skipping...`; a rerun makes it); a directory hpcp opened to its owner keeps owner rwx where no finish sets its mode (`-co`, `-nds`, a named destination no source directory lands on), and on macOS one with no owner read can be left 0700; on macOS a case-only rename by a move (`hpcp X -d x -rf`) is refused with 241 on a case-insensitive APFS, `hpcp a/x ldir/ -d a/x` exits 202 where Linux exits 213, a hard link put at the name of a 0044 file between a move's look and its chmod can get the mode 0044, and a socket the operator names is not copied; on Python 3.6 and 3.7 an early Ctrl-C with forkserver or spawn can still print a worker's `EOFError`.
 
 ## Upgrading to 9.91 from 9.90
 
 Nothing needs doing to upgrade. What changed:
 
-- **The name probe no longer empties, follows or waits for what another user puts at its name:** a copy with two names that fold alike (`Makefile`, `makefile`) asks the destination by making a hidden `.hpcp-case-probe-...` directory in it, and from 9.83 to 9.90 another local user who could write that destination could have it delete the files of another directory (in a root run, anyone's), stop the run for good with a FIFO, or have a file's times set. The probe now works through descriptors of the directories it holds, and a pair it cannot ask about in that run is refused (213) unless the destination's listing already holds both names; Windows still asks by path, and so does macOS in a directory the runner may write and search but not read (see [docs/limitations.md](docs/limitations.md), "The name probe by path").
+- **The name probe no longer empties, follows or waits for what another user puts at its name:** a copy with two names that fold alike (`Makefile`, `makefile`) asks the destination by making a hidden `.hpcp-case-probe-...` directory in it, and from 9.83 to 9.90 another local user who could write that destination could have it delete the files of another directory (in a root run, anyone's), stop the run for good with a FIFO, or have a file's times set. The probe now works through descriptors of the directories it holds, and a pair it cannot ask about in that run is refused (213) unless the destination's listing already holds both names; Windows still asks by path, and so does macOS in a directory the runner may write and search but not read, under a Python without `os.O_SEARCH` or where that open fails (see [docs/limitations.md](docs/limitations.md), "The name probe by path").
 
 ## Upgrading to 9.90 from 9.89
 
@@ -44,11 +45,11 @@ Nothing needs doing to upgrade. What changed:
 - **A destination named with `-d` that is a link is worked out once a file:** a retry after a failed first attempt writes where the first attempt went, and a dangling link that appears at a named landing later is refused as at the first look.
 - **A pinned destination refused in one process is said where another destination takes the file:** `Note: B now leads to another directory than the one this run started writing in; ...`, once a process, with no error (9.89 said nothing).
 - **`-lt`: a target that holds a link to itself and fails to copy is tried once** (9.87 to 9.89 printed the same `Copy failed` line about 990 times).
-- **A device node copied by a non-root user onto a `-d` link** says `Copy failed: cannot make a device node like /dev/null here`, as 9.87 did.
+- **A device node copied by a non-root user onto a `-d` link** says `Copy failed: cannot make a device node like /dev/null here, ...`, as 9.87 did.
 - **A move's fsync of a file its owner may not read (mode 0044)** gives the owner read through what it looked at (on Linux with /proc an `O_PATH` descriptor checked against the look; on macOS `lchmod` by name); without /proc the chmod follows a link, as in 9.89.
 - **Python 3.6 with forkserver or spawn: an early Ctrl-C prints a worker's `EOFError: Ran out of input` more rarely** (a known limitation below Python 3.8); the run ends 130 with nothing lost.
 - **macOS:**
-  - a rerun carries a source's changed or removed xattrs and ACL to a file or directory hpcp holds (not an identical FIFO or device node, nor the ACL of a directory reached by path), at about 11 µs a file or directory, so a pooled rerun of a tree of many one-file directories takes 4 to 6 % longer than 9.87's (a known limitation);
+  - a rerun carries a source's changed or removed xattrs and ACL to a file or directory hpcp holds (not an identical FIFO or device node, nor the ACL of a directory reached by path). It mirrors the source: an xattr only the landing has (a Finder tag, a program's own) is removed, but never the marks macOS keeps itself (`com.apple.quarantine`, `com.apple.lastuseddate#PS`, `com.apple.provenance`, `com.apple.macl`). It costs about 11 µs a file or directory, so a pooled rerun of a tree of many one-file directories takes 4 to 6 % longer than 9.87's (a known limitation);
   - a directory's BSD flags, and an identical file's, are set through the descriptor hpcp holds (`fchflags`), where `-d out/` with `out` a link gave the link the flags;
   - a socket named as a source is skipped with a note (`Special file skipped: sock is a socket; ...`), exit 0, as one met in a tree is and as macOS's `cp` does; a move leaves it in place. 9.89 exited 213 there and its move kept every source. No socket is made on macOS (a known limitation); Linux is unchanged;
   - a paced parallel remove (`-rm -pfl -F N`) no longer waits about as long as hpcp had run before each unlink: its workers share one clock;
@@ -524,7 +525,7 @@ options:
   -dis, --dest_image_size DEST_IMAGE_SIZE
                         Destination Image Size, specify the size of the
                         destination image to split into. Default is 0 (No
-                        split). Example: {10TiB} or {1G}
+                        split). Example: 10TiB or 1G
   -diff, --get_diff_image [GET_DIFF_IMAGE]
                         Generate a patch image that updates the base (-d /
                         -di) to the source (src_path / -si): added and
@@ -545,7 +546,7 @@ options:
                         Resize the destination image to the specified size
                         with -dd. Applies to biggest partiton first. Specify
                         multiple -ddr to resize subsequent sized partitions.
-                        Example: {100GiB} or {200G}
+                        Example: 100GiB or 200G
   -nfp, --no_fs_param_mirror
                         Do not mirror source filesystem parameters (geometry,
                         features) in -dd mode. Create destination filesystems
