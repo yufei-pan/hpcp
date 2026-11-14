@@ -1060,15 +1060,28 @@ def test_content_only_drops_a_file_capability_as_a_write_in_place_does(tmp_path,
 @not_root
 @pytest.mark.parametrize('route', [[], ['-wb']], ids=['default', 'write-beside'])
 def test_content_only_drops_setuid_for_a_non_root_owner_as_the_kernel_does(tmp_path, route):
-	# suidprobe: the owner writing in place lost 4700 -> 700 and 6755 -> 755, kept 2745.
-	for name, mode, kept in (('u', 0o4700, 0o700), ('ug', 0o6755, 0o755), ('g', 0o2745, 0o2745)):
+	# suidprobe: the owner writing in place lost 4700 -> 700 and 6755 -> 755, kept 2745 (Linux; macOS's write clears 2745 to
+	# 745 too). What a plain write by the runner leaves is asked of the kernel here, on a twin of each file. On macOS 9.92's
+	# default route kept 4700 and 6755: its cp puts back the mode it found once its writes have cleared them (test_993.py).
+	modes = (('u', 0o4700), ('ug', 0o6755), ('g', 0o2745))
+	kept = {}
+	for name, mode in modes:
+		plain = tmp_path / ('plain-' + name)
+		write(plain, 'old')
+		os.chmod(str(plain), mode)
+		fd = os.open(str(plain), os.O_WRONLY)
+		os.write(fd, b'new')
+		os.close(fd)
+		kept[name] = stat.S_IMODE(os.stat(str(plain)).st_mode)
 		write(tmp_path / 'a' / name, 'new')
 		write(tmp_path / 'out' / name, 'old')
 		os.chmod(str(tmp_path / 'out' / name), mode)
+	assert kept['u'] == 0o700, oct(kept['u'])
 	rc, output = run(['a/', '-d', 'out/', '-co'] + route, tmp_path)
 	assert rc == 0, output[-2000:]
-	for name, mode, kept in (('u', 0o4700, 0o700), ('ug', 0o6755, 0o755), ('g', 0o2745, 0o2745)):
-		assert stat.S_IMODE(os.stat(str(tmp_path / 'out' / name)).st_mode) == kept and read(tmp_path / 'out' / name) == 'new'
+	for name, mode in modes:
+		now = stat.S_IMODE(os.stat(str(tmp_path / 'out' / name)).st_mode)
+		assert (now, read(tmp_path / 'out' / name)) == (kept[name], 'new'), (name, oct(mode), oct(now), oct(kept[name]))
 
 
 @posix_only

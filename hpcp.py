@@ -4423,12 +4423,23 @@ def _co_carry(target, st):
 				return None
 	return carried
 
+# Whether set-group-ID without group execute is no set-group-ID program, which a write then leaves: Linux's exec and its
+# should_remove_suid. macOS's exec honours it (a 2745 program ran with its file's group), and a write by the file's owner
+# cleared it (2745 became 0745; macOS 26.6.2, 2026-11-13).
+_SETGID_NEEDS_GROUP_EXECUTE = sys.platform.startswith('linux')
+
+def _write_clears(mode):
+	"""The set-ID bits of mode that the kernel clears on a write by a user other than root: set-user-ID, and set-group-ID
+	where group execute is set or the platform runs it without (_SETGID_NEEDS_GROUP_EXECUTE)."""
+	if mode & stat.S_ISGID and (mode & stat.S_IXGRP or not _SETGID_NEEDS_GROUP_EXECUTE):
+		return mode & (stat.S_ISUID | stat.S_ISGID)
+	return mode & stat.S_ISUID
+
 def _carry_over(st, temp, carried, held=None):
 	"""Give temp, the new file of a -co rewrite, exactly what the old file (st, carried: _co_carry) had: its carried xattrs
 	(each set, and any such name temp gained, as an ACL inherited from a default ACL, removed), owner and group, and mode, less
-	set-user-ID, and set-group-ID where group-execute is set, when the runner is not root: the kernel clears those on a write
-	by such a user, so the write in place lost them too. A label the filesystem gives itself (setting security.selinux fails
-	with EOPNOTSUPP: vfat, a context= mount) is skipped. Anything else that fails raises. On Linux each step reaches what cp
+	the set-ID bits a write clears (_write_clears) when the runner is not root, as a write in place leaves them. A label the
+	filesystem gives itself (setting security.selinux fails with EOPNOTSUPP: vfat, a context= mount) is skipped. Anything else that fails raises. On Linux each step reaches what cp
 	made through an O_PATH descriptor of it (never opened: a node made of a device is not acted on): a link or another file
 	put at its name since (a user who can write the directory) is refused, so no chown or chmod goes through a link. held: the
 	descriptor hpcp made temp by (_cp_beside), which every step goes through instead."""
@@ -4461,9 +4472,7 @@ def _carry_over(st, temp, carried, held=None):
 		os.chown(temp, st.st_uid, st.st_gid)
 		mode = stat.S_IMODE(st.st_mode)
 		if os.geteuid() != 0:
-			mode &= ~stat.S_ISUID
-			if mode & stat.S_IXGRP:
-				mode &= ~stat.S_ISGID
+			mode &= ~_write_clears(mode)
 		os.chmod(temp, mode)
 	finally:
 		if fd is not None:
@@ -5255,6 +5264,12 @@ def _cp_held(command, src_path, target, fd, fst, space, through_link, new=False,
 					and (named.st_dev, named.st_ino) == (fst.st_dev, fst.st_ino)):
 				os.unlink(*_at(base, name), **_fd_of(base))
 		_cp_failed(e, given, target)
+	if CONTENT_ONLY and not new and hasattr(os, 'geteuid') and fst.st_uid == os.geteuid() != 0:
+		# The set-ID bits a write by its owner clears (_write_clears) go, as a plain write leaves them: macOS's cp (copyfile's
+		# data copy) puts back the mode it found once its writes have cleared them. Only an owner can have had them put back.
+		now, cleared = stat.S_IMODE(os.fstat(fd).st_mode), _write_clears(stat.S_IMODE(fst.st_mode))
+		if now & cleared:
+			os.fchmod(fd, now & ~cleared)
 	if not CONTENT_ONLY and not new:
 		_remove_stale_xattrs(src_path, fd)
 		if held is not None:

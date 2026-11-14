@@ -302,3 +302,75 @@ def test_993_a_name_that_cannot_be_made_for_space_or_quota_says_the_fix_and_leav
 	line = 'nothing can be made in %s to ask it (%s): %s and run again' % (directory, os.strerror(number), fix)
 	assert made and (answers, why) == ({}, {'X': line, 'x': line}), (made, answers, why)
 	assert os.listdir(directory) == []
+
+
+# ---- -co and set-ID bits ----
+
+not_root = pytest.mark.skipif(not hasattr(os, 'geteuid') or os.geteuid() == 0, reason='a write by root keeps set-ID bits')
+
+
+def _plain_write_leaves(directory, mode):
+	'''The mode a plain write by the runner leaves on a file of mode in directory: the kernel's answer, by doing it.'''
+	path = os.path.join(directory, 'plain-%o' % mode)
+	with open(path, 'w') as fh:
+		fh.write('old')
+	os.chmod(path, mode)
+	fd = os.open(path, os.O_WRONLY)
+	try:
+		os.write(fd, b'new')
+	finally:
+		os.close(fd)
+	return os.stat(path).st_mode & 0o7777
+
+
+def _co_rewrite(tmp_path, monkeypatch, mode, route):
+	'''A -co rewrite of out/x (mode, the runner's) from x through copy_file, by route ('default': in place; '-wb': beside),
+	with cp stood in for by cp and then the mode out/x had put back by name, as macOS's cp does through its descriptor. The
+	mode out/x ends with.'''
+	src, out = str(tmp_path / 'x'), str(tmp_path / 'out')
+	os.mkdir(out)
+	for path, text in ((src, 'new'), (os.path.join(out, 'x'), 'old')):
+		with open(path, 'w') as fh:
+			fh.write(text)
+	os.chmod(os.path.join(out, 'x'), mode)
+	monkeypatch.setattr(hpcp, 'CONTENT_ONLY', True)
+	monkeypatch.setattr(hpcp, 'WRITE_BESIDE', route == '-wb')
+	real = hpcp.run_command_in_multicmd_with_path_check
+
+	def cp_then_put_back(command, *args, **kwargs):
+		result = real(command, *args, **kwargs)
+		if route == 'default':
+			os.chmod(os.path.join(out, 'x'), mode)
+		return result
+	monkeypatch.setattr(hpcp, 'run_command_in_multicmd_with_path_check', cp_then_put_back)
+	assert hpcp.copy_file(src, [os.path.join(out, 'x')])[0] > 0 and not hpcp.ERRORS, hpcp.ERRORS
+	with open(os.path.join(out, 'x')) as fh:
+		assert fh.read() == 'new'
+	return os.stat(os.path.join(out, 'x')).st_mode & 0o7777
+
+
+@posix_only
+@not_root
+@pytest.mark.parametrize('mode', [0o4700, 0o6755, 0o2755, 0o2745])
+@pytest.mark.parametrize('route', ['default', '-wb'])
+def test_993_a_content_only_rewrite_ends_with_the_set_id_bits_a_plain_write_leaves(tmp_path, monkeypatch, reset_hpcp_globals, route, mode):
+	# A -co rewrite by the file's owner (not root) keeps its mode, less the set-ID bits the kernel clears on a write by that
+	# user, as a plain write leaves them (asked here by doing one). macOS's cp (copyfile's data copy, also through the held
+	# descriptor) puts back the mode it found once its own writes have cleared them, so 9.92's rewrite in place kept 4700 and
+	# 6755 there (ran on macOS 26.6.2: 0700 during the copy, 4700 at its end, even after a chmod by hand during it). Stood in
+	# for on any platform: the default route fails on 9.92 everywhere; -wb guards what 9.92 gets right on Linux.
+	plain = _plain_write_leaves(str(tmp_path), mode)
+	assert plain & 0o4000 == 0, oct(plain)
+	assert _co_rewrite(tmp_path, monkeypatch, mode, route) == plain
+
+
+@posix_only
+@not_root
+@pytest.mark.parametrize('route', ['default', '-wb'])
+def test_993_where_set_group_id_runs_without_group_execute_a_rewrite_clears_it_too(tmp_path, monkeypatch, reset_hpcp_globals, route):
+	# macOS runs a 2745 program with its file's group (a set-group-ID program without group execute: ran on 26.6.2), and its
+	# write clears that bit (2745 became 0745); Linux runs it as any other and keeps the bit on a write. 9.92's beside route
+	# applied Linux's rule everywhere, so on macOS a -wb rewrite of 2745 was still a set-group-ID program. Forced here: the
+	# platform as macOS has it.
+	monkeypatch.setattr(hpcp, '_SETGID_NEEDS_GROUP_EXECUTE', False)
+	assert _co_rewrite(tmp_path, monkeypatch, 0o2745, route) == 0o745
