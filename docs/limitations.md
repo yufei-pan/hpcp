@@ -377,12 +377,12 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - **Noted:** 2026-11-12, the 9.90 Mac health check; the builder's call, not asked (a deferral). Moved to 9.93 on 2026-11-13: 9.92 is the docs pass, the quiet cleanup, the multiCMD 1.64 embed and the size check; the main session's call (a deferral, not asked). Moved to 9.94 on 2026-11-13: 9.93 is the name probe's redesign and the `-co` set-user-ID cause; the main session's call (a deferral, not asked).
 
 ### `-tfs` does not check a destination the run makes
-- **Kind:** deferred (9.93).
+- **Kind:** deferred (9.94).
 - **What the operator sees:** `hpcp src/ -d new/ -tfs ext4`, where `new` does not exist and its parent is on a filesystem of another type: the run makes `new`, copies and exits 0, with no `Destination fs type mismatch` (ran in Docker on Python 3.14: `-tfs tmpfs -d /tmp/n1/` and `-d /tmp/n2` on an overlay, with a source ending in `/`, both copied, exit 0; the same two with the directories already there exit 227 and copy nothing). The same in 9.91 and 9.92.
 - **Why:** in `hpcp()` the loop over the destinations makes a missing one that ends in a separator (a directory destination gets one in `get_dests`) and asks the type only in the `elif target_file_system:` branch after it (read). `get_fs_type_from_path` itself answers a missing path with its nearest existing parent's type (ran).
-- **Plan (9.93):** ask the type of the destination's nearest existing parent before making it, in the same change as the `-tfs` entry above.
-- **Revisit when:** 9.93.
-- **Noted:** 2026-11-13, found by the 9.92 round 1 fixer while checking the `-tfs` entry above (a deferral, not asked).
+- **Plan (9.94):** ask the type of the destination's nearest existing parent before making it, in the same change as the `-tfs` entry above.
+- **Revisit when:** 9.94.
+- **Noted:** 2026-11-13, found by the 9.92 round 1 fixer while checking the `-tfs` entry above (a deferral, not asked). Moved to 9.94 on 2026-11-13: 9.93 is the name probe's redesign and the `-co` set-user-ID cause; the main session's call (a deferral, not asked).
 
 ### macOS: the test suite assumes Linux in about 175 tests
 - **Kind:** deferred (9.94).
