@@ -15,14 +15,16 @@ def _run_with_embedded_multicmd(tmp_path, code):
 
 
 @pytest.mark.parametrize('installed, uses_installed', [
-	("'1.61'", True),
+	("'1.64'", True),
 	("'1.100'", True),   # float('1.100') == 1.1 would wrongly reject it
 	("'2.0'", True),
-	("'1.60'", False),   # older than the embedded copy, which brings the exec wrapper's SIGINT mask (1.61)
+	("'1.63'", False),   # older than the embedded copy, whose shown calls stop when stdout's reader quits and whose quiet calls do not (1.64)
+	("'1.61'", False),   # older still: 9.91's copy, with the exec wrapper's SIGINT mask
+	("'1.60'", False),   # no SIGINT mask in the exec wrapper (1.61)
 	("'1.59'", False),   # older still: no thread-start fix (1.60)
 	("'1.58'", False),   # older still: no pass_fds
 	("'1.56'", False),   # the floor pip accepts, older than the embedded copy
-	("'1.9'", False),    # minor 9 < 61, though float('1.9') > 1.61
+	("'1.9'", False),    # minor 9 < 64, though float('1.9') > 1.64
 	("'garbage'", False),
 	(None, False),       # a module without a version
 ])
@@ -33,11 +35,11 @@ def test_an_installed_multicmd_is_used_only_when_not_older_than_the_embedded_one
 		cwd=str(tmp_path), env=env, universal_newlines=True, check=True).stdout.split()
 	assert out[0] == str(uses_installed)
 	if not uses_installed:
-		assert out[1] == '1.61'
+		assert out[1] == '1.64'
 
 
 def test_embedded_multicmd_is_used_when_the_installed_one_is_older(tmp_path):
-	assert _run_with_embedded_multicmd(tmp_path, 'import hpcp; print(hpcp.multiCMD.version)').strip() == '1.61'
+	assert _run_with_embedded_multicmd(tmp_path, 'import hpcp; print(hpcp.multiCMD.version)').strip() == '1.64'
 
 
 @pytest.mark.skipif(os.name != 'posix', reason='pass_fds is POSIX')
@@ -49,7 +51,7 @@ r, w = os.pipe()
 task = hpcp.multiCMD.run_commands([['sh', '-c', 'echo through >&%d' % w]], quiet=True, return_object=True, pass_fds=(w,))[0]
 os.close(w)
 print(hpcp.multiCMD.version, task.returncode, os.read(r, 100).decode().strip())"""
-	assert _run_with_embedded_multicmd(tmp_path, code).split() == ['1.61', '0', 'through']
+	assert _run_with_embedded_multicmd(tmp_path, code).split() == ['1.64', '0', 'through']
 
 
 def test_the_import_gate_tracks_the_embedded_copy_and_no_installer_is_asked_for_multicmd():
@@ -61,7 +63,7 @@ def test_the_import_gate_tracks_the_embedded_copy_and_no_installer_is_asked_for_
 		source = f.read()
 	# the embed sits one tab in, inside the import's signal mask (9.88)
 	gate = re.search(r"\) < \((\d+), (\d+)\):\n\t\t\traise ImportError\('multiCMD too old'\)", source)
-	assert '%s.%s' % gate.groups() == '1.61'
+	assert '%s.%s' % gate.groups() == '1.64'
 	header = source[:source.index('# ///\n', source.index('# /// script\n') + 1)]
 	assert 'xxhash' in header and 'multicmd' not in header.lower()
 	with open(os.path.join(_ROOT, 'setup.py'), encoding='utf-8') as f:
