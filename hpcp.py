@@ -4427,7 +4427,8 @@ def _co_carry(target, st):
 
 # Whether set-group-ID without group execute is no set-group-ID program, which a write then leaves: Linux's exec and its
 # should_remove_suid. macOS's exec honours it (a 2745 program ran with its file's group), and a write by the file's owner
-# cleared it (2745 became 0745; macOS 26.6.2, 2026-11-13).
+# cleared it (2745 became 0745; macOS 26.6.2, 2026-11-13). Other systems are not measured and get macOS's rule: Linux's is the
+# exception (the bit without group execute marked mandatory locking there), and a dropped bit is the safe side.
 _SETGID_NEEDS_GROUP_EXECUTE = sys.platform.startswith('linux')
 
 def _write_clears(mode):
@@ -14245,8 +14246,10 @@ def _ask_names(directory, names):
 	directory, all at once, in a new directory made beside what is there; a name that is there already is one name with the one
 	that holds it. Only where nothing can be made does a listing answer. The undo is rmdir alone, of the names made and then of
 	the probe, so no file and nothing that holds anything can go, whatever stands at those names by then. Who may write the
-	directory may decide the answer (docs/limitations.md). The directory keeps its times. SIGINT, SIGTERM and SIGHUP wait until
-	the probe is gone; SIGKILL cannot (docs/limitations.md), and a signal sent while another thread exists may reach it."""
+	directory may decide the answer (docs/limitations.md). The directory keeps its times where the runner owns it or is root
+	(another who may write it cannot set them back). SIGINT, SIGTERM and SIGHUP wait until the probe is gone where the platform
+	can hold them back (not Windows); SIGKILL cannot (docs/limitations.md), and a signal sent while another thread exists may
+	reach it."""
 	answers, why = {}, {}
 	probe = '.hpcp-case-probe-%d-%s' % (os.getpid(), uuid.uuid4().hex)
 	held = signal.pthread_sigmask(signal.SIG_BLOCK, _STOPS) if hasattr(signal, 'pthread_sigmask') else None
@@ -14303,7 +14306,8 @@ def _ask_names(directory, names):
 				else:
 					failed = _make_names(probe_base, directory, names, made, answers, why)
 			finally:
-				# rmdir alone, of the names this call made and then of the probe: it removes nothing but an empty directory, so
+				# rmdir alone, of the names this call made and then of the probe: it removes nothing but an empty directory (on
+				# Windows also a link to a directory, never what it leads to), so
 				# whatever stands at those names by now (a directory or a link put there; by path, what a link leads to), no
 				# file and nothing that holds anything goes (an empty directory put there can: whoever put it could remove it).
 				undoing = [functools.partial(os.rmdir, *_at(probe_base, name), **_fd_of(probe_base)) for name in made]
