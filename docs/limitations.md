@@ -388,7 +388,7 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 ### `hpcp a/x ldir/ -d a/x` prints a false "may be a mounted dir" hint
 - **Kind:** deferred (9.94).
 - **What the operator sees:** with `ldir` a link to `a`, `hpcp a/x ldir/ -d a/x` (see the known limitation below: exit 213 on Linux) prints `Destination path a/x/ may be a mounted dir, known issue with os.path.exists` and `Continuing without creating dest folder...` before the 213 (ran 2026-11-13), though `a/x` is a plain file there, not a mounted directory. The exit code is right. The same in 9.92.
-- **Why:** a trailing separator is added to a file destination when one source is a directory, and the `FileExistsError` branch of the destinations loop in `hpcp()` then prints the hint.
+- **Why:** with more than one source the destination gets a trailing separator (`get_dest_from_path`), so making `a/x/` where `a/x` is a file raises `FileExistsError`, whose branch in `hpcp()`'s destinations loop prints the hint.
 - **Plan (9.94):** print the hint only when the destination is a directory.
 - **Revisit when:** 9.94.
 - **Noted:** 2026-11-13, the 9.93 final review's second opinion (h993-lim2 3); the main session's call (a deferral, not asked).
