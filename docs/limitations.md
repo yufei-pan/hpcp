@@ -376,6 +376,14 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - **Revisit when:** 9.94.
 - **Noted:** 2026-11-12, the 9.90 Mac health check; the builder's call, not asked (a deferral). Moved to 9.93 on 2026-11-13: 9.92 is the docs pass, the quiet cleanup, the multiCMD 1.64 embed and the size check; the main session's call (a deferral, not asked). Moved to 9.94 on 2026-11-13: 9.93 is the name probe's redesign and the `-co` set-user-ID cause; the main session's call (a deferral, not asked).
 
+### `-tfs` does not check a destination the run makes
+- **Kind:** deferred (9.93).
+- **What the operator sees:** `hpcp src/ -d new/ -tfs ext4`, where `new` does not exist and its parent is on a filesystem of another type: the run makes `new`, copies and exits 0, with no `Destination fs type mismatch` (ran in Docker on Python 3.14: `-tfs tmpfs -d /tmp/n1/` and `-d /tmp/n2` on an overlay, with a source ending in `/`, both copied, exit 0; the same two with the directories already there exit 227 and copy nothing). The same in 9.91 and 9.92.
+- **Why:** in `hpcp()` the loop over the destinations makes a missing one that ends in a separator (a directory destination gets one in `get_dests`) and asks the type only in the `elif target_file_system:` branch after it (read). `get_fs_type_from_path` itself answers a missing path with its nearest existing parent's type (ran).
+- **Plan (9.93):** ask the type of the destination's nearest existing parent before making it, in the same change as the `-tfs` entry above.
+- **Revisit when:** 9.93.
+- **Noted:** 2026-11-13, found by the 9.92 round 1 fixer while checking the `-tfs` entry above (a deferral, not asked).
+
 ### macOS: the test suite assumes Linux in about 175 tests
 - **Kind:** deferred (9.94).
 - **What the operator sees:** (a developer running the suite on macOS) main's full serial suite on macOS 26, Python 3.9.6, fails 180 tests (2,134 passed, 512 skipped; 9.90: 175 failed, 2,156 passed, 518 skipped; a Python 3.14 run: 163 failed, 2,136 passed, 511 skipped, 16 deselected), never run whole there before. All but a few are the tests' own Linux assumptions: names that differ only in case or Unicode form on a case-insensitive APFS (56), the held file looked up through `/proc/self/fd` where macOS hands `cp` `/dev/fd/N` (34, 15 of them 60-s timeouts), names that are not UTF-8, which APFS refuses (33), Linux's `os.*xattr` calls (27), macOS's 1,024-byte path limit in the deep-tree tests (15), and smaller groups (setgid inheritance, `/proc/mounts`, `os.makedev`, a gc-timed descriptor count, the C locale). The code bugs in it were the paced remove's clock (fixed in 9.90) and the socket (fixed in 9.90); `-tfs` is its own entry above.
