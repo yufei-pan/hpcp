@@ -217,11 +217,51 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 
 ### A -co rewrite beside whose new file its owner may not read keeps the old copy, where nothing holds the new file
 - **Kind:** known limitation.
-- **What the operator sees:** on macOS, the BSDs and Linux without /proc, a non-root `-co` rewrite that goes beside (`-wb`, or by default a file with other names or one that does not open for writing) of a source whose new file its owner may not read (mode 0044, a source of another user's read through its group or others) keeps the old copy: exit 190, `... its owner, group or an xattr cannot be given to the new copy (Permission denied)`. 9.93 completed it by the new file's name. Linux with /proc is not affected (an `O_PATH` descriptor needs no read).
-- **Workaround:** give the file owner read, or rerun without `-wb`.
-- **Why:** there `cp` makes the new file by name, and the carry must open it to set anything on it without following a link (9.94: a link another user put at that name got the old file's owner and mode). A 0044 file cannot be opened for writing either, so a write-only retry does not help.
+- **What the operator sees:** where `cp` makes the new file by name (the BSDs, Linux without /proc; macOS only where `cp` fails hpcp's held-file question), a non-root `-co` rewrite that goes beside (`-wb`, or by default a file with other names or one that does not open for writing) of a source whose new file its owner may not read (mode 0044, a source of another user's read through its group or others) keeps the old copy: exit 190, `... its owner, group or an xattr cannot be given to the new copy (Permission denied)`. 9.93 completed it there by the new file's name. Linux with /proc is not affected (an `O_PATH` descriptor needs no read).
+- **Workaround:** give the source owner read. Under `-wb`, a rerun without it also completes a file the default writes in place.
+- **Why:** there `cp` makes the new file by name, and the carry must open it to set anything on it without following a link (9.93 set them by name, and a link another user put there got the old file's owner and mode). A 0044 file cannot be opened for writing either, so a write-only retry does not help.
 - **Revisit when:** someone hits it.
-- **Approved:** 2026-11-14, the user chose "Known limitation (Recommended)".
+- **Approved:** 2026-11-14, the user chose "Known limitation (Recommended)". Facts corrected 2026-11-15 by the 9.94 final review: macOS takes the held route (ran on macOS 26.6.2), "rerun without -wb" helps only under `-wb` (ran), and the link bug was 9.93's.
+
+### A -co rewrite beside of a source without owner write keeps the old copy when the old file holds a user.* xattr
+- **Kind:** deferred (9.95).
+- **What the operator sees:** a non-root `-co` rewrite that goes beside (`-wb`, other names, not writable) of a source of mode 0444, onto a file that holds a `user.*` xattr: exit 190, `... an xattr cannot be given to the new copy (Permission denied)`, the old copy kept. With and without /proc, and in 9.93 (ran 2026-11-15).
+- **Why:** the new file has the source's mode when the carry sets the xattrs, and a `user.*` xattr needs write permission, through a descriptor too.
+- **Plan (9.95):** owner write on the new file while the carry sets the xattrs; the carry sets the old file's mode last.
+- **Revisit when:** 9.95.
+- **Noted:** 2026-11-15, the 9.94 final review (second-opinion lead lim1 1); a deferral, not asked.
+
+### `hpcp src -d blob/` with `blob` a file still prints the "may be a mounted dir" hint
+- **Kind:** deferred (9.95).
+- **What the operator sees:** with one source and a destination `blob/` that is a file, `_make_dest_directory` prints `Destination path ... maybe a mounted dir, known issue with os.path.exists` and `Continuing without creating dest folder...` (9.93 the same); what comes after names the problem. 9.94 took the hint out for a destination given more than one source (README).
+- **Why:** 9.94 fixed one of the two sites with the lstat rule (a name that is no directory is left to the copy, which names it); the other site, `_make_dest_directory`, was not reached.
+- **Plan (9.95):** the same lstat rule there.
+- **Revisit when:** 9.95.
+- **Noted:** 2026-11-15, the 9.94 final review (second-opinion lead code3 1); a deferral, not asked.
+
+### A stop between hpcp()'s last step and its cleanup skips the cleanup
+- **Kind:** deferred (9.95).
+- **What the operator sees:** Ctrl-C in the microseconds between the `finally:` of `hpcp()` and the start of `clean_up()` ends the run without the cleanup: mounts or loop devices of an image run can stay. 9.93 the same.
+- **Why:** `_CLEANING`, which makes a stop there only a record, is set when `clean_up()` starts.
+- **Plan (9.95):** set it first thing in that `finally:`, and have `clean_up()` hand it back as it found it.
+- **Revisit when:** 9.95.
+- **Noted:** 2026-11-15, the 9.94 final review (F7); a deferral, not asked.
+
+### macOS: a -co rewrite beside carries no xattrs or ACL (to check)
+- **Kind:** deferred (9.95).
+- **What the operator sees:** not run: on macOS, where Python has no `os.listxattr`, `_co_carry` returns nothing, so a `-co` rewrite that goes beside would give the new file none of the old file's xattrs or ACL.
+- **Why:** from reading only (the 9.94 final review's second-opinion lead lim1 6).
+- **Plan (9.95):** run it on the Mac first; if it is so, carry them through the descriptor as the rerun's settle does there.
+- **Revisit when:** 9.95.
+- **Noted:** 2026-11-15, the 9.94 final review (F7); a deferral, not asked.
+
+### Tests: 9.94's mutants the suite does not catch
+- **Kind:** deferred (9.95).
+- **What the operator sees:** nothing; a developer: removing the held route's identity check before the rename, the settle's identity check at its open, the settle's `/proc`-route chmod by name, the FAT attribute SET value, the held carry's chmod or its `user.*` set, each passes test_994 (the 9.94 final review's mutants M1, M5, M13, M6, M10 and M11; M10 is caught by test_993). The same code is in 9.93, so none is 9.94's regression. Also loose exit-code asserts in two new tests and the case-only rename test's macOS branch.
+- **Why:** 9.94 added the tests its own changes needed (the final review's F5); these guard older code.
+- **Plan (9.95):** one test each, forced at the call as test_994's are.
+- **Revisit when:** 9.95.
+- **Noted:** 2026-11-15, the 9.94 final review (F5, last paragraph); a deferral, not asked.
 
 ### With -wb, a rewrite does not keep a per-file layout, chattr flags or the project id
 - **Kind:** known limitation.
@@ -354,9 +394,9 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 
 ### macOS: the test suite assumes Linux in about 175 tests
 - **Kind:** deferred (9.95).
-- **What the operator sees:** (a developer running the suite on macOS) main's full serial suite on macOS 26, Python 3.9.6, fails 180 tests (2,134 passed, 512 skipped; 9.90: 175 failed, 2,156 passed, 518 skipped; a Python 3.14 run: 163 failed, 2,136 passed, 511 skipped, 16 deselected), never run whole there before. All but a few are the tests' own Linux assumptions: names that differ only in case or Unicode form on a case-insensitive APFS (56), the held file looked up through `/proc/self/fd` where macOS hands `cp` `/dev/fd/N` (34, 15 of them 60-s timeouts), names that are not UTF-8, which APFS refuses (33), Linux's `os.*xattr` calls (27), macOS's 1,024-byte path limit in the deep-tree tests (15), and smaller groups (setgid inheritance, `/proc/mounts`, `os.makedev`, a gc-timed descriptor count, the C locale). The code bugs in it were the paced remove's clock (fixed in 9.90) and the socket (fixed in 9.90); `-tfs` is its own entry above.
+- **What the operator sees:** (a developer running the suite on macOS) main's full serial suite on macOS 26, Python 3.9.6, fails 180 tests (2,134 passed, 512 skipped; 9.90: 175 failed, 2,156 passed, 518 skipped; a Python 3.14 run: 163 failed, 2,136 passed, 511 skipped, 16 deselected), never run whole there before. All but a few are the tests' own Linux assumptions: names that differ only in case or Unicode form on a case-insensitive APFS (56), the held file looked up through `/proc/self/fd` where macOS hands `cp` `/dev/fd/N` (34, 15 of them 60-s timeouts), names that are not UTF-8, which APFS refuses (33), Linux's `os.*xattr` calls (27), macOS's 1,024-byte path limit in the deep-tree tests (15), and smaller groups (setgid inheritance, `/proc/mounts`, `os.makedev`, a gc-timed descriptor count, the C locale). The code bugs in it were the paced remove's clock (fixed in 9.90) and the socket (fixed in 9.90); `-tfs` reads the type by statfs since 9.94.
 - **Why:** the suite was written and run on Linux; the Mac was first used for it on 2026-11-11.
-- **Plan (9.95):** gate each group by what the platform does (a case-sensitivity probe of the test's directory, or a case-sensitive APFS volume (test_darwin's RAM disk is plain APFS, which folds; a case-sensitive one is APFSX); the held file by `fcntl.F_GETPATH` in the tests that still read `/proc/self/fd` (test_darwin, conftest's descriptor guard and the probe tests' `_fd_path` helpers already do); skips where a name or xattr call is refused; trees by relative paths), so the macOS run shows only real failures. The four behaviours the check found are decided or have entries of their own: `-co` with set-ID bits (4700 kept under hpcp, 700 by hand: macOS's `cp` put back the mode its writes had cleared; fixed in 9.93), a case-only-rename patch apply's summary ("added 0, restored 2": a deferral above), `-d a/x` with `a/x` reached through a link (202 on macOS, 213 on Linux: a known limitation below, its test accepts both codes on macOS), and `hpcp X -d x -rf` refused with 241 on a case-insensitive APFS (a known limitation below, its test gated off such filesystems).
+- **Plan (9.95):** gate each group by what the platform does (a case-sensitivity probe of the test's directory, or a case-sensitive APFS volume (test_darwin's RAM disk is plain APFS, which folds; a case-sensitive one is APFSX); the held file by `fcntl.F_GETPATH` in the tests that still read `/proc/self/fd` (test_darwin, conftest's descriptor guard and the probe tests' `_fd_path` helpers already do); skips where a name or xattr call is refused; trees by relative paths), so the macOS run shows only real failures. The four behaviours the check found are decided or have entries of their own: `-co` with set-ID bits (4700 kept under hpcp, 700 by hand: macOS's `cp` put back the mode its writes had cleared; fixed in 9.93), a case-only-rename patch apply's summary ("added 0, restored 2": its tree is right, checked on macOS 26.6.2 in 9.94; the test expects that summary where the filesystem folds case), `-d a/x` with `a/x` reached through a link (202 on macOS, 213 on Linux: a known limitation below, its test accepts both codes on macOS), and `hpcp X -d x -rf` refused with 241 on a case-insensitive APFS (a known limitation below, its test gated off such filesystems).
 - **Revisit when:** 9.95.
 - **Noted:** 2026-11-12, the 9.90 Mac health check (logs in the session's scratchpad, b990/mac/); the builder's call, not asked (a deferral). Moved to 9.93 on 2026-11-13: 9.92 is the docs pass, the quiet cleanup, the multiCMD 1.64 embed and the size check; the main session's call (a deferral, not asked). Moved to 9.94 on 2026-11-13: 9.93 is the name probe's redesign and the `-co` set-user-ID cause; the main session's call (a deferral, not asked). Moved to 9.95 on 2026-11-14: a build the 9.94 run did not reach: about 180 tests in groups, each to be run on the Mac; the 9.94 builder's call (a deferral, not asked).
 
