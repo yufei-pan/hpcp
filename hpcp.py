@@ -993,6 +993,9 @@ _WATCH_GRACE = 4
 # loop acts on it within 1 s (_check_stop): raised anywhere in there, its KeyboardInterrupt could leave a lock of Python's
 # pool code held (concurrent.futures.wait's), and the pool's shutdown would wait on it for good.
 _DEFER = 0
+# True while the parent runs clean_up(): a stop there, the first too, is only recorded, and the run ends by it once the
+# cleanup has finished (main's _end_now). Not a pool region: the cleanup runs its commands in the parent.
+_CLEANING = False
 # The parent has acted on its stop (_check_stop raised for it, or hpcp() took its KeyboardInterrupt). Not set where _stop
 # raises: Python drops a KeyboardInterrupt raised in a weakref callback or a __del__, and the next check acts on it then.
 _STOP_ACTED = False
@@ -1040,7 +1043,8 @@ def _stop(signum, frame):
 	cleaned up); later ones return, so a second Ctrl-C cannot cut the cleanup halfway (the parent says so once, naming
 	Ctrl-\\). The stop is passed on to this process's pool workers, which a signal to this process alone (kill PID, timeout)
 	never reaches. A pool worker between tasks has nothing to clean up and ends at once. In the parent inside a pool region
-	(_DEFER) the first stop is only recorded: the region's loop raises it (_check_stop). A file hpcp makes is held by C before
+	(_DEFER) the first stop is only recorded: the region's loop raises it (_check_stop); in the cleanup (_CLEANING) too, and the
+	run ends by it once the cleanup is done. A file hpcp makes is held by C before
 	this can run (_create), so a stop that raises there leaves nothing the caller's cleanup cannot find."""
 	global _STOPPED, _STOPPED_PID, _STOP_NOTED
 	if _ENDING:
@@ -1081,7 +1085,7 @@ def _stop(signum, frame):
 		return
 	_STOPPED, _STOPPED_PID = signum, os.getpid()
 	_pass_stop_on(signum)
-	if _DEFER and os.getpid() == _MAIN_PID:
+	if (_DEFER or _CLEANING) and os.getpid() == _MAIN_PID:
 		return
 	if _DROPPING and _in_dropping_call(frame):
 		# Python would drop the raise, and 3.6 and 3.7 print it as 'Exception ignored' with its traceback. Recorded, it is acted
@@ -15233,7 +15237,7 @@ def _cleanup_step(what, message=None):
 	"""One step of clean_up, with the line it prints first. What the step raises is said on stderr and the steps after it still
 	run: once stdout's reader has quit (`hpcp -dd src dst | head`), a print or a shown command's call raises, and 9.89 to 9.91
 	left the loop devices attached. The line has nowhere to go then and is dropped, not the step. A stop does not reach it:
-	clean_up only records one (_DEFER)."""
+	clean_up only records one (_CLEANING)."""
 	if message:
 		_print_or_drop(message)
 	try:
@@ -15249,12 +15253,12 @@ def clean_up(mount_points: list,loop_devices: list, delayed_commands: list = Non
 	in here, the first one too, is recorded and taken as a later stop is (_stop): the cleanup finishes, and then the run ends
 	as the signal asked (main's _end_now). Before 9.94 a first stop here cut the step it landed in and skipped the rest, so
 	mounts and loop devices could stay."""
-	global _DEFER
-	_DEFER += 1
+	global _CLEANING
+	outer, _CLEANING = _CLEANING, True
 	try:
 		_clean_up(mount_points, loop_devices, delayed_commands)
 	finally:
-		_DEFER -= 1
+		_CLEANING = outer
 
 def _clean_up(mount_points, loop_devices, delayed_commands):
 	# clean up loop devices and mount points if we are using a image
