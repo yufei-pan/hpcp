@@ -5868,25 +5868,23 @@ def _settle_identical(src_path, src_st, dest, look, base=None):
 	look. False, with nothing set, when dest is no longer the file looked at (a link, or
 	another file's name, put there since: neither gets the source's owner or mode), for the caller to look again.
 
-	On Linux an O_PATH descriptor, reached by its /proc/self/fd name (as _carry_over); elsewhere a regular file or a FIFO opened
-	for reading without following a link (the check just read the file; a FIFO opens so without waiting for a writer, 9.94),
-	and what cannot be opened so (a device node, whose open acts on the device; a socket; a FIFO its owner may not read) by its
-	name in base, its owner, times and (where chmod can be told so) mode set relative to base without following a link put at
-	it, its xattrs (Linux without /proc; none on macOS) and BSD flags (macOS) by name (no dir_fd form). base: the door's result
-	for dest's directory (None: its path), which the landing is opened in."""
+	On Linux an O_PATH descriptor, reached by its /proc/self/fd name (as _carry_over); elsewhere a regular file opened for
+	reading without following a link (the check just read it), and a node by its name in base, its owner, times and (where
+	chmod can be told so) mode set relative to base without following a link put at it, its xattrs (Linux without /proc; none
+	on macOS) and BSD flags (macOS) by name (no dir_fd form). A FIFO is never opened for reading: that lets in a writer blocked
+	on it, and what it writes is lost (on macOS even an O_EVTONLY open does, 9.94 final review). base: the door's result for
+	dest's directory (None: its path), which the landing is opened in."""
 	base = os.path.dirname(dest) if base is None else base
 	leaf = os.path.basename(dest)
 	fd = None
 	try:
-		if _PATH_FDS or stat.S_ISREG(look.st_mode) or stat.S_ISFIFO(look.st_mode):
+		if _PATH_FDS or stat.S_ISREG(look.st_mode):
 			how = _SETTLE_PATH_FLAGS if _PATH_FDS else _SETTLE_READ_FLAGS
 			fd = os.open(leaf, how, dir_fd=base) if base.__class__ is int else os.open(os.path.join(base, leaf), how)
 	except OSError as e:
 		if e.errno in (errno.ENOENT, errno.ELOOP):
 			return False  # gone, or a link put there (O_NOFOLLOW)
-		if not (e.errno == errno.EACCES and stat.S_ISFIFO(look.st_mode)):
-			raise
-		# a FIFO its owner may not read (0222): by its name, below
+		raise
 	try:
 		now = os.fstat(fd) if fd is not None else os.lstat(*_at(base, leaf), **_fd_of(base))
 		if (now.st_dev, now.st_ino, stat.S_IFMT(now.st_mode)) != (look.st_dev, look.st_ino, stat.S_IFMT(look.st_mode)):

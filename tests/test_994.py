@@ -420,78 +420,51 @@ def _held(directory):
 	return os.open(directory, os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0))
 
 
-@posix_only
-@pytest.mark.skipif(not os.path.isdir('/proc/self/fd'), reason='the stand-in names an open file by /proc/self/fd')
-def test_994_an_identical_fifo_s_xattrs_go_through_a_descriptor_where_there_is_no_proc(tmp_path, monkeypatch):
-	# A rerun settles an identical FIFO at a landing (_settle_identical). Without /proc (forced) 9.93 listed, removed and set
-	# its xattrs by the landing's logical path, so out/d swapped for a link to victim/ after the door held it led them to
-	# victim/fifo, and set its mode by its name below the held directory (following a link put there). 9.94 opens the FIFO
-	# for reading without following a link (it opens without waiting for a writer) and does all of it through that
-	# descriptor. The xattr calls are stood in for: a FIFO takes no user.* xattr on Linux.
-	monkeypatch.setattr(hpcp, '_PATH_FDS', False)
-	os.makedirs(str(tmp_path / 'out' / 'd'))
-	os.makedirs(str(tmp_path / 'victim'))
-	os.mkfifo(str(tmp_path / 'src'), 0o640)
-	os.mkfifo(str(tmp_path / 'out' / 'd' / 'fifo'), 0o600)
-	os.mkfifo(str(tmp_path / 'victim' / 'fifo'), 0o600)
-	src_st = os.lstat(str(tmp_path / 'src'))
-	look = os.lstat(str(tmp_path / 'out' / 'd' / 'fifo'))
-	base = _held(str(tmp_path / 'out' / 'd'))
-	set_on = []
-
-	def where(target):
-		return os.readlink('/proc/self/fd/%d' % target) if isinstance(target, int) else target
-
-	def listxattr(target, **kwargs):
-		return ['user.k'] if where(target) == str(tmp_path / 'src') else []
-
-	def getxattr(target, name, **kwargs):
-		return b'v'
-
-	def setxattr(target, name, value, **kwargs):
-		set_on.append(where(target))
-
-	def removexattr(target, name, **kwargs):
-		set_on.append(where(target))
-	monkeypatch.setattr(hpcp, '_XATTRS', (listxattr, getxattr, setxattr, removexattr))
+def _reader_seen(path):
+	'''Whether something has the FIFO at path open for reading, asked as a writer would be let in: a write open that does not
+	wait answers ENXIO where nobody reads.'''
 	try:
-		os.rename(str(tmp_path / 'out' / 'd'), str(tmp_path / 'out' / 'd.away'))
-		os.symlink(str(tmp_path / 'victim'), str(tmp_path / 'out' / 'd'))
-		assert hpcp._settle_identical(str(tmp_path / 'src'), src_st, str(tmp_path / 'out' / 'd' / 'fifo'), look, base)
-	finally:
-		os.close(base)
-	assert set_on == [str(tmp_path / 'out' / 'd.away' / 'fifo')], set_on
-	assert stat.S_IMODE(os.lstat(str(tmp_path / 'out' / 'd.away' / 'fifo')).st_mode) == 0o640
-	assert stat.S_IMODE(os.lstat(str(tmp_path / 'victim' / 'fifo')).st_mode) == 0o600
-
-
-def _fifo_takes_xattrs(directory):
-	probe = os.path.join(directory, 'fifo-probe')
-	os.mkfifo(probe)
-	try:
-		hpcp._XATTRS[2](probe, 'user.hpcp-probe', b'1', follow_symlinks=False)
-		return True
-	except (OSError, TypeError):
-		return False
-	finally:
-		os.unlink(probe)
+		fd = os.open(path, os.O_WRONLY | os.O_NONBLOCK)
+	except OSError as e:
+		if e.errno == errno.ENXIO:
+			return False
+		raise
+	os.close(fd)
+	return True
 
 
 @posix_only
-def test_994_an_identical_fifo_gets_its_source_s_xattrs(tmp_path):
-	# Where a FIFO takes an xattr (macOS: user names; Linux: none as nobody), a rerun gives an identical FIFO the source's.
-	# 9.93 gave a node none on macOS (no xattr call there takes a dir_fd, so they would have gone by the full path); 9.94
-	# sets them through the descriptor it opened the FIFO by. Skipped where a FIFO takes none.
-	if hpcp._XATTRS is None or not _fifo_takes_xattrs(str(tmp_path)):
-		pytest.skip('a FIFO takes no xattr here')
+@pytest.mark.parametrize('landing_mode', [0o600, 0o222])
+@pytest.mark.parametrize('held', [True, False])
+@pytest.mark.parametrize('proc', [True, False])
+def test_994_a_rerun_never_opens_an_identical_fifo_for_reading(tmp_path, monkeypatch, proc, held, landing_mode):
+	# A guard: 9.93 never opened an identical FIFO landing, and 9.94 as built did where there is no /proc (a read open that
+	# does not wait): a program blocked in open(landing, O_WRONLY) was let in, and what it wrote went into a pipe nobody
+	# reads and was lost (measured on macOS 26.6.2; on Linux without /proc the writer died of SIGPIPE). On macOS even an
+	# O_EVTONLY open does it. Here the writer is told from a probe: at every call the settle makes while it holds what it
+	# opened, a non-blocking write open must still find no reader. (A FIFO's owner and mode are set by name without /proc.)
+	if proc and not hpcp._PATH_FDS:
+		pytest.skip('no O_PATH with /proc here')
+	monkeypatch.setattr(hpcp, '_PATH_FDS', proc)
 	os.makedirs(str(tmp_path / 'out'))
-	os.mkfifo(str(tmp_path / 'src'), 0o640)
-	os.mkfifo(str(tmp_path / 'out' / 'fifo'), 0o640)
-	hpcp._XATTRS[2](str(tmp_path / 'src'), 'user.kept', b'yes', follow_symlinks=False)
-	base = _held(str(tmp_path / 'out'))
+	source, landing = str(tmp_path / 'src'), str(tmp_path / 'out' / 'fifo')
+	os.mkfifo(source, 0o640)
+	os.mkfifo(landing, 0o600)
+	os.chmod(landing, landing_mode)
+	os.utime(source, (1, 1))
+	look = os.lstat(landing)
+	seen = []
+	for name in ('lstat', 'fstat', 'utime'):
+		def probing(*args, _real=getattr(os, name), **kwargs):
+			seen.append(_reader_seen(landing))
+			return _real(*args, **kwargs)
+		monkeypatch.setattr(os, name, probing)
+	base = _held(str(tmp_path / 'out')) if held else str(tmp_path / 'out')
 	try:
-		assert hpcp._settle_identical(str(tmp_path / 'src'), os.lstat(str(tmp_path / 'src')), str(tmp_path / 'out' / 'fifo'),
-			os.lstat(str(tmp_path / 'out' / 'fifo')), base)
+		assert hpcp._settle_identical(source, os.lstat(source), landing, look, base)
 	finally:
-		os.close(base)
-	assert hpcp._XATTRS[1](str(tmp_path / 'out' / 'fifo'), 'user.kept', follow_symlinks=False) == b'yes'
+		if held:
+			os.close(base)
+	monkeypatch.undo()
+	assert seen and not any(seen), seen
+	assert stat.S_IMODE(os.lstat(landing).st_mode) == 0o640 and os.lstat(landing).st_mtime == 1  # it was settled

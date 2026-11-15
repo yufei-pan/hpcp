@@ -541,20 +541,17 @@ def test_an_empty_destination_is_no_destination(tmp_path, sources):
 # ---- 9.88 N1: an identical FIFO or device node's owner and mode, set by name, never through a link put at it
 
 @pytest.mark.skipif(os.name != 'posix' or not hasattr(os, 'mkfifo'), reason='FIFOs')
-@pytest.mark.parametrize('landing_mode', [0o600, 0o222])
-def test_an_identical_node_s_owner_and_mode_are_set_without_following_a_link(tmp_path, monkeypatch, reset_hpcp_globals, landing_mode):
-	# Off Linux (macOS) and on Linux without /proc, _settle_identical has no O_PATH descriptor for a FIFO or device node. 9.87
-	# gave the owner (_chown_like_cp) and the mode by a call that follows a link put at the name since the look, so a root run
-	# could give the link's target the source's owner and mode. Since 9.94 a FIFO that opens for reading (0600) is settled
-	# through that descriptor; one its owner may not read (0222, not root) by name: chown is told not to follow always, chmod
-	# where the platform can (macOS's lchmod; Linux has none: the approved known limitation).
+def test_an_identical_node_s_owner_and_mode_are_set_without_following_a_link(tmp_path, monkeypatch, reset_hpcp_globals):
+	# Off Linux (macOS) and on Linux without /proc, _settle_identical has no descriptor for a FIFO or device node: it sets its
+	# metadata by name. 9.87 gave the owner (_chown_like_cp) and the mode by a call that follows a link put at the name since
+	# the look, so a root run could give the link's target the source's owner and mode. chown is told not to follow
+	# always; chmod where the platform can (macOS's lchmod; Linux has none: the approved known limitation).
 	import types
 	import hpcp
 	monkeypatch.setattr(hpcp, '_PATH_FDS', False)
 	source, landing = str(tmp_path / 'p'), str(tmp_path / 'q')
 	os.mkfifo(source, 0o644)
 	os.mkfifo(landing, 0o600)
-	os.chmod(landing, landing_mode)
 	look = os.lstat(landing)
 	real = os.lstat(source)
 	# another owner and group than the landing's, and another mode: both are set
@@ -564,7 +561,7 @@ def test_an_identical_node_s_owner_and_mode_are_set_without_following_a_link(tmp
 	for name in ('chown', 'chmod'):
 		original = getattr(os, name)
 		def spy(path, *args, _original=original, _name=name, **kwargs):
-			calls.append((_name, not isinstance(path, int) and kwargs.get('follow_symlinks', True)))  # a descriptor follows nothing
+			calls.append((_name, kwargs.get('follow_symlinks', True)))
 			return _original(path, *args, **kwargs)
 		monkeypatch.setattr(os, name, spy)
 	try:
