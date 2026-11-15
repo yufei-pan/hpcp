@@ -995,12 +995,13 @@ _WATCH_GRACE = 4
 # pool code held (concurrent.futures.wait's), and the pool's shutdown would wait on it for good.
 _DEFER = 0
 # True while the parent runs clean_up(): a stop there, the first too, is only recorded, and the run ends by it once the
-# cleanup has finished (main's _end_now). Not a pool region: the cleanup runs its commands in the parent.
+# cleanup has finished (main's _end_now; a -dd partition's nested hpcp() acts on it when it returns, _check_stop). Not a pool
+# region: the cleanup runs its commands in the parent.
 _CLEANING = False
 # The parent has acted on its stop (_check_stop raised for it, or hpcp() took its KeyboardInterrupt). Not set where _stop
 # raises: Python drops a KeyboardInterrupt raised in a weakref callback or a __del__, and the next check acts on it then.
 _STOP_ACTED = False
-# The parent has said once that a later stop is ignored while it cleans up (_stop).
+# The parent has said once that it is cleaning up first, on the first stop that lands in the cleanup or a later one (_say_stopping).
 _STOP_NOTED = False
 # A pool, or _looked_at's threads, was left with something of it still running or stuck: main() ends by os._exit, not by the
 # interpreter's exit, which joins Python's pool threads.
@@ -1038,6 +1039,15 @@ def _end_by(signum):
 	# A default action that does not end the process (none of ours): end anyway.
 	os._exit(128 + signum)
 
+def _say_stopping():
+	"""The parent's one line, once, for a stop it does not act on at once (the cleanup finishes first). One write, never
+	print: a handler printing while the main thread prints raises 'reentrant call'."""
+	global _STOP_NOTED
+	if os.getpid() == _MAIN_PID and not _STOP_NOTED:
+		_STOP_NOTED = True
+		_say('Stopping: cleaning up first (cp stopped, temporary files removed, images unmounted); Ctrl-\\ ends hpcp now, '
+			'which may leave them')
+
 def _stop(signum, frame):
 	"""The handler for every stop a process can catch: the first raises KeyboardInterrupt, so multiCMD stops cp (in a process
 	group of its own, which no group signal reaches) and every finally runs (a temporary file is discarded, mounts are
@@ -1045,9 +1055,10 @@ def _stop(signum, frame):
 	Ctrl-\\). The stop is passed on to this process's pool workers, which a signal to this process alone (kill PID, timeout)
 	never reaches. A pool worker between tasks has nothing to clean up and ends at once. In the parent inside a pool region
 	(_DEFER) the first stop is only recorded: the region's loop raises it (_check_stop); in the cleanup (_CLEANING) too, and the
-	run ends by it once the cleanup is done. A file hpcp makes is held by C before
-	this can run (_create), so a stop that raises there leaves nothing the caller's cleanup cannot find."""
-	global _STOPPED, _STOPPED_PID, _STOP_NOTED
+	run ends by it once the cleanup is done (a -dd partition's nested run: when it returns, _check_stop), after one line saying
+	so (_say_stopping). A file hpcp makes is held by C before this can run (_create), so a stop that raises there leaves
+	nothing the caller's cleanup cannot find."""
+	global _STOPPED, _STOPPED_PID
 	if _ENDING:
 		return
 	if not _IN_TASK and os.getpid() != _MAIN_PID:
@@ -1078,15 +1089,13 @@ def _stop(signum, frame):
 			_end_by(_STOPPED)
 		raise SystemExit(128 + signum)
 	if _STOPPED_PID == os.getpid():
-		if os.getpid() == _MAIN_PID and not _STOP_NOTED:
-			# One write, never print: a handler printing while the main thread prints raises 'reentrant call'.
-			_STOP_NOTED = True
-			_say('Stopping: cleaning up first (cp stopped, temporary files removed, images unmounted); Ctrl-\\ ends hpcp now, '
-				'which may leave them')
+		_say_stopping()
 		return
 	_STOPPED, _STOPPED_PID = signum, os.getpid()
 	_pass_stop_on(signum)
 	if (_DEFER or _CLEANING) and os.getpid() == _MAIN_PID:
+		if _CLEANING:
+			_say_stopping()  # the cleanup may take minutes (an e2fsck): nothing else tells the operator it is being waited for
 		return
 	if _DROPPING and _in_dropping_call(frame):
 		# Python would drop the raise, and 3.6 and 3.7 print it as 'Exception ignored' with its traceback. Recorded, it is acted
@@ -15265,8 +15274,7 @@ def _cleanup_step(what, message=None):
 def clean_up(mount_points: list,loop_devices: list, delayed_commands: list = None):
 	"""Unmount mount_points, run delayed_commands, detach loop_devices: every step, each its own try (_cleanup_step). A stop
 	in here, the first one too, is recorded and taken as a later stop is (_stop): the cleanup finishes, and then the run ends
-	as the signal asked (main's _end_now). Before 9.94 a first stop here cut the step it landed in and skipped the rest, so
-	mounts and loop devices could stay."""
+	as the signal asked (main's _end_now; a nested run's caller, _check_stop)."""
 	global _CLEANING
 	outer, _CLEANING = _CLEANING, True
 	try:
@@ -15624,6 +15632,10 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = None,
 						exit_not_enough_space = exit_not_enough_space, write_beside = write_beside, read_before_write = read_before_write)
 				finally:
 					ERRORS[:0] = outer_errors
+				# A stop that landed in the nested run's cleanup was only recorded (_CLEANING) and the run returned 0: act on it
+				# here, before the next partition's mounts, or a partition that cannot be mounted is copied whole (9.93 raised
+				# out of the nested cleanup at once).
+				_check_stop()
 				if copy_rc:
 					raise RuntimeError(f"Partition copy error: Copying partition {partition} failed with return code {copy_rc}.")
 			# sort the output partitions

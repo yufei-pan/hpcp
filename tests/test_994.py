@@ -371,6 +371,8 @@ _CLEANUP_STOPPED = '''
 import os, signal, sys
 sys.path.insert(0, %(root)r)
 import hpcp
+for name in ('SIGINT', 'SIGTERM', 'SIGHUP'):
+	signal.signal(getattr(signal, name), signal.SIG_DFL)  # a caller that ignores them (nohup, a background job) would keep them so
 hpcp._MAIN_PID = os.getpid()
 hpcp._install_stops()
 here = %(here)r
@@ -398,6 +400,76 @@ def test_994_a_first_stop_during_the_cleanup_lets_it_finish(tmp_path, name):
 	output = task.stdout.decode('utf-8', 'replace')
 	assert output.strip().splitlines()[-1] == 'ended %d' % getattr(__import__('signal'), 'SIG' + name), output
 	assert os.path.exists(str(tmp_path / 'one')) and os.path.exists(str(tmp_path / 'two')), output
+	# The first stop says so, once (it landed in the cleanup, which may take minutes: an e2fsck): later ones were the only ones to.
+	assert output.count('Stopping: cleaning up first') == 1 and 'Ctrl-\\ ends hpcp now' in output, output
+
+
+_DD_NESTED_CLEANUP_STOPPED = '''
+import os, signal, sys, tempfile
+from types import SimpleNamespace
+sys.path.insert(0, %(root)r)
+import hpcp
+for name in ('SIGINT', 'SIGTERM', 'SIGHUP'):
+	signal.signal(getattr(signal, name), signal.SIG_DFL)  # a caller that ignores them (nohup, a background job) would keep them so
+hpcp._MAIN_PID = os.getpid()
+hpcp._install_stops()
+here = %(here)r
+roots, copied, sent = [], [], []
+
+def mount_dir():
+	path = os.path.join(here, 'mount%%d' %% len(roots))
+	os.mkdir(path)
+	roots.append(path)
+	if len(roots) == 1:
+		with open(os.path.join(path, 'data.txt'), 'w') as fh:  # partition 1's source holds a file; partition 2's mounts nothing
+			fh.write('partition data')
+	return path
+
+def run(command, **kwargs):
+	return [] if command[0] == 'mount' else real_run(command, **kwargs)
+
+real_run = hpcp.run_command_in_multicmd_with_path_check
+name = '_clean_up' if hasattr(hpcp, '_clean_up') else 'clean_up'  # 9.93 has no _clean_up
+real_clean = getattr(hpcp, name)
+
+def clean_with_a_stop(*args):
+	# The first cleanup is the first partition's nested run's: the stop lands in it (the lists are empty there).
+	if not sent:
+		sent.append(1)
+		os.kill(os.getpid(), signal.SIGINT)
+	return real_clean(*args)
+
+hpcp.validate_dd_source_path = lambda *a, **k: '/dev/fake-source'
+hpcp.create_dd_dest_part_table = lambda *a, **k: ({'/dev/fake-source': {}, '1': {'size': 4096}, '2': {'size': 4096}}, [], None)
+hpcp.get_partitions = lambda device: [device + '1', device + '2']
+hpcp.os.geteuid = lambda: 0
+hpcp.tempfile = SimpleNamespace(mkdtemp=mount_dir)
+hpcp.os.path.ismount = lambda path: path in roots[:2]
+hpcp.run_command_in_multicmd_with_path_check = run
+setattr(hpcp, name, clean_with_a_stop)
+hpcp.dd_partition = lambda *a, **k: copied.append(a[2])
+rc = hpcp.hpcp(['/dev/fake-source'], dest_image=os.path.join(here, 'dest.img'), dd=True, single_thread=True, max_workers=1,
+	no_directory_sync=True)
+print('rc', rc, 'mounted', len(roots), 'dd copied partitions', copied)
+'''
+
+
+@pytest.mark.skipif(not __import__('sys').platform.startswith('linux'), reason='-dd is Linux')
+def test_994_a_stop_in_a_partition_s_cleanup_ends_the_dd_run_before_the_next_partition(tmp_path):
+	# -dd copies each partition by a nested hpcp(). Ctrl-C landing in its cleanup (its lists are empty there, so the window
+	# is short) is only recorded and the nested run returns 0: 9.94 as built went on to the next partition's mounts, and where
+	# that could not be mounted dd_partition copied it whole, before anything checked the stop. 9.93 raised out of the nested
+	# cleanup at once, so this guards what 9.93 gets right. The disk setup and the mounts are stood in for (as test_dd_errors);
+	# the stop is a real SIGINT.
+	import subprocess
+	import sys
+	code = _DD_NESTED_CLEANUP_STOPPED % {'root': os.path.dirname(hpcp.__file__), 'here': str(tmp_path)}
+	task = subprocess.run([sys.executable, '-c', code], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=120,
+		start_new_session=True)
+	output = task.stdout.decode('utf-8', 'replace')
+	assert 'Keyboard Interrupt' in output and 'dd copied partitions []' in output, output[-3000:]
+	assert os.listdir(str(tmp_path)).count('mount2') == 0, output[-3000:]  # the second partition's mounts were never made
+	assert os.path.exists(str(tmp_path / 'mount1' / 'data.txt')), output[-3000:]  # the first partition's copy was whole
 
 
 @posix_only
