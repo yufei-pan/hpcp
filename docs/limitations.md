@@ -215,6 +215,14 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - **Revisit when:** an operator needs such rewrites in directories that take no new name.
 - **Approved:** 2026-11-09, the user chose "Approve (Recommended)".
 
+### A -co rewrite beside whose new file its owner may not read keeps the old copy, where nothing holds the new file
+- **Kind:** known limitation.
+- **What the operator sees:** on macOS, the BSDs and Linux without /proc, a non-root `-co` rewrite that goes beside (`-wb`, or by default a file with other names or one that does not open for writing) of a source whose new file its owner may not read (mode 0044, a source of another user's read through its group or others) keeps the old copy: exit 190, `... its owner, group or an xattr cannot be given to the new copy (Permission denied)`. 9.93 completed it by the new file's name. Linux with /proc is not affected (an `O_PATH` descriptor needs no read).
+- **Workaround:** give the file owner read, or rerun without `-wb`.
+- **Why:** there `cp` makes the new file by name, and the carry must open it to set anything on it without following a link (9.94: a link another user put at that name got the old file's owner and mode). A 0044 file cannot be opened for writing either, so a write-only retry does not help.
+- **Revisit when:** someone hits it.
+- **Approved:** 2026-11-14, the user chose "Known limitation (Recommended)".
+
 ### With -wb, a rewrite does not keep a per-file layout, chattr flags or the project id
 - **Kind:** known limitation.
 - **What the operator sees:** with `-wb` (and on the default's beside cases), the new file takes its directory's default Lustre or GPFS layout, not the one set on the old file (`lfs setstripe`), and no `chattr` flags or project id of the old file. A default in-place rewrite keeps all of them.
