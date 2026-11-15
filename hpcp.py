@@ -15227,8 +15227,8 @@ def detach_loop_device(loop_device, retries=5, delay=0.5):
 def _cleanup_step(what, message=None):
 	"""One step of clean_up, with the line it prints first. What the step raises is said on stderr and the steps after it still
 	run: once stdout's reader has quit (`hpcp -dd src dst | head`), a print or a shown command's call raises, and 9.89 to 9.91
-	left the loop devices attached. The line has nowhere to go then and is dropped, not the step. A stop (KeyboardInterrupt)
-	is not caught: it ends the cleanup, as before 9.92 (docs/limitations.md)."""
+	left the loop devices attached. The line has nowhere to go then and is dropped, not the step. A stop does not reach it:
+	clean_up only records one (_DEFER)."""
 	if message:
 		_print_or_drop(message)
 	try:
@@ -15240,6 +15240,18 @@ def _cleanup_step(what, message=None):
 			pass
 
 def clean_up(mount_points: list,loop_devices: list, delayed_commands: list = None):
+	"""Unmount mount_points, run delayed_commands, detach loop_devices: every step, each its own try (_cleanup_step). A stop
+	in here, the first one too, is recorded and taken as a later stop is (_stop): the cleanup finishes, and then the run ends
+	as the signal asked (main's _end_now). Before 9.94 a first stop here cut the step it landed in and skipped the rest, so
+	mounts and loop devices could stay."""
+	global _DEFER
+	_DEFER += 1
+	try:
+		_clean_up(mount_points, loop_devices, delayed_commands)
+	finally:
+		_DEFER -= 1
+
+def _clean_up(mount_points, loop_devices, delayed_commands):
 	# clean up loop devices and mount points if we are using a image
 	# Every command runs quiet: a shown command's output stops it, and its call raises, once stdout's reader has quit (multiCMD
 	# 1.61 to 1.63 at its first line, 1.64 when it prints for over a second). Its failure is still said, on stderr, and what one

@@ -336,3 +336,36 @@ def test_994_macos_reads_a_destination_s_type(tmp_path):
 	kind = hpcp.get_fs_type_from_path(str(tmp_path))
 	mounts = subprocess.run(['mount'], stdout=subprocess.PIPE, check=True).stdout.decode('utf-8', 'replace')
 	assert kind and ('(%s,' % kind in mounts or '(%s)' % kind in mounts), (kind, mounts)
+
+
+_CLEANUP_STOPPED = '''
+import os, signal, sys
+sys.path.insert(0, %(root)r)
+import hpcp
+hpcp._MAIN_PID = os.getpid()
+hpcp._install_stops()
+here = %(here)r
+first = ['sh', '-c', 'kill -%(signal)s %%d; sleep 0.5; touch %%s/one' %% (os.getpid(), here)]
+try:
+	hpcp.clean_up([], [], [first, ['touch', os.path.join(here, 'two')]])
+	print('ended', hpcp._STOPPED)
+except KeyboardInterrupt:
+	print('cut')
+'''
+
+
+@posix_only
+@pytest.mark.parametrize('name', ['INT', 'TERM', 'HUP'])
+def test_994_a_first_stop_during_the_cleanup_lets_it_finish(tmp_path, name):
+	# A run that mounted an image or attached a loop device, stopped for the first time while clean_up() runs (here inside its
+	# delayed commands' step: the first command signals hpcp): 9.93 raised the stop there, so the step was cut (its command
+	# stopped) and every step after it skipped, and mounts, loop devices or a -dd clone's mkfs UUID could stay. 9.94 records
+	# it, as a later stop: both commands run to their end, and the stop is there for main() to end the run by.
+	import subprocess
+	import sys
+	code = _CLEANUP_STOPPED % {'root': os.path.dirname(hpcp.__file__), 'here': str(tmp_path), 'signal': name}
+	task = subprocess.run([sys.executable, '-c', code], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=60,
+		start_new_session=True)
+	output = task.stdout.decode('utf-8', 'replace')
+	assert output.strip().splitlines()[-1] == 'ended %d' % getattr(__import__('signal'), 'SIG' + name), output
+	assert os.path.exists(str(tmp_path / 'one')) and os.path.exists(str(tmp_path / 'two')), output
