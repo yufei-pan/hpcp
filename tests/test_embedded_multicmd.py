@@ -15,10 +15,11 @@ def _run_with_embedded_multicmd(tmp_path, code):
 
 
 @pytest.mark.parametrize('installed, uses_installed', [
-	("'1.66'", True),
+	("'1.67'", True),
 	("'1.100'", True),   # float('1.100') == 1.1 would wrongly reject it
 	("'2.0'", True),
-	("'1.65'", False),   # older than the embedded copy, whose countdown at a terminal ends at its timeout whatever was typed (1.66)
+	("'1.66'", False),   # older than the embedded copy, whose format_bytes counts '4.1G' as 4100000000 bytes, not 4099999999 (1.67)
+	("'1.65'", False),   # older still: a countdown at a terminal that waited for a line to end past its timeout (1.66)
 	("'1.64'", False),   # older still: an ended stdin at the countdown raised, where 1.65 takes it for no answer
 	("'1.63'", False),   # older still: shown calls that went on when stdout's reader quit (1.64)
 	("'1.61'", False),   # older still: 9.91's copy, with the exec wrapper's SIGINT mask
@@ -26,7 +27,7 @@ def _run_with_embedded_multicmd(tmp_path, code):
 	("'1.59'", False),   # older still: no thread-start fix (1.60)
 	("'1.58'", False),   # older still: no pass_fds
 	("'1.56'", False),   # the floor pip accepts, older than the embedded copy
-	("'1.9'", False),    # minor 9 < 66, though float('1.9') > 1.66
+	("'1.9'", False),    # minor 9 < 67, though float('1.9') > 1.67
 	("'garbage'", False),
 	(None, False),       # a module without a version
 ])
@@ -37,11 +38,11 @@ def test_an_installed_multicmd_is_used_only_when_not_older_than_the_embedded_one
 		cwd=str(tmp_path), env=env, universal_newlines=True, check=True).stdout.split()
 	assert out[0] == str(uses_installed)
 	if not uses_installed:
-		assert out[1] == '1.66'
+		assert out[1] == '1.67'
 
 
 def test_embedded_multicmd_is_used_when_the_installed_one_is_older(tmp_path):
-	assert _run_with_embedded_multicmd(tmp_path, 'import hpcp; print(hpcp.multiCMD.version)').strip() == '1.66'
+	assert _run_with_embedded_multicmd(tmp_path, 'import hpcp; print(hpcp.multiCMD.version)').strip() == '1.67'
 
 
 @pytest.mark.skipif(os.name != 'posix', reason='pass_fds is POSIX')
@@ -53,7 +54,7 @@ r, w = os.pipe()
 task = hpcp.multiCMD.run_commands([['sh', '-c', 'echo through >&%d' % w]], quiet=True, return_object=True, pass_fds=(w,))[0]
 os.close(w)
 print(hpcp.multiCMD.version, task.returncode, os.read(r, 100).decode().strip())"""
-	assert _run_with_embedded_multicmd(tmp_path, code).split() == ['1.66', '0', 'through']
+	assert _run_with_embedded_multicmd(tmp_path, code).split() == ['1.67', '0', 'through']
 
 
 def test_the_import_gate_tracks_the_embedded_copy_and_no_installer_is_asked_for_multicmd():
@@ -65,7 +66,7 @@ def test_the_import_gate_tracks_the_embedded_copy_and_no_installer_is_asked_for_
 		source = f.read()
 	# the embed sits one tab in, inside the import's signal mask (9.88)
 	gate = re.search(r"\) < \((\d+), (\d+)\):\n\t\t\traise ImportError\('multiCMD too old'\)", source)
-	assert '%s.%s' % gate.groups() == '1.66'
+	assert '%s.%s' % gate.groups() == '1.67'
 	header = source[:source.index('# ///\n', source.index('# /// script\n') + 1)]
 	assert 'xxhash' in header and 'multicmd' not in header.lower()
 	with open(os.path.join(_ROOT, 'setup.py'), encoding='utf-8') as f:
@@ -85,7 +86,7 @@ def test_xxhash_is_not_required_where_stock_pip_cannot_install_it():
 @pytest.mark.parametrize('typed, answer', [(b'n\n', "'n'"), (b'n', 'None'), (b'n\x04', 'None')])
 def test_the_embedded_countdown_takes_only_a_line_ended_before_it_runs_out(tmp_path, typed, answer):
 	# hpcp's prompts (-dd's "All data ... will be lost", the destination prompt, a mount that fails) ask through the embedded
-	# multiCMD's countdown, and take no answer for their default. 1.66 (hpcp 9.94): at a terminal a line ended by Enter is the
+	# multiCMD's countdown, and take no answer for their default. From 1.66 (hpcp 9.94 carries 1.67): at a terminal a line ended by Enter is the
 	# answer, and text with no Enter is none when the countdown runs out, also typed and then one Ctrl-D, which 1.64 (hpcp
 	# 9.93) waited on past the countdown for the line to end.
 	import pty
