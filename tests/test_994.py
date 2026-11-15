@@ -1,5 +1,6 @@
 '''hpcp 9.94. Each test fails on 9.93 (v9.93) unless it says it guards what 9.93 already gets right. Every swap is forced in
-this process, at the call it is timed by: no sleeps, no random sweep.'''
+this process, at the call it is timed by, and no sweep is random. (The first-stop tests have a child wait 0.5 s for a command
+to be running; a stop that lands late still passes.)'''
 import errno
 import os
 import stat
@@ -187,7 +188,8 @@ def _co_beside(tmp_path, monkeypatch, route, plant=None, source='regular'):
 def test_994_a_rewrite_whose_new_file_was_swapped_keeps_the_old_copy_and_the_link_s_file(tmp_path, monkeypatch, reset_hpcp_globals, route, what):
 	# The same through copy_file: a link (or a FIFO) put at the new file's name after cp wrote it. 9.93's read route gave the
 	# victim the old file's mode and owner and renamed the link over out/x; 9.94 keeps out/x as it was (190, naming why), the
-	# victim untouched, and nothing left at the temporary name.
+	# victim untouched, and nothing left at the temporary name. [proc-symlink] and [proc-hardlink] guard what 9.93 gets right
+	# (its O_PATH check refused both links); the FIFO ones and the read route fail on 9.93.
 	victim = _Victim(str(tmp_path / 'v' / 'victim'))
 	st, errors = _co_beside(tmp_path, monkeypatch, route, lambda temp: _plant(what, temp, victim))
 	assert victim.untouched(), (victim.before, victim.state())

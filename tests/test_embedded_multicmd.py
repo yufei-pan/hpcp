@@ -18,7 +18,7 @@ def _run_with_embedded_multicmd(tmp_path, code):
 	("'1.67'", True),
 	("'1.100'", True),   # float('1.100') == 1.1 would wrongly reject it
 	("'2.0'", True),
-	("'1.66'", False),   # older than the embedded copy, whose format_bytes counts '4.1G' as 4100000000 bytes, not 4099999999 (1.67)
+	("'1.66'", False),   # older than the embedded copy, whose format_bytes counts '4.1G' as 4100000000 bytes (1.66 gives 4099999999)
 	("'1.65'", False),   # older still: a countdown at a terminal that waited for a line to end past its timeout (1.66)
 	("'1.64'", False),   # older still: an ended stdin at the countdown raised, where 1.65 takes it for no answer
 	("'1.63'", False),   # older still: shown calls that went on when stdout's reader quit (1.64)
