@@ -153,12 +153,15 @@ def test_994_another_user_s_file_at_the_carry_s_name_keeps_its_owner_and_mode(tm
 	assert (stat.S_IMODE(now.st_mode), now.st_uid, now.st_gid) == (0o644, VICTIM, VICTIM)
 
 
-def _co_beside(tmp_path, monkeypatch, route, plant=None):
+def _co_beside(tmp_path, monkeypatch, route, plant=None, source='regular'):
 	'''A -co -wb rewrite of out/x (_old_file) from x through copy_file, where cp makes the new file by name (no held route)
 	and _carry_over reaches it by route (_carry_route). plant(temp) runs once cp has written the new file, before the carry.
-	The run's ERRORS.'''
+	source: 'regular', or 'fifo' (cp -a makes the new node). The run's ERRORS.'''
 	_carry_route(monkeypatch, route)
-	_write(str(tmp_path / 'x'), 'new')
+	if source == 'fifo':
+		os.mkfifo(str(tmp_path / 'x'), 0o644)
+	else:
+		_write(str(tmp_path / 'x'), 'new')
 	st = _old_file(str(tmp_path / 'out' / 'x'))
 	monkeypatch.setattr(hpcp, 'CONTENT_ONLY', True)
 	monkeypatch.setattr(hpcp, 'WRITE_BESIDE', True)
@@ -195,18 +198,21 @@ def test_994_a_rewrite_whose_new_file_was_swapped_keeps_the_old_copy_and_the_lin
 
 
 @posix_only
+@pytest.mark.parametrize('source', ['regular', 'fifo'])
 @pytest.mark.parametrize('route', ['proc', 'read'])
-def test_994_a_rewrite_through_the_carry_s_descriptor_keeps_its_metadata(tmp_path, monkeypatch, reset_hpcp_globals, route):
+def test_994_a_rewrite_through_the_carry_s_descriptor_keeps_its_metadata(tmp_path, monkeypatch, reset_hpcp_globals, route, source):
 	# A -co rewrite beside, with nothing put at the new file's name, gives it the old file's mode and owner (the runner's 0666;
-	# in a root run OTHER's 6755) and a user.* xattr, as 9.93 does: it guards what 9.93 gets right.
-	xattrs = _user_xattrs(str(tmp_path))
+	# in a root run OTHER's 6755) and a user.* xattr, as 9.93 does: it guards what 9.93 gets right. A FIFO source is made anew
+	# by cp -a, and the FIFO gets them (opened for reading where there is no /proc; a FIFO takes no user.* xattr on Linux).
+	xattrs = source == 'regular' and _user_xattrs(str(tmp_path))
 	if xattrs:
 		_write(str(tmp_path / 'out' / 'x'), 'old')
 		os.setxattr(str(tmp_path / 'out' / 'x'), 'user.kept', b'yes')
-	st, errors = _co_beside(tmp_path, monkeypatch, route)
+	st, errors = _co_beside(tmp_path, monkeypatch, route, source=source)
 	assert not errors, errors
 	now = os.lstat(str(tmp_path / 'out' / 'x'))
-	assert _read(str(tmp_path / 'out' / 'x')) == 'new' and now.st_ino != st.st_ino
+	assert now.st_ino != st.st_ino
+	assert stat.S_ISFIFO(now.st_mode) if source == 'fifo' else _read(str(tmp_path / 'out' / 'x')) == 'new'
 	assert (stat.S_IMODE(now.st_mode), now.st_uid, now.st_gid) == (stat.S_IMODE(st.st_mode), st.st_uid, st.st_gid)
 	if xattrs:
 		assert os.getxattr(str(tmp_path / 'out' / 'x'), 'user.kept') == b'yes'

@@ -4486,56 +4486,68 @@ def _write_clears(mode):
 		return mode & (stat.S_ISUID | stat.S_ISGID)
 	return mode & stat.S_ISUID
 
-def _carry_over(st, temp, carried, held=None, base=None):
+def _carry_over(st, temp, carried, held=None, base=None, kind=stat.S_IFREG):
 	"""Give temp, the new file of a -co rewrite, exactly what the old file (st, carried: _co_carry) had: its carried xattrs
 	(each set, and any such name temp gained, as an ACL inherited from a default ACL, removed), owner and group, and mode, less
 	the set-ID bits a write clears (_write_clears) when the runner is not root, as a write in place leaves them. A label the
 	filesystem gives itself (setting security.selinux fails with EOPNOTSUPP: vfat, a context= mount) is skipped. Anything else
-	that fails raises. Every step goes through a descriptor, never temp's name: held, the one hpcp made temp by (_cp_beside);
-	else one opened at temp's name without following a link (on Linux with /proc an O_PATH one, reached by its /proc/self/fd
-	name and never opened for data, so a node made of a device is not acted on; elsewhere one opened for reading). What that
-	opens must be a regular file with one name, owned by the runner or already by the old file's owner: a link, a node or
-	another user's file put at the name since cp made it (a user who can write the directory) is refused, so no chown, chmod
-	or xattr reaches the file a link leads to, and a root run gives no other user's file this one's owner and mode. base: the
-	door's result for temp's directory (_cp_beside), which temp's name is opened in; None: temp, a path."""
+	that fails raises. kind: the file type cp made (the source's: a FIFO or device node source is made anew by cp -a).
+	Every step goes through a descriptor, never temp's name: held, the one hpcp made temp by (_cp_beside); else one opened at
+	temp's name without following a link (on Linux with /proc an O_PATH one, reached by its /proc/self/fd name and never
+	opened for data, so a node made of a device is not acted on; elsewhere a regular file or a FIFO opened for reading). A
+	device node or a socket there (no /proc: an open of one acts on the device, or fails) is reached by its name in base, as
+	an identical node is (_settle_identical): chown and the xattr calls never follow a link put at it, chmod where the
+	platform can say so (not Linux). What is there must be a file of kind with one name, owned by the runner or already by
+	the old file's owner: a link, another type or another user's file put at the name since cp made it (a user who can write
+	the directory) is refused, so no chown, chmod or xattr reaches the file a link leads to, and a root run gives no other
+	user's file this one's owner and mode. base: the door's result for temp's directory (_cp_beside), which temp's name is
+	opened in; None: temp, a path."""
+	name = os.path.basename(temp)
+	at, at_how = (_at(base, name), _fd_of(base)) if base is not None else ((temp,), {})
 	fd = None
-	if held is None:
+	if held is None and (_PATH_FDS or kind in (stat.S_IFREG, stat.S_IFIFO)):
 		try:
-			fd = os.open(*(_at(base, os.path.basename(temp)) if base is not None else (temp,)),
-				_CARRY_PATH_FLAGS if _PATH_FDS else _CARRY_READ_FLAGS, **_fd_of(base))
+			fd = os.open(*at, _CARRY_PATH_FLAGS if _PATH_FDS else _CARRY_READ_FLAGS, **at_how)
 		except OSError as e:
 			if e.errno in (errno.ELOOP, errno.EMLINK):  # a link at the name: O_NOFOLLOW (EMLINK: FreeBSD's word for it)
 				raise OSError(errno.EEXIST, 'it was replaced since cp made it', temp) from None
 			raise
 	try:
-		if fd is not None:
-			now = os.fstat(fd)
-			if not stat.S_ISREG(now.st_mode) or now.st_nlink != 1 or now.st_uid not in (os.geteuid(), st.st_uid):
-				raise OSError(errno.EEXIST, 'it was replaced since cp made it', temp)
-			temp = '/proc/self/fd/%d' % fd if _PATH_FDS else fd  # the first leads to the descriptor's file, and no further
+		if held is not None:
+			xpath = cpath = mpath = held
+			xhow, chow, mhow = {}, {}, {}
 		else:
-			temp = held
+			now = os.fstat(fd) if fd is not None else os.lstat(*at, **at_how)
+			if stat.S_IFMT(now.st_mode) != kind or now.st_nlink != 1 or now.st_uid not in (os.geteuid(), st.st_uid):
+				raise OSError(errno.EEXIST, 'it was replaced since cp made it', temp)
+			if fd is not None:
+				xpath = cpath = mpath = '/proc/self/fd/%d' % fd if _PATH_FDS else fd  # the first leads to the descriptor's file, and no further
+				xhow, chow, mhow = {}, {}, {}
+			else:
+				xpath, xhow = _io(base, name, temp) if base is not None else temp, {'follow_symlinks': False}
+				cpath, chow = at[0], dict(at_how, follow_symlinks=False)
+				mpath, mhow = at[0], dict(at_how, **({'follow_symlinks': False} if os.chmod in os.supports_follow_symlinks else {}))
 		if hasattr(os, 'listxattr'):
 			try:
-				gained = os.listxattr(temp)
+				gained = os.listxattr(xpath, **xhow)
 			except OSError as e:
 				if e.errno not in (errno.ENOTSUP, errno.EOPNOTSUPP):
 					raise
 				gained = []
-			for name in gained:
-				if name not in carried and (name.startswith('user.') or name in _CO_CARRIED[:2]):
-					os.removexattr(temp, name)
-			for name, value in carried.items():
+			for xname in gained:
+				if xname not in carried and (xname.startswith('user.') or xname in _CO_CARRIED[:2]):
+					os.removexattr(xpath, xname, **xhow)
+			for xname, value in carried.items():
 				try:
-					os.setxattr(temp, name, value)
+					os.setxattr(xpath, xname, value, **xhow)
 				except OSError as e:
-					if not (name == 'security.selinux' and e.errno in (errno.ENOTSUP, errno.EOPNOTSUPP)):
+					if not (xname == 'security.selinux' and e.errno in (errno.ENOTSUP, errno.EOPNOTSUPP)):
 						raise
-		os.chown(temp, st.st_uid, st.st_gid)
+		os.chown(cpath, st.st_uid, st.st_gid, **chow)
 		mode = stat.S_IMODE(st.st_mode)
 		if os.geteuid() != 0:
 			mode &= ~_write_clears(mode)
-		os.chmod(temp, mode)
+		os.chmod(mpath, mode, **mhow)
 	finally:
 		if fd is not None:
 			os.close(fd)
@@ -5522,7 +5534,7 @@ def _cp_beside(command, src_path, target, st, why, space, src_st=None, base=None
 			attributes = None
 			if carried is not None:
 				what = 'its owner, group or an xattr cannot be given to the new copy (%s)'
-				_carry_over(st, temp, carried, fd, base)
+				_carry_over(st, temp, carried, fd, base, stat.S_IFMT((src_st or os.lstat(src_path)).st_mode))
 				attributes = _fat_attributes(*_at(base, name), **_fd_of(base))
 			elif not CONTENT_ONLY:
 				_remove_stale_xattrs(src_path, _io(base, tname, temp) if fd is None else fd)
