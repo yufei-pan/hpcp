@@ -219,6 +219,73 @@ def test_994_a_rewrite_through_the_carry_s_descriptor_keeps_its_metadata(tmp_pat
 	assert sorted(os.listdir(str(tmp_path / 'out'))) == ['x']
 
 
+@posix_only
+@pytest.mark.parametrize('call', ['chown', 'chmod'])
+@pytest.mark.parametrize('route', ['proc', 'read'])
+def test_994_a_link_put_at_the_new_file_s_name_inside_the_carry_gets_neither_call(tmp_path, monkeypatch, route, call):
+	# The carry checks the file it opened and then acts through that descriptor, never its name: a link put at the name
+	# between the check and the chown (or the chmod; a user who can write the directory, in the microseconds there) must get
+	# nothing, and the file the carry checked gets all of it. A carry that checks by descriptor and then acts by name passes
+	# every test that plants the link before the carry (the three above). Forced here, at the call. As nobody the chown
+	# half cannot show (the group the victim has is the runner's already): the root runs do.
+	_carry_route(monkeypatch, route)
+	victim = _Victim(str(tmp_path / 'v' / 'victim'))
+	st = _old_file(str(tmp_path / 'out' / 'x'))
+	temp = str(tmp_path / 'out' / '.hpcp_tmp_0123456789abcdef')
+	_write(temp, 'what cp wrote')
+	os.chmod(temp, 0o600)
+	real = getattr(os, call)
+	swapped = []
+
+	def swap_then_call(path, *args, **kwargs):
+		if not swapped:
+			swapped.append(path)
+			os.rename(temp, temp + '.away')
+			os.symlink(victim.path, temp)
+		return real(path, *args, **kwargs)
+	monkeypatch.setattr(os, call, swap_then_call)
+	hpcp._carry_over(st, temp, {})
+	monkeypatch.undo()
+	assert swapped, 'the carry never called os.%s' % call
+	assert victim.untouched(), (victim.before, victim.state())
+	now = os.lstat(temp + '.away')
+	assert (stat.S_IMODE(now.st_mode), now.st_uid, now.st_gid) == (stat.S_IMODE(st.st_mode), st.st_uid, st.st_gid)
+
+
+@posix_only
+@pytest.mark.parametrize('route', ['proc', 'read'])
+def test_994_the_carry_opens_the_new_file_in_the_directory_the_door_holds(tmp_path, monkeypatch, reset_hpcp_globals, route):
+	# A run the door holds (NAMED_DESTS), cp making the new file by name (no held route). Once cp has written out/d/.hpcp_tmp_X,
+	# out/d is swapped for a link to victim/, which holds a regular one-name file of that name and of the runner's (what the
+	# carry's check lets through). The carry opens the name relative to the directory the door holds (out/d.away): the victim's
+	# file is untouched. Opened by the logical path (out/d/...), which leads to the victim now, it would pass the check and get
+	# the old file's mode, and in a root run its owner.
+	_carry_route(monkeypatch, route)
+	_write(str(tmp_path / 'x'), 'new')
+	st = _old_file(str(tmp_path / 'out' / 'd' / 'x'))
+	os.makedirs(str(tmp_path / 'victim'))
+	monkeypatch.setattr(hpcp, 'CONTENT_ONLY', True)
+	monkeypatch.setattr(hpcp, 'WRITE_BESIDE', True)
+	monkeypatch.setattr(hpcp, 'NAMED_DESTS', frozenset([str(tmp_path / 'out')]))
+	monkeypatch.setattr(hpcp, '_held_route', lambda: None)
+	real = hpcp.run_command_in_multicmd_with_path_check
+	victims = []
+
+	def cp_then_swap(command, *args, **kwargs):
+		result = real(command, *args, **kwargs)
+		victims.append(_Victim(str(tmp_path / 'victim' / os.path.basename(command[-1]))))
+		os.rename(str(tmp_path / 'out' / 'd'), str(tmp_path / 'out' / 'd.away'))
+		os.symlink(str(tmp_path / 'victim'), str(tmp_path / 'out' / 'd'))
+		return result
+	monkeypatch.setattr(hpcp, 'run_command_in_multicmd_with_path_check', cp_then_swap)
+	hpcp.copy_file(str(tmp_path / 'x'), [str(tmp_path / 'out' / 'd' / 'x')])
+	assert victims and victims[0].untouched(), (victims[0].before, victims[0].state())
+	assert not hpcp.ERRORS, hpcp.ERRORS
+	now = os.lstat(str(tmp_path / 'out' / 'd.away' / 'x'))
+	assert _read(str(tmp_path / 'out' / 'd.away' / 'x')) == 'new'
+	assert (stat.S_IMODE(now.st_mode), now.st_uid, now.st_gid) == (stat.S_IMODE(st.st_mode), st.st_uid, st.st_gid)
+
+
 def _cli(args, cwd):
 	'''The CLI in its own session (no terminal to prompt on): (return code, stdout and stderr as text).'''
 	import subprocess
