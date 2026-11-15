@@ -650,8 +650,9 @@ def test_990_an_identical_node_gets_no_xattrs_by_the_landings_full_path_on_macos
 	# R6: no xattr call on macOS takes a dir_fd, so an identical FIFO, socket or device node's xattrs went by the landing's full
 	# path (_io gives dest where /proc is not there), through a directory on the way that another user swapped for a link in a
 	# root run: they were removed from, and the source's set on, the file of that name where the link leads, while everything
-	# else of its settle goes relative to the held directory. 9.89 carried no xattrs on macOS. A node gets none; a regular file
-	# keeps getting them, through the descriptor hpcp checked. (macOS's shape here: _PATH_FDS off, macOS's listing.)
+	# else of its settle goes relative to the held directory. 9.89 carried no xattrs on macOS. 9.90 to 9.93 gave a node none;
+	# since 9.94 a FIFO is opened for reading as a regular file is, and gets them through the descriptor hpcp checked. (macOS's
+	# shape here: _PATH_FDS off, macOS's listing.)
 	src, dest = str(tmp_path / 'src'), str(tmp_path / 'dest')
 	for path in (src, dest):
 		if kind == 'fifo':
@@ -670,10 +671,7 @@ def test_990_an_identical_node_gets_no_xattrs_by_the_landings_full_path_on_macos
 	monkeypatch.setattr(hpcp, '_mac_sync_acl', lambda src, fd: False)
 	assert hpcp._settle_identical(src, os.lstat(src), dest, os.lstat(dest))
 	assert dest not in listed, listed  # never by the landing's path
-	if kind == 'fifo':
-		assert listed == [], listed
-	else:
-		assert [type(path) for path in listed] == [str, int], listed  # the source by its path, the landing by its descriptor
+	assert [type(path) for path in listed] == [str, int], listed  # the source by its path, the landing by its descriptor
 
 
 # -- The name probe before a copy, in a directory the runner's own mode shuts it out of ---------------------------------------------
