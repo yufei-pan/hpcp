@@ -2247,10 +2247,11 @@ def test_single_fs_case_only_rename_applies_whatever_the_reported_type(trees, hp
 	_fake_mounts(hpcp_mod, monkeypatch, (target, fs_type))
 	summary = hpcp_mod.apply_patch_tree([str(vol)], str(target), max_workers=1)
 	if _folds_case(tmp_path):
-		# A case-insensitive filesystem (macOS's default APFS): the check finds EFI/Boot/ and its file there already (they fold
-		# to EFI/BOOT's), so it counts them done; the deletes then take them away, and the repair step writes them again
-		# ('restored'). The tree is the new one all the same (run on macOS 26.6.2, 2026-11-14).
-		assert (summary['deleted'], summary['added'], summary['restored'], summary['modified'], summary['failed']) == (2, 0, 2, 1, 0)
+		# A case-insensitive filesystem (macOS's default APFS): where the reported type is one hpcp takes for folding (vfat,
+		# exfat, hfsplus) the adds are added; otherwise the check finds EFI/Boot/ and its file there already (they fold to
+		# EFI/BOOT's), counts them done, the deletes take them away, and the repair step writes them again ('restored'). The
+		# tree is the new one either way (run on macOS 26.6.2, 2026-11-14).
+		assert (summary['deleted'], summary['added'] + summary['restored'], summary['modified'], summary['failed']) == (2, 2, 1, 0)
 	else:
 		assert (summary['deleted'], summary['added'], summary['modified'], summary['failed']) == (2, 2, 1, 0)
 	assert _changes(hpcp_mod, new, target) == []

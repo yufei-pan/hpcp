@@ -234,14 +234,15 @@ def test_994_a_destination_that_is_a_file_gets_no_mounted_dir_hint(tmp_path, cas
 	# hpcp a/x ldir/ -d a/x (ldir a link to a) and hpcp y z -d f (f a plain file): with more than one source the destination
 	# gets a trailing separator, its making meets the file, and 9.93 printed "Destination path ... may be a mounted dir" and
 	# "Continuing without creating dest folder..." though nothing there is a directory. 9.94 leaves it to what comes after
-	# (213 at the landing check on Linux, 202 on macOS; 190 for the copy into a file).
+	# (213 at the landing check on Linux, 202 on macOS; 190 for the copy into a file, or 202 on macOS, whose mkdir of f/
+	# says ENOTDIR, which the destination loop takes for a destination it cannot make).
 	for name, text in (('a/x', 'A'), ('y', 'Y'), ('z', 'Z'), ('f', 'F')):
 		_write(str(tmp_path / name), text)
 	os.symlink('a', str(tmp_path / 'ldir'))
 	args = ['a/x', 'ldir/', '-d', 'a/x'] if case == 'link-to-the-file-s-directory' else ['y', 'z', '-d', 'f']
 	rc, output = _cli(args, tmp_path)
 	assert 'may be a mounted dir' not in output and 'Continuing without creating dest folder' not in output, output[-2000:]
-	assert rc in ((202, 213) if case == 'link-to-the-file-s-directory' else (190,)), output[-2000:]
+	assert rc in ((202, 213) if case == 'link-to-the-file-s-directory' else (190, 202) if __import__('sys').platform == 'darwin' else (190,)), output[-2000:]
 	assert _read(str(tmp_path / 'a/x')) == 'A' and _read(str(tmp_path / 'f')) == 'F'
 
 
