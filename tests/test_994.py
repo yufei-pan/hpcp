@@ -369,3 +369,122 @@ def test_994_a_first_stop_during_the_cleanup_lets_it_finish(tmp_path, name):
 	output = task.stdout.decode('utf-8', 'replace')
 	assert output.strip().splitlines()[-1] == 'ended %d' % getattr(__import__('signal'), 'SIG' + name), output
 	assert os.path.exists(str(tmp_path / 'one')) and os.path.exists(str(tmp_path / 'two')), output
+
+
+@posix_only
+@pytest.mark.skipif(not os.path.isdir('/proc/self/fd'), reason='the stand-in names an open file by /proc/self/fd')
+def test_994_a_rewrite_s_fat_bits_go_to_the_held_directory_not_through_a_swapped_one(tmp_path, monkeypatch, reset_hpcp_globals):
+	# A -co rewrite beside of a vfat file reads the old file's FAT attribute bits and sets them on the new one after the
+	# rename. Without /proc (forced) 9.93 did both by the landing's logical path: out/d swapped for a link to victim/ once cp
+	# had written the new file led them to victim/x. 9.94 opens the name in the directory the door holds, as the rename.
+	# The ioctl is stood in for (no vfat here): the old file reads read-only (0x01), the new one 0.
+	import fcntl
+	monkeypatch.setattr(hpcp, '_PATH_FDS', False)
+	_write(str(tmp_path / 'x'), 'new')
+	_write(str(tmp_path / 'out' / 'd' / 'x'), 'old')
+	_write(str(tmp_path / 'victim' / 'x'), 'not yours')
+	monkeypatch.setattr(hpcp, 'CONTENT_ONLY', True)
+	monkeypatch.setattr(hpcp, 'WRITE_BESIDE', True)
+	monkeypatch.setattr(hpcp, 'NAMED_DESTS', frozenset([str(tmp_path / 'out')]))
+	calls = []
+
+	def ioctl(fd, request, arg=0, *rest):
+		where = os.readlink('/proc/self/fd/%d' % fd)
+		calls.append((request, where))
+		if request == hpcp._FAT_IOCTL_GET_ATTRIBUTES:
+			return __import__('struct').pack('I', 1 if len(calls) == 1 else 0)
+		return 0
+	monkeypatch.setattr(fcntl, 'ioctl', ioctl)
+	real = hpcp.run_command_in_multicmd_with_path_check
+
+	def cp_then_swap(command, *args, **kwargs):
+		result = real(command, *args, **kwargs)
+		os.rename(str(tmp_path / 'out' / 'd'), str(tmp_path / 'out' / 'd.away'))
+		os.symlink(str(tmp_path / 'victim'), str(tmp_path / 'out' / 'd'))
+		return result
+	monkeypatch.setattr(hpcp, 'run_command_in_multicmd_with_path_check', cp_then_swap)
+	hpcp.copy_file(str(tmp_path / 'x'), [str(tmp_path / 'out' / 'd' / 'x')])
+	assert calls and not [where for _, where in calls if 'victim' in where], calls
+	assert [where for request, where in calls if request == hpcp._FAT_IOCTL_SET_ATTRIBUTES] == [str(tmp_path / 'out' / 'd.away' / 'x')], calls
+
+
+def _held(directory):
+	'''The door's hold on directory, as it holds one where there is no /proc (a read descriptor).'''
+	return os.open(directory, os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0))
+
+
+@posix_only
+@pytest.mark.skipif(not os.path.isdir('/proc/self/fd'), reason='the stand-in names an open file by /proc/self/fd')
+def test_994_an_identical_fifo_s_xattrs_go_through_a_descriptor_where_there_is_no_proc(tmp_path, monkeypatch):
+	# A rerun settles an identical FIFO at a landing (_settle_identical). Without /proc (forced) 9.93 listed, removed and set
+	# its xattrs by the landing's logical path, so out/d swapped for a link to victim/ after the door held it led them to
+	# victim/fifo, and set its mode by its name below the held directory (following a link put there). 9.94 opens the FIFO
+	# for reading without following a link (it opens without waiting for a writer) and does all of it through that
+	# descriptor. The xattr calls are stood in for: a FIFO takes no user.* xattr on Linux.
+	monkeypatch.setattr(hpcp, '_PATH_FDS', False)
+	os.makedirs(str(tmp_path / 'out' / 'd'))
+	os.makedirs(str(tmp_path / 'victim'))
+	os.mkfifo(str(tmp_path / 'src'), 0o640)
+	os.mkfifo(str(tmp_path / 'out' / 'd' / 'fifo'), 0o600)
+	os.mkfifo(str(tmp_path / 'victim' / 'fifo'), 0o600)
+	src_st = os.lstat(str(tmp_path / 'src'))
+	look = os.lstat(str(tmp_path / 'out' / 'd' / 'fifo'))
+	base = _held(str(tmp_path / 'out' / 'd'))
+	set_on = []
+
+	def where(target):
+		return os.readlink('/proc/self/fd/%d' % target) if isinstance(target, int) else target
+
+	def listxattr(target, **kwargs):
+		return ['user.k'] if where(target) == str(tmp_path / 'src') else []
+
+	def getxattr(target, name, **kwargs):
+		return b'v'
+
+	def setxattr(target, name, value, **kwargs):
+		set_on.append(where(target))
+
+	def removexattr(target, name, **kwargs):
+		set_on.append(where(target))
+	monkeypatch.setattr(hpcp, '_XATTRS', (listxattr, getxattr, setxattr, removexattr))
+	try:
+		os.rename(str(tmp_path / 'out' / 'd'), str(tmp_path / 'out' / 'd.away'))
+		os.symlink(str(tmp_path / 'victim'), str(tmp_path / 'out' / 'd'))
+		assert hpcp._settle_identical(str(tmp_path / 'src'), src_st, str(tmp_path / 'out' / 'd' / 'fifo'), look, base)
+	finally:
+		os.close(base)
+	assert set_on == [str(tmp_path / 'out' / 'd.away' / 'fifo')], set_on
+	assert stat.S_IMODE(os.lstat(str(tmp_path / 'out' / 'd.away' / 'fifo')).st_mode) == 0o640
+	assert stat.S_IMODE(os.lstat(str(tmp_path / 'victim' / 'fifo')).st_mode) == 0o600
+
+
+def _fifo_takes_xattrs(directory):
+	probe = os.path.join(directory, 'fifo-probe')
+	os.mkfifo(probe)
+	try:
+		hpcp._XATTRS[2](probe, 'user.hpcp-probe', b'1', follow_symlinks=False)
+		return True
+	except (OSError, TypeError):
+		return False
+	finally:
+		os.unlink(probe)
+
+
+@posix_only
+def test_994_an_identical_fifo_gets_its_source_s_xattrs(tmp_path):
+	# Where a FIFO takes an xattr (macOS: user names; Linux: none as nobody), a rerun gives an identical FIFO the source's.
+	# 9.93 gave a node none on macOS (no xattr call there takes a dir_fd, so they would have gone by the full path); 9.94
+	# sets them through the descriptor it opened the FIFO by. Skipped where a FIFO takes none.
+	if hpcp._XATTRS is None or not _fifo_takes_xattrs(str(tmp_path)):
+		pytest.skip('a FIFO takes no xattr here')
+	os.makedirs(str(tmp_path / 'out'))
+	os.mkfifo(str(tmp_path / 'src'), 0o640)
+	os.mkfifo(str(tmp_path / 'out' / 'fifo'), 0o640)
+	hpcp._XATTRS[2](str(tmp_path / 'src'), 'user.kept', b'yes', follow_symlinks=False)
+	base = _held(str(tmp_path / 'out'))
+	try:
+		assert hpcp._settle_identical(str(tmp_path / 'src'), os.lstat(str(tmp_path / 'src')), str(tmp_path / 'out' / 'fifo'),
+			os.lstat(str(tmp_path / 'out' / 'fifo')), base)
+	finally:
+		os.close(base)
+	assert hpcp._XATTRS[1](str(tmp_path / 'out' / 'fifo'), 'user.kept', follow_symlinks=False) == b'yes'

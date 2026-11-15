@@ -5519,7 +5519,7 @@ def _cp_beside(command, src_path, target, st, why, space, src_st=None, base=None
 			if carried is not None:
 				what = 'its owner, group or an xattr cannot be given to the new copy (%s)'
 				_carry_over(st, temp, carried, fd, base)
-				attributes = _fat_attributes(_io(base, name, target))
+				attributes = _fat_attributes(*_at(base, name), **_fd_of(base))
 			elif not CONTENT_ONLY:
 				_remove_stale_xattrs(src_path, _io(base, tname, temp) if fd is None else fd)
 			# Renamed unsynced, a power cut could leave nothing where the old copy was.
@@ -5547,8 +5547,10 @@ def _cp_beside(command, src_path, target, st, why, space, src_st=None, base=None
 				raise _Refused(f'cannot replace the {_kind_of(st)} {target} ({parent}: {_why(_shown(e, parent, base))}): not writing ',
 					f' into it; make {parent} writable, or remove {target}')
 			raise _KeptOld(f'{why}; {what % _why(_shown(e, os.path.dirname(target), base))}{_in_place_hint(target, st, src_path, base)}')
-		if attributes is not None and attributes != _fat_attributes(_io(base, name, target)):
-			_set_fat_attributes(_io(base, name, target), attributes, target)
+		# Relative to the directory the door holds, as the rename: by its path (Linux without /proc), a directory on the way
+		# swapped for a link led them elsewhere (9.93).
+		if attributes is not None and attributes != _fat_attributes(*_at(base, name), **_fd_of(base)):
+			_set_fat_attributes(*_at(base, name), attributes, target, **_fd_of(base))
 		return get_file_size(*_at(base, name), **_fd_of(base))
 	finally:
 		if fd is not None:
@@ -5850,22 +5852,25 @@ def _settle_identical(src_path, src_st, dest, look, base=None):
 	look. False, with nothing set, when dest is no longer the file looked at (a link, or
 	another file's name, put there since: neither gets the source's owner or mode), for the caller to look again.
 
-	On Linux an O_PATH descriptor, reached by its /proc/self/fd name (as _carry_over); elsewhere a regular file opened for
-	reading without following a link (the check just read it), and a node by its name in base, its owner, times and (where
-	chmod can be told so) mode set relative to base without following a link put at it, its xattrs (Linux without /proc; none
-	on macOS) and BSD flags (macOS) by name (no dir_fd form). base: the door's result for dest's directory (None: its path), which the
-	landing is opened in."""
+	On Linux an O_PATH descriptor, reached by its /proc/self/fd name (as _carry_over); elsewhere a regular file or a FIFO opened
+	for reading without following a link (the check just read the file; a FIFO opens so without waiting for a writer, 9.94),
+	and what cannot be opened so (a device node, whose open acts on the device; a socket; a FIFO its owner may not read) by its
+	name in base, its owner, times and (where chmod can be told so) mode set relative to base without following a link put at
+	it, its xattrs (Linux without /proc; none on macOS) and BSD flags (macOS) by name (no dir_fd form). base: the door's result
+	for dest's directory (None: its path), which the landing is opened in."""
 	base = os.path.dirname(dest) if base is None else base
 	leaf = os.path.basename(dest)
 	fd = None
 	try:
-		if _PATH_FDS or stat.S_ISREG(look.st_mode):
+		if _PATH_FDS or stat.S_ISREG(look.st_mode) or stat.S_ISFIFO(look.st_mode):
 			how = _SETTLE_PATH_FLAGS if _PATH_FDS else _SETTLE_READ_FLAGS
 			fd = os.open(leaf, how, dir_fd=base) if base.__class__ is int else os.open(os.path.join(base, leaf), how)
 	except OSError as e:
 		if e.errno in (errno.ENOENT, errno.ELOOP):
 			return False  # gone, or a link put there (O_NOFOLLOW)
-		raise
+		if not (e.errno == errno.EACCES and stat.S_ISFIFO(look.st_mode)):
+			raise
+		# a FIFO its owner may not read (0222): by its name, below
 	try:
 		now = os.fstat(fd) if fd is not None else os.lstat(*_at(base, leaf), **_fd_of(base))
 		if (now.st_dev, now.st_ino, stat.S_IFMT(now.st_mode)) != (look.st_dev, look.st_ino, stat.S_IFMT(look.st_mode)):
@@ -8913,14 +8918,14 @@ _FAT_IOCTL_GET_ATTRIBUTES, _FAT_IOCTL_SET_ATTRIBUTES = _fat_ioctl_numbers()
 # Read-only, hidden, system and archive: the attribute bits a regular file carries.
 _FAT_FILE_ATTRIBUTES = 0x27
 
-def _fat_attributes(path):
+def _fat_attributes(path, dir_fd=None):
 	"""The FAT attribute bits of an existing file on vfat / msdos, else None (missing file, not a regular
-	file, another filesystem, or a platform without fcntl)."""
+	file, another filesystem, or a platform without fcntl). dir_fd: path is a name in that directory (the door's, _at)."""
 	try:
 		import fcntl
-		if not stat.S_ISREG(os.lstat(path).st_mode):
+		if not stat.S_ISREG(os.lstat(path, dir_fd=dir_fd).st_mode):
 			return None
-		fd = os.open(path, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NONBLOCK', 0))
+		fd = os.open(path, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NONBLOCK', 0), dir_fd=dir_fd)
 	except (ImportError, OSError):
 		return None
 	try:
@@ -8930,13 +8935,13 @@ def _fat_attributes(path):
 	finally:
 		os.close(fd)
 
-def _set_fat_attributes(path, attributes, key):
-	"""Set path's FAT attribute bits; a failure is a warning, never an error."""
+def _set_fat_attributes(path, attributes, key, dir_fd=None):
+	"""Set path's FAT attribute bits; a failure is a warning, never an error. dir_fd: as _fat_attributes."""
 	try:
 		import fcntl
-		if not stat.S_ISREG(os.lstat(path).st_mode):
+		if not stat.S_ISREG(os.lstat(path, dir_fd=dir_fd).st_mode):
 			return
-		fd = os.open(path, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NONBLOCK', 0))
+		fd = os.open(path, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NONBLOCK', 0), dir_fd=dir_fd)
 		try:
 			fcntl.ioctl(fd, _FAT_IOCTL_SET_ATTRIBUTES, struct.pack('I', attributes))
 		finally:
