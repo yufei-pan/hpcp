@@ -300,7 +300,7 @@ finally:
 
 version = '9.94'
 __version__ = version
-COMMIT_DATE = '2026-11-14'
+COMMIT_DATE = '2026-11-15'
 
 MAGIC_NUMBER = 1.61803398875
 RANDOM_DESTINATION_SELECTION = False
