@@ -41,7 +41,7 @@ The user's rulings on how the cas repos are worked, one line each; a line change
 - macOS (2026-11-11): tests run on the user's own always-on Mac, as a standard user made for them, never with sudo.
 
 ## Questions waiting for the user
-- **A known limitation for macOS nodes (9.94):** "On macOS a rerun gives a device node, a FIFO its owner may not read (0222), or a directory the door reached by path no ACL (and the node no xattrs); their owner, mode and times go by name below the held directory." Why: opening a device node acts on the device, a 0222 FIFO does not open for reading, a directory reached by path has no descriptor. 9.94 gives other FIFOs their xattrs and ACL, which 9.93 gave none. Ask at resume.
+- **9.94: approve a known limitation for macOS nodes?** (written in full 2026-11-15) Text: "On macOS a rerun gives a device node, a FIFO its owner may not read (0222), or a directory the door reached by path no ACL (and the node no xattrs); their owner, mode and times go by name below the held directory." Why not fix: opening a device node acts on the device, a 0222 FIFO does not open for reading, and a directory reached by path has no descriptor. 9.94 gives other FIFOs their xattrs and ACL, which 9.93 gave none, so it narrows an older gap and makes nothing worse. Revisit when: the read route's design check (9.95). (a) Approve as a known limitation (recommended). (b) Keep it open for 9.95. Waits on it: the docs/limitations.md and README text; by RULES the merge and the final review need not wait. Words it would reverse: none (the goal of 2026-11-09 above).
 - Later, with the read route's design check (9.95): a macOS directory with neither owner read nor search (entry "The door goes by path in a directory the runner may not read").
 
 ## Closed
