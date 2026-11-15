@@ -876,24 +876,53 @@ def get_fs_type_from_path(path):
 		path (str): The path to check.
 
 	Returns:
-		str: The filesystem type of the path.
+		str: The filesystem type of the path (its nearest existing parent's where it does not exist), '' where it cannot be
+		read (_fs_type says why).
 	"""
+	return _fs_type(path)[0]
+
+def _fs_type(path):
+	"""(the filesystem type of path, or of its nearest existing parent where it does not exist yet, None), or ('', why) where
+	it cannot be read. Linux and the BSDs: df -PT's second column; macOS: statfs's f_fstypename (its df takes -T as a list of
+	types to show, and printed nothing: apfs, msdos, exfat, nfs, smbfs ...); Windows: fsutil."""
 	try:
 		if not os.path.exists(path):
 			path = get_last_existing_parent(path)
+			if not path:
+				return '', 'no part of its path exists'
 		if os.name == 'nt':
-			# Windows
 			drive, _ = os.path.splitdrive(os.path.abspath(path))
-			fs_type = run_command_in_multicmd_with_path_check(["fsutil", "fsinfo", "volumeinfo", drive],quiet=True)
-			for line in fs_type:
+			for line in run_command_in_multicmd_with_path_check(["fsutil", "fsinfo", "volumeinfo", drive], quiet=True):
 				if 'File System Name' in line:
-					return line.partition(':')[-1].strip()
-			return ''
-		else:
-			fs_type = run_command_in_multicmd_with_path_check(["df", "-PT", path],quiet=True,extra_env=_C_LOCALE)[-1].split()[1]
-		return fs_type
-	except Exception:
-		return ''
+					return line.partition(':')[-1].strip(), None
+			return '', 'fsutil named no file system'
+		if sys.platform == 'darwin':
+			return _statfs_type(path), None
+		lines = run_command_in_multicmd_with_path_check(["df", "-PT", path], quiet=True, extra_env=_C_LOCALE)
+		fields = lines[-1].split() if lines else []
+		if len(fields) < 2:
+			return '', 'df -PT printed no type'
+		return fields[1], None
+	except Exception as e:
+		return '', _why(e) or type(e).__name__
+
+def _statfs_type(path):
+	"""macOS: the f_fstypename of statfs(path). The struct is the 64-bit-inode one (statfs$INODE64 on x86_64, statfs on arm64,
+	where it is the only one): f_fstypename is 16 bytes at offset 72 (sys/mount.h: uint32 bsize, int32 iosize, five uint64
+	counts, fsid_t, uid_t owner, uint32 type, flags and fssubtype), in a struct of 2,168 bytes."""
+	import ctypes
+	buffer = ctypes.create_string_buffer(4096)
+	for name in ('statfs$INODE64', 'statfs'):
+		try:
+			function = _libc_fn(name, [ctypes.c_char_p, ctypes.c_void_p], ctypes.c_int)
+			break
+		except OSError:
+			continue
+	else:
+		raise OSError(errno.ENOTSUP, 'statfs is not available here')
+	if function(os.fsencode(path), buffer) != 0:
+		raise _libc_error()
+	return buffer.raw[72:88].split(b'\0', 1)[0].decode('ascii', 'replace')
 
 def expand_paths(paths):
 	"""
@@ -15297,7 +15326,7 @@ def get_args(args = None):
 	parser.add_argument('-nfp','--no_fs_param_mirror', action='store_true', help='Do not mirror source filesystem parameters (geometry, features) in -dd mode. Create destination filesystems with mkfs defaults, preserving only label and UUID.')
 	parser.add_argument('-L','-rl','--rate_limit', type=str, default=None, help='Approximate a rate limit the copy speed in bytes/second. Example: 10M for 10 MB/s, 1Gi for 1 GiB/s. Default is 0: no rate limit.')
 	parser.add_argument('-F','-frl','--file_rate_limit', type=str, default=None, help='Approximate a rate limit the copy speed in files/second. Example: 10K for 10000 files/s, 1Ki for 1024 files/s. Default is 0: no rate limit.')
-	parser.add_argument('-tfs','--target_file_system', type=str, default=None, help='Specify the target file system type. Will abort if the target file system type does not match. Example: ext4, xfs, f2fs, ntfs, fat32, exfat. Default is None: do not check target file system type.')
+	parser.add_argument('-tfs','--target_file_system', type=str, default=None, help='Specify the target file system type, as df -T names it (macOS: as statfs does, such as apfs or msdos). A destination of another type, or whose type cannot be read, is left out (exit 227), and the run stops when none is left. Example: ext4, xfs, f2fs, vfat, exfat. Default is None: do not check target file system type.')
 	parser.add_argument('-ncd','--no_create_dir', action='store_true', help='Ignore any destination folder that does not already exist. ( Will still copy if dest is a file )')
 	parser.add_argument('-co','--content_only', action='store_true', help='Content-only copy: do not sync mode, owner, or timestamps on files or directories. A destination file with other hard links is replaced, not written through. A FIFO, socket or device node is made as cp -a makes it, never read. Still create missing destination directories using filesystem-default permissions (so parent ACL/setgid/setuid inherit).')
 	parser.add_argument('-wb', '--write_beside', '--write-beside', action='store_true', help='Write every rewrite to a new file beside the old one, write it to disk and rename it over the old one once whole: a source that fails, a full disk or a stop leave the old copy as it was. The file gets a new inode (a per-file Lustre or GPFS layout, chattr flags and a project id are not kept; NFS readers holding it open may get ESTALE). Needs a new name in the file\'s directory and room for a second copy: without either the old copy stays (exit 190). By default a rewrite is written in place, and only a file with other names, one that cannot be opened for writing, or a FIFO, device or link goes beside.')
@@ -15640,17 +15669,23 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = None,
 		for dest in dests:
 			try:
 				if dest and dest != ... :
+					if target_file_system:
+						# Asked before a missing destination is made: of its nearest existing parent, where it would be made.
+						destfs, why = _fs_type(dest)
+						if not destfs:
+							eprint(f"Destination fs type mismatch: Expected {target_file_system}, but the type of {dest} cannot be read ({why}), ignoring {dest}.")
+							dests_to_remove.append(dest)
+							continue
+						if destfs.lower() != target_file_system.lower():
+							eprint(f"Destination fs type mismatch: Expected {target_file_system}, got {destfs}, ignoring {dest}.")
+							dests_to_remove.append(dest)
+							continue
 					if dest.endswith(os.path.sep) and (not (os.path.exists(dest) or os.path.ismount(dest))):
 						if no_create_dir:
 							eprint(f"Destination path does not exist: {dest} does not exist, skipping as --no_create_dir is specified, ignoring {dest}.")
 							dests_to_remove.append(dest)
 						else:
 							_makedirs(dest, exist_ok=True)
-					elif target_file_system:
-						destfs = get_fs_type_from_path(dest)
-						if destfs and destfs.lower() != target_file_system.lower():
-							eprint(f"Destination fs type mismatch: Expected {target_file_system}, got {destfs}, ignoring {dest}.")
-							dests_to_remove.append(dest)
 			except FileExistsError:
 				# Something is at the name that isdir did not take for a directory: a file, a FIFO or a link to no directory is
 				# left to the copy, which names it; the hint is for a name that cannot be looked at (a dead mount).

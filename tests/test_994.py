@@ -280,3 +280,59 @@ def test_994_an_ncd_refusal_another_destination_takes_is_said(tmp_path, sync):
 		assert '-ncd makes no directory in its place; nothing is written below it, and the other destinations take its files' in notes[0]
 	else:
 		assert rc == 213 and not notes and 'B/sub is a link' in output, output[-3000:]
+
+
+def _tfs_tree(tmp_path):
+	_write(str(tmp_path / 'src' / 'f'), 'f')
+
+
+@posix_only
+def test_994_tfs_asks_a_destination_s_type_before_making_it(tmp_path):
+	# hpcp src/ -d new/ -tfs TYPE, new/ missing and its parent of another type: 9.93 made new/, copied and exited 0 (the type
+	# was asked only of a destination that was there). 9.94 asks new/'s nearest existing parent first: 227, new/ not made.
+	_tfs_tree(tmp_path)
+	rc, output = _cli(['src/', '-d', 'new/', '-tfs', 'nosuchfs'], tmp_path)
+	assert rc == 227 and 'Destination fs type mismatch: Expected nosuchfs, got ' in output, output[-2000:]
+	assert not os.path.lexists(str(tmp_path / 'new'))
+
+
+@posix_only
+def test_994_tfs_takes_a_destination_of_its_type_made_or_there(tmp_path):
+	# The type hpcp reads for tmp_path, given to -tfs: a missing destination is made and copied into, and so is one that is
+	# there (it guards what 9.93 gets right on Linux; on macOS 9.93 read no type and skipped the check).
+	_tfs_tree(tmp_path)
+	kind = hpcp.get_fs_type_from_path(str(tmp_path))
+	assert kind, 'no type read for %s' % tmp_path
+	os.makedirs(str(tmp_path / 'there'))
+	for dest in ('new/', 'there/'):
+		rc, output = _cli(['src/', '-d', dest, '-tfs', kind.upper()], tmp_path)
+		assert rc == 0 and _read(str(tmp_path / dest / 'f')) == 'f', output[-2000:]
+
+
+@posix_only
+@pytest.mark.skipif(__import__('sys').platform == 'darwin', reason='macOS reads the type by statfs, not df')
+def test_994_tfs_refuses_a_destination_whose_type_cannot_be_read(tmp_path):
+	# A df that prints no type (DF_PATH, as a df other than GNU's or a dead mount can): 9.93 read '' and skipped the check
+	# (exit 0, the copy made), as macOS's df always did. 9.94 leaves the destination out, naming why: 227.
+	_tfs_tree(tmp_path)
+	os.makedirs(str(tmp_path / 'out'))
+	df = tmp_path / 'df'
+	df.write_text('#!/bin/sh\nexit 0\n')
+	os.chmod(str(df), 0o755)
+	import subprocess
+	import sys
+	task = subprocess.run([sys.executable, hpcp.__file__, 'src/', '-d', 'out/', '-tfs', 'ext4'], stdout=subprocess.PIPE,
+		stderr=subprocess.STDOUT, cwd=str(tmp_path), timeout=600, start_new_session=True, env=dict(os.environ, DF_PATH=str(df)))
+	output = task.stdout.decode('utf-8', 'replace')
+	assert task.returncode == 227 and 'cannot be read (df -PT printed no type)' in output, output[-2000:]
+	assert os.listdir(str(tmp_path / 'out')) == []
+
+
+@pytest.mark.skipif(__import__('sys').platform != 'darwin', reason='macOS')
+def test_994_macos_reads_a_destination_s_type(tmp_path):
+	# macOS's df takes -T as a list of types to show and printed nothing, so 9.93's -tfs read '' and checked nothing. statfs's
+	# f_fstypename is what mount(8) prints for the same filesystem.
+	import subprocess
+	kind = hpcp.get_fs_type_from_path(str(tmp_path))
+	mounts = subprocess.run(['mount'], stdout=subprocess.PIPE, check=True).stdout.decode('utf-8', 'replace')
+	assert kind and ('(%s,' % kind in mounts or '(%s)' % kind in mounts), (kind, mounts)
