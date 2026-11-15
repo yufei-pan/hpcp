@@ -200,6 +200,8 @@ _PARSED = [
 
 @pytest.mark.parametrize('run, tools', _PARSED, ids=[sorted(tools)[0] + str(i) for i, (_, tools) in enumerate(_PARSED)])
 def test_every_parsed_tool_runs_in_the_c_locale(monkeypatch, run, tools):
+	if tools == {'df'} and sys.platform == 'darwin':
+		pytest.skip('macOS reads a path\'s filesystem type by statfs and runs no df (test_994 covers that route)')
 	calls = _record(monkeypatch)
 	_quietly(run)
 	assert {tool for tool, _ in calls} >= tools

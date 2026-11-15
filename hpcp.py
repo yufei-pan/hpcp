@@ -56,7 +56,7 @@ try:
 	from pprint import pformat
 	try:
 		import multiCMD  # type: ignore
-		if tuple(int(x) for x in multiCMD.version.split('.')) < (1, 64):
+		if tuple(int(x) for x in multiCMD.version.split('.')) < (1, 67):
 			raise ImportError('multiCMD too old')
 	except Exception:
 		import sys,types,base64,zlib   # noqa: E401
@@ -65,219 +65,223 @@ try:
 		_SRC_B85=r'''
 	GhUA(CNnN&G+Z`\!NRRU?j/?\e'5<tOB/XI7#`dtP+;32@W<N0-t*Pd#QW"F=oJ*Of*hj+ALDnre*KO,B("HbF5M%OOM?/4or>"+^<)89<H7J,O6p4UH
 	o&p2<EZe+gtpR2R0Q<3>:"EeJtuBW=W=/JSu]6Cb+c/5a2q$oW4FV(+G9^'Wc$!8Dh;QKh?@I(e1,,G!XHtUXrcNiWm1+-a_m">IbFocg,^a%K4]7)eR
-	bbL->4HiJB>Te2I!2SXcl`?,jE@sU+Vd-<Pb'R&Xoah=i5ofHW<!i<9-fohu:;NMIU@Vj%,b2YKu(=41U60%^1m;pXT8DDdQ6d0.5X"E4m_.QqnRG7#b
-	qE+5.N6OYq>tDE@.Gcdf3LKjaq$G&eM948`mle)BPP&ZfBA-dRZ=q477Sn;kCMpgrh$];FOGZRCG)aaUH)LjlinI/W[,<IF<[Wms'\QW9>%cb7&aHIIA
-	Y^7NUCI/*"/jPej7R-ad`LcIGdB=D$um)`J[UfeJrWWeeI!Z[gPI>HHgQoVr:0+1ZB.i_QjQDt-DHNp8F1lC1_*acWF4?l#e?_>"p3uuc0rR5sDY2LHe
-	"B$l0+.^C6LK?]//Douq].CYegh&DsU&4fMEJu$fRj;q%-pG2#cd+4>5"&s</s<&g,.B%kliEpOdin?hS@q,#]Sq?Q3.$.h_925'<te^9n`_^s08C@+)
-	o$b"p?L`3]-D%l/E\iH55oO!3ni+VJhmP7f"B&c)N`KEi;a6Jp[[Cco98cU2o)=%D_D(7ou$+T]$2#9?.(!8>C1[0iJ6t`jra%m[0$[tcPWn*7rR8\f*
-	0D`#,S>;Zakjs^+L%%*LPRZF`A4K7XN8LeI4KV+pLPkoBq2:1]\mkffD&8pV^a1hW34Z%-fZ&)s,m1kY2cI\?B/N##,S(.Pt?4St'-_0-ZnFP93SUC[A
-	rW=l4A&gF>)qHsJ)D7scXteIQTE?N1uRnbI\YNKWNbZg6U73\:_.b=JLofo*q"aU;hK8,Bo:n"Y/o[N7(A]NA4$`Umc8#[bj4YHlikWH-qHN>oFD7oXj
-	`6^cOtEN;4aq./XbZip&`WiG`@<fb:D?.QhF8\S*pkf_0uYbmtDb8Yr2_;BP+Eg=*ObS^I_1_29#jTnRR"^VP6r2RKF0&3X.rr<Xem(S06kA&s<GRL9`
-	pJ0:!\:0RHH;Nk>[g7LAiJ_HWg6M(3mKM.C7YSLT<P,7=7l1`u'KY23?C#[*L])8akC*+QMVnd_p+6K=?#HfPY`TB%(KqS>ZMV%f$r+VE04bKc^1841?
-	&jO,cFo:M#Z<sliR4Z.`.$Md_rbKr]6grcC9L#q];QjLpj9W/Xm0DsTK@irH,s7+])WWNO0&K_6T_eFcO[f1_*W%UdA\He.cpN@k_:%f>.jH?m_J2Wf]
-	Dir1uCrG`]5S^hL*ILE,/gm50l=JKBKq45r4GrpcmgN8li\7CYo,/Ve,b&>SV<l1;"VKAMo.*Z@3L"=%Um5#<F%B-YXP8ekqEK'"dES"'Xo:"1e.Ud,M
-	5D2u!DGBcBr<[\;S"N:`A'Lc%Y8NP'T(OR\n\EtY.i6njPfn%#Cj^.'Z"s(=`c2-Br@=es2=_$8`4@()3R;1*NZf,.c3l/CC?B\g4ZX/hH5^j\Fns+Kf
-	87i3D6,!!e5-TO;",YU1k<gm+%4jq<3G%&eF_n-!mk6;3QiE\g"*cMhVftE7tiG##D7,'^-&[N!o3JYTQjm_:%pddnKA/t=6CRTm!3*1V_*:9EL`t0,p
-	2NBrA[2+jq/XK$`pHs<Ib?H7,#Lpi'N$^n"j[Kf.\S@o(be/NMbq#um#@:G)OFC!j2TBRX!Wo,72T7q0)oG>a9P-.LSsABiJ#Ko;1p5QQhE0t&^I83YI
-	XM3K(cJ*K`='cC4C;9TQC-CDZmoaGe!]/EjA*Ql5CC[S5'J^ZoK63bkls&,rP3J9c:VHqJDJFZl/ELnL4scpnDa>6$?UiR$Ltukh;)@9!)JMs/P31u,N
-	pQn=e]45#^T?8^IWe&7j+UI5H;P35LN+$TE]2,&V/=8g,/3T%>LZo4;>W27ol'9EIqfM#Ifp.SNc1$jS3//G2Lr2#&O;JL/l&jjH1&#=-29*r[<Rm4$2
-	@F#!-N$$E!$qk*gP=oY=k(0Fd\qJ50qQ29UQ!j=tp!TYoZ%[Om:Kp,ut;hM2Bu'k0t'B2.^>UOU'U\`+niJ.IR4p3phRVLpu]<"htB]0]BT//%H_F2qJ
-	qYWOr-_HG?d-U6Ai>M-c:N1CfK4%LW8#Ot9A?,rAa.?&k%9>@'1c8trI<OO@mKd?LVmG'ii?P(m3+\%Cnjs,=W'6],_\ehoNj6km<Sf3dTWWF&_pjrU:
-	(!,5&a+gu5a5-:Cb,c_I#'>hN'E83dI'2aGeo$aBUR"Jo=4U"!W-OHJP9'ogT%_P3HnbU3*Ss"Ibb9I/&23N)<s`F,rdgVSBl]82"h,$mBGPl6g[f!KP
-	)h(JS*9Cs1Atm6+81\Xo[ag'*Mu]2T48#Pk(nS0dhm'W#3kulWY-=Roh$5U;)?@a^Hl%U->?0!9S@a95a"D/m(#'9DL`sZcs?PY/P6I^Gg]AZer%FsTp
-	66YLkIdiQ8FcS+74V&"r76!j(/OgUb&h$oCi@p&AZ";=6*l8C.QSmQ)p_MKG$S=UQ6(%p;W:]GJ5'BTp6K-I2D;FP%ia[.2uf.J4'6Ipn<*J!fl9`X2B
-	iGa;dsXU</3JKcO&l`-3\$_iWm'*9[mb!?g8R1[7s$MZ"t5PlWS&Ue3ke`5[jXf#W*C+ef]L,gRQ"S7^!eQY8,6p4ebok7DFMVQ^\eELZm$LjHt]))SW
-	hi1FDK-kHG/V!'gI_*@jT,Xu<L`Xo.dNeId)"A`4cQlC5HOE(oL`Ru5YJ-VS-DIH2Zk6(nn,lhFC69X?s.9c9J=AkTb?oeZL+!DMA(M(oFEZ4k1VhneA
-	([@2:hg%T:#EWOO>A`?:^=tjp0p,HZ/_^CKMMa0hYT$uL*,.BL7@6;%6cb`1I[TUsAlZ%9=H"cZ/AVfaUc$678CZirGlk0Q;)UZa0M=+^9Sh&m]B"O=]
-	d[h+(u'ItYuC^Q@?8?9P+HB?N\5\R+8[H8"Ec4=8P$TR;6C\:RH,6hPrs<gT6FJ;l+Pe_89i5kimXbD`7A=*#@e7YctrWq"\]5[1tmKh0e_9.N[$JplZ
-	E:g7b`W(>TLNc1[u&:m=*_iBQko-P4<%S"o#)#OQh4t>BnF/4UHJ9+ood^F4b4JpT.gS(u'qU2"-L]gAY1?``U:]S^I(!FuX=G_Io+&K3D/8b!MmJO&J
-	l8._C@#Sf4#C@ttWL@<8=_MeRq<:8K$i7DEs\jHrrs&4\8pNu"b[^gPN+/'("_X9r2XD\Ut`.1dFR<)7_5?u@Z*)Q4+^f[E^K<-e'0R057""Rqh,YZC?
-	Vq39[qb0D+C:;rV/SC6rY1='bjW]Km_m*O,6<e!`qoT&5d9HD`M=A^3,Z+BNZ<2ra6d90D8N>^`R(P:DsStV-O/0\:A(o_&nACr+MmQENifVKS:?A5FE
-	\m/nU5)^V'Fb_F<\9,IE*c0%S-;`gg&V5k\<Xm+VQk)MUQ0[aVV2!t$:f&b7<HDf,ibcY:9"ZDtpBkU99Bm9/AR(Fop%0k+Ur@Wj'7c1OH9afr`/s5;j
-	J04'BaFmPhsn8k3%5,kQ>8>6@X%2le)fBPjHrf/0GS['.<Iu.BcubB[8ags+b:X^W-mXph@O6]LRiji\./W:#ae"_ljDRm3D8U*eQc0/%(CbXk!=G%Ei
-	:2_#jD;;+<l[Z=fo(k^qt#KQ/=QdaqJcjWmr;?#fo1@-6d!1M#^Am(`eI4!gn]L9=12^1=lB[ko3JfQs$LfZqi<`7oJN'40&es]2$/tle:0)g@g?24[c
-	pf?$jrm0Y*VNm*^_%0fmVLE9kpC8MDbI,4!2JC[hg6<o&<KZ!"N[Sb.**+sThrBNACN>,nGkDCo5#+gBiMM&`RCY0k928Z\>ab(H1(rYTchKAN?%$ir0
-	2R1ACYi1\Q`jWjl-h0s9N39_LDgnW0PkAng*]?O?B)[r%?(#p^6F%hC3E:>-#>$aL!pV;]K\++pGbE&Y_cRSWK_<\BTpt5I1!Cc?f[YIbfkcP,N.SDbs
-	N$+#AB7,)IqTIi%lKsfJ&qikk8r'OS<Rlp6Gj+ZD9_7E-bo%Q7/a/"k$R'"B"tE6k2ht^O+6sr!F3e`)XfUn_k?XkXiqW$,p`f^hpTV1d_1?M_\E@LCh
-	]?-0\A>oZTA03kH@Ls']I4,BZ8>@EO8RGHb^*Ysk..NO'q;;O/srCa%iXIFM!EIo)KD6(/VnZ[7fn$#VVjl&QqGqkpt&Ns,>p$,qXQo]@hXHg2MkMEd0
-	(CggatVPkR0Id/kUG0T^LdH5tBY$KNYSKlQF;gJ$>7[%S2S*.QlqE$<^C=(FSn@WM#+8NYG(X0`o)`fdOtr@ImTs`t'Y*[:R%Zn,_9!F4k*P<?e4.G\g
-	:Dr;_p/p(G3SI`1&p`%/F.,L6g8flPtESkNJ=1,&IA2)%NOJNbptqM-JMFaVVS:2DD^B:UOYd3*9K47!a1$2.9+H.HqAUYesg4g:sFk#b7N+hugRXJ*D
-	7b7b*%0/kYYkc^La&[U])5VU7R8+KsF)uUKgi#_fC!6eo\7C%>l"qMXrGJ&,%bZePa6tiSi"ZDV-2SeTJ2h6lmq$F\klqab[Q'MaE^[_/$Du0tQ5[a8`
-	1]+m'Bo$Zk&#?NKl3"G"5P^a6,'KY[^O,fC8%R#_/jT0]8o;0r-2hLiBX-]E;qeWoXe32r6+ViZp&<LM"$<d7N-o#W_"%51[@VNpMCE1C<m+FgWOY1ne
-	*kX2pW9Ra_u#Dn`S.umkef=+l*[YPd*?C>mSk1[Zt?LY4bn2]mWGGk:]BMejdL?CO!%U7+U?%V)Y0aVo-#NjojJ(1F+%ru13[E2\t]ftqs*F"kdd[`+F
-	'4q;&LIX`p<h>4&4np^-4i]W3A8CfmCW#@]gbs:M;XJ(*63[Bn.hH:u^7X&J47`!2'*\C<pO,K.'9qUH@Z"VpK1d\'T@?ntW#";F0bG4ltRh4_@]AC"*
-	oMBr!Z7Ia&X01LRSTRDrk-e#ulZ57!mfr>V.%,EK^<A+7qjNrtu6FhA@n<fNh(!Z(4<4Eoj;77n7fV)dZ%U:7:NC%0K.!trh/N4-t#UaJi&d4Nr-^nLI
-	9NNA$+/BCci\jBR9D-$/oI&A@d*P;.qefb%i=9\L5/+Hn"nW/iu^cLfb)(tl#=PC6B5)8t376>A;,Z19<]C798'JgXI'c@KuT'(n*$:YO`&*U:g+ND;%
-	=rf86Yq%[7hT''85`E`dX/Fc=nL?bM[P?:dB@PBoiolY24(fc7Aa>.&?.CeXT-f8'e+/J'e7[f9n+KLd1-NkXlo9[e*!u++qgX!*T8ud`1&e#.LAElp_
-	+.7/W"CQcIo61.f-hl=POK)9\d$Y)<a\t+8[RLl_c[*MXM'9q,ipbf."ULaG*.e.A?c32QYo;WL*K.n'JlSDK-ihM1=N0D]*/7=VdVP>1c_;S67g[90R
-	p43Ob&>A!lKucdRZ[Q5&)(kO]<5@G>*aHI4,f#!(rlKaq9:=?9e25/7Ds*Y)$n@M;F'edi"_12e;c0Kfb01<`qU6Rqk-]TN;%3=K+)jPKAQ9TJ"&<o9p
-	BA51*Ps1qp1]E;JkmI5L0uZS4DE<o=2rI>F`O@N<'09GlY7GrAH%mO%Z3:0<J+hUoJs-3o?\V$J]`.J%n3p#p>@%J10QA28])ih7S[kdbXr/^g4[l)SZ
-	%K=HCEEjpa)/lrN\Zb=H]"iP[CotCu2A+K:6U"RV@I;p(AXDUmd=h\gkJlFN\2Y=&<Q5!r^`_E(3g\ph@62*1s-H^N-KB8?"'.M$QL<T"E/UG]If=s+%
-	_6\lLen?(*q[!$QYQOVOTinYifpG.W"L0DF)p](MMm[0'n#MR3GB7[B5'KHWrqL,8YI,W+WVpWe[#-$4N/d>XMf/RPJt%0(g'c#$H("nh6::69q'3+Y&
-	&Fq*d.`nAGEtD<frI%7<iI7(.`:`IXldL>p,c3(`V&,3IgTsrh"9G%Dn2gnV#[H1PVU=EI%*uJ4pTE(\Fr\1E=JkA=mfub!t0(KS_5o5H,bIGN#Tt8'C
-	7l/at6gIVgei^AQ/&64)rhQMQJ?'1<s8R7MNAKUs0-kOhjKpF%eF/cV?-uT#B,g\"#cfb7K&09`&"/$i&Vo4/2]+L'iaSOt!A(g7@G#/(VD%"2I:87Y6
-	T'3c1>^gZSYYha\U7g;jZe<J>GMT[d+)b%fZ_L<lktn!:gVn)cAl1$00n0ZC&<k)+i&6/C@?fH0BVEXKRr1&<9FNuGjqH$a8=osU7M\?91/Q0=,_ett?
-	<C+\4%\GL(oD>Vio>H%`$@T0Gu;a&S\g1HprYBm.DZ]oJL,_d,]ge?:%")kNj`s($8[(#cOP[>giRPOql%V`(ALN;!LU;N2DI*D(^3[FC7oBG\WL,cSH
-	g!%mtlL2Ot^*;0oZ<_lBX6K(*>P%fW!c1d,os[^?=2@J]7)4U5gq;!^?!PfD;KuL6id%E]a=4)BP<Ko#N_B44+N.4=D.)p__fP*r-UEhPYOY^P`H7=Qj
-	,RpP"<Nq<FbJIEGGOS.o/YQJ"cq_9,b(R$+48Jl@q&tCdjoiALVe<HQ!=lU4idu>+S`!"oha2T4_+jRpfGN?i85_Y`bK2U=%SE$T;8Sp](//Sh1o`@Y,
-	TtYVf='#5FmH\-aR4Z`"Q8c[#:N%%"OC@k:CXq0+Fh?q1rkbK?(&696iWO'V9it\B7bXDAW>qlp)l17e@M3+j4hG`7H?EI#9Jqm0)ei7r[q7G6al+'j3
-	B,T``LW3],%r);[gkBu[.?SOFLakH;p#P;/@B)#+\dkQ^gii"kR]=rulM@kVJ94Hf'FF><>1"Q+aHgC#al?goO.2sO-!BK3)$Zl+;7!i(1s4lZ4nhSq#
-	^+1'Q`5ce2+TL/g@\pXhQN4pY%$[Mg%22"sbO8,;Z_3=Wp52oQR^&7,(GFaHbCB/dO5OE@ak#M]G,7`Lu@"r3h8(d6fF[p-/[q\Pl+0A>FfjLNaGY2X^
-	J^jf-B>\HV7/384\X/Jio(Vd#l@D1(-X2lX]G#nhLT:b8D<jhGknY,[Uf(T1P#li6hFYd,)FS?>)`Yt^9kD.MQhe495N#6O_SMR?*o*Z!s#FBjPA^oBn
-	X5_=3j?R)/CPTq%Nu,UO#@h^7kHO%q4>3dU<;:*:%q2BL4%:s0K]F4Z_#41`PA&lJLi^3i'Qid_qQf'ae8,JA)1fbGR&tq[5@.a^W<:RV^e0LT5Sg(q-
-	!i5=8*eD(dl:sVkZVJ:WFCUe[t_I!Cs).lH8R[i2>5X".mc9ZufA]WKO;i3-V^?_3l25[Or^fS=&c."8:V6bQTjg8%F.;m.jMocuDEch>IqZ9WO(%rE_
-	4+J_=.eZm-:UN%)^U^LQJn`P[#0me6*mO\<S>>dsM^L5`1ES?Gi%dEFR9"o@5>[V3Q,IX?<b('!C^ioi.dN4[7`GfZkIV8kgsIQ3V/2D4suQJLU:LdV+
-	WES('B`f]%@$i`Q-5ch:.9.XM%[Ns`_=&k9TE`=DZ.SH+$"\,1N![LVG!<`df-hE_?4k$U&T%R7sZBUl[/7NhddF7^Ta0.d/K'%[!8YB])BSGH^&_!/B
-	Jk9<0KQ>#l1V)21+8qRgAS"k2N'k!e),e7CPXe5=%76$p?BaVNKPP6nkTm4]5^+Ct1Iu'X\Z:^]$!Nc&Kj&J2a9,Y7jD6s\443SOI==W#HMV>kmM6`q:
-	Fk?g3o=hW.1V7u,MLqZbF@Tn8UZL>)2$5`-VqI+W`?R#CV/@-At][fgYAbJjh`Z&`*1r?C81E.%PO;$YN&C%,-(0B1.UY7@$=m5KPe-^K<'P%FMsT=X6
-	C3q9NFcrIZR]k#>K*Z.G0j4eUmUJe^DPJ?W_gf0Q4=X:rfh,cCNdf%).m'%UqC1WfG0H]CJ-@;TLU.LVBn;Nh%/f/ge]]Wei(2j-Gq2;kb.pQ`q*FV&R
-	4X[QP_21<bT$<3O[kdpCLC#:_4Pq'`dDhP<oIDEa].7j;G']1'g]YoGYLi]+_8R$hG$1H1Z5i:D[f_s*3i^gdYJ53[^lV10]H:?2LKGiZulS`TL>+7pj
-	2oh''Cq$\W&gJ.GYhO&<1p[&&6X%;VC"VHBBrnnXDqMTYX(^.6O[GDK'Ghp9r.O;"Q7='W"A>nT^E&Is+oaV0+fOYS<"5_^?^ERBEZ9BF]#@%iI$7L4u
-	"5,BrOs!<KY#p*pBf7(pqgfROpiJ=,\D3NIU,&:h7o?aAFaVuR%\)m/B9QV3VcK#l!+<M*^WjluGPpVg+)VQ!O1W(Q5<_0A^gD`1%u7(FQ_ACt]%Wc@+
-	$BMqprS`Z_L))'^,o?`k_5e2:'_mH<Jn)S?Pp3rb#68uACka-qVAEAiB`dRrY(Olgs;<gB9U<9oO!(1IMPIV\N.TMf`hC=V8%DqG0*O-,4U[a'mT35'u
-	3hdYUAIgdS*tPKJ0iMnaigO0LCBE`O!a5g$<;5[)EZfZ+FooZcVU0D:r'n\sIKU9UYcaq;(E]ODqQuZO?SWO_1N^q_YG*^0$Y)2]W>>pr#i`<N-&]!DA
-	X^(_\YcKgbu$e(LOW-1p>op;YJ.ie%dkMFF3ImCcW':+(t.i1(P[Cgk_mFgP]%I7Q1F241"?!1?iP-0FsgAj/qp`T6l;3lqUUQq$h&gcTUnD=023?mKa
-	AXuQd3L'4&7j.Q8l@j^%l2ZT:VP4[K"Mrb;K^ZM3Glh-FJ#c_M:1GG3oF`qZn9uUBec22T$2_WEiE\jE4Y,i/JHN760f<F0%',_B+GRt]M_(E]Roibl&
-	:PN$8S(6s`ZQ\nf8-[g\XZa9Q-a6;K[^[HmfNsm%/>/Z8@V2tM:W;NsgcZ"!$8JLKY6RDu!*+Cd125^PR]Vtl0YJP1g>,^Z-o)p']N31hGSeZAnBfE-]
-	">lM!"uWM$abK.Vi):;)e.*T.DgHfgP0udOaq+o99si,ZuhC5CEs:U1O*Ko#YOS`@mI,#:MuL>^oGT1.?<Jhg1]9Kr(Jee13'(K=ca#+%29%[4;o9i1)
-	MR]l!uS#rLm\(@@5c7,:O@\1PZ@3;.DB0krZcVg9=,'K9>V`=U3C7$cAIC0Ah/uJ-Z2*dN;B+E^^S@]RZqG*_U;i1\,)ZHS&k^:\eqaS>PQMis9D4%NY
-	T8X.Pd^hOKVBHZ;F#&^QmoLAlu@\21KZX8pSo\e$a2^lhr?HYI)Z+c#:e35*!'9pL)>/.C2_-$j12qqR-X?R@tbcQAt5RQg*"P,hV>$5>*O)[=95;-;D
-	(A:ZNL,ZOd9f1jc#ECmu'U+oTIPeG4KJo3UDU9Wq7?:#rF4>uLgPkuKrFb_G6<8;<FJ<4VZhl)>2p8,=l.ChbK7=Wif7?PX@eA`rh(VH'pbTV83nYm6B
-	g^hYfS&M6"\b\;?36/^,G)L\_4r9.-/W)f-Ci<(k@ro5n(&>bem'r.%HF*$i!"/G=F$-:d6of(%GeZ82\c\KPSn_T89G'%'eHU]$<On6'66C\]Q)D_Ha
-	USibD@oG@ePYWMlcWE>Ki#"<bqks.P[TIXgtCcM#^%fi`GB^36+%+7R2F&Egto-WQ:rCak[?[WC.-d@g_n7CbnM`M?uk_,CU@qG+aYacb2=AZI+1J:/*
-	P3odm6qUZbRuY/]gBpm%#MS+tp@g)=i&A=pH:i=T=94OGUQtZH%GN(qEt=h;0/Cp8h<BK8EdAnFNf8$8Jm"",+Da1<C9[s6\ot]_UmZf9p%Cjan5_@"(
-	,"Jc9"a^O+kdL:DM>'KA0Z']BFf*krtiqeS%!#NpmlV^B$gf;F?B/`mP\'*Q9RhYb/5l_egU!+O"d9/+<Vq*G^cr6_h$D"<*!.ONBh0ke-R#IOiKnM5^
-	5<S@W+hQD<_b,!<_p5uFN5PE<?]<43ZaA+5Cp5%XXa4549XtEd[Fl5KdH/bZL<j<"sk\:9:)SiaBF)s?0lP_[1V;Im;/%6m[=U6U6Co#M>pSRo9&`k]+
-	^a)FR'(aFrpua3M1m3!97H')Ne4"^:-m<_]oouY+hGQk7a699!=@RC'E,N9Ul7oSJ9ZMsEC9a<EZnheGRl6mjXV._8)R_MU-+;@2MNTElL4kj+^=8Q@9
-	Duo%Qg$[9e8&6nRq]g(g]I9o/mPL-dMaY4rQ>_dr:KtARF&!8^'?!G/oj-J6f8"6*4mL_X3lel_;"aHN#"$(4C#sq;X&M`I>a[11$h2JruMr7JAHt9.;
-	H04%s:\.irRoP.]c-=3Jt:i_*tf&Y"`9VIC4eeG-h1*F'c\qS9?p+?#@ep5>7+"af%;Nbr@qt]=KZa5*AfLesu9`-+H9lgFa+V(Ef;s[_/)Qdac<Bku%
-	RdV%AWMD(`e(<4@5T;1"1a`fBC&4$N^/gtD,5Wm^e<*H:?DJ9iZ%b*ajDf4HBnmTYO%kUJMIJE`\#[4PM8nf>AJaC&,<JAIP%h2WCO2L2!u6!8$47;i2
-	W-j"ggPXn649j<sj@?*"$^)qJ2OAjj&RIG_opBJ2jh9Mq\[\@W?n[rLpm`Fsf_s++:Y*G6+mSV9YLG2V0:1(91m\,_qeB';.8:'iL/Eu[!l'!3<q#8CA
-	Vh8mm:S0dsG!("Y"jN//r8:q:hu?du(O)AGipO\]IsQTmO:c5#s#LbZp.iXAR`=?1j9E3hae`%='h<9LBH4CVa96RR.%O2l]L@1K?^"FpA&&C3EF-l6R
-	\Fc(L[_K-j-]Ql(gMAIQuY6e,*55!mA((Vm2snHNiFYt1J<J)*,r`*_;qrc`S<]7ME9FtltX7:X=lUmA)XMCGt!-Oa.1b^e^_p5>_>nAnu.+SHj(cMBK
-	3*mDLLXdYg^Y>nO^rt*=#f;EnurP.U00toNe#M(@3G"7];)$l3uCo<\!TC,S^pg'/Xt@'[mpbeF`V9rf^1,!UC]q@@Xn<U_7B-K]+-2d'e_2_V<;;).1
-	))?sS^B3+2rcQ"U?/!<,#Ac>;dIf/HVGMl[]#fpYh.Ye5K`CV"\sFA*$8:7Bp@CT8Df8sR&!@PjHf@%$%0*0\ER]pXfkQL!m`3l[seRKme<0$jc,,k'e
-	dH-ac=ZR+OR!S27;d&u)dF#1)G(1Rh9IsL_`F]*kR:LKE1;?-`%Y0>.>H"#-r#8.qJ,O6J/F2kK?6SfIniX]-?M9*S&T$iqU1*^k*cGdOOrK4?trNl%K
-	(?@)@\-R?9d/I"M("]A1+;O59-7X2$iTMBoZ_ffV_epZeLMkhiUtWCtmC^t/a0j18'eJ4QMbOLmCA%FUoQ*W&i?;P,q?n;"S%cX^qZ^GEUV%uT;?1S9k
-	&@4JDBo>0.h,/J-pkU!I0]R%NSHL:<8+unQamXTB+ODcR!gsiTE7I^>?Ufd9.r@0`uuhVPV/mmX@;opBU[V'B)r[j)dgdCgF0m[RR>6^-]3T<JMKg0N8
-	STh0d#*ZM_jLfcYI>!!*+rIe0J#6bPut__8G*sWJ*thMK-<MV(*5f$QIe%jY"dsAlt8`QBn&>pX=tAIe"hIfrSA<J4/R/k3p!lT6H=gk5OPo8ac(IeYr
-	/>E=letX@j=>NXs]rNh*OGOm<ts>-q4+s%k:Bg8_&U1_r1I9Stn-=\[gDB+LE5Y*`H!GcB_8WdmudBt?dkT%V==.?c[WSeTm,CYr+<miWpYOu.o'$ZZ\
-	mP%icho?m2R^Stco3Y'Y#WS3FG;"JQ?Zf694*6bG%jJ08\]+7''@BB\D*>M8gTolXLkHfH-%iq_`KGk:IJB6$llot*pE1i_YSGl\Nmegn3Ktr>1S$Qsd
-	qt-m<^keX5q5LhdZZZN!hNU27#GZ4\s,f-V9i$-b>`MG>OE,[i?G-=&c.g!E=9&Vs(,sjg.bh%B.f^/$o/U56#!9Rp3m<XT"VTIWYKjS7Yd@JM?bHEnX
-	#KMIMs9]4_-K.uGOo0nKn?.%LMJo550o8dBa4+i@_s;W<3LXOJJHVH+(q</gZ)I(Z$ch_U]*&P6K4o+Gn`CpJQI\`/FpFq?-&%@-EbZTK+u:c:mtSR*0
-	oO?@UGXmF`<GSkJQkX)QeEq6T<7C7;qpefe3jd;.r'AEll:F&aJ;h#Q;4g.KrK1-LA1-&XK,7^Z-oe\aOR-oDr5-U*E9*_B[:G%`n9qQ`;\X*$ijdckd
-	01g[TOH&RTu$.Rgt?jA3BL*RciRL4<3!CQa.&ZK$8:?Gi=5.6?h_#kqt2]`M><ZVTXn:t]+%FY:!`7%)R$dYWl3'PB.]9S/4])4KHX<,)7VUnYW`@".h
-	A=ah?C9*.0lh-NjbFcgdjq1r:5>&<$u`WM:FA@YEbk$#J/g=1_CrS;"2q0IKI91/_M<;Ni"#!!m<-@GU,:q4pX<0H"F+I`P7n(ZGQe[Ble1V8mFoF:nW
-	?)1Cd*8Z.N2H&!NK.S5p\^-AhG?[us;df%XOEWh$5Ho\,0:*d<97I3*G^I38T%)^6be\%WA21_op``ORn@O@',b`nhTU-q+l.7&"!$oSPIM`>8VLK/mT
-	V!t@f9gf!ph#_A6'0?ZWN=R<ZWUCkcC@>oiJH./@3_'EBe!3b-j4)?6#UK4:/X/DV^$GN@AXs'I6F<T']7R#OT>cakQ*-?Xdl_&)q%\.]><H,klE2jJi
-	<fSJRTYTkthIjjua)O\.J"1KA97mF=(M^-9W%fjQ8X?#APoE"`(M;If"K,&'hNZ=RtpS2p:b(1W4i*G?bmS-/q,a<OM9h.??F^;C+6F;cBtJTBf_r\Zd
-	#aY_5SZ6S<M'd-W+G%[;NUV6DY`P1gh+I=?&QM1mfG`KoAp>V5H.nE-pXgLlk:c/d)B\cZUCkuL;)pdWYmVfOfG>NAGbf&rVO?<5,/E!dSbF?el7Zp+`
-	C>KG(9I@e9@@4n]<-*R*+=cA)VCsZDP-tVh@VJR@%2K&b<BmNs+C)0p70E\^q7N7<ZnOR/2dMD4^j`FOoD<C/d\MBT/[S9WJ#`h7_]:hM(>"<SBXoMT.
-	/qIoGg*ZU$[=R31EXP,^!]t;W-WFT=ju!7TXQ;?gOoQr[^=jq0cYg934MV"@g=_q,]6ZFtXZ]GOdLGs;EuQ*j/@N$<--0^:'HU%Cp`5>$"!<Wt5`+tO?
-	TPpEjQ(>4BY0aLN?LS3F3WDX[I9bF1Z+j3&@pgqg3%pKREVIBVuF%2lj]j1-kOi4<lAd/mUj/$qZR('Fpshq`UY..N?>.i*5'mHdsXDsVO:G"'P%2<&#
-	7.G4"F/"lFO2EJG[ofZITI3HZ([1H8^gp1K^aj1(-Rd`(+"7(S@3T5f^bMKAhM'IL3&nO!+dLfLaVQ!3F^[VcL'0%QFBUl%)BPn7WE6>g5H4iYPQp.5D
-	l:1/u!WQ*o)o!pCPkpS1d<%Y_k3<KX')49W8VV?CA=H<Vusq=ts=D\h'j,?mqrAdX@VFAai(IVFd8ZG7f>>fS1VDf&10l_,U4(9\7#3aYX/@C(ZW5',E
-	JKgD[q$\p3^#:skCpX@GAIk?kjaYq7iIe@-NSl<)\gJ9@5b+`:!#6E>#+++-3(f7:kaf*o;r+bJZ'J55qRQ$:R2dr?uC`E[qA)pT@SgH1R12B2N..`DC
-	7(^<d'k#5*[P@m9VMA8j7ut&QN>a4UYS&"!^O0Y8/9ql$=YN[nTs*.P'd16;0,/CZ=9J[i6%e6k\*"=BG&su*;cmls_*mJ#*8$.8d6@q@#PPd/+D!gdW
-	4@WDABA.Hg<>H^kC;M*Nrg__:,+lk['tUo^p>B,,ggbkr*fh5QjnjSa_bQ(1>b.a(!=*rUImGB$,L$Xifs\0g=%fgZ2NtDbM%#N>IM"tME\=(+U_gT>%
-	YO"/[@:K)R1H202VRfgl.U\:LUY*";MGQU<F#i$98L"-I1+fnBX,.N?jS%0),[ucM-<O\A?E%-9E+R,\mMbi>IRm/h]pkpclRS;5;?ur[PujR9)APbh$
-	U;//q%B]0bgEq[[VujjB_j)o!73%7Ydf487`h=@Mf]BH]_0No#diE')>.>?[r^](D*KZuCA^qY&C^F0kZ;,9*]XLGZ^`fg%cd1Gg]Obb$-"K#iF/f.Rr
-	/?+)Uc3Ll.>Ge,asqp=f6?6Bc9I-9X%Alu!h0:Z-J,k(nq9a[XGdq^m6fJ<g1^tSOG;Fqst4_&OjgB\LO?KWV)DDh1BC/;ZTTW&V8m*Z6gF'#O&E6DGF
-	n;`tV%`>F"oDh=`<4\oV?J/Lm[dDFG.$6r/b3`a'+)8:0im5Y.gh;;!p,XWdVk)@,bnfXRD.@,/2:W6UX.n>;LEHn5#'>Br1K=&Seb+RT+*a!+BQFm2)
-	-GP["81;&PB=56!@@JCQ@,??+5;Ec#i=e20f>i(71Q/,=FVo;TS@*,Z/$tb0?jB5CTaRI+)enN$f/d<H1n69hM_P8F^AkQpWmBeKqFA0]GEUceJ>P)XA
-	'Z-9a`dW>.XnpaF-uq]YgbQ$ra.Q]L+s[nnDI'T7`592>k`\#ZpCubh0DV0jWe1;hQ6^XbHuDj+dDBklb9DZ;J49,,"+t<6h6nl_B7XZZT^]TdKOh,?r
-	cS6J=NSr$RW'6Ga@K#ho?n9)r6BDA4A.rSlu.WAs^=ChUa6-Z:Bg?&flRfk,B*'m,Z[!l,4m(WQ<V#J[o+&&+7H!-:7=jVlL8nk\tfs-f^d\PJBM)l%d
-	*+bSff=i-95jJHbp3>*@>L=RX--TQ/4c*XBd)Qi>)X%Q%=M(uF7!&#URZ3*ibE9U9_T@UV'IS,R%42pWUgY+a]]Fe(15`XO=*@Fkje@:NQI,K`d'Mu;R
-	kQR:7HI02Vf5/K\Z"jAo$UN33`PC>73/@[m+'k$1W<b;3,dVU7YonSe`-B<KUU;s(4k3#SCHSWM$&^LEUXjc=/,4)mOLol,B]acPJh@I@6DKE#J=mtW8
-	,$K`*K3)JfJnirA6<jb*J1cIe2&Ks-LM3V,oE)s!.;%AaK"9g0Wp$X"_oDd9@7OqA".0p:/aC<mfW:I@c%s7qc4]k_&M'$''W-#:A_ia%-#MO62lZK\J
-	@bqDlspEX<ECY+#n*"hQFcM2-](G+(tQ-Z',Trh&!N1"^Y63cO&7C>H9ggZ'Rf;@44aq:4C.9\Za)&N?$]_A/<=[S(l_%gWnJ_?-D)E<aT=Rk(4eCOm7
-	$>^)`m^A!%L3,K++o$8mb@fjlnH6/i^k^s'fc;lb)/78HOE\'D%=l#JhS7SOB]S.o:g$Y\GfO2maeRbF2YK@hedE%_]KD*=5L\k^K@^U;A0ET^UDVBl!
-	*FM@[U\mu=lM-n`c=$`Xm'ES^QOB5i#B!s/:Jm-^'n:33u8L6H$K%'/t@/-I-=hE^9W#Sa\Crd;6Z(:$GIg9"T57F(l?bH@!rO\CL5k9Cf"cmpbNKWaP
-	!u8!KM<7b;-U.Mq$r?<Z"j0e.f\N$h]1MnX:P4:qoa'tB_bl!OVH%m/d!4\#Ggf`jj7/5'I:W?S,b(\l3,/!>9<\U/G\>1mY/JGS#53\[&0I"5fPd/;2
-	m[N=o58iT5t&Q7UQg([o8u9uS%%O]nJg2u@;1eGKB*$7ijsbmGX\&O.A(gF8+l^n<9&PX<+hR*F='#q%^0&fb)+X+qqSI*HrUnK)Q[f6>^'m25`lLa9f
-	<6MUH><3=6H;FI9'V=#Jp2g5]RQ0cdjPU>1%#)%\3!'!V+j#f`OMbSJQCFR8%$j57Y-sPR4D(J&9-E?o#nc*K>Zi-6jAq8E<!*K**Ap4bi$?b(c3@UTT
-	[pO;_^LOU^#s!c8aVcTaYTp&cLHEu:GYE(7,u;gZS=f_M?8*0k]Y,W3(V'nk@Yqc@6c:`LI!X>KqniR-*Q.X\Xe[J)+4\#GPj()es>Ud$F_F/[GT_uXD
-	slj^f_o#@b1?uS8KA&7M<+-TRH?^eFci38-'Ls(Q(42nPbc'XPJ]8&-d(9/\@&&f@;JY1=fYl)e+/f*>0Z?_i:Gggb@=`.<MTh9/aN6$"6@HNX+WM/;G
-	e=7+PFtmA;OqTSL,qGj-Z8A?RGBZl,@1UZHZ\:"eY=h_H#r/VaODGl'`X+48dt.$C-W]q2@;cQiq5n,XI?E.gY"c/r,iW)GH>Tfd;`G]&gN(C8=L<`N_
-	U>VG3p\@]Y"rn4<Gj4\1:-2jhH^1q.9I"&/m$TS"[=&QE>D!]N9K0r,g7_tds/9*I.CX.V3kct='F&i%d6=BF2G'TD>Ma-ZN6Er`Tf#6e:+bu$LgPibf
-	8!B"i@'i2RQDSlV5El+/!3=*L;03*jkAig&8b..o9[Nm`S7cGMj;0/!`)&ND%X*]Z)M&L4aH1?;/RHK^(2sM5gAHrN>m$p`eomn#=m3_/n>G"eIE.gG7
-	8M,E0:NR$q@&0__hH"p4Q5%0SA?XHnuhFd[PjnU"iLjPn*Y!k]3"l^al+Q/\lR0;`S(`<Fd%WIjQFRZ'SPdrTuM&r72!4)jH\ID5ET92g@f4M+L3T%E,
-	0_d4+f/'u1r_-di<"%B[O`\GUA>l9m6(tuUKND?G\$FNrC/?I4%XMN3bA583"[PZ!\1,K;Z#J-HW6,e4GhKtRaU.5Cj3T:V&ZuA!6HBAEQlVnKJqQ.>=
-	W<nJ:ktHc]1M.Fm$%4/9-GG6Rf4S+K/=1A=/N\&"0&UBuC;O[X*g'.G+pKRO<&>@bYs`&o3C42H79O>udn@l/b]8_Ia@I5mTubp0GrR4>n7K:IA+9:GS
-	1N&[pHXY5OYq<l_-mibX<GYjUWD#33XZS`*La&@mHHbN^>Dd@hci$+91`=Q8)7jI=_RW6r=4/S(u_IK>5R@DEnjTklK823foWaQjQA5\F5P_$#+q_Nrm
-	G'm_Cjm,pOi]@2iHrM1P]G:#E$Gn+p1s\5@;2KCO9kN/\c1rl2R5Y<QeS>m'&C\[:Q]Bn9D'a59Ta/5"'jK+REK87a<ag:ZHI3)unT$PZ0H(X*L&]N<D
-	N>*rb3u`#b&L'2AbBmLlu\_BE/LldY7`"'f>9T#]sNJ"(ejjYi:_T#InsV6$V5YT!WlBkF*5Q:@SsNFI!`..+q_#\-.3+CTg$((H)Z:iQ25YJ3?KrY,<
-	^Iq&'scE",9#0<3TKKZpj2X8B+WliK,Wlfssb'806Eh:l,a+"s3@Uth-Z40;U(2%"o?KY"Dmm7JffJFOI"EnH>HT];WCh^GRjGLlH?Dn6aUg\tDK>C]/
-	Ful0)>i?j+^4Fdk-,ke0Xb,+qH%2oSC/tZe7XOk%F]@kkj9J0/*/a)4]`F;#[@X5$U(FN9O'+&/=@Ta!I,Bk6aa]=#PL1Q4f0WGT[DFCC\!H+7Nh^5dm
-	3=kAWNtGS=tQR`0sTeA+6?eG[Gl:"[+ck\>uS8FETMgYbE]SR+,b^e``hJ?^<1M^:Y)L8hC)#H=,_e#-)98#X*`l%'2tir:l;tnp+p,&-RN>90gB?Kf0
-	7/.2--7+,!RudFtInAI9u@JjD+:g4TJbhVNaA32&q)\#9&6MW*E56BAjV>,id(QqE=H?I/78*Gr*nBKG%=:bUjO/j,#hs'K*qQ@kH7Jb9CT>--f$dN/U
-	^:K+aX^XpiE)pMk48c1oDEJ.9hT7NU#IDsV:ThJIrY0Wl('>fS?BWq&Oi=)07O!l$IU\o$Nn.-aRWF'8^8'5KdjE_b$DNo<%04Ll>DJ6^<`Q7#n)Bq"c
-	'>Lk4k3O7A0$s=_)E8%VNJ0UU;;-4AHQ/D`D;Gb0O:))@tU&%)\[i7QW/U-Thh,8\hLdT3GWaULsD:WT`f!4&CpBTLrp0YJS'Y2LVldo^>*_q<[&^Z$k
-	p%cHS!\F6I_;H/1S,ng!JaG[Q$,Z8:\3-@8NBRu\q!%U-]nR0qL>ja:34]ZNnA.C/1j?^h3=$f69TJL,VKp,h:8d9j3@>WK_!heu_a,l+Att2_GIcuoV
-	\#3)j=mueLO.r06ds9nl>.hpJ.OZbr_0_0_V=kY_tuBO;tFmjE+4Ec33Qc[a0YcuE<%7'Hk&n[@/l&J%`Ud[:*I39a1.Sn?N>qA$(F>:Mk<7FS=\n0Up
-	OhZn3iiJHP%ZDZ2$>u=uEe_UkWJ@V5p5$fnlcdXt:*NYmt%5^eO\?!/$EDF^7Q4)m"PT[cIYIbEljMo=$F!-uPd*:Ds@>/ngV4*f5);$GA29bZQq4$V:
-	E1gL$Pk_`<HY8mQY,O;tYfoE+@p35Ld!2ldpOBG)e_DA=[nDL'j.ZC14qa*q^Dl\f6p`MM,h3Io9'/Msp6]?H*AnGLt?<.9.i@d0?>WLK7XDG5`KRQg@
-	78'=1Wjh1hfBg,:X3&Y="jLEI#$k10Dp5]miO-7kNdd-<sDdU8*nH[*"rcgHX%<W8fPL??'Y$.0s'pGrSK4'CS"%Saood>eQ]"H,&<B8>%)P<Mic>9k#
-	l_HBWY'5U*"%=A]$Ic%dFXfPp4N0@QNOF>s<me4L1^dF8SVALf?VmsGo$TUrYWoH+l5N>ub3Z\R8uZ%N\,5XN^O<NaqT43\`M:KN0+P;2k3h'Tf[$5%G
-	H)mdM2jMAI[_gf@_NIt>COGqCX9q/-ub;p6,U1K5"661jMk31;&<JT1>KTce?8sO[G<H#^#.3-._-\Kj$nOhd,@8&q'`IFVBm1a3S]pKj>(__^+Du.ik
-	sVe8dNg".h2Hg:0j0D[V^R*J_+(^5\*W6jO%THgVj"V7.M<U2rn8)a)DV[q-%3?/gP-(4BkF4d#>,n:KunIZLWHrhN8Z\k4.5UMo-r7:^!jp49L"f[G0
-	uD1.DN<p!tVO.lOt:*N]fZ01QQV[OO?TAL,MqlZgM^3_YJ.<stMGG6Mgjc9j<*if3(Kl\I`*$,5V<i4cH79X)f5lat&7^>35H1(&O:TGA=^/u=9]^!'+
-	H\8PXQ3F:F%>rhJ6PFUPYf7G3,9QfT2nAhu'F>nimR59r5*JGNLFbf6s:Un)JfO\^=KgZ4&dU<87%,=g<4YrPVq;%";C.X2Ng^0_Y72lF3l/fb.XH^jG
-	3_$,LhTUs;,!'1d;XSD![\4gtdd)/N8U;r<,mi0P3;:6G'fk.2NC&ogi$s^Y/8"P8P-*7o2:re].23H@G`[#&$d(C4KIdTR@"eg$fK#-rLITlHJV*SK,
-	8i!G6kt\ja-m]nXA%oY,?!/'S7k&"=K2cLP%!bY2`Rq$?7Q1h.FdZcFdsWUbhd&L/;h"bCoRPGS[kEFZ1r\m.kJ_E-!$SjqYe-_3YcfY_sFWH2e(M7[%
-	o,arh9+U3^c\[FdG(`k+kh6$G!SlJNJ(PAL/L;['_<e&ku\OCt)Ecd*872bmC+8T7p-^[#2"i=Tk'^.Os\KBYC.@EA8aiE7l]O*=a#lpik-fTi^b,',3
-	uuQsTEL2QegH]r;tiQAH3\LiB-^.^::XITMk3\#a_rV!SMd_u<T2S6RPsTm"Gc8hFgA!lQqHW6.0T>?)%>Pt/ab#&#nD.n]^(*'<*6foO'Y[n\(O(ZOV
-	paQ4Uoe"JYZqo&"QoV4_k#Y$SQH6$*4p_O9u;7WR`=CWPOOVKu9eE)^FNYN^\MOi]?HGrsp7UF!haH#@J9!:9l<1[sXU.a)'ipcUM1+S6_7Vo.)85(Qo
-	?(ZLIQ[g'`apUldM@4\_'etF16,I:?6j?8Tc)2qiP[T)%+okZuc:N<50b:%9`5l)76)HBd50cu*6UTg_oGV?%JJ/r3JgN<.rI_A4#IDg&HBOOGS79JNe
-	OaH\1=Pp*^%3V[OWOeffi)/j27=))oTe"X<[aZi/Lq['71XQn9IHeVXo0q;,FmXGd\j+E(tR]jPfU8h7jnF,0=?B387X6ZB;&UnDK,lo54U[@?Hgb?[0
-	E[BL:_OoGq/7TH-#QqF?UhD1lVbM/3b'p$XiZK2WHkcE^'h#Q3MYP_[C53*#Hkm*:3.-IeDbe#%]ccp<Z-p]Ph?j_$3]9Noc=,MfD0,+`o;,rd""u%E6
-	UHBET2D>SotnCu>KZL7pUP%%Xj9#>6_80SSp64I^pMPT$)EcN6'2*Us;_EC']<.Bli=%hW*.:P+Y(RjL^2C:O1dr<3%T]#SfV2?;k%<]%TaK@A5QAbn0
-	r+cW?='nJ$seDN&5hp@Pn2(eR.Ri3XVA>WtPq695sr5EN0hHblU`Y;cSed`aXf,NG\l#9kD47)5&j>7Ef2G!\k=UO[1#H]t15Uuj%F)o]1gX+gYop<la
-	$jF=joQ!1nrM(1tpFT8oUM>I&(j@NbZpFrlhB!]eP#3-#[mBK]g[>[k_4\h7H_V?Dk`&I!T+B5E+45%8r@eZe;j<.Z<1c@(YnfpBk-ks?=rh)BR-rU>!
-	thKK+<dJTdon7])YYR#pae^`G`s6M#4Q[D`:RJ+\)uu]Zq"dr_QQ;61r3@5V'Tf:Kd#P1&17M@l>foFs)OG3<ETElKC[]9Ys]0+/\>F-7TVSaO!uo^.i
-	(.A.ps_"!f0,AoEhuk"mSUq_[.+D+_>^BakG.?#X^Jia`N=hcE,SnF29]Kk<(cKj4*1.O%MB,VS<F31htH`MTH_hn7qUHY@VC>eQk)8B@?qH`<`q^R\P
-	^Vhs:L/VZS;OQG\eC[S7)df4^TT@!XCLOVq<7,sc>Of-D5>]S$r/k_YtYopB/u0&,>k0Zs^*@3dl>9TW%i1+m*Dd)1tl&frVF<#'2<C6@5#*R<5*"A/-
-	s)FIVO.&h32+[%-e(qYAu*pQb'R!9?[T!@mJl5BL_nI>t!"t3SQ9S.Y&_sL[l<pCsQK1ed?"lBQOH`pej">TGgUNcScj9Qk/IK.K4Ftp0RF-'<lJs2Mb
-	&%8$a<e\[\Zg*153K9n6GG'BYfYP@sRCGaHIIR!)QkQ8+.I#Zs/5tFh_&Nu3q8.Ol2/JCZ_YZk29^NgcnbD@E)`/tHf^'.d-%\j;n=ffp9Z\MOn!McUH
-	+bso.cT#D!.fK=_Rl=%Y-V2P5-<:<fAKH/=E8QdSCn6/nr"**dSQ?PbcS+4O5Ot=);M+6ffJ2<>/%B$g*seQ[#NGN7k\2H0f"cQpDZZ&UuKBADR;fJD1
-	4Z*O'_P:UjO7a&]Ca^^8la,9Hbtqntn1IIWkgIero!]W5V25DPcjWGr+M#6=XQ5.6oQ:pJpi68TaI?<->MW/6/WH4f41Drp^_?)SK9,d8cf]D663#QBF
-	YHeGu+5]:NakS^Yi^9dJ/m-%OXq6)r?seR9:QT$89/SAk@2XmfB@ihtHWb>W&bD%N54BlAIu>jE:B8EXs_ghJ!7H>25M=MCP12'oG':]V+:=J:"LcbG\
-	"^VYWURTCiFG/b_$A8c97'G9P0J<$L4RTgr./mcP\:"o+OS`'oY!G=Wd_05GTq&`3NG_E_s0'='KL*N276[S?4W#-KAOo_\:p8*:Gjde6\Aku&LncHRs
-	jWFBkKp`8q9O5eDRIP-3UB"MH?&a1U:7Bn*Qg9oA*1NJpLSIf"LDeu_7S]Ut[L:P[.:aAi,>dPf@GBjci\pbMJ\(46!>\/gE:/[Il'4J*DV/FGZ<6jk"
-	_%T<[1\8DnL5p5nb7!:1sPit_aaE,#tO/@g[KU7#P!s%L*5QChYEZ6h.E^Wa\T6_A!tibF>$nE&o(rOBqcEcOH=N1cS6-K:%C_.-(?MUmM.Podu&4cQI
-	,5L<5'P'K/Bld,6Tun%Yj/P'm+A=geo$([e_\f:`U%6\e[mY$K_1^TH@:`90Ln$@^^6t5<lssfDNX9Yo:cMQ&VY`EEj'09EB^N&"nW>5f);"QA<E.7pR
-	CpEBSS-%FLTq@2"E+_pi,4Q;60*l$4Qe5e7%gL+/HS*F;rHZ;[o'0_XU9G1<[:mo2D=(Y[a:#K+KaR9U"/"$eor1A'F@VU4gCH%tXE%4.fBX#J-jfc7]
-	oT?TVt$rqOspo/O\Gh?mmP)#T34%O8,^Y^F=fSPiQI<F85GKI9:m%<QWlCZp7s8>a9<=2)\"1sAoM'M"6=:;A-nj'3<RDN84=f>Ns&hftcipFtH:dJO_
-	f0B;5\t;85RJQ5Vr_#6jSDJL6K0jo55'MALW&M!&,4(p%l;P[j,Yd^S8!jlr@pLkWO<,hj#CQNp;ikp*Qse6%68r2QPXc>>0Eb`(H/3*u(-0l^o7r<C!
-	pR6GQXQHXNl.B(7ViXD*>PMV8;W1aV4J+RnYR([NlNm//*T"7E"pVfKDr[<r891>Ol_^65bhPqY0.oikPFta@1fD2err>Er8)/LH,O=XquNXlCd+%>>L
-	nb^F7M\9CQ<VEF#.^*Ri`3Sa4s"Q!I<9R4j1!E(R^<2hEN+$Zm`V:6c!rGl\]KIO5nG)>cOTpLl<G.G2!#&P88U[+30%=hH`ge]XuR40^/h-pGsN*j.;
-	VRl]#"N-T5i:aP3T^"jm1i10Esj_]\Zj:s-J<FcS>\j"L9Xi4H36k&UQF^'Te,OK(:ced_U49t1;ObCYP.9DR5u69C6(cY42i%l$e_KjkR=A4Hf)(PPb
-	m,>2>6P6@IrAZ)$E)3f?d_dXEiTdpT7rLHRWj4SEA,D?2#bRKfh1n9lt+OA*F$kp=G)GK7H62tCBdL#6.!3>(/i*$t?YYF]bKePO4SC;U/^q6$MGP/V3
-	Zqrn<`jZ;*P[1T+TYs"]jo^#(>JSod"ePnI3h=Pd^B!$)pr>9Cfh#/d"@d"WYDSV#OEcs7SSGTDM$+qF]id7Om+G/-No\g5`m;atR_j41W0TTuF@+B?V
-	'",PYubpFInZe5j(>W'XN/GgFt/&^#p]RF!:JoPUnY@7<l;s\EekS0'6PL>s2d<:^oCK=]Q,uCPWZ`YF?f@Eb.=cqa,Yg?#M/PPNYlYbCd,$IRN8MHqY
-	pbF.Ll^9iK0Ir!KjnY$]]9q[R6>;DWWfY+.3IYJT]1lkdcXRbHDh<`#jXaOX:WZ$@]k>`@M8#rJE9ECc:^P*?Fm+:MKC!h<YtSL_Y/CJ8$SNTU$mS^a)
-	G>O>s@4(ZZ)/$cH%qU6`j2P0DFV*"OE(36$>+6"q#N09;:+YI#M)W$!cl5#@2..%En<]]\p#Q>oNFDU7>XJ?WPr'FBMW-YR1;e2VK\RZ#ZqRq4.k3>9s
-	i&^fi2Z3s=;?<7>s*+I&r^\3Bg*5gM_MoQmF%K?lS<,KeXS#_]`n9I3BB<O.R_WBVUW"-^'o`s/f3V;sI\7@8p&;:PEB=/UkW(\s/IiX1QdsCC)HpeL?
-	n6pKbQsZj64CT3K?ioB=B?7%M?)1Y:W.m,?1H%5:%7cUl\g7odZ.!1#[iA[)$Zk1h[.GAt82@E`$(`f>8.uSBJ<).@Ak%W"IKXFIE:I29V0XR0EPO<.@
-	Vq!B(rb[:B`bK0j@:.E4&0dP_5A=7a=^kQN9fUc-5KosBgk5[mKV"TcL$4a39Y?%'U//,WWKKZ?]Eq0@,f5Li7AKmhkk.EHH3RXj8P98Gt%3D6Fpg(lC
-	*k/`@SYS"G0A86pO6uiR2&,c^d:/A2\L]CC8LIaN)JfdI9Js(:+NF3G"OpmCXr2l4al5`nJ?eQ=A9\pW.5?`)+-nqW"0)F^8XMesCl\bL\$IZ0LHLd0P
-	d0j<&LElVN2B91H97_3n`Vd,D_;pP4OeYc<irH/n%F1I)h+:dp]'8Ds\DG'<B&dPNLj53XQZ-P`q$l<QMJo2^'d)&_3('MDLE,)P9:!#YDW$SnP^p(oG
-	`#*:Y3:lnO\I5L=E`aM5If&&W?^%^lkkH>AEQ>1On*i^=?58?-PJ(S$We`N9a>Ya([ge?3mG<<AP;P$;9MLZQ_lhkk8(l`Yar`.AE+V5'.eBc"f]8cSl
-	_gQ0jWa"<"O5>%%^NdHdj$BQVIei01?iK0QQ[eu1jkme$q=E2ks8M]7?bV!b&%0r9FKkN;3>TW+eB`F_"q*E6jIoL:<qS;kG&"L(b2d\@"qtNr(e!V!5
-	03?`;3*U_2Y:DI6U+#u`R&WR?[C3%CC7%%IH*:sJWo-qQde7W%-Dt[<MFt-m`cd(J8F`b_N6W%i\jkh_'QcOT<$n5&Qru&a8`@h-$R3Q6AKC4cuAmRV7
-	LK=p#^4i7,p(>2B"I-]A'.>(K09j'Wl6VgF_@3-Qk__4L.=_9\:\GS)nR&.8'$l-`@[onu`;ZN\`45TYX)G?;2L/X"3&3P>P30%/@7Kngura>CeTo>;T
-	0D7N\\5cXn*(TXp.=/S7TTRqJ-.*Kj9@=)c'u*rK0IZZ2H^U1Hk-n([EW+lCjic5IA#G]]pd"Gac<?@si@\g,ZPC:aNW+,'U$nLtrj?q&Ggbg1*0R!]S
-	0G>[j%O3/3$AuEYZ_Y)NFnGquj1j2i"eR\=M?:GnGjRmPe%FRf55Y*2d]H-MrjV35ZdUjP"!1"_67OE^&#ZI`*KbNO@JMDD228?CB<3XsnpQsn]"imUo
-	!uEC58R%Q2am_Jc[uk2l@&7NjejPku5kMd(9N=*AU='p^XX`"U9"O\As(T;r'n5C1<L8S9@.@5O(SK6f_QC&WYj^'M:,[e"]SZ(j9R^Vcqc_*k0qEbqc
-	J1Aj%QY*I(U8iU[=AfDl3m-2ZH0<jK+g;XWk1lF%BU1MgZ2F5<7ClT3sDV);_h7hB-gKm8Jhn+XApB9DWY,#(Ke1Yo_LFsIX5TYT*'B'cm3.d=EpJ+<a
-	D>#!sa90%P<gjX7<CH(o=E^98lp+Z"%^GNrYJ%;I0"VJmT$,Bb;4C79.Gu/uW"KONjrsa`$B2jJ'B+Gi7B#;u"`D>#4)gP+.qQA+qURnJaHXGXm(D`uh
-	NNZm3#u>b9D#<Snh^(f4H\nACA$GfONC0ahaKCJC%Tas"Va&3&gKKb?(fci`4r%fB8G^Mj1l6Y>!=-,2Q7IdY]0+C:uf3UbKtcT:isNYO5rW?+/<I4ia
-	1iN'jqc6r[e,c#u(p&$_hr!O(XK0fI3*XA]J^DB!O4]XO!p]J8A-dS[RHP7P`l8A?%G_<iN?.:<*\>NC"o#7#5cOfXXFIWjFnK/FK;,./gqF2KnTR9__
-	/lal3UkS'B%SF_7Ra!Y.<J;pV8*LJ@M/ITL>P@?X1INtPXjrjLF11/:AtrD=US2hN]d(VA/sT$JZ21-AAus9W\f7[`Q/7AJ6D\m92,ia&i9Dfj-<@m[o
-	\3JRW:[]edqSbUi;gQC$qu?,Efncg,$BT^UIMqqeXVA],bj9bo7-%*`dSTg,.!nJ8AsgNk_?Wj@L$=AZS"k?ajMA'&1+EXeho):MI`I+FUR%WA25d4it
-	VE$W9(;TBXU>UR+SC.VJF6%FDV7n)TtO-YPH^ZNSkefCe_3)MgcTpCo"9Y2H08n*7T12ob.8Z8_#WlF#R+fi6T)9]n&E*UhV"NI%...iQl_IqSPk+XSZ
-	2>m6O47BbYIVGABNB@pF3fR%%Dc)Hah48HijOl/L6bFQ!(-m$WJ+Nqn7sVVbN[S%?SPi_FKc\4bU%mL]-Us.VTXlaNmZBITdfeuI_<M@b!L&3Qs^d^<5
-	eRq8VSV=5a9Po?,X2E?cr#N8qo)u'''
+	bbL->4HiJB>Te2I!2SXcl`?,jE@sU+Vd-<Pb'R&Xoah=i5ofHW<!i<9-fohu;:L`N_8<E?n>Tf4XR/SQs-(LKDNYqeH/][kB+mQ]o0Si-JB;0V:%lM&O
+	oj5-uuK,&?VrgiV2lT;u=#$Gl`'m,U!PGPKebVo-t*,?Vca:S&;ZniQ<0i#dT$nB9N'G"okmAl/^0PPnl2&H-Qfq"j16X8([A<3("B/upO)SpPlKoqqb
+	<I6F(eq=)u>aMYLM0\Q>I&T_nRcYg(tforn@8[Btn<=:Qr"?8S*q@KdX0QVbS?5B>c<]I*]/QE6hp'aFjBb\<H4hc;lG^b#S^HR!kFulG>qkrmh>f/dT
+	#c(_>5<=_K&$LG>=MEfkG?K7T\]nkq6MLB#itt(V2bDl);1*C%T:]D\I#,pW>U2rW7;c*`f`Oe(VaK[[3.$($Go?X,EVBBZK9b=-Y9pLQj3qAp?Oe_52
+	h(N#mFB>EG=U-c=O(VoI/MsuFgS37"D8!LXa,uP2'Arj_>tEsmcDQOk9oH5DLbM)hH^&Ll\F*2FdjtQ];/$P[eB@?_@PaJbWjsdC'P;rShXW2O5@PBY7
+	$eK$qaOUAoeJoI9e,*3\[u=lf'MuNV8P"Wu6$76k#(_kM6:TBECe`Z?:%OmYT=@]ud<>):WA,2TiXAd$lGpEF68&%@S90<+r]G4?:+G?UQfk-U414f@Y
+	l9ZG,X*[oI5mpps.fO7lDsWZU)h^&C#/iq!1<)C<jNB%P"MFBTH;QB=igZPSc$Or)QtO7[eThFI/gD*;2bGd4>&Ms8JO&\a^G?Y-Q`;rtfo)`MegO/Vh
+	KL,,rri`:?Ko?#5NBaO&J<E8A`X<*Gg\u^NkP'j+id?g7u?qi]fQT+nCK>7$5jXP1)QnnlHBHCQ%aq:).$G7'Jq,Mik?+=7<rW+2SfmO6LcIKdWn.nLJ
+	m[^G!E;^tnoq9`[D\2tb_AUa7[4C&Fg^C,dN='r2X*.JZNbBKt.!3=E]I`72&,YJLchm3-'YtGHlrslX]A-Z+?m?W)0!m0[AG9jU)4H9j?HNsOIE=JB\
+	f:n6SU2H$&Yt"b_kg5<M#FnRL<[gmGP>iPeR")mG#:P!nb72=>Lgbp6$EZonrUD4G6'<'*a8gGLN[WlSf`JAJq`!3UJjmU<6Fl^d1&$V[<Ul^gk"/7Z-
+	2ToBYKhmN,r+F]_Rf"i7>VcI@bYs#L@`GK4YnnnUJV'PcT<Mf"M1=:<W?*\LQacA9^0ub%_22Ac4%$Y*,[H%s12d:=;*OXJ6]u,^.^0#.2bS#'004TZ(
+	7gDX[amdPdnWCdYs#)!NL,&Sm?P)L;#.+lb^Cjs33[M-q+VhfDZ^I>qA$rm-BOCU+"`Z:L7YJdo;F_/(@.U\O->Y;*PEe&/Y]dCOB>='$cIJc0ogrX%D
+	ON\EdJ7<4WJ:3(U#8=4?_XYd5)H_cQEmD>TkLN`tec4(=+_n1[$4Q%X5Z[3Es_UCngLph@9,%_qhEXn$+bMgG)nWAj!a>iPJf/*a"E391H38-[!O!-8j
+	D&dnaCFpYl>:u+KmYCQqQFBD6&#bV-),5i$b)IP;En*Y.R<\s%RTEfc&%o!2+T7n]D2d/:"U%:NCl3f?2MRVLR*9<"4=eO[s%mbUBjA',]m%o,IZ"=;r
+	V?Ku0l07!MAMAdH+pX2/MXYgBiWLmV_c4jaIS!bIe];0I-tD=l$9FNdg^+7qgmpRS<^gk!P=c?d`!lf$k)BiiPkOK($G].(#jo`]=Y\R!1jtp>*<9s8'
+	k0gZ:)AI&G2]OIZaK*O$H7rIT1sEI\`,&5n2C7,64VPZt\71)[o<iGUS/BO/t0RiWRN#%rNg<3do5'aRR1=m(T_B%G:Xt%'+u^a<Mq$Y9:N4r)"#dG':
+	Yk%!:&''MQnkbr,$Yl%-Z/@2eFm!1hd+CR,)"aCFd!5_m,)Cg.Gum!HlU]FPUs/&\#-c^NF[8,n+5ElC[\!$;tFmJY[.9a>rEW$[rcG(l[1=X;pHkDm"
+	m@!Qe8KsRXR:O]e][]kDS(csGtGE>AP%cWH`]8e\L;]#]*Q@;!AS9=bqWbbZd$;'l6g:;Q\^*'^E6Au`fbX_T8-L;/GFY@c&a5+XW4Z+M2<<Y/In-'%R
+	/!.C+Nt#kJNk=>dQ!$Bq%Hn^'-N4=Qq-;InXPG@c7P0hhY,mnu;=bis-TqlY4LLmEpgO4E3kTrqQp^b<+^X)2XqJh6r<#.1dc;IC$>q"dcn+bK[cbgt,
+	p-,t2UUQoAbsgL53s49l)uU.3_Z;B5K=&*bn1'@VD7(8%+=fa<@']/lBOD4U1TWKItP*4:"#E!R0`ORJ0]^<flM'Qh#Kt?TY't<>*KrFn>)\>X;-Wo6R
+	sI=&.*D[/SQK05M?3,$nMGua3,)X8QfT'kO/]k+FnlUY/nYNeW?4e.To4##pk0Y7is,*m#<BDmX.$b6Rsr:qC^Lj-.BG@;`;_<!/L?qn3d's"<>CI=,.
+	SnO?&h97?\<t$9P&bM!n<'L*=O,3RAeN"$jS/B%3g&(&LoJ.Ka'*8X4aTM2`V;XHE$d6UWH#8=i&#36dhS0@=7Km0tFic6:c#9jo=Tj#6^'&bUmD1MC<
+	[^d#Xt;'6!>8C;LqJq*P18W:a#N$20R*"*F1#bJEO0fSIo+lsi"MmGG=!"V!8h85J>cNsjg8cZkeKR1Xp;RGKsYbX*M_/pH#5!h$a0$'bkj>?W@:D:Qb
+	0%;7S^@R)R%j9,)[bATRICF\k@Nqj>>.+_u'GY1Y@5ku"3RVm#MD0O)L6+>Ar%d)pbc4uPYo$Q>=b7ZM88F<LOf6ZoncW:,U25?L@$Y3ER1Q&dGKBqYH
+	W/]60XgiqA#TJ-_B+QQ,X'T\*F8C.5P@rP#jPGYP)t-.U0K9R1W_FZ.s^XX5OYsUdsJLIORSD``2?<gLonM3%`TK;U"T3l$^_P@Bs[s[@U?K;*(Onjf'
+	<NXN4',/\2o!PB&Y%SgAS=\d-ae8-0*$0$gq.&+Og9q\+#n>H4opP70&SFkHNJtmTIM00X_^3C#0rD[Jd;]NNnND4/;&"lu:YmK[2&*#IU@PP_DXs*iG
+	YN<H\\&4>ene`XX0!_ra]I(=N]VSOu+]MLOkBa>'`o+c]Yk*\C@?J\e#6<fhsH=;A>:hC,mJ;BRl.W1NEH_;&G41f,-EZ)=@uWUf-?1C7M#$/dW8@'/R
+	6ngV,kQ(:2fS;K*=32PZ;AY.R_<-@VGfqG+KXo=QlkoJASQo_B#Z(aK7@s-s?W)TCJUU-gO)`,E.0*Jbp4[U1)=@BSa0N-#eafn9%gj=!\YY.!R]a@hj
+	FLfa4Hl,0-l4-bVETqki4kQ-19VBPW,6A[BXW!970HYt4.bE;68e&]&TqGTMX6.\7`S69TP^#brmM4.QQIIK=b.&cglfh]68;m-^-3,3'omh]nM':=Ua
+	[^>.dLlb)^Z0GaE)I5_/_=[K`U;GcVTZO)aYBP=@4LF-;s9%;dm2QdC8lMp6395F;#/,i]ckOE%QjP[E?,8S&MT'IfG1ucF-b74Wk#9=(iB@9c%Gp*jA
+	8>H&CCIU5XZ;>Z<D$`J;)kt/&-'RPpbQ^<NAR^&<M;_9LQs@'*4bd0ffqG"Y^B#Q=r5EAZY^@dl4"W0XFlVBV/OIO/1&-G?,XqG+F/qf<r62[-\HBH\c
+	nW](Vfc@<+1&fqf?*@W\.!iRXdeP@.Wr7+R7sf&@RKXL\Ku@^Bm?46c-377Ndod&af&ZrBb`gfhF$6X[Z%&ij"e>bd?CP#sMKPm980r%[KZ#/*H()$4E
+	C1EFc=^dFmIb=Mb9]D^U'E7-nf\OW4*cfLU4G+5Nb2]+)]/&kFKkElhFi8@3%[(M"!mXZ/tDr^dmQQK4ISlP,uK%FR2n?M_A!fGXVC_*@Ud9R2&<L.Up
+	)*ntachR:roU!J)eCuDs,RB[`PR^o/X/ZgLnBg2gR-)Z8Rkm/N>0mj_(IH,d$riI_D[sJ)51VdukFUM2>$9UHcFZR9`UVp7nO<AZmpU9SJcjnHE6lke^
+	-03?E.`T=5I^=ao_oj-GYo.bASI_i+8MaoRJ"@qb]?j(.Q1G'>qecM*]1kk&Cm`h1u^E/=qL9@NWf'%9YlS*0pSg`nZT!p8#008o]:]D`[1gWD%a$iUB
+	riY\6F.)d2-uS>a4m?5i'=nK9!<'$+"*uf0PSYra7B@*0;*3<-Zch'sanZ/l(]^;aD)O*@[0:@g%2JZVcmn_re3pNuq?4C<Lp=i<-N"k-E+)X$fG;n^s
+	YgqZ.g>lm77/rJ8&jM-"e;8"L[PZKJfi4INjXAR=qaCLE0)!e"eroFFe#lhI:1SCgeEcT5,=U-[KuG1\C@'C;Q5o;pob7_beXH=0ajc*<N&6[lS.=[R[
+	MQR<3)?Z'C<d9eoM,%f50JRFN.O6!pk2u5$Y^chJe!1:`AMe)\b%3@DomWe1)R(("KM9o4]$>_-8D1L/tD?(Wdne67`fUl@?.kMFiJ)g4(hY%m,JACGI
+	BD-a.dLb6_+%U$!e-Ba#Ie#@K7-m7@IeWJeNc^oH>_)7CQ.gCo9)?r\csk8iVR1-h>!I/mK6.W>li!l$#BjRM)>V)9JE-7AC-Cmi'iWDfXHocW;fd?gV
+	Ve(CmZUrLLA)VfMR@`cd>)S5dq`1*Tq0_[h5NB@C!Bu=H4K>Dh!7__TD["Uau/Qe*^R.M64T$61uqA6k!Ms]lba2Bk5*lsAa[oCF[mTsp=7V"d;r5J61
+	?KmU,"o9NS+W\G+?^iI=6]D;.4IeZhK2%`EYRqT$V:s/3KF@dK!QnTu=K;+s>HJ!'^(Be=P"7##UIk7sE8#:SH<RDkZ\^j@;e"V1RQnHHNuYHd&Mbd\n
+	`#dn">MrL,=@B#&(11QBZ9VdH]>Ih4eVq_p5)7im@Wa5Ej_*X=eJlZacgX;XN/">&>VH1&aVMNfNV8or/(7;lK'dbpf:#:,Z=)/Yf%8Pb_,U0F_8JOAh
+	R)Hdg4=cfQ\FbR1Rg8s5gq+a`R4*L9mX@!![YmU%J<oU`#iZBHsJT]TO10j\%YdA<bI1GlEMg!gU8YSTXG2ZBN.:tCr.P`!t4O4Q2'oX2K*meEW6&^R*
+	ZoVOK@TR:M]T9sNJJaHS<_p>Yi`1I$Ch'EQc`!ai`6g*CG0WMLbLR8,\uKO:5"uC-VWAa-W6`JQhX-lRA9sX9fl7;T3>186pAap34s-DIA,Jt;%J=]jK
+	9)P>:a9'PrhB8:Y>IbY-fH.RF:G01XMCo4PA%ucL9h.$=F1@l8BPFU;$+uMllmH;aC5<B0AVY9$qH6f-tZ'f#>K[$AYr<hFpeGY:;_$[BQ?M/Kik@Q@K
+	'GE,6JOa"bmoPV3-A,IFL6`,HEL`m[+CnqbS\%!L,buPp6PZ]RK:H=i/$4>S5Z_'"nnSV_^BADohS@$?m3AXKm4K2V31C6*:&FYYo,^-BelP6!](Xju"
+	T`IA4+pBma?Ei:PRcqe4CuAmo^hXhYGoq@H<'`Ai0@QnZ6Mnnao)geI2ES?Nj4]s2hp9b%^B9+bEJ;s*iFlI"L^)sAC-aCG;0`C!.Acu\/n>,4<@dT>2
+	)#''YijDG@1>co'BAp]^D$Ae:el?shC`oQGK6F3!^qr05a=l#eRZ[CY`"fZ*CD!4qV/LeoFNLN,F[eoH_K'm9o9pG&9#KnQ#-W6+-%%5ch>P+GrY(())
+	JnGN!XjK24p(?q,?jH+(6F1.[ZS@68$"?gk2kD0$(Mh9-hcD%FmcN@cI-um7rUJ4P?>E,5;Z#-TBGEmF)&qP:(Z#)*"ZQ<0Zknn'nh^^YKneNRnjd*<*
+	eH]2U$j]bmOW^VZWD&NXAVD.<JKDq>Kqk[m<>E/MsJ.FrY3qn\EUX(hf;Sf9*%lB-tSJhq)5"tHk)`.EUB<Aiu1`aZeX#O"r?,t40reJnr*em(cRcN-e
+	Ne>PZtRq:B(TEbGO.LG2fU,'O+N,AXpS/N$rXt8Xg7a,(kjjk*Th<T:K:t4c-/YDE3EVQ6H%?R.dr=(@](gG=;>5%2BG0,u[^0Zoc[%<igX(#CqSON<C
+	,-FkS\F\'Y:=^5k+L[?29TWs[n$6*%22Ph!3H%%gOrhCXG6hT]Vb@a$:f@#@tWbS:G*K=\\^YW^X6j:m&mA+WQk+#SYloCgUYlYSB$EF$>>.a]&HXA*Q
+	We69A)E;/$hg@hQh[SdA&`MQntVg>4C[*:_n?M.,fB.;q#8.7/C\XBP*#2Ws]Nsi$PBQ*?(.)/S\1hQgb*7A)a%csk"7#*.fq3^-GF@b\LkL878%<6-p
+	ZC.Pqe_busHpt1gA\7ed<n#r3[c[H7"k]X7lYiC^Y(DkCM1?1J\9XeF]""PgV!ttJ`UcdDO],.d-@I_$*LHDH5_u>XgVDnIL?I%m:P'^+?KJ;*MWlN,`
+	Z<\)#s9oXl3OeimRZ$;k&[us$6I<Q82`t&5GFnba2H&fVH<Va%YaKo._-Z3H]St[61@s$lCk51HcQh/n?7o]^qW=<N7H;3YEBl(5"StjFQJ//]+<G`>Z
+	7a<:?,$$Il[mC:1h?=M'oSQBGWi)(]YY_c<95l?5cQ\o+B[N#EN"LQL]9(-p.NqEL!L;gb/SkfmubANT`$E6^H]nLp'Nhq%QtlgBlR]No8cLmg_b5/$`
+	i76O/u9FD.$n1;&S`dYq,\4,Z#LcWua&-=\Sc0^p=RcjfJ[_(F)D[62f%`a6sQGU1sjl!i^B#eg=n[hiMb^Yi+<DUb/ud;W4(BJ]LL"\/BpHc5Bf]o?#
+	G5%_!JJ69:46&,X_Fo)[,)1>6)(\@^)CC$tO*q;D>Jg^'jI)N'.HMQ%/mQ(aMf)YY(J(i`Lc)hDm7i]#t_$nFZO0IFVl]0?=Dq1.c5$FRjZb]$Mn<D;F
+	!ilJ9cA'g5M=<IGF"\h\jmVI&e,t2.:UVf;GUEXY%p'KPg=DTmdOd/?8Ys5B,d6VK]T\F71l0ZZ2fP!GR`^6$0(X5QI__F(KS(q]4Le2!rc>^^-Jo_bj
+	"i?ZFC:"1=Je*k*C:>4+)N^GN`p%(o0%:R7?tJ4RdQ:b%JcNp@<_qGB0D;AMh+#c!a0=D_1gZSL::G,P<n.t`k'QNn.#jkCMD9MIZ[?-:K9=#52YR/o!
+	JVIY3nNg0SYNp:.L'rT8ki5Wd"3p"--4<e<So?_,%>:#<\JQC$DeE;C,D\E:.=\K/5=ID-]JW3&0;:#OK3LQj[YXNcG/Uf^kkgU#UmQ])*^=R8t,*qRp
+	A5!jf-SBh'T4),lD5I`KeeMhgt?h<j+e,+"$[\8LnF$lN,h3FAV)UR?+R$M;:ZD:+)8r:]XN.fRWE`R/6R)0_EKn;pQp994SprGX6=D-Zqt/\B+T&;U*
+	8ii_sbN?bu`(B0#8JQQP<Q<;!(D+VHIY,WI1jetq?<0f/'$B.<&"A#6m!XKPU:ZaB]H_t.+4gVHpALTW@=iBaRUSm;2O'dO>"O.*uP<dG2cjIaE,Gm7c
+	"d?Z@#j$laB6(=A5Pd)XbK?iD(l)kT18KGe.$'CY)MB"j]I)+&#hRFfcq.9CJaPosArt.:E`X2C'=9S,$FSmCO9`3Lak:tCG,""'qtu>%p%6_agatElS
+	lWXXFM?R7;]HQu7^T^=QT**gP55q[1'X;I:S)t6<3't$f64\:bX*8U\%,Etb(X2+Lpab]e3r];**tO'?H8V(79&<dA<,6M^a?[H$/94F#?Ls)l%h,Y=4
+	8CmR&lNmr?/E`&";:>;m7XGWs/(sX/2!t^9@SV@,>Q9ToNW8S3+>U)13a.*5leA<#q*nGNF6`Ul].;%XhQT*BQ8V>tgED<>/)Ca"8`CVaN<j04?0l8iM
+	99D0nHCAXF/(W*Z5`VS/ke%THE)o20Oh]LeYph0_D;O$q!.G)MMD@QA7"`,U<O0Jga'Ao95H_<28WL=74\JB&3rIF8Ab9E.DoS]D&!nApfa43Qk[5Nka
+	DlBU'enek2+[[Zb<]J8H@n(S(L<fu*e$6fZbrP:4gob[:;0F2F(C:ti-n@FCm<Cg$,Mt@;$aAC'Fi+rm4lQ$B6Yfe*W#/%:]IRVZhAUQoE%_*\q'N"Es
+	#I7dn,sdWu?*X7kdVM0jp&cu'n`aY7EOdrr6tJEYO.pOblM.l-*B)a>c6g0E:9>ob!5Np2J")Wtn+b4Y527,!*d;s,IXH<`J\MDA*tD)k014csFL=>_5
+	'ZqknWP?>L%k..I!;UId0iHCSIdmpWYB#/^G'IoPbjDtaKFF9oXeT`_h0M.r?j#b\XtOYc6eHPl+d/Ar@F&7Ec['$Z4$YY8q6Ykm?4+:7,f5L.e)<H.t
+	F[R@8FlXV4#!+#[_Q$ioaD'@>"ciMeACJZIdFHBo=9V@s?fiAs:t>gTn.fFYDp4R54NMo"3XD+Q7!tAf(%8,0`mEpM!g3IBb92DE8[[n;3QJW_s#C"-t
+	>G0IC=P$B"n'VR&i79BaVhm>[g;`<RPa'T59qg3^),SPBr;_)X%@ftsIdlY+D)qiGJlC+ql]!&CT)9?ckXc$YsjMokYVFHR/40TGK*\U!8gg>$=E^e!I
+	`?#pRE%1,(N`^0>b`_=$bD?)N6,jD`"(X!OuJ'C9mfBX_s&QI$SB4*Fhlg3EfRu4gUReQ&'DI/d\jCU`F?!/7spAhQ?Y@53)-Scl6n/sE$Jm49.lF"Y*
+	T+&'O2lkhKAjbXUOUS\C>'kF,:10OuCiMacZ+V^)=[58O`QW!%Sr1pp\9enu'k1"u?Oqku!35fRACA>)2-Vjc@!Y$A[(E;>:h2g,H**<ZnLg>aiLu`:F
+	E`N#!@29$(MEo;:DYPV2T2+1;hXsW[LMiR+p$*hQ7VV7B^$YIejpQ3BCO'h&X;4K`dh1%T%kq[J5qr@;]NnZ[F)Kuq3bXUAE$&tZQL(6)CQ*@GVhO[AM
+	@5De&c3&qEr6/_D&AL7oCfBB+>_EUW-i?ds$K6[:,1-#:&+JZOWeM(PXke?bZ>t!>,C3V*Cc5jbb6_Gl^cn4I4V\B&q,>p0,aFT(:dK3DJ!$`t?gG*BO
+	2O=$JJG]K%!bpYpq%,G$bi%/gb_E+`j>=95"gFWkLCJL.k^p<q/=6OqQUE-cg,Rk"4\=;\>H9(^>BpUM1;^.`pMT0GlI21=-#-!.3\'I[4(2@PHHUTgg
+	/aT?*#8>uIPYFDJ%j-#".6t<)p.=7?!"Pn+f7:X`M]nB"lG\krX./,gmlOHpLW4:Nj!?p4?^/5IClq;Ea;f[R!MZ0WVMB\+^WJsiZ06f(jR7$OEj&7Hd
+	\0%.U2iC?#F7jO]EK5C8lk]=HHnH28>82Y:f\W-_a6%Jf/+SITfl82*oOcn[!>OmYkBKTRM/q8*n:#FBFU's+4Oq)NR3H2.WXT5&X)]H.KKfCD.Sl6oO
+	rYTMh'/!`Wh\-$esE][$DCiVRqFj;.Dlo;\?j<#&aE]\MqRIFJnc/M1,4qh\\2.8/X\fLdDLD9e;1I^\MKJfROME$^uX?6f4`on6M=MPPefS=q5B!T<m
+	[7gVh:p5Aq<f;>EXgkfK2k/7:'`X1Z\.bZjoQ[Z2PKG+VT!rAWQk'0QOiX]=g:flrgHb#8=LaiTFJO'k1d##7,bLAWeR@s4b`sGk9P=Y;=#eb69DH_>J
+	=#"9$!MIeURQ%<;!\-ua@>.)HcU4aos\pXs)!&'bbc:/,nWY>5Td>0J"A-O>U/]_R+IekbJ3!Q:'SQ=,O5o7\GPq4hN'g#N0"<(r[YA'f=/%VcStj(/@
+	IX0`85]j:RHPt@OIlm#Z&IdEK]G$T7=Oe#Iem1I/:O/qAQ?!XVAlG.mQo>F<#XC;podFATT1k9@ck2p]?ehq:A9#!OT=)Le@ZOg:Kfgqs[mnN\Q,KaG6
+	J4Yc--0CionBY7#BdE!QMo$/'W/L@S:dXIDl7$*5]VUWLO3pH"Y`.e-i7rL4e73$sR#VaheRCTjBP.Nm2JkV]>:!BO2/I%495LYC'dZdb%1+U6I&So_Q
+	MQY(0@P=RW7SCe2q*R/\HVOi>e!n8V);<Gqj/CRq<@ib18.dOHk/ml?0$BtL;3oJ3He&I<hgCbK"(7n)(f*0GdrhkV:,%Jq\D=B@b?=sr]MeL!J:iR;U
+	f6F+6oH;`ric*<EP<ZEYNH\Jr=G*?(8R6qe?RUlt622kIcCl3ULj5]@rXkI[D,"P>QP&RrNmrGBI9LI3bZ#X?#=I95oRb[p:97/jMPpCj@u,UoTEcd\R
+	)R8g,*#gK]W0W,DD2U@o9KN?-\,G('F=\?k"H<MfHW45e]g!VK>)PquXgYK]gggp[n(d8b'r!7O0%C0RpNjZ@^tOMS.V!J;s)],`c)D"9nsK<j-GMr"M
+	9:^$VW.?TKGS$jq^_]3#'I6[!D+K)O*1Z8@imL=8^\t)XAD+32]j*Arjh36eVLXT,T>Uq64h4pL<%q29@SA&H@h*W=lWKUO;On@`#=OQ0udjIBXnGSP`
+	:C#beSj%Mpm!/$<$CW.<q8'fS^]1Pu0((Xl`SH7Ds7H<e+=#C%rcKF=m@B7b1l]KAa:37YP=r#Y.ur[#co>]5OU:/.;*(DbH&MAu^F#ok`de_Eik1YJ2
+	+?J/&)gl:`\Hpb0Y$aq0]dCS73IL"g.<$6g-;Zo**$.qB9is13T,M4K#qZOMn+>M'm6frg!tJT=C6/d`kkjdo8<C)N]F:EX/h^I\H\faj\Z-1p^0Q$cu
+	<+ch>5>S@&K'Zj-,ir3tA\Ujgli*<OQ@rl+8u$/_Ep$N)1%'e/>WgX]45f81GhW-YW&`.&JeNW9O!Pr?n;7"4fEl_`2cX80u]9#fB*BTkt<CKt!IU1VS
+	11_7CIdE5DlO/("]=!W7(bSCuCpYA^9n(0N5$ZSeT;@<hmKeo^:ol'N0PS2@^_el4_UPq%("`+UjV^bWr?3$s^.H8?E`/D&SJFGreT1_8NW>bDJ78D_I
+	Rnt)DYAkTr.!j(GUTO"rQk@S1m/]JcRrpo@Il_Fa.T>2lBU]:J)>a_)[o"q1m%jWut7b0j<kDWo]LLr#f`?2<^&s7s+4JaX3AObf3SVqu)qBKLrqIeit
+	/]_4`E"VTPU&Cs$/$;[A5q:IQ9iUI'_pLaiAkdK6L>>6S&)FU\8[W]sg3K`=Nbb,N.p0H,(Rl&eeEZ]3l0";,_F)!6obTU#2gp2Gp'ngi7X7i2U]B0Qb
+	i);sgdhX><uRCs;1s7"q@<())S'kSW3gif/or,1cQ:kQ0`,h[5m;uG[^,NQQX4h@N^HR5.:#be=GuZid583.c2o>]2nkRe[o%bA1l%=E:D=,W"(dX?)8
+	Y-Z@m77?(2(iUT@_^"!3-epWCa%KQiHmHK87(p;[\p[']XL$8l[DV(,iN)b$CGpbciGI/M/t[n#$ibr8^QpZWX[W!K#+>bhmba5OTTXc2GthPMG,rW_r
+	(Zj!)^s=I1S[*$;6m*BRtn,1egpZtQA5rh3McZrKo4BIn>pR1sf9Z^S[hc5n`H>qrl"n5@<O;uriRdWCJ_4gUPZ;C6874Xma8f"S,Vha'k<-#!e.(??C
+	d,h'EZk+h2.IT+EhF<%6%;RIYmT]Y&]B#XEG31*^(a[^DBG9;--_cdEh3\$MW6R-/"cY)i9+$*LK#W3Mq!0NhafmW.jiBTC<3W6@'h"fWD$\8OA2eUkR
+	pZY[XJ.Y(Inl'IRB'fqu]d\@N%S#?As!)77R\':N\/^dZ+m&D]]QjJ*S%!mjYQ,4o/T._X<OQ&d<WF='k&\CK%!I)jFI4/2$7)i7?_)$M@;2q%^3K[e=
+	)Zsq(Xq8GK=c<tn)h@f$O'2*%bG_HI@_JRdgY6\`IpV8WF#>)!\:'n5L)Z>[`>e/@f$RG8,[)+KZ$Y4o-eok!j<4I=laim\r[r_9O+32"t>EOTes1.3@
+	`"]`P+;dlein0c\LU:2-TmmL2NGeMVdbSZX4bSU<n-ajH>Gk,1OGY&,LEY<!nr@:"X;9,:l4NI`GZSF5Q(9kl\L:6q<K3KL_Dl*K]Ll03)@;3(TVQTe@
+	BB[c?nn,JO((</Pi\ae*a#3i6W.%0*?!eg12*A]OIS]nSVJ;KURG&amuDH3LUWAtR/fTX),(lWe%KLbbt&V%XYF.*c9CR04BD1Glj:WRCQ784A$I_>NZ
+	aZhuceQNVIc]"OVMlQYS^o+AMI[Fi+uN!CDja`<jNc*_p>[&F3dqn'uDo(DoqQA5C$W:XM"%<=jW:&+47Tl?h;W$Jij5rK*Mhm]e-WbqWTAp,UjkoBg8
+	]1AiS35#3%D5=%'#$XDjEh=MYn$])qVSM!9+n'Z'Ip`<7?S4RWQi7K3nb.EO4fQ=LR"Np7a^TLin3s#.i-,M-84'XY5qbf5e#u($!(`()r@edP9`H5c5
+	sJo`XtfJ!nBE9`K-6X>;d$"WB="f`SN2Vh_\9/=_aZ0jdT!FN:^G.\KAP&GSYUFh:.Oe%_b;p-qg(X2.DE(%,6JQLd0!9]><-?,2Pd<;G([]7dK<;]"`
+	FZ1!l[41e"Hu_b]t,(E$<lA#.^?cktK+F9mS3WaN].]%b+eh$eB'Vr:]l6+.R!>Z/je0DjKK0Ar$P3m^Ob/9>l8LX(pO[;BBcEV+PQkVl!ut51d=nEa^
+	oL?jW%>L0X$-T\E&l*@M$58mu.I-+,T5qu#5-&drJmMClMi\Q[o;iQY_:\'HZSS&q(dF9g+de#eX2n;X.c:ZlVm\&anNXj9.)]W@.<i=n7Nl$geNBR^A
+	d[ud)Qq`KK__d$GX8m_$4ZPX/7fV#_);9IZ_:"q_)D;GWXde'p5e1@gL@0UJmN&DO=j,q@DUb1<Fb3>uggW\8RF(I,=D4@8s&KZQIG!gm/[#X-b>lh5<
+	>QW_l[8$.'CBM9AjVEAG"ErS7:T28Yc"dN2=j([Y,QUf?IC2f?TA=NFG^or_['MW6GP,os>'le'V&SjUk;G:^=_r!W99@IT-p4)en2hO'#!O0qJJ-p)^
+	3"ahaiWXHcuqA")FK*Ek*i\:C>V<kB"gRE+EGMl[-I^u17:_c:AnlCfGdRA:`uVGXGGI<h9C7'pBq2.lkhRkMrd5;)a@6\3I%apVYbbp9J`a#.*)CW*_
+	),lG?1C#eTG:j!;ETUAZZnFp>0=@okY\kB!>G^A/:,QM3##M00VC3J<#C$#/^g-r"<&f*^^M"Y`l(+!EcDA:9A!?*,b[3dfYa+i6``J\XIrH`%S'j;Ih
+	bSA>jn7.r2&h"jf+`mmjLW*=@]FWZjs0GmJS79F8XXosS&poCFmZhCQ%]8%,!obS1W5l(he0r6cLOA:[GZ\W0B6hqFG?f0`1H/7'D$FhXC>_Ia07IHIi
+	s$\M>m((O=E%p7ifm\c[ar`UX]PAQK]r9D1%4f<,B\"?bJPXWCu%g&^&5559E0VDN`P#8VUpsme=.9[Jl2/aQ/DSeXtfJjAl`lP,_4AB9-A_)J&;<Aae
+	M0=RR/&7I3D.NdQ9b4M_NZMu,)Dt?3@3n&"Ieh3N=n3h'ZXBGf6XR0*.mSKU?RXo?YQtA\Jd0=_DpKScmH/"4VQecpJr.d$3Ns5OUONo`%d\C<6-=_R;
+	0*,gaca>p[$_^FcMtm3*X,@GSRQi`Bl=)hJS.]78YYO`q8E]J0H1S0P2"&/AA33K/!P1o7[7db'8"+;`%)3>[ARTY@f+]fQaQ#'[VTjq'n'V065IY2[*
+	3t">@_Su2.ArD?D.)V\/@#BT#,63#V$n,7%"o\'QOt"9q83Wi1G(:)bD*)?18AtSaXO)E.aW)9Qi6.8Ce%N_D<#d>[Ek`n:,u/UILXtrDer_19YY)RBP
+	.U=Z2/cGD4Ujp)i.sbG.@_2L[GE)N=SVG4*<YZ&7ZEcpEE>*PEJ]i-(R:\$SoFFm1'uC#SbFp$JZFk@X8U7lFE:%r$DKZ@RHQB4tK(R6O3#"d/h>Y$We
+	<]528QE]>/[n8rGpp7^AJ]g*VQq9I7*bcjnY?T><t8Dj^kRhS=nVUo^KY\+O@J[OqmV34"rHcG2_[Ljo'^!992ghQ8beXhB35Z9*OfVK=WkH8(+iKgmk
+	i>jj7*/7\"klHZJWH:c6]s>&eCtkYm:a1h=PhX=,5LaS?`Li3<\BtEum<)<S:-5M7RP!/.g;_4<CT8O5<^jFT%m^iJ%-R[mB;k/1Wp9o15O^!5dH2jC1
+	U++@#O8R,-L#=K!_Vme/GVQ]5.1^P&A6EB@qn\/M]>@8Yl7hU5Rl'7@_5dM?^U`Jem)"q52La&(:oFWo'B<P]bq'PlFb^+n"7^T$U5X@GV=/PW\%s1=I
+	V58Rhf\9ZuuajOSbolG_]:+)5^<,H&$q@jjUq-56i@RCA=?B&?a`tR'CS5A%KTAV[,LF>7Cng`sq^ddL!KgA>=;Q6pT'qWLQIgejg<:B'[AD6;?rZ7^f
+	H/KsZ'0q+i2-KnLc!&@MUeQN4TdgaG^:qo-h;;fV@Yg!GOL:>SaW],Wc.Zd%c3/*JBA"FqBd/r]I5%t8e6*df>n!TnVZau,hNje(mVs#!;RF.X^$2b*U
+	463bKVZ@jBHa\CLkE[3\Z%BW49:NGCGRqY[S1g8L0=-o)Y'4YeM!FA;.AI"`Oi6nIG5HT-.r0/%(GDb34\$^GDGpB2BJ/knX4&2j_W,Wj,pqR?R.%kP.
+	cjMDLoq6A7Y1\gAA(Lbh(P8HFMLiIME"E8c5Ir*B;A!LD8S74M@mL+TM=HU!7Vcd/HE)r/f6C9$',G"i8$2MZ<q,,d+F!S6dEMQ*"^Mt`KLQ]%!'rd7O
+	7(!J3uE1sZ#LZoaKX_N3WsApWFo$q9\^@68h`)o!Vg,bOB'=W@9a%;$IhhRQD2uka#;CkS>LbVhZrMq`P*pMpT6E`K/^*(,gr0$Sb@WL)8r")K)?2uE\
+	3Fkhcqmj=@3W;5B,9#]j6E$CUV/m5L0,9@j`-n].[uA$bWQET+eGe[oR\Y@P<GT_bcSlSc";QF'k(,)EG6GaXiZ@2n-?*[[jbH\sC%iXM2W-blpNe,Lu
+	$\HojYF`ZcqE7Yo0h'P\E^ZcQfoK>]JaJ=2BOVcN1=Mk6.iDk0rYe)b[0NLCjD3@VTX(XTnV+-/AT275;=#-hIRi*IDug3PA!Fe+o_IqtU?j3G7h9M+g
+	2l$W;4Fib]c'#1<OYC];d.0LP-+KrS$c"p=S"gt@-i;m@tP=g#("K1,r_!je9Z?F:Q:cYDAfoRXL@QVglrsl-3IMb*b^3KOuqfa]#JE6`V$6JeN)C=;*
+	"tEpu'$[BU:42tl(nTO=$^@W<Ye)hYGE_a:T*>NllOhodL8+h'9rmd=U%-?&n><B]a5\=-qoJ^08N'@cE73mZQXC7>nBR9c?&=b0%I==@+[.#IZ/77UD
+	eA)Zk2#T1K8>,M7k+*@k9GOu2K-iCj#=>t_pTTm#K[!M`H;CdnVT/);EjOjO6ZDgW5\q9WQm14kY-#k*F?,VPnU.5pUOe3q5Pp!1g&MJ\aImDJ0GrLRV
+	WI#7s@QEYKfRlqQ.3X%ta>XJ`J5@Sukq3[A)(2*&uj-!ogO$ZNl(O3\T\j1Rl+_IN31o.2,a/s+H6j^graP3Z80[9h$hlOiW$4"p[\jH47p]PRT3_7U7
+	/j+>qA"+rdlo"kkS6T7;=2m0?%pjtJh<i/D2tVY6*YYk(HN3@aE<8SW37.L<T<p92COTf>%"=D@af_P<t+<VU;TC[Y2HDGqk]/Mq![8UjoIk"qb2L]b_
+	ofc,TIjGd<A^u0Ou`e)mW4sm%n^GKfP_-n--&XO#0G)BqMRkZ!tFq8.R/6#9^+,V_U"$`QW@/6?4>qE^@AFhMRnYYQ`ZJ;U#6^?AM(m3iJ_os45;a\Im
+	WAu3+lsdaU,U[(!93+a:A8+O-n*Zk8_B,5nB+&!U?C.Bo&n51L+PAY,N>#JPV?>je:9<fC_VQ-\nls)9q]`9Y>ao2n8Ar+mo\*QRVJnA*\)i_OZ"OH'K
+	V`$mFP'ZD>bB`GWn^EAAS0>^]t4Em;Qq#+>ct*/$[t5-i[ftC):?4n8XNLsVX\E3puK1:9/4NsY-b&\*70PbkCd(2g[qI:Acj^nMUbkJWVpLu']>%\R#
+	Rdc$A:t[D/,h0f:.db5=!EY4"U?E4_W_]ZMT9:=.mG&h3XHPn%^U?="J4,)OI+2H&Ys+%0tiA]pP1p#h<8p&l\OoqH`R'n3t]dhG^ODKBKUm$Tqi;[q2
+	M%7MpE%0f?Y+@I@Wp$j?&I)@0^\=Y1l[l8&%^iqLT!ai0+="F)<"f/lV5/&bZ/?;0*/M@6F);?blj2&V+*Vs!u$,nMC!GMppBqg@d2Q_jcWG]oqE4Km"
+	>LV56V=.k<nK>A\W#E!D)N+8(a\G.XK0XQ%t)kBkC'Pahe=BM8(=bE=OaIF<"D/"qBAS;_?%Wjd8Jr9Am]_<uK7?7i_El9-*C#O$LoHFa+f;U#toN?IY
+	;A0gSd[:BCB?Vue')G:P9mdI/Y0X,t=YAaY>B]4$>en[seV)D;4<g2l71<5(WG!iO@Yr#gF+bIoMmCbtVjE_>R,o<qOHDAc6]n^?o5IM[iQZPr`o-Gm3
+	*Du@mXZ-H,AZXbK>S`O=@81^7ZjhEF;?.I4#C(`g=(C&I(uF_^:/!5QBJW+O1N^qZdA8Kq]5A10Z$bt[J%Ygjg_3`e^"=EZQXD-aNn;AkJ"E($pI=&r2
+	%"dKO)U6mg0A`DALc$Ae)dR%hskg6jBqBI_L=uf(Ra&>(59me,MA=Wg:'ZfjS`BCWg>ciUL+MIR*C<I>Ih!5hNoON1=DWT>otF2ZC&'.&gf.=7\&D)[V
+	&[4oE@tM*3&"-_(Tch'HrCKL<8"eu@9I#IqdR4HI\%s"a=ZgMIq`4c<[pVW1W7faRtH]VOMP/5_YU@nG/^V=CfV"9W*V&V0od%>^l1jCF`R^-L$?PPd[
+	p@e:tW>A`1*OEU1+cQ'2ebH4uK[r1$%\dMf/naP>p4Kh>:s"Y)&a=^\.)ig@<cG2?NcC#g4Kc4@(Bf;ssm*K_FG`9Voe8dpu'oA'c:_s=-_[8';K8]0a
+	Ho`@Z_F%:N"0!#.MAJ!O"g+!Zr`C&gX;"3ap?^Q"W8Pe>%udqW'\Q3,"!h;j4\KEV+^Sq+Z^R>eN,2Mi^)*u:ru>#cUI2o%KrEjCKiM)i/]ktK8'e-f7
+	t=-.A\jY=>"[+M@`bl=b.ECD`T`P![n4$?V/UYA`Ws,Q.rj6+('Q@M[E@0MQ00WhXAb1m;jLC#(^Jqk7_*"fpVraNVGJq>'Rd[]B>R279ZG@eIaCW(I>
+	VNLX>n*dIV`'P>4)Uk]\O1@e`L(_!4o:+.>*.c3;tB;1^:Kf\YRTt_Ca,*`g:3.HfjAao\EpGC8C5'-*.09>:<Ik'6X:'C6"Lu>-'BC7F$odS<49u)6!
+	ZA,rQXr(m81mj5bBPnWP=$)kI(i4Jn&)f\+cegBo05ga:IZN`StTjbY1ael"+(IV13SgW7W:e=EQ$Zj8K9epJ=rS>+1I_f^!FE\l,D\X4m!:UW%-2")0
+	fXARhqA@4K:Z9W<dZt6QE7ljqMYTPVL_$0h7TR`;u.'bKm[=u,.2h%9dmb2BcV>Q&ZLUMP/_ZYbLXPF_qA%O[<O#u5@4F`VFEh/!:YKK$kR05f=T`<C)
+	o9E;Y=S@&n5p'*s!L"d[m6?.._X]@j4J%1b4qb0rl/dT3L(a<:i[c]A]b5ha_/UAMp:f3C%O)-ONpT01H,U3;VjG1Z-WdUhn-tZ#5qR[X]n'2X\EYiI&
+	=9of0XYn]HK$DAe'/QkCa]+1&3%o69XSBI]D2'tgK0>4j*lW"@Y0q+Y@6q@Mr$le!0RdT"QqJCImeDaiueu4&7*Li>YXW>J4.D19qoMDO!$2Q0Cp;ag9
+	_E9,#<a&#Sac#r#9.JRTk,:6Sk7\e^(Sg`)Ua-QA3Uc#HiF3L4'DZ_+<@m/u3FOXFKQEjTOA^QPX)jpFsl@DP5<O)?a4rBUCe$M0Dc']eUYQ=ZHcr8HQ
+	HW?XC[g3JLm5?$DTr*&TbK!pg[^_32kuWuQe+&h9;e'e>knH.SdrRILp1IV?jhMdmjJV:Gf1JBHFp1q*<bk!TG6I.f=\T3eL!\gD[e-749_';<"7%mA@
+	gEmRO+G6)?FpQHn`%2h&aDR1Vk_srie,K7Hn,kRjReG8Y-dEC];3<o'Qj_QU"7DqqnS)V%p?,fo=b$#=-(![7.AQI<Q4MC%L+qn&>2"PL1DTY&Id@RJ&
+	enhkQ)'02#L%HffYEIG8oGmH:lZb>Arf(,NbEgR-?r;+dSihEr_/@=en!(]gbXSOL-tOj6j&.;%DKT8-]QsDNjo3YkK?j'YNt7g(B@i-Vql-im6$;Wq7
+	o0j>DbU'i<E@(d-0hr:KP/o.M8rHN,.3#WDhWUu..509X)asf\D1W)II3t?#GPtF?%Dcg?-B;0Jj>A9rQ.E^#=[^K^e1#\Cq/VH>P=3F`7=^m/?O^=H`
+	&;97*DYgo]nP\>qXj:"kj)cCF'%E3SfffT-\:eo.(EpF4f90G<$_^72Y-%KqZ&=T\8pQ.2bGs\lh46P%2YWq[%R=AfR2YF8JZAUEi,;YWD:_oHDe#WR$
+	ha3e4Ec<XE-<d?SH^FT?bKJfq9tfsrLUBsaB.,sUTI/a?\;CeES"Zm[mE`GC>hR\Qr/qH,'=U8rkB`bI3D3[:co%9N@KRn_'S!$6Yo>\U^4(5hiA/+MZ
+	6FTpiND+Ad2a=g;/JtH9UME!BA[?n]OgKN%]$m'',5h^AqFo^-"WiJ;AG5JMecB\ip&A"^U#\Fp`W=XDg1o^#W)/Icc%QV'57L=r1$j+l%K:uEsPr3ZB
+	<3*[")f7ub`!E3pgIuHO5mjHtn`l<[=fP+-Y#B<-K4ufU]Z1tF.`&r$)O4FKkfG,TX)VmY1O`7N-CjTKl!tQoD[ZnS*'1kB%>(j+-ERc;Y#tf0m9`=<<
+	[`bR)TB-B.0<Y?e5Jl5YT#RLH76!s))rnZg];;3=s:R[$H>uBf='s(70&^ggX91<F\C@d"iNHC6*Fegq+=[iNjVK\3jnYXI1(0IloKmS@l8/B[,l!n;^
+	VE0nMPHFRb[0\ECe>GTc=efD+t(UmRkYp6JQ6i;.:i?]\qG@WNMn`6VX!_7$0Y@UZ,r%h6aHn/s0+4dOijm75s798ljlU<?=1@2RMslVZfDji^"n>O<-
+	-ikUC@RAT[g[EbJQ%7aN?rNRk/KQ7Vl<>s@)MehNAs/!phD:R,s@WFUe<)<33SXRui1do`@plY(3:/ML-F%G)Plfqb\tmAinHJ9,?f&qA^uKcF?RT*lm
+	1MtB`!er9&2a.q"B$>CV"ah6n]@#a)O-p0u\RYkU7M3LJ1nC19i3uU.\K\._sL/[:N?elWG%=9<]Q3SkPl*+$1[TSM@=g*b$f2p%p.'=JnXkG!SZ/B_P
+	nmu).EmuQl0SLo-jLnO2'Y4MUUKnEK.![_CSuknF!TJn8=D^,IjZUXHN$]/^B+Y?9`_cOl6Wjj-K`fb=R#M>GBT*7dd(o8a`[W%R7cW`9<k<7-),!pVV
+	'3oRf3`_TT@cWI+,ji.F]$Z@7P)nf>";ejKM&_T?rRnIfEj=(Ugg_)_t]10I`G!OC.H7I(2'L4Y4XtF&KnZa'a-cG>Hp=!m>?"D1[+Oo`rYd@L)-aG==
+	#cYV%_!MEOWtUQ7o-,!@ajZ6tg!(fs!,[flu)-mg.&6+<Xf*kd:jQW*saP1kTgrY^c<9afu8sE'3N^Kf")4b3FQfSlQlT+1W0IMEF5h>*/[Ri7/d(SRG
+	>*16B""N[!/l$d9&IF$UX(D]'%N?7K@jh)BR:"A^F'\l`8AE"4qj$i].=!d7LMXb%T<\fRIH+%nOeP.&kZq=4:fp_.e2j",$Ib0R2'J<^?%UV:=91;4o
+	kVAp>%0B(F=0eM;0P6j)upTg8,-NdnVB"e#Em19-6D2I+TL;q4I?VT)]*f8Jfg;<)n>J`Jgl141'&90U!HI,e%nIPrM3-[\=!:=iJdT>2MhZ<D:bW?4:
+	]mTJ3+T''OkALk^;CnSXKQ7oR/;:Gt"o7!r*Rp6L)HjO8n,;#0&/i<Wb<^KM-:@!W;<"2Y/uJ*bE+&Vu%1,stMB#Tf*^3qh,[L"G#n3pGZ$8rdm'D6K<
+	+1k";:90\)4Z`!PBVD?TL&LG+92W8Et6.\DFCtrlNadiBL9RS6FAYd>&L/_BTRokjXq)l!TrZf<ZM-[QO$So".=f4`H&4O&HaVs@2DC73>@N'1o2]<3M
+	e66-M[_!5l^H_[l4KU8&N4N(@!)TF!o)`dAI7;2>q&H`"cocCT+dO)W5\.*9M8+EjnOb*%04mKdI]qBfsAqN#-^rHL'0<[*S"iS(=o[Jb3E)>;=CM`3q
+	jJ#FFTU-X;tTO>jUB$8o;+RKHrD/L-Aq=hH1LC^.?o)-sn.'4g<`T[3:u@:V"FiGL?m#I%V^3XAE@:N8.mA7!X#OX1V]/KIe*CR]($g413hej]d6n\#i
+	.=El6nEHiWi-,:?ZJl<`U<Mu4/'ks8Eo8i/SqucI!$qUXO=B%tGHt:.^0@6iN=d00CP-t_3$a05b?G$7mn]@Ob#:nj@+9?oblZ@;-Y:XgW;b;S)QK\pg
+	SVL7"b!35tK:Fr]VG_W2IJ;C1^nI1+7lYqdpS!rfU^np=hR+n5h`\dq&%_SRI1\>QO^#^"8.&&X*1$-il(f7T.'M:i&/Z^F9tKhfrOttI,>,Gkm$#(g)
+	''H3lQ:Ym4Z_V/:*8*@X#cm(l)eaj-Who[3s!WC"W[?WLcfCM9KD69=NO'P\=F&rdcP?dniJF1gMcJDhdG/)B]>d'YL==+a3"3!Uf:63itF@T+uVAE+.
+	>\QHZ)frO/`Ip<X@U5]BE0abC[C+9W[,7J>'A]pa0`q'pr2Sr-$p*q1d65)/T`-9D*]J4\?>-4>BjlX92*1W`5$.UTArm6^pP`ek:,8B3e^l;3Rh%;/S
+	5k-e"*R)GK=91MRS[Ztp$kG'&hGZqkf]L5fhe`sZPM5!gd4't*gNp;umTR;NrHkB,FKpCF[76%O,Q-APV0_9u!:?JY/mXf<gqon!O$BYXu"'79^PG5hm
+	[@V];<gtEX(30CnZX\_EY>6-dRG%bcIJ3%om9/^M_.6>?]Z3&=#0n\lW(%OSR54Ai'2-nK^U'sOMTni@$`DA9Igbf1;"g)Q"rh%egK@*d['!:_J)Jlb/
+	,o(\[i%FTp^%oOhMA*6IjXdt2!MUbRR@2)*='*8O&*qGA0ki%:MMmojD<6C2I0@(@4^0jrcMm3pMY6`TlT53_4e4QeKYp\!CSu)3U`EM\6gShu]4!p=h
+	/!%mc8aU/o^_3We6FQ3h;>fQnXBVAj*A;0R0XWXC]d[3[(2B5iH:'WbftM8!\@P>KQ`MQc%t@`dqpEJA/u'Wr[ahQ;oV'8MaVYBGK<=t'PW=bqIZVP,a
+	<<U5E&4X`-U]C;Wl/V-=40VFm7;)k8)h=O[9S[`_L)\mnV27:O%7?*pIHQo:4j)Ko?*dV],RA>JknODUJKh5A1biX2*GfQ5+9+X"I3V^"s4qnbr=AI>.
+	Tc-queqjS@\u#ZB[1&AAIA;fjoD%TkF4WYN-S\#Cc11^"OV^ig\R52;]g3tg+9`cC_N6?JPe7Ift:NQ)FoXlcPRA0=1P.TS:CTL#3/r%&>uNTFW:I&#]
+	$Z:IEp/VsS\K-S)hE_I)Ear3uiD^Y@$2P]aN7l+YY.,0XG8I%a]rD8r^#HTsq\X9!t5r\3^/g7RJ*"jkU3f4YD#2*d`[Ga)2_<o22I!e[][/<'l)N,9C
+	o3c2N*=5C'4Pqp3RLeC(7h.l,9mm(VeFjg*:*r2b!)I.#*Q/Z:WX1PgW]!_uA0/f`S*(oSFVOU:M3:T",53MnMeN@K@S7Ph+Y#\kO^T`m_\*"j<"$V9f
+	a>;L4Dq,,?VA'O>cBW::0n=)#).)H0[tsq(p/C*;)):b'W6Rk8Vdjd``ru7`lc<\U,Xb26`,CL=[e-58Q_/4+I7f$e46&tgMoB%3=XAif3o>RB>`5-_j
+	4&$oBBg4&O<o08;8R[J3@4C:pOB0;)%k0TU+*1FRNHs`u!Idnd!(NZC5#)&-G0Ydkp^RC8B5GA9ialN=Db\9!^V$8$Id-&Tn;iE2^X;P@#6+-RZ#s4aG
+	]:Ba)Uaq"MD]+5;q+1%<K#o+'G5KtVOj9tg.:eURU_Eg9#>i5dN[CuU\('%R-N]f\:1SkVN5KIg*-I"<*^0CY9NJ#JH_rq4V;WP6WMO\G`H0E7jg6!"G
+	eHU4>g4@XP+q5?B[a<Ksm!U<V&n"gK]d<h5m?t134nWFqB*!]GqaAY(]^bC?+H]%7fgs[<5C.&i+7pbp-O@9Ye>lA*+(BJjUc=L*jY_2(S4(a*om]&P>
+	KTql!=R+"Y/_SY5,@j#N]1&ik&<>c'B[@^n)IV>H,-j<d$u#:PT'Q62laaaDmT@CVPIKl$bjV+ZKb9g1b6O9'Z5HrrBNfIpce0,FY6$H;dYs[YmL-Ju0
+	t36W5i+SkT)!9@=_+6e&G@_H0eH#$hb^PBlFITPi;GWV#F?q)BL:_a[bV^LCo<!Eg&!M_Q?O+n%e";2(;egFBs0<j5448AZ/1;Ep0uL*O1]<JAPD\Gb@
+	%mH%>3:D6Rhb9eih<cNl1:[JGLF4QnJWijX)h86E9$)>Bfk[1uSp,0+/sV0'-Sq$gf]5^SG.k5/]k2(5b9=OW>0A>ng2]N\#=t:D.ohQ(;eZB2IG.:TG
+	LdKe@M8pU;[;O(ZKNN>)`T0K2g;dr8KnK014`1JIFiCbV-@7fA7=811Ks'!-fiJnnfE`\ts9+2[)`P>9`'!:O[R9NBCh8IO)/@XK^-8D,;i$VL?g:-QJ
+	Fs2B)OWSg.:Rci/qkZ;.R(^Jl/-+f"KRK2SGqc,B"lOnE-Uf5O(/<Kp#Uc6J/OZhI@hNe!ZZLr>qP(mr33Qf`j9d^Wd?2>]r'RLQrouD`e2=>Wl`Hn%*
+	CSqdNQTub!"Q3%h74O1=_J8j*9+DPDJ"h*SDLhP'!E^(@JlE5XN04E*MS@@5M6_#8gp&*_d"->OJKonR+I`o-Lh9^=Sc?GjSr.agUZ%<&RK8P\ljHQn6
+	afLOheqR.=<Eq>G(=_ZLZlR9=3GM#Ku>'d/Wh@kE=.<9;$JTWZi,b8-?M06?C^`$_(TNn9<6Gu*`4HW_K2^m$h/<>5[]a"GY#L0djt!IK*C6a5Z-!?>t
+	JYn<K;iu0-"K9S=h]rN0d%+gt5dBCK(i^.3BtX,8<mAQ!c^iiq4+ceE6H;TE5[j/:o(^;"=_um?Se`DGP>9RVK*djZ$tl\g/I\SOiH^C"I+B^lh&Y\a-
+	`]0S*_Y]4LNbA%(@r72o6ro)IgOA/Tcd&)Pqh%A[sR[fEGGn85j)[T<r)ru3R.MuZ7i;u3RR,>GR;L?Gc#n6oMTGmGM>_^Ko"SXecmC);qu"p^O2GkD(
+	mG5`gdbmRK@*/HU**9N!N8Y9l,"D[;1)"B1J#KsuS\(aW*#:#B?XD`^Rb9kY*`"-9d$E0Fk@Z;JI)\-+8QYWR,b!m@q:o[XT!]Z.uHe:0+2luSF"ds5*
+	\A[CV=6Qpt(gV12*66(:]3;>`le^IUH.]Z5E#"0lNe:f(5!r=82Z'Q&^E6/I>BkT#7JJI7L8_T[45.?APZJ"V+f'H3]!`Jj?d-B&B->jV:'>Yq'/&Yuq
+	V:l_N6l6EE_Jc&&c$Zs2B#mnoQ'YZ/#Va^XdsZI8"Du@eQA<Nk#+nLm2jr?L`!.Y:Oh"uZ**DOe,&W2FSV@n,?N^62]BMPTDTrF?ldDgY%0q)&u6Q!$m
+	"b?It)KZ$*,OiP?34I3!5Dm(L:R>N>,-\A:#,X(JM`Pk*(g7ISq>YVV\B&1iIOQR$"YU?a4^,6)+Cd1[IgOA5]u)/Rn\(1F#[A)<KC<e)"OReobTlc/I
+	(LZQB]b*rdeAC03SthnspnY4M[t]2krV1F]l)\7N4=W0QeYFYBOQM8WCI7Y5c3^0HW:\e>%Ckl),!"s[noiSONZr+4]4DksC;S]?dtG9/t5gAg+k;kH8
+	Qo;@ZLo',2LIerhXT0E8Me&Qt<o^OT,55p>kl9%,a5<Qm$fTY#XpYB3XB:1l(lGooj-J@h4(SAn3Fj:1)A:>@hm;+u-o?M':2CH5(BCS>R8`Re:E[Y:@
+	e,X7kXZV$n3+[]*j>!"N5@4l^4`ji&Im<AHSX2M5r*\s_"+&rpE3$e4P$XX(<H-3=XL;p)Ioql=$Xj^B@n(?L\GbAi?.[P/A%5F2q&MBYoc;f!];4X0;
+	WCUgXhG(LS%tlH5_KhrA<4`tY\b:;bMU`GPha_`d:Y#kh%I^jB37i8PDrDORQT@a=1i/nUS=t1n80uB>B\)s!b]lhBV7&=5#tl0bVX-%FWG=*bS:.:cS
+	@F?,j,@P_$qXenE5h&NOq:b9gae_hj.mbq)4"Lesq?2UJ#/E3!:Su)JmjP*LTGrgD+]&+RHRsLZ,0<.tW4^IV-d?jI7j<Mh5#V>-=5Lg,kfT>^oHc&)a
+	T[@omg&Nf9RebD66&*A&)]0U6!GR8d)+gD*M*:'$_/D=0gr@/3*(A1DDH0Vpg,3'eT((kW&rj"">#"oI+qD`R5`OK;V;E04Um["Xp2%.BC%)c;Iq<f.5
+	q:%e13V);E=W2dh'9[g(<\'ZjX=n#aO?[>MuV;`-?234>'&"IGADg<!\+IK6@_7Bc4s*QkU\"(#!?lX8.U+]sjD/'(pACMFTrFD=12[6n%<-D?"cES*.
+	Cn(>PMWQt7Ff-?\)+mAUpn2.I3!l?HM:EMTaj"'hl2h@&N*a7gcqi!Cm6`!L*L_Y?1)o]2SZ;!3CZr]O&YUL+;N:H')l*%*Di)kV4*KtnoF\lZ7]OZ2S
+	FGi14Y7j&Vl2)Ua9D7UQcNdjpZ-O?,'$Q<ANXr"jXH_m$ucKoh,U5aGG!@Z%3/-U,JD4Z%p0t.+ld#acfpjtm1"1h33Ehf@>P<''0MqT"Z>YS-;$hj:k
+	9[D4*8n;#oG>kkQa6Pp35Jf)Z8EB6RX!46TC@>hHcX'AqOHoIX(DLc)ZJhIqlG^L[BlE_q+'^p]H0YTT/VZ'1DL^BA>WR!mIg49'`a.Vp\&9/l]CuX#$
+	$tMq(.jpL?'Zl'K1Q<;KUrIT>XaZ+<it2_2!PK4sdJ'3jnC*RkU%\0oWcj9G.)Yg>_K^26`Fb.^GU^0Oo]$qLcTV&]s8aSD7D.^Dl@3u>VPa!.2r+.5B
+	c\4W=;n0CB#_Mj`o#S0?7(A!78C-_VO$61Q&BqWDGWJ.Il&LJ@Ec>%?l)RV5NB;<KS8I9n)pW;LL'R^`A6q8i6^1AARSDL(u*6rA=B;\Tca&YrNe9?*(
+	YrCY+GQ@?0`J9D7E><sX64L@.A1aR2nci+Le^^B7K"JAL&.eNumTjXeHl_FV>?,08>)es%AoV\a5P;m(Q`G:8g/#baF5R(B,@N[m`NY8&Y0onMo8_']L
+	8jjG-'.B',+58!FhGMkEO%gZ,@S[aZ1?HN9b#kO;0B4"*,G2S*>$(>0,K$"Y?jI"cCq<$,c`lg[p^0I'_][=Wd]ISr*HC0^n5tQH3SleVs4`hq(bsRi6
+	PK(3e0G%Vs7pio1c66)QB"pE/h@ja9XUe^=%.fgD%`71d6,o<-(ALVd*R_R%%Dd.TjMA9*K'Qm=K%Hg2Q72c4GU-R=`![:lQfB_Ec7#pcJuT0>tI6ha0
+	F5nLMPY&>'FbO!:2EM(Le5;O8_651INa^6B;&8O+f/_4tu>n[>mknaYOAO5e]li*2<e44uIlM"?6p'''
 		exec(zlib.decompress(base64.a85decode(_SRC_B85)).decode("utf-8"), multiCMD.__dict__)
 	try:
 		import xxhash  # type: ignore
@@ -294,9 +298,9 @@ finally:
 	if _IMPORT_MASK is not None and _signal.SIGINT not in _IMPORT_MASK:
 		_signal.pthread_sigmask(_signal.SIG_UNBLOCK, (_signal.SIGINT,))
 
-version = '9.93'
+version = '9.94'
 __version__ = version
-COMMIT_DATE = '2026-11-13'
+COMMIT_DATE = '2026-11-15'
 
 MAGIC_NUMBER = 1.61803398875
 RANDOM_DESTINATION_SELECTION = False
@@ -306,6 +310,7 @@ FILES_RATE_LIMIT = 0
 
 COMMAND_TIMEOUT = 0
 NO_CREATE_DIR = False
+NO_DIRECTORY_SYNC = False  # -nds: no directory sync says an -ncd refusal's 213 line, so a file's note does (_door_step)
 CONTENT_ONLY = False
 WRITE_BESIDE = False  # -wb: every rewrite goes beside the old file, renamed over it once whole (_cp_beside)
 READ_FIRST = False  # -rbw: the source is read to its end before a rewrite in place (_read_through)
@@ -876,24 +881,53 @@ def get_fs_type_from_path(path):
 		path (str): The path to check.
 
 	Returns:
-		str: The filesystem type of the path.
+		str: The filesystem type of the path (its nearest existing parent's where it does not exist), '' where it cannot be
+		read (_fs_type says why).
 	"""
+	return _fs_type(path)[0]
+
+def _fs_type(path):
+	"""(the filesystem type of path, or of its nearest existing parent where it does not exist yet, None), or ('', why) where
+	it cannot be read. Linux and the BSDs: df -PT's second column; macOS: statfs's f_fstypename (its df takes -T as a list of
+	types to show, and printed nothing: apfs, msdos, exfat, nfs, smbfs ...); Windows: fsutil."""
 	try:
 		if not os.path.exists(path):
 			path = get_last_existing_parent(path)
+			if not path:
+				return '', 'no part of its path exists'
 		if os.name == 'nt':
-			# Windows
 			drive, _ = os.path.splitdrive(os.path.abspath(path))
-			fs_type = run_command_in_multicmd_with_path_check(["fsutil", "fsinfo", "volumeinfo", drive],quiet=True)
-			for line in fs_type:
+			for line in run_command_in_multicmd_with_path_check(["fsutil", "fsinfo", "volumeinfo", drive], quiet=True):
 				if 'File System Name' in line:
-					return line.partition(':')[-1].strip()
-			return ''
-		else:
-			fs_type = run_command_in_multicmd_with_path_check(["df", "-PT", path],quiet=True,extra_env=_C_LOCALE)[-1].split()[1]
-		return fs_type
-	except Exception:
-		return ''
+					return line.partition(':')[-1].strip(), None
+			return '', 'fsutil named no file system'
+		if sys.platform == 'darwin':
+			return _statfs_type(path), None
+		lines = run_command_in_multicmd_with_path_check(["df", "-PT", path], quiet=True, extra_env=_C_LOCALE)
+		fields = lines[-1].split() if lines else []
+		if len(fields) < 2:
+			return '', 'df -PT printed no type'
+		return fields[1], None
+	except Exception as e:
+		return '', _why(e) or type(e).__name__
+
+def _statfs_type(path):
+	"""macOS: the f_fstypename of statfs(path). The struct is the 64-bit-inode one (statfs$INODE64 on x86_64, statfs on arm64,
+	where it is the only one): f_fstypename is 16 bytes at offset 72 (sys/mount.h: uint32 bsize, int32 iosize, five uint64
+	counts, fsid_t, uid_t owner, uint32 type, flags and fssubtype), in a struct of 2,168 bytes."""
+	import ctypes
+	buffer = ctypes.create_string_buffer(4096)
+	for name in ('statfs$INODE64', 'statfs'):
+		try:
+			function = _libc_fn(name, [ctypes.c_char_p, ctypes.c_void_p], ctypes.c_int)
+			break
+		except OSError:
+			continue
+	else:
+		raise OSError(errno.ENOTSUP, 'statfs is not available here')
+	if function(os.fsencode(path), buffer) != 0:
+		raise _libc_error()
+	return buffer.raw[72:88].split(b'\0', 1)[0].decode('ascii', 'replace')
 
 def expand_paths(paths):
 	"""
@@ -960,10 +994,14 @@ _WATCH_GRACE = 4
 # loop acts on it within 1 s (_check_stop): raised anywhere in there, its KeyboardInterrupt could leave a lock of Python's
 # pool code held (concurrent.futures.wait's), and the pool's shutdown would wait on it for good.
 _DEFER = 0
+# True while the parent runs clean_up(): a stop there, the first too, is only recorded, and the run ends by it once the
+# cleanup has finished (main's _end_now; a -dd partition's nested hpcp() acts on it when it returns, _check_stop). Not a pool
+# region: the cleanup runs its commands in the parent.
+_CLEANING = False
 # The parent has acted on its stop (_check_stop raised for it, or hpcp() took its KeyboardInterrupt). Not set where _stop
 # raises: Python drops a KeyboardInterrupt raised in a weakref callback or a __del__, and the next check acts on it then.
 _STOP_ACTED = False
-# The parent has said once that a later stop is ignored while it cleans up (_stop).
+# The parent has said once that it is cleaning up first, on the first stop that lands in the cleanup or a later one (_say_stopping).
 _STOP_NOTED = False
 # A pool, or _looked_at's threads, was left with something of it still running or stuck: main() ends by os._exit, not by the
 # interpreter's exit, which joins Python's pool threads.
@@ -1001,15 +1039,26 @@ def _end_by(signum):
 	# A default action that does not end the process (none of ours): end anyway.
 	os._exit(128 + signum)
 
+def _say_stopping():
+	"""The parent's one line, once, for a stop it does not act on at once (the cleanup finishes first). One write, never
+	print: a handler printing while the main thread prints raises 'reentrant call'."""
+	global _STOP_NOTED
+	if os.getpid() == _MAIN_PID and not _STOP_NOTED:
+		_STOP_NOTED = True
+		_say('Stopping: cleaning up first (cp stopped, temporary files removed, images unmounted); Ctrl-\\ ends hpcp now, '
+			'which may leave them')
+
 def _stop(signum, frame):
 	"""The handler for every stop a process can catch: the first raises KeyboardInterrupt, so multiCMD stops cp (in a process
 	group of its own, which no group signal reaches) and every finally runs (a temporary file is discarded, mounts are
 	cleaned up); later ones return, so a second Ctrl-C cannot cut the cleanup halfway (the parent says so once, naming
 	Ctrl-\\). The stop is passed on to this process's pool workers, which a signal to this process alone (kill PID, timeout)
 	never reaches. A pool worker between tasks has nothing to clean up and ends at once. In the parent inside a pool region
-	(_DEFER) the first stop is only recorded: the region's loop raises it (_check_stop). A file hpcp makes is held by C before
-	this can run (_create), so a stop that raises there leaves nothing the caller's cleanup cannot find."""
-	global _STOPPED, _STOPPED_PID, _STOP_NOTED
+	(_DEFER) the first stop is only recorded: the region's loop raises it (_check_stop); in the cleanup (_CLEANING) too, and the
+	run ends by it once the cleanup is done (a -dd partition's nested run: when it returns, _check_stop), after one line saying
+	so (_say_stopping). A file hpcp makes is held by C before this can run (_create), so a stop that raises there leaves
+	nothing the caller's cleanup cannot find."""
+	global _STOPPED, _STOPPED_PID
 	if _ENDING:
 		return
 	if not _IN_TASK and os.getpid() != _MAIN_PID:
@@ -1040,15 +1089,13 @@ def _stop(signum, frame):
 			_end_by(_STOPPED)
 		raise SystemExit(128 + signum)
 	if _STOPPED_PID == os.getpid():
-		if os.getpid() == _MAIN_PID and not _STOP_NOTED:
-			# One write, never print: a handler printing while the main thread prints raises 'reentrant call'.
-			_STOP_NOTED = True
-			_say('Stopping: cleaning up first (cp stopped, temporary files removed, images unmounted); Ctrl-\\ ends hpcp now, '
-				'which may leave them')
+		_say_stopping()
 		return
 	_STOPPED, _STOPPED_PID = signum, os.getpid()
 	_pass_stop_on(signum)
-	if _DEFER and os.getpid() == _MAIN_PID:
+	if (_DEFER or _CLEANING) and os.getpid() == _MAIN_PID:
+		if _CLEANING:
+			_say_stopping()  # the cleanup may take minutes (an e2fsck): nothing else tells the operator it is being waited for
 		return
 	if _DROPPING and _in_dropping_call(frame):
 		# Python would drop the raise, and 3.6 and 3.7 print it as 'Exception ignored' with its traceback. Recorded, it is acted
@@ -1286,7 +1333,7 @@ RUN_ID = None
 # never follows a swap of it for a link to another directory. One the run makes later is pinned by each process's open. The
 # parent keeps each pin's descriptor open for the run (_named_ids), so a mount below a destination cannot expire meanwhile.
 NAMED_IDS = {}
-_TASK_SETTINGS = ('NAMED_DESTS', 'RUN_ID', 'NAMED_IDS', 'CONTENT_ONLY', 'WRITE_BESIDE', 'READ_FIRST', 'NO_CREATE_DIR', 'SYNC_COPIES', 'RANDOM_DESTINATION_SELECTION', 'HASH_SIZE', 'COMMAND_TIMEOUT',
+_TASK_SETTINGS = ('NAMED_DESTS', 'RUN_ID', 'NAMED_IDS', 'CONTENT_ONLY', 'WRITE_BESIDE', 'READ_FIRST', 'NO_CREATE_DIR', 'NO_DIRECTORY_SYNC', 'SYNC_COPIES', 'RANDOM_DESTINATION_SELECTION', 'HASH_SIZE', 'COMMAND_TIMEOUT',
 	'BYTES_RATE_LIMIT', 'FILES_RATE_LIMIT', 'MIRROR_FS_PARAMS', 'REMOVE_FILES_WHILE_LISTING', '_BAR')
 
 def _submit_task(executor, func, *args, **kwargs):
@@ -1490,6 +1537,8 @@ class _pool:
 					space = _SPACE_WARNED[2] if self.space and _SPACE_WARNED is not None else None
 					kwargs = {'initializer': _pool_worker_start, 'initargs': (handed, space, self.rate)}
 				self.executor = ProcessPoolExecutor(max_workers=self.max_workers, **kwargs)
+				if (3, 9) <= sys.version_info < (3, 12):
+					self.executor._processes = _Workers()  # before the first submit, which hands it to the manager thread
 			finally:
 				_restore_stops(mask)
 		except BaseException:
@@ -1610,6 +1659,15 @@ class _pool:
 						'Ctrl-\\ ends hpcp now, which may leave a temporary file or a torn file there')
 			if alive:
 				multiprocessing.connection.wait([child.sentinel for child in alive], timeout=1)
+
+class _Workers(dict):
+	"""A pool's {pid: worker process} (ProcessPoolExecutor._processes) on Python 3.9 to 3.11, whose values() is a copy. From
+	3.9 a forkserver or spawn pool starts its workers as work comes, in submit, under the lock that the manager thread does not
+	take on a worker's death before 3.12 (terminate_broken): its walk over the workers met one being added, and its thread's
+	`RuntimeError: dictionary changed size during iteration` traceback was printed after an early Ctrl-C (EL7, Python 3.11,
+	spawn: 8 of 12 batches of the early-stop test). A copy is taken in C, which no other thread can cut."""
+	def values(self):
+		return list(dict.values(self))
 
 _QUIETED_36 = []
 
@@ -4438,60 +4496,91 @@ def _write_clears(mode):
 		return mode & (stat.S_ISUID | stat.S_ISGID)
 	return mode & stat.S_ISUID
 
-def _carry_over(st, temp, carried, held=None):
+def _carry_over(st, temp, carried, held=None, base=None, kind=stat.S_IFREG):
 	"""Give temp, the new file of a -co rewrite, exactly what the old file (st, carried: _co_carry) had: its carried xattrs
 	(each set, and any such name temp gained, as an ACL inherited from a default ACL, removed), owner and group, and mode, less
 	the set-ID bits a write clears (_write_clears) when the runner is not root, as a write in place leaves them. A label the
-	filesystem gives itself (setting security.selinux fails with EOPNOTSUPP: vfat, a context= mount) is skipped. Anything else that fails raises. On Linux each step reaches what cp
-	made through an O_PATH descriptor of it (never opened: a node made of a device is not acted on): a link or another file
-	put at its name since (a user who can write the directory) is refused, so no chown or chmod goes through a link. held: the
-	descriptor hpcp made temp by (_cp_beside), which every step goes through instead."""
-	fd = os.open(temp, os.O_PATH | os.O_NOFOLLOW | getattr(os, 'O_CLOEXEC', 0)) if _PATH_FDS and held is None else None
+	filesystem gives itself (setting security.selinux fails with EOPNOTSUPP: vfat, a context= mount) is skipped. Anything else
+	that fails raises. kind: the file type cp made (the source's: a FIFO or device node source is made anew by cp -a).
+	Every step goes through a descriptor, never temp's name: held, the one hpcp made temp by (_cp_beside); else one opened at
+	temp's name without following a link (on Linux with /proc an O_PATH one, reached by its /proc/self/fd name and never
+	opened for data, so a node made of a device is not acted on; elsewhere a regular file or a FIFO opened for reading). A
+	device node or a socket there (no /proc: an open of one acts on the device, or fails) is reached by its name in base, as
+	an identical node is (_settle_identical): chown and the xattr calls never follow a link put at it, chmod where the
+	platform can say so (not Linux). What is there must be a file of kind with one name, owned by the runner or already by
+	the old file's owner: a link, another type or another user's file put at the name since cp made it (a user who can write
+	the directory) is refused, so no chown, chmod or xattr reaches the file a link leads to, and a root run gives no other
+	user's file this one's owner and mode. base: the door's result for temp's directory (_cp_beside), which temp's name is
+	opened in; None: temp, a path."""
+	name = os.path.basename(temp)
+	at, at_how = (_at(base, name), _fd_of(base)) if base is not None else ((temp,), {})
+	fd = None
+	if held is None and (_PATH_FDS or kind in (stat.S_IFREG, stat.S_IFIFO)):
+		try:
+			fd = os.open(*at, _CARRY_PATH_FLAGS if _PATH_FDS else _CARRY_READ_FLAGS, **at_how)
+		except OSError as e:
+			if e.errno in (errno.ELOOP, errno.EMLINK):  # a link at the name: O_NOFOLLOW (EMLINK: FreeBSD's word for it)
+				raise OSError(errno.EEXIST, 'it was replaced since cp made it', temp) from None
+			raise
 	try:
-		if fd is not None:
-			now = os.fstat(fd)
-			if stat.S_ISLNK(now.st_mode) or now.st_nlink != 1:
+		if held is not None:
+			xpath = cpath = mpath = held
+			xhow, chow, mhow = {}, {}, {}
+		else:
+			now = os.fstat(fd) if fd is not None else os.lstat(*at, **at_how)
+			if stat.S_IFMT(now.st_mode) != kind or now.st_nlink != 1 or now.st_uid not in (os.geteuid(), st.st_uid):
 				raise OSError(errno.EEXIST, 'it was replaced since cp made it', temp)
-			temp = '/proc/self/fd/%d' % fd  # leads to the descriptor's file, and no further
-		elif held is not None:
-			temp = held
-		how = {} if fd is not None or held is not None else {'follow_symlinks': False}
+			if fd is not None:
+				xpath = cpath = mpath = '/proc/self/fd/%d' % fd if _PATH_FDS else fd  # the first leads to the descriptor's file, and no further
+				xhow, chow, mhow = {}, {}, {}
+			else:
+				xpath, xhow = _io(base, name, temp) if base is not None else temp, {'follow_symlinks': False}
+				cpath, chow = at[0], dict(at_how, follow_symlinks=False)
+				mpath, mhow = at[0], dict(at_how, **({'follow_symlinks': False} if os.chmod in os.supports_follow_symlinks else {}))
 		if hasattr(os, 'listxattr'):
 			try:
-				gained = os.listxattr(temp, **how)
+				gained = os.listxattr(xpath, **xhow)
 			except OSError as e:
 				if e.errno not in (errno.ENOTSUP, errno.EOPNOTSUPP):
 					raise
 				gained = []
-			for name in gained:
-				if name not in carried and (name.startswith('user.') or name in _CO_CARRIED[:2]):
-					os.removexattr(temp, name, **how)
-			for name, value in carried.items():
+			for xname in gained:
+				if xname not in carried and (xname.startswith('user.') or xname in _CO_CARRIED[:2]):
+					os.removexattr(xpath, xname, **xhow)
+			for xname, value in carried.items():
 				try:
-					os.setxattr(temp, name, value, **how)
+					os.setxattr(xpath, xname, value, **xhow)
 				except OSError as e:
-					if not (name == 'security.selinux' and e.errno in (errno.ENOTSUP, errno.EOPNOTSUPP)):
+					if not (xname == 'security.selinux' and e.errno in (errno.ENOTSUP, errno.EOPNOTSUPP)):
 						raise
-		os.chown(temp, st.st_uid, st.st_gid)
+		os.chown(cpath, st.st_uid, st.st_gid, **chow)
 		mode = stat.S_IMODE(st.st_mode)
 		if os.geteuid() != 0:
 			mode &= ~_write_clears(mode)
-		os.chmod(temp, mode)
+		os.chmod(mpath, mode, **mhow)
 	finally:
 		if fd is not None:
 			os.close(fd)
 
 # Linux: a file reached through an O_PATH descriptor's /proc/self/fd/N name, never through a link at its own name.
 _PATH_FDS = hasattr(os, 'O_PATH') and os.path.isdir('/proc/self/fd')
+# How _carry_over opens a new file that cp made by name, never following a link at it: O_PATH on Linux with /proc (it acts on
+# nothing it opens); elsewhere (Linux without /proc, macOS, the BSDs) for reading, which fchown, fchmod and the xattr calls
+# take, O_NONBLOCK so a FIFO put there is not waited on, O_NOCTTY so a terminal is not taken.
+_CARRY_PATH_FLAGS = getattr(os, 'O_PATH', 0) | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_CLOEXEC', 0)
+_CARRY_READ_FLAGS = (os.O_RDONLY | getattr(os, 'O_NONBLOCK', 0) | getattr(os, 'O_NOCTTY', 0) | getattr(os, 'O_NOFOLLOW', 0)
+	| getattr(os, 'O_CLOEXEC', 0))
 
 class _Refused(Exception):
 	"""A landing this run will not write, for each file it would hold: a 'Destination clash' (213) naming what is there and
 	the fix. text(file) is the message for one file. said: this process has printed it (a pinned destination that leads
 	elsewhere, _dest_directory): recorded for each file, printed once (_say_refused). note: what a process says once where
-	another destination takes the file (_copy_file), or None where nothing is said then."""
-	def __init__(self, before, after, said=False, note=None):
+	another destination takes the file (_copy_file), or None where nothing is said then. key: what the note is said once a
+	process for (_NOTED), where the door keeps no record of the refusal to mark it said (-ncd's, by directory); None: said
+	marks it."""
+	def __init__(self, before, after, said=False, note=None, key=None):
 		super().__init__(before + '...' + after)
-		self.before, self.after, self.said, self.note = before, after, said, note
+		self.before, self.after, self.said, self.note, self.key = before, after, said, note, key
 	def text(self, path):
 		return f'Destination clash: {self.before}{path}{self.after}'
 
@@ -4503,7 +4592,10 @@ def _pin_refused(root):
 			'the other destinations take its files. Run hpcp again to write where it leads now')
 
 def _say_refused(refusal, what):
-	"""refusal's 213 line for what (eprint), or only its record where this process printed it already (refusal.said)."""
+	"""refusal's 213 line for what (eprint), or only its record where this process printed it already (refusal.said). A
+	refusal with a key is said for this process: no file's note repeats it (_NOTED)."""
+	if refusal.key is not None:
+		_NOTED.add(refusal.key)
 	if refusal.said:
 		ERRORS.append(refusal.text(what))
 	else:
@@ -4535,6 +4627,9 @@ _O_NOFOLLOW = getattr(os, 'O_NOFOLLOW', 0)
 # below the same named destination may close it, and a number reused then would lead a stale holder's write elsewhere, so
 # a caller that holds an answer across another door call keeps a dup of it (_kept) and closes that.
 _CURSORS = {}
+# The keys of the refusals this process has said (_Refused.key): a directory sync's 213 line, or a file's note (_copy_file).
+# Cleared with the cursors.
+_NOTED = set()
 # [the run whose cursors these are (RUN_ID), this process's budget for them (_hold_budget, taken at the run's start: a forked
 # worker inherits it with the limit it was taken from)]
 _CURSORS_RUN = [None, None]
@@ -4561,6 +4656,7 @@ def _hold_budget():
 def _close_cursors():
 	"""Close every descriptor the door holds in this process, and forget what it walked by path (a new run, the run's end)."""
 	_BY_PATH.clear()
+	_NOTED.clear()
 	while _CURSORS:
 		held = _CURSORS.popitem()[1]
 		if isinstance(held, _HeldDirs):
@@ -4759,8 +4855,12 @@ def _door_step(base, name, current, make, source, below, first=None):
 			above = above and os.path.dirname(above.rstrip(os.sep))
 		named_form = f'name it with -d {_shell_word(current + os.sep)} to write through it' if link is not None else f'remove {current}'
 		if NO_CREATE_DIR:
-			raise _Refused(f'{current} is a {kind}' + (f' to {link}' if link is not None else '') +
-				' and -ncd makes no directory in its place: not copying ', f' below it; {named_form}')
+			what = f'{current} is a {kind}' + (f' to {link}' if link is not None else '') + ' and -ncd makes no directory in its place'
+			# A directory sync says this refusal as its 213 line; under -nds none runs, so a file's note does, once a process for
+			# each directory (the key), and a run without -nds says nothing here (9.93's silence where another destination takes
+			# the file, and no directory sync reached its directory: a list run).
+			raise _Refused(f'{what}: not copying ', f' below it; {named_form}', key=('-ncd', current) if NO_DIRECTORY_SYNC else None,
+				note=f'{what}; nothing is written below it ({named_form})' if NO_DIRECTORY_SYNC else None)
 		try:
 			os.unlink(*_at(base, name), **how)
 		except (FileNotFoundError, IsADirectoryError):
@@ -5447,8 +5547,8 @@ def _cp_beside(command, src_path, target, st, why, space, src_st=None, base=None
 			attributes = None
 			if carried is not None:
 				what = 'its owner, group or an xattr cannot be given to the new copy (%s)'
-				_carry_over(st, _io(base, tname, temp), carried, fd)
-				attributes = _fat_attributes(_io(base, name, target))
+				_carry_over(st, temp, carried, fd, base, stat.S_IFMT((src_st or os.lstat(src_path)).st_mode))
+				attributes = _fat_attributes(*_at(base, name), **_fd_of(base))
 			elif not CONTENT_ONLY:
 				_remove_stale_xattrs(src_path, _io(base, tname, temp) if fd is None else fd)
 			# Renamed unsynced, a power cut could leave nothing where the old copy was.
@@ -5476,8 +5576,10 @@ def _cp_beside(command, src_path, target, st, why, space, src_st=None, base=None
 				raise _Refused(f'cannot replace the {_kind_of(st)} {target} ({parent}: {_why(_shown(e, parent, base))}): not writing ',
 					f' into it; make {parent} writable, or remove {target}')
 			raise _KeptOld(f'{why}; {what % _why(_shown(e, os.path.dirname(target), base))}{_in_place_hint(target, st, src_path, base)}')
-		if attributes is not None and attributes != _fat_attributes(_io(base, name, target)):
-			_set_fat_attributes(_io(base, name, target), attributes, target)
+		# Relative to the directory the door holds, as the rename: by its path (Linux without /proc), a directory on the way
+		# swapped for a link led them elsewhere (9.93).
+		if attributes is not None and attributes != _fat_attributes(*_at(base, name), **_fd_of(base)):
+			_set_fat_attributes(*_at(base, name), attributes, target, **_fd_of(base))
 		return get_file_size(*_at(base, name), **_fd_of(base))
 	finally:
 		if fd is not None:
@@ -5782,8 +5884,9 @@ def _settle_identical(src_path, src_st, dest, look, base=None):
 	On Linux an O_PATH descriptor, reached by its /proc/self/fd name (as _carry_over); elsewhere a regular file opened for
 	reading without following a link (the check just read it), and a node by its name in base, its owner, times and (where
 	chmod can be told so) mode set relative to base without following a link put at it, its xattrs (Linux without /proc; none
-	on macOS) and BSD flags (macOS) by name (no dir_fd form). base: the door's result for dest's directory (None: its path), which the
-	landing is opened in."""
+	on macOS) and BSD flags (macOS) by name (no dir_fd form). A FIFO is never opened for reading: that lets in a writer blocked
+	on it, and what it writes is lost (on macOS even an O_EVTONLY open does, 9.94 final review). base: the door's result for
+	dest's directory (None: its path), which the landing is opened in."""
 	base = os.path.dirname(dest) if base is None else base
 	leaf = os.path.basename(dest)
 	fd = None
@@ -5977,10 +6080,12 @@ def _copy_file(src_path, dest_paths, full_hash, verbose, concurrent_processes, b
 			# once a process, as a note (9.89 said nothing), where no directory sync reached its directory first: the door's
 			# first answer is the one that is not said yet, the later ones are (_dest_directory), as is one this process printed
 			# already. A directory source's pin refusal is its directory sync's own 213 line (said, so no file prints the Note;
-			# 9.89 does the same), and a link's is its own (_say_refused). Any other refusal here was said by the directory sync
-			# too, except under -nds, which has none: an -ncd refusal there is said by nothing, as in 9.89 (docs/limitations.md,
-			# deferred to 9.93).
-			if refusal.note is not None and not refusal.said:
+			# 9.89 does the same), and a link's is its own (_say_refused). An -ncd refusal has a note only under -nds,
+			# which has no directory sync to say it: once a process for each directory (its key, _NOTED), where 9.89 to 9.93 said
+			# nothing. Any other refusal here was said by the directory sync too.
+			if refusal.note is not None and not refusal.said and refusal.key not in _NOTED:
+				if refusal.key is not None:
+					_NOTED.add(refusal.key)
 				print('Note: ' + refusal.note)
 	looks = {dest: _look(dest, bases, landings[dest]) for dest in dest_paths}
 	if not src_is_link:
@@ -8840,14 +8945,14 @@ _FAT_IOCTL_GET_ATTRIBUTES, _FAT_IOCTL_SET_ATTRIBUTES = _fat_ioctl_numbers()
 # Read-only, hidden, system and archive: the attribute bits a regular file carries.
 _FAT_FILE_ATTRIBUTES = 0x27
 
-def _fat_attributes(path):
+def _fat_attributes(path, dir_fd=None):
 	"""The FAT attribute bits of an existing file on vfat / msdos, else None (missing file, not a regular
-	file, another filesystem, or a platform without fcntl)."""
+	file, another filesystem, or a platform without fcntl). dir_fd: path is a name in that directory (the door's, _at)."""
 	try:
 		import fcntl
-		if not stat.S_ISREG(os.lstat(path).st_mode):
+		if not stat.S_ISREG(os.lstat(path, dir_fd=dir_fd).st_mode):
 			return None
-		fd = os.open(path, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NONBLOCK', 0))
+		fd = os.open(path, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NONBLOCK', 0), dir_fd=dir_fd)
 	except (ImportError, OSError):
 		return None
 	try:
@@ -8857,13 +8962,13 @@ def _fat_attributes(path):
 	finally:
 		os.close(fd)
 
-def _set_fat_attributes(path, attributes, key):
-	"""Set path's FAT attribute bits; a failure is a warning, never an error."""
+def _set_fat_attributes(path, attributes, key, dir_fd=None):
+	"""Set path's FAT attribute bits; a failure is a warning, never an error. dir_fd: as _fat_attributes."""
 	try:
 		import fcntl
-		if not stat.S_ISREG(os.lstat(path).st_mode):
+		if not stat.S_ISREG(os.lstat(path, dir_fd=dir_fd).st_mode):
 			return
-		fd = os.open(path, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NONBLOCK', 0))
+		fd = os.open(path, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NONBLOCK', 0), dir_fd=dir_fd)
 		try:
 			fcntl.ioctl(fd, _FAT_IOCTL_SET_ATTRIBUTES, struct.pack('I', attributes))
 		finally:
@@ -15154,8 +15259,8 @@ def detach_loop_device(loop_device, retries=5, delay=0.5):
 def _cleanup_step(what, message=None):
 	"""One step of clean_up, with the line it prints first. What the step raises is said on stderr and the steps after it still
 	run: once stdout's reader has quit (`hpcp -dd src dst | head`), a print or a shown command's call raises, and 9.89 to 9.91
-	left the loop devices attached. The line has nowhere to go then and is dropped, not the step. A stop (KeyboardInterrupt)
-	is not caught: it ends the cleanup, as before 9.92 (docs/limitations.md)."""
+	left the loop devices attached. The line has nowhere to go then and is dropped, not the step. A stop does not reach it:
+	clean_up only records one (_CLEANING)."""
 	if message:
 		_print_or_drop(message)
 	try:
@@ -15167,6 +15272,17 @@ def _cleanup_step(what, message=None):
 			pass
 
 def clean_up(mount_points: list,loop_devices: list, delayed_commands: list = None):
+	"""Unmount mount_points, run delayed_commands, detach loop_devices: every step, each its own try (_cleanup_step). A stop
+	in here, the first one too, is recorded and taken as a later stop is (_stop): the cleanup finishes, and then the run ends
+	as the signal asked (main's _end_now; a nested run's caller, _check_stop)."""
+	global _CLEANING
+	outer, _CLEANING = _CLEANING, True
+	try:
+		_clean_up(mount_points, loop_devices, delayed_commands)
+	finally:
+		_CLEANING = outer
+
+def _clean_up(mount_points, loop_devices, delayed_commands):
 	# clean up loop devices and mount points if we are using a image
 	# Every command runs quiet: a shown command's output stops it, and its call raises, once stdout's reader has quit (multiCMD
 	# 1.61 to 1.63 at its first line, 1.64 when it prints for over a second). Its failure is still said, on stderr, and what one
@@ -15257,7 +15373,7 @@ def get_args(args = None):
 	parser.add_argument('-nfp','--no_fs_param_mirror', action='store_true', help='Do not mirror source filesystem parameters (geometry, features) in -dd mode. Create destination filesystems with mkfs defaults, preserving only label and UUID.')
 	parser.add_argument('-L','-rl','--rate_limit', type=str, default=None, help='Approximate a rate limit the copy speed in bytes/second. Example: 10M for 10 MB/s, 1Gi for 1 GiB/s. Default is 0: no rate limit.')
 	parser.add_argument('-F','-frl','--file_rate_limit', type=str, default=None, help='Approximate a rate limit the copy speed in files/second. Example: 10K for 10000 files/s, 1Ki for 1024 files/s. Default is 0: no rate limit.')
-	parser.add_argument('-tfs','--target_file_system', type=str, default=None, help='Specify the target file system type. Will abort if the target file system type does not match. Example: ext4, xfs, f2fs, ntfs, fat32, exfat. Default is None: do not check target file system type.')
+	parser.add_argument('-tfs','--target_file_system', type=str, default=None, help='Specify the target file system type, as df -T names it (macOS: as statfs does, such as apfs or msdos). A destination of another type, or whose type cannot be read, is left out (exit 227), and the run stops when none is left. Example: ext4, xfs, f2fs, vfat, exfat. Default is None: do not check target file system type.')
 	parser.add_argument('-ncd','--no_create_dir', action='store_true', help='Ignore any destination folder that does not already exist. ( Will still copy if dest is a file )')
 	parser.add_argument('-co','--content_only', action='store_true', help='Content-only copy: do not sync mode, owner, or timestamps on files or directories. A destination file with other hard links is replaced, not written through. A FIFO, socket or device node is made as cp -a makes it, never read. Still create missing destination directories using filesystem-default permissions (so parent ACL/setgid/setuid inherit).')
 	parser.add_argument('-wb', '--write_beside', '--write-beside', action='store_true', help='Write every rewrite to a new file beside the old one, write it to disk and rename it over the old one once whole: a source that fails, a full disk or a stop leave the old copy as it was. The file gets a new inode (a per-file Lustre or GPFS layout, chattr flags and a project id are not kept; NFS readers holding it open may get ESTALE). Needs a new name in the file\'s directory and room for a second copy: without either the old copy stays (exit 190). By default a rewrite is written in place, and only a file with other names, one that cannot be opened for writing, or a FIFO, device or link goes beside.')
@@ -15316,12 +15432,14 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = None,
 	global FILES_RATE_LIMIT
 	global COMMAND_TIMEOUT
 	global NO_CREATE_DIR
+	global NO_DIRECTORY_SYNC
 	global CONTENT_ONLY
 	global WRITE_BESIDE
 	global READ_FIRST
 	global MIRROR_FS_PARAMS
 	global REMOVE_FILES_WHILE_LISTING
 	NO_CREATE_DIR = no_create_dir
+	NO_DIRECTORY_SYNC = no_directory_sync
 	CONTENT_ONLY = content_only
 	WRITE_BESIDE = write_beside
 	READ_FIRST = read_before_write
@@ -15514,6 +15632,10 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = None,
 						exit_not_enough_space = exit_not_enough_space, write_beside = write_beside, read_before_write = read_before_write)
 				finally:
 					ERRORS[:0] = outer_errors
+				# A stop that landed in the nested run's cleanup was only recorded (_CLEANING) and the run returned 0: act on it
+				# here, before the next partition's mounts, or a partition that cannot be mounted is copied whole (9.93 raised
+				# out of the nested cleanup at once).
+				_check_stop()
 				if copy_rc:
 					raise RuntimeError(f"Partition copy error: Copying partition {partition} failed with return code {copy_rc}.")
 			# sort the output partitions
@@ -15600,19 +15722,32 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = None,
 		for dest in dests:
 			try:
 				if dest and dest != ... :
+					if target_file_system:
+						# Asked before a missing destination is made: of its nearest existing parent, where it would be made.
+						destfs, why = _fs_type(dest)
+						if not destfs:
+							eprint(f"Destination fs type mismatch: Expected {target_file_system}, but the type of {dest} cannot be read ({why}), ignoring {dest}.")
+							dests_to_remove.append(dest)
+							continue
+						if destfs.lower() != target_file_system.lower():
+							eprint(f"Destination fs type mismatch: Expected {target_file_system}, got {destfs}, ignoring {dest}.")
+							dests_to_remove.append(dest)
+							continue
 					if dest.endswith(os.path.sep) and (not (os.path.exists(dest) or os.path.ismount(dest))):
 						if no_create_dir:
 							eprint(f"Destination path does not exist: {dest} does not exist, skipping as --no_create_dir is specified, ignoring {dest}.")
 							dests_to_remove.append(dest)
 						else:
 							_makedirs(dest, exist_ok=True)
-					elif target_file_system:
-						destfs = get_fs_type_from_path(dest)
-						if destfs and destfs.lower() != target_file_system.lower():
-							eprint(f"Destination fs type mismatch: Expected {target_file_system}, got {destfs}, ignoring {dest}.")
-							dests_to_remove.append(dest)
-			except FileExistsError :
-				eprint(f"Destination path {dest} may be a mounted dir, known issue with os.path.exists\nContinuing without creating dest folder...")
+			except FileExistsError:
+				# Something is at the name that isdir did not take for a directory: a file, a FIFO or a link to no directory is
+				# left to the copy, which names it; the hint is for a name that cannot be looked at (a dead mount).
+				try:
+					there = os.lstat(dest.rstrip(os.sep) or dest)
+				except OSError:
+					there = None
+				if there is None or stat.S_ISDIR(there.st_mode):
+					eprint(f"Destination path {dest} may be a mounted dir, known issue with os.path.exists\nContinuing without creating dest folder...")
 			except OSError as e:
 				# A destination that cannot be made (no permission, a read-only or full filesystem, a file in its path, a name the
 				# filesystem refuses such as 'x.' on exFAT mounted iocharset=cp1251): that destination is out, and the rest go on.
