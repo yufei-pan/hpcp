@@ -310,6 +310,7 @@ FILES_RATE_LIMIT = 0
 
 COMMAND_TIMEOUT = 0
 NO_CREATE_DIR = False
+NO_DIRECTORY_SYNC = False  # -nds: no directory sync says an -ncd refusal's 213 line, so a file's note does (_door_step)
 CONTENT_ONLY = False
 WRITE_BESIDE = False  # -wb: every rewrite goes beside the old file, renamed over it once whole (_cp_beside)
 READ_FIRST = False  # -rbw: the source is read to its end before a rewrite in place (_read_through)
@@ -1323,7 +1324,7 @@ RUN_ID = None
 # never follows a swap of it for a link to another directory. One the run makes later is pinned by each process's open. The
 # parent keeps each pin's descriptor open for the run (_named_ids), so a mount below a destination cannot expire meanwhile.
 NAMED_IDS = {}
-_TASK_SETTINGS = ('NAMED_DESTS', 'RUN_ID', 'NAMED_IDS', 'CONTENT_ONLY', 'WRITE_BESIDE', 'READ_FIRST', 'NO_CREATE_DIR', 'SYNC_COPIES', 'RANDOM_DESTINATION_SELECTION', 'HASH_SIZE', 'COMMAND_TIMEOUT',
+_TASK_SETTINGS = ('NAMED_DESTS', 'RUN_ID', 'NAMED_IDS', 'CONTENT_ONLY', 'WRITE_BESIDE', 'READ_FIRST', 'NO_CREATE_DIR', 'NO_DIRECTORY_SYNC', 'SYNC_COPIES', 'RANDOM_DESTINATION_SELECTION', 'HASH_SIZE', 'COMMAND_TIMEOUT',
 	'BYTES_RATE_LIMIT', 'FILES_RATE_LIMIT', 'MIRROR_FS_PARAMS', 'REMOVE_FILES_WHILE_LISTING', '_BAR')
 
 def _submit_task(executor, func, *args, **kwargs):
@@ -4846,8 +4847,11 @@ def _door_step(base, name, current, make, source, below, first=None):
 		named_form = f'name it with -d {_shell_word(current + os.sep)} to write through it' if link is not None else f'remove {current}'
 		if NO_CREATE_DIR:
 			what = f'{current} is a {kind}' + (f' to {link}' if link is not None else '') + ' and -ncd makes no directory in its place'
-			raise _Refused(f'{what}: not copying ', f' below it; {named_form}', key=('-ncd', current),
-				note=f'{what}; nothing is written below it, and the other destinations take its files ({named_form})')
+			# A directory sync says this refusal as its 213 line; under -nds none runs, so a file's note does, once a process for
+			# each directory (the key), and a run without -nds says nothing here (9.93's silence where another destination takes
+			# the file, and no directory sync reached its directory: a list run).
+			raise _Refused(f'{what}: not copying ', f' below it; {named_form}', key=('-ncd', current) if NO_DIRECTORY_SYNC else None,
+				note=f'{what}; nothing is written below it ({named_form})' if NO_DIRECTORY_SYNC else None)
 		try:
 			os.unlink(*_at(base, name), **how)
 		except (FileNotFoundError, IsADirectoryError):
@@ -6067,9 +6071,9 @@ def _copy_file(src_path, dest_paths, full_hash, verbose, concurrent_processes, b
 			# once a process, as a note (9.89 said nothing), where no directory sync reached its directory first: the door's
 			# first answer is the one that is not said yet, the later ones are (_dest_directory), as is one this process printed
 			# already. A directory source's pin refusal is its directory sync's own 213 line (said, so no file prints the Note;
-			# 9.89 does the same), and a link's is its own (_say_refused). An -ncd refusal is said the same way, once a process
-			# for each directory (its key) where no directory sync said it (_NOTED): under -nds, which has none, it was said by
-			# nothing before 9.94. Any other refusal here was said by the directory sync too.
+			# 9.89 does the same), and a link's is its own (_say_refused). An -ncd refusal has a note only under -nds,
+			# which has no directory sync to say it: once a process for each directory (its key, _NOTED), where 9.89 to 9.93 said
+			# nothing. Any other refusal here was said by the directory sync too.
 			if refusal.note is not None and not refusal.said and refusal.key not in _NOTED:
 				if refusal.key is not None:
 					_NOTED.add(refusal.key)
@@ -15420,12 +15424,14 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = None,
 	global FILES_RATE_LIMIT
 	global COMMAND_TIMEOUT
 	global NO_CREATE_DIR
+	global NO_DIRECTORY_SYNC
 	global CONTENT_ONLY
 	global WRITE_BESIDE
 	global READ_FIRST
 	global MIRROR_FS_PARAMS
 	global REMOVE_FILES_WHILE_LISTING
 	NO_CREATE_DIR = no_create_dir
+	NO_DIRECTORY_SYNC = no_directory_sync
 	CONTENT_ONLY = content_only
 	WRITE_BESIDE = write_beside
 	READ_FIRST = read_before_write

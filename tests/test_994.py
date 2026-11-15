@@ -265,28 +265,50 @@ def test_994_a_pool_s_worker_table_can_be_walked_while_a_worker_is_added(reset_h
 
 
 @posix_only
+@pytest.mark.parametrize('workers', ['serial', 'pool'])
 @pytest.mark.parametrize('sync', ['-nds', 'synced'])
-def test_994_an_ncd_refusal_another_destination_takes_is_said(tmp_path, sync):
-	# hpcp src/ -d A/ -d B/ -ncd -nds -s, B/sub a link: the door refuses to make a directory in the link's place (-ncd), A
-	# takes src/sub's files, and 9.93 said nothing of B (exit 0, no line): -nds has no directory sync to say it. 9.94 notes it
-	# once a process for each refused directory (two files below it, one note). With a directory sync (synced) its own 213 line
-	# says it, and in this serial run no file's note repeats it (a guard: 9.93 printed the 213 line too).
-	for name in ('f', 'g'):
-		_write(str(tmp_path / 'src' / 'sub' / name), name)
+def test_994_an_ncd_refusal_another_destination_takes_is_said_under_nds_only(tmp_path, sync, workers):
+	# hpcp src/ -d A/ -d B/ -ncd [-nds], B/sub a link: the door refuses to make a directory in the link's place (-ncd) and A takes
+	# src/sub's files. 9.93 said nothing of B where -nds (no directory sync to say it); 9.94 as built printed a Note once a
+	# process even beside a directory sync's own 213 line (9 of them with a pool, 9.93: the 213 line alone), and the note said "the other
+	# destinations take its files", which is false where they cannot. Now: under -nds a note, once a process for each refused
+	# directory (one serial, at most one a worker), without that clause; with a directory sync its 213 line and no note (a guard
+	# of what 9.93 does: it fails on 9.94 as built with a pool).
+	for index in range(40):
+		_write(str(tmp_path / 'src' / 'sub' / ('f%d' % index)), str(index))
 	os.makedirs(str(tmp_path / 'A' / 'sub'))
 	os.makedirs(str(tmp_path / 'B'))
 	os.makedirs(str(tmp_path / 'elsewhere'))
 	os.symlink(str(tmp_path / 'elsewhere'), str(tmp_path / 'B' / 'sub'))
-	args = ['src/', '-d', 'A/', '-d', 'B/', '-ncd', '-s'] + (['-nds'] if sync == '-nds' else [])
+	args = ['src/', '-d', 'A/', '-d', 'B/', '-ncd'] + (['-s'] if workers == 'serial' else ['-j', '4']) + (['-nds'] if sync == '-nds' else [])
 	rc, output = _cli(args, tmp_path)
-	notes = [line for line in output.splitlines() if line.startswith('Note: ') and 'B/sub is a link' in line]
-	assert _read(str(tmp_path / 'A' / 'sub' / 'f')) == 'f' and _read(str(tmp_path / 'A' / 'sub' / 'g')) == 'g'
+	notes = [line for line in output.splitlines() if line.startswith('Note: ')]
+	assert sorted(os.listdir(str(tmp_path / 'A' / 'sub'))) == sorted('f%d' % index for index in range(40))
 	assert os.listdir(str(tmp_path / 'elsewhere')) == []
 	if sync == '-nds':
-		assert rc == 0 and len(notes) == 1, output[-3000:]
-		assert '-ncd makes no directory in its place; nothing is written below it, and the other destinations take its files' in notes[0]
+		assert rc == 0 and 'B/sub is a link' in output, output[-3000:]
+		assert len(notes) == 1 if workers == 'serial' else 1 <= len(notes) <= 4, output[-3000:]
+		for note in notes:
+			assert '-ncd makes no directory in its place; nothing is written below it (name it with -d ' in note, note
+			assert 'other destinations' not in note, note
 	else:
 		assert rc == 213 and not notes and 'B/sub is a link' in output, output[-3000:]
+
+
+@posix_only
+def test_994_an_ncd_refusal_under_nds_is_no_promise_that_another_destination_takes_the_files(tmp_path):
+	# The note's old clause "and the other destinations take its files" was false where the other destination cannot either:
+	# here C/sub is missing and -ncd makes none, so every file fails (213, nothing copied). The note claims nothing of the
+	# others. A guard of what 9.93 does (it said nothing); 9.94 as built said the false clause.
+	for index in range(10):
+		_write(str(tmp_path / 'src' / 'sub' / ('f%d' % index)), str(index))
+	os.makedirs(str(tmp_path / 'B'))
+	os.makedirs(str(tmp_path / 'C'))
+	os.makedirs(str(tmp_path / 'elsewhere'))
+	os.symlink(str(tmp_path / 'elsewhere'), str(tmp_path / 'B' / 'sub'))
+	rc, output = _cli(['src/', '-d', 'B/', '-d', 'C/', '-ncd', '-nds', '-s'], tmp_path)
+	assert rc != 0 and not os.path.exists(str(tmp_path / 'C' / 'sub')), output[-3000:]
+	assert 'the other destinations take' not in output, output[-3000:]
 
 
 def _tfs_tree(tmp_path):
