@@ -13292,8 +13292,10 @@ class _RemoveProgress:
 			suffix += f'Folders: {format_bytes(folders,use_1024_bytes=False,to_str=True)} '
 		if self.rate_limiter:
 			suffix += f'| Overall: {format_bytes(self.rate_limiter["count"] + self.overall_before,use_1024_bytes=False,to_str=True)} Files'
-		multiCMD.print_progress_bar(iteration=int(now - self.start), total=0, prefix=path[-50:], suffix=suffix)
+		# Marked before the draw: a stop that raises inside it (after the frame is written, as the test's does) leaves a line that
+		# finish() ends. Marked after, the stop's report would land on the frame (3.6 under a CPU quota: 1 run of 30).
 		self.drawn = _BAR_DRAWN = True
+		multiCMD.print_progress_bar(iteration=int(now - self.start), total=0, prefix=path[-50:], suffix=suffix)
 
 	def finish(self):
 		"""End the line the last frame left open, as the next error or summary line starts on its own."""

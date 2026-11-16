@@ -172,6 +172,22 @@ def test_995_the_open_line_is_known_to_error_lines_and_ended_by_finish(capsys, m
 	assert capsys.readouterr().out == ''
 
 
+def test_995_a_stop_inside_a_frames_draw_leaves_the_line_to_finish(capsys, monkeypatch, reset_hpcp_globals):
+	'''A stop (KeyboardInterrupt) can come right after the frame is written, before show() returns: the line is open, and finish()
+	ends it. (The program's stop test below hit that window once in 30 runs on Python 3.6 under a CPU quota: it signals as the
+	first frame arrives.)'''
+	def draw_and_stop(*args, **kwargs):
+		print('\rframe', end='')
+		raise KeyboardInterrupt
+	monkeypatch.setattr(hpcp.multiCMD, 'print_progress_bar', draw_and_stop)
+	progress = hpcp._RemoveProgress()
+	with pytest.raises(KeyboardInterrupt):
+		progress.show('/some/directory', 1)
+	assert hpcp._BAR_DRAWN
+	progress.finish()
+	assert capsys.readouterr().out == '\rframe\n' and not hpcp._BAR_DRAWN
+
+
 def test_995_a_run_that_shows_no_frame_prints_no_empty_line(tmp_path, capsys, reset_hpcp_globals):
 	'''Guards what 9.94 gets right: a removal quicker than the first frame prints no blank line before the summary.'''
 	_tree(tmp_path / 'src', directories=2, per_directory=3)
