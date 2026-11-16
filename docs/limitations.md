@@ -343,6 +343,30 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - **Revisit when:** 9.96, first.
 - **Noted:** 2026-11-16, the 9.95 build; the main session's call (a deferral, not asked).
 
+### A `-pfl` listing prints no progress line
+- **Kind:** deferred (9.96).
+- **What the operator sees:** with `-pfl`, the file listing that a copy, a move or `-rwloff` makes runs in pool jobs, and the parent prints nothing while it waits: `Getting file list for ...`, then nothing until `Time taken to get file list`. The serial listing draws its line every 0.5 s. The same in 9.73, 9.94 and 9.95 (ran on `-rm -rwloff` over 400,000 files: 2 to 3 frames of the listing's line serially, none with `-pfl`, in all three).
+- **Why:** not a regression (9.73 printed none either), so 9.95 ships the `-rm` fix alone. The user, 2026-11-16 (relayed): "hpcp new version will not print file listing progress?"
+- **Plan (9.96):** the wait loop of `get_file_list_parallel` draws the listing's line when it is due (the directory last listed, with the files and folders counted so far), as `-rm -pfl`'s loop draws its line, with a test at a pty and through a pipe.
+- **Revisit when:** 9.96.
+- **Noted:** 2026-11-16, the 9.95 final review (N4); the main session's call (a deferral, not asked).
+
+### `-rm -pfl` shows no count while one job empties a wide directory
+- **Kind:** deferred (9.96).
+- **What the operator sees:** under `-rm -pfl` a wide directory is one pool job, and the job reports its count when it returns: until then the line shows the directory and the seconds (`root | iteration:N |`), with `Overall: N Files` under `-F` (its shared count is live). Better than 9.94, which printed nothing.
+- **Why:** a count that the jobs share costs every unlink one more step, and 9.95 keeps that cost off the removal.
+- **Plan (9.96):** count through a shared counter, as `-F`'s pace does (`_shared_rate_wait`), measured first on a 200,000-file directory against 9.95: it ships only if the removal is no slower where it shows.
+- **Revisit when:** 9.96.
+- **Noted:** 2026-11-16, the 9.95 second opinion on the code (L7); the main session's call (a deferral, not asked).
+
+### A reader that closes the pipe early ends `-rm` with exit 120
+- **Kind:** deferred (9.96).
+- **What the operator sees:** `hpcp -rm -rf tree | head -1` (stdout a pipe whose reader leaves early): the tree is removed whole, and hpcp exits 120 with `Exception ignored while flushing sys.stdout: BrokenPipeError: [Errno 32] Broken pipe` on stderr. 9.94 exited 0: it printed nothing until its end, while `head` still read. A copy does the same in 9.94 and 9.95 (`hpcp src -d dst/ | head -1`: exit 70 with a `General Exception: [Errno 32] Broken pipe` traceback, nothing copied).
+- **Why:** the first progress frame flushes stdout early, so the reader's leaving shows at the end. Printing progress needs it, and 9.73's `-rm` did the same. The final review ruled it not an issue for 9.95 and the main session made it a deferral, so that the change of a copy's exit code is weighed once.
+- **Plan (9.96):** one handler at the exit path, for `-rm` and a copy: a closed stdout ends the run with the run's own return code (the files are removed), with a test through `| head -1` for both.
+- **Revisit when:** 9.96.
+- **Noted:** 2026-11-16, the 9.95 final review (N2) and second opinions (code L2, docs Lead 2); the main session's call (a deferral, not asked).
+
 ### macOS: a socket the operator names is not copied
 - **Kind:** known limitation.
 - **What the operator sees:** `hpcp sock file -d DIR/` on macOS: `Special file skipped: sock is a socket; macOS copies no socket (its cp skips one too), and a move leaves it in place`, exit 0. The other sources are copied; nothing is made at the socket's landing, and what is there stays. With `-rf` the socket stays in the source and the rest moves. A run whose sources are all sockets says `Nothing to copy: every source is a socket` and exits 0. That is what a socket met in a tree gets on every platform (`Special file skipped`, and a move's `Move left entries`), and what macOS's own `cp -a` does (exit 0); of macOS's own tools only `rsync -a` makes a socket node (`cp -a`, `ditto`, `pax`, `tar` and `cpio` make none; ran on macOS 26.6.2). 9.89 exited 213 there (`copied sock, but it is at none of its landings`), and its move kept every source (212). On Linux a named socket is copied as before, by `cp -a` (one `mknodat` at the name below the held directory). A delete (`-rm` with no destination) removes a named socket on macOS as before.
