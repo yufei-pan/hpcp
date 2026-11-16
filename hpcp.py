@@ -12813,6 +12813,9 @@ def process_remove(src_paths: list,single_thread = False, max_workers = multipro
 			_file_list_rate_limit(rate_limiter)
 			if _remove_one_listed(path, source_ids[path], '.'):
 				removed += 1
+			# Files named as arguments (-rm dir/*) are no walk's entries: this loop shows the line too.
+			if time.monotonic() >= progress.due:
+				progress.show(os.path.dirname(path), removed)
 		progress.files = removed
 		parallel = not single_thread and max_workers > 1
 		if trees and parallel and not REMOVE_FILES_WHILE_LISTING:

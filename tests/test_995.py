@@ -331,3 +331,37 @@ def test_995_the_errors_after_the_last_frame_leave_no_blank_lines(locked_tree):
 	rc, output = _run(['-rm', '-rf', '-F', str(FILES_PER_SECOND), 'src'], locked_tree.parent)
 	assert rc != 0 and _frames(output), output
 	assert output.partition('Error occurred:')[0].count('Remove process exception:') == 2 and '\n\n' not in output, output
+
+
+def test_995_files_named_as_arguments_show_a_line_while_they_are_removed(tmp_path, capsys, paced, monkeypatch):
+	'''hpcp -rm dir/* names every file: no walk, so only the loop over the arguments can show the line (9.95's first version
+	drew none: 6,000 files took seconds in silence). Each frame carries the count so far and the directory of the last file.'''
+	times = []
+	real_show = hpcp._RemoveProgress.show
+	def show(self, *args, **kwargs):
+		times.append(time.monotonic())
+		return real_show(self, *args, **kwargs)
+	monkeypatch.setattr(hpcp._RemoveProgress, 'show', show)
+	(tmp_path / 'src').mkdir()
+	names = [str(tmp_path / 'src' / ('f%d' % number)) for number in range(TOTAL)]
+	for name in names:
+		open(name, 'w').close()
+	hpcp.process_remove(names, single_thread=True, remove_force=True)
+	end = time.monotonic()
+	assert os.listdir(str(tmp_path / 'src')) == []
+	frames = _frames(_before_the_summary(capsys.readouterr().out))
+	assert frames and end - times[0] >= FIRST_FRAME_BEFORE_THE_END, (frames, end - times[0])
+	assert all(frame.startswith(str(tmp_path / 'src')[-50:] + ' | iteration:') for frame in frames), frames
+	counts = [int(re.search(r'Removed: (\d+)\.00 ', frame).group(1)) for frame in frames]
+	assert counts == sorted(counts) and 0 < counts[0] < counts[-1] < TOTAL
+
+
+def test_995_the_program_given_files_to_remove_prints_the_line(tmp_path):
+	'''The real program as the shell runs it for -rm dir/*: every file an argument, its output a pipe.'''
+	(tmp_path / 'src').mkdir()
+	names = [os.path.join('src', 'f%d' % number) for number in range(PROGRAM_TOTAL)]
+	for name in names:
+		open(str(tmp_path / name), 'w').close()
+	rc, output = _run(['-rm', '-rf', '-F', str(FILES_PER_SECOND)] + names, tmp_path)
+	assert rc == 0 and os.listdir(str(tmp_path / 'src')) == [], output
+	assert _frames(_before_the_summary(output, PROGRAM_TOTAL)), output
