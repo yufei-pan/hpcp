@@ -12831,6 +12831,9 @@ def process_remove(src_paths: list,single_thread = False, max_workers = multipro
 		for root in trees:
 			count, _, errors = _remove_tree_fd(root, source_ids[root], exclude, remove_files=True, rate_limiter=rate_limiter, progress=progress)
 			removed += count
+			if errors:
+				# The lines below start their own: one ends the frame, not each (a blank line after every one).
+				progress.finish()
 			for path, e in errors:
 				_report_unremoved(path, e)
 	finally:

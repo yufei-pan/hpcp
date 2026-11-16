@@ -322,3 +322,12 @@ def test_995_a_stop_ends_the_open_line_before_the_report_on_stdout(tmp_path, ext
 	assert 'Keyboard Interrupt' in err.decode('utf-8', 'replace')
 	report = output.index('Error occurred: ')
 	assert output[report - 1] == '\n', output[max(0, report - 120):report + 60]
+
+
+@posix_only
+def test_995_the_errors_after_the_last_frame_leave_no_blank_lines(locked_tree):
+	'''The walk's errors are reported after its last frame, serially: the first ended the frame's line and each next one, and the
+	summary after them, added an empty line (the open line was still known). Stdout and stderr one pipe.'''
+	rc, output = _run(['-rm', '-rf', '-F', str(FILES_PER_SECOND), 'src'], locked_tree.parent)
+	assert rc != 0 and _frames(output), output
+	assert output.partition('Error occurred:')[0].count('Remove process exception:') == 2 and '\n\n' not in output, output
