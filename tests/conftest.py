@@ -208,6 +208,8 @@ def _clear_hpcp_transient_state():
 	hpcp._STDIN_HELD_LIST = False
 	# A task run in this process (_run_task) leaves its parent's handed answer (_held_route) behind.
 	hpcp._HELD_GIVEN = None
+	# A frame of a removal's progress line left open (_RemoveProgress.show) by a test that did not end it.
+	hpcp._BAR_DRAWN = False
 	# The door's descriptors (by RUN_ID: None outside hpcp()) would hold a directory pytest has removed.
 	if hasattr(hpcp, '_close_cursors'):
 		hpcp._close_cursors()
