@@ -12826,9 +12826,9 @@ def process_remove(src_paths: list,single_thread = False, max_workers = multipro
 				pairs.extend((path, root) for path in set(files) | set(links))
 			removed += _remove_items(_items_below(pairs, {root: (root, source_ids[root], source_ids[root]) for root in trees}), single_thread, max_workers,
 				verbose, files_per_job)
-			# The walk's -F pace starts after the listing (its time is no credit).
+			# The walk's -F pace starts after the listing (its time is no credit); its Overall count goes on from the jobs'.
 			rate_limiter = progress.rate_limiter = _new_rate_limiter()
-			progress.files = removed
+			progress.files = progress.overall_before = removed
 		elif trees and parallel and parallel_file_listing:
 			removed += _remove_trees_parallel([(root, source_ids[root]) for root in trees], max_workers, exclude, rate_limiter, progress)
 		for root in trees:
@@ -13264,14 +13264,14 @@ class _RemoveProgress:
 	50 characters, then 'Removed: N Folders: M' (N entries unlinked, M directories removed), with '| Overall: N Files' under
 	-F. The walks check due once an entry, so a slow unlink (a network filesystem) shows too. The line is left open, for the
 	next frame to start over; finish() ends it. Walks add what they removed when they end (files, folders)."""
-	__slots__ = ('start', 'due', 'files', 'folders', 'rate_limiter', 'drawn')
+	__slots__ = ('start', 'due', 'files', 'folders', 'rate_limiter', 'overall_before', 'drawn')
 	# 9.73's, and the listing's: twice a second is live to the eye and a line each is nothing to a terminal or a log.
 	_INTERVAL = 0.5
 
 	def __init__(self, rate_limiter=None):
 		self.start = time.monotonic()
 		self.due = self.start + self._INTERVAL
-		self.files = self.folders = 0
+		self.files = self.folders = self.overall_before = 0
 		self.rate_limiter = rate_limiter
 		self.drawn = False
 
@@ -13289,7 +13289,7 @@ class _RemoveProgress:
 		if folders:
 			suffix += f'Folders: {format_bytes(folders,use_1024_bytes=False,to_str=True)} '
 		if self.rate_limiter:
-			suffix += f'| Overall: {format_bytes(self.rate_limiter["count"],use_1024_bytes=False,to_str=True)} Files'
+			suffix += f'| Overall: {format_bytes(self.rate_limiter["count"] + self.overall_before,use_1024_bytes=False,to_str=True)} Files'
 		multiCMD.print_progress_bar(iteration=int(now - self.start), total=0, prefix=path[-50:], suffix=suffix)
 		self.drawn = _BAR_DRAWN = True
 

@@ -384,3 +384,17 @@ def test_995_a_directory_gone_before_its_rmdir_is_counted_as_removed_in_every_wa
 	count, _, errors = hpcp._remove_tree_fd(str(tmp_path / 'src'), hpcp._directory_identity(str(tmp_path / 'src')), remove_files=True, progress=progress)
 	assert not errors and count == 6 and not (tmp_path / 'src').exists()
 	assert progress.folders == 4, progress.folders
+
+
+def test_995_after_rwloff_the_walks_overall_count_goes_on_from_the_jobs(tmp_path, capsys, monkeypatch, reset_hpcp_globals):
+	'''-rwloff removes the listed files in pool jobs, then the walk takes the directories with a -F pace of its own: its frames
+	counted from 0 ("Removed: 30" beside "Overall: 0").'''
+	monkeypatch.setattr(hpcp._RemoveProgress, '_INTERVAL', 0)
+	monkeypatch.setattr(hpcp, 'FILES_RATE_LIMIT', 100000)
+	monkeypatch.setattr(hpcp, 'REMOVE_FILES_WHILE_LISTING', False)
+	_tree(tmp_path / 'src', directories=3, per_directory=10)
+	hpcp.process_remove([str(tmp_path / 'src')], single_thread=False, max_workers=2, remove_force=True)
+	assert not (tmp_path / 'src').exists()
+	frames = [frame for frame in _frames(capsys.readouterr().out) if 'Overall:' in frame]
+	assert frames and all('Removed: 30.00 ' in frame for frame in frames), frames
+	assert all(re.search(r'Overall: 30\.00 +Files', frame) for frame in frames), frames
