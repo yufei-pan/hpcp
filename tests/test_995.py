@@ -1,6 +1,6 @@
 '''hpcp 9.95: -rm shows its progress as it removes, as 9.73 did (9.74 to 9.94 printed nothing between "Removing files from"
 and the "Removed N files" line). Each test fails on 9.94 unless it says it guards what 9.94 already gets right. The pace
-under -F is what makes a removal last: N files at -F N / 1.2 take at least 1.2 s whatever the machine, so a frame (every
+under -F is what makes a removal last: N files at -F 100 take at least N / 100 s whatever the machine, so a frame (every
 0.5 s) is always due, and no test waits on a machine's speed.'''
 import os
 import re
@@ -16,14 +16,18 @@ import hpcp
 posix_only = pytest.mark.skipif(os.name != 'posix', reason='POSIX')
 HPCP = os.path.abspath(hpcp.__file__)
 
-# The pace and the tree: 150 files at -F 100 take at least 1.5 s; the first frame is due at 0.5 s and files are still being
-# unlinked then, so one is drawn by the walk, in a worker's directory or in the parent's wait.
+# The pace and the tree: 300 files at -F 100 take at least 3 s; the first frame is due at 0.5 s and files are still being
+# unlinked then, so one is drawn by the walk, in a worker's directory or in the parent's wait. The pace counts from the run's
+# start, and a -pfl pool takes its time to start (over a second on a busy machine, Python 3.9 as root: the first version of the
+# cadence check failed there), so the run is long enough to show a frame after that.
 FILES_PER_SECOND = 100
-DIRECTORIES, PER_DIRECTORY = 6, 25
+DIRECTORIES, PER_DIRECTORY = 6, 50
 TOTAL = DIRECTORIES * PER_DIRECTORY
-# The first frame is due at 0.5 s into the run, and the run lasts 1.5 s past the pool's start: a frame that comes at the end (a
-# loop that checks the clock only between directories, or after them) is no frame of the run; this is how far before the end the
-# first one is, whatever the machine's load does to the start.
+# The real program's tests only need a frame before the summary: 200 files, 2 s.
+PROGRAM_DIRECTORIES, PROGRAM_PER_DIRECTORY = 4, 50
+PROGRAM_TOTAL = PROGRAM_DIRECTORIES * PROGRAM_PER_DIRECTORY
+# A frame that comes at the end (a loop that checks the clock only between directories, or after them) is no frame of the run:
+# this is how far before the end the first one is.
 FIRST_FRAME_BEFORE_THE_END = 0.5
 SHAPES = [pytest.param((DIRECTORIES, PER_DIRECTORY), id='tree'), pytest.param((1, TOTAL), id='one-wide-directory')]
 
@@ -183,10 +187,10 @@ def _run(args, cwd):
 @pytest.mark.parametrize('extra', [[], ['-pfl']], ids=['serial', 'pfl'])
 def test_995_hpcp_rm_through_a_pipe_prints_the_line(tmp_path, extra):
 	'''The real program, its output a pipe: a line before the summary.'''
-	_tree(tmp_path / 'src')
+	_tree(tmp_path / 'src', PROGRAM_DIRECTORIES, PROGRAM_PER_DIRECTORY)
 	rc, output = _run(['-rm', '-rf', '-F', str(FILES_PER_SECOND), '-j', '2'] + extra + ['src'], tmp_path)
 	assert rc == 0 and not (tmp_path / 'src').exists(), output
-	assert _frames(_before_the_summary(output)), output
+	assert _frames(_before_the_summary(output, PROGRAM_TOTAL)), output
 
 
 def _at_a_terminal(args, cwd, size):
@@ -229,9 +233,9 @@ def _at_a_terminal(args, cwd, size):
 @pytest.mark.parametrize('extra', [[], ['-pfl']], ids=['serial', 'pfl'])
 def test_995_hpcp_rm_at_a_terminal_prints_the_line_on_one_line(tmp_path, extra, size):
 	'''At a terminal, sized or not (script's pty has no size: 0 columns), each frame is the one line.'''
-	_tree(tmp_path / 'src')
+	_tree(tmp_path / 'src', PROGRAM_DIRECTORIES, PROGRAM_PER_DIRECTORY)
 	rc, shown = _at_a_terminal(['-rm', '-rf', '-F', str(FILES_PER_SECOND), '-j', '2'] + extra + ['src'], tmp_path, size)
 	assert rc == 0 and not (tmp_path / 'src').exists(), shown
-	frames = _frames(_before_the_summary(shown))
+	frames = _frames(_before_the_summary(shown, PROGRAM_TOTAL))
 	assert frames, shown
 	assert all(frame.count('iteration:') == 1 and '| Overall: ' in frame for frame in frames), frames
