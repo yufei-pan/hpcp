@@ -430,8 +430,9 @@ REMOVE_FILES_WHILE_LISTING = True
 SINGLE_PASS_FILE_LIMIT = 1_000_000
 
 #%% ---- Helper Functions ----
-# Whether this run shows a progress bar (not under -v, which turns it off): a pool task's error line may then land on the
-# bar's line (_bar_line_start). A run setting, handed to the workers (_TASK_SETTINGS).
+# Whether this run shows a progress bar or line: a pool task's error line may then land on its line (_bar_line_start). A
+# copy's bars are off under -v (the copy sets it); a removal's line is drawn under -v too (process_remove sets it). A run
+# setting, handed to the workers (_TASK_SETTINGS).
 _BAR = False
 # Whether the parent's progress bar drew a frame since its line last ended (Adaptive_Progress_Bar sets it, stop() clears it).
 _BAR_DRAWN = False
@@ -13262,8 +13263,9 @@ class _RemoveProgress:
 	(_remove_trees_parallel) show it when it is due, every _INTERVAL seconds while they work, at a terminal and through a
 	pipe, in the style of the listing's (get_file_list_serial, which 9.73's -rm removed through): the current directory's last
 	50 characters, then 'Removed: N Folders: M' (N entries unlinked, M directories removed), with '| Overall: N Files' under
-	-F. The walks check due once an entry, so a slow unlink (a network filesystem) shows too. The line is left open, for the
-	next frame to start over; finish() ends it. Walks add what they removed when they end (files, folders)."""
+	-F. The walks check due once an entry, so a wide directory shows as it goes, and a slow unlink (a network filesystem) as
+	soon as it returns. The line is left open, for the next frame to start over; finish() ends it. Walks add what they
+	removed when they end (files, folders)."""
 	__slots__ = ('start', 'due', 'files', 'folders', 'rate_limiter', 'overall_before', 'drawn')
 	# 9.73's, and the listing's: twice a second is live to the eye and a line each is nothing to a terminal or a log.
 	_INTERVAL = 0.5
@@ -13671,8 +13673,9 @@ def _remove_trees_parallel(trees, max_workers, exclude=None, rate_limiter=None, 
 			while queue and len(futures) < max_workers * 2:
 				path, identity = queue.popleft()
 				futures[_submit_task(executor, _remove_directory_entries, path, identity, exclude)] = path
-			# Until a frame is due (a job on a wide directory reports when it is done, the line shows meanwhile).
-			timeout = 1 if progress is None else min(1, max(0.01, progress.due - time.monotonic()))
+			# Until a frame is due (a job on a wide directory reports when it is done, the line shows meanwhile); a frame already
+			# due waits for nothing (0 returns at once, and the frame below moves the due time on).
+			timeout = 1 if progress is None else min(1, max(0, progress.due - time.monotonic()))
 			for future in _wait(futures, executor, timeout):
 				current = futures.pop(future)
 				count, subdirectories = _task_result(future, (0, []), 'Remove process exception')
@@ -15911,7 +15914,7 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = None,
 			# leading elsewhere writes nothing there (_dest_directory).
 			NAMED_IDS = _named_ids(NAMED_DESTS)
 			SYNC_COPIES = bool(remove)
-			# -v turns the progress bars off (suppress_all_output)
+			# -v turns the copy's progress bars off (suppress_all_output); a removal's line is drawn under -v too (process_remove)
 			_BAR = not verbose
 			# Refuses a clash before anything is copied or removed.
 			dropped, replaced, in_place = _settle_destinations(src_paths, dests, dest_image, directory_only, copy_exclude, 1 if single_thread else max_workers,
