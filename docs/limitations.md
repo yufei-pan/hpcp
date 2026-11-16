@@ -337,8 +337,8 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 
 ### A single-threaded move's and `-rme`'s removal print no progress line
 - **Kind:** deferred (9.96).
-- **What the operator sees:** with `-s` (or one worker), a move's removal of its copied sources and `-rme`'s removal of extra files print nothing between the confirmation and their summary, and a move's last pass over its source directories prints nothing at all, as in 9.73 to 9.95. A long removal there looks stalled. The parallel forms print the "Deleted" bar, and plain `-rm` its progress line (9.95).
-- **Why:** these paths were silent before 9.74's rewrite too (checked on 9.73, 9.94 and 9.95 in the 9.95 build), so they are not part of the regression 9.95 fixes; 9.95 ships that fix alone. The user, 2026-11-16 (relayed): "It NEEDS to print interm outputs when it is removing in command line."
+- **What the operator sees:** with `-s` (or one worker), a move's removal of its copied sources and `-rme`'s removal of extra files print nothing between the confirmation and their summary, as in 9.73 to 9.95. A move's last pass over its source directories prints nothing in any mode, parallel too. A long removal there looks stalled. The parallel forms print the "Deleted" bar, and plain `-rm` its progress line (9.95).
+- **Why:** these paths were silent before 9.74's rewrite too (checked in the 9.95 build on 9.73 as cas-toolbox 2026.42.2 pinned it, commit 7114c5c, and on 9.94 and 9.95; an earlier 9.73 state, 1e46213, ran the move's removal through `process_remove`, which drew the listing's line with `-s`), so they are not part of the regression 9.95 fixes; 9.95 ships that fix alone. The user, 2026-11-16 (relayed): "It NEEDS to print interm outputs when it is removing in command line."
 - **Plan (9.96):** give `_remove_listed_files` (the serial branch of `_remove_items`) and the move's directory pass (`_remove_tree_fd` in the move's cleanup) the same `_RemoveProgress` as plain `-rm`, with a test at a pty and through a pipe that fails on 9.95.
 - **Revisit when:** 9.96, first.
 - **Noted:** 2026-11-16, the 9.95 build; the main session's call (a deferral, not asked).
