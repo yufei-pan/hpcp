@@ -5,6 +5,7 @@ under -F is what makes a removal last: N files at -F 100 take at least N / 100 s
 import os
 import re
 import select
+import signal
 import subprocess
 import sys
 import time
@@ -290,3 +291,34 @@ def test_995_an_error_line_while_the_line_is_open_clears_it_at_a_terminal(locked
 	assert rc != 0, shown
 	assert _frames(shown), shown
 	assert _every_start_of_a_line(shown, 'Remove process exception:', '\n\r') == [], shown
+
+
+@posix_only
+@pytest.mark.parametrize('extra', [[], ['-pfl']], ids=['serial', 'pfl'])
+def test_995_a_stop_ends_the_open_line_before_the_report_on_stdout(tmp_path, extra):
+	'''A stop (SIGTERM, as Ctrl-C is) once the first frame has come, stdout one pipe and stderr another: "Error occurred: ..." (stdout)
+	started right after the open frame, padding and all, as nothing ended the line when the removal was left by the stop. The
+	status is what 9.94 gives (the run ends by the signal, "return code: 130." in the report) and the stop's own line is on stderr.'''
+	_tree(tmp_path / 'src', PROGRAM_DIRECTORIES, PROGRAM_PER_DIRECTORY)
+	proc = subprocess.Popen([sys.executable, HPCP, '-rm', '-rf', '-F', str(FILES_PER_SECOND), '-j', '2'] + extra + ['src'], cwd=str(tmp_path),
+		stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+	seen = b''
+	deadline = time.monotonic() + 60
+	try:
+		while b'iteration:' not in seen:
+			assert time.monotonic() < deadline, 'no frame in 60 s: %r' % seen
+			if select.select([proc.stdout], [], [], 0.2)[0]:
+				chunk = os.read(proc.stdout.fileno(), 4096)
+				assert chunk, 'the run ended without a frame: %r' % seen
+				seen += chunk
+		proc.send_signal(signal.SIGTERM)
+		out, err = proc.communicate(timeout=60)
+	finally:
+		proc.kill()
+		proc.wait()
+	output = (seen + out).decode('utf-8', 'replace')
+	assert 'Removed %d files' % PROGRAM_TOTAL not in output, 'the run was over before the stop: %r' % output
+	assert proc.returncode == -signal.SIGTERM and 'return code: 130.' in output, (proc.returncode, output, err)
+	assert 'Keyboard Interrupt' in err.decode('utf-8', 'replace')
+	report = output.index('Error occurred: ')
+	assert output[report - 1] == '\n', output[max(0, report - 120):report + 60]

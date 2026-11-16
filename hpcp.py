@@ -12835,7 +12835,8 @@ def process_remove(src_paths: list,single_thread = False, max_workers = multipro
 				_report_unremoved(path, e)
 	finally:
 		_BAR = bar
-	progress.finish()
+		# Every way out ends the open line: a stop's report (on stdout, whatever stderr is) starts its own line.
+		progress.finish()
 	print(f"Removed {removed} files and links from {pformat(processedPaths)} in {time.monotonic()-start_time:0.4f} seconds")
 	print('-'*80)
 	# A listing cached before (or by -rwloff) would show the removed trees.
