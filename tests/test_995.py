@@ -369,7 +369,8 @@ def test_995_files_named_as_arguments_show_a_line_while_they_are_removed(tmp_pat
 	assert frames and end - times[0] >= FIRST_FRAME_BEFORE_THE_END, (frames, end - times[0])
 	assert all(frame.startswith(str(tmp_path / 'src')[-50:] + ' | iteration:') for frame in frames), frames
 	counts = [int(re.search(r'Removed: (\d+)\.00 ', frame).group(1)) for frame in frames]
-	assert counts == sorted(counts) and 0 < counts[0] < counts[-1] < TOTAL
+	# (A frame can come right after the last unlink, so the last count may be the total.)
+	assert counts == sorted(counts) and 0 < counts[0] < TOTAL and counts[-1] <= TOTAL
 
 
 def test_995_the_program_given_files_to_remove_prints_the_line(tmp_path):
