@@ -2,7 +2,6 @@
 and the "Removed N files" line). Each test fails on 9.94 unless it says it guards what 9.94 already gets right. The pace
 under -F is what makes a removal last: N files at -F N / 1.2 take at least 1.2 s whatever the machine, so a frame (every
 0.5 s) is always due, and no test waits on a machine's speed.'''
-import errno
 import os
 import re
 import select
@@ -17,11 +16,16 @@ import hpcp
 posix_only = pytest.mark.skipif(os.name != 'posix', reason='POSIX')
 HPCP = os.path.abspath(hpcp.__file__)
 
-# The pace and the tree: 6 directories of 20 files at -F 100 take 1.2 s; the first frame is due at 0.5 s and files are still
-# being unlinked then, so one is drawn by the walk, in a worker's directory or in the parent's wait.
+# The pace and the tree: 150 files at -F 100 take at least 1.5 s; the first frame is due at 0.5 s and files are still being
+# unlinked then, so one is drawn by the walk, in a worker's directory or in the parent's wait.
 FILES_PER_SECOND = 100
-DIRECTORIES, PER_DIRECTORY = 6, 20
+DIRECTORIES, PER_DIRECTORY = 6, 25
 TOTAL = DIRECTORIES * PER_DIRECTORY
+# The first frame is due at 0.5 s into the run, and the run lasts 1.5 s past the pool's start: a frame that comes at the end (a
+# loop that checks the clock only between directories, or after them) is no frame of the run; this is how far before the end the
+# first one is, whatever the machine's load does to the start.
+FIRST_FRAME_BEFORE_THE_END = 0.5
+SHAPES = [pytest.param((DIRECTORIES, PER_DIRECTORY), id='tree'), pytest.param((1, TOTAL), id='one-wide-directory')]
 
 
 def _tree(root, directories=DIRECTORIES, per_directory=PER_DIRECTORY):
@@ -58,18 +62,29 @@ MODES = [
 ]
 
 
+@pytest.mark.parametrize('shape', SHAPES)
 @pytest.mark.parametrize('options, descriptors', MODES)
-def test_995_plain_rm_shows_a_line_while_it_removes(tmp_path, capsys, paced, monkeypatch, options, descriptors):
-	'''9.74 to 9.94 removed in silence: no line between "Removing files from" and the summary.'''
+def test_995_plain_rm_shows_a_line_while_it_removes(tmp_path, capsys, paced, monkeypatch, options, descriptors, shape):
+	'''9.74 to 9.94 removed in silence: no line between "Removing files from" and the summary. The first frame comes by the
+	time it is due, not once the files are gone: in a wide directory only a check an entry (the walk's unlinks, a -pfl job's
+	wait in the parent) can show it.'''
 	if not descriptors:
 		monkeypatch.setattr(hpcp, '_DIR_FD_WALK', False)
-	_tree(tmp_path / 'src')
+	times = []
+	real_show = hpcp._RemoveProgress.show
+	def show(self, *args, **kwargs):
+		times.append(time.monotonic())
+		return real_show(self, *args, **kwargs)
+	monkeypatch.setattr(hpcp._RemoveProgress, 'show', show)
+	_tree(tmp_path / 'src', *shape)
 	hpcp.process_remove([str(tmp_path / 'src')], remove_force=True, **options)
+	end = time.monotonic()
 	assert not (tmp_path / 'src').exists()
 	shown = _before_the_summary(capsys.readouterr().out)
 	frames = _frames(shown)
 	assert frames, 'no progress line in %r' % shown
-	assert re.search(r'iteration:\d+ \| (Removed: [\d.]+ ?K? )?(Folders: [\d.]+ ?K? )?\| Overall: [\d.]+ ?K? Files', frames[-1]), frames[-1]
+	assert end - times[0] >= FIRST_FRAME_BEFORE_THE_END, 'the first frame came %.2f s before the end' % (end - times[0])
+	assert re.search(r'iteration:\d+ \| (Removed: [\d.]+ ?K? +)?(Folders: [\d.]+ ?K? +)?\| Overall: [\d.]+ ?K? +Files', frames[-1]), frames[-1]
 
 
 def test_995_the_line_is_the_listings_with_removed_and_folders(tmp_path, capsys, monkeypatch, reset_hpcp_globals):
@@ -90,6 +105,20 @@ def test_995_the_line_is_the_listings_with_removed_and_folders(tmp_path, capsys,
 	assert re.search(r'iteration:\d+ \| Removed: ', frames[-1])
 
 
+@pytest.mark.parametrize('descriptors', [True, False], ids=['descriptors', 'no-descriptors'])
+def test_995_a_tree_of_empty_directories_shows_a_line_a_directory(tmp_path, capsys, monkeypatch, reset_hpcp_globals, descriptors):
+	'''No file is unlinked, so only the walk's check at each directory (the rmdirs) can show a frame.'''
+	if not descriptors:
+		monkeypatch.setattr(hpcp, '_DIR_FD_WALK', False)
+	monkeypatch.setattr(hpcp._RemoveProgress, '_INTERVAL', 0)
+	for index in range(30):
+		(tmp_path / 'src' / ('d%d' % index)).mkdir(parents=True)
+	hpcp.process_remove([str(tmp_path / 'src')], single_thread=True, remove_force=True)
+	frames = _frames(_before_the_summary(capsys.readouterr().out, 0))
+	assert len(frames) >= 30 and re.search(r'Folders: 3[01]\.00 ', frames[-1]), frames[-1]
+	assert not any('Removed:' in frame for frame in frames)
+
+
 def test_995_under_the_file_rate_limit_the_line_has_the_overall_count(tmp_path, capsys, monkeypatch, reset_hpcp_globals):
 	monkeypatch.setattr(hpcp._RemoveProgress, '_INTERVAL', 0)
 	monkeypatch.setattr(hpcp, 'FILES_RATE_LIMIT', 100000)
@@ -97,7 +126,7 @@ def test_995_under_the_file_rate_limit_the_line_has_the_overall_count(tmp_path, 
 	hpcp.process_remove([str(tmp_path / 'src')], single_thread=True, remove_force=True)
 	frames = _frames(capsys.readouterr().out)
 	assert frames and all('| Overall: ' in frame for frame in frames)
-	assert 'Overall: 100.00 Files' in frames[-1]
+	assert re.search(r'Overall: 100\.00 +Files', frames[-1]), frames[-1]
 
 
 def test_995_the_walk_adds_to_what_the_pfl_jobs_removed(tmp_path, capsys, monkeypatch, reset_hpcp_globals):
@@ -117,7 +146,7 @@ def test_995_the_open_line_is_known_to_error_lines_and_ended_by_finish(capsys, m
 	progress.show('/some/directory', 3, 1)
 	assert hpcp._BAR_DRAWN
 	shown = capsys.readouterr().out
-	assert shown.startswith('\r') and not shown.endswith('\n') and 'Removed: 3.00 Folders: 1.00' in shown
+	assert shown.startswith('\r') and not shown.endswith('\n') and re.search(r'Removed: 3\.00 +Folders: 1\.00', shown)
 	progress.finish()
 	assert not hpcp._BAR_DRAWN and capsys.readouterr().out == '\n'
 	progress.finish()
