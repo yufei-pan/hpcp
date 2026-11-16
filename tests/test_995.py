@@ -178,10 +178,10 @@ def test_995_the_library_and_a_moves_walks_print_nothing(tmp_path, capsys, monke
 
 
 def _run(args, cwd):
-	'''hpcp as a program: stdout and stderr through one pipe. (exit status, output)'''
+	'''hpcp as a program: stdout and stderr through one pipe, the bytes as written (a carriage return stays one). (exit status, output)'''
 	done = subprocess.run([sys.executable, HPCP] + args, cwd=str(cwd), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-		stdin=subprocess.DEVNULL, universal_newlines=True, timeout=120)
-	return done.returncode, done.stdout
+		stdin=subprocess.DEVNULL, timeout=120)
+	return done.returncode, done.stdout.decode('utf-8', 'replace')
 
 
 @pytest.mark.parametrize('extra', [[], ['-pfl']], ids=['serial', 'pfl'])
@@ -239,3 +239,54 @@ def test_995_hpcp_rm_at_a_terminal_prints_the_line_on_one_line(tmp_path, extra, 
 	frames = _frames(_before_the_summary(shown, PROGRAM_TOTAL))
 	assert frames, shown
 	assert all(frame.count('iteration:') == 1 and '| Overall: ' in frame for frame in frames), frames
+
+
+@pytest.fixture
+def locked_tree(tmp_path):
+	'''src/ with a/ and z/ of 100 files each (at -F 100: the walk is in a/ at the first frame) and src/a/sub/locked/ (mode 0555)
+	holding two files the runner can not unlink: each is an error line, reached after the first frame. Root can unlink them.'''
+	if os.name != 'posix' or os.geteuid() == 0:
+		pytest.skip('needs a directory its owner can not write into (not root)')
+	root = tmp_path / 'src'
+	locked = root / 'a' / 'sub' / 'locked'
+	locked.mkdir(parents=True)
+	for directory in ('a', 'z'):
+		(root / directory).mkdir(exist_ok=True)
+		for number in range(100):
+			(root / directory / ('f%d' % number)).write_text('x')
+	for name in ('k1', 'k2'):
+		(locked / name).write_text('x')
+	locked.chmod(0o555)
+	yield root
+	locked.chmod(0o755)
+
+
+def _every_start_of_a_line(text, mark, starts='\n'):
+	'''The places before the final "Error occurred:" report where mark is not right after a character of starts (a line's start, or
+	the terminal's clear-and-return): each is a stretch of text ending in it. Fails when mark does not occur at all.'''
+	text = text.partition('Error occurred:')[0]
+	places = [match.start() for match in re.finditer(re.escape(mark), text)]
+	assert places, 'no %r in %r' % (mark, text)
+	return [text[max(0, place - 60):place + len(mark)] for place in places if place and text[place - 1] not in starts]
+
+
+@posix_only
+@pytest.mark.parametrize('extra', [[], ['-pfl']], ids=['serial', 'pfl'])
+def test_995_an_error_line_while_the_line_is_open_starts_its_own_line_in_a_log(locked_tree, extra):
+	'''9.95's first version: under -pfl a job's "Remove process exception:" came right after the open frame (a combined log: on the
+	frame's line, after its padding), as a job of a plain -rm did not know the run drew one. 9.94 drew no frame. (The serial walk
+	reports in the parent, which knows: that one guards.)'''
+	rc, output = _run(['-rm', '-rf', '-F', str(FILES_PER_SECOND), '-j', '2'] + extra + ['src'], locked_tree.parent)
+	assert rc != 0 and not (locked_tree / 'a' / 'f0').exists(), output
+	assert _frames(output), output
+	assert _every_start_of_a_line(output, 'Remove process exception:') == [], output
+
+
+@posix_only
+@pytest.mark.parametrize('size', [(40, 120), None], ids=['sized-terminal', 'unsized-terminal'])
+def test_995_an_error_line_while_the_line_is_open_clears_it_at_a_terminal(locked_tree, size):
+	'''At a terminal the job's line starts with the clear-line and return a copy's error line does, in a pty with a size or none.'''
+	rc, shown = _at_a_terminal(['-rm', '-rf', '-F', str(FILES_PER_SECOND), '-j', '2', '-pfl', 'src'], locked_tree.parent, size)
+	assert rc != 0, shown
+	assert _frames(shown), shown
+	assert _every_start_of_a_line(shown, 'Remove process exception:', '\n\r') == [], shown

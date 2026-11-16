@@ -12799,35 +12799,42 @@ def process_remove(src_paths: list,single_thread = False, max_workers = multipro
 	start_time = time.monotonic()
 	rate_limiter = _new_rate_limiter()
 	progress = _RemoveProgress(rate_limiter)
-	removed = 0
-	trees = []
-	for path in processedPaths:
-		if os.path.isdir(path) and not os.path.islink(path):
-			trees.append(path)
-			continue
-		_file_list_rate_limit(rate_limiter)
-		if _remove_one_listed(path, source_ids[path], '.'):
-			removed += 1
-	progress.files = removed
-	parallel = not single_thread and max_workers > 1
-	if trees and parallel and not REMOVE_FILES_WHILE_LISTING:
-		# -rwloff: list everything first, then remove the listed files in pool jobs.
-		pairs = []
-		for root in trees:
-			files, links, _, _ = get_file_list(root, max_workers=max_workers, exclude=exclude, parallel_file_listing=parallel_file_listing, drop_cache=True)
-			pairs.extend((path, root) for path in set(files) | set(links))
-		removed += _remove_items(_items_below(pairs, {root: (root, source_ids[root], source_ids[root]) for root in trees}), single_thread, max_workers,
-			verbose, files_per_job)
-		# The walk's -F pace starts after the listing (its time is no credit).
-		rate_limiter = progress.rate_limiter = _new_rate_limiter()
+	# The jobs of -pfl and -rwloff print their error lines in their own processes, where the parent's frame is not known: each starts
+	# off the progress line (_bar_line_start), as a copy's do.
+	global _BAR
+	bar, _BAR = _BAR, True
+	try:
+		removed = 0
+		trees = []
+		for path in processedPaths:
+			if os.path.isdir(path) and not os.path.islink(path):
+				trees.append(path)
+				continue
+			_file_list_rate_limit(rate_limiter)
+			if _remove_one_listed(path, source_ids[path], '.'):
+				removed += 1
 		progress.files = removed
-	elif trees and parallel and parallel_file_listing:
-		removed += _remove_trees_parallel([(root, source_ids[root]) for root in trees], max_workers, exclude, rate_limiter, progress)
-	for root in trees:
-		count, _, errors = _remove_tree_fd(root, source_ids[root], exclude, remove_files=True, rate_limiter=rate_limiter, progress=progress)
-		removed += count
-		for path, e in errors:
-			_report_unremoved(path, e)
+		parallel = not single_thread and max_workers > 1
+		if trees and parallel and not REMOVE_FILES_WHILE_LISTING:
+			# -rwloff: list everything first, then remove the listed files in pool jobs.
+			pairs = []
+			for root in trees:
+				files, links, _, _ = get_file_list(root, max_workers=max_workers, exclude=exclude, parallel_file_listing=parallel_file_listing, drop_cache=True)
+				pairs.extend((path, root) for path in set(files) | set(links))
+			removed += _remove_items(_items_below(pairs, {root: (root, source_ids[root], source_ids[root]) for root in trees}), single_thread, max_workers,
+				verbose, files_per_job)
+			# The walk's -F pace starts after the listing (its time is no credit).
+			rate_limiter = progress.rate_limiter = _new_rate_limiter()
+			progress.files = removed
+		elif trees and parallel and parallel_file_listing:
+			removed += _remove_trees_parallel([(root, source_ids[root]) for root in trees], max_workers, exclude, rate_limiter, progress)
+		for root in trees:
+			count, _, errors = _remove_tree_fd(root, source_ids[root], exclude, remove_files=True, rate_limiter=rate_limiter, progress=progress)
+			removed += count
+			for path, e in errors:
+				_report_unremoved(path, e)
+	finally:
+		_BAR = bar
 	progress.finish()
 	print(f"Removed {removed} files and links from {pformat(processedPaths)} in {time.monotonic()-start_time:0.4f} seconds")
 	print('-'*80)
