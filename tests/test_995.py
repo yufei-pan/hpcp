@@ -365,3 +365,22 @@ def test_995_the_program_given_files_to_remove_prints_the_line(tmp_path):
 	rc, output = _run(['-rm', '-rf', '-F', str(FILES_PER_SECOND)] + names, tmp_path)
 	assert rc == 0 and os.listdir(str(tmp_path / 'src')) == [], output
 	assert _frames(_before_the_summary(output, PROGRAM_TOTAL)), output
+
+
+@pytest.mark.parametrize('descriptors', [True, False], ids=['descriptors', 'no-descriptors'])
+def test_995_a_directory_gone_before_its_rmdir_is_counted_as_removed_in_every_walk(tmp_path, monkeypatch, reset_hpcp_globals, descriptors):
+	'''Something else removes d1 between the walk's listing and its rmdir: the fallback walk and the root count it (_rmdir_below
+	answers None), and the descriptor walk's directory counts it the same.'''
+	if not descriptors:
+		monkeypatch.setattr(hpcp, '_DIR_FD_WALK', False)
+	_tree(tmp_path / 'src', directories=3, per_directory=2)
+	real_rmdir = os.rmdir
+	def rmdir(path, *args, **kwargs):
+		real_rmdir(path, *args, **kwargs)
+		if os.path.basename(path) == 'd1':
+			raise FileNotFoundError(path)
+	monkeypatch.setattr(os, 'rmdir', rmdir)
+	progress = hpcp._RemoveProgress()
+	count, _, errors = hpcp._remove_tree_fd(str(tmp_path / 'src'), hpcp._directory_identity(str(tmp_path / 'src')), remove_files=True, progress=progress)
+	assert not errors and count == 6 and not (tmp_path / 'src').exists()
+	assert progress.folders == 4, progress.folders

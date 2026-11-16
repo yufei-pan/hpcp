@@ -13550,7 +13550,8 @@ def _remove_tree_fd(root, root_id, exclude=None, remove_files=False, rate_limite
 				os.rmdir(frame[3], dir_fd=held.top())
 				folders += 1
 			except FileNotFoundError:
-				pass
+				# Already gone: counted as every other walk does (_rmdir_below gives None for it).
+				folders += 1
 			except OSError as e:
 				if e.errno not in busy:
 					errors.append((frame[0], e))
