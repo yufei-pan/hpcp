@@ -371,3 +371,24 @@ def test_996_a_tasks_error_lines_are_printed_by_the_parent_once(capsys, monkeypa
 	assert capsys.readouterr().err == 'Copy failed: a task\'s line\n' and hpcp.ERRORS == ['Copy failed: a task\'s line']
 	assert hpcp._task_result(future(), 'default', 'Copy process crashed', report=False) is None
 	assert capsys.readouterr().err == '' and hpcp.ERRORS == ['Copy failed: a task\'s line']
+
+
+# ---- 4. A file -rm could not remove is reported once ----
+
+@not_root
+@pytest.mark.parametrize('extra', [['-pfl'], ['-rwloff']], ids=['pfl', 'rwloff'])
+def test_996_an_unremovable_file_is_reported_once(tmp_path, extra):
+	'''-rm with pool jobs: the job that met a file it could not unlink reported it, and the walk after the jobs met it again and
+	reported it too (9.94 and 9.95: 6 lines and 6 entries in the list for 3 files). The walk reports it, once; the exit status is
+	192 as before.'''
+	_tree(tmp_path / 'src', 2, 10)
+	_locked(tmp_path / 'src' / 'locked', ['k0', 'k1', 'k2'])
+	try:
+		rc, output = _run(['-rm', '-rf', '-j', '2'] + extra + ['src'], tmp_path)
+	finally:
+		_unlock(tmp_path / 'src')
+	assert rc == 192 and sorted(os.listdir(str(tmp_path / 'src'))) == ['locked'], output
+	lines, _, report = output.partition('Error occurred: ')
+	assert lines.count('Remove process exception:') == 3 and report.count('Remove process exception:') == 3, output
+	for name in ('k0', 'k1', 'k2'):
+		assert lines.count(os.path.join('locked', name) + ' generated an exception') == 1, output

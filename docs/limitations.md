@@ -359,14 +359,6 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - **Revisit when:** 9.96.
 - **Noted:** 2026-11-16, a second opinion on 9.95's fix round 2 (docs12 L3); the main session's call (a deferral, not asked).
 
-### `-rm -pfl` reports each unremovable file twice
-- **Kind:** deferred (9.96).
-- **What the operator sees:** `hpcp -rm -rf -pfl tree` over a directory with 3 files that cannot be unlinked prints 6 `Remove process exception:` lines, and the `Error occurred:` list holds 6: each file is reported by the job that met it, and again by the walk that goes over the directories after the jobs. The files stay, and the exit status is 192. The same in 9.94 and 9.95 (ran on both).
-- **Why:** a job leaves a file it cannot unlink where it is, and the walk that removes the directories (and any file a job left) meets it again; nothing tells the walk that a job reported it.
-- **Plan (9.96):** report a file once: the walk skips a file in a directory whose job already reported, or the parent prints the jobs' reports it receives through the futures and the jobs print none (the entry above weighs the same for the blank lines). A test with one unremovable file under `-pfl`: one report, one entry in the list.
-- **Revisit when:** 9.96.
-- **Noted:** 2026-11-16, the re-review of 9.95's fix round (an observation), second opinions (tests L2); the main session's call (a deferral, not asked).
-
 ### macOS: a socket the operator names is not copied
 - **Kind:** known limitation.
 - **What the operator sees:** `hpcp sock file -d DIR/` on macOS: `Special file skipped: sock is a socket; macOS copies no socket (its cp skips one too), and a move leaves it in place`, exit 0. The other sources are copied; nothing is made at the socket's landing, and what is there stays. With `-rf` the socket stays in the source and the rest moves. A run whose sources are all sockets says `Nothing to copy: every source is a socket` and exits 0. That is what a socket met in a tree gets on every platform (`Special file skipped`, and a move's `Move left entries`), and what macOS's own `cp -a` does (exit 0); of macOS's own tools only `rsync -a` makes a socket node (`cp -a`, `ditto`, `pax`, `tar` and `cpio` make none; ran on macOS 26.6.2). 9.89 exited 213 there (`copied sock, but it is at none of its landings`), and its move kept every source (212). On Linux a named socket is copied as before, by `cp -a` (one `mknodat` at the name below the held directory). A delete (`-rm` with no destination) removes a named socket on macOS as before.

@@ -4160,9 +4160,10 @@ def delete_file_bulk(paths, exclude=None):
 	endTime = time.monotonic()
 	return total_size, endTime - start_time
 
-def delete_file_list_parallel(file_list, max_workers, verbose=False,files_per_job=1,init_size=0,remover=None):
+def delete_file_list_parallel(file_list, max_workers, verbose=False,files_per_job=1,init_size=0,remover=None,report=True):
 	"""Delete file_list in pool jobs; remover (a worker body taking a list of paths, returning (bytes, seconds)) is
-	delete_file_bulk unless given."""
+	delete_file_bulk unless given. Without report the jobs' error lines and errors are left out (_task_result): the
+	caller's next step meets and reports what they could not remove."""
 	remover = remover or delete_file_bulk
 	global FILES_RATE_LIMIT
 	global BYTES_RATE_LIMIT
@@ -4204,7 +4205,7 @@ def delete_file_list_parallel(file_list, max_workers, verbose=False,files_per_jo
 			for doneTask in done:
 				delete_files = futures.pop(doneTask)
 				deleted_files_count_this_run = len(delete_files)
-				rmSize, rmTime = _task_result(doneTask, (0, 0), 'Remove process exception')
+				rmSize, rmTime = _task_result(doneTask, (0, 0), 'Remove process exception', report=report)
 				current_iteration_total_run_time += rmTime
 				apb.update(num_files=deleted_files_count_this_run,cpSize=rmSize,cpTime=rmTime,files_per_job=files_per_job)
 			apb.scheduled_jobs = len(futures)
@@ -12890,8 +12891,9 @@ def process_remove(src_paths: list,single_thread = False, max_workers = multipro
 		for root in trees:
 			files, links, _, _ = get_file_list(root, max_workers=max_workers, exclude=exclude, parallel_file_listing=parallel_file_listing, drop_cache=True)
 			pairs.extend((path, root) for path in set(files) | set(links))
+		# What a job could not remove the walk below meets again, and reports once (9.95 reported it twice).
 		removed += _remove_items(_items_below(pairs, {root: (root, source_ids[root], source_ids[root]) for root in trees}), single_thread, max_workers,
-			verbose, files_per_job)
+			verbose, files_per_job, report=False)
 		# The walk's -F pace starts after the listing (its time is no credit); its Overall count goes on from the jobs'.
 		rate_limiter = progress.rate_limiter = _new_rate_limiter()
 		progress.files = progress.overall_before = removed
@@ -13387,11 +13389,13 @@ class _RemoveProgress:
 		_BAR_DRAWN = True
 		multiCMD.print_progress_bar(iteration=int(now - self.start), total=0, prefix=path[-50:], suffix=suffix)
 
-def _remove_items(items, single_thread=False, max_workers=1, verbose=False, files_per_job=1, one_filesystem=False, progress=None):
+def _remove_items(items, single_thread=False, max_workers=1, verbose=False, files_per_job=1, one_filesystem=False, progress=None,
+		report=True):
 	"""Unlink items (see _remove_listed_files) in this process, paced by -F, or in pool jobs of neighbouring entries,
 	large enough to share their directories' descriptors (with -F as given, as delete_file_list_parallel paces by
 	job). With one_filesystem (-rme) nothing on another filesystem than its root is removed. progress (_RemoveProgress):
-	the line in this process (the pool's jobs show the "Deleted" bar instead). Returns the number of items handled."""
+	the line in this process (the pool's jobs show the "Deleted" bar instead). report: see delete_file_list_parallel
+	(-rwloff: the walk after the jobs reports). Returns the number of items handled."""
 	if not items:
 		return 0
 	if single_thread or max_workers <= 1:
@@ -13399,7 +13403,7 @@ def _remove_items(items, single_thread=False, max_workers=1, verbose=False, file
 		return len(items)
 	job_size = files_per_job if FILES_RATE_LIMIT > 0 else max(files_per_job, min(256, len(items) // (max_workers * 4) or 1))
 	remover = functools.partial(_remove_listed_files, one_filesystem=True) if one_filesystem else _remove_listed_files
-	return delete_file_list_parallel(items, max_workers, verbose, job_size, remover=remover)[0]
+	return delete_file_list_parallel(items, max_workers, verbose, job_size, remover=remover, report=report)[0]
 
 def _dir_entries(fd):
 	"""[(name, is a directory)] for directory descriptor fd, a symlink being no directory: from d_type where scandir can
@@ -13736,7 +13740,8 @@ def _remove_directory_entries(path, expected_id, exclude=None):
 
 def _remove_trees_parallel(trees, max_workers, exclude=None, rate_limiter=None, progress=None):
 	"""-pfl: empty the directories of trees ([(root, its identity)]) in pool jobs, one directory each
-	(_remove_directory_entries), queueing the subdirectories each job reports. With rate_limiter (-F), the jobs pace
+	(_remove_directory_entries), queueing the subdirectories each job reports. What a job could not remove is left for the
+	walk after them (_remove_tree_fd), which meets it again and reports it: the jobs' error lines are left out. With rate_limiter (-F), the jobs pace
 	each unlink from one shared count (_shared_rate_wait), and the count carries on into the walk after. progress
 	(_RemoveProgress): the loop shows it when it is due, with the entries the jobs have reported, and is given their count at
 	the end. Returns the entries unlinked; the directories themselves are left for _remove_tree_fd."""
@@ -13762,7 +13767,8 @@ def _remove_trees_parallel(trees, max_workers, exclude=None, rate_limiter=None, 
 			timeout = 1 if progress is None else min(1, max(0, progress.due - time.monotonic()))
 			for future in _wait(futures, executor, timeout):
 				current = futures.pop(future)
-				count, subdirectories = _task_result(future, (0, []), 'Remove process exception')
+				# What a job could not remove the walk after the jobs meets again, and reports once (9.95 reported it twice).
+				count, subdirectories = _task_result(future, (0, []), 'Remove process exception', report=False)
 				removed += count
 				queue.extend(subdirectories)
 			if progress is not None and time.monotonic() >= progress.due:
