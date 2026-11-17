@@ -434,8 +434,9 @@ SINGLE_PASS_FILE_LIMIT = 1_000_000
 # The one mark of stdout's line: True while a progress frame (a bar's, the listing's or a removal's line) is the last thing on
 # it, the line left open for the next frame to start over. A frame sets it as it is drawn; whatever ends the line clears it:
 # _end_line, an error line whose start ended stdout's line too (_error_line), a bar's frame at its total, and a bar's stop()
-# (its summary starts with a line end). Only the parent draws frames and prints error lines: a pool task's error lines are
-# printed by the parent when its result comes (_settled).
+# (its summary starts with a line end). Only the parent draws frames and keeps the mark: a pool task's error lines are printed
+# by the parent when its result comes (_settled). What a worker writes straight to stdout or stderr (_space_warning, a
+# discarded temporary file's note, _copy_file's notes, the link-tracking bar) does not know it, as in 9.95 (docs/limitations.md).
 _BAR_DRAWN = False
 _LINE_START = [None, '', False]  # (pid, _line_start's answer, whether stdout and stderr are one file)
 

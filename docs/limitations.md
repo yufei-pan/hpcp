@@ -267,7 +267,7 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - **Kind:** deferred (9.96).
 - **What the operator sees:** under `-nds`, `hpcp src/ -d A/ -d B/ -ncd -nds` with `B/sub` a link prints its `Note: B/sub is a link ...` once in each worker process that copies a file below it (26 identical lines at `-j 32`; 94 for 20 such directories, ran 2026-11-15), and in a list run once for each listed file below it, since each gets a pool of its own (24 lines for 24 files, ran). A destination that now leads elsewhere than the run pinned (`... now leads to another directory ...`) is noted the same way, since 9.89. The exit code and the files copied are right.
 - **Why:** the note is printed where the file is copied, and each worker remembers only what it printed itself.
-- **Plan (9.96):** each task hands its notes back with its errors, and the parent prints each once a run. The pin note then drops "and the other destinations take its files", which is false where they fail too.
+- **Plan (9.96):** each task hands its notes back with its errors (since 9.96 a task's error lines come back through `_settled` already: the parent only has to print each note once a run). The pin note then drops "and the other destinations take its files", which is false where they fail too.
 - **Revisit when:** 9.96.
 - **Noted:** 2026-11-15, the 9.94 fix round's re-review; a deferral, not asked.
 
@@ -278,6 +278,46 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - **Plan (9.96):** the outer run checks for a stop before it reads the nested return code, as it does after the nested cleanup since 9.94.
 - **Revisit when:** 9.96.
 - **Noted:** 2026-11-15, the 9.94 fix round's second opinion (code lead 3); a deferral, not asked.
+
+### Some lines a pool worker writes itself land on the parent's open progress line
+- **Kind:** deferred (9.97).
+- **What the operator sees:** the lines a pool worker writes straight to stdout or stderr (a discarded temporary file's note, `_copy_file`'s `Note:` and `Error copying` lines, a link-tracking bar's errors) know nothing of the parent's progress line: in a combined log (`> log 2>&1`) one can land on a frame's line. Each is one line for a rare event. 9.95 and 9.96 alike (read from the code 2026-11-17; the space warning below is the one reproduced).
+- **Why:** only the parent knows whether its line is open (one mark, `_BAR_DRAWN`); a pool task's error lines come back to it with the task's result (`_settled`), these writes never did.
+- **Plan (9.97):** each such line goes back with the task's result as the error lines do (`_TASK_LINES`), and the parent prints it with the same line start.
+- **Revisit when:** 9.97.
+- **Noted:** 2026-11-17, 9.96's final review (second opinions code1 and docs2); a deferral, not asked.
+
+### The space warning starts with a line end where no line is open
+- **Kind:** deferred (9.97).
+- **What the operator sees:** `hpcp big -d /small/out/ > log 2>&1` where the destination is too small (one 3 MiB file to a 1 MiB tmpfs, ran 2026-11-17): an empty line between `Processing 5 files with 32 workers` and `Space warning: ...`, with no frame open. 9.95 the same. The warning itself, the exit status and the files copied are right.
+- **Why:** `_space_warning` runs in a worker, which cannot know whether the parent's line is open, and takes the line start for an open one (`_line_start`) whatever the mark says.
+- **Plan (9.97):** the same as the entry above: the warning goes back with the task's result and the parent prints it.
+- **Revisit when:** 9.97.
+- **Noted:** 2026-11-17, 9.96's final review (second opinions code1 and docs2); a deferral, not asked.
+
+### `-F` and the live counts do not reach `-pfl` jobs on Python 3.6 where the pool spawns its workers (Windows)
+- **Kind:** deferred (9.97).
+- **What the operator sees:** `hpcp -rm -rf -pfl -F 2000` on 46,000 files in 21 directories (one of 40,000 files), Python 3.6 with the spawn start method (Windows): the jobs ignore the pace (1.7 s on 9.95, 2.7 s on 9.96 where about 23 s are expected), and while the wide directory's job runs the line stays at the finished jobs' count (the listing's too: a wide folder under `-pfl` is counted when its job returns). The files are removed all the same. Not seen with fork (Python 3.6 to 3.14) or with spawn on 3.9 and 3.14 (checked 2026-11-17).
+- **Why:** Python 3.6's pool has no initializer (3.7+), so a spawned worker never gets the rate share or the live counts, which reach a forked worker by inheritance.
+- **Plan (9.97):** where the pool has no initializer, each task carries the share (the counter and the live counts are shared objects: they can be passed as a task's arguments to a process the pool starts).
+- **Revisit when:** 9.97. Python 3.6 is end-of-life support: the fix goes in only if it adds no part to the 3.11+ path.
+- **Noted:** 2026-11-17, 9.96's final review (second opinion code4); a deferral, not asked.
+
+### A pool task keeps all its error lines until it returns
+- **Kind:** deferred (9.97).
+- **What the operator sees:** a job that meets a great many failures (one copy job over a directory of unreadable files) holds every error line, twice (in its error list and in `_TASK_LINES`), until it returns, and the parent prints them then: memory the size of the lines, and the lines late. 9.95 printed each as it happened (and kept its error list in the worker alike).
+- **Why:** 9.96's task hands its error lines back with its result so that only the parent writes to the line; no number bounds them.
+- **Plan (9.97):** measure how many lines the worst jobs meet (a tree of unreadable files), keep that many in a task with a final `... and N more` line (the error list keeps counting), and write the number's reason beside it.
+- **Revisit when:** 9.97.
+- **Noted:** 2026-11-17, 9.96's final review (second opinion code1); a deferral, not asked.
+
+### macOS: the progress frames in a log each take a line of their own
+- **Kind:** deferred (9.97).
+- **What the operator sees:** on macOS, in a log or a pipe, multiCMD writes the progress frames each on its own line, and the first after an empty line (one empty line before the first frame in the 9.96 Mac run; 9.95 the same). Linux writes them with a carriage return.
+- **Why:** not traced yet: the frames are drawn by multiCMD's `print_progress_bar` (embedded, 1.67).
+- **Plan (9.97):** find where multiCMD's frame form on macOS differs from Linux's, fix it in multiCMD and embed it.
+- **Revisit when:** 9.97.
+- **Noted:** 2026-11-17, found while checking 9.96 on the Mac; a deferral, not asked.
 
 ### With -wb, a rewrite does not keep a per-file layout, chattr flags or the project id
 - **Kind:** known limitation.
