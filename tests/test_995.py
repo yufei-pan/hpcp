@@ -206,6 +206,14 @@ def test_995_the_open_line_is_known_to_error_lines_and_ended_by_finish(capsys, m
 	assert capsys.readouterr().out == ''
 
 
+def test_995_finish_leaves_the_mark_of_a_line_it_did_not_draw(capsys, reset_hpcp_globals):
+	'''-rwloff's job bar (Adaptive_Progress_Bar) sets _BAR_DRAWN and a stop skips its stop(): the removal's finish() has drawn no
+	frame of its own, so it ends no line and leaves the mark for the stop's report to start off the bar's line.'''
+	hpcp._BAR_DRAWN = True
+	hpcp._RemoveProgress().finish()
+	assert hpcp._BAR_DRAWN and capsys.readouterr().out == ''
+
+
 def test_995_a_stop_inside_a_frames_draw_leaves_the_line_to_finish(capsys, monkeypatch, reset_hpcp_globals):
 	'''A stop (KeyboardInterrupt) can come right after the frame is written, before show() returns: the line is open, and finish()
 	ends it. (The program's stop test below hit that window once in 30 runs on Python 3.6 under a CPU quota: it signals as the
@@ -408,6 +416,20 @@ def test_995_a_stop_ends_the_open_line_before_the_report_on_stdout(tmp_path, ext
 	assert returncode == status and 'return code: 130.' in output, (returncode, output, err)
 	assert 'Keyboard Interrupt' in err
 	report = output.index('Error occurred: ')
+	assert output[report - 1] == '\n', output[max(0, report - 120):report + 60]
+
+
+@posix_only
+@pytest.mark.parametrize('sig, status', STOPS)
+def test_995_a_stop_in_rwloffs_job_phase_leaves_its_bar_line_to_the_report(tmp_path, sig, status):
+	'''-rwloff's jobs show the "Deleted" bar (its frames carry "F/s Limit" under -F), whose line a stop leaves open (its own end of line is skipped): the removal's
+	finish() must not clear the mark that line set, or "Keyboard Interrupt: ..." is glued to the bar's text (stdout and stderr one
+	pipe: 9.94 started it on its own line; 9.95's first fix round glued it).'''
+	_tree(tmp_path / 'src', PROGRAM_DIRECTORIES, PROGRAM_PER_DIRECTORY)
+	returncode, output, _ = _stopped(['-rm', '-rf', '-rwloff', '-F', str(FILES_PER_SECOND), '-j', '2', 'src'], tmp_path, b'F/s Limit', sig, merged=True)
+	assert 'Removed %d files' % PROGRAM_TOTAL not in output, 'the run was over before the stop: %r' % output
+	assert returncode == status, (returncode, output)
+	report = output.index('Keyboard Interrupt: ')
 	assert output[report - 1] == '\n', output[max(0, report - 120):report + 60]
 
 
