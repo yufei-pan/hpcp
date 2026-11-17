@@ -14289,6 +14289,9 @@ def remove_moved_sources(src_paths, file_list, sym_links, single_thread=False, m
 	# directories (in every mode); the pool's jobs show the "Deleted" bar.
 	progress = _RemoveProgress()
 	_remove_items(listed, single_thread, max_workers, verbose, files_per_job, progress=progress)
+	# The pool's jobs drew the "Deleted" bar, not this line, whose first frame has been due since it began: drawn at once, the
+	# pass over the directories would show an empty one (no count yet) after the bar's summary. Its first is half a second in.
+	progress.due = time.monotonic() + _LINE_INTERVAL
 	left = []
 	for root in roots:
 		# A root inside another one is walked with it.

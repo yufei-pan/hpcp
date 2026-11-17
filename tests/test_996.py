@@ -115,7 +115,18 @@ def test_996_a_serial_moves_removal_prints_the_line_at_a_terminal(tmp_path, size
 	assert frames and all(frame.count('iteration:') == 1 and 'Removed: ' in frame for frame in frames), frames
 
 
-def test_996_a_moves_directory_pass_shows_the_line_in_every_mode(tmp_path, capsys, monkeypatch, reset_hpcp_globals):
+def test_996_a_pooled_moves_directory_pass_draws_no_empty_frame(tmp_path):
+	'''The pass over the source directories after a pool removed the files: its first frame is half a second into it. 9.96 drew it
+	at once (the line's first frame was due since the move began), an empty one ("src | iteration:2 |") after the bar's summary.'''
+	_tree(tmp_path / 'src')
+	rc, output = _run(['-rm', '-rf', '-F', str(FILES_PER_SECOND), '-j', '2', 'src', '-d', 'dst/'], tmp_path)
+	assert rc == 0 and not (tmp_path / 'src').exists(), output
+	frames = _frames(_removal(output))
+	assert all(re.search(r'(Removed|Folders): [\d.]+ ', frame) for frame in frames), frames
+
+
+@pytest.mark.parametrize('single_thread', [True, False], ids=['serial', 'pool'])
+def test_996_a_moves_directory_pass_shows_the_line_in_every_mode(tmp_path, capsys, monkeypatch, reset_hpcp_globals, single_thread):
 	'''The pass over the source directories after the files are gone (a pool's too: its jobs show the "Deleted" bar, the pass
 	is the parent's) draws the line with the directories it removes: 9.95 drew none in any mode.'''
 	monkeypatch.setattr(hpcp, '_LINE_INTERVAL', 0)
