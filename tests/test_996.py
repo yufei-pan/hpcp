@@ -435,6 +435,8 @@ def test_996_an_unremovable_file_is_reported_once(tmp_path, extra):
 	assert rc == 192 and sorted(os.listdir(str(tmp_path / 'src'))) == ['locked'], output
 	lines, _, report = output.partition('Error occurred: ')
 	assert lines.count('Remove process exception:') == 3 and report.count('Remove process exception:') == 3, output
+	# The summary counts what was unlinked (20), not the 23 listed (9.95 and 9.96's -rwloff counted the failed unlinks too).
+	assert 'Removed 20 files and links from' in lines, output
 	for name in ('k0', 'k1', 'k2'):
 		assert lines.count(os.path.join('locked', name) + ' generated an exception') == 1, output
 

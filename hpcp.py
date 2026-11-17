@@ -4199,7 +4199,10 @@ def get_file_list_parallel(path,max_workers=56,exclude=None,append_hash=False,fu
 
 #%% ---- Delete Files ----
 def delete_file_bulk(paths, exclude=None):
+	"""Remove paths (a directory with what is in it, as -rm does). Returns (bytes, seconds, paths removed), the contract of a
+	delete_file_list_parallel remover."""
 	total_size = 0
+	removed = 0
 	start_time = time.monotonic()
 	for path in paths:
 		if exclude and is_excluded(path, exclude):
@@ -4213,20 +4216,23 @@ def delete_file_bulk(paths, exclude=None):
 					_rmtree(path, exclude, report=True)
 				else:
 					os.remove(path)
+				removed += 1
 			except Exception as exc:
 				eprint(f'Remove process exception:\n Deleting {path} generated an exception: {exc}')
 	endTime = time.monotonic()
-	return total_size, endTime - start_time
+	return total_size, endTime - start_time, removed
 
 def delete_file_list_parallel(file_list, max_workers, verbose=False,files_per_job=1,init_size=0,remover=None,report=True):
-	"""Delete file_list in pool jobs; remover (a worker body taking a list of paths, returning (bytes, seconds)) is
-	delete_file_bulk unless given. Without report the jobs' error lines and errors are left out (_task_result): the
-	caller's next step meets and reports what they could not remove."""
+	"""Delete file_list in pool jobs; remover (a worker body taking a list of paths, returning (bytes, seconds, how many it
+	removed)) is delete_file_bulk unless given. Without report the jobs' error lines and errors are left out (_task_result): the
+	caller's next step meets and reports what they could not remove. Returns (paths handled: the "Deleted" bar's count, bytes,
+	paths the jobs removed)."""
 	remover = remover or delete_file_bulk
 	global FILES_RATE_LIMIT
 	global BYTES_RATE_LIMIT
 	total_files = len(file_list)
 	file_list_iterator = iter(file_list)
+	removed = 0
 	start_time = time.monotonic()
 	last_refresh_time = start_time
 	futures = {}
@@ -4263,7 +4269,9 @@ def delete_file_list_parallel(file_list, max_workers, verbose=False,files_per_jo
 			for doneTask in done:
 				delete_files = futures.pop(doneTask)
 				deleted_files_count_this_run = len(delete_files)
-				rmSize, rmTime = _task_result(doneTask, (0, 0), 'Remove process exception', report=report)
+				# (A job that crashed removed none of them: its default.)
+				rmSize, rmTime, rmCount = _task_result(doneTask, (0, 0, 0), 'Remove process exception', report=report)
+				removed += rmCount
 				current_iteration_total_run_time += rmTime
 				apb.update(num_files=deleted_files_count_this_run,cpSize=rmSize,cpTime=rmTime,files_per_job=files_per_job)
 			apb.scheduled_jobs = len(futures)
@@ -4304,7 +4312,7 @@ def delete_file_list_parallel(file_list, max_workers, verbose=False,files_per_jo
 	endTime = time.monotonic()
 	apb.stop()
 	_print_operation_summary(apb, endTime - start_time)
-	return apb.item_counter, apb.size_counter
+	return apb.item_counter, apb.size_counter, removed
 
 #%% ---- Copy Files ----
 def _chown_like_cp(path, st, **how):
@@ -13159,8 +13167,8 @@ def _remove_listed_files(items, rmdir=False, rate_limiter=None, one_filesystem=F
 	Lustre). rate_limiter (-F, in this process) paces the unlinks. With one_filesystem (-rme), a directory on another
 	device than its root (a filesystem mounted below it that mountinfo did not list, a btrfs subvolume: as rsync -x) is
 	not entered, with a note. progress (_RemoveProgress; a serial removal, in the parent): shown when it is due, checked
-	once an entry, and given the counts at the end. Returns (bytes, seconds) as delete_file_bulk does; bytes are not
-	counted."""
+	once an entry, and given the counts at the end. Returns (bytes, seconds, files and links unlinked) as delete_file_bulk
+	does (a remover of delete_file_list_parallel); bytes are not counted."""
 	start_time = time.monotonic()
 	clock = time.monotonic
 	# What this call removed, for progress: files and links unlinked, directories removed (one already gone counts, as in the walks).
@@ -13248,7 +13256,7 @@ def _remove_listed_files(items, rmdir=False, rate_limiter=None, one_filesystem=F
 			if progress is not None:
 				progress.files += removed
 				progress.folders += folders
-		return 0, time.monotonic() - start_time
+		return 0, time.monotonic() - start_time, removed
 	# held: the directories down to the current one, from the root (_HeldDirs); None before the first root.
 	held, current_root = None, None
 	# (root, components) of a directory that could not be entered: nothing listed below it is removed.
@@ -13330,7 +13338,7 @@ def _remove_listed_files(items, rmdir=False, rate_limiter=None, one_filesystem=F
 		if progress is not None:
 			progress.files += removed
 			progress.folders += folders
-	return 0, time.monotonic() - start_time
+	return 0, time.monotonic() - start_time, removed
 
 _SCANDIR_FD = os.scandir in os.supports_fd
 # Python 3.6 has no scandir on a descriptor. On Linux /proc/self/fd/N is the very directory descriptor N is open on (no
@@ -13453,15 +13461,15 @@ def _remove_items(items, single_thread=False, max_workers=1, verbose=False, file
 	large enough to share their directories' descriptors (with -F as given, as delete_file_list_parallel paces by
 	job). With one_filesystem (-rme) nothing on another filesystem than its root is removed. progress (_RemoveProgress):
 	the line in this process (the pool's jobs show the "Deleted" bar instead). report: see delete_file_list_parallel
-	(-rwloff: the walk after the jobs reports). Returns the number of items handled."""
+	(-rwloff: the walk after the jobs reports). Returns the number of files and links unlinked (not the ones that could not
+	be)."""
 	if not items:
 		return 0
 	if single_thread or max_workers <= 1:
-		_remove_listed_files(items, rate_limiter=_new_rate_limiter(), one_filesystem=one_filesystem, progress=progress)
-		return len(items)
+		return _remove_listed_files(items, rate_limiter=_new_rate_limiter(), one_filesystem=one_filesystem, progress=progress)[2]
 	job_size = files_per_job if FILES_RATE_LIMIT > 0 else max(files_per_job, min(256, len(items) // (max_workers * 4) or 1))
 	remover = functools.partial(_remove_listed_files, one_filesystem=True) if one_filesystem else _remove_listed_files
-	return delete_file_list_parallel(items, max_workers, verbose, job_size, remover=remover, report=report)[0]
+	return delete_file_list_parallel(items, max_workers, verbose, job_size, remover=remover, report=report)[2]
 
 def _dir_entries(fd, progress=None, path=None, files=0, folders=0):
 	"""[(name, is a directory)] for directory descriptor fd, a symlink being no directory: from d_type where scandir can
