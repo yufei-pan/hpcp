@@ -1300,7 +1300,8 @@ def _init_worker():
 	if not _worker_initialized:
 		_on_worker_start()
 		# A forked worker has the parent's mark of an open line (the frame it was drawing when the pool forked): the line is the
-		# parent's, and a note of the worker's own (_remove_listed_files's) must not end it.
+		# parent's, and a worker's note must not end it. A guard: no pool job ends a line today (_remove_listed_files's say() does,
+		# but only on its rmdir path, which runs in the parent), and one that did would end the parent's.
 		_BAR_DRAWN = False
 		# A worker that did not fork from the parent (forkserver, the default from Python 3.14) has a new stdout.
 		_escape_unencodable_stdout()
@@ -1529,7 +1530,8 @@ def _new_live(count):
 	the line then shows what the jobs return. Made as _new_slots makes its mapping, and for the same reason: Python 3.6 backs
 	a multiprocessing.Array with a file in the temporary directory, which a full disk (the case -rm is for) cannot take, so
 	forked workers inherit an anonymous shared mapping, which leaves no file; the other start methods get an Array through the
-	initializer."""
+	initializer. (On Python 3.6 the pool has no initializer, _pool: with forkserver or spawn the Array is made and no worker
+	gets it, so the line shows what the jobs return; to return None there, as _new_slots does, is a 9.97 deferral.)"""
 	with contextlib.suppress(OSError, ImportError, ValueError, TypeError):
 		if multiprocessing.get_start_method() == 'fork':
 			import mmap
@@ -4124,10 +4126,11 @@ def get_file_list_parallel(path,max_workers=56,exclude=None,append_hash=False,fu
 		listed_items = len(file_list) + len(link_list)
 		# A folder's listing that crashed (this default): its folder stays, as before 9.77.
 		no_result = (frozenset(), frozenset(), 0, frozenset())
-		# The listing's line, as the serial listing draws it, here in the parent (the jobs draw none, so two processes never draw
+		# The listing's line, in the serial listing's style, here in the parent (the jobs draw none, so two processes never draw
 		# one line): every _LINE_INTERVAL seconds, the folder the oldest running job lists and what the jobs have listed so far:
 		# those they returned, and what each running one has put in its worker's live cells (get_file_list_serial). A wide folder
-		# counts as it is listed.
+		# counts as it is listed. A running job's cell holds its files and links together, so its links show under Files until it
+		# returns (Links counts the returned ones; a 9.97 deferral: three cells a worker).
 		due = listing_start_time + _LINE_INTERVAL
 		current = path
 		live = _new_live(max_workers)
@@ -4203,7 +4206,8 @@ def get_file_list_parallel(path,max_workers=56,exclude=None,append_hash=False,fu
 
 #%% ---- Delete Files ----
 def delete_file_bulk(paths, exclude=None):
-	"""Remove paths (a directory with what is in it, as -rm does). Returns (bytes, seconds, paths removed), the contract of a
+	"""Remove paths (a directory with what is in it, as -rm does). Returns (bytes, seconds, how many paths it went through
+	without an exception: a directory counts as one even when an excluded entry or a failure inside it stays), the contract of a
 	delete_file_list_parallel remover."""
 	total_size = 0
 	removed = 0
@@ -4230,7 +4234,8 @@ def delete_file_list_parallel(file_list, max_workers, verbose=False,files_per_jo
 	"""Delete file_list in pool jobs; remover (a worker body taking a list of paths, returning (bytes, seconds, how many it
 	removed)) is delete_file_bulk unless given. Without report the jobs' error lines and errors are left out (_task_result): the
 	caller's next step meets and reports what they could not remove. Returns (paths handled: the "Deleted" bar's count, bytes,
-	paths the jobs removed)."""
+	the sum of what the jobs' removers counted: paths for delete_file_bulk, files and links unlinked for _remove_listed_files; a
+	job that died part way counts none, its unlinks left out)."""
 	remover = remover or delete_file_bulk
 	global FILES_RATE_LIMIT
 	global BYTES_RATE_LIMIT
@@ -4273,7 +4278,8 @@ def delete_file_list_parallel(file_list, max_workers, verbose=False,files_per_jo
 			for doneTask in done:
 				delete_files = futures.pop(doneTask)
 				deleted_files_count_this_run = len(delete_files)
-				# (A job that crashed removed none of them: its default.)
+				# (A job that died part way counts as none, its default: what it unlinked before is left out of the count. Its error
+				# line and the exit status stand.)
 				rmSize, rmTime, rmCount = _task_result(doneTask, (0, 0, 0), 'Remove process exception', report=report)
 				removed += rmCount
 				current_iteration_total_run_time += rmTime
@@ -13469,7 +13475,7 @@ def _remove_items(items, single_thread=False, max_workers=1, verbose=False, file
 	job). With one_filesystem (-rme) nothing on another filesystem than its root is removed. progress (_RemoveProgress):
 	the line in this process (the pool's jobs show the "Deleted" bar instead). report: see delete_file_list_parallel
 	(-rwloff: the walk after the jobs reports). Returns the number of files and links unlinked (not the ones that could not
-	be)."""
+	be; a pool job that died part way counts none, its unlinks left out)."""
 	if not items:
 		return 0
 	if single_thread or max_workers <= 1:

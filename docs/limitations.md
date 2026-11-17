@@ -264,11 +264,11 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - **Noted:** 2026-11-15, the 9.94 final review (F5, last paragraph); a deferral, not asked.
 
 ### A refusal's note is printed once for each worker, not once a run
-- **Kind:** deferred (9.96).
-- **What the operator sees:** under `-nds`, `hpcp src/ -d A/ -d B/ -ncd -nds` with `B/sub` a link prints its `Note: B/sub is a link ...` once in each worker process that copies a file below it (26 identical lines at `-j 32`; 94 for 20 such directories, ran 2026-11-15), and in a list run once for each listed file below it, since each gets a pool of its own (24 lines for 24 files, ran). A destination that now leads elsewhere than the run pinned (`... now leads to another directory ...`) is noted the same way, since 9.89. The exit code and the files copied are right.
+- **Kind:** deferred (9.97).
+- **What the operator sees:** under `-nds`, `hpcp src/ -d A/ -d B/ -ncd -nds` with `B/sub` a link prints its `Note: B/sub is a link ...` once in each worker process that copies a file below it (26 identical lines at `-j 32`; 94 for 20 such directories, ran 2026-11-15; 8 to 10 for 40 files in one directory when run again on 2026-11-17, the number following how many workers get a file), and in a list run (`-sfl`, 24 files) the same, once for each worker process (1, 2 and 7 lines at `-j 1`, `-j 2` and `-j 24`, ran 2026-11-17). A destination that now leads elsewhere than the run pinned (`... now leads to another directory ...`) is noted the same way, since 9.89. The exit code and the files copied are right.
 - **Why:** the note is printed where the file is copied, and each worker remembers only what it printed itself.
-- **Plan (9.96):** each task hands its notes back with its errors (since 9.96 a task's error lines come back through `_settled` already: the parent only has to print each note once a run). The pin note then drops "and the other destinations take its files", which is false where they fail too.
-- **Revisit when:** 9.96.
+- **Plan (9.97):** each task hands its notes back with its errors (since 9.96 a task's error lines come back through `_settled` already: the parent only has to print each note once a run). The pin note then drops "and the other destinations take its files", which is false where they fail too.
+- **Revisit when:** 9.97.
 - **Noted:** 2026-11-15, the 9.94 fix round's re-review; a deferral, not asked.
 
 ### A stop in a `-dd` partition's copy exits 181, not 130
@@ -281,9 +281,9 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 
 ### Some lines a pool worker writes itself land on the parent's open progress line
 - **Kind:** deferred (9.97).
-- **What the operator sees:** the lines a pool worker writes straight to stdout or stderr (a discarded temporary file's note, `_copy_file`'s `Note:` and `Error copying` lines, a link-tracking bar's errors) know nothing of the parent's progress line: in a combined log (`> log 2>&1`) one can land on a frame's line. Each is one line for a rare event. 9.95 and 9.96 alike (read from the code 2026-11-17; the space warning below is the one reproduced).
-- **Why:** only the parent knows whether its line is open (one mark, `_BAR_DRAWN`); a pool task's error lines come back to it with the task's result (`_settled`), these writes never did.
-- **Plan (9.97):** each such line goes back with the task's result as the error lines do (`_TASK_LINES`), and the parent prints it with the same line start.
+- **What the operator sees:** the lines a pool worker writes straight to stdout or stderr (a discarded temporary file's note, `_copy_file`'s `Note:` and `Error copying` lines) know nothing of the parent's progress line: in a combined log (`> log 2>&1`) one can land on a frame's line (an `Error copying` line was seen on a frame in 9.95, not in three runs of 9.96; 9.96 by reading the code, 2026-11-17). The link-tracking bar is the parent's own and sets no mark, so its errors (`Failed to create symbolic link`) land on its frame the same way (`...|10.0% | 971.23 F/sFailed to create symbolic link`, ran 2026-11-17 on 9.96 and 9.95). Each is one line for a rare event.
+- **Why:** only the parent knows whether its line is open (one mark, `_BAR_DRAWN`); a pool task's error lines come back to it with the task's result (`_settled`), these writes never did. The link-tracking bar runs in the parent, in no task, but its frames do not set the mark as the copy bar's do, so its errors start no new line.
+- **Plan (9.97):** each worker's line goes back with the task's result as the error lines do (`_TASK_LINES`), and the parent prints it with the same line start. The link-tracking bar sets the mark as the copy bar does, and its errors go through `_error_line`.
 - **Revisit when:** 9.97.
 - **Noted:** 2026-11-17, 9.96's final review (second opinions code1 and docs2); a deferral, not asked.
 
@@ -299,13 +299,13 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - **Kind:** deferred (9.97).
 - **What the operator sees:** `hpcp -rm -rf -pfl -F 2000` on 46,000 files in 21 directories (one of 40,000 files), Python 3.6 with the spawn start method (Windows): the jobs ignore the pace (1.7 s on 9.95, 2.7 s on 9.96 where about 23 s are expected), and while the wide directory's job runs the line stays at the finished jobs' count (the listing's too: a wide folder under `-pfl` is counted when its job returns). The files are removed all the same. Not seen with fork (Python 3.6 to 3.14) or with spawn on 3.9 and 3.14 (checked 2026-11-17).
 - **Why:** Python 3.6's pool has no initializer (3.7+), so a spawned worker never gets the rate share or the live counts, which reach a forked worker by inheritance.
-- **Plan (9.97):** where the pool has no initializer, each task carries the share (the counter and the live counts are shared objects: they can be passed as a task's arguments to a process the pool starts).
+- **Plan (9.97):** where the pool has no initializer, the share must reach a spawned worker another way. Shared values can not be passed as a task's arguments (Python 3.14 raises `Synchronized objects should only be shared between processes through inheritance`; Python 3.6 never completes), so the carrier is to design first: a file-backed mapping passed by name, or a Manager proxy (neither tried).
 - **Revisit when:** 9.97. Python 3.6 is end-of-life support: the fix goes in only if it adds no part to the 3.11+ path.
 - **Noted:** 2026-11-17, 9.96's final review (second opinion code4); a deferral, not asked.
 
 ### A pool task keeps all its error lines until it returns
 - **Kind:** deferred (9.97).
-- **What the operator sees:** a job that meets a great many failures (one copy job over a directory of unreadable files) holds every error line, twice (in its error list and in `_TASK_LINES`), until it returns, and the parent prints them then: memory the size of the lines, and the lines late. 9.95 printed each as it happened (and kept its error list in the worker alike).
+- **What the operator sees:** a job that meets a great many failures (one copy job over a directory of unreadable files) holds every error line in `_TASK_LINES` (and each one with a `:` in its error list too) until it returns, and the parent prints them then: memory the size of the lines, and the lines late. 9.95 printed each as it happened (and kept its error list in the worker alike).
 - **Why:** 9.96's task hands its error lines back with its result so that only the parent writes to the line; no number bounds them.
 - **Plan (9.97):** measure how many lines the worst jobs meet (a tree of unreadable files), keep that many in a task with a final `... and N more` line (the error list keeps counting), and write the number's reason beside it.
 - **Revisit when:** 9.97.
@@ -318,6 +318,38 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - **Plan (9.97):** find where multiCMD's frame form on macOS differs from Linux's, fix it in multiCMD and embed it.
 - **Revisit when:** 9.97.
 - **Noted:** 2026-11-17, found while checking 9.96 on the Mac; a deferral, not asked.
+
+### Under `-pfl`, a running job's symlinks show as files on the listing's line
+- **Kind:** deferred (9.97).
+- **What the operator sees:** while a `-pfl` job lists a folder of many symlinks, the listing's line counts them under `Files` (`src/wide | iteration:1 | Files: 297.00 K`), and they move to `Links` when the job returns (ran 2026-11-17, 600,000 symlinks in one folder). 9.95's job drew its own frames with `Links:`. The counts and the listing are right.
+- **Why:** a job's live cells carry two counts, the entries (files and links) and the subfolders.
+- **Plan (9.97):** three cells a worker (files, links, folders), each shown under its own label.
+- **Revisit when:** 9.97.
+- **Noted:** 2026-11-17, 9.96's fix round re-review; a deferral, not asked.
+
+### On Python 3.14 with no writable temporary directory, a pooled copy or `-rm -pfl` exits 70
+- **Kind:** deferred (9.97).
+- **What the operator sees:** `hpcp -j 2 src -d dst/` or `hpcp -rm -rf -pfl -j 2 src` on Python 3.14 where no directory takes a file (`/tmp`, `/var/tmp`, `/usr/tmp` and the working directory read-only or full; ran 2026-11-17, in a read-only container with the data on a tmpfs): exit 70 with a traceback at the pool's first worker (`No usable temporary directory found`), nothing copied or removed. 9.95 the same; Python 3.6 and 3.11, which fork their workers, work.
+- **Why:** 3.14's default start method is the fork server, which makes its socket in the temporary directory when the pool starts its first worker.
+- **Plan (9.97):** where no temporary directory takes the fork server's socket, start the pool's workers by fork, as 3.6 to 3.13 do (the case `-rm` is for, a full disk), and test it with the read-only layout above.
+- **Revisit when:** 9.97.
+- **Noted:** 2026-11-17, 9.96's fix round re-review (found while checking the live cells' guard); a deferral, not asked.
+
+### Python 3.6 with forkserver or spawn: the live counts' array is made and no worker gets it
+- **Kind:** deferred (9.97).
+- **What the operator sees:** nothing wrong on screen: a `-pfl` listing of the same tree gave the right sets and no frame showed a wrong count (ran 2026-11-17, Python 3.6 with spawn); the line shows what the jobs return. The cost is a temporary-file arena made for nothing. From reading only, on a full temporary filesystem its first touch can raise SIGBUS, which the guard around it does not catch (not run).
+- **Why:** `_new_live` returns a `multiprocessing.Array` for every start method but fork, and Python 3.6's pool has no initializer to hand it to a worker; `_new_slots` already returns nothing there.
+- **Plan (9.97):** `_new_live` returns None there too. Python 3.6 is end-of-life support: this takes a part out of the 3.6 path.
+- **Revisit when:** 9.97.
+- **Noted:** 2026-11-17, 9.96's fix round, second opinion (code1 lead 3); a deferral, not asked.
+
+### A `-pfl` listing job that raises keeps its partial counts in the listing's line
+- **Kind:** deferred (9.97).
+- **What the operator sees:** when a listing job raises an error its per-entry handlers do not catch (a `MemoryError`, say; no ordinary path to one was found), `Files` and `Folders` on the line stay overstated by what the job had listed, for the rest of that listing. The returned sets are as before: the folder's entries are left out. Not run.
+- **Why:** the job's published counts stay in its worker's cells; its last publish does not run when it raises, and the parent takes no counts from a crashed job.
+- **Plan (9.97):** when a job's result is the crash default, the parent takes what its worker had published off the sum.
+- **Revisit when:** 9.97.
+- **Noted:** 2026-11-17, 9.96's fix round, second opinion (code1 lead 2); a deferral, not asked.
 
 ### With -wb, a rewrite does not keep a per-file layout, chattr flags or the project id
 - **Kind:** known limitation.

@@ -368,7 +368,8 @@ def test_996_a_pfl_jobs_error_lines_leave_no_blank_line_in_a_combined_log(tmp_pa
 @not_root
 def test_996_a_copys_job_error_lines_leave_no_blank_line_in_a_combined_log(tmp_path):
 	'''A copy's job meets several files it can not read: 9.94 and 9.95 started each of its error lines with a line end, an empty
-	line before each one after the first that no frame came between (16 of the 50 in one run). Each is still at a line's start.'''
+	line before each one after the first that no frame came between (16, 19 and 19 of the 50 in three runs of 9.95). Each is still
+	at a line's start.'''
 	_tree(tmp_path / 'src', 2, 100)
 	for number in range(0, 100, 2):
 		os.chmod(str(tmp_path / 'src' / 'd1' / ('f%d' % number)), 0)
