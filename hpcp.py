@@ -440,8 +440,8 @@ _BAR_DRAWN = False
 _LINE_START = [None, '', False]  # (pid, _line_start's answer, whether stdout and stderr are one file)
 
 def _line_start():
-	"""What starts an error line that may land on a progress frame's line, once per process: '\033[2K\r' when stderr is a
-	terminal (it clears the frame's line and starts there, also where the frame reaches the terminal through | tee); '\n' when
+	"""What starts an error line that may land on a progress frame's line, once per process: '\\033[2K\\r' when stderr is a
+	terminal (it clears the frame's line and starts there, also where the frame reaches the terminal through | tee); '\\n' when
 	stdout and stderr are one file (> log 2>&1), which ends the frame's line; else nothing (no frame is in stderr's file). Where
 	stdout and stderr are one file, a terminal too, the line it starts ends stdout's open line (_LINE_START[2])."""
 	pid = os.getpid()
@@ -1441,8 +1441,8 @@ def _run_task(settings, func, *args, **kwargs):
 		_end_by(_STOPPED)
 
 def _settled(future, report=True):
-	"""(result, errors, crash) of a done _submit_task future, the task's error lines printed here (with report: a caller whose
-	next step meets and reports again what the task could not do leaves them out). What it failed with is the worker's, a stop
+	"""(result, errors, crash) of a done _submit_task future, the task's error lines printed here (report False leaves them out:
+	for a caller whose next step meets and reports again what the task could not do). What it failed with is the worker's, a stop
 	(SystemExit, KeyboardInterrupt: the pool's worker loop sends back one raised as it sent a result) included, and becomes a
 	crash; a stop of this process's own is raised on. A BrokenProcessPool marks the pool (_POOL_BROKEN)."""
 	global _POOL_BROKEN
