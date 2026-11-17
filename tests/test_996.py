@@ -441,6 +441,25 @@ def test_996_an_unremovable_file_is_reported_once(tmp_path, extra):
 		assert lines.count(os.path.join('locked', name) + ' generated an exception') == 1, output
 
 
+@not_root
+@pytest.mark.parametrize('extra', [['-s'], ['-j', '2']], ids=['serial', 'pool'])
+def test_996_a_move_reports_an_unremovable_listed_file_once(tmp_path, extra):
+	'''A move whose source has files that can not be unlinked: the removal of the listed files reports each, and the pass over the
+	directories no longer names them again as "entries the copy did not list" (9.94 and 9.95 did, with the wrong reason).'''
+	_tree(tmp_path / 'src', 2, 10)
+	_locked(tmp_path / 'src' / 'locked', ['k0', 'k1', 'k2'])
+	try:
+		rc, output = _run(['-rm', '-rf'] + extra + ['src', '-d', 'dst/'], tmp_path)
+	finally:
+		_unlock(tmp_path / 'src')
+		_unlock(tmp_path / 'dst')
+	assert rc == 192, output
+	lines, _, report = output.partition('Error occurred: ')
+	assert lines.count('Remove process exception:') == 3 and report.count('Remove process exception:') == 3, output
+	assert 'Move left entries' not in output, output
+	assert sorted(os.listdir(str(tmp_path / 'src' / 'locked'))) == ['k0', 'k1', 'k2']
+
+
 # ---- 5. A reader that closes the pipe early ----
 
 @posix_only

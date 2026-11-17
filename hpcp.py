@@ -14283,6 +14283,9 @@ def remove_moved_sources(src_paths, file_list, sym_links, single_thread=False, m
 	for path in sorted(kept):
 		eprint(f'Destination clash: not removing {path}: {kept[path]}')
 	pairs = [(path, root) for path, root in pairs if path not in kept]
+	# What the listed removal tries: one it could not unlink is reported there, once; the directory pass does not name it again as
+	# an entry the copy did not list (nor one kept, reported above).
+	reported = {path for path, _ in pairs} | set(kept)
 	listed = _items_below(pairs, {root: (root, root_ids[root], root_ids[root]) for root in roots})
 	print(f"Removing the {len(listed)} files and links copied from {_sources_text(roots)} with {max_workers if not single_thread else '1'} workers")
 	if not remove_force:
@@ -14306,7 +14309,7 @@ def remove_moved_sources(src_paths, file_list, sym_links, single_thread=False, m
 		if not os.path.isdir(root) or os.path.islink(root) or outermost_root(root) != root:
 			continue
 		_, root_left, errors = _remove_tree_fd(root, root_ids[root], exclude, progress=progress)
-		left.extend(path for path in root_left if os.path.abspath(path) not in kept)
+		left.extend(path for path in root_left if os.path.abspath(path) not in reported)
 		for directory, e in errors:
 			if e.errno in (errno.ELOOP, errno.ENOTDIR, errno.ESTALE):
 				eprint(f'Remove directory failed: not removing {directory}: it, or a directory on its path, is no longer what the copy listed ({e.strerror})')
