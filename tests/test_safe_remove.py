@@ -68,8 +68,8 @@ def test_serial_remove_never_enters_a_directory_swapped_after_its_parent_was_rea
 	victim = _victim(tmp_path)
 	real = hpcp_mod._dir_entries
 	calls = []
-	def dir_entries(fd):
-		entries = real(fd)
+	def dir_entries(fd, *frame):
+		entries = real(fd, *frame)
 		calls.append(fd)
 		if len(calls) == 1:
 			_swap_for_a_symlink(src / 'sub', victim)
@@ -325,8 +325,8 @@ def test_serial_walk_removes_an_entry_that_became_a_directory(tmp_path, hpcp_mod
 	(src / 'x').mkdir(parents=True)
 	(src / 'x' / 'inside.txt').write_text('x')
 	real = hpcp_mod._dir_entries
-	def dir_entries(fd):
-		return [(name, False if name == 'x' else is_dir) for name, is_dir in real(fd)]
+	def dir_entries(fd, *frame):
+		return [(name, False if name == 'x' else is_dir) for name, is_dir in real(fd, *frame)]
 	monkeypatch.setattr(hpcp_mod, '_dir_entries', dir_entries)
 	hpcp_mod.process_remove([str(src)], single_thread=True, remove_force=True)
 	assert not src.exists()
@@ -483,7 +483,7 @@ def test_move_second_pass_enters_a_directory_whose_type_check_failed(tmp_path, h
 	root = tmp_path / 'src'
 	(root / 'sub' / 'empty').mkdir(parents=True)
 	real = hpcp_mod._dir_entries
-	monkeypatch.setattr(hpcp_mod, '_dir_entries', lambda fd: [(name, None if name == 'sub' else is_dir) for name, is_dir in real(fd)])
+	monkeypatch.setattr(hpcp_mod, '_dir_entries', lambda fd, *frame: [(name, None if name == 'sub' else is_dir) for name, is_dir in real(fd, *frame)])
 	_, left, errors = hpcp_mod._remove_tree_fd(str(root), hpcp_mod._path_identity(str(root)))
 	assert (left, errors) == ([], [])
 	assert not root.exists()
@@ -494,7 +494,7 @@ def test_walk_unlinks_a_file_whose_type_check_failed(tmp_path, hpcp_mod, reset_h
 	root.mkdir()
 	(root / 'f.txt').write_text('x')
 	real = hpcp_mod._dir_entries
-	monkeypatch.setattr(hpcp_mod, '_dir_entries', lambda fd: [(name, None) for name, _ in real(fd)])
+	monkeypatch.setattr(hpcp_mod, '_dir_entries', lambda fd, *frame: [(name, None) for name, _ in real(fd, *frame)])
 	removed, left, errors = hpcp_mod._remove_tree_fd(str(root), hpcp_mod._path_identity(str(root)), remove_files=True)
 	assert (removed, left, errors) == (1, [], [])
 	assert not root.exists()
