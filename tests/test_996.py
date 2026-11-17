@@ -575,6 +575,30 @@ def test_996_the_walk_without_descriptor_calls_shows_the_line_while_it_lists(tmp
 	monkeypatch.setattr(hpcp, '_walk', walk)
 	hpcp.process_remove([str(tmp_path / 'src')], single_thread=True, remove_force=True)
 	assert not (tmp_path / 'src').exists()
+# ---- 8. Found in the review of 9.96 ----
+
+def _mark_in_a_worker():
+	'''What a pool worker's stdout line mark is (a module-level function: a task is pickled by its name).'''
+	return hpcp._BAR_DRAWN
+
+
+def test_996_a_forked_worker_starts_with_no_line_open(monkeypatch, reset_hpcp_globals):
+	'''A worker forked while the parent's progress line was open has the parent's mark: the line is the parent's, and the notes a
+	worker prints itself ("Keeping non-empty directory:" ends the open line first) must not end it. Forked workers (the default
+	before Python 3.14) are the ones that inherit it.'''
+	import multiprocessing
+	monkeypatch.setattr(hpcp, '_worker_initialized', False)
+	method = multiprocessing.get_start_method()
+	multiprocessing.set_start_method('fork', force=True)
+	try:
+		hpcp._BAR_DRAWN = True
+		with hpcp._pool(1) as executor:
+			result, errors, crash = hpcp._settled(hpcp._submit_task(executor, _mark_in_a_worker))
+	finally:
+		multiprocessing.set_start_method(method, force=True)
+	assert crash is None and result is False, (result, crash)
+
+
 @pytest.mark.parametrize('how', ['arguments', 'stored-list'])
 def test_996_rme_with_rf_removes_the_extras_without_asking(tmp_path, how):
 	'''-rf is "Remove all files without prompt" (its help): 9.95 asked all the same before -rme removed its extra files, and with no

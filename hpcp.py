@@ -1295,9 +1295,12 @@ def _init_worker():
 	the stops in. A pool worker starts with them blocked (_pool.submit blocks them while it may start one, and a fork server
 	keeps the mask it started with for every worker it forks), so a stop that came meanwhile reaches hpcp's handler only now
 	and ends the worker without a traceback (Python's own SIGINT handler raises one there under forkserver and spawn)."""
-	global _worker_initialized
+	global _worker_initialized, _BAR_DRAWN
 	if not _worker_initialized:
 		_on_worker_start()
+		# A forked worker has the parent's mark of an open line (the frame it was drawing when the pool forked): the line is the
+		# parent's, and a note of the worker's own (_remove_listed_files's) must not end it.
+		_BAR_DRAWN = False
 		# A worker that did not fork from the parent (forkserver, the default from Python 3.14) has a new stdout.
 		_escape_unencodable_stdout()
 		_claim_slot()
