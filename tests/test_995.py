@@ -240,8 +240,8 @@ def test_995_a_run_that_shows_no_frame_prints_no_empty_line(tmp_path, capsys, re
 
 
 def test_995_the_library_and_a_moves_walks_print_nothing(tmp_path, capsys, monkeypatch, reset_hpcp_globals):
-	'''_rmtree (the library) and the move's directory pass give the walk no progress object: no line, whatever the interval (the
-	move's directory pass is silent in every mode: a 9.96 deferral). On 9.94 this fails only for the missing class.'''
+	'''_rmtree (the library) and a walk given no progress object (a direct call) draw no line, whatever the interval. (A move's
+	directory pass gives it one since 9.96: tests/test_996.py.) On 9.94 this fails only for the missing class.'''
 	monkeypatch.setattr(hpcp._RemoveProgress, '_INTERVAL', 0)
 	_tree(tmp_path / 'one')
 	hpcp._rmtree(tmp_path / 'one')

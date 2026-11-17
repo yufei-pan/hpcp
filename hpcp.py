@@ -11760,10 +11760,15 @@ def remove_extra_dirs(src_paths, dests,exclude=None,dest_image=False,keep=(),des
 	# Once the walks have entered them all (one on another device then is no longer here).
 	for _, name in extraDirs.values():
 		print(f"Deleting extra directory: {name}")
-	# Deepest first, by descriptors from each pinned destination root without following symlinks (_remove_listed_files).
+	# Deepest first, by descriptors from each pinned destination root without following symlinks (_remove_listed_files), with
+	# the removal's line.
 	ordered = sorted(extraDirs, key=lambda path: (-len(pathlib.Path(path).parts), path))
-	_remove_listed_files(_items_below(((directory, extraDirs[directory][0]) for directory in ordered), dest_roots, sort=False), rmdir=True,
-		one_filesystem=True)
+	progress = _RemoveProgress()
+	try:
+		_remove_listed_files(_items_below(((directory, extraDirs[directory][0]) for directory in ordered), dest_roots, sort=False), rmdir=True,
+			one_filesystem=True, progress=progress)
+	finally:
+		progress.finish()
 
 def _source_guard(src_paths):
 	"""-rme's last word on a path it found extra: guarded(path, kind) is True when path (as the destination's walk spells
@@ -12100,9 +12105,14 @@ def remove_extra_files(total_file_list, dests,max_workers,verbose,files_per_job,
 			_confirm("Do you want to delete them? (y/n)", "Not deleting extra files")
 			start_time = time.monotonic()
 			# By descriptors from each pinned destination root, without following symlinks (_remove_listed_files): a
-			# destination directory swapped for a symlink while the prompt waited is not removed through.
-			_remove_items(_items_below(((path, extra_roots[path]) for path in inDestNotInSrc), dest_roots), single_thread, max_workers,
-				verbose, files_per_job, one_filesystem=True)
+			# destination directory swapped for a symlink while the prompt waited is not removed through. Serially with
+			# the removal's line (the pool's jobs show the "Deleted" bar).
+			progress = _RemoveProgress()
+			try:
+				_remove_items(_items_below(((path, extra_roots[path]) for path in inDestNotInSrc), dest_roots), single_thread, max_workers,
+					verbose, files_per_job, one_filesystem=True, progress=progress)
+			finally:
+				progress.finish()
 			# The destinations' listings (cached) still show what was removed.
 			_get_file_list_cache.clear()
 			endTime = time.monotonic()
@@ -13029,7 +13039,7 @@ class _HeldDirs:
 			os.close(fd)
 		self.names, self.fds = [], []
 
-def _remove_listed_files(items, rmdir=False, rate_limiter=None, one_filesystem=False):
+def _remove_listed_files(items, rmdir=False, rate_limiter=None, one_filesystem=False, progress=None):
 	"""Worker body for remove_moved_sources and remove_extra_files: unlink these (root, its identity, path below it)
 	entries, files and links, in path order (with rmdir, remove_extra_dirs: rmdir them, non-empty ones kept). Never a directory: unlink refuses one, so a listed path that became a directory keeps what it
 	holds; one already gone is no error. Each goes relative to its directory's descriptor, reached from the pinned root
@@ -13039,26 +13049,42 @@ def _remove_listed_files(items, rmdir=False, rate_limiter=None, one_filesystem=F
 	them, so each directory is opened about once per job; nothing is stat'ed (a stat costs a server round trip on
 	Lustre). rate_limiter (-F, in this process) paces the unlinks. With one_filesystem (-rme), a directory on another
 	device than its root (a filesystem mounted below it that mountinfo did not list, a btrfs subvolume: as rsync -x) is
-	not entered, with a note. Returns (bytes, seconds) as delete_file_bulk does; bytes are not counted."""
+	not entered, with a note. progress (_RemoveProgress; a serial removal, in the parent): shown when it is due, checked
+	once an entry, and given the counts at the end. Returns (bytes, seconds) as delete_file_bulk does; bytes are not
+	counted."""
 	start_time = time.monotonic()
+	clock = time.monotonic
+	# What this call removed, for progress: files and links unlinked, directories removed (one already gone counts, as in the walks).
+	removed = folders = 0
+	def say(text):
+		# A note of its own on stdout: the progress line, if open, ends first.
+		if progress is not None:
+			progress.finish()
+		print(text)
 	def remove(name, fd, path):
+		nonlocal removed, folders
 		try:
 			if rmdir:
 				os.rmdir(name, dir_fd=fd)
+				folders += 1
 			else:
 				if rate_limiter is not None:
 					_file_list_rate_limit(rate_limiter)
 				os.unlink(name, dir_fd=fd)
-		except (FileNotFoundError, IsADirectoryError):
+				removed += 1
+		except FileNotFoundError:
+			if rmdir:
+				folders += 1
+		except IsADirectoryError:
 			pass
 		except OSError as exc:
 			if not rmdir:
 				_unlink_failed(name, fd, path, exc)
 			elif exc.errno in (errno.ENOTEMPTY, errno.EEXIST):
-				print(f"Keeping non-empty directory: {path}")
+				say(f"Keeping non-empty directory: {path}")
 			elif exc.errno == errno.EBUSY and _is_mount_point(path):
 				# Mounted on since it was listed: another filesystem, left alone.
-				print(f"Keeping mount point: {path}")
+				say(f"Keeping mount point: {path}")
 			else:
 				_report_rmdir_failed(path, exc)
 	fallback_devices = {}
@@ -13080,29 +13106,40 @@ def _remove_listed_files(items, rmdir=False, rate_limiter=None, one_filesystem=F
 		except OSError:
 			return False
 	def remove_one(root, root_id, rel):
+		nonlocal removed, folders
 		if not rmdir:
 			_file_list_rate_limit(rate_limiter)
-			_remove_one_listed(root, root_id, rel)
+			if _remove_one_listed(root, root_id, rel):
+				removed += 1
 			return
 		e = _rmdir_below(root, root_id, rel)
 		if e is None:
+			folders += 1
 			return
 		path = root if rel in ('', '.') else os.path.join(root, rel)
 		if e.errno in (errno.ENOTEMPTY, errno.EEXIST):
-			print(f"Keeping non-empty directory: {path}")
+			say(f"Keeping non-empty directory: {path}")
 		elif e.errno == errno.EBUSY and _is_mount_point(path):
-			print(f"Keeping mount point: {path}")
+			say(f"Keeping mount point: {path}")
 		else:
 			_report_rmdir_failed(path, e)
 	if not _DIR_FD_WALK:
-		for root, root_id, rel in items:
-			# A serial removal's stop not acted on yet is, before the next entry goes (a no-op in a pool's worker).
-			_check_stop()
-			if one_filesystem and rel not in ('', '.') and foreign(root, rel):
-				eprint(f'Other filesystem left: {os.path.dirname(os.path.join(root, rel))} is another filesystem below {root}: '
-					'nothing in it is removed')
-				continue
-			remove_one(root, root_id, rel)
+		try:
+			for root, root_id, rel in items:
+				# A serial removal's stop not acted on yet is, before the next entry goes (a no-op in a pool's worker).
+				_check_stop()
+				# Once an entry, before it goes: a slow unlink (a network filesystem) shows as soon as it returns.
+				if progress is not None and clock() >= progress.due:
+					progress.show(os.path.dirname(os.path.join(root, rel)), removed, folders)
+				if one_filesystem and rel not in ('', '.') and foreign(root, rel):
+					eprint(f'Other filesystem left: {os.path.dirname(os.path.join(root, rel))} is another filesystem below {root}: '
+						'nothing in it is removed')
+					continue
+				remove_one(root, root_id, rel)
+		finally:
+			if progress is not None:
+				progress.files += removed
+				progress.folders += folders
 		return 0, time.monotonic() - start_time
 	# held: the directories down to the current one, from the root (_HeldDirs); None before the first root.
 	held, current_root = None, None
@@ -13116,6 +13153,8 @@ def _remove_listed_files(items, rmdir=False, rate_limiter=None, one_filesystem=F
 		for root, root_id, rel in items:
 			# A serial removal's stop not acted on yet is, before the next entry goes (a no-op in a pool's worker).
 			_check_stop()
+			if progress is not None and clock() >= progress.due:
+				progress.show(os.path.dirname(os.path.join(root, rel)), removed, folders)
 			if rel in ('', '.'):
 				remove_one(root, root_id, rel)
 				continue
@@ -13180,6 +13219,9 @@ def _remove_listed_files(items, rmdir=False, rate_limiter=None, one_filesystem=F
 	finally:
 		if held is not None:
 			held.close_all()
+		if progress is not None:
+			progress.files += removed
+			progress.folders += folders
 	return 0, time.monotonic() - start_time
 
 _SCANDIR_FD = os.scandir in os.supports_fd
@@ -13261,13 +13303,14 @@ def _new_rate_limiter():
 	return {'start_time': time.monotonic(), 'count': 0, 'limit': FILES_RATE_LIMIT} if FILES_RATE_LIMIT > 0 else None
 
 class _RemoveProgress:
-	"""The progress line of -rm, one object for the run: its descriptor walks (_remove_tree_fd) and its -pfl jobs
-	(_remove_trees_parallel) show it when it is due, every _INTERVAL seconds while they work, at a terminal and through a
+	"""The progress line of a removal, one object for it: plain -rm's descriptor walks (_remove_tree_fd) and its -pfl jobs
+	(_remove_trees_parallel); a move's and -rme's serial removal (_remove_listed_files) and a move's pass over its source
+	directories. They show it when it is due, every _INTERVAL seconds while they work, at a terminal and through a
 	pipe, in the style of the listing's (get_file_list_serial, which 9.73's -rm removed through): the current directory's last
 	50 characters, then 'Removed: N Folders: M' (N entries unlinked, M directories removed), with '| Overall: N Files' under
-	-F. The walks check due once an entry, so a wide directory shows as it goes, and a slow unlink (a network filesystem) as
-	soon as it returns. The line is left open, for the next frame to start over; finish() ends it. Walks add what they
-	removed when they end (files, folders)."""
+	-F (plain -rm's). The walks check due once an entry, so a wide directory shows as it goes, and a slow unlink (a network
+	filesystem) as soon as it returns. The line is left open, for the next frame to start over; finish() ends it. Walks add
+	what they removed when they end (files, folders)."""
 	__slots__ = ('start', 'due', 'files', 'folders', 'rate_limiter', 'overall_before', 'drawn')
 	# 9.73's, and the listing's: twice a second is live to the eye and a line each is nothing to a terminal or a log.
 	_INTERVAL = 0.5
@@ -13308,15 +13351,15 @@ class _RemoveProgress:
 			self.drawn = False
 			_BAR_DRAWN = False
 
-def _remove_items(items, single_thread=False, max_workers=1, verbose=False, files_per_job=1, one_filesystem=False):
+def _remove_items(items, single_thread=False, max_workers=1, verbose=False, files_per_job=1, one_filesystem=False, progress=None):
 	"""Unlink items (see _remove_listed_files) in this process, paced by -F, or in pool jobs of neighbouring entries,
 	large enough to share their directories' descriptors (with -F as given, as delete_file_list_parallel paces by
-	job). With one_filesystem (-rme) nothing on another filesystem than its root is removed. Returns the number of
-	items handled."""
+	job). With one_filesystem (-rme) nothing on another filesystem than its root is removed. progress (_RemoveProgress):
+	the line in this process (the pool's jobs show the "Deleted" bar instead). Returns the number of items handled."""
 	if not items:
 		return 0
 	if single_thread or max_workers <= 1:
-		_remove_listed_files(items, rate_limiter=_new_rate_limiter(), one_filesystem=one_filesystem)
+		_remove_listed_files(items, rate_limiter=_new_rate_limiter(), one_filesystem=one_filesystem, progress=progress)
 		return len(items)
 	job_size = files_per_job if FILES_RATE_LIMIT > 0 else max(files_per_job, min(256, len(items) // (max_workers * 4) or 1))
 	remover = functools.partial(_remove_listed_files, one_filesystem=True) if one_filesystem else _remove_listed_files
@@ -14109,21 +14152,30 @@ def remove_moved_sources(src_paths, file_list, sym_links, single_thread=False, m
 	# A named link goes last, after the trees too: a path named through it (lb/x, lb/d/) is reached while it is there.
 	last = [item for item in listed if item[2] == '.' and item[0] not in holders and os.path.islink(item[0])]
 	listed = [item for item in listed if item not in last]
-	_remove_items(listed, single_thread, max_workers, verbose, files_per_job)
+	# The removal's line, as plain -rm's: drawn by the serial removal of the listed files and by the pass over the source
+	# directories (in every mode); the pool's jobs show the "Deleted" bar.
+	progress = _RemoveProgress()
 	left = []
-	for root in roots:
-		# A root inside another one is walked with it.
-		if not os.path.isdir(root) or os.path.islink(root) or outermost_root(root) != root:
-			continue
-		_, root_left, errors = _remove_tree_fd(root, root_ids[root], exclude)
-		left.extend(path for path in root_left if os.path.abspath(path) not in kept)
-		for directory, e in errors:
-			if e.errno in (errno.ELOOP, errno.ENOTDIR, errno.ESTALE):
-				eprint(f'Remove directory failed: not removing {directory}: it, or a directory on its path, is no longer what the copy listed ({e.strerror})')
-			else:
-				eprint(f'Remove directory failed: {directory}: {e}')
-	if last:
-		_remove_items(last, single_thread, max_workers, verbose, files_per_job)
+	try:
+		_remove_items(listed, single_thread, max_workers, verbose, files_per_job, progress=progress)
+		for root in roots:
+			# A root inside another one is walked with it.
+			if not os.path.isdir(root) or os.path.islink(root) or outermost_root(root) != root:
+				continue
+			_, root_left, errors = _remove_tree_fd(root, root_ids[root], exclude, progress=progress)
+			left.extend(path for path in root_left if os.path.abspath(path) not in kept)
+			if errors:
+				# The lines below start their own: one ends the frame, not each.
+				progress.finish()
+			for directory, e in errors:
+				if e.errno in (errno.ELOOP, errno.ENOTDIR, errno.ESTALE):
+					eprint(f'Remove directory failed: not removing {directory}: it, or a directory on its path, is no longer what the copy listed ({e.strerror})')
+				else:
+					eprint(f'Remove directory failed: {directory}: {e}')
+		if last:
+			_remove_items(last, single_thread, max_workers, verbose, files_per_job, progress=progress)
+	finally:
+		progress.finish()
 	if left:
 		shown = ', '.join(pformat(path) for path in left[:10]) + (f' and {len(left) - 10} more' if len(left) > 10 else '')
 		eprint(f'Move left entries: {len(left)} source entries the copy did not list (written during the move, or special '
