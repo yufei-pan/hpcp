@@ -434,8 +434,8 @@ SINGLE_PASS_FILE_LIMIT = 1_000_000
 # copy's bars are off under -v (the copy sets it); a removal's walks' line is drawn under -v too (process_remove sets it; the
 # "Deleted" bar of -rwloff's jobs is off under -v). A run setting, handed to the workers (_TASK_SETTINGS).
 _BAR = False
-# Whether the parent's progress bar drew a frame since its line last ended (Adaptive_Progress_Bar and _RemoveProgress set it; stop()
-# and finish() clear it, each for the line it drew: a stop skips the former, and the latter leaves that bar's mark alone).
+# Whether the parent's progress bar drew a frame since its line last ended (Adaptive_Progress_Bar and _RemoveProgress set it; the
+# bar's stop() clears it, and _RemoveProgress.finish() only for the line it drew, so a bar a stop left open keeps its mark).
 _BAR_DRAWN = False
 _LINE_START = [None, '']  # (pid, _line_start's answer)
 
@@ -12843,8 +12843,8 @@ def process_remove(src_paths: list,single_thread = False, max_workers = multipro
 				_report_unremoved(path, e)
 	finally:
 		_BAR = bar
-		# Every way out ends the line a frame of this run's walks left open: a stop's report (on stdout, whatever stderr is) starts
-		# its own line. (-rwloff's job bar is not theirs: its mark stays set, and the report starts off its line, as in 9.94.)
+		# Every way out ends the line a frame of this run's walks left open: a stop's `Error occurred:` line (stdout, whatever stderr
+		# is) starts its own line. (-rwloff's job bar is not theirs: its mark stays set, and the report starts off its line, as in 9.94.)
 		progress.finish()
 	print(f"Removed {removed} files and links from {pformat(processedPaths)} in {time.monotonic()-start_time:0.4f} seconds")
 	print('-'*80)
@@ -13301,7 +13301,7 @@ class _RemoveProgress:
 
 	def finish(self):
 		"""End the line the last frame left open, as the next error or summary line starts on its own. Only the line this
-		object drew: the mark another bar set (-rwloff's job bar, whose own end of line a stop skips) stays for the stop's report."""
+		object drew: the mark another bar set (-rwloff's job bar, whose stop() a stop skips) stays for the stop's report."""
 		global _BAR_DRAWN
 		if self.drawn:
 			print()
