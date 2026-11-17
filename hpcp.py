@@ -461,6 +461,37 @@ def _bar_line_start():
 	bar has drawn a frame since its line last ended; else nothing."""
 	return _line_start() if (_IN_TASK and _BAR) or _BAR_DRAWN else ''
 
+def _end_line():
+	"""End stdout's line where a progress frame left it open (_BAR_DRAWN), so what is printed next starts a line of its own."""
+	global _BAR_DRAWN
+	if _BAR_DRAWN:
+		print()
+		_BAR_DRAWN = False
+
+# How often a progress line (the listing's, the removal's) draws a frame while its work goes on: 9.73's and the listing's
+# interval; twice a second is live to the eye, and a line each is nothing to a terminal or a log.
+_LINE_INTERVAL = 0.5
+
+def _show_listing(path, seconds, files, links, folders, size, rate_limiter=None):
+	"""Draw a frame of the listing's progress line (get_file_list_serial's, and the -pfl listing's loop): path's last 50
+	characters, the seconds, then what is listed so far (counts; each left out while 0), with '| Overall: N Files' under -F
+	where the listing paces itself. The line is left open (_BAR_DRAWN) for the next frame."""
+	global _BAR_DRAWN
+	suffix = ''
+	if files:
+		suffix += f'Files: {format_bytes(files,use_1024_bytes=False,to_str=True)} '
+	if links:
+		suffix += f'Links: {format_bytes(links,use_1024_bytes=False,to_str=True)} '
+	if folders:
+		suffix += f'Folders: {format_bytes(folders,use_1024_bytes=False,to_str=True)} '
+	if size:
+		suffix += f'Size: {format_bytes(size)}B '
+	if rate_limiter:
+		suffix += f'| Overall: {format_bytes(rate_limiter["count"],use_1024_bytes=False,to_str=True)} Files'
+	# Marked before the draw, as the removal's frame (_RemoveProgress.show).
+	_BAR_DRAWN = True
+	multiCMD.print_progress_bar(iteration=seconds, total=0, prefix=f'{path}'[-50:], suffix=suffix)
+
 def eprint(*args, **kwargs):
 	global ERRORS
 	out = kwargs.get('file', sys.stderr)
@@ -3639,6 +3670,7 @@ def get_file_list(path, exclude=None, append_hash=False, full_hash=False, max_wo
 	# Said for a directory only: a list (-sfl) gives one source per file, two lines each say nothing.
 	announce = os.path.isdir(path)
 	if announce:
+		_end_line()
 		print(f"Getting file list for {path}")
 	if parallel_file_listing:
 		file_list, links, size, folders = get_file_list_parallel(path, max_workers=max_workers, exclude=exclude, append_hash=append_hash, full_hash=full_hash, boundary=boundary)
@@ -3647,6 +3679,8 @@ def get_file_list(path, exclude=None, append_hash=False, full_hash=False, max_wo
 	result = (file_list, links, size, folders)
 	_get_file_list_cache[cache_key] = result
 	if announce:
+		# The listing's line ends first (9.73 to 9.95 printed this on its last frame's line).
+		_end_line()
 		print(f"Time taken to get file list: {time.monotonic() - start_time:0.4f} seconds")
 	return result
 
@@ -3846,12 +3880,13 @@ def _filesystem_boundary(listed_root, real_root, visible=None):
 		device = identity[0] if identity else None
 	return (points, device)
 
-def get_file_list_serial(root,exclude=None,append_hash=False,full_hash=False,recurse=True,_rate_limiter=None,respect_file_rate_limit=True,boundary=None,known_dir=False):
+def get_file_list_serial(root,exclude=None,append_hash=False,full_hash=False,recurse=True,_rate_limiter=None,respect_file_rate_limit=True,boundary=None,known_dir=False,show=True):
 	"""(files, links, size, folders) below root. Iterative: a tree deeper than Python's recursion limit (about 1000
 	levels) is listed too; each directory below root gets the checks a call for it as root would (length, exclude,
 	link, file, directory). recurse False lists root's entries only (its directories in folders, unchecked: a listing of
 	each says). boundary: see get_file_list. known_dir: root comes from a parent's listing (-pfl), which said directory:
-	checked as a directory below root is."""
+	checked as a directory below root is. show: draw the listing's line every _LINE_INTERVAL seconds (_show_listing); a
+	-pfl job's call does not, the parent's loop draws it."""
 	global FILES_RATE_LIMIT
 	if _rate_limiter is None and respect_file_rate_limit and FILES_RATE_LIMIT > 0:
 		_rate_limiter = {'start_time': time.monotonic(), 'count': 0, 'limit': FILES_RATE_LIMIT}
@@ -3859,7 +3894,6 @@ def get_file_list_serial(root,exclude=None,append_hash=False,full_hash=False,rec
 	links = set()
 	folders = set()
 	size = 0
-	iteration = 0
 	start_time = time.monotonic()
 	globalStartTIme = start_time
 	# -rme's destination listing: each directory below the root is opened before anything else (_enter_directory), so a
@@ -3932,25 +3966,12 @@ def get_file_list_serial(root,exclude=None,append_hash=False,full_hash=False,rec
 				continue
 			for entry in _scan_dir(target, current):
 				path = os.path.join(current, entry.name) if scan_fd is not None else entry.path
-				# update the progress bar every 0.5 seconds
-				currentTime = time.monotonic()
-				if currentTime - start_time > 0.5:
-					start_time = currentTime
-					# use the time passed as the iteration number
-					iteration = int(currentTime - globalStartTIme)
-					suffix = ''
-					if file_list:
-						suffix += f'Files: {format_bytes(len(file_list),use_1024_bytes=False,to_str=True)} '
-					if links:
-						suffix += f'Links: {format_bytes(len(links),use_1024_bytes=False,to_str=True)} '
-					if folders:
-						suffix += f'Folders: {format_bytes(len(folders),use_1024_bytes=False,to_str=True)} '
-					if size:
-						suffix += f'Size: {format_bytes(size)}B '
-					if _rate_limiter:
-						suffix += f'| Overall: {format_bytes(_rate_limiter["count"],use_1024_bytes=False,to_str=True)} Files'
-					# if the root is longer than 50 characters, we only show the last 50 characters
-					multiCMD.print_progress_bar(iteration=iteration, total=0, prefix=f'{current}'[-50:], suffix=suffix)
+				if show:
+					currentTime = time.monotonic()
+					if currentTime - start_time > _LINE_INTERVAL:
+						start_time = currentTime
+						# The seconds since the listing started as the iteration.
+						_show_listing(current, int(currentTime - globalStartTIme), len(file_list), len(links), len(folders), size, _rate_limiter)
 				if exclude and is_excluded(path,exclude):
 					continue
 				try:
@@ -3999,8 +4020,8 @@ def get_file_list_parallel(path,max_workers=56,exclude=None,append_hash=False,fu
 	if os.path.isfile(path):
 		realSize = get_file_size(path)
 		return frozenset([get_file_repr(path,append_hash,full_hash)]) ,frozenset(), realSize,frozenset()
-	#print(f'Getting file list for {path}')
 	if os.path.isdir(path):
+		started = time.monotonic()
 		file_list, link_list , size, folder_list = get_file_list_serial(
 			path,
 			exclude=exclude,
@@ -4020,8 +4041,17 @@ def get_file_list_parallel(path,max_workers=56,exclude=None,append_hash=False,fu
 		listed_items = len(file_list) + len(link_list)
 		# A folder's listing that crashed (this default): its folder stays, as before 9.77.
 		no_result = (frozenset(), frozenset(), 0, frozenset())
+		# The listing's line, as the serial listing draws it, here in the parent (the jobs draw none, so two processes never draw
+		# one line): every _LINE_INTERVAL seconds, the folder a job last listed and what the jobs have listed so far. A wide
+		# folder adds to the counts when its job returns; meanwhile the seconds go on.
+		due = listing_start_time + _LINE_INTERVAL
+		current = path
 		with _pool(max_workers) as executor:
 			while folders_to_expand or futures:
+				now = time.monotonic()
+				if now >= due:
+					due = now + _LINE_INTERVAL
+					_show_listing(current, int(now - started), len(file_list), len(link_list), len(folder_list), size)
 				under_rate_limit = (
 					FILES_RATE_LIMIT <= 0
 					or listed_items <= FILES_RATE_LIMIT * (time.monotonic() - listing_start_time)
@@ -4039,6 +4069,7 @@ def get_file_list_parallel(path,max_workers=56,exclude=None,append_hash=False,fu
 						respect_file_rate_limit=False,
 						boundary=boundary,
 						known_dir=True,
+						show=False,
 					)] = folder
 					under_rate_limit = (
 						FILES_RATE_LIMIT <= 0
@@ -4048,9 +4079,10 @@ def get_file_list_parallel(path,max_workers=56,exclude=None,append_hash=False,fu
 					if folders_to_expand and FILES_RATE_LIMIT > 0:
 						time.sleep(0.05)
 					continue
-				done = _wait(futures, executor)
+				# Until the next frame is due (one already due waits for nothing: the frame above moves the time on).
+				done = _wait(futures, executor, min(1, max(0, due - time.monotonic())))
 				for doneTask in done:
-					folder_path = futures.pop(doneTask)
+					folder_path = current = futures.pop(doneTask)
 					result = _task_result(doneTask, no_result, 'Listing error')
 					dir_file_list, dir_link_list, dir_size, dir_folder_list = result
 					if result is not no_result and folder_path not in dir_folder_list:
@@ -13305,19 +13337,17 @@ def _new_rate_limiter():
 class _RemoveProgress:
 	"""The progress line of a removal, one object for it: plain -rm's descriptor walks (_remove_tree_fd) and its -pfl jobs
 	(_remove_trees_parallel); a move's and -rme's serial removal (_remove_listed_files) and a move's pass over its source
-	directories. They show it when it is due, every _INTERVAL seconds while they work, at a terminal and through a
+	directories. They show it when it is due, every _LINE_INTERVAL seconds while they work, at a terminal and through a
 	pipe, in the style of the listing's (get_file_list_serial, which 9.73's -rm removed through): the current directory's last
 	50 characters, then 'Removed: N Folders: M' (N entries unlinked, M directories removed), with '| Overall: N Files' under
 	-F (plain -rm's). The walks check due once an entry, so a wide directory shows as it goes, and a slow unlink (a network
 	filesystem) as soon as it returns. The line is left open, for the next frame to start over; finish() ends it. Walks add
 	what they removed when they end (files, folders)."""
 	__slots__ = ('start', 'due', 'files', 'folders', 'rate_limiter', 'overall_before', 'drawn')
-	# 9.73's, and the listing's: twice a second is live to the eye and a line each is nothing to a terminal or a log.
-	_INTERVAL = 0.5
 
 	def __init__(self, rate_limiter=None):
 		self.start = time.monotonic()
-		self.due = self.start + self._INTERVAL
+		self.due = self.start + _LINE_INTERVAL
 		self.files = self.folders = self.overall_before = 0
 		self.rate_limiter = rate_limiter
 		self.drawn = False
@@ -13327,7 +13357,7 @@ class _RemoveProgress:
 		on top of what the walks before it removed."""
 		global _BAR_DRAWN
 		now = time.monotonic()
-		self.due = now + self._INTERVAL
+		self.due = now + _LINE_INTERVAL
 		files += self.files
 		folders += self.folders
 		suffix = ''

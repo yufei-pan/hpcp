@@ -118,7 +118,7 @@ def test_996_a_serial_moves_removal_prints_the_line_at_a_terminal(tmp_path, size
 def test_996_a_moves_directory_pass_shows_the_line_in_every_mode(tmp_path, capsys, monkeypatch, reset_hpcp_globals):
 	'''The pass over the source directories after the files are gone (a pool's too: its jobs show the "Deleted" bar, the pass
 	is the parent's) draws the line with the directories it removes: 9.95 drew none in any mode.'''
-	monkeypatch.setattr(hpcp._RemoveProgress, '_INTERVAL', 0)
+	monkeypatch.setattr(hpcp, '_LINE_INTERVAL', 0)
 	src = tmp_path / 'src'
 	_tree(src, directories=3, per_directory=2)
 	files = [os.path.join(str(src), 'd%d' % index, 'f%d' % number) for index in range(3) for number in range(2)]
@@ -136,7 +136,7 @@ def test_996_rme_removes_its_extra_files_and_directories_with_the_line(tmp_path,
 	total. 9.95 printed "Deleting extra directory:" lines and nothing while it removed.'''
 	if not descriptors:
 		monkeypatch.setattr(hpcp, '_DIR_FD_WALK', False)
-	monkeypatch.setattr(hpcp._RemoveProgress, '_INTERVAL', 0)
+	monkeypatch.setattr(hpcp, '_LINE_INTERVAL', 0)
 	monkeypatch.setattr(sys.stdin, 'isatty', lambda: True)
 	monkeypatch.setattr('builtins.input', lambda: 'y')
 	(tmp_path / 'src').mkdir()
@@ -156,7 +156,7 @@ def test_996_rme_removes_its_extra_files_and_directories_with_the_line(tmp_path,
 
 def test_996_a_note_of_the_extra_directories_pass_starts_its_own_line(tmp_path, capsys, reset_hpcp_globals, monkeypatch):
 	'''"Keeping non-empty directory:" (stdout) while the line is open: the frame's line ends first.'''
-	monkeypatch.setattr(hpcp._RemoveProgress, '_INTERVAL', 0)
+	monkeypatch.setattr(hpcp, '_LINE_INTERVAL', 0)
 	(tmp_path / 'out' / 'a').mkdir(parents=True)
 	(tmp_path / 'out' / 'b').mkdir()
 	(tmp_path / 'out' / 'b' / 'stays').write_text('x')
@@ -169,3 +169,60 @@ def test_996_a_note_of_the_extra_directories_pass_starts_its_own_line(tmp_path, 
 	assert _frames(shown), shown
 	_starts_a_line(shown, 'Keeping non-empty directory:')
 	assert not (tmp_path / 'out' / 'a').exists() and progress.folders == 1
+
+
+# ---- 2. A -pfl listing's line (and the listing's time on a line of its own) ----
+
+# 40 folders of 5 files: the -pfl listing paces its jobs at -F 100 (200 files: 2 s), so the parent's loop has frames to draw.
+LISTING_FOLDERS, LISTING_PER_FOLDER = 40, 5
+
+
+def _listing(output):
+	'''The listing's part of a copy's output, from "Getting file list for" to "Time taken to get file list", which must start a
+	line of its own (9.73 to 9.95 printed it on the last frame's line).'''
+	_starts_a_line(output, 'Time taken to get file list')
+	return output[output.index('Getting file list for'):output.index('Time taken to get file list')]
+
+
+@pytest.mark.parametrize('extra', [['-pfl'], []], ids=['pfl', 'serial'])
+def test_996_a_listing_prints_its_line_through_a_pipe(tmp_path, extra):
+	'''-pfl: 9.73 to 9.95 printed nothing between "Getting file list for" and "Time taken to get file list" in a tree of small
+	folders (the jobs list, the parent waited in silence). Serial: the line was there, and the time landed on its last frame.'''
+	_tree(tmp_path / 'src', LISTING_FOLDERS, LISTING_PER_FOLDER)
+	rc, output = _run(['-F', str(FILES_PER_SECOND), '-j', '2'] + extra + ['src', '-d', 'dst/'], tmp_path)
+	assert rc == 0 and len(os.listdir(str(tmp_path / 'dst' / 'src'))) == LISTING_FOLDERS, output
+	frames = _frames(_listing(output))
+	assert frames and all(re.search(r'\| iteration:\d+ \| Files: [\d.]+ ', frame) for frame in frames), frames
+
+
+@posix_only
+@pytest.mark.parametrize('size', [(40, 120), None], ids=['sized-terminal', 'unsized-terminal'])
+def test_996_a_pfl_listing_prints_its_line_at_a_terminal(tmp_path, size):
+	_tree(tmp_path / 'src', LISTING_FOLDERS, LISTING_PER_FOLDER)
+	rc, shown = _at_a_terminal(['-F', str(FILES_PER_SECOND), '-j', '2', '-pfl', 'src', '-d', 'dst/'], tmp_path, size)
+	assert rc == 0, shown
+	frames = _frames(_listing(shown))
+	assert frames and all(frame.count('iteration:') == 1 and 'Files: ' in frame for frame in frames), frames
+
+
+def test_996_a_pfl_jobs_listing_draws_no_frame(tmp_path, capsys, monkeypatch, reset_hpcp_globals):
+	'''A -pfl job lists its folder in another process: its frames (a folder whose listing takes over 0.5 s drew them in 9.73 to
+	9.95) would share the parent's line. The jobs are asked for none, and a listing asked for none draws none.'''
+	monkeypatch.setattr(hpcp, '_LINE_INTERVAL', 0)
+	_tree(tmp_path / 'src', 3, 4)
+	submitted = []
+	real = hpcp._submit_task
+	def submit(executor, func, *args, **kwargs):
+		if func is hpcp.get_file_list_serial:
+			submitted.append(kwargs.get('show', True))
+		return real(executor, func, *args, **kwargs)
+	monkeypatch.setattr(hpcp, '_submit_task', submit)
+	files, _, _, folders = hpcp.get_file_list_parallel(str(tmp_path / 'src'), max_workers=2)
+	assert len(files) == 12 and len(folders) == 4
+	assert submitted == [False] * 3
+	# (The parent's own frames leave the line open: get_file_list ends it.)
+	hpcp._end_line()
+	capsys.readouterr()
+	files, _, _, _ = hpcp.get_file_list_serial(str(tmp_path / 'src'), show=False)
+	assert len(files) == 12 and capsys.readouterr().out == ''
+	assert not hpcp._BAR_DRAWN

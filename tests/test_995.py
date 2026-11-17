@@ -121,7 +121,7 @@ def test_995_plain_rm_shows_a_line_while_it_removes(tmp_path, capsys, paced, mon
 def test_995_the_line_is_the_listings_with_removed_and_folders(tmp_path, capsys, monkeypatch, reset_hpcp_globals):
 	'''The directory's last 50 characters, then "iteration:N | Removed: N Folders: M" (the listing's frame has Files: Links:
 	Folders: Size: where this has Removed: Folders:). With the interval 0 every entry shows a frame, and the counts grow to the last.'''
-	monkeypatch.setattr(hpcp._RemoveProgress, '_INTERVAL', 0)
+	monkeypatch.setattr(hpcp, '_LINE_INTERVAL', 0)
 	root = tmp_path / ('long-directory-name-' * 4) / 'src'
 	_tree(root, directories=3, per_directory=50)
 	hpcp.process_remove([str(root)], single_thread=True, remove_force=True)
@@ -141,7 +141,7 @@ def test_995_a_tree_of_empty_directories_shows_a_line_a_directory(tmp_path, caps
 	'''No file is unlinked, so only the walk's check at each directory (the rmdirs) can show a frame.'''
 	if not descriptors:
 		monkeypatch.setattr(hpcp, '_DIR_FD_WALK', False)
-	monkeypatch.setattr(hpcp._RemoveProgress, '_INTERVAL', 0)
+	monkeypatch.setattr(hpcp, '_LINE_INTERVAL', 0)
 	for index in range(30):
 		(tmp_path / 'src' / ('d%d' % index)).mkdir(parents=True)
 	hpcp.process_remove([str(tmp_path / 'src')], single_thread=True, remove_force=True)
@@ -151,7 +151,7 @@ def test_995_a_tree_of_empty_directories_shows_a_line_a_directory(tmp_path, caps
 
 
 def test_995_under_the_file_rate_limit_the_line_has_the_overall_count(tmp_path, capsys, monkeypatch, reset_hpcp_globals):
-	monkeypatch.setattr(hpcp._RemoveProgress, '_INTERVAL', 0)
+	monkeypatch.setattr(hpcp, '_LINE_INTERVAL', 0)
 	monkeypatch.setattr(hpcp, 'FILES_RATE_LIMIT', 100000)
 	_tree(tmp_path / 'src', directories=2, per_directory=50)
 	hpcp.process_remove([str(tmp_path / 'src')], single_thread=True, remove_force=True)
@@ -163,7 +163,7 @@ def test_995_under_the_file_rate_limit_the_line_has_the_overall_count(tmp_path, 
 def test_995_the_walk_adds_to_what_the_pfl_jobs_removed(tmp_path, capsys, monkeypatch, reset_hpcp_globals):
 	'''-pfl: the jobs unlink the files, the walk after removes the directories; the line carries the count on, the Overall count
 	(under -F, the jobs' shared one) as well.'''
-	monkeypatch.setattr(hpcp._RemoveProgress, '_INTERVAL', 0)
+	monkeypatch.setattr(hpcp, '_LINE_INTERVAL', 0)
 	monkeypatch.setattr(hpcp, 'FILES_RATE_LIMIT', 100000)
 	_tree(tmp_path / 'src', directories=4, per_directory=5)
 	hpcp.process_remove([str(tmp_path / 'src')], single_thread=False, max_workers=2, parallel_file_listing=True, remove_force=True)
@@ -181,7 +181,7 @@ def test_995_pfl_with_no_pace_draws_while_its_jobs_unlink(tmp_path, capsys, monk
 	are other processes and draw nothing): the first frame comes before the last job's report. Without the loop's draw the walk
 	shows the only frames, after the jobs.'''
 	monkeypatch.setattr(hpcp, 'FILES_RATE_LIMIT', 0)
-	monkeypatch.setattr(hpcp._RemoveProgress, '_INTERVAL', 0)
+	monkeypatch.setattr(hpcp, '_LINE_INTERVAL', 0)
 	times, reported = _times_of_frames_and_job_reports(monkeypatch)
 	_tree(tmp_path / 'src', directories=4, per_directory=5)
 	hpcp.process_remove([str(tmp_path / 'src')], single_thread=False, max_workers=2, parallel_file_listing=True, remove_force=True)
@@ -242,7 +242,7 @@ def test_995_a_run_that_shows_no_frame_prints_no_empty_line(tmp_path, capsys, re
 def test_995_the_library_and_a_moves_walks_print_nothing(tmp_path, capsys, monkeypatch, reset_hpcp_globals):
 	'''_rmtree (the library) and a walk given no progress object (a direct call) draw no line, whatever the interval. (A move's
 	directory pass gives it one since 9.96: tests/test_996.py.) On 9.94 this fails only for the missing class.'''
-	monkeypatch.setattr(hpcp._RemoveProgress, '_INTERVAL', 0)
+	monkeypatch.setattr(hpcp, '_LINE_INTERVAL', 0)
 	_tree(tmp_path / 'one')
 	hpcp._rmtree(tmp_path / 'one')
 	_tree(tmp_path / 'two')
@@ -501,13 +501,14 @@ def test_995_a_directory_gone_before_its_rmdir_is_counted_as_removed_in_every_wa
 def test_995_after_rwloff_the_walks_overall_count_goes_on_from_the_jobs(tmp_path, capsys, monkeypatch, reset_hpcp_globals):
 	'''-rwloff removes the listed files in pool jobs, then the walk takes the directories with a -F pace of its own: its frames
 	counted from 0 ("Removed: 30" beside "Overall: 0").'''
-	monkeypatch.setattr(hpcp._RemoveProgress, '_INTERVAL', 0)
+	monkeypatch.setattr(hpcp, '_LINE_INTERVAL', 0)
 	monkeypatch.setattr(hpcp, 'FILES_RATE_LIMIT', 100000)
 	monkeypatch.setattr(hpcp, 'REMOVE_FILES_WHILE_LISTING', False)
 	_tree(tmp_path / 'src', directories=3, per_directory=10)
 	hpcp.process_remove([str(tmp_path / 'src')], single_thread=False, max_workers=2, remove_force=True)
 	assert not (tmp_path / 'src').exists()
-	frames = [frame for frame in _frames(capsys.readouterr().out) if 'Overall:' in frame]
+	# (The walk's frames: the listing before it draws its own, with the interval 0 too.)
+	frames = [frame for frame in _frames(capsys.readouterr().out.partition('Time taken to get file list')[2]) if 'Overall:' in frame]
 	assert frames and all('Removed: 30.00 ' in frame for frame in frames), frames
 	assert all(re.search(r'Overall: 30\.00 +Files', frame) for frame in frames), frames
 
