@@ -337,23 +337,23 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 
 ### A single-threaded move's and `-rme`'s removal print no progress line
 - **Kind:** deferred (9.96).
-- **What the operator sees:** with `-s` (or one worker), a move's removal of its copied sources and `-rme`'s removal of extra files print nothing between the confirmation and their summary, as in 9.73 to 9.95. A move's last pass over its source directories prints nothing in any mode, parallel too. A long removal there looks stalled. The parallel forms print the "Deleted" bar, and plain `-rm` its progress line (9.95).
-- **Why:** these paths were silent before 9.74's rewrite too (checked in the 9.95 build on 9.73 as cas-toolbox 2026.42.2 pinned it, commit 7114c5c, and on 9.94 and 9.95; an earlier 9.73 state, 1e46213, ran the move's removal through `process_remove`, which drew the listing's line with `-s`), so they are not part of the regression 9.95 fixes; 9.95 ships that fix alone. The user, 2026-11-16 (relayed): "It NEEDS to print interm outputs when it is removing in command line."
-- **Plan (9.96):** give `_remove_listed_files` (the serial branch of `_remove_items`) and the move's directory pass (`_remove_tree_fd` in the move's cleanup) the same `_RemoveProgress` as plain `-rm`, with a test at a pty and through a pipe that fails on 9.95.
+- **What the operator sees:** with `-s` (or one worker), a move's removal of its copied sources and `-rme`'s removal of extra files print nothing between the confirmation and their summary, as in 9.73 to 9.95. A move's last pass over its source directories, and `-rme`'s removal of extra directories (a `Deleting extra directory:` line each, no count), print nothing in any mode, parallel too. A long removal there looks stalled. The parallel forms print the "Deleted" bar (not under `-v`, which turns that bar off: nothing at all there), and plain `-rm` its progress line (9.95).
+- **Why:** these paths were silent in the released 9.73 (commit 7114c5c, as cas-toolbox 2026.42.2 pinned it; checked in the 9.95 build, on 9.94 and 9.95 too) before 9.74's rewrite (an earlier 9.73 state, 1e46213, ran the move's removal through `process_remove`, which drew the listing's line with `-s`), so they are not part of the regression 9.95 fixes; 9.95 ships that fix alone. The user, 2026-11-16 (relayed): "It NEEDS to print interm outputs when it is removing in command line."
+- **Plan (9.96):** give `_remove_listed_files` (the serial branch of `_remove_items`) and the move's directory pass (`_remove_tree_fd` in the move's cleanup) the same `_RemoveProgress` as plain `-rm` (`-rme`'s extra-directories pass goes through `_remove_listed_files` too), with a test at a pty and through a pipe that fails on 9.95.
 - **Revisit when:** 9.96, first.
 - **Noted:** 2026-11-16, the 9.95 build; the main session's call (a deferral, not asked).
 
 ### A `-pfl` listing prints no progress line
 - **Kind:** deferred (9.96).
-- **What the operator sees:** with `-pfl`, the file listing that a copy, a move or `-rwloff` makes runs in pool jobs, and the parent prints nothing while it waits: `Getting file list for ...`, then nothing until `Time taken to get file list`. The serial listing draws its line every 0.5 s. The same in 9.73, 9.94 and 9.95 (ran on `-rm -rwloff` over 400,000 files: 2 to 3 frames of the listing's line serially, none with `-pfl`, in all three).
-- **Why:** not a regression (9.73 printed none either), so 9.95 ships the `-rm` fix alone. The user, 2026-11-16 (relayed): "hpcp new version will not print file listing progress?"
-- **Plan (9.96):** the wait loop of `get_file_list_parallel` draws the listing's line when it is due (the directory last listed, with the files and folders counted so far), as `-rm -pfl`'s loop draws its line, with a test at a pty and through a pipe.
+- **What the operator sees:** with `-pfl`, the file listing that a copy, a move or `-rwloff` makes runs in pool jobs, and the parent prints nothing while it waits: `Getting file list for ...`, then nothing until `Time taken to get file list`. The serial listing draws its line every 0.5 s. The same in 9.73, 9.94 and 9.95 (ran on `-rm -rwloff` over 400,000 files: 2 to 3 frames of the listing's line serially, none with `-pfl` in a tree of small folders, in all three). A folder whose listing takes over 0.5 s shows one frame, drawn by the pool worker that lists it (`dir | iteration:0 | Files: 78.64 K Folders: 1.00`, on a folder of 300,000 files), in 9.73, 9.94 and 9.95 alike.
+- **Why:** not a regression (9.73 printed the same: nothing from the parent, and that worker's frame), so 9.95 ships the `-rm` fix alone. The serial listing's progress has no `_BAR` or `-v` gate, and a pool worker keeps stdout. The user, 2026-11-16 (relayed): "hpcp new version will not print file listing progress?"
+- **Plan (9.96):** the wait loop of `get_file_list_parallel` draws the listing's line when it is due (the directory last listed, with the files and folders counted so far), as `-rm -pfl`'s loop draws its line, and a pool worker's own frame is gated off as the removal's jobs draw none (their frames are the parent's alone), so two processes do not draw one line, with a test at a pty and through a pipe.
 - **Revisit when:** 9.96.
 - **Noted:** 2026-11-16, the 9.95 final review (N4); the main session's call (a deferral, not asked).
 
 ### `-rm -pfl` shows no count while one job empties a wide directory
 - **Kind:** deferred (9.96).
-- **What the operator sees:** under `-rm -pfl` a wide directory is one pool job, and the job reports its count when it returns: until then the line shows the directory and the seconds (`root | iteration:N |`), with `Overall: N Files` under `-F` (its shared count is live). Better than 9.94, which printed nothing.
+- **What the operator sees:** under `-rm -pfl` a wide directory is one pool job, and the job reports its count when it returns: until then the line shows the last directory a job finished (the wide directory's parent, not the wide directory) and the seconds (`/data/tree | iteration:N |`), with `Overall: N Files` under `-F` (its shared count is live). Better than 9.94, which printed nothing.
 - **Why:** a count that the jobs share costs every unlink one more step, and 9.95 keeps that cost off the removal.
 - **Plan (9.96):** count through a shared counter, as `-F`'s pace does (`_shared_rate_wait`), measured first on a 200,000-file directory against 9.95: it ships only if the removal is no slower where it shows.
 - **Revisit when:** 9.96.
@@ -361,11 +361,27 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 
 ### A reader that closes the pipe early ends `-rm` with exit 120
 - **Kind:** deferred (9.96).
-- **What the operator sees:** `hpcp -rm -rf tree | head -1` (stdout a pipe whose reader leaves early): the tree is removed whole, and hpcp exits 120 with `Exception ignored while flushing sys.stdout: BrokenPipeError: [Errno 32] Broken pipe` on stderr. 9.94 exited 0: it printed nothing until its end, while `head` still read. A copy does the same in 9.94 and 9.95 (`hpcp src -d dst/ | head -1`: exit 70 with a `General Exception: [Errno 32] Broken pipe` traceback, nothing copied).
+- **What the operator sees:** `hpcp -rm -rf tree | head -1` (stdout a pipe whose reader leaves early), when the removal runs past its first frame at 0.5 s (a tree of 300,000 files did, one of 60,000 did not): the tree is removed whole, and hpcp exits 120 with two lines on stderr, `Exception ignored while flushing sys.stdout:` and `BrokenPipeError: [Errno 32] Broken pipe`. 9.94's plain `-rm` exited 0: it printed nothing until its end, while `head` still read. A copy does the same in 9.94 and 9.95 (`hpcp src -d dst/ | head -1`: exit 70 with a `General Exception: [Errno 32] Broken pipe` traceback, no file copied; its folders may be made).
 - **Why:** the first progress frame flushes stdout early, so the reader's leaving shows at the end. Printing progress needs it, and 9.73's `-rm` did the same. The final review ruled it not an issue for 9.95 and the main session made it a deferral, so that the change of a copy's exit code is weighed once.
 - **Plan (9.96):** one handler at the exit path, for `-rm` and a copy: a closed stdout ends the run with the run's own return code (the files are removed), with a test through `| head -1` for both.
 - **Revisit when:** 9.96.
 - **Noted:** 2026-11-16, the 9.95 final review (N2) and second opinions (code L2, docs Lead 2); the main session's call (a deferral, not asked).
+
+### Blank lines between `-rm`'s error lines in a combined log
+- **Kind:** deferred (9.96).
+- **What the operator sees:** with stdout and stderr in one file or pipe (`> log 2>&1`), once `-rm`'s line has drawn, each error line of a file named as an argument (`hpcp -rm dir/*`; two unremovable named files), of a `-pfl` or `-rwloff` job, or of the walk where it has no descriptor calls (Windows') is followed by an empty line until the next frame. A copy's job error lines do the same since before 9.94. Every error line starts its own line; the error list and the exit code are unchanged.
+- **Why:** the line is marked open when a frame is drawn and marked ended only by the removal's own end of line, not by an error line that ends it; a job in another process cannot see the mark.
+- **Plan (9.96):** one mark, "stdout's line is open": `eprint` clears it when its line start ended that line (stderr is stdout's file or terminal), and `_RemoveProgress.finish()` ends the line only while it is marked, so its `drawn` and the descriptor walk's extra `finish()` before its errors go (keeping 9.95's fix 8: a stop in `-rwloff`'s job phase leaves that bar's mark for the stop's report). For the jobs, weigh having the parent print the lines it already receives through the future (see the entry below: under `-pfl` the walk reports the same files again). A test through one pipe: several unremovable named files and a `-pfl` job, no `\n\n`.
+- **Revisit when:** 9.96.
+- **Noted:** 2026-11-16, the re-review of 9.95's fix round (R1) and its second opinions (tests L1 to L3); the main session's call (a deferral, not asked).
+
+### `-rm -pfl` reports each unremovable file twice
+- **Kind:** deferred (9.96).
+- **What the operator sees:** `hpcp -rm -rf -pfl tree` over a directory with 3 files that cannot be unlinked prints 6 `Remove process exception:` lines, and the `Error occurred:` list holds 6: each file is reported by the job that met it, and again by the walk that goes over the directories after the jobs. The files stay, and the exit status is 192. The same in 9.94 and 9.95 (ran on both).
+- **Why:** a job leaves a file it cannot unlink where it is, and the walk that removes the directories (and any file a job left) meets it again; nothing tells the walk that a job reported it.
+- **Plan (9.96):** report a file once: the walk skips a file in a directory whose job already reported, or the parent prints the jobs' reports it receives through the futures and the jobs print none (the entry above weighs the same for the blank lines). A test with one unremovable file under `-pfl`: one report, one entry in the list.
+- **Revisit when:** 9.96.
+- **Noted:** 2026-11-16, the re-review of 9.95's fix round (an observation), second opinions (tests L2); the main session's call (a deferral, not asked).
 
 ### macOS: a socket the operator names is not copied
 - **Kind:** known limitation.
