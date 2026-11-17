@@ -431,8 +431,8 @@ SINGLE_PASS_FILE_LIMIT = 1_000_000
 
 #%% ---- Helper Functions ----
 # Whether this run shows a progress bar or line: a pool task's error line may then land on its line (_bar_line_start). A
-# copy's bars are off under -v (the copy sets it); a removal's line is drawn under -v too (process_remove sets it). A run
-# setting, handed to the workers (_TASK_SETTINGS).
+# copy's bars are off under -v (the copy sets it); a removal's walks' line is drawn under -v too (process_remove sets it; the
+# "Deleted" bar of -rwloff's jobs is off under -v). A run setting, handed to the workers (_TASK_SETTINGS).
 _BAR = False
 # Whether the parent's progress bar drew a frame since its line last ended (Adaptive_Progress_Bar and _RemoveProgress set it; stop()
 # and finish() clear it, each for the line it drew: a stop skips the former, and the latter leaves that bar's mark alone).
@@ -15919,7 +15919,7 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = None,
 			# leading elsewhere writes nothing there (_dest_directory).
 			NAMED_IDS = _named_ids(NAMED_DESTS)
 			SYNC_COPIES = bool(remove)
-			# -v turns the copy's progress bars off (suppress_all_output); a removal's line is drawn under -v too (process_remove)
+			# -v turns the copy's progress bars off (suppress_all_output); the removal's walks' line is drawn under -v too (process_remove)
 			_BAR = not verbose
 			# Refuses a clash before anything is copied or removed.
 			dropped, replaced, in_place = _settle_destinations(src_paths, dests, dest_image, directory_only, copy_exclude, 1 if single_thread else max_workers,
