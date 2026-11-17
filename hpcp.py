@@ -12113,8 +12113,8 @@ def _landings(entry_abs, by_source):
 			rel = os.path.relpath(entry_abs, src_abs)
 			yield from (os.path.join(actual_dest, rel) for actual_dest in actual_dests)
 
-def remove_extra_files(total_file_list, dests,max_workers,verbose,files_per_job,single_thread=False,exclude=None,parallel_file_listing=False,src_paths=None,sym_links=None,dest_image=False,keep=(),dest_roots=None,listed=None,named=None):
-		"""Remove files in ``dests`` that have no counterpart in ``total_file_list``.
+def remove_extra_files(total_file_list, dests,max_workers,verbose,files_per_job,single_thread=False,exclude=None,parallel_file_listing=False,src_paths=None,sym_links=None,dest_image=False,keep=(),dest_roots=None,listed=None,named=None,remove_force=False):
+		"""Remove files in ``dests`` that have no counterpart in ``total_file_list``. ``remove_force`` (-rf): no prompt.
 
 		``total_file_list`` may contain absolute src-side paths (as returned by
 		``process_copy``) or already-trimmed relative paths (as loaded from a
@@ -12231,7 +12231,8 @@ def remove_extra_files(total_file_list, dests,max_workers,verbose,files_per_job,
 				print(f"No extra files found in {dests}")
 		else:
 			print(f"Files in dest but not in src count: {len(inDestNotInSrc)}")
-			_confirm("Do you want to delete them? (y/n)", "Not deleting extra files")
+			if not remove_force:
+				_confirm("Do you want to delete them? (y/n)", "Not deleting extra files")
 			start_time = time.monotonic()
 			# By descriptors from each pinned destination root, without following symlinks (_remove_listed_files): a
 			# destination directory swapped for a symlink while the prompt waited is not removed through. Serially with
@@ -12822,7 +12823,7 @@ def _stored_names(lines):
 
 def store_file_list(file_list, src_paths: list, single_thread=False, max_workers=multiprocessing.cpu_count(), verbose=False,
 					files_per_job=1, compare_file_list=False, remove_extra=False, parallel_file_listing=False, exclude=None,
-					diff_file_list=None,tar_diff_file_list = False, src_str=None,append_hash=True,full_hash=False):
+					diff_file_list=None,tar_diff_file_list = False, src_str=None,append_hash=True,full_hash=False,remove_force=False):
 	"""
 	Process a file list by performing various operations such as removing extra files, getting file lists from source paths,
 	comparing file lists, and writing the final file list to a file.
@@ -12836,6 +12837,7 @@ def store_file_list(file_list, src_paths: list, single_thread=False, max_workers
 		files_per_job (int, optional): The number of files to process per job when removing extra files. Defaults to 1.
 		compare_file_list (bool, optional): Whether to compare the file list with the source paths. Defaults to False.
 		remove_extra (bool, optional): Whether to remove extra files from the file list. Defaults to False.
+		remove_force (bool, optional): -rf: remove the extra files without asking. Defaults to False.
 		parallel_file_listing (bool, optional): Whether to use parallel file listing. Defaults to False.
 		exclude (str, optional): A pattern to exclude files from the file list. Defaults to None.
 
@@ -12857,7 +12859,8 @@ def store_file_list(file_list, src_paths: list, single_thread=False, max_workers
 		if len(src_paths) == 1 and not _has_listed(src_paths):
 			# file_list_file already holds trimmed (relative) paths, so we don't
 			# pass src_paths -- entries are used as-is for the comparison.
-			remove_extra_files(file_list_file, [src_paths[0]], max_workers, verbose, files_per_job, single_thread, exclude=exclude, parallel_file_listing=parallel_file_listing)
+			remove_extra_files(file_list_file, [src_paths[0]], max_workers, verbose, files_per_job, single_thread, exclude=exclude, parallel_file_listing=parallel_file_listing,
+				remove_force=remove_force)
 			print('-' * 80)
 		else:
 			print("Currently only supports removing extra files for a single src_path, given as an argument, when using file_list")
@@ -15981,7 +15984,7 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = None,
 			store_file_list(target_file_list,src_paths,single_thread=single_thread, max_workers=max_workers,verbose=verbose, 
 							files_per_job=files_per_job,compare_file_list=compare_file_list, remove_extra=remove_extra,
 							parallel_file_listing=parallel_file_listing,exclude=exclude,diff_file_list=diff_file_list,tar_diff_file_list=tar_diff_file_list,src_str = src_str,
-							append_hash=append_hash_to_file_list,full_hash=full_hash)
+							append_hash=append_hash_to_file_list,full_hash=full_hash,remove_force=remove_force)
 			raise RuntimeError("Exiting after storing file list.")
 		
 		# if dest_image:
@@ -16178,7 +16181,7 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = None,
 				# The directories the copy covers, from its listings, before remove_extra_files clears them.
 				covered = _covered_directories(src_paths, dests, bool(dest_image), exclude, max_workers, parallel_file_listing)
 				remove_extra_files(total_file_list, dests,max_workers,verbose,files_per_job,single_thread,exclude=exclude,parallel_file_listing=parallel_file_listing,src_paths=src_paths,sym_links=total_sym_links,
-					dest_image=bool(dest_image),keep=link_targets,dest_roots=dest_roots,listed=listed,named=named_sources)
+					dest_image=bool(dest_image),keep=link_targets,dest_roots=dest_roots,listed=listed,named=named_sources,remove_force=remove_force)
 				print('-'*80)
 				print("Removing extra directories...")
 				remove_extra_dirs(src_paths, dests,exclude=exclude,dest_image=bool(dest_image),keep=link_targets,dest_roots=dest_roots,named=named_sources,covered=covered)

@@ -575,4 +575,23 @@ def test_996_the_walk_without_descriptor_calls_shows_the_line_while_it_lists(tmp
 	monkeypatch.setattr(hpcp, '_walk', walk)
 	hpcp.process_remove([str(tmp_path / 'src')], single_thread=True, remove_force=True)
 	assert not (tmp_path / 'src').exists()
+@pytest.mark.parametrize('how', ['arguments', 'stored-list'])
+def test_996_rme_with_rf_removes_the_extras_without_asking(tmp_path, how):
+	'''-rf is "Remove all files without prompt" (its help): 9.95 asked all the same before -rme removed its extra files, and with no
+	terminal to ask (stdin at EOF) stopped with exit 147, nothing removed. (-rf with a destination is a move: the sources go too.)'''
+	(tmp_path / 'src' / 'd').mkdir(parents=True)
+	(tmp_path / 'src' / 'd' / 'f').write_text('x')
+	if how == 'arguments':
+		(tmp_path / 'out' / 'src').mkdir(parents=True)
+		(tmp_path / 'out' / 'src' / 'extra').write_text('x')
+		rc, output = _run(['src', '-d', 'out/', '-rme', '-rf'], tmp_path)
+		assert rc == 0 and sorted(os.listdir(str(tmp_path / 'out' / 'src'))) == ['d'] and not (tmp_path / 'src').exists(), output
+	else:
+		assert _run(['src', '-fl', 'list.tsv'], tmp_path)[0] == 0
+		(tmp_path / 'src' / 'extra').write_text('x')
+		rc, output = _run(['src', '-fl', 'list.tsv', '-rme', '-rf'], tmp_path)
+		assert sorted(os.listdir(str(tmp_path / 'src'))) == ['d'], output
+	assert 'Do you want to delete them?' not in output, output
+
+
 	assert len(ticks) == 42 and _frames(capsys.readouterr().out), len(ticks)
