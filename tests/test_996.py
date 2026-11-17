@@ -175,6 +175,8 @@ def test_996_a_note_of_the_extra_directories_pass_starts_its_own_line(tmp_path, 
 
 # 40 folders of 5 files: the -pfl listing paces its jobs at -F 100 (200 files: 2 s), so the parent's loop has frames to draw.
 LISTING_FOLDERS, LISTING_PER_FOLDER = 40, 5
+# A listing's frame: the seconds, then the files listed so far (none before the first folder's), the folders (the root's own).
+LISTING_FRAME = r'\| iteration:\d+ \| (Files: [\d.]+ +)?Folders: [\d.]+ '
 
 
 def _listing(output):
@@ -191,8 +193,10 @@ def test_996_a_listing_prints_its_line_through_a_pipe(tmp_path, extra):
 	_tree(tmp_path / 'src', LISTING_FOLDERS, LISTING_PER_FOLDER)
 	rc, output = _run(['-F', str(FILES_PER_SECOND), '-j', '2'] + extra + ['src', '-d', 'dst/'], tmp_path)
 	assert rc == 0 and len(os.listdir(str(tmp_path / 'dst' / 'src'))) == LISTING_FOLDERS, output
+	# (A frame drawn before the first job's report has no file yet: the root holds folders only. A pool's start under a CPU
+	# quota, with other tests beside it, took over 0.5 s.)
 	frames = _frames(_listing(output))
-	assert frames and all(re.search(r'\| iteration:\d+ \| Files: [\d.]+ ', frame) for frame in frames), frames
+	assert frames and all(re.search(LISTING_FRAME, frame) for frame in frames), frames
 
 
 @posix_only
@@ -202,7 +206,7 @@ def test_996_a_pfl_listing_prints_its_line_at_a_terminal(tmp_path, size):
 	rc, shown = _at_a_terminal(['-F', str(FILES_PER_SECOND), '-j', '2', '-pfl', 'src', '-d', 'dst/'], tmp_path, size)
 	assert rc == 0, shown
 	frames = _frames(_listing(shown))
-	assert frames and all(frame.count('iteration:') == 1 and 'Files: ' in frame for frame in frames), frames
+	assert frames and all(frame.count('iteration:') == 1 and re.search(LISTING_FRAME, frame) for frame in frames), frames
 
 
 def test_996_a_pfl_jobs_listing_draws_no_frame(tmp_path, capsys, monkeypatch, reset_hpcp_globals):

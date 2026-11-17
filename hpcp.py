@@ -1721,7 +1721,7 @@ def _quiet_36_pool_shutdown():
 
 def _wait(futures, pool, timeout=1):
 	"""The one wait of every pool loop: the futures done within timeout seconds (1: most loops refresh the progress bar each
-	second; -rm's -pfl loop asks for the time its progress line is due, _RemoveProgress), then the parent's stop acted on
+	second; -rm's and the listing's -pfl loops ask for the time their progress line is due), then the parent's stop acted on
 	(_check_stop), then the pool watched (_pool.watch). So a stop is acted on within 1 s in every loop, and a pool stuck on
 	a dead worker ends the run."""
 	done, _ = concurrent.futures.wait(futures, timeout=timeout, return_when=concurrent.futures.FIRST_COMPLETED)
