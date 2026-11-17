@@ -298,9 +298,9 @@ finally:
 	if _IMPORT_MASK is not None and _signal.SIGINT not in _IMPORT_MASK:
 		_signal.pthread_sigmask(_signal.SIG_UNBLOCK, (_signal.SIGINT,))
 
-version = '9.94'
+version = '9.95'
 __version__ = version
-COMMIT_DATE = '2026-11-15'
+COMMIT_DATE = '2026-11-16'
 
 MAGIC_NUMBER = 1.61803398875
 RANDOM_DESTINATION_SELECTION = False
@@ -430,10 +430,12 @@ REMOVE_FILES_WHILE_LISTING = True
 SINGLE_PASS_FILE_LIMIT = 1_000_000
 
 #%% ---- Helper Functions ----
-# Whether this run shows a progress bar (not under -v, which turns it off): a pool task's error line may then land on the
-# bar's line (_bar_line_start). A run setting, handed to the workers (_TASK_SETTINGS).
+# Whether this run shows a progress bar or line: a pool task's error line may then land on its line (_bar_line_start). A
+# copy's bars are off under -v (the copy sets it); a removal's walks' line is drawn under -v too (process_remove sets it; the
+# "Deleted" bar of -rwloff's jobs is off under -v). A run setting, handed to the workers (_TASK_SETTINGS).
 _BAR = False
-# Whether the parent's progress bar drew a frame since its line last ended (Adaptive_Progress_Bar sets it, stop() clears it).
+# Whether the parent's progress bar drew a frame since its line last ended (Adaptive_Progress_Bar and _RemoveProgress set it; the
+# bar's stop() clears it, and _RemoveProgress.finish() only for the line it drew, so a bar a stop left open keeps its mark).
 _BAR_DRAWN = False
 _LINE_START = [None, '']  # (pid, _line_start's answer)
 
@@ -1686,11 +1688,12 @@ def _quiet_36_pool_shutdown():
 	concurrent.futures.process._queue_management_worker = _queue_management_worker
 	_QUIETED_36.append(real)
 
-def _wait(futures, pool):
-	"""The one wait of every pool loop: the futures done within 1 s (most loops refresh the progress bar each second), then
-	the parent's stop acted on (_check_stop), then the pool watched (_pool.watch). So a stop is acted on within 1 s in every
-	loop, and a pool stuck on a dead worker ends the run."""
-	done, _ = concurrent.futures.wait(futures, timeout=1, return_when=concurrent.futures.FIRST_COMPLETED)
+def _wait(futures, pool, timeout=1):
+	"""The one wait of every pool loop: the futures done within timeout seconds (1: most loops refresh the progress bar each
+	second; -rm's -pfl loop asks for the time its progress line is due, _RemoveProgress), then the parent's stop acted on
+	(_check_stop), then the pool watched (_pool.watch). So a stop is acted on within 1 s in every loop, and a pool stuck on
+	a dead worker ends the run."""
+	done, _ = concurrent.futures.wait(futures, timeout=timeout, return_when=concurrent.futures.FIRST_COMPLETED)
 	_check_stop()
 	pool.watch(done)
 	return done
@@ -12797,33 +12800,52 @@ def process_remove(src_paths: list,single_thread = False, max_workers = multipro
 	print('-'*80)
 	start_time = time.monotonic()
 	rate_limiter = _new_rate_limiter()
-	removed = 0
-	trees = []
-	for path in processedPaths:
-		if os.path.isdir(path) and not os.path.islink(path):
-			trees.append(path)
-			continue
-		_file_list_rate_limit(rate_limiter)
-		if _remove_one_listed(path, source_ids[path], '.'):
-			removed += 1
-	parallel = not single_thread and max_workers > 1
-	if trees and parallel and not REMOVE_FILES_WHILE_LISTING:
-		# -rwloff: list everything first, then remove the listed files in pool jobs.
-		pairs = []
+	progress = _RemoveProgress(rate_limiter)
+	# The jobs of -pfl and -rwloff print their error lines in their own processes, where the parent's frame is not known: each starts
+	# off the progress line (_bar_line_start), as a copy's do.
+	global _BAR
+	bar, _BAR = _BAR, True
+	try:
+		removed = 0
+		trees = []
+		for path in processedPaths:
+			if os.path.isdir(path) and not os.path.islink(path):
+				trees.append(path)
+				continue
+			_file_list_rate_limit(rate_limiter)
+			if _remove_one_listed(path, source_ids[path], '.'):
+				removed += 1
+			# Files named as arguments (-rm dir/*) are no walk's entries: this loop shows the line too.
+			if time.monotonic() >= progress.due:
+				progress.show(os.path.dirname(path), removed)
+		progress.files = removed
+		parallel = not single_thread and max_workers > 1
+		if trees and parallel and not REMOVE_FILES_WHILE_LISTING:
+			# -rwloff: list everything first, then remove the listed files in pool jobs.
+			pairs = []
+			for root in trees:
+				files, links, _, _ = get_file_list(root, max_workers=max_workers, exclude=exclude, parallel_file_listing=parallel_file_listing, drop_cache=True)
+				pairs.extend((path, root) for path in set(files) | set(links))
+			removed += _remove_items(_items_below(pairs, {root: (root, source_ids[root], source_ids[root]) for root in trees}), single_thread, max_workers,
+				verbose, files_per_job)
+			# The walk's -F pace starts after the listing (its time is no credit); its Overall count goes on from the jobs'.
+			rate_limiter = progress.rate_limiter = _new_rate_limiter()
+			progress.files = progress.overall_before = removed
+		elif trees and parallel and parallel_file_listing:
+			removed += _remove_trees_parallel([(root, source_ids[root]) for root in trees], max_workers, exclude, rate_limiter, progress)
 		for root in trees:
-			files, links, _, _ = get_file_list(root, max_workers=max_workers, exclude=exclude, parallel_file_listing=parallel_file_listing, drop_cache=True)
-			pairs.extend((path, root) for path in set(files) | set(links))
-		removed += _remove_items(_items_below(pairs, {root: (root, source_ids[root], source_ids[root]) for root in trees}), single_thread, max_workers,
-			verbose, files_per_job)
-		# The walk's -F pace starts after the listing (its time is no credit).
-		rate_limiter = _new_rate_limiter()
-	elif trees and parallel and parallel_file_listing:
-		removed += _remove_trees_parallel([(root, source_ids[root]) for root in trees], max_workers, exclude, rate_limiter)
-	for root in trees:
-		count, _, errors = _remove_tree_fd(root, source_ids[root], exclude, remove_files=True, rate_limiter=rate_limiter)
-		removed += count
-		for path, e in errors:
-			_report_unremoved(path, e)
+			count, _, errors = _remove_tree_fd(root, source_ids[root], exclude, remove_files=True, rate_limiter=rate_limiter, progress=progress)
+			removed += count
+			if errors:
+				# The lines below start their own: one ends the frame, not each (a blank line after every one).
+				progress.finish()
+			for path, e in errors:
+				_report_unremoved(path, e)
+	finally:
+		_BAR = bar
+		# Every way out ends the line a frame of this run's walks left open: a stop's `Error occurred:` line (stdout, whatever stderr
+		# is) starts its own line. (-rwloff's job bar is not theirs: its mark stays set, and the report starts off its line, as in 9.94.)
+		progress.finish()
 	print(f"Removed {removed} files and links from {pformat(processedPaths)} in {time.monotonic()-start_time:0.4f} seconds")
 	print('-'*80)
 	# A listing cached before (or by -rwloff) would show the removed trees.
@@ -13238,6 +13260,54 @@ def _new_rate_limiter():
 	"""A _file_list_rate_limit state for -F (FILES_RATE_LIMIT) starting now, or None without -F."""
 	return {'start_time': time.monotonic(), 'count': 0, 'limit': FILES_RATE_LIMIT} if FILES_RATE_LIMIT > 0 else None
 
+class _RemoveProgress:
+	"""The progress line of -rm, one object for the run: its descriptor walks (_remove_tree_fd) and its -pfl jobs
+	(_remove_trees_parallel) show it when it is due, every _INTERVAL seconds while they work, at a terminal and through a
+	pipe, in the style of the listing's (get_file_list_serial, which 9.73's -rm removed through): the current directory's last
+	50 characters, then 'Removed: N Folders: M' (N entries unlinked, M directories removed), with '| Overall: N Files' under
+	-F. The walks check due once an entry, so a wide directory shows as it goes, and a slow unlink (a network filesystem) as
+	soon as it returns. The line is left open, for the next frame to start over; finish() ends it. Walks add what they
+	removed when they end (files, folders)."""
+	__slots__ = ('start', 'due', 'files', 'folders', 'rate_limiter', 'overall_before', 'drawn')
+	# 9.73's, and the listing's: twice a second is live to the eye and a line each is nothing to a terminal or a log.
+	_INTERVAL = 0.5
+
+	def __init__(self, rate_limiter=None):
+		self.start = time.monotonic()
+		self.due = self.start + self._INTERVAL
+		self.files = self.folders = self.overall_before = 0
+		self.rate_limiter = rate_limiter
+		self.drawn = False
+
+	def show(self, path, files=0, folders=0):
+		"""Draw a frame for path, the directory being worked in. files and folders: what the running walk has removed so far,
+		on top of what the walks before it removed."""
+		global _BAR_DRAWN
+		now = time.monotonic()
+		self.due = now + self._INTERVAL
+		files += self.files
+		folders += self.folders
+		suffix = ''
+		if files:
+			suffix += f'Removed: {format_bytes(files,use_1024_bytes=False,to_str=True)} '
+		if folders:
+			suffix += f'Folders: {format_bytes(folders,use_1024_bytes=False,to_str=True)} '
+		if self.rate_limiter:
+			suffix += f'| Overall: {format_bytes(self.rate_limiter["count"] + self.overall_before,use_1024_bytes=False,to_str=True)} Files'
+		# Marked before the draw: a stop that raises inside it (after the frame is written, as the test's does) leaves a line that
+		# finish() ends. Marked after, the stop's report would land on the frame (3.6 under a CPU quota: 1 run of 30).
+		self.drawn = _BAR_DRAWN = True
+		multiCMD.print_progress_bar(iteration=int(now - self.start), total=0, prefix=path[-50:], suffix=suffix)
+
+	def finish(self):
+		"""End the line the last frame left open, as the next error or summary line starts on its own. Only the line this
+		object drew: the mark another bar set (-rwloff's job bar, whose stop() a stop skips) stays for the stop's report."""
+		global _BAR_DRAWN
+		if self.drawn:
+			print()
+			self.drawn = False
+			_BAR_DRAWN = False
+
 def _remove_items(items, single_thread=False, max_workers=1, verbose=False, files_per_job=1, one_filesystem=False):
 	"""Unlink items (see _remove_listed_files) in this process, paced by -F, or in pool jobs of neighbouring entries,
 	large enough to share their directories' descriptors (with -F as given, as delete_file_list_parallel paces by
@@ -13298,7 +13368,7 @@ def _changed(fd, expected):
 		raise
 
 def _remove_tree_fd(root, root_id, exclude=None, remove_files=False, rate_limiter=None, spelled=None, parent_fd=None,
-		mounts=None):
+		mounts=None, progress=None):
 	"""Walk the directory tree at root by descriptors from the pinned root (_open_source_root), each directory opened
 	relative to its parent with O_NOFOLLOW, deepest first, as shutil.rmtree does (one open and one listing per directory):
 	rmdir each directory once its entries are handled. With remove_files (plain -rm) its other entries are unlinked
@@ -13306,7 +13376,8 @@ def _remove_tree_fd(root, root_id, exclude=None, remove_files=False, rate_limite
 	unlinked, entries left in place, excluded ones aside; errors as (path, OSError)): a directory swapped for a symlink,
 	or a root replaced, is an error and nothing below it is touched. A directory that still holds something stays.
 	rate_limiter (a _file_list_rate_limit state, -F) paces the unlinks. spelled: root as the caller wrote it, the base of
-	the paths excludes are matched against (and errors name).
+	the paths excludes are matched against (and errors name). progress (_RemoveProgress, plain -rm): shows the removal as it
+	goes, and is given its counts when the walk ends.
 
 	For the apply's forced removal (_remove_tree_around_mounts): parent_fd, a descriptor of root's parent, starts the
 	walk there instead of at the pinned root: root is its entry basename(root), opened with O_NOFOLLOW, checked against
@@ -13315,6 +13386,8 @@ def _remove_tree_fd(root, root_id, exclude=None, remove_files=False, rate_limite
 	is then stat'ed, each directory checked against that stat once opened, and a directory whose listing fails is still
 	tried with rmdir."""
 	removed, left, errors = 0, [], []
+	folders = 0
+	clock = time.monotonic
 	if not _DIR_FD_WALK:
 		base = spelled if spelled is not None else root
 		directories = []
@@ -13332,11 +13405,20 @@ def _remove_tree_fd(root, root_id, exclude=None, remove_files=False, rate_limite
 					_file_list_rate_limit(rate_limiter)
 					if _remove_one_listed(root, root_id, os.path.relpath(path, base)):
 						removed += 1
+					if progress is not None and clock() >= progress.due:
+						progress.show(dirpath, removed, folders)
 			dirnames[:] = [name for name in dirnames if name not in links and not (exclude and is_excluded(os.path.join(dirpath, name), exclude))]
 		for directory in sorted(directories, key=lambda path: path.count(os.sep), reverse=True):
 			e = _rmdir_below(root, root_id, os.path.relpath(directory, base))
-			if e is not None and e.errno not in (errno.ENOTEMPTY, errno.EEXIST, errno.EBUSY):
+			if e is None:
+				folders += 1
+			elif e.errno not in (errno.ENOTEMPTY, errno.EEXIST, errno.EBUSY):
 				errors.append((directory, e))
+			if progress is not None and clock() >= progress.due:
+				progress.show(directory, removed, folders)
+		if progress is not None:
+			progress.files += removed
+			progress.folders += folders
 		return removed, left, errors
 	try:
 		if parent_fd is None:
@@ -13409,6 +13491,9 @@ def _remove_tree_fd(root, root_id, exclude=None, remove_files=False, rate_limite
 						subdirectories.append((entry, False, None))
 					else:
 						errors.append((child, e))
+				# Once an entry: a wide directory, or a slow unlink, shows as it goes (a clock read is nothing to an unlink).
+				if progress is not None and clock() >= progress.due:
+					progress.show(path, removed, folders)
 		if name is not None:
 			held.push(name, fd)
 		frames.append([path, subdirectories, 0, name])
@@ -13419,6 +13504,9 @@ def _remove_tree_fd(root, root_id, exclude=None, remove_files=False, rate_limite
 			return removed, left, errors
 		while frames:
 			frame = frames[-1]
+			# A directory at a time: a tree of directories with nothing in them shows too.
+			if progress is not None and clock() >= progress.due:
+				progress.show(frame[0], removed, folders)
 			if frame[2] < len(frame[1]):
 				entry, unknown, expected = frame[1][frame[2]]
 				frame[2] += 1
@@ -13459,19 +13547,26 @@ def _remove_tree_fd(root, root_id, exclude=None, remove_files=False, rate_limite
 						e = None
 					except OSError as rmdir_error:
 						e = rmdir_error
-				if e is not None and e.errno not in busy:
+				if e is None:
+					folders += 1
+				elif e.errno not in busy:
 					errors.append((root, e))
 				break
 			held.pop()
 			try:
 				os.rmdir(frame[3], dir_fd=held.top())
+				folders += 1
 			except FileNotFoundError:
-				pass
+				# Already gone: counted as every other walk does (_rmdir_below gives None for it).
+				folders += 1
 			except OSError as e:
 				if e.errno not in busy:
 					errors.append((frame[0], e))
 	finally:
 		held.close_all()
+		if progress is not None:
+			progress.files += removed
+			progress.folders += folders
 	return removed, left, errors
 
 # (shared count, start time, files per second) in a -pfl pool's workers under -F (_init_rate_share)
@@ -13560,15 +13655,17 @@ def _remove_directory_entries(path, expected_id, exclude=None):
 		os.close(fd)
 	return removed, subdirectories
 
-def _remove_trees_parallel(trees, max_workers, exclude=None, rate_limiter=None):
+def _remove_trees_parallel(trees, max_workers, exclude=None, rate_limiter=None, progress=None):
 	"""-pfl: empty the directories of trees ([(root, its identity)]) in pool jobs, one directory each
 	(_remove_directory_entries), queueing the subdirectories each job reports. With rate_limiter (-F), the jobs pace
-	each unlink from one shared count (_shared_rate_wait), and the count carries on into the walk after. Returns the
-	entries unlinked; the directories themselves are left for _remove_tree_fd."""
+	each unlink from one shared count (_shared_rate_wait), and the count carries on into the walk after. progress
+	(_RemoveProgress): the loop shows it when it is due, with the entries the jobs have reported, and is given their count at
+	the end. Returns the entries unlinked; the directories themselves are left for _remove_tree_fd."""
 	queue = deque(trees)
 	futures = {}
 	removed = 0
 	share = None
+	current = trees[0][0] if trees else ''
 	if rate_limiter:
 		# Every job paces each unlink from one shared count (a wide directory too, not just the queueing of jobs). Python 3.6's
 		# pool takes no initializer: its workers fork from this process at the first submit and inherit it (_pool).
@@ -13581,13 +13678,22 @@ def _remove_trees_parallel(trees, max_workers, exclude=None, rate_limiter=None):
 			while queue and len(futures) < max_workers * 2:
 				path, identity = queue.popleft()
 				futures[_submit_task(executor, _remove_directory_entries, path, identity, exclude)] = path
-			for future in _wait(futures, executor):
-				futures.pop(future)
+			# Until a frame is due (a job on a wide directory reports when it is done, the line shows meanwhile); a frame already
+			# due waits for nothing (0 returns at once, and the frame below moves the due time on).
+			timeout = 1 if progress is None else min(1, max(0, progress.due - time.monotonic()))
+			for future in _wait(futures, executor, timeout):
+				current = futures.pop(future)
 				count, subdirectories = _task_result(future, (0, []), 'Remove process exception')
 				removed += count
 				queue.extend(subdirectories)
+			if progress is not None and time.monotonic() >= progress.due:
+				if rate_limiter:
+					rate_limiter['count'] = counter.value
+				progress.show(current, removed)
 	if rate_limiter:
 		rate_limiter['count'] = counter.value
+	if progress is not None:
+		progress.files += removed
 	return removed
 
 def _rmdir_below(root, root_id, rel):
@@ -15813,7 +15919,7 @@ def hpcp(src_path, dest_paths = [], single_thread = False, max_workers = None,
 			# leading elsewhere writes nothing there (_dest_directory).
 			NAMED_IDS = _named_ids(NAMED_DESTS)
 			SYNC_COPIES = bool(remove)
-			# -v turns the progress bars off (suppress_all_output)
+			# -v turns the copy's progress bars off (suppress_all_output); the removal's walks' line is drawn under -v too (process_remove)
 			_BAR = not verbose
 			# Refuses a clash before anything is copied or removed.
 			dropped, replaced, in_place = _settle_destinations(src_paths, dests, dest_image, directory_only, copy_exclude, 1 if single_thread else max_workers,

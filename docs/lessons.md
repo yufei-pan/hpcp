@@ -5,7 +5,8 @@ agreed behaviour here. For the full story of a line, find the entry with the sam
 `lessons-full.md`.
 
 When one has to change, add the full entry to `lessons-full.md` and one line here, newest last, in the
-same commit as the change. Keep this file under 20 KB: at the cap, merge lines before adding.
+same commit as the change. Never merge lines to save space; before this file passes 80 KB (what one
+Claude Code read returns, measured 2026-11-15), ask the user.
 
 - **2026-11-05 A list of paths names paths, not just files**: when a second input route joins an existing one, ask what its input means before reusing the rule; when two inputs can land on one output, name what the operator meant by each and decide the winner once, before any work starts.
 - **2026-11-06 A landing is a path too**: for every path a run writes, ask what else the run reads there; refuse a source landing on another source's path (or inside it, or on a directory holding it) once, before any copy, in every mode.
@@ -66,3 +67,4 @@ same commit as the change. Keep this file under 20 KB: at the cap, merge lines b
 - **2026-11-13 An undo that cannot destroy needs no proof**: the probe guarded an undo that unlinked what it found, by proving what stood at a name; make the thing so that its undo is an operation that removes nothing of value (`mkdir`, then `rmdir`), and the proofs, with their rounds, have no job.
 - **2026-11-13 A tool that writes can put back what its write cleared**: macOS's cp puts back the mode it found, so the set-ID bits its writes cleared came back under -co; check the file after the tool's whole run against what a plain write leaves (asked by doing one), and keep a kernel's rule for that kernel (macOS runs set-group-ID without group execute).
 - **2026-11-14 A check that cannot read its answer refuses, before the step it guards**: `-tfs` read the type with GNU `df -PT`, which macOS's `df` takes another way, and an empty answer skipped the check, so the option checked nothing there; and it asked only of a destination that was there, after the loop made the missing ones. Read the answer the platform's own way, ask before the step that makes what is asked about, and make "could not read" a refusal that names why.
+- **2026-11-16 A rewrite of a long-running path keeps what it told the operator**: 9.74 moved plain `-rm` to the descriptor walk for symlink safety and the walk printed nothing, where the old path drew a progress line every 0.5 s; nobody saw it for 21 releases because no test asked for output. When a rewrite replaces the code a long job runs in, list what the old path printed while it worked and carry it across, and pin it with a test on the real output (a pace, such as -F, makes the job last, so the test never waits on a machine), asking too where the lines after the progress line land (an error line or a stop's report on the open frame's line).
