@@ -392,6 +392,10 @@ def _stopped(args, cwd, marker, sig, merged=False):
 
 
 STOPS = [pytest.param(signal.SIGTERM, -signal.SIGTERM, id='SIGTERM'), pytest.param(signal.SIGINT, 130, id='SIGINT')]
+# The stop tests' pace (9.96): they signal at the first frame, and 200 files at -F 100 left the -pfl and -rwloff runs 0.1 to 0.2 s
+# before their summary at a 10% CPU quota (a pool's start ate the rest); at -F 20 the run lasts 10 s, and the stop still comes at
+# the first frame.
+STOP_PACE = '20'
 
 
 @posix_only
@@ -403,7 +407,7 @@ def test_995_a_stop_ends_the_open_line_before_the_report_on_stdout(tmp_path, ext
 	program with status 130, a SIGTERM by the signal itself (-15, as in 9.94); the report says "return code: 130." for both, and the
 	stop's own line is on stderr.'''
 	_tree(tmp_path / 'src', PROGRAM_DIRECTORIES, PROGRAM_PER_DIRECTORY)
-	returncode, output, err = _stopped(['-rm', '-rf', '-F', str(FILES_PER_SECOND), '-j', '2'] + extra + ['src'], tmp_path, b'iteration:', sig)
+	returncode, output, err = _stopped(['-rm', '-rf', '-F', STOP_PACE, '-j', '2'] + extra + ['src'], tmp_path, b'iteration:', sig)
 	assert 'Removed %d files' % PROGRAM_TOTAL not in output, 'the run was over before the stop: %r' % output
 	assert returncode == status and 'return code: 130.' in output, (returncode, output, err)
 	assert 'Keyboard Interrupt' in err
@@ -418,7 +422,7 @@ def test_995_a_stop_in_rwloffs_job_phase_leaves_its_bar_line_to_the_report(tmp_p
 	line is skipped): its mark must stay for the stop's report, or "Keyboard Interrupt: ..." is glued to the bar's text (stdout and
 	stderr one pipe: 9.94 started it on its own line; 9.95's first fix round glued it).'''
 	_tree(tmp_path / 'src', PROGRAM_DIRECTORIES, PROGRAM_PER_DIRECTORY)
-	returncode, output, _ = _stopped(['-rm', '-rf', '-rwloff', '-F', str(FILES_PER_SECOND), '-j', '2', 'src'], tmp_path, b'F/s Limit', sig, merged=True)
+	returncode, output, _ = _stopped(['-rm', '-rf', '-rwloff', '-F', STOP_PACE, '-j', '2', 'src'], tmp_path, b'F/s Limit', sig, merged=True)
 	assert 'Removed %d files' % PROGRAM_TOTAL not in output, 'the run was over before the stop: %r' % output
 	assert returncode == status, (returncode, output)
 	report = output.index('Keyboard Interrupt: ')
