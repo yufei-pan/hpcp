@@ -2,8 +2,8 @@
 and the "Removed N files" line). Each test fails on 9.94 unless it says it guards what 9.94 already gets right. The pace
 under -F is what makes a removal last: N files at -F 100 take at least N / 100 s whatever the machine, so a frame (every
 0.5 s) is always due. The serial runs also check that the first frame came well before the end; a -pfl pool's start takes a time
-that depends on the machine (a forkserver start under load ate that margin), so a -pfl run is only checked for a frame before
-the summary.'''
+that depends on the machine (a forkserver start under load ate that margin), so a -pfl run is checked for the order instead: its
+first frame comes before its last job's report (the loop draws while the jobs unlink, not only the walk after them).'''
 import os
 import re
 import select
@@ -20,9 +20,10 @@ posix_only = pytest.mark.skipif(os.name != 'posix', reason='POSIX')
 HPCP = os.path.abspath(hpcp.__file__)
 
 # The pace and the tree: 300 files at -F 100 take at least 3 s; the first frame is due at 0.5 s and files are still being
-# unlinked then, so one is drawn by the walk, in a worker's directory or in the parent's wait. The pace counts from the run's
-# start, and a -pfl pool takes its time to start (over a second on a busy machine, Python 3.9 as root: the first version of the
-# cadence check failed there), so the run is long enough to show a frame after that.
+# unlinked then, so one is drawn by the serial walk (at an entry) or by the -pfl loop in the parent's wait (a job is another
+# process and draws nothing). The pace counts from the run's start, and a -pfl pool takes its time to start (over a second on a
+# busy machine, Python 3.9 as root: the first version of the cadence check failed there), so the run is long enough to show a
+# frame after that.
 FILES_PER_SECOND = 100
 DIRECTORIES, PER_DIRECTORY = 6, 50
 TOTAL = DIRECTORIES * PER_DIRECTORY
@@ -30,7 +31,7 @@ TOTAL = DIRECTORIES * PER_DIRECTORY
 PROGRAM_DIRECTORIES, PROGRAM_PER_DIRECTORY = 4, 50
 PROGRAM_TOTAL = PROGRAM_DIRECTORIES * PROGRAM_PER_DIRECTORY
 # A frame that comes at the end (a loop that checks the clock only between directories, or after them) is no frame of the run:
-# this is how far before the end the first one is, in the serial runs (not in -pfl's: see the module docstring).
+# this is how far before the end the first one is, in the serial runs (-pfl's runs check the order: see the module docstring).
 FIRST_FRAME_BEFORE_THE_END = 0.5
 SHAPES = [pytest.param((DIRECTORIES, PER_DIRECTORY), id='tree'), pytest.param((1, TOTAL), id='one-wide-directory')]
 
@@ -41,6 +42,24 @@ def _tree(root, directories=DIRECTORIES, per_directory=PER_DIRECTORY):
 		directory.mkdir(parents=True)
 		for number in range(per_directory):
 			(directory / ('f%d' % number)).write_text('x')
+
+
+def _times_of_frames_and_job_reports(monkeypatch):
+	'''Wrap what draws a frame (_RemoveProgress.show) and what takes a -pfl job's report (_task_result, called in the parent for each
+	finished job): two lists of clock readings, the frames' and the reports'. A job is another process, so the order of the two is
+	what shows that the loop draws while the jobs work, whatever the machine's speed.'''
+	times, reported = [], []
+	real_show = hpcp._RemoveProgress.show
+	def show(self, *args, **kwargs):
+		times.append(time.monotonic())
+		return real_show(self, *args, **kwargs)
+	monkeypatch.setattr(hpcp._RemoveProgress, 'show', show)
+	real_task_result = hpcp._task_result
+	def task_result(*args, **kwargs):
+		reported.append(time.monotonic())
+		return real_task_result(*args, **kwargs)
+	monkeypatch.setattr(hpcp, '_task_result', task_result)
+	return times, reported
 
 
 def _frames(text):
@@ -73,16 +92,12 @@ MODES = [
 @pytest.mark.parametrize('options, descriptors', MODES)
 def test_995_plain_rm_shows_a_line_while_it_removes(tmp_path, capsys, paced, monkeypatch, options, descriptors, shape):
 	'''9.74 to 9.94 removed in silence: no line between "Removing files from" and the summary. The first frame comes by the
-	time it is due, not once the files are gone: in a wide directory only a check an entry (the walk's unlinks, a -pfl job's
-	wait in the parent) can show it.'''
+	time it is due, not once the files are gone: in a wide directory only a check at an entry (the walk's unlinks) or the -pfl
+	loop's wait in the parent can show it. Serial: the first frame is well before the end. -pfl: it is before the last job's
+	report (the loop draws while the jobs unlink: without that draw the line comes from the walk after them).'''
 	if not descriptors:
 		monkeypatch.setattr(hpcp, '_DIR_FD_WALK', False)
-	times = []
-	real_show = hpcp._RemoveProgress.show
-	def show(self, *args, **kwargs):
-		times.append(time.monotonic())
-		return real_show(self, *args, **kwargs)
-	monkeypatch.setattr(hpcp._RemoveProgress, 'show', show)
+	times, reported = _times_of_frames_and_job_reports(monkeypatch)
 	_tree(tmp_path / 'src', *shape)
 	hpcp.process_remove([str(tmp_path / 'src')], remove_force=True, **options)
 	end = time.monotonic()
@@ -92,17 +107,20 @@ def test_995_plain_rm_shows_a_line_while_it_removes(tmp_path, capsys, paced, mon
 	assert frames, 'no progress line in %r' % shown
 	if options['single_thread']:
 		assert end - times[0] >= FIRST_FRAME_BEFORE_THE_END, 'the first frame came %.2f s before the end' % (end - times[0])
+	else:
+		assert reported and times[0] < reported[-1], 'the first frame came %.3f s after the last job reported' % (times[0] - reported[-1])
 	assert re.search(r'iteration:\d+ \| (Removed: [\d.]+ ?K? +)?(Folders: [\d.]+ ?K? +)?(\| )?Overall: [\d.]+ ?K? +Files', frames[-1]), frames[-1]
 	# The Overall count is the pace's own (under -pfl the jobs' shared count): it only grows, and is never behind what the jobs reported.
 	overall = [float(re.search(r'Overall: ([\d.]+) ', frame).group(1)) for frame in frames]
 	removed = [float(re.search(r'Removed: ([\d.]+) ', frame).group(1)) if 'Removed:' in frame else 0 for frame in frames]
-	assert overall == sorted(overall) and overall[-1] > 0, frames
+	# (The last frame can be stale on a loaded host, a run ending within 0.5 s of it: the summary has the total.)
+	assert overall == sorted(overall), frames
 	assert all(done >= count for done, count in zip(overall, removed)), frames
 
 
 def test_995_the_line_is_the_listings_with_removed_and_folders(tmp_path, capsys, monkeypatch, reset_hpcp_globals):
-	'''The directory's last 50 characters, then "iteration:N | Removed: N Folders: M" (the listing's frame has the same parts). With
-	the interval 0 every entry shows a frame, and the counts grow to the last.'''
+	'''The directory's last 50 characters, then "iteration:N | Removed: N Folders: M" (the listing's frame has Files: Links:
+	Folders: Size: where this has Removed: Folders:). With the interval 0 every entry shows a frame, and the counts grow to the last.'''
 	monkeypatch.setattr(hpcp._RemoveProgress, '_INTERVAL', 0)
 	root = tmp_path / ('long-directory-name-' * 4) / 'src'
 	_tree(root, directories=3, per_directory=50)
@@ -155,6 +173,22 @@ def test_995_the_walk_adds_to_what_the_pfl_jobs_removed(tmp_path, capsys, monkey
 	assert 'Folders: ' in frames[-1]
 	# Every frame of the jobs' loop has the count of the files they had unlinked, never the parent's own (0): never behind what they reported.
 	assert all(float(re.search(r'Overall: ([\d.]+) ', frame).group(1)) >= float(re.search(r'Removed: ([\d.]+) ', frame).group(1)) for frame in frames if 'Removed:' in frame), frames
+
+
+def test_995_pfl_with_no_pace_draws_while_its_jobs_unlink(tmp_path, capsys, monkeypatch, reset_hpcp_globals):
+	'''-pfl without -F (the default: no pace, no shared count): the loop shows the line while the jobs unlink too, not only the walk
+	after them. A run that outlasts 0.5 s with no pace is the machine's doing, so the interval is 0 (the parent draws; the jobs
+	are other processes and draw nothing): the first frame comes before the last job's report. Without the loop's draw the walk
+	shows the only frames, after the jobs.'''
+	monkeypatch.setattr(hpcp, 'FILES_RATE_LIMIT', 0)
+	monkeypatch.setattr(hpcp._RemoveProgress, '_INTERVAL', 0)
+	times, reported = _times_of_frames_and_job_reports(monkeypatch)
+	_tree(tmp_path / 'src', directories=4, per_directory=5)
+	hpcp.process_remove([str(tmp_path / 'src')], single_thread=False, max_workers=2, parallel_file_listing=True, remove_force=True)
+	assert not (tmp_path / 'src').exists()
+	frames = _frames(_before_the_summary(capsys.readouterr().out, 20))
+	assert frames and not any('Overall' in frame for frame in frames), frames
+	assert reported and times[0] < reported[-1], 'the first frame came %.3f s after the last job reported' % (times[0] - reported[-1])
 
 
 def test_995_the_open_line_is_known_to_error_lines_and_ended_by_finish(capsys, monkeypatch, reset_hpcp_globals):
@@ -264,8 +298,8 @@ def _at_a_terminal(args, cwd, size):
 @pytest.mark.parametrize('size', [(40, 120), None], ids=['sized-terminal', 'unsized-terminal'])
 @pytest.mark.parametrize('extra', [[], ['-pfl']], ids=['serial', 'pfl'])
 def test_995_hpcp_rm_at_a_terminal_prints_the_line_on_one_line(tmp_path, extra, size):
-	'''At a terminal, sized or not (script's pty has no size: 0 columns), each frame holds one "iteration:" and the Overall count
-	(no two frames glued). The width is not measured: a frame wider than the terminal wraps (planned in multiCMD).'''
+	'''At a terminal, sized or not (a pty from pty.fork has no size, as under `script`: 0 columns), each frame holds one "iteration:"
+	and the Overall count (no two frames glued). The width is not measured: a frame wider than the terminal wraps (planned in multiCMD).'''
 	_tree(tmp_path / 'src', PROGRAM_DIRECTORIES, PROGRAM_PER_DIRECTORY)
 	rc, shown = _at_a_terminal(['-rm', '-rf', '-F', str(FILES_PER_SECOND), '-j', '2'] + extra + ['src'], tmp_path, size)
 	assert rc == 0 and not (tmp_path / 'src').exists(), shown
@@ -276,16 +310,19 @@ def test_995_hpcp_rm_at_a_terminal_prints_the_line_on_one_line(tmp_path, extra, 
 
 @pytest.fixture
 def locked_tree(tmp_path):
-	'''src/ with a/ and z/ of 100 files each (at -F 100: the walk is in a/ at the first frame) and src/a/sub/locked/ (mode 0555)
-	holding two files the runner can not unlink: each is an error line, reached after the first frame. Root can unlink them.'''
+	'''src/ with a/ of 300 files and z/ of 100, and src/a/sub/locked/ (mode 0555) holding two files the runner can not unlink: each is
+	an error line, reached after the first frame. At -F 100 the 400 files take at least 4 s: serial, the walk is in a/ at the first
+	frame; under -pfl, a's job is still unlinking, and the locked directory's job starts only once a's returns, after 3 s or more
+	(the first frame is at 0.5 s, or when the pool has started: over a second under a CPU quota of 0.25, so a/ is long enough
+	for the frame to come well before the error). Root can unlink them.'''
 	if os.name != 'posix' or os.geteuid() == 0:
 		pytest.skip('needs a directory its owner can not write into (not root)')
 	root = tmp_path / 'src'
 	locked = root / 'a' / 'sub' / 'locked'
 	locked.mkdir(parents=True)
-	for directory in ('a', 'z'):
+	for directory, count in (('a', 300), ('z', 100)):
 		(root / directory).mkdir(exist_ok=True)
-		for number in range(100):
+		for number in range(count):
 			(root / directory / ('f%d' % number)).write_text('x')
 	for name in ('k1', 'k2'):
 		(locked / name).write_text('x')
@@ -294,13 +331,17 @@ def locked_tree(tmp_path):
 	locked.chmod(0o755)
 
 
-def _every_start_of_a_line(text, mark, starts='\n'):
-	'''The places before the final "Error occurred:" report where mark is not right after a character of starts (a line's start, or
-	the terminal's clear-and-return): each is a stretch of text ending in it. Fails when mark does not occur at all.'''
+CLEAR_LINE = '\x1b[2K\r'
+
+
+def _every_start_of_a_line(text, mark, starts=('\n',)):
+	'''The places before the final "Error occurred:" report where mark does not come right after one of starts (a line's start: a
+	newline, or at a terminal the clear-line and return, whole: a bare return would leave the bar's text on the line): each is a
+	stretch of text ending in it. Fails when mark does not occur at all.'''
 	text = text.partition('Error occurred:')[0]
 	places = [match.start() for match in re.finditer(re.escape(mark), text)]
 	assert places, 'no %r in %r' % (mark, text)
-	return [text[max(0, place - 60):place + len(mark)] for place in places if place and text[place - 1] not in starts]
+	return [text[max(0, place - 60):place + len(mark)] for place in places if place and not text[:place].endswith(tuple(starts))]
 
 
 @posix_only
@@ -308,7 +349,8 @@ def _every_start_of_a_line(text, mark, starts='\n'):
 def test_995_an_error_line_while_the_line_is_open_starts_its_own_line_in_a_log(locked_tree, extra):
 	'''9.95's first version: under -pfl a job's "Remove process exception:" came right after the open frame (a combined log: on the
 	frame's line, after its padding), as a job of a plain -rm did not know the run drew one. 9.94 drew no frame. (The serial walk
-	reports in the parent, which knows: that one guards.)'''
+	ends the frame's line before it reports its errors, in the parent: that case passes on the first build too, and guards the
+	line's end. The test for an error printed while a frame is open, in the parent, is the named file's, below.)'''
 	rc, output = _run(['-rm', '-rf', '-F', str(FILES_PER_SECOND), '-j', '2'] + extra + ['src'], locked_tree.parent)
 	assert rc != 0 and not (locked_tree / 'a' / 'f0').exists(), output
 	assert _frames(output), output
@@ -318,40 +360,53 @@ def test_995_an_error_line_while_the_line_is_open_starts_its_own_line_in_a_log(l
 @posix_only
 @pytest.mark.parametrize('size', [(40, 120), None], ids=['sized-terminal', 'unsized-terminal'])
 def test_995_an_error_line_while_the_line_is_open_clears_it_at_a_terminal(locked_tree, size):
-	'''At a terminal the job's line starts with the clear-line and return a copy's error line does, in a pty with a size or none.'''
+	'''At a terminal the job's line starts with the clear-line and return a copy's error line does (the whole escape, not a bare
+	return), in a pty with a size or none.'''
 	rc, shown = _at_a_terminal(['-rm', '-rf', '-F', str(FILES_PER_SECOND), '-j', '2', '-pfl', 'src'], locked_tree.parent, size)
 	assert rc != 0, shown
 	assert _frames(shown), shown
-	assert _every_start_of_a_line(shown, 'Remove process exception:', '\n\r') == [], shown
+	assert _every_start_of_a_line(shown, 'Remove process exception:', ('\n', CLEAR_LINE)) == [], shown
 
 
-@posix_only
-@pytest.mark.parametrize('extra', [[], ['-pfl']], ids=['serial', 'pfl'])
-def test_995_a_stop_ends_the_open_line_before_the_report_on_stdout(tmp_path, extra):
-	'''A stop (SIGTERM, as Ctrl-C is) once the first frame has come, stdout one pipe and stderr another: "Error occurred: ..." (stdout)
-	started right after the open frame, padding and all, as nothing ended the line when the removal was left by the stop. The
-	status is what 9.94 gives (the run ends by the signal, "return code: 130." in the report) and the stop's own line is on stderr.'''
-	_tree(tmp_path / 'src', PROGRAM_DIRECTORIES, PROGRAM_PER_DIRECTORY)
-	proc = subprocess.Popen([sys.executable, HPCP, '-rm', '-rf', '-F', str(FILES_PER_SECOND), '-j', '2'] + extra + ['src'], cwd=str(tmp_path),
-		stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+def _stopped(args, cwd, marker, sig, merged=False):
+	'''hpcp as a program, sent sig as soon as marker (bytes) has come on its stdout: stdout and stderr two pipes, or one (merged). A
+	SIGINT the parent ignores (a job its shell started with &) would be ignored by the program too, so it is given the default back.
+	(exit status, what stdout held, what stderr held: b"" when merged)'''
+	proc = subprocess.Popen([sys.executable, HPCP] + args, cwd=str(cwd), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+		stderr=subprocess.STDOUT if merged else subprocess.PIPE, preexec_fn=lambda: signal.signal(signal.SIGINT, signal.SIG_DFL))
 	seen = b''
 	deadline = time.monotonic() + 60
 	try:
-		while b'iteration:' not in seen:
-			assert time.monotonic() < deadline, 'no frame in 60 s: %r' % seen
+		while marker not in seen:
+			assert time.monotonic() < deadline, 'no %r in 60 s: %r' % (marker, seen)
 			if select.select([proc.stdout], [], [], 0.2)[0]:
 				chunk = os.read(proc.stdout.fileno(), 4096)
-				assert chunk, 'the run ended without a frame: %r' % seen
+				assert chunk, 'the run ended before %r: %r' % (marker, seen)
 				seen += chunk
-		proc.send_signal(signal.SIGTERM)
+		proc.send_signal(sig)
 		out, err = proc.communicate(timeout=60)
 	finally:
 		proc.kill()
 		proc.wait()
-	output = (seen + out).decode('utf-8', 'replace')
+	return proc.returncode, (seen + out).decode('utf-8', 'replace'), (err or b'').decode('utf-8', 'replace')
+
+
+STOPS = [pytest.param(signal.SIGTERM, -signal.SIGTERM, id='SIGTERM'), pytest.param(signal.SIGINT, 130, id='SIGINT')]
+
+
+@posix_only
+@pytest.mark.parametrize('sig, status', STOPS)
+@pytest.mark.parametrize('extra', [[], ['-pfl']], ids=['serial', 'pfl'])
+def test_995_a_stop_ends_the_open_line_before_the_report_on_stdout(tmp_path, extra, sig, status):
+	'''A stop once the first frame has come, stdout one pipe and stderr another: "Error occurred: ..." (stdout) started right after
+	the open frame, padding and all, as nothing ended the line when the removal was left by the stop. Ctrl-C (SIGINT) ends the
+	program with status 130, a SIGTERM by the signal itself (-15, as in 9.94); the report says "return code: 130." for both, and the
+	stop's own line is on stderr.'''
+	_tree(tmp_path / 'src', PROGRAM_DIRECTORIES, PROGRAM_PER_DIRECTORY)
+	returncode, output, err = _stopped(['-rm', '-rf', '-F', str(FILES_PER_SECOND), '-j', '2'] + extra + ['src'], tmp_path, b'iteration:', sig)
 	assert 'Removed %d files' % PROGRAM_TOTAL not in output, 'the run was over before the stop: %r' % output
-	assert proc.returncode == -signal.SIGTERM and 'return code: 130.' in output, (proc.returncode, output, err)
-	assert 'Keyboard Interrupt' in err.decode('utf-8', 'replace')
+	assert returncode == status and 'return code: 130.' in output, (returncode, output, err)
+	assert 'Keyboard Interrupt' in err
 	report = output.index('Error occurred: ')
 	assert output[report - 1] == '\n', output[max(0, report - 120):report + 60]
 
@@ -382,7 +437,8 @@ def test_995_files_named_as_arguments_show_a_line_while_they_are_removed(tmp_pat
 	end = time.monotonic()
 	assert os.listdir(str(tmp_path / 'src')) == []
 	frames = _frames(_before_the_summary(capsys.readouterr().out))
-	assert frames and end - times[0] >= FIRST_FRAME_BEFORE_THE_END, (frames, end - times[0])
+	assert frames, 'no progress line'
+	assert end - times[0] >= FIRST_FRAME_BEFORE_THE_END, 'the first frame came %.2f s before the end' % (end - times[0])
 	assert all(frame.startswith(str(tmp_path / 'src')[-50:] + ' | iteration:') for frame in frames), frames
 	counts = [int(re.search(r'Removed: (\d+)\.00 ', frame).group(1)) for frame in frames]
 	# (A frame can come right after the last unlink, so the last count may be the total.)
@@ -402,8 +458,9 @@ def test_995_the_program_given_files_to_remove_prints_the_line(tmp_path):
 
 @pytest.mark.parametrize('descriptors', [True, False], ids=['descriptors', 'no-descriptors'])
 def test_995_a_directory_gone_before_its_rmdir_is_counted_as_removed_in_every_walk(tmp_path, monkeypatch, reset_hpcp_globals, descriptors):
-	'''Something else removes d1 between the walk's listing and its rmdir: the fallback walk and the root count it (_rmdir_below
-	answers None), and the descriptor walk's directory counts it the same.'''
+	'''A directory that something else removes between the walk's listing and its rmdir (the rmdir here finds it gone) counts under
+	Folders: like any other, in both walks. (The fallback walk and the root already did: _rmdir_below answers None for a gone
+	directory; the descriptor walk's inner directories did not.)'''
 	if not descriptors:
 		monkeypatch.setattr(hpcp, '_DIR_FD_WALK', False)
 	_tree(tmp_path / 'src', directories=3, per_directory=2)
