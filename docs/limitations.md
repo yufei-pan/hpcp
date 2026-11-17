@@ -303,9 +303,16 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - **Revisit when:** 9.97. Python 3.6 is end-of-life support: the fix goes in only if it adds no part to the 3.11+ path.
 - **Noted:** 2026-11-17, 9.96's final review (second opinion code4); a deferral, not asked.
 
+### A pool job's error lines show when its job returns
+- **Kind:** known limitation.
+- **What the operator sees:** in a pooled run (a copy's, a listing's or a removal's jobs), a job hands its error lines back with its result and hpcp prints them then: seconds after the failure among small files, later where a large file follows the failed one in the same job. A job that never returns (a stop with Ctrl-C, a worker killed or out of memory, one hung on a dead mount) shows none of the lines it held. 9.95 printed each line as it happened. The progress line itself stays live, the error list and the exit status are as in 9.95, and a rerun meets the same files again; with `-s` every line prints at once.
+- **Why:** only the process that draws the progress line knows whether it is open, so a worker printing its own lines is how 9.94 and 9.95 put them on the frame or after an empty line (the blank lines 9.96 removed). Sending each line at once needs a second channel from every worker beside the results, which a killed worker can leave half written.
+- **Revisit when:** an operator misses a line that a stopped or killed run held, or the jobs get such a channel for another reason.
+- **Approved:** 2026-11-17, the user's pick "Known limitation (Recommended)" (relayed by chief). The user asked, 2026-11-16, "It NEEDS to print interm outputs when it is removing in command line": the progress line does; only the error lines wait for their job.
+
 ### A pool task keeps all its error lines until it returns
 - **Kind:** deferred (9.97).
-- **What the operator sees:** a job that meets a great many failures (one copy job over a directory of unreadable files) holds every error line in `_TASK_LINES` (and each one with a `:` in its error list too) until it returns, and the parent prints them then: memory the size of the lines, and the lines late. 9.95 printed each as it happened (and kept its error list in the worker alike).
+- **What the operator sees:** a job that meets a great many failures (one copy job over a directory of unreadable files) holds every error line in `_TASK_LINES` (and each one with a `:` in its error list too) until it returns, and the parent prints them then: memory the size of the lines (the lines' timing is the known limitation above). 9.95 printed each as it happened (and kept its error list in the worker alike).
 - **Why:** 9.96's task hands its error lines back with its result so that only the parent writes to the line; no number bounds them.
 - **Plan (9.97):** measure how many lines the worst jobs meet (a tree of unreadable files), keep that many in a task with a final `... and N more` line (the error list keeps counting), and write the number's reason beside it.
 - **Revisit when:** 9.97.
