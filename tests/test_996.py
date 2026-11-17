@@ -164,7 +164,7 @@ def test_996_a_note_of_the_extra_directories_pass_starts_its_own_line(tmp_path, 
 	identity = hpcp._directory_identity(root)
 	progress = hpcp._RemoveProgress()
 	hpcp._remove_listed_files([(root, identity, 'a'), (root, identity, 'b')], rmdir=True, progress=progress)
-	progress.finish()
+	hpcp._end_line()
 	shown = capsys.readouterr().out
 	assert _frames(shown), shown
 	_starts_a_line(shown, 'Keeping non-empty directory:')
@@ -230,3 +230,144 @@ def test_996_a_pfl_jobs_listing_draws_no_frame(tmp_path, capsys, monkeypatch, re
 	files, _, _, _ = hpcp.get_file_list_serial(str(tmp_path / 'src'), show=False)
 	assert len(files) == 12 and capsys.readouterr().out == ''
 	assert not hpcp._BAR_DRAWN
+
+
+# ---- 3. One mark for stdout's open line: no blank lines between error lines, and a stop's report on a line of its own ----
+
+not_root = pytest.mark.skipif(os.name != 'posix' or os.geteuid() == 0, reason='root reads and unlinks what these tests lock')
+
+
+def _locked(directory, names):
+	'''directory (made) holding names, mode 0555: its files can not be unlinked by their owner (not root).'''
+	os.makedirs(str(directory))
+	for name in names:
+		open(os.path.join(str(directory), name), 'w').close()
+	os.chmod(str(directory), 0o555)
+
+
+def _unlock(root):
+	for directory, _, _ in os.walk(str(root)):
+		os.chmod(directory, 0o755)
+
+
+@not_root
+def test_996_error_lines_of_named_files_leave_no_blank_line_in_a_combined_log(tmp_path):
+	'''hpcp -rm dir/* with three files that can not be unlinked, stdout and stderr one pipe: once the line had drawn, 9.95 put an
+	empty line after each error line (the mark stayed set after an error line had ended the frame's line).'''
+	_tree(tmp_path / 'src', 1, TOTAL)
+	_locked(tmp_path / 'locked', ['k0', 'k1', 'k2'])
+	try:
+		rc, output = _run(['-rm', '-rf', '-F', str(FILES_PER_SECOND), '-s'] + [os.path.join('src', 'd0', 'f%d' % number) for number in range(TOTAL)]
+			+ ['locked/k0', 'locked/k1', 'locked/k2'], tmp_path)
+	finally:
+		_unlock(tmp_path / 'locked')
+	assert rc == 192 and _frames(output), output
+	assert output.count('Remove process exception:') == 3 + 3 and '\n\n' not in output, output
+
+
+@not_root
+def test_996_a_pfl_jobs_error_lines_leave_no_blank_line_in_a_combined_log(tmp_path):
+	'''-rm -pfl: a job is another process and can not see the parent's line, so 9.95 started each of its error lines with a line
+	end, an empty line where the line was already ended. The parent prints them now (when the job's result comes).'''
+	_tree(tmp_path / 'src', 1, 300)
+	_locked(tmp_path / 'src' / 'd0' / 'sub' / 'locked', ['k0', 'k1', 'k2'])
+	try:
+		rc, output = _run(['-rm', '-rf', '-F', str(FILES_PER_SECOND), '-j', '2', '-pfl', 'src'], tmp_path)
+	finally:
+		_unlock(tmp_path / 'src')
+	assert rc == 192 and _frames(output), output
+	assert '\n\n' not in output.partition('Error occurred:')[0], output
+
+
+@not_root
+def test_996_a_copys_job_error_lines_leave_no_blank_line_in_a_combined_log(tmp_path):
+	'''A copy's job meets several files it can not read: 9.94 and 9.95 started each of its error lines with a line end, an empty
+	line before each one after the first that no frame came between (14 of 50 here). Each is still at a line's start.'''
+	_tree(tmp_path / 'src', 2, 100)
+	for number in range(0, 100, 2):
+		os.chmod(str(tmp_path / 'src' / 'd1' / ('f%d' % number)), 0)
+	rc, output = _run(['-F', str(FILES_PER_SECOND), '-j', '2', 'src', '-d', 'dst/'], tmp_path)
+	assert rc == 190, output
+	before = output.partition('Error occurred:')[0]
+	assert len(re.findall(r'(?m)^Copy failed: ', before)) == 50 and '\n\nCopy failed' not in before, output
+
+
+def _stopped(args, cwd, marker):
+	'''hpcp as a program, stdout and stderr two pipes, sent SIGTERM as soon as marker (a regular expression over bytes) matches
+	what has come on stdout. (exit status, stdout, stderr)'''
+	import signal
+	proc = subprocess.Popen([sys.executable, HPCP] + args, cwd=str(cwd), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+		stderr=subprocess.PIPE)
+	seen = b''
+	deadline = time.monotonic() + 60
+	try:
+		while not re.search(marker, seen):
+			assert time.monotonic() < deadline, 'no %r in 60 s: %r' % (marker, seen)
+			if select.select([proc.stdout], [], [], 0.2)[0]:
+				chunk = os.read(proc.stdout.fileno(), 4096)
+				assert chunk, 'the run ended before %r: %r' % (marker, seen)
+				seen += chunk
+		proc.send_signal(signal.SIGTERM)
+		out, err = proc.communicate(timeout=60)
+	finally:
+		proc.kill()
+		proc.wait()
+	return proc.returncode, (seen + out).decode('utf-8', 'replace'), err.decode('utf-8', 'replace')
+
+
+# The pace of the stop tests: 200 files at -F 20 last 10 s, so the stop at the marker always comes before the run's end.
+STOP_PACE = '20'
+# A bar's frame under -F carries "F/s Limit" (its prefix can be cut at a narrow width); the copy's comes after "Processing N files".
+STOPPED_BARS = [
+	pytest.param(['-F', STOP_PACE, '-j', '2', 'src', '-d', 'dst/'], rb'Processing \d+ files[^\r]*\r[^\n]*F/s Limit', id='copy-bar'),
+	pytest.param(['-rm', '-rf', '-rwloff', '-F', STOP_PACE, '-j', '2', 'src'], rb'F/s Limit', id='rwloff-bar'),
+	pytest.param(['-F', STOP_PACE, '-j', '2', 'src', '-d', 'dst/'], rb'iteration:', id='listing-line'),
+]
+
+
+@posix_only
+@pytest.mark.parametrize('args, marker', STOPPED_BARS)
+def test_996_a_stop_under_a_bar_ends_its_line_before_the_report_on_stdout(tmp_path, args, marker):
+	'''stdout and stderr apart (> out 2> err), a SIGTERM while a copy's bar, -rwloff's "Deleted" bar or the listing's line is up:
+	9.94 and 9.95 printed "Error occurred: ..." on that line in stdout (a stop skips the bar's own end of line).'''
+	_tree(tmp_path / 'src')
+	returncode, output, err = _stopped(args, tmp_path, marker)
+	assert returncode == -15 and 'Keyboard Interrupt' in err, (returncode, output, err)
+	assert 'return code: 130.' in output, output
+	_starts_a_line(output, 'Error occurred: ')
+
+
+def test_996_an_error_line_ends_the_open_line_only_where_it_is_stdouts_file(capsys, reset_hpcp_globals):
+	'''One mark: an error line whose start ended stdout's line (stderr is stdout's file or terminal) clears it, so the next one
+	starts no empty line; where stderr is elsewhere (a terminal, stdout a file) stdout's line is still open, for its next line to end.'''
+	pid = os.getpid()
+	hpcp._BAR_DRAWN = True
+	hpcp._LINE_START[:] = [pid, '\n', True]
+	hpcp.eprint('Remove process exception: one')
+	hpcp.eprint('Remove process exception: two')
+	assert capsys.readouterr().err == '\nRemove process exception: one\nRemove process exception: two\n' and not hpcp._BAR_DRAWN
+	hpcp._BAR_DRAWN = True
+	hpcp._LINE_START[:] = [pid, '\x1b[2K\r', False]
+	hpcp.eprint('Remove process exception: three')
+	assert capsys.readouterr().err == '\x1b[2K\rRemove process exception: three\n' and hpcp._BAR_DRAWN
+	assert hpcp.get_rc_from_error() == 192
+	assert capsys.readouterr().out.startswith('\nError occurred: ') and not hpcp._BAR_DRAWN
+	hpcp._LINE_START[:] = [None, '', False]
+
+
+def test_996_a_tasks_error_lines_are_printed_by_the_parent_once(capsys, monkeypatch, reset_hpcp_globals):
+	'''A pool task's eprint goes back with its result (_run_task), and the parent prints it as it takes the result (_settled), off
+	its own line; a caller whose next step reports the same again takes the result without them (report=False).'''
+	import concurrent.futures
+	monkeypatch.setattr(hpcp, '_worker_initialized', True)
+	settings = {name: getattr(hpcp, name) for name in hpcp._TASK_SETTINGS}
+	result = hpcp._run_task(settings, hpcp.eprint, 'Copy failed: a task\'s line')
+	assert capsys.readouterr().err == '' and result[3] == ['Copy failed: a task\'s line\n']
+	def future():
+		done = concurrent.futures.Future()
+		done.set_result(result)
+		return done
+	assert hpcp._task_result(future(), 'default', 'Copy process crashed') is None
+	assert capsys.readouterr().err == 'Copy failed: a task\'s line\n' and hpcp.ERRORS == ['Copy failed: a task\'s line']
+	assert hpcp._task_result(future(), 'default', 'Copy process crashed', report=False) is None
+	assert capsys.readouterr().err == '' and hpcp.ERRORS == ['Copy failed: a task\'s line']

@@ -192,32 +192,24 @@ def test_995_pfl_with_no_pace_draws_while_its_jobs_unlink(tmp_path, capsys, monk
 
 
 def test_995_the_open_line_is_known_to_error_lines_and_ended_by_finish(capsys, monkeypatch, reset_hpcp_globals):
-	'''show() sets the flag the parent's error lines consult (_BAR_DRAWN) and finish() clears it and ends the line. Where the error
-	lines land is tested with the real program (below).'''
+	'''show() sets the mark the parent's error lines consult (_BAR_DRAWN), and the line's end (9.96: _end_line, 9.95's finish())
+	clears it and ends the line. Where the error lines land is tested with the real program (below).'''
 	progress = hpcp._RemoveProgress()
 	assert not hpcp._BAR_DRAWN
 	progress.show('/some/directory', 3, 1)
 	assert hpcp._BAR_DRAWN
 	shown = capsys.readouterr().out
 	assert shown.startswith('\r') and not shown.endswith('\n') and re.search(r'Removed: 3\.00 +Folders: 1\.00', shown)
-	progress.finish()
+	hpcp._end_line()
 	assert not hpcp._BAR_DRAWN and capsys.readouterr().out == '\n'
-	progress.finish()
+	hpcp._end_line()
 	assert capsys.readouterr().out == ''
 
 
-def test_995_finish_leaves_the_mark_of_a_line_it_did_not_draw(capsys, reset_hpcp_globals):
-	'''-rwloff's job bar (Adaptive_Progress_Bar) sets _BAR_DRAWN and a stop skips its stop(): the removal's finish() has drawn no
-	frame of its own, so it ends no line and leaves the mark for the stop's report to start off the bar's line.'''
-	hpcp._BAR_DRAWN = True
-	hpcp._RemoveProgress().finish()
-	assert hpcp._BAR_DRAWN and capsys.readouterr().out == ''
-
-
 def test_995_a_stop_inside_a_frames_draw_leaves_the_line_to_finish(capsys, monkeypatch, reset_hpcp_globals):
-	'''A stop (KeyboardInterrupt) can come right after the frame is written, before show() returns: the line is open, and finish()
-	ends it. (The program's stop test below hit that window once in 30 runs on Python 3.6 under a CPU quota: it signals as the
-	first frame arrives.)'''
+	'''A stop (KeyboardInterrupt) can come right after the frame is written, before show() returns: the line is open, and its end
+	(_end_line) ends it. (The program's stop test below hit that window once in 30 runs on Python 3.6 under a CPU quota: it signals
+	as the first frame arrives.)'''
 	def draw_and_stop(*args, **kwargs):
 		print('\rframe', end='')
 		raise KeyboardInterrupt
@@ -226,7 +218,7 @@ def test_995_a_stop_inside_a_frames_draw_leaves_the_line_to_finish(capsys, monke
 	with pytest.raises(KeyboardInterrupt):
 		progress.show('/some/directory', 1)
 	assert hpcp._BAR_DRAWN
-	progress.finish()
+	hpcp._end_line()
 	assert capsys.readouterr().out == '\rframe\n' and not hpcp._BAR_DRAWN
 
 
@@ -422,9 +414,9 @@ def test_995_a_stop_ends_the_open_line_before_the_report_on_stdout(tmp_path, ext
 @posix_only
 @pytest.mark.parametrize('sig, status', STOPS)
 def test_995_a_stop_in_rwloffs_job_phase_leaves_its_bar_line_to_the_report(tmp_path, sig, status):
-	'''-rwloff's jobs show the "Deleted" bar (its frames carry "F/s Limit" under -F), whose line a stop leaves open (its own end of line is skipped): the removal's
-	finish() must not clear the mark that line set, or "Keyboard Interrupt: ..." is glued to the bar's text (stdout and stderr one
-	pipe: 9.94 started it on its own line; 9.95's first fix round glued it).'''
+	'''-rwloff's jobs show the "Deleted" bar (its frames carry "F/s Limit" under -F), whose line a stop leaves open (its own end of
+	line is skipped): its mark must stay for the stop's report, or "Keyboard Interrupt: ..." is glued to the bar's text (stdout and
+	stderr one pipe: 9.94 started it on its own line; 9.95's first fix round glued it).'''
 	_tree(tmp_path / 'src', PROGRAM_DIRECTORIES, PROGRAM_PER_DIRECTORY)
 	returncode, output, _ = _stopped(['-rm', '-rf', '-rwloff', '-F', str(FILES_PER_SECOND), '-j', '2', 'src'], tmp_path, b'F/s Limit', sig, merged=True)
 	assert 'Removed %d files' % PROGRAM_TOTAL not in output, 'the run was over before the stop: %r' % output
