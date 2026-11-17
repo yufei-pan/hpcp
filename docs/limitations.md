@@ -343,14 +343,6 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - **Revisit when:** 9.96.
 - **Noted:** 2026-11-16, the 9.95 second opinion on the code (L7); the main session's call (a deferral, not asked).
 
-### A reader that closes the pipe early gives `-rm` exit 120
-- **Kind:** deferred (9.96).
-- **What the operator sees:** `hpcp -rm -rf tree | head -1` (stdout a pipe whose reader leaves early), when the removal runs past its first frame at 0.5 s (a tree of 300,000 files did, one of 60,000 did not): the removal completes and the tree is removed whole, then hpcp exits 120 with two lines on stderr, `Exception ignored while flushing sys.stdout:` and `BrokenPipeError: [Errno 32] Broken pipe`. 9.94's plain `-rm` exited 0: it printed nothing until its end, while `head` still read. A copy does the same in 9.94 and 9.95 (`hpcp src -d dst/ | head -1`: exit 70 with a `General Exception: [Errno 32] Broken pipe` traceback, no file copied; its folders may be made).
-- **Why:** the first progress frame flushes stdout early, so the reader's leaving shows at the end. Printing progress needs it, and 9.73's `-rm` did the same. The final review ruled it not an issue for 9.95 and the main session made it a deferral, so that the change of a copy's exit code is weighed once.
-- **Plan (9.96):** one handler at the exit path, for `-rm` and a copy: a closed stdout ends the run with the run's own return code (the files are removed), with a test through `| head -1` for both.
-- **Revisit when:** 9.96.
-- **Noted:** 2026-11-16, the 9.95 final review (N2) and second opinions (code L2, docs Lead 2); the main session's call (a deferral, not asked).
-
 ### A directory whose listing alone takes over 0.5 s shows no line until it is listed
 - **Kind:** deferred (9.96).
 - **What the operator sees:** `-rm`'s walk lists a whole directory before it unlinks its first entry, and its first progress check comes after an unlink; a directory of millions of entries, or one on a slow network filesystem, whose listing alone takes over 0.5 s shows no line until it is listed. 9.94 showed none at all; 9.73's scan drew frames while it listed.

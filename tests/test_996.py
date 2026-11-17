@@ -392,3 +392,33 @@ def test_996_an_unremovable_file_is_reported_once(tmp_path, extra):
 	assert lines.count('Remove process exception:') == 3 and report.count('Remove process exception:') == 3, output
 	for name in ('k0', 'k1', 'k2'):
 		assert lines.count(os.path.join('locked', name) + ' generated an exception') == 1, output
+
+
+# ---- 5. A reader that closes the pipe early ----
+
+@posix_only
+@pytest.mark.parametrize('args, done', [
+	pytest.param(['-rm', '-rf', '-F', str(FILES_PER_SECOND), 'src'], 'removed', id='rm'),
+	pytest.param(['-rm', '-rf', '-F', str(FILES_PER_SECOND), '-j', '2', '-pfl', 'src'], 'removed', id='rm-pfl'),
+	pytest.param(['-F', str(FILES_PER_SECOND), '-j', '2', 'src', '-d', 'dst/'], 'copied', id='copy'),
+])
+def test_996_a_reader_that_leaves_early_ends_nothing(tmp_path, args, done):
+	'''hpcp ... | head -1: head leaves after the first line (the first frame's flush, at 0.5 s), and the run goes on writing to a
+	closed pipe. 9.95: -rm removed the tree and exited 120 with a BrokenPipeError note (the interpreter's last flush), a copy ended
+	at its pool's start with exit 70 and a traceback, nothing copied. Now the run's output is dropped from there and it goes on to
+	its end: exit 0, the work done, nothing on stderr.'''
+	_tree(tmp_path / 'src')
+	hp = subprocess.Popen([sys.executable, HPCP] + args, cwd=str(tmp_path), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+		stderr=subprocess.PIPE)
+	head = subprocess.Popen(['head', '-1'], stdin=hp.stdout, stdout=subprocess.PIPE)
+	hp.stdout.close()
+	first = head.communicate(timeout=120)[0]
+	# The run is paced past 2 s and head left at its first line: what hpcp writes from here goes to a closed pipe.
+	assert hp.poll() is None and first, first
+	err = hp.stderr.read()
+	hp.stderr.close()
+	assert hp.wait(timeout=120) == 0 and err == b'', err
+	if done == 'removed':
+		assert not (tmp_path / 'src').exists()
+	else:
+		assert sum(len(files) for _, _, files in os.walk(str(tmp_path / 'dst'))) == TOTAL

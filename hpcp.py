@@ -25,6 +25,7 @@ try:
 	import functools
 	import glob
 	import hashlib
+	import io
 	import itertools
 	import locale
 	import math
@@ -16264,31 +16265,59 @@ def hpcp_gui():
 	root.mainloop()
 
 #%% ---- CLI ----
-# Python 3.6's stdout, replaced by _escape_unencodable_stdout: kept, since collected it would close the buffer.
+# The stdout _escape_unencodable_stdout replaced: kept, since collected it would close the buffer.
 _STRICT_STDOUT = None
+
+class _Stdout(io.TextIOWrapper):
+	"""hpcp's stdout (_escape_unencodable_stdout): what the encoding cannot show is escaped, and a reader that left (hpcp ... |
+	head -1) ends nothing: the first write or flush that finds the pipe closed points stdout's descriptor (and stderr's, where
+	it is the same pipe) at os.devnull, and the run goes on to its end and its own exit status, its output dropped from there.
+	9.95's -rm then exited 120 (the interpreter's last flush failed), and a copy 70 with a traceback (a pool's start flushes
+	stdout)."""
+	def write(self, text):
+		try:
+			return super().write(text)
+		except BrokenPipeError:
+			self._reader_gone()
+			return super().write(text)
+
+	def flush(self):
+		try:
+			super().flush()
+		except BrokenPipeError:
+			self._reader_gone()
+			super().flush()
+
+	def _reader_gone(self):
+		try:
+			fd = self.fileno()
+			devnull = os.open(os.devnull, os.O_WRONLY)
+		except (OSError, ValueError):
+			return
+		try:
+			with contextlib.suppress(OSError):
+				out, err = os.fstat(fd), os.fstat(2)
+				if (out.st_dev, out.st_ino) == (err.st_dev, err.st_ino):
+					os.dup2(devnull, 2)
+			with contextlib.suppress(OSError):
+				os.dup2(devnull, fd)
+		finally:
+			os.close(devnull)
 
 def _escape_unencodable_stdout():
 	"""Paths with bytes that are not UTF-8 arrive surrogate-escaped; under a UTF-8 locale stdout is strict, and one
 	print of such a name would end the run partway. Show them escaped instead (stderr already does). The same for
 	anything else the encoding cannot show: Python 3.6's stdout in the C locale is ASCII with surrogateescape, and the
-	progress bar's first block character ended the copy."""
+	progress bar's first block character ended the copy. The same buffer through a new wrapper (_Stdout), which holds no text
+	of its own, and outlives a reader that leaves. Only a genuine TextIOWrapper (a tee or logging proxy in its place is left
+	alone: it would be bypassed)."""
 	global _STRICT_STDOUT
-	try:
-		sys.stdout.reconfigure(errors='backslashreplace')
-		return
-	except ValueError:
-		return
-	except AttributeError:
-		pass
-	# Python 3.6 has no reconfigure: the same buffer through a new wrapper, which holds no text of its own.
-	# Only a genuine TextIOWrapper (a tee or logging proxy in its place is left alone: it would be bypassed).
-	import io
 	stdout = sys.stdout
-	if type(stdout) is not io.TextIOWrapper or stdout.errors == 'backslashreplace':
+	if type(stdout) is not io.TextIOWrapper:
 		return
 	try:
 		stdout.flush()
-		sys.stdout = io.TextIOWrapper(stdout.buffer, encoding=stdout.encoding, errors='backslashreplace',
+		sys.stdout = _Stdout(stdout.buffer, encoding=stdout.encoding, errors='backslashreplace',
 			line_buffering=stdout.line_buffering, write_through=True)
 	except (AttributeError, ValueError, OSError):
 		return
