@@ -422,3 +422,18 @@ def test_996_a_reader_that_leaves_early_ends_nothing(tmp_path, args, done):
 		assert not (tmp_path / 'src').exists()
 	else:
 		assert sum(len(files) for _, _, files in os.walk(str(tmp_path / 'dst'))) == TOTAL
+
+
+# ---- 6. -rm -pfl counts a wide directory while one job empties it ----
+
+@posix_only
+def test_996_pfl_counts_a_wide_directory_as_its_job_empties_it(tmp_path):
+	'''One directory of 100 files is one -pfl job, paced at -F 20 (5 s). 9.95's line had no count until the job returned (only the
+	seconds, and "Overall" under -F). Each worker now puts what it has unlinked in a live count every 0.5 s, so a frame drawn while
+	the job runs shows part of the directory removed.'''
+	_tree(tmp_path / 'src', 1, 100)
+	rc, output = _run(['-rm', '-rf', '-F', '20', '-j', '2', '-pfl', 'src'], tmp_path)
+	assert rc == 0 and not (tmp_path / 'src').exists(), output
+	counts = [float(re.search(r'Removed: ([\d.]+) ', frame).group(1)) for frame in _frames(output) if 'Removed:' in frame]
+	assert any(0 < count < 100 for count in counts), counts
+	assert counts == sorted(counts), counts

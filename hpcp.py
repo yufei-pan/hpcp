@@ -13653,13 +13653,14 @@ def _remove_tree_fd(root, root_id, exclude=None, remove_files=False, rate_limite
 			progress.folders += folders
 	return removed, left, errors
 
-# (shared count, start time, files per second) in a -pfl pool's workers under -F (_init_rate_share)
+# (shared count or None, start time, files per second or 0, live counts) in a -rm -pfl pool's workers (_init_rate_share)
 _RATE_SHARE = None
 
-def _init_rate_share(counter, start_time, limit):
-	"""Pool initializer for -pfl under -F: the jobs take their unlink slots from one shared counter."""
+def _init_rate_share(counter, start_time, limit, live=None):
+	"""Pool initializer for -rm -pfl: under -F the jobs take their unlink slots from one shared counter; live: a count for
+	each worker of what it has unlinked (_remove_directory_entries), which the parent's progress line shows."""
 	global _RATE_SHARE
-	_RATE_SHARE = (counter, start_time, limit)
+	_RATE_SHARE = (counter, start_time, limit, live)
 
 def _shared_clock():
 	"""Seconds on a clock every process of the host reads alike. time.monotonic() is not one on macOS with Python 3.7 to 3.9:
@@ -13670,9 +13671,9 @@ def _shared_clock():
 
 def _shared_rate_wait():
 	"""-F across pool jobs: take the next slot of the shared count and sleep until its time (a no-op without -F)."""
-	if _RATE_SHARE is None:
+	if _RATE_SHARE is None or not _RATE_SHARE[2]:
 		return
-	counter, start_time, limit = _RATE_SHARE
+	counter, start_time, limit = _RATE_SHARE[:3]
 	with counter.get_lock():
 		counter.value += 1
 		slot = counter.value
@@ -13695,6 +13696,15 @@ def _remove_directory_entries(path, expected_id, exclude=None):
 			_report_unremoved(path, exc)
 		return 0, []
 	removed, subdirectories = 0, []
+	# This worker's live count (the pool's slot it claimed, _MY_SLOT): it alone writes it, so it needs no lock. A wide directory
+	# shows on the parent's line as it is emptied: what this job unlinked goes in every _LINE_INTERVAL seconds (one clock read an
+	# unlink: nothing to an unlink, measured), and the rest before it returns.
+	live = _RATE_SHARE[3] if _RATE_SHARE is not None and _MY_SLOT is not None else None
+	worker = _MY_SLOT // 2 if live is not None else None
+	if worker is not None and worker >= len(live):
+		live = None
+	clock = time.monotonic
+	published, publish_at = 0, clock() + _LINE_INTERVAL
 	try:
 		st = os.fstat(fd)
 		if expected_id is None or (st.st_dev, st.st_ino) != tuple(expected_id):
@@ -13721,6 +13731,9 @@ def _remove_directory_entries(path, expected_id, exclude=None):
 			try:
 				os.unlink(name, dir_fd=fd)
 				removed += 1
+				if live is not None and clock() >= publish_at:
+					live[worker] += removed - published
+					published, publish_at = removed, clock() + _LINE_INTERVAL
 			except FileNotFoundError:
 				pass
 			except OSError as exc:
@@ -13737,6 +13750,8 @@ def _remove_directory_entries(path, expected_id, exclude=None):
 		_report_unremoved(path, exc)
 	finally:
 		os.close(fd)
+	if live is not None:
+		live[worker] += removed - published
 	return removed, subdirectories
 
 def _remove_trees_parallel(trees, max_workers, exclude=None, rate_limiter=None, progress=None):
@@ -13744,20 +13759,24 @@ def _remove_trees_parallel(trees, max_workers, exclude=None, rate_limiter=None, 
 	(_remove_directory_entries), queueing the subdirectories each job reports. What a job could not remove is left for the
 	walk after them (_remove_tree_fd), which meets it again and reports it: the jobs' error lines are left out. With rate_limiter (-F), the jobs pace
 	each unlink from one shared count (_shared_rate_wait), and the count carries on into the walk after. progress
-	(_RemoveProgress): the loop shows it when it is due, with the entries the jobs have reported, and is given their count at
-	the end. Returns the entries unlinked; the directories themselves are left for _remove_tree_fd."""
+	(_RemoveProgress): the loop shows it when it is due, with what the workers have unlinked so far (their live counts: a job
+	on a wide directory counts as it goes), and is given the jobs' count at the end. Returns the entries unlinked; the directories themselves are left for _remove_tree_fd."""
 	queue = deque(trees)
 	futures = {}
 	removed = 0
 	share = None
 	current = trees[0][0] if trees else ''
+	# What each worker has unlinked so far, its jobs' running counts included (_remove_directory_entries): the line's count.
+	live = multiprocessing.Array('d', max_workers, lock=False) if progress is not None else None
 	if rate_limiter:
 		# Every job paces each unlink from one shared count (a wide directory too, not just the queueing of jobs). Python 3.6's
 		# pool takes no initializer: its workers fork from this process at the first submit and inherit it (_pool).
 		counter = multiprocessing.Value('d', rate_limiter['count'])
 		# The start on a clock every process reads alike (_shared_clock), not this process's time.monotonic(): on macOS with
 		# Python 3.7 to 3.9 a spawned worker's counts from its own start, and each unlink waited about the parent's age.
-		share = (counter, _shared_clock() - (time.monotonic() - rate_limiter['start_time']), rate_limiter['limit'])
+		share = (counter, _shared_clock() - (time.monotonic() - rate_limiter['start_time']), rate_limiter['limit'], live)
+	elif live is not None:
+		share = (None, 0, 0, live)
 	with _pool(max_workers, rate=share) as executor:
 		while queue or futures:
 			while queue and len(futures) < max_workers * 2:
@@ -13775,7 +13794,8 @@ def _remove_trees_parallel(trees, max_workers, exclude=None, rate_limiter=None, 
 			if progress is not None and time.monotonic() >= progress.due:
 				if rate_limiter:
 					rate_limiter['count'] = counter.value
-				progress.show(current, removed)
+				# (A worker without a slot publishes nothing: the jobs' reports are the floor.)
+				progress.show(current, max(removed, int(sum(live))))
 	if rate_limiter:
 		rate_limiter['count'] = counter.value
 	if progress is not None:

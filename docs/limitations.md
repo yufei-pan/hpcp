@@ -335,14 +335,6 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - **Revisit when:** 9.96.
 - **Noted:** 2026-11-11, the 9.88 W1 fixer's call 5c, the final review's D1; the main session's decision, not asked (a deferral). Moved to 9.90 on 2026-11-11: 9.89 took only the rerun trim and the multiCMD requirement. Built in 9.90 and reverted in its fix round on 2026-11-12 (the 9.90 review's F1), back in 9.91; the main session's call (a revert and a deferral, not asked). Moved to 9.92 on 2026-11-13: 9.91 is the name probe's fix alone. Moved to 9.93 on 2026-11-13: 9.92 is the docs pass, the quiet cleanup, the multiCMD 1.64 embed and the size check; the main session's call (a deferral, not asked). Moved to 9.94 on 2026-11-13: 9.93 is the name probe's redesign and the `-co` set-user-ID cause; the main session's call (a deferral, not asked). Moved to 9.95 on 2026-11-14: it needs a design check: the pass moves from threads into the pool, where 9.90's in-thread version measured 5 to 11 times as long with an injected round trip and was reverted, and the measurement the plan names (tmpfs, XFS, an injected round trip, a pool start under forkserver) decides the shape; the 9.94 builder's call (a deferral, not asked). Moved to 9.96 on 2026-11-16: 9.95 is the `-rm` progress fix alone; the main session's call (a deferral, not asked).
 
-### `-rm -pfl` shows no count while one job empties a wide directory
-- **Kind:** deferred (9.96).
-- **What the operator sees:** under `-rm -pfl` a wide directory is one pool job, and the job reports its count when it returns: until then the line shows the last directory a job finished (the wide directory's parent, not the wide directory) and the seconds (`/data/tree | iteration:N |`), with `Overall: N Files` under `-F` (its shared count is live). Better than 9.94, which printed nothing.
-- **Why:** a count that the jobs share costs every unlink one more step, and 9.95 keeps that cost off the removal.
-- **Plan (9.96):** count through a shared counter, as `-F`'s pace does (`_shared_rate_wait`), measured first on a 200,000-file directory against 9.95: it ships only if the removal is no slower where it shows.
-- **Revisit when:** 9.96.
-- **Noted:** 2026-11-16, the 9.95 second opinion on the code (L7); the main session's call (a deferral, not asked).
-
 ### A directory whose listing alone takes over 0.5 s shows no line until it is listed
 - **Kind:** deferred (9.96).
 - **What the operator sees:** `-rm`'s walk lists a whole directory before it unlinks its first entry, and its first progress check comes after an unlink; a directory of millions of entries, or one on a slow network filesystem, whose listing alone takes over 0.5 s shows no line until it is listed. 9.94 showed none at all; 9.73's scan drew frames while it listed.
