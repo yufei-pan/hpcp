@@ -3763,13 +3763,14 @@ def _makedirs(name, mode=0o777, exist_ok=False):
 		if not exist_ok or not os.path.isdir(name):
 			raise
 
-def _walk(top, device=None, foreign=None):
+def _walk(top, device=None, foreign=None, tick=None):
 	"""os.walk(top) top-down, symlinks to directories listed but not entered, unreadable directories skipped, without
 	recursion (os.walk recursed once per level before Python 3.12). The caller may prune dirnames in place. With
 	device (-rme), each directory below top is opened as it is entered (_enter_directory, which refuses a symlink) and
 	one then on another device (a filesystem mounted on entering it: an NFSv4 submount, an automount; or, not opened,
 	by its lstat) is not walked; foreign, when given, is called with its path. Each is read through its descriptor
-	(_scan_target), and a symlink is among the filenames (its d_type: no lstat)."""
+	(_scan_target), and a symlink is among the filenames (its d_type: no lstat). tick, when given, is called with the
+	directory being listed for each entry it reads (the removal's line: _remove_tree_fd)."""
 	enter = device is not None
 	pending = [top]
 	while pending:
@@ -3798,6 +3799,8 @@ def _walk(top, device=None, foreign=None):
 				continue
 			with os.scandir(target) as entries:
 				for entry in entries:
+					if tick is not None:
+						tick(dirpath)
 					try:
 						is_dir = entry.is_dir(follow_symlinks=not enter)
 					except OSError:
@@ -13406,14 +13409,21 @@ def _remove_items(items, single_thread=False, max_workers=1, verbose=False, file
 	remover = functools.partial(_remove_listed_files, one_filesystem=True) if one_filesystem else _remove_listed_files
 	return delete_file_list_parallel(items, max_workers, verbose, job_size, remover=remover, report=report)[0]
 
-def _dir_entries(fd):
+def _dir_entries(fd, progress=None, path=None, files=0, folders=0):
 	"""[(name, is a directory)] for directory descriptor fd, a symlink being no directory: from d_type where scandir can
 	read the descriptor (_scan_target; no stat per entry, a server round trip each on Lustre), else listdir and a stat
-	each. None: unknown (no d_type, and its stat failed)."""
+	each. None: unknown (no d_type, and its stat failed). progress (_RemoveProgress, the walk's): shown for path when it is
+	due, checked once an entry, with the walk's counts so far (files, folders): a directory whose listing alone takes over
+	_LINE_INTERVAL seconds (millions of entries, a slow network filesystem) shows as it is listed."""
 	result = []
+	clock = time.monotonic
+	due = progress.due if progress is not None else None
 	if _SCANDIR_FD or _PROC_FD:
 		with os.scandir(_scan_target(fd, None)) as entries:
 			for entry in entries:
+				if due is not None and clock() >= due:
+					progress.show(path, files, folders)
+					due = progress.due
 				try:
 					result.append((entry.name, entry.is_dir(follow_symlinks=False)))
 				except OSError:
@@ -13421,6 +13431,9 @@ def _dir_entries(fd):
 					result.append((entry.name, None))
 		return result
 	for name in os.listdir(fd):
+		if due is not None and clock() >= due:
+			progress.show(path, files, folders)
+			due = progress.due
 		try:
 			result.append((name, stat.S_ISDIR(os.stat(name, dir_fd=fd, follow_symlinks=False).st_mode)))
 		except FileNotFoundError:
@@ -13475,7 +13488,11 @@ def _remove_tree_fd(root, root_id, exclude=None, remove_files=False, rate_limite
 	if not _DIR_FD_WALK:
 		base = spelled if spelled is not None else root
 		directories = []
-		for dirpath, dirnames, filenames in _walk(base):
+		def tick(dirpath):
+			# While a directory is listed, as the descriptor walk's listing does (_dir_entries).
+			if clock() >= progress.due:
+				progress.show(dirpath, removed, folders)
+		for dirpath, dirnames, filenames in _walk(base, tick=tick if progress is not None else None):
 			directories.append(dirpath)
 			# os.walk lists a symlink to a directory among the directories: it is a link, removed like a file.
 			links = [name for name in dirnames if os.path.islink(os.path.join(dirpath, name))]
@@ -13520,7 +13537,7 @@ def _remove_tree_fd(root, root_id, exclude=None, remove_files=False, rate_limite
 		"""Handle the entries of directory fd (just opened, or the root's), then hold it (frames, held)."""
 		nonlocal removed
 		try:
-			entries = _dir_entries(fd) if mounts is None else [(entry, None) for entry in os.listdir(fd)]
+			entries = _dir_entries(fd, progress, path, removed, folders) if mounts is None else [(entry, None) for entry in os.listdir(fd)]
 		except OSError as e:
 			errors.append((path, e))
 			if mounts is None:

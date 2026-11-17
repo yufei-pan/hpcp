@@ -437,3 +437,57 @@ def test_996_pfl_counts_a_wide_directory_as_its_job_empties_it(tmp_path):
 	counts = [float(re.search(r'Removed: ([\d.]+) ', frame).group(1)) for frame in _frames(output) if 'Removed:' in frame]
 	assert any(0 < count < 100 for count in counts), counts
 	assert counts == sorted(counts), counts
+
+
+# ---- 7. A directory whose listing alone takes long shows the line while it is listed ----
+
+@pytest.mark.parametrize('scandir', [True, False], ids=['scandir', 'listdir'])
+def test_996_the_walk_shows_the_line_while_it_lists_a_directory(tmp_path, capsys, monkeypatch, reset_hpcp_globals, scandir):
+	'''The walk lists a whole directory before it unlinks its first entry: 9.95 checked the time only at the unlinks, so a
+	directory whose listing alone took over 0.5 s (millions of entries, a slow network filesystem) showed no line until it was
+	listed. With the interval 0 every entry the listing reads is a frame's chance: frames come from inside the listing, with the
+	counts so far.'''
+	if not scandir:
+		monkeypatch.setattr(hpcp, '_SCANDIR_FD', False)
+		monkeypatch.setattr(hpcp, '_PROC_FD', False)
+	monkeypatch.setattr(hpcp, '_LINE_INTERVAL', 0)
+	_tree(tmp_path / 'src', 2, 20)
+	shown, during = [], []
+	real_show, real_entries = hpcp._RemoveProgress.show, hpcp._dir_entries
+	def show(self, path, files=0, folders=0):
+		shown.append(files + self.files)
+		return real_show(self, path, files, folders)
+	def entries(*args, **kwargs):
+		before = len(shown)
+		result = real_entries(*args, **kwargs)
+		during.append(len(shown) - before)
+		return result
+	monkeypatch.setattr(hpcp._RemoveProgress, 'show', show)
+	monkeypatch.setattr(hpcp, '_dir_entries', entries)
+	hpcp.process_remove([str(tmp_path / 'src')], single_thread=True, remove_force=True)
+	assert not (tmp_path / 'src').exists()
+	# The root's listing (2 directories) and each directory's (20 files): a frame an entry.
+	assert sorted(during) == [2, 20, 20], during
+	assert shown == sorted(shown) and shown[-1] == 40, shown
+
+
+def test_996_the_walk_without_descriptor_calls_shows_the_line_while_it_lists(tmp_path, capsys, monkeypatch, reset_hpcp_globals):
+	'''The walk where there are no descriptor calls (Windows': os.walk's way, _walk) lists a directory before its files are
+	unlinked too: its listing draws the line, with the interval 0 a frame an entry read.'''
+	monkeypatch.setattr(hpcp, '_DIR_FD_WALK', False)
+	monkeypatch.setattr(hpcp, '_LINE_INTERVAL', 0)
+	_tree(tmp_path / 'src', 2, 20)
+	ticks = []
+	real_walk = hpcp._walk
+	def walk(*args, **kwargs):
+		tick = kwargs.get('tick')
+		def counted(dirpath):
+			ticks.append(dirpath)
+			return tick(dirpath)
+		if tick is not None:
+			kwargs['tick'] = counted
+		return real_walk(*args, **kwargs)
+	monkeypatch.setattr(hpcp, '_walk', walk)
+	hpcp.process_remove([str(tmp_path / 'src')], single_thread=True, remove_force=True)
+	assert not (tmp_path / 'src').exists()
+	assert len(ticks) == 42 and _frames(capsys.readouterr().out), len(ticks)
