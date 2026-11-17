@@ -94,11 +94,11 @@ def test_995_plain_rm_shows_a_line_while_it_removes(tmp_path, capsys, paced, mon
 	'''9.74 to 9.94 removed in silence: no line between "Removing files from" and the summary. The first frame comes by the
 	time it is due, not once the files are gone: in a wide directory only a check at an entry (the walk's unlinks) or the -pfl
 	loop's wait in the parent can show it. Serial: the first frame is well before the end. -pfl: not timed (a cold pool's start is
-	the machine's; pfl_with_no_pace checks that the loop draws while the jobs unlink), but where one wide directory's job outlasted
-	its first frame by over a second, a frame before the last shows part of the directory removed (the job's live count).'''
+	the machine's; pfl_with_no_pace checks that the loop draws while the jobs unlink); a wide directory's live count is
+	test_996's (pfl_counts_a_wide_directory_as_its_job_empties_it).'''
 	if not descriptors:
 		monkeypatch.setattr(hpcp, '_DIR_FD_WALK', False)
-	times, reported = _times_of_frames_and_job_reports(monkeypatch)
+	times, _ = _times_of_frames_and_job_reports(monkeypatch)
 	_tree(tmp_path / 'src', *shape)
 	hpcp.process_remove([str(tmp_path / 'src')], remove_force=True, **options)
 	end = time.monotonic()
@@ -115,9 +115,6 @@ def test_995_plain_rm_shows_a_line_while_it_removes(tmp_path, capsys, paced, mon
 	# (The last frame can be stale on a loaded host, a run ending within 0.5 s of it: the summary has the total.)
 	assert overall == sorted(overall), frames
 	assert all(done >= count for done, count in zip(overall, removed)), frames
-	if not options['single_thread'] and shape[0] == 1 and reported and reported[-1] - times[0] > 1:
-		# One wide directory is one job: the frames drawn while it unlinks (it ran on over a second after the first) hold its count.
-		assert any(count > 0 for count in removed[:-1]), frames
 
 
 def test_995_the_line_is_the_listings_with_removed_and_folders(tmp_path, capsys, monkeypatch, reset_hpcp_globals):
@@ -233,8 +230,11 @@ def test_995_a_stop_inside_a_frames_draw_leaves_the_line_to_end_line(capsys, mon
 	assert capsys.readouterr().out == '\rframe\n' and not hpcp._BAR_DRAWN
 
 
-def test_995_a_run_that_shows_no_frame_prints_no_empty_line(tmp_path, capsys, reset_hpcp_globals):
+def test_995_a_run_that_shows_no_frame_prints_no_empty_line(tmp_path, capsys, monkeypatch, reset_hpcp_globals):
 	'''Guards what 9.94 gets right: a removal quicker than the first frame prints no blank line before the summary.'''
+	# No frame is due in this run's few milliseconds, whatever the host (an hour: nothing real behind it but "never").
+	# raising=False: 9.94, which this test also passes on, has no such name.
+	monkeypatch.setattr(hpcp, '_LINE_INTERVAL', 3600, raising=False)
 	_tree(tmp_path / 'src', directories=2, per_directory=3)
 	hpcp.process_remove([str(tmp_path / 'src')], single_thread=True, remove_force=True)
 	shown = capsys.readouterr().out
@@ -244,13 +244,13 @@ def test_995_a_run_that_shows_no_frame_prints_no_empty_line(tmp_path, capsys, re
 
 def test_995_the_library_and_a_walk_with_no_progress_object_print_nothing(tmp_path, capsys, monkeypatch, reset_hpcp_globals):
 	'''_rmtree (the library) and a walk given no progress object (a direct call) draw no line, whatever the interval. (A move's
-	directory pass gives it one since 9.96: tests/test_996.py.) On 9.94 this fails only for the missing class.'''
+	directory pass gives it one since 9.96: tests/test_996.py.) On 9.94 this errors on the missing _LINE_INTERVAL.'''
 	monkeypatch.setattr(hpcp, '_LINE_INTERVAL', 0)
 	_tree(tmp_path / 'one')
 	hpcp._rmtree(tmp_path / 'one')
 	_tree(tmp_path / 'two')
 	hpcp._remove_tree_fd(str(tmp_path / 'two'), hpcp._directory_identity(str(tmp_path / 'two')), remove_files=False)
-	assert _frames(capsys.readouterr().out) == []
+	assert capsys.readouterr().out == ''
 	assert not (tmp_path / 'one').exists()
 
 

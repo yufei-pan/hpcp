@@ -56,9 +56,9 @@ def _run(args, cwd):
 	return done.returncode, done.stdout.decode('utf-8', 'replace')
 
 
-def _at_a_terminal(args, cwd, size, answers=()):
-	'''hpcp with a pty as its stdin, stdout and stderr (a terminal of size (rows, columns), or none: 0 x 0). answers: (question,
-	reply) pairs: reply is typed once question has come. (exit status, what the terminal showed)'''
+def _at_a_terminal(args, cwd, size):
+	'''hpcp with a pty as its stdin, stdout and stderr (a terminal of size (rows, columns), or none: 0 x 0).
+	(exit status, what the terminal showed)'''
 	import fcntl
 	import pty
 	import struct
@@ -74,12 +74,9 @@ def _at_a_terminal(args, cwd, size, answers=()):
 	if size:
 		fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack('HHHH', size[0], size[1], 0, 0))
 	shown = b''
-	answers = list(answers)
 	deadline = time.monotonic() + 120
 	try:
 		while time.monotonic() < deadline:
-			if answers and answers[0][0] in shown:
-				os.write(fd, answers.pop(0)[1])
 			ready, _, _ = select.select([fd], [], [], 0.2)
 			if not ready:
 				continue
@@ -128,21 +125,35 @@ def test_996_a_serial_moves_removal_prints_the_line_at_a_terminal(tmp_path, size
 	assert frames and all(frame.count('iteration:') == 1 and 'Removed: ' in frame for frame in frames), frames
 
 
-def test_996_a_pooled_moves_directory_pass_draws_no_empty_frame(tmp_path):
-	'''The pass over the source directories after a pool removed the files: its first frame is half a second into it. 9.96 drew it
-	at once (the line's first frame was due since the move began), an empty one ("src | iteration:2 |") after the bar's summary.'''
-	_tree(tmp_path / 'src')
-	rc, output = _run(['-rm', '-rf', '-F', str(FILES_PER_SECOND), '-j', '2', 'src', '-d', 'dst/'], tmp_path)
-	assert rc == 0 and not (tmp_path / 'src').exists(), output
-	frames = _frames(_removal(output))
-	assert all(re.search(r'(Removed|Folders): [\d.]+ ', frame) for frame in frames), frames
+def test_996_a_pooled_moves_directory_pass_draws_no_empty_frame(tmp_path, capsys, monkeypatch, reset_hpcp_globals):
+	'''The pass over the source directories after a pool removed the files: its first frame is half a second into it. The build
+	before 9.96's first fix round drew it at once (the line's first frame was due since the move began), an empty one ("src |
+	iteration:2 |") after the bar's summary. The files' removal here takes 0.6 s, longer than the first frame's wait, and each
+	directory the pass removes 0.3 s, so the pass draws frames, and each carries the folders removed so far.'''
+	real_rmdir, real_remove_items = os.rmdir, hpcp._remove_items
+	def slow_rmdir(path, *args, **kwargs):
+		time.sleep(0.3)
+		return real_rmdir(path, *args, **kwargs)
+	def slow_remove_items(*args, **kwargs):
+		result = real_remove_items(*args, **kwargs)
+		time.sleep(0.6)
+		return result
+	monkeypatch.setattr(os, 'rmdir', slow_rmdir)
+	monkeypatch.setattr(hpcp, '_remove_items', slow_remove_items)
+	src = tmp_path / 'src'
+	_tree(src, directories=4, per_directory=2)
+	files = [os.path.join(str(src), 'd%d' % index, 'f%d' % number) for index in range(4) for number in range(2)]
+	hpcp.remove_moved_sources([str(src)], files, {}, single_thread=False, max_workers=2, remove_force=True)
+	assert not src.exists()
+	frames = _frames(_removal(capsys.readouterr().out))
+	assert frames and all(re.search(r'(Removed|Folders): [\d.]+ ', frame) for frame in frames), frames
 
 
 @pytest.mark.parametrize('single_thread', [True, False], ids=['serial', 'pool'])
 def test_996_a_moves_directory_pass_shows_the_line_in_every_mode(tmp_path, capsys, monkeypatch, reset_hpcp_globals, single_thread):
 	'''The pass over the source directories after the files are gone (a pool's too: its jobs show the "Deleted" bar, the pass
 	is the parent's) draws the line with the directories it removes: 9.95 drew none in any mode.'''
-	monkeypatch.setattr(hpcp, '_LINE_INTERVAL', 0, raising=False)
+	monkeypatch.setattr(hpcp, '_LINE_INTERVAL', 0)
 	src = tmp_path / 'src'
 	_tree(src, directories=3, per_directory=2)
 	files = [os.path.join(str(src), 'd%d' % index, 'f%d' % number) for index in range(3) for number in range(2)]
@@ -160,7 +171,7 @@ def test_996_rme_removes_its_extra_files_and_directories_with_the_line(tmp_path,
 	total. 9.95 printed "Deleting extra directory:" lines and nothing while it removed.'''
 	if not descriptors:
 		monkeypatch.setattr(hpcp, '_DIR_FD_WALK', False)
-	monkeypatch.setattr(hpcp, '_LINE_INTERVAL', 0, raising=False)
+	monkeypatch.setattr(hpcp, '_LINE_INTERVAL', 0)
 	monkeypatch.setattr(sys.stdin, 'isatty', lambda: True)
 	monkeypatch.setattr('builtins.input', lambda: 'y')
 	(tmp_path / 'src').mkdir()
@@ -182,7 +193,7 @@ def test_996_rme_removes_its_extra_files_and_directories_with_the_line(tmp_path,
 
 def test_996_a_note_of_the_extra_directories_pass_starts_its_own_line(tmp_path, capsys, reset_hpcp_globals, monkeypatch):
 	'''"Keeping non-empty directory:" (stdout) while the line is open: the frame's line ends first.'''
-	monkeypatch.setattr(hpcp, '_LINE_INTERVAL', 0, raising=False)
+	monkeypatch.setattr(hpcp, '_LINE_INTERVAL', 0)
 	(tmp_path / 'out' / 'a').mkdir(parents=True)
 	(tmp_path / 'out' / 'b').mkdir()
 	(tmp_path / 'out' / 'b' / 'stays').write_text('x')
@@ -238,7 +249,7 @@ def test_996_a_pfl_listing_prints_its_line_at_a_terminal(tmp_path, size):
 def test_996_a_pfl_jobs_listing_draws_no_frame(tmp_path, capsys, monkeypatch, reset_hpcp_globals):
 	'''A -pfl job lists its folder in another process: its frames (a folder whose listing takes over 0.5 s drew them in 9.73 to
 	9.95) would share the parent's line. The jobs are asked for none, and a listing asked for none draws none.'''
-	monkeypatch.setattr(hpcp, '_LINE_INTERVAL', 0, raising=False)
+	monkeypatch.setattr(hpcp, '_LINE_INTERVAL', 0)
 	_tree(tmp_path / 'src', 3, 4)
 	submitted = []
 	real = hpcp._submit_task
@@ -259,14 +270,17 @@ def test_996_a_pfl_jobs_listing_draws_no_frame(tmp_path, capsys, monkeypatch, re
 
 
 @posix_only
+@pytest.mark.skipif(sys.platform == 'darwin', reason='forks the pool; macOS starts workers with spawn (fork there can crash a child)')
 def test_996_a_pfl_listing_counts_a_wide_folder_while_its_job_lists_it(tmp_path, capsys, monkeypatch, reset_hpcp_globals):
 	'''One -pfl job lists a folder of many entries: its frames name that folder, and the count rises as the job lists it (the job
 	puts what it has listed in its worker's live cells; the parent shows them with what the finished jobs returned). 9.96's frames
 	named the folder a job last finished, with the counts of the finished jobs only, until the wide folder's job returned (9.95's
 	job drew its own frames). Forked workers, so the patches below reach them: the interval 0 (the job publishes at every entry
-	and the parent draws a frame at every pass) and a listing that takes 1 ms an entry (300 entries last 0.3 s).'''
+	and the parent draws a frame at every pass) and a listing that takes 1 ms an entry (300 entries last 0.3 s). The small folder
+	holds files and two subfolders: no frame counts more than the tree has (what a finished job returned is not counted again
+	from its worker's cells), and a wide folder's frame shows more than the small folder's whole count.'''
 	import multiprocessing
-	monkeypatch.setattr(hpcp, '_LINE_INTERVAL', 0, raising=False)
+	monkeypatch.setattr(hpcp, '_LINE_INTERVAL', 0)
 	real = hpcp.get_file_repr
 	def slow(*args):
 		time.sleep(0.001)
@@ -274,10 +288,12 @@ def test_996_a_pfl_listing_counts_a_wide_folder_while_its_job_lists_it(tmp_path,
 	monkeypatch.setattr(hpcp, 'get_file_repr', slow)
 	wide, small = tmp_path / 'src' / 'wide', tmp_path / 'src' / 'small'
 	wide.mkdir(parents=True)
-	small.mkdir()
+	(small / 's0').mkdir(parents=True)
+	(small / 's1').mkdir()
 	for number in range(300):
 		(wide / ('f%d' % number)).write_text('x')
-	(small / 'one').write_text('x')
+	for number in range(100):
+		(small / ('f%d' % number)).write_text('x')
 	method = multiprocessing.get_start_method()
 	multiprocessing.set_start_method('fork', force=True)
 	try:
@@ -285,11 +301,16 @@ def test_996_a_pfl_listing_counts_a_wide_folder_while_its_job_lists_it(tmp_path,
 	finally:
 		multiprocessing.set_start_method(method, force=True)
 	hpcp._end_line()
-	assert len(files) == 301 and len(folders) == 3
-	frames = [(frame.split(' | ')[0], float(re.search(r'Files: ([\d.]+) ', frame).group(1))) for frame in _frames(capsys.readouterr().out) if 'Files:' in frame]
-	counts = [count for _, count in frames]
+	assert len(files) == 400 and len(folders) == 5
+	def count(frame, word):
+		found = re.search(word + r': ([\d.]+) ', frame)
+		return float(found.group(1)) if found else 0
+	frames = [(frame.split(' | ')[0], count(frame, 'Files'), count(frame, 'Folders')) for frame in _frames(capsys.readouterr().out)]
+	counts = [files for _, files, _ in frames]
 	assert counts == sorted(counts), counts
-	assert any(name.endswith('wide') and 1 < count < 300 for name, count in frames), frames
+	# Never more than is there: what the finished jobs returned is not counted again from their workers' cells.
+	assert all(files <= 400 and folders <= 5 for _, files, folders in frames), frames
+	assert any(name.endswith('wide') and 100 < files < 400 for name, files, _ in frames), frames
 
 
 # ---- 3. One mark for stdout's open line: no blank lines between error lines, and a stop's report on a line of its own ----
@@ -449,7 +470,7 @@ def test_996_a_tasks_error_lines_are_printed_by_the_parent_once(capsys, monkeypa
 def test_996_an_unremovable_file_is_reported_once(tmp_path, extra):
 	'''-rm with pool jobs: the job that met a file it could not unlink reported it, and the walk after the jobs met it again and
 	reported it too (9.94 and 9.95: 6 lines and 6 entries in the list for 3 files). The walk reports it, once; the exit status is
-	192 as before.'''
+	192 as before. Under -rwloff the "Removed N files and links" summary counts what was unlinked, not the files the jobs tried.'''
 	_tree(tmp_path / 'src', 2, 10)
 	_locked(tmp_path / 'src' / 'locked', ['k0', 'k1', 'k2'])
 	try:
@@ -469,7 +490,8 @@ def test_996_an_unremovable_file_is_reported_once(tmp_path, extra):
 @pytest.mark.parametrize('extra', [[], ['-pfl']], ids=['serial', 'pfl'])
 def test_996_an_unlistable_directory_is_reported_once(tmp_path, extra):
 	'''A directory nobody can list (mode 0): a -pfl job's failure to list it is left out with the rest of its lines, and the walk
-	after the jobs reports it, once (9.94 and 9.95 reported it twice under -pfl).'''
+	after the jobs reports it, once (9.94 and 9.95 reported it twice under -pfl). The serial case is the control: with no jobs the
+	walk alone reports the directory once (9.95 did too, so it passes on every build), and the -pfl case must say the same.'''
 	_tree(tmp_path / 'src', 2, 10)
 	closed = tmp_path / 'src' / 'd1' / 'closed'
 	closed.mkdir()
@@ -538,7 +560,8 @@ def test_996_a_reader_that_leaves_early_ends_nothing(tmp_path, args, done, joine
 	'''hpcp ... | head -1: head leaves after the first line (the command line hpcp echoes at its start), and the run goes on writing
 	to a closed pipe. 9.95: -rm removed the tree and exited 120 with a BrokenPipeError note (the interpreter's last flush), a copy
 	ended at its pool's start with exit 70 and a traceback, nothing copied. Now the run's output is dropped from there and it goes
-	on to its end: exit 0, the work done, nothing on stderr.'''
+	on to its end: exit 0, the work done, nothing on stderr. (With stderr in the same pipe there is no stderr to read: that case
+	shows it by the exit code and the work.)'''
 	_tree(tmp_path / 'src')
 	rc, err = _reader_leaves_early(args, tmp_path, joined)
 	assert rc == 0 and err == b'', err
@@ -550,8 +573,9 @@ def test_996_a_reader_that_leaves_early_ends_nothing(tmp_path, args, done, joine
 
 @not_root
 def test_996_a_closed_stderr_pipe_loses_error_lines_not_the_run(tmp_path):
-	'''2>&1 | head -1 with files the copy can not read: the error lines come after head has gone, into a closed pipe on both
-	streams. The run goes on and ends with its own code (190), every readable file copied.'''
+	'''2>&1 | head -1 with files the copy can not read: the error lines come after head has gone (on a slow host a line may come
+	first; the checks hold either way), into a closed pipe on both streams. The run goes on and ends with its own code (190),
+	every readable file copied. (The lines are lost, which a closed pipe can not show: the test checks the code and the copy.)'''
 	_tree(tmp_path / 'src')
 	for number in range(3):
 		os.chmod(str(tmp_path / 'src' / 'd1' / ('f%d' % number)), 0)
@@ -580,8 +604,10 @@ def test_996_pfl_counts_a_wide_directory_as_its_job_empties_it(tmp_path):
 
 def test_996_pfl_removal_needs_no_shared_array(tmp_path, capsys, monkeypatch, reset_hpcp_globals):
 	'''The jobs' live counts are shared memory made as the pool's slots are (_new_live): where none can be made the removal goes on
-	and the line shows what the jobs return. Python 3.6 backs a multiprocessing.Array with a file in the temporary directory, which
-	a full disk (the case -rm is for) cannot take: 9.96 exited 70 with a traceback there, nothing removed (9.95 made it under -F only).'''
+	(the line then shows what the jobs return; this test checks the removal and its summary). Python 3.6 backs a
+	multiprocessing.Array with a file in the temporary directory, which a full disk (the case -rm is for) cannot take: 9.96 exited
+	70 with a traceback there, nothing removed (9.95 made it under -F only). Both ways it is made are refused here: the anonymous
+	mapping forked workers inherit (mmap) and the Array the other start methods get.'''
 	import mmap
 	import multiprocessing
 	def refuse(*args, **kwargs):
@@ -606,7 +632,7 @@ def test_996_the_walk_shows_the_line_while_it_lists_a_directory(tmp_path, capsys
 	if not scandir:
 		monkeypatch.setattr(hpcp, '_SCANDIR_FD', False)
 		monkeypatch.setattr(hpcp, '_PROC_FD', False)
-	monkeypatch.setattr(hpcp, '_LINE_INTERVAL', 0, raising=False)
+	monkeypatch.setattr(hpcp, '_LINE_INTERVAL', 0)
 	_tree(tmp_path / 'src', 2, 20)
 	shown, during = [], []
 	real_show, real_entries = hpcp._RemoveProgress.show, hpcp._dir_entries
@@ -632,7 +658,7 @@ def test_996_the_walk_without_descriptor_calls_shows_the_line_while_it_lists(tmp
 	unlinked too: its listing draws the line, with the interval 0 a frame at every entry its listing reads (the frames of the
 	listing itself, not the unlinks' and the rmdirs' after it).'''
 	monkeypatch.setattr(hpcp, '_DIR_FD_WALK', False)
-	monkeypatch.setattr(hpcp, '_LINE_INTERVAL', 0, raising=False)
+	monkeypatch.setattr(hpcp, '_LINE_INTERVAL', 0)
 	_tree(tmp_path / 'src', 2, 20)
 	shown, ticks = [], []
 	real_show = hpcp._RemoveProgress.show
@@ -664,6 +690,7 @@ def _mark_in_a_worker():
 	return hpcp._BAR_DRAWN
 
 
+@posix_only
 def test_996_a_forked_worker_starts_with_no_line_open(monkeypatch, reset_hpcp_globals):
 	'''A worker forked while the parent's progress line was open has the parent's mark: the line is the parent's, and the notes a
 	worker prints itself ("Keeping non-empty directory:" ends the open line first) must not end it. Forked workers (the default
@@ -700,7 +727,6 @@ def test_996_rme_with_rf_removes_the_extras_without_asking(tmp_path, how):
 	assert 'Do you want to delete them?' not in output, output
 
 
-@not_root
 def test_996_a_listing_after_named_files_starts_its_own_line(tmp_path):
 	'''-rm -rwloff of named files and a tree: the named files' removal leaves its line open, and "Getting file list for" starts a
 	line of its own.'''
