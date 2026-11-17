@@ -232,6 +232,40 @@ def test_996_a_pfl_jobs_listing_draws_no_frame(tmp_path, capsys, monkeypatch, re
 	assert not hpcp._BAR_DRAWN
 
 
+@posix_only
+def test_996_a_pfl_listing_counts_a_wide_folder_while_its_job_lists_it(tmp_path, capsys, monkeypatch, reset_hpcp_globals):
+	'''One -pfl job lists a folder of many entries: its frames name that folder, and the count rises as the job lists it (the job
+	puts what it has listed in its worker's live cells; the parent shows them with what the finished jobs returned). 9.96's frames
+	named the folder a job last finished, with the counts of the finished jobs only, until the wide folder's job returned (9.95's
+	job drew its own frames). Forked workers, so the patches below reach them: the interval 0 (the job publishes at every entry
+	and the parent draws a frame at every pass) and a listing that takes 1 ms an entry (300 entries last 0.3 s).'''
+	import multiprocessing
+	monkeypatch.setattr(hpcp, '_LINE_INTERVAL', 0, raising=False)
+	real = hpcp.get_file_repr
+	def slow(*args):
+		time.sleep(0.001)
+		return real(*args)
+	monkeypatch.setattr(hpcp, 'get_file_repr', slow)
+	wide, small = tmp_path / 'src' / 'wide', tmp_path / 'src' / 'small'
+	wide.mkdir(parents=True)
+	small.mkdir()
+	for number in range(300):
+		(wide / ('f%d' % number)).write_text('x')
+	(small / 'one').write_text('x')
+	method = multiprocessing.get_start_method()
+	multiprocessing.set_start_method('fork', force=True)
+	try:
+		files, _, _, folders = hpcp.get_file_list_parallel(str(tmp_path / 'src'), max_workers=2)
+	finally:
+		multiprocessing.set_start_method(method, force=True)
+	hpcp._end_line()
+	assert len(files) == 301 and len(folders) == 3
+	frames = [(frame.split(' | ')[0], float(re.search(r'Files: ([\d.]+) ', frame).group(1))) for frame in _frames(capsys.readouterr().out) if 'Files:' in frame]
+	counts = [count for _, count in frames]
+	assert counts == sorted(counts), counts
+	assert any(name.endswith('wide') and 1 < count < 300 for name, count in frames), frames
+
+
 # ---- 3. One mark for stdout's open line: no blank lines between error lines, and a stop's report on a line of its own ----
 
 not_root = pytest.mark.skipif(os.name != 'posix' or os.geteuid() == 0, reason='root reads and unlinks what these tests lock')
@@ -437,6 +471,25 @@ def test_996_pfl_counts_a_wide_directory_as_its_job_empties_it(tmp_path):
 	counts = [float(re.search(r'Removed: ([\d.]+) ', frame).group(1)) for frame in _frames(output) if 'Removed:' in frame]
 	assert any(0 < count < 100 for count in counts), counts
 	assert counts == sorted(counts), counts
+	# The frame names the directory the running job empties, not the last one a job finished (the root's, which listed it).
+	assert any(0 < float(re.search(r'Removed: ([\d.]+) ', frame).group(1)) < 100 and frame.split(' | ')[0].endswith('/src/d0')
+		for frame in _frames(output) if 'Removed:' in frame), _frames(output)
+
+
+def test_996_pfl_removal_needs_no_shared_array(tmp_path, capsys, monkeypatch, reset_hpcp_globals):
+	'''The jobs' live counts are shared memory made as the pool's slots are (_new_live): where none can be made the removal goes on
+	and the line shows what the jobs return. Python 3.6 backs a multiprocessing.Array with a file in the temporary directory, which
+	a full disk (the case -rm is for) cannot take: 9.96 exited 70 with a traceback there, nothing removed (9.95 made it under -F only).'''
+	import mmap
+	import multiprocessing
+	def refuse(*args, **kwargs):
+		raise OSError('No usable temporary directory found')
+	monkeypatch.setattr(multiprocessing, 'Array', refuse)
+	monkeypatch.setattr(mmap, 'mmap', refuse)
+	_tree(tmp_path / 'src', 3, 4)
+	hpcp.process_remove([str(tmp_path / 'src')], single_thread=False, max_workers=2, parallel_file_listing=True, remove_force=True)
+	assert not (tmp_path / 'src').exists()
+	assert 'Removed 12 files and links' in capsys.readouterr().out
 
 
 # ---- 7. A directory whose listing alone takes long shows the line while it is listed ----

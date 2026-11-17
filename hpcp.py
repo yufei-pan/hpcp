@@ -1518,6 +1518,32 @@ def _new_slots(count):
 			return (array.get_lock(), array.get_obj()), array
 	return None, None
 
+def _new_live(count):
+	"""Live counts for a pool of count workers (a pool's rate share, _pool): two doubles a worker, in the slots' shape (the
+	worker in slot _MY_SLOT has the cells _MY_SLOT - 1 and _MY_SLOT: _my_live), for a job to write what it has done so far
+	into and the parent's progress line to read (_remove_trees_parallel, get_file_list_parallel). None where none can be made:
+	the line then shows what the jobs return. Made as _new_slots makes its mapping, and for the same reason: Python 3.6 backs
+	a multiprocessing.Array with a file in the temporary directory, which a full disk (the case -rm is for) cannot take, so
+	forked workers inherit an anonymous shared mapping, which leaves no file; the other start methods get an Array through the
+	initializer."""
+	with contextlib.suppress(OSError, ImportError, ValueError, TypeError):
+		if multiprocessing.get_start_method() == 'fork':
+			import mmap
+			return memoryview(mmap.mmap(-1, 16 * count)).cast('d')
+		return multiprocessing.Array('d', 2 * count, lock=False)
+	return None
+
+def _my_live():
+	"""(the live counts, the index of this worker's first cell) in a pool worker that has them (_new_live), else (None, 0)."""
+	live = _RATE_SHARE[3] if _RATE_SHARE is not None and _MY_SLOT is not None else None
+	if live is None or _MY_SLOT >= len(live):
+		return None, 0
+	return live, _MY_SLOT - 1
+
+def _live_sum(live, cell=0):
+	"""What the workers have counted so far in their cell-th count (a pool's _new_live)."""
+	return int(sum(live[index] for index in range(cell, len(live), 2)))
+
 def _submit_36(executor, mask, fn, args, kwargs):
 	"""ProcessPoolExecutor.submit of Python 3.6 (3.6.15), whose wakeup of the manager thread (_result_queue.put(None)) waits
 	for good on the result queue's write lock when a worker ended holding it (stopped inside SemLock.__enter__): here the
@@ -3923,7 +3949,9 @@ def get_file_list_serial(root,exclude=None,append_hash=False,full_hash=False,rec
 	link, file, directory). recurse False lists root's entries only (its directories in folders, unchecked: a listing of
 	each says). boundary: see get_file_list. known_dir: root comes from a parent's listing (-pfl), which said directory:
 	checked as a directory below root is. show: draw the listing's line every _LINE_INTERVAL seconds (_show_listing); a
-	-pfl job's call does not, the parent's loop draws it."""
+	-pfl job's call does not (the parent's loop draws it): in a pool worker with live counts (_my_live) it puts what it has
+	listed so far, the entries (files and links) and the subfolders found, in its cells every _LINE_INTERVAL seconds, and
+	the rest when it ends, for the parent's line."""
 	global FILES_RATE_LIMIT
 	if _rate_limiter is None and respect_file_rate_limit and FILES_RATE_LIMIT > 0:
 		_rate_limiter = {'start_time': time.monotonic(), 'count': 0, 'limit': FILES_RATE_LIMIT}
@@ -3933,6 +3961,15 @@ def get_file_list_serial(root,exclude=None,append_hash=False,full_hash=False,rec
 	size = 0
 	start_time = time.monotonic()
 	globalStartTIme = start_time
+	live, cell = (None, 0) if show else _my_live()
+	published, publish_at = [0, 0], start_time + _LINE_INTERVAL
+	def publish():
+		# Whole 8-byte stores into this worker's own cells; what the job has found since its last one goes on top (cumulative: the
+		# parent subtracts what the jobs it has taken returned). The root is in folders, as the parent has it already: not counted.
+		found = len(file_list) + len(links), len(folders) - (root in folders)
+		live[cell] += found[0] - published[0]
+		live[cell + 1] += found[1] - published[1]
+		published[:] = found
 	# -rme's destination listing: each directory below the root is opened before anything else (_enter_directory), so a
 	# filesystem mounted on entering it (an NFSv4 submount, an automount: its parent's device, and no mountinfo entry,
 	# until then) is mounted and its device checked before anything in it is read; another device is another
@@ -4009,6 +4046,9 @@ def get_file_list_serial(root,exclude=None,append_hash=False,full_hash=False,rec
 						start_time = currentTime
 						# The seconds since the listing started as the iteration.
 						_show_listing(current, int(currentTime - globalStartTIme), len(file_list), len(links), len(folders), size, _rate_limiter)
+				elif live is not None and time.monotonic() >= publish_at:
+					publish()
+					publish_at = time.monotonic() + _LINE_INTERVAL
 				if exclude and is_excluded(path,exclude):
 					continue
 				try:
@@ -4042,6 +4082,8 @@ def get_file_list_serial(root,exclude=None,append_hash=False,full_hash=False,rec
 		finally:
 			if scan_fd is not None:
 				os.close(scan_fd)
+	if live is not None:
+		publish()
 	return frozenset(file_list), frozenset(links) , size, frozenset(folders - set(['.', '..']))
 
 def get_file_list_parallel(path,max_workers=56,exclude=None,append_hash=False,full_hash=False,boundary=None):
@@ -4079,16 +4121,26 @@ def get_file_list_parallel(path,max_workers=56,exclude=None,append_hash=False,fu
 		# A folder's listing that crashed (this default): its folder stays, as before 9.77.
 		no_result = (frozenset(), frozenset(), 0, frozenset())
 		# The listing's line, as the serial listing draws it, here in the parent (the jobs draw none, so two processes never draw
-		# one line): every _LINE_INTERVAL seconds, the folder a job last listed and what the jobs have listed so far. A wide
-		# folder adds to the counts when its job returns; meanwhile the seconds go on.
+		# one line): every _LINE_INTERVAL seconds, the folder the oldest running job lists and what the jobs have listed so far:
+		# those they returned, and what each running one has put in its worker's live cells (get_file_list_serial). A wide folder
+		# counts as it is listed.
 		due = listing_start_time + _LINE_INTERVAL
 		current = path
-		with _pool(max_workers) as executor:
+		live = _new_live(max_workers)
+		# What the jobs taken so far returned: the live cells hold it too (a job's last publish comes before its result).
+		taken_entries = taken_folders = 0
+		with _pool(max_workers, rate=(None, 0, 0, live) if live is not None else None) as executor:
 			while folders_to_expand or futures:
 				now = time.monotonic()
 				if now >= due:
 					due = now + _LINE_INTERVAL
-					_show_listing(current, int(now - started), len(file_list), len(link_list), len(folder_list), size)
+					# (The cells are read one by one, so a count can be a little behind a result just taken: never below it.)
+					more_files = more_folders = 0
+					if live is not None:
+						more_files = max(0, _live_sum(live) - taken_entries)
+						more_folders = max(0, _live_sum(live, 1) - taken_folders)
+					current = next(iter(futures.values()), current)
+					_show_listing(current, int(now - started), len(file_list) + more_files, len(link_list), len(folder_list) + more_folders, size)
 				under_rate_limit = (
 					FILES_RATE_LIMIT <= 0
 					or listed_items <= FILES_RATE_LIMIT * (time.monotonic() - listing_start_time)
@@ -4119,9 +4171,11 @@ def get_file_list_parallel(path,max_workers=56,exclude=None,append_hash=False,fu
 				# Until the next frame is due (one already due waits for nothing: the frame above moves the time on).
 				done = _wait(futures, executor, min(1, max(0, due - time.monotonic())))
 				for doneTask in done:
-					folder_path = current = futures.pop(doneTask)
+					folder_path = futures.pop(doneTask)
 					result = _task_result(doneTask, no_result, 'Listing error')
 					dir_file_list, dir_link_list, dir_size, dir_folder_list = result
+					taken_entries += len(dir_file_list) + len(dir_link_list)
+					taken_folders += len(dir_folder_list) - (folder_path in dir_folder_list)
 					if result is not no_result and folder_path not in dir_folder_list:
 						# Its listing did not list it as a directory (another filesystem once entered, -rme; a link or
 						# a file since; one too long): not a folder, as in a serial listing.
@@ -13713,13 +13767,10 @@ def _remove_directory_entries(path, expected_id, exclude=None):
 			_report_unremoved(path, exc)
 		return 0, []
 	removed, subdirectories = 0, []
-	# This worker's live count (the pool's slot it claimed, _MY_SLOT): it alone writes it, so it needs no lock. A wide directory
+	# This worker's live count (its first cell in the pool's, _my_live): it alone writes it, so it needs no lock. A wide directory
 	# shows on the parent's line as it is emptied: what this job unlinked goes in every _LINE_INTERVAL seconds (one clock read an
 	# unlink: nothing to an unlink, measured), and the rest before it returns.
-	live = _RATE_SHARE[3] if _RATE_SHARE is not None and _MY_SLOT is not None else None
-	worker = _MY_SLOT // 2 if live is not None else None
-	if worker is not None and worker >= len(live):
-		live = None
+	live, cell = _my_live()
 	clock = time.monotonic
 	published, publish_at = 0, clock() + _LINE_INTERVAL
 	try:
@@ -13749,7 +13800,7 @@ def _remove_directory_entries(path, expected_id, exclude=None):
 				os.unlink(name, dir_fd=fd)
 				removed += 1
 				if live is not None and clock() >= publish_at:
-					live[worker] += removed - published
+					live[cell] += removed - published
 					published, publish_at = removed, clock() + _LINE_INTERVAL
 			except FileNotFoundError:
 				pass
@@ -13768,7 +13819,7 @@ def _remove_directory_entries(path, expected_id, exclude=None):
 	finally:
 		os.close(fd)
 	if live is not None:
-		live[worker] += removed - published
+		live[cell] += removed - published
 	return removed, subdirectories
 
 def _remove_trees_parallel(trees, max_workers, exclude=None, rate_limiter=None, progress=None):
@@ -13776,15 +13827,15 @@ def _remove_trees_parallel(trees, max_workers, exclude=None, rate_limiter=None, 
 	(_remove_directory_entries), queueing the subdirectories each job reports. What a job could not remove is left for the
 	walk after them (_remove_tree_fd), which meets it again and reports it: the jobs' error lines are left out. With rate_limiter (-F), the jobs pace
 	each unlink from one shared count (_shared_rate_wait), and the count carries on into the walk after. progress
-	(_RemoveProgress): the loop shows it when it is due, with what the workers have unlinked so far (their live counts: a job
-	on a wide directory counts as it goes), and is given the jobs' count at the end. Returns the entries unlinked; the directories themselves are left for _remove_tree_fd."""
+	(_RemoveProgress): the loop shows it when it is due, for the directory the oldest running job empties, with what the workers
+	have unlinked so far (their live counts: a job on a wide directory counts as it goes), and is given the jobs' count at the end. Returns the entries unlinked; the directories themselves are left for _remove_tree_fd."""
 	queue = deque(trees)
 	futures = {}
 	removed = 0
 	share = None
 	current = trees[0][0] if trees else ''
 	# What each worker has unlinked so far, its jobs' running counts included (_remove_directory_entries): the line's count.
-	live = multiprocessing.Array('d', max_workers, lock=False) if progress is not None else None
+	live = _new_live(max_workers) if progress is not None else None
 	if rate_limiter:
 		# Every job paces each unlink from one shared count (a wide directory too, not just the queueing of jobs). Python 3.6's
 		# pool takes no initializer: its workers fork from this process at the first submit and inherit it (_pool).
@@ -13803,7 +13854,7 @@ def _remove_trees_parallel(trees, max_workers, exclude=None, rate_limiter=None, 
 			# due waits for nothing (0 returns at once, and the frame below moves the due time on).
 			timeout = 1 if progress is None else min(1, max(0, progress.due - time.monotonic()))
 			for future in _wait(futures, executor, timeout):
-				current = futures.pop(future)
+				futures.pop(future)
 				# What a job could not remove the walk after the jobs meets again, and reports once (9.95 reported it twice).
 				count, subdirectories = _task_result(future, (0, []), 'Remove process exception', report=False)
 				removed += count
@@ -13811,8 +13862,10 @@ def _remove_trees_parallel(trees, max_workers, exclude=None, rate_limiter=None, 
 			if progress is not None and time.monotonic() >= progress.due:
 				if rate_limiter:
 					rate_limiter['count'] = counter.value
-				# (A worker without a slot publishes nothing: the jobs' reports are the floor.)
-				progress.show(current, max(removed, int(sum(live))))
+				# The folder the oldest running job empties, with what the workers have unlinked so far (a worker without a slot
+				# publishes nothing, and where no live counts could be made the jobs' reports are all there is).
+				current = next(iter(futures.values()), current)
+				progress.show(current, removed if live is None else max(removed, _live_sum(live)))
 	if rate_limiter:
 		rate_limiter['count'] = counter.value
 	if progress is not None:
