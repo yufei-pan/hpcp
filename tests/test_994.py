@@ -229,7 +229,9 @@ def test_994_a_link_put_at_the_new_file_s_name_inside_the_carry_gets_neither_cal
 	# between the check and the chown (or the chmod; a user who can write the directory, in the microseconds there) must get
 	# nothing, and the file the carry checked gets all of it. A carry that checks by descriptor and then acts by name passes
 	# every test that plants the link before the carry (the three above). Forced here, at the call. As nobody the chown
-	# half cannot show (the group the victim has is the runner's already): the root runs do.
+	# half cannot show (the group the victim has is the runner's already): the root runs do. [proc-chown] and [proc-chmod]
+	# guard what 9.93 gets right (its /proc route acted through the O_PATH descriptor's /proc/self/fd name); the read route
+	# fails on 9.93.
 	_carry_route(monkeypatch, route)
 	victim = _Victim(str(tmp_path / 'v' / 'victim'))
 	st = _old_file(str(tmp_path / 'out' / 'x'))
@@ -261,7 +263,8 @@ def test_994_the_carry_opens_the_new_file_in_the_directory_the_door_holds(tmp_pa
 	# out/d is swapped for a link to victim/, which holds a regular one-name file of that name and of the runner's (what the
 	# carry's check lets through). The carry opens the name relative to the directory the door holds (out/d.away): the victim's
 	# file is untouched. Opened by the logical path (out/d/...), which leads to the victim now, it would pass the check and get
-	# the old file's mode, and in a root run its owner.
+	# the old file's mode, and in a root run its owner. [proc] guards what 9.93 gets right (it gave the carry the name below
+	# the held directory's /proc/self/fd entry); [read] fails on 9.93.
 	_carry_route(monkeypatch, route)
 	_write(str(tmp_path / 'x'), 'new')
 	st = _old_file(str(tmp_path / 'out' / 'd' / 'x'))
@@ -304,14 +307,15 @@ def test_994_a_destination_that_is_a_file_gets_no_mounted_dir_hint(tmp_path, cas
 	# gets a trailing separator, its making meets the file, and 9.93 printed "Destination path ... may be a mounted dir" and
 	# "Continuing without creating dest folder..." though nothing there is a directory. 9.94 leaves it to what comes after
 	# (213 at the landing check on Linux, 202 on macOS; 190 for the copy into a file, or 202 on macOS, whose mkdir of f/
-	# says ENOTDIR, which the destination loop takes for a destination it cannot make).
+	# says ENOTDIR, which the destination loop takes for a destination it cannot make). Each platform's own code (9.97: the
+	# link case took either code on both; docs/limitations.md, "`hpcp a/x ldir/ -d a/x`: exit 213 on Linux, 202 on macOS").
 	for name, text in (('a/x', 'A'), ('y', 'Y'), ('z', 'Z'), ('f', 'F')):
 		_write(str(tmp_path / name), text)
 	os.symlink('a', str(tmp_path / 'ldir'))
 	args = ['a/x', 'ldir/', '-d', 'a/x'] if case == 'link-to-the-file-s-directory' else ['y', 'z', '-d', 'f']
 	rc, output = _cli(args, tmp_path)
 	assert 'may be a mounted dir' not in output and 'Continuing without creating dest folder' not in output, output[-2000:]
-	assert rc in ((202, 213) if case == 'link-to-the-file-s-directory' else (190, 202) if __import__('sys').platform == 'darwin' else (190,)), output[-2000:]
+	assert rc == (202 if __import__('sys').platform == 'darwin' else 213 if case == 'link-to-the-file-s-directory' else 190), output[-2000:]
 	assert _read(str(tmp_path / 'a/x')) == 'A' and _read(str(tmp_path / 'f')) == 'F'
 
 
@@ -377,8 +381,10 @@ def test_994_an_ncd_refusal_under_nds_is_no_promise_that_another_destination_tak
 	os.makedirs(str(tmp_path / 'elsewhere'))
 	os.symlink(str(tmp_path / 'elsewhere'), str(tmp_path / 'B' / 'sub'))
 	rc, output = _cli(['src/', '-d', 'B/', '-d', 'C/', '-ncd', '-nds', '-s'], tmp_path)
-	assert rc != 0 and not os.path.exists(str(tmp_path / 'C' / 'sub')), output[-3000:]
-	assert 'the other destinations take' not in output, output[-3000:]
+	assert rc == 213 and 'the other destinations take' not in output, output[-3000:]
+	# Nothing copied: not below C (no sub made), not through B/sub's link (still a link, its target empty).
+	assert os.listdir(str(tmp_path / 'C')) == [] and os.listdir(str(tmp_path / 'elsewhere')) == [], output[-3000:]
+	assert os.listdir(str(tmp_path / 'B')) == ['sub'] and os.path.islink(str(tmp_path / 'B' / 'sub')), output[-3000:]
 
 
 def _tfs_tree(tmp_path):
@@ -447,6 +453,16 @@ hpcp._MAIN_PID = os.getpid()
 hpcp._install_stops()
 here = %(here)r
 first = ['sh', '-c', 'kill -%(signal)s %%d; sleep 0.5; touch %%s/one' %% (os.getpid(), here)]
+run = hpcp.run_commands_in_multicmd_with_path_check
+
+def run_then_stop_again(*args, **kwargs):
+	# A later stop, still in the cleanup: sent by this process once the delayed commands have run, so it is handled apart from
+	# the first (two signals pending at once would be handled once).
+	result = run(*args, **kwargs)
+	os.kill(os.getpid(), signal.SIG%(signal)s)
+	return result
+
+hpcp.run_commands_in_multicmd_with_path_check = run_then_stop_again
 try:
 	hpcp.clean_up([], [], [first, ['touch', os.path.join(here, 'two')]])
 	print('ended', hpcp._STOPPED)
@@ -461,7 +477,8 @@ def test_994_a_first_stop_during_the_cleanup_lets_it_finish(tmp_path, name):
 	# A run that mounted an image or attached a loop device, stopped for the first time while clean_up() runs (here inside its
 	# delayed commands' step: the first command signals hpcp): 9.93 raised the stop there, so the step was cut (its command
 	# stopped) and every step after it skipped, and mounts, loop devices or a -dd clone's mkfs UUID could stay. 9.94 records
-	# it, as a later stop: both commands run to their end, and the stop is there for main() to end the run by.
+	# it, as a later stop: both commands run to their end, and the stop is there for main() to end the run by. A second stop
+	# follows once the commands have run (still in the cleanup): it is recorded too, and says nothing more.
 	import subprocess
 	import sys
 	code = _CLEANUP_STOPPED % {'root': os.path.dirname(hpcp.__file__), 'here': str(tmp_path), 'signal': name}
@@ -470,7 +487,8 @@ def test_994_a_first_stop_during_the_cleanup_lets_it_finish(tmp_path, name):
 	output = task.stdout.decode('utf-8', 'replace')
 	assert output.strip().splitlines()[-1] == 'ended %d' % getattr(__import__('signal'), 'SIG' + name), output
 	assert os.path.exists(str(tmp_path / 'one')) and os.path.exists(str(tmp_path / 'two')), output
-	# The first stop says so, once (it landed in the cleanup, which may take minutes: an e2fsck): later ones were the only ones to.
+	# The first stop says so (it landed in the cleanup, which may take minutes: an e2fsck; later ones were the only ones to),
+	# once: the second says nothing more.
 	assert output.count('Stopping: cleaning up first') == 1 and 'Ctrl-\\ ends hpcp now' in output, output
 
 
@@ -512,6 +530,7 @@ def clean_with_a_stop(*args):
 hpcp.validate_dd_source_path = lambda *a, **k: '/dev/fake-source'
 hpcp.create_dd_dest_part_table = lambda *a, **k: ({'/dev/fake-source': {}, '1': {'size': 4096}, '2': {'size': 4096}}, [], None)
 hpcp.get_partitions = lambda device: [device + '1', device + '2']
+hpcp.is_device = lambda path: False  # the fake partitions: a mount that failed goes to dd_partition, not to a stat of them
 hpcp.os.geteuid = lambda: 0
 hpcp.tempfile = SimpleNamespace(mkdtemp=mount_dir)
 hpcp.os.path.ismount = lambda path: path in roots[:2]
@@ -529,8 +548,9 @@ def test_994_a_stop_in_a_partition_s_cleanup_ends_the_dd_run_before_the_next_par
 	# -dd copies each partition by a nested hpcp(). Ctrl-C landing in its cleanup (its lists are empty there, so the window
 	# is short) is only recorded and the nested run returns 0: 9.94 as built went on to the next partition's mounts, and where
 	# that could not be mounted dd_partition copied it whole, before anything checked the stop. 9.93 raised out of the nested
-	# cleanup at once, so this guards what 9.93 gets right. The disk setup and the mounts are stood in for (as test_dd_errors);
-	# the stop is a real SIGINT.
+	# cleanup at once, so this guards what 9.93 gets right. The disk setup and the mounts are stood in for (as test_dd_errors;
+	# is_device too, so a run that went on would reach dd_partition for the second partition, as described, not fail at a stat
+	# of its fake path); the stop is a real SIGINT.
 	import subprocess
 	import sys
 	code = _DD_NESTED_CLEANUP_STOPPED % {'root': os.path.dirname(hpcp.__file__), 'here': str(tmp_path)}
@@ -584,16 +604,16 @@ def _held(directory):
 	return os.open(directory, os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0))
 
 
-def _reader_seen(path):
+def _reader_seen(path, _open=os.open, _close=os.close):
 	'''Whether something has the FIFO at path open for reading, asked as a writer would be let in: a write open that does not
-	wait answers ENXIO where nobody reads.'''
+	wait answers ENXIO where nobody reads. (By the real open and close, which a test may be standing in for.)'''
 	try:
-		fd = os.open(path, os.O_WRONLY | os.O_NONBLOCK)
+		fd = _open(path, os.O_WRONLY | os.O_NONBLOCK)
 	except OSError as e:
 		if e.errno == errno.ENXIO:
 			return False
 		raise
-	os.close(fd)
+	_close(fd)
 	return True
 
 
@@ -605,8 +625,9 @@ def test_994_a_rerun_never_opens_an_identical_fifo_for_reading(tmp_path, monkeyp
 	# A guard: 9.93 never opened an identical FIFO landing, and 9.94 as built did where there is no /proc (a read open that
 	# does not wait): a program blocked in open(landing, O_WRONLY) was let in, and what it wrote went into a pipe nobody
 	# reads and was lost (measured on macOS 26.6.2; on Linux without /proc the writer died of SIGPIPE). On macOS even an
-	# O_EVTONLY open does it. Here the writer is told from a probe: at every call the settle makes while it holds what it
-	# opened, a non-blocking write open must still find no reader. (A FIFO's owner and mode are set by name without /proc.)
+	# O_EVTONLY open does it. Here the writer is told from a probe: before and after each call the settle makes (each open,
+	# close, stat, chown, chmod and utime), a non-blocking write open must still find no reader, so an open for reading is
+	# seen even where it is closed before the next call. (A FIFO's owner and mode are set by name without /proc.)
 	if proc and not hpcp._PATH_FDS:
 		pytest.skip('no O_PATH with /proc here')
 	monkeypatch.setattr(hpcp, '_PATH_FDS', proc)
@@ -616,19 +637,186 @@ def test_994_a_rerun_never_opens_an_identical_fifo_for_reading(tmp_path, monkeyp
 	os.mkfifo(landing, 0o600)
 	os.chmod(landing, landing_mode)
 	os.utime(source, (1, 1))
-	look = os.lstat(landing)
-	seen = []
-	for name in ('lstat', 'fstat', 'utime'):
-		def probing(*args, _real=getattr(os, name), **kwargs):
-			seen.append(_reader_seen(landing))
-			return _real(*args, **kwargs)
-		monkeypatch.setattr(os, name, probing)
+	look, src_st = os.lstat(landing), os.lstat(source)
 	base = _held(str(tmp_path / 'out')) if held else str(tmp_path / 'out')
+	seen = []  # (the settle's calls only: the test's own are made before and after)
+	for name in ('open', 'close', 'stat', 'lstat', 'fstat', 'chown', 'chmod', 'utime'):
+		real = getattr(os, name)
+
+		def probing(*args, _real=real, **kwargs):
+			seen.append(_reader_seen(landing))
+			try:
+				return _real(*args, **kwargs)
+			finally:
+				seen.append(_reader_seen(landing))
+		monkeypatch.setattr(os, name, probing)
+		for group in ('supports_dir_fd', 'supports_fd', 'supports_follow_symlinks'):
+			if real in getattr(os, group):  # hpcp asks them (os.chmod in os.supports_follow_symlinks): the same answer
+				monkeypatch.setattr(os, group, getattr(os, group) | {probing})
 	try:
-		assert hpcp._settle_identical(source, os.lstat(source), landing, look, base)
+		assert hpcp._settle_identical(source, src_st, landing, look, base)
 	finally:
+		monkeypatch.undo()
 		if held:
 			os.close(base)
-	monkeypatch.undo()
 	assert seen and not any(seen), seen
 	assert stat.S_IMODE(os.lstat(landing).st_mode) == 0o640 and os.lstat(landing).st_mtime == 1  # it was settled
+
+
+# ---- The 9.94 final review's mutants that no test caught (9.97): each test guards what 9.93 gets right ----
+
+
+@posix_only
+@pytest.mark.parametrize('what', PLANTED)
+@pytest.mark.parametrize('content_only', [True, False], ids=['-co', 'plain'])
+def test_994_what_is_put_at_a_held_new_file_s_name_is_not_renamed_over_the_landing(tmp_path, monkeypatch, reset_hpcp_globals, content_only, what):
+	# A rewrite beside (-wb) where cp wrote the new file through the descriptor hpcp made it by (_held_route): its rename is
+	# by name, so the name is first checked to be still the file hpcp holds. Forced at the fsync of that descriptor, the last
+	# call before the check: the new file renamed aside and a link to the victim (or a FIFO) put at its name, by a user who
+	# can write out/. The old copy stays (190, naming why), the victim untouched, nothing left at the temporary name. Without
+	# the check (the review's M1) the link or the FIFO was renamed over out/x. copy_file tries again: each attempt meets it.
+	if not hpcp._held_route():
+		pytest.skip('cp writes no held file here')
+	victim = _Victim(str(tmp_path / 'v' / 'victim'))
+	out = str(tmp_path / 'out')
+	_write(str(tmp_path / 'x'), 'new')
+	_write(os.path.join(out, 'x'), 'old')
+	st = os.lstat(os.path.join(out, 'x'))
+	monkeypatch.setattr(hpcp, 'CONTENT_ONLY', content_only)
+	monkeypatch.setattr(hpcp, 'WRITE_BESIDE', True)
+	real, planted = os.fsync, []
+
+	def plant_then_fsync(fd):
+		held = os.fstat(fd)
+		for name in os.listdir(out):
+			temp = os.path.join(out, name)
+			if name.startswith('.hpcp_tmp_') and not name.endswith('.away') and os.lstat(temp).st_ino == held.st_ino:
+				os.rename(temp, temp + '.away')
+				_plant(what, temp, victim)
+				planted.append(name)
+		return real(fd)
+	monkeypatch.setattr(os, 'fsync', plant_then_fsync)
+	hpcp.copy_file(str(tmp_path / 'x'), [os.path.join(out, 'x')])
+	errors = list(hpcp.ERRORS)
+	monkeypatch.undo()
+	assert planted, 'no fsync of a held new file'
+	assert victim.untouched(), (victim.before, victim.state())
+	now = os.lstat(os.path.join(out, 'x'))
+	assert stat.S_ISREG(now.st_mode) and (now.st_dev, now.st_ino) == (st.st_dev, st.st_ino), (now, st)
+	assert _read(os.path.join(out, 'x')) == 'old'
+	assert any(error.startswith('Copy failed') and 'something else was put at its name' in error for error in errors), errors
+	assert sorted(os.listdir(out)) == sorted(['x'] + [name + '.away' for name in planted])
+
+
+def _identical(tmp_path):
+	'''A source and its landing out/x that the skip check found identical, the landing still to be settled: the source 0640
+	with an old time (in a root run OTHER's), the landing 0600. (source, its lstat, landing, the landing's lstat, the victim,
+	its time).'''
+	source, landing = str(tmp_path / 'src'), str(tmp_path / 'out' / 'x')
+	for path in (source, landing):
+		_write(path, 'same')
+	os.chmod(source, 0o640)
+	os.utime(source, (1, 1))
+	if os.geteuid() == 0:
+		os.chown(source, OTHER, OTHER)
+	os.chmod(landing, 0o600)
+	victim = _Victim(str(tmp_path / 'v' / 'victim'))
+	return source, os.lstat(source), landing, os.lstat(landing), victim, os.lstat(victim.path).st_mtime_ns
+
+
+@posix_only
+@pytest.mark.parametrize('route', ['proc', 'read'])
+def test_994_a_settle_whose_landing_is_swapped_at_its_open_sets_nothing(tmp_path, monkeypatch, route):
+	# A rerun's skip check found out/x identical to the source; the settle (_settle_identical) then gives it the source's
+	# mode, times (and owner) through a descriptor it opens at the name, checked against the skip check's look. Forced at that
+	# open: out/x renamed aside and a hard link to the victim put at its name (a user who can write out/; a symbolic link the
+	# open's O_NOFOLLOW refuses already). The settle answers False with nothing set, for copy_file to look again. Without the
+	# check (the review's M5) the victim got the source's mode and times, and in a root run its owner.
+	_carry_route(monkeypatch, route)
+	source, src_st, landing, look, victim, victim_time = _identical(tmp_path)
+	base = _held(os.path.dirname(landing))
+	real, swapped = os.open, []
+
+	def swap_then_open(path, *args, **kwargs):
+		if not swapped and os.path.basename(path) == 'x':
+			swapped.append(path)
+			os.rename(landing, landing + '.away')
+			os.link(victim.path, landing)
+		return real(path, *args, **kwargs)
+	monkeypatch.setattr(os, 'open', swap_then_open)
+	try:
+		settled = hpcp._settle_identical(source, src_st, landing, look, base)
+	finally:
+		monkeypatch.undo()
+		os.close(base)
+	assert swapped, 'the settle opened nothing'
+	assert settled is False
+	assert victim.untouched() and os.lstat(victim.path).st_mtime_ns == victim_time, (victim.before, victim.state())
+	now = os.lstat(landing + '.away')
+	assert (stat.S_IMODE(now.st_mode), now.st_uid, now.st_gid, now.st_mtime_ns) == (0o600, look.st_uid, look.st_gid, look.st_mtime_ns)
+
+
+@posix_only
+@pytest.mark.parametrize('call', ['chown', 'chmod', 'utime'])
+@pytest.mark.parametrize('route', ['proc', 'read'])
+def test_994_a_link_put_at_the_landing_inside_the_settle_gets_none_of_its_calls(tmp_path, monkeypatch, route, call):
+	# The settle checks the descriptor it opened against the look, then acts through it (Linux with /proc: its /proc/self/fd
+	# name, which leads to that file and no further; elsewhere the descriptor), never by out/x's name: a link put there
+	# between the check and the chown, the chmod or the utime (a user who can write out/) gets nothing, and the file looked at
+	# gets it all. Forced at the call. A chmod by the landing's name (the review's M13, on the /proc route) followed the link.
+	# The chown only in a root run: as nobody the source's owner and group are the landing's already, so there is none.
+	if call == 'chown' and os.geteuid() != 0:
+		pytest.skip('the settle gives no owner as nobody: the source is the runner\'s')
+	_carry_route(monkeypatch, route)
+	source, src_st, landing, look, victim, victim_time = _identical(tmp_path)
+	base = _held(os.path.dirname(landing))
+	real, swapped = getattr(os, call), []
+
+	def swap_then_call(path, *args, **kwargs):
+		if not swapped:
+			swapped.append(path)
+			os.rename(landing, landing + '.away')
+			os.symlink(victim.path, landing)
+		return real(path, *args, **kwargs)
+	monkeypatch.setattr(os, call, swap_then_call)
+	try:
+		assert hpcp._settle_identical(source, src_st, landing, look, base)
+	finally:
+		monkeypatch.undo()
+		os.close(base)
+	assert swapped, 'the settle never called os.%s' % call
+	assert victim.untouched() and os.lstat(victim.path).st_mtime_ns == victim_time, (victim.before, victim.state())
+	now = os.lstat(landing + '.away')
+	assert (stat.S_IMODE(now.st_mode), now.st_uid, now.st_gid, now.st_mtime_ns) == (0o640, src_st.st_uid, src_st.st_gid, src_st.st_mtime_ns)
+
+
+@posix_only
+def test_994_a_rewrite_gives_the_new_file_the_old_file_s_fat_bits(tmp_path, monkeypatch, reset_hpcp_globals):
+	# A -co rewrite beside of a vfat file reads the old file's FAT attribute bits before the rename (here read-only and
+	# archive, 0x21) and sets them on the new file after it, which vfat gave archive alone (0x20). The ioctl is stood in for
+	# (no vfat here), each file's bits kept by its number. One SET, of the old file's bits, on the new file: a SET of other
+	# bits (the review's M6) fails.
+	import fcntl
+	import struct
+	_write(str(tmp_path / 'x'), 'new')
+	_write(str(tmp_path / 'out' / 'x'), 'old')
+	old = os.lstat(str(tmp_path / 'out' / 'x'))
+	bits, sets, real = {old.st_ino: 0x21}, [], fcntl.ioctl
+
+	def ioctl(fd, request, arg=0, *rest):
+		number = os.fstat(fd).st_ino
+		if request == hpcp._FAT_IOCTL_GET_ATTRIBUTES:
+			return struct.pack('I', bits.get(number, 0x20))
+		if request == hpcp._FAT_IOCTL_SET_ATTRIBUTES:
+			bits[number] = struct.unpack('I', arg)[0]
+			sets.append((number, bits[number]))
+			return 0
+		return real(fd, request, arg, *rest)
+	monkeypatch.setattr(fcntl, 'ioctl', ioctl)
+	monkeypatch.setattr(hpcp, 'CONTENT_ONLY', True)
+	monkeypatch.setattr(hpcp, 'WRITE_BESIDE', True)
+	hpcp.copy_file(str(tmp_path / 'x'), [str(tmp_path / 'out' / 'x')])
+	assert not hpcp.ERRORS, hpcp.ERRORS
+	now = os.lstat(str(tmp_path / 'out' / 'x'))
+	assert now.st_ino != old.st_ino and _read(str(tmp_path / 'out' / 'x')) == 'new'
+	assert sets == [(now.st_ino, 0x21)], sets
