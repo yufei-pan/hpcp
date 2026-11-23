@@ -481,6 +481,37 @@ def test_997_macos_the_lean_reads_answer_as_the_xattr_tool_and_ls_do(tmp_path):
 		os.close(fd)
 
 
+@darwin_only
+@pytest.mark.parametrize('route', ['held', 'read'])
+def test_997_macos_a_co_rewrite_beside_keeps_the_old_file_s_xattrs_and_acl(tmp_path, monkeypatch, reset_hpcp_globals, route):
+	# A -co rewrite beside (-wb) gives the new file the old one's owner, group and mode, and on Linux its xattrs; on macOS it
+	# gave it none of the old file's xattrs or ACL, and kept the source's xattr that cp copied (9.94 to 9.96: Python has no
+	# os.listxattr there). Through the descriptor hpcp made the new file by (held), or one opened at its name (read).
+	if route == 'read':
+		monkeypatch.setattr(hpcp, '_held_route', lambda: None)
+	_write(tmp_path / 'x', 'new')
+	subprocess.run(['xattr', '-w', 'org.example.source', 'theirs', str(tmp_path / 'x')], check=True)
+	landing = str(tmp_path / 'out' / 'x')
+	_write(landing, 'old')
+	subprocess.run(['xattr', '-w', 'org.example.tag', 'mine', landing], check=True)
+	subprocess.run(['chmod', '+a', 'everyone allow read', landing], check=True)
+	old = os.lstat(landing)
+	monkeypatch.setattr(hpcp, 'CONTENT_ONLY', True)
+	monkeypatch.setattr(hpcp, 'WRITE_BESIDE', True)
+	try:
+		hpcp.copy_file(str(tmp_path / 'x'), [landing])
+		assert not hpcp.ERRORS, hpcp.ERRORS
+		now = os.lstat(landing)
+		with open(landing) as handle:
+			assert handle.read() == 'new' and now.st_ino != old.st_ino
+		names = subprocess.run(['xattr', landing], stdout=subprocess.PIPE, universal_newlines=True, check=True).stdout.split()
+		assert 'org.example.tag' in names and 'org.example.source' not in names, names
+		acl = subprocess.run(['ls', '-led', landing], stdout=subprocess.PIPE, universal_newlines=True, check=True).stdout
+		assert 'everyone allow read' in acl, acl
+	finally:
+		subprocess.run(['chmod', '-N', landing], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
 # ---- 6. Stops ----
 
 _DD_COPY_STOPPED = '''

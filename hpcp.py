@@ -4757,7 +4757,21 @@ def _co_carry(target, st):
 	if euid != 0 and not (st.st_uid == euid and (st.st_gid == os.getegid() or st.st_gid in os.getgroups())):
 		return None
 	if not hasattr(os, 'listxattr'):
-		return {}
+		if _XATTRS is None:
+			return {}
+		# macOS: every name a program sets (_is_portable_xattr), read through libc; the system's own marks and hidden names stay
+		# as the new file has them. 9.94 to 9.96 carried none there (macOS's Python has no os.listxattr). Its ACL is carried by
+		# _carry_over.
+		listxattr, getxattr = _XATTRS[:2]
+		carried = {}
+		try:
+			for name in listxattr(target, follow_symlinks=False):
+				if _is_portable_xattr(name):
+					carried[name] = getxattr(target, name, follow_symlinks=False)
+		except OSError as e:
+			if e.errno not in _XATTR_SKIPPED:
+				return None
+		return carried
 	try:
 		names = os.listxattr(target, follow_symlinks=False)
 	except OSError as e:
@@ -4788,7 +4802,7 @@ def _write_clears(mode):
 		return mode & (stat.S_ISUID | stat.S_ISGID)
 	return mode & stat.S_ISUID
 
-def _carry_over(st, temp, carried, held=None, base=None, kind=stat.S_IFREG):
+def _carry_over(st, temp, carried, held=None, base=None, kind=stat.S_IFREG, old=None):
 	"""Give temp, the new file of a -co rewrite, exactly what the old file (st, carried: _co_carry) had: its carried xattrs
 	(each set, and any such name temp gained, as an ACL inherited from a default ACL, removed), owner and group, and mode, less
 	the set-ID bits a write clears (_write_clears) when the runner is not root, as a write in place leaves them. A label the
@@ -4805,7 +4819,8 @@ def _carry_over(st, temp, carried, held=None, base=None, kind=stat.S_IFREG):
 	the old file's owner: a link, another type or another user's file put at the name since cp made it (a user who can write
 	the directory) is refused, so no chown, chmod or xattr reaches the file a link leads to, and a root run gives no other
 	user's file this one's owner and mode. base: the door's result for temp's directory (_cp_beside), which temp's name is
-	opened in; None: temp, a path."""
+	opened in; None: temp, a path. On macOS the xattrs go through libc (_XATTRS) and only through a descriptor, and old (the
+	old file's path, not followed) gives a regular file its ACL (_mac_sync_acl), as a rerun's settle does there."""
 	name = os.path.basename(temp)
 	at, at_how = (_at(base, name), _fd_of(base)) if base is not None else ((temp,), {})
 	fd = None
@@ -4832,26 +4847,31 @@ def _carry_over(st, temp, carried, held=None, base=None, kind=stat.S_IFREG):
 				xpath, xhow = _io(base, name, temp) if base is not None else temp, {'follow_symlinks': False}
 				cpath, chow = at[0], dict(at_how, follow_symlinks=False)
 				mpath, mhow = at[0], dict(at_how, **({'follow_symlinks': False} if os.chmod in os.supports_follow_symlinks else {}))
-		if hasattr(os, 'listxattr'):
+		mac = _XATTRS is not None and _XATTRS[0] is _mac_listxattr
+		if _XATTRS is not None and (not mac or (kind == stat.S_IFREG and xpath.__class__ is int)):
+			listxattr, _, setxattr, removexattr = _XATTRS
 			if os.geteuid() != 0 and not now.st_mode & stat.S_IWUSR:
 				# A user.* xattr is set or removed only with write permission, through a descriptor too: the new file of a
 				# source without owner write (0444) has it until its exact mode is set below (9.94 to 9.96 kept the old copy: 190).
 				os.chmod(mpath, stat.S_IMODE(now.st_mode) | stat.S_IWUSR, **mhow)
 			try:
-				gained = os.listxattr(xpath, **xhow)
+				gained = listxattr(xpath, **xhow)
 			except OSError as e:
 				if e.errno not in (errno.ENOTSUP, errno.EOPNOTSUPP):
 					raise
 				gained = []
 			for xname in gained:
-				if xname not in carried and (xname.startswith('user.') or xname in _CO_CARRIED[:2]):
-					os.removexattr(xpath, xname, **xhow)
+				# What cp gave the new file of its own (macOS's cp copies the source's names) and the old file lacks goes.
+				if xname not in carried and (_is_portable_xattr(xname) if mac else xname.startswith('user.') or xname in _CO_CARRIED[:2]):
+					removexattr(xpath, xname, **xhow)
 			for xname, value in carried.items():
 				try:
-					os.setxattr(xpath, xname, value, **xhow)
+					setxattr(xpath, xname, value, **xhow)
 				except OSError as e:
 					if not (xname == 'security.selinux' and e.errno in (errno.ENOTSUP, errno.EOPNOTSUPP)):
 						raise
+			if mac and old is not None:
+				_mac_sync_acl(old, xpath)
 		os.chown(cpath, st.st_uid, st.st_gid, **chow)
 		mode = stat.S_IMODE(st.st_mode)
 		if os.geteuid() != 0:
@@ -5842,7 +5862,7 @@ def _cp_beside(command, src_path, target, st, why, space, src_st=None, base=None
 			attributes = None
 			if carried is not None:
 				what = 'its owner, group or an xattr cannot be given to the new copy (%s)'
-				_carry_over(st, temp, carried, fd, base, stat.S_IFMT((src_st or os.lstat(src_path)).st_mode))
+				_carry_over(st, temp, carried, fd, base, stat.S_IFMT((src_st or os.lstat(src_path)).st_mode), _io(base, name, target))
 				attributes = _fat_attributes(*_at(base, name), **_fd_of(base))
 			elif not CONTENT_ONLY:
 				_remove_stale_xattrs(src_path, _io(base, tname, temp) if fd is None else fd)
