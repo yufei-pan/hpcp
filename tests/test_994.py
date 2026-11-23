@@ -356,7 +356,8 @@ def test_994_an_ncd_refusal_another_destination_takes_is_said_under_nds_only(tmp
 	assert os.listdir(str(tmp_path / 'elsewhere')) == []
 	if sync == '-nds':
 		assert rc == 0 and 'B/sub is a link' in output, output[-3000:]
-		assert len(notes) == 1 if workers == 'serial' else 1 <= len(notes) <= 4, output[-3000:]
+		# (9.97: once a run; 9.94 to 9.96 said it once for each worker that met it, up to the 4 workers here.)
+		assert len(notes) == 1, output[-3000:]
 		for note in notes:
 			assert '-ncd makes no directory in its place; nothing is written below it (name it with -d ' in note, note
 			assert 'other destinations' not in note, note

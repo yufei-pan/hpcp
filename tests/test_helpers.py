@@ -62,10 +62,11 @@ def test_worker_reports_only_current_task_errors(hpcp_mod, reset_hpcp_globals, m
 	hpcp_mod.ERRORS.append('Copy failed: parent error')
 	settings = {name: getattr(hpcp_mod, name) for name in hpcp_mod._TASK_SETTINGS}
 	# (Since 9.96 the task's error lines go back too, for the parent to print.)
+	# (9.97: each line with its stream.)
 	assert hpcp_mod._run_task(settings, hpcp_mod.eprint, 'FS param warning: defaults') == (None, ['FS param warning: defaults'], None,
-		['FS param warning: defaults\n'])
+		[('err', 'FS param warning: defaults\n')])
 	assert hpcp_mod._run_task(settings, hpcp_mod.eprint, 'Copy failed: worker error') == (None, ['Copy failed: worker error'], None,
-		['Copy failed: worker error\n'])
+		[('err', 'Copy failed: worker error\n')])
 	assert hpcp_mod._run_task(settings, int, '3') == (3, [], None, [])
 	result, errors, crash, lines = hpcp_mod._run_task(settings, int, 'x')
 	assert result is None and errors == [] and crash.startswith('ValueError') and lines == []
