@@ -14107,22 +14107,25 @@ def _same_contents(first, second, second_open=None):
 
 # Filesystems where a stat by name is a round trip to a server for each part of the path the client checks again: there
 # the copy check looks at a directory's landings relative to it, opened once (_lstat_below: one path walk a directory, not
-# one a landing). Measured on NFS only (an EL8 v4.1 loopback mounted actimeo=0, a rerun's copy check of 100,000 landings
-# in 10,000 directories: 2.4 times fewer GETATTRs, 2 to 2.4 times faster); the others are listed because their clients
-# ask the server along a path walk in the same way, not measured. On a local filesystem the opens cost more than the
-# path walks they save (about 10 to 25% slower, Docker), so there a landing is looked at by its path, as in 9.86.
-_NETWORK_FS = frozenset(('nfs', 'nfs4', 'lustre', 'gpfs', 'cifs', 'smb3', 'ceph', 'beegfs'))
+# one a landing). Measured on Linux NFS (an EL8 v4.1 loopback mounted actimeo=0, a rerun's copy check of 100,000 landings
+# in 10,000 directories: 2.4 times fewer GETATTRs, 2 to 2.4 times faster), and on macOS (26.6.2, the 9.97 design check:
+# the same server calls either way with default options, but by directory 2.3 to 3.0 times faster on an SMB mount with
+# 10,000 directories of one file each, 3 times on NFSv3 noac with 50 directories of 1,000 files, and at most 0.17 s slower
+# for 10,000 directories where all is cached; macOS names the two smbfs and nfs). The others are listed because their
+# clients ask the server along a path walk in the same way, not measured. On a local filesystem the opens cost more than
+# the path walks they save (about 10 to 25% slower, Docker; 2.3 times on a macOS APFS, each open and close about 20 us), so
+# there a landing is looked at by its path, as in 9.86.
+_NETWORK_FS = frozenset(('nfs', 'nfs4', 'lustre', 'gpfs', 'cifs', 'smb3', 'smbfs', 'ceph', 'beegfs'))
 
 def _on_network_fs(paths):
-	"""True when one of paths (the destinations) is on a _NETWORK_FS: one stat a destination, its type from the mount table
-	(_mount_type, Linux; elsewhere never, and a destination that cannot be stat'ed is not). macOS too takes every destination
-	by path: on a local APFS disk the check by directory cost 2.3 times as much for 10,000 directories of one file each (each
-	open and close about 20 us), and a rerun 12 % more; a macOS NFS or SMB mount is not measured yet (docs/limitations.md)."""
+	"""True when one of paths (the destinations) is on a _NETWORK_FS: one look a destination, its type from the mount table
+	(_mount_type, Linux) or from statfs (_statfs_type, macOS: 22 us on APFS, one round trip on a network mount); elsewhere
+	never, and a destination that cannot be asked is not."""
 	for path in paths:
 		try:
-			if _mount_type(os.stat(path).st_dev) in _NETWORK_FS:
+			if (_statfs_type(path) if sys.platform == 'darwin' else _mount_type(os.stat(path).st_dev)) in _NETWORK_FS:
 				return True
-		except OSError:
+		except (OSError, ImportError):
 			pass
 	return False
 

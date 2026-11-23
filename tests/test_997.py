@@ -512,7 +512,32 @@ def test_997_macos_a_co_rewrite_beside_keeps_the_old_file_s_xattrs_and_acl(tmp_p
 		subprocess.run(['chmod', '-N', landing], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
-# ---- 6. Stops ----
+# ---- 6. macOS: the copy check on a network mount ----
+
+@pytest.mark.parametrize('kind, grouped', [('smbfs', True), ('nfs', True), ('apfs', False), ('hfs', False), (OSError, False),
+	(ImportError, False)])
+def test_997_macos_checks_a_destination_on_a_network_mount_by_directory(monkeypatch, kind, grouped):
+	# 9.88 to 9.96 checked every macOS landing by its path, a network mount too: the 9.97 design check measured by directory
+	# 2.3 to 3.0 times faster on an SMB mount (10,000 directories of one file) and on NFSv3 noac (50 of 1,000), as Linux takes
+	# them. The type from statfs (_statfs_type: smbfs, nfs); a destination that cannot be asked, or a Python without ctypes,
+	# stays by path. The platform and statfs stood in for.
+	def statfs(path):
+		if not isinstance(kind, str):
+			raise kind('stand-in')
+		return kind
+	monkeypatch.setattr(hpcp.sys, 'platform', 'darwin')
+	monkeypatch.setattr(hpcp, '_statfs_type', statfs)
+	assert hpcp._on_network_fs(['/somewhere']) is grouped
+
+
+@darwin_only
+def test_997_macos_a_local_destination_stays_by_path(tmp_path):
+	# On APFS the check by directory cost 2.3 times as much for 10,000 directories of one file each (9.88's first build took
+	# every macOS destination by directory): a local destination is looked at by path. Guards what 9.96 gets right.
+	assert hpcp._statfs_type(str(tmp_path)) == 'apfs' and hpcp._on_network_fs([str(tmp_path)]) is False
+
+
+# ---- 7. Stops ----
 
 _DD_COPY_STOPPED = '''
 import os, signal, sys
