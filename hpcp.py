@@ -4072,8 +4072,8 @@ def get_file_list_serial(root,exclude=None,append_hash=False,full_hash=False,rec
 	each says). boundary: see get_file_list. known_dir: root comes from a parent's listing (-pfl), which said directory:
 	checked as a directory below root is. show: draw the listing's line every _LINE_INTERVAL seconds (_show_listing); a
 	-pfl job's call does not (the parent's loop draws it): in a pool worker with live counts (_my_live) it puts what it has
-	listed so far, the entries (files and links) and the subfolders found, in its cells every _LINE_INTERVAL seconds, and
-	the rest when it ends, for the parent's line."""
+	listed so far, its files, its links and its folders (a cell each), in its cells every _LINE_INTERVAL seconds, and the
+	rest when it ends, for the parent's line."""
 	global FILES_RATE_LIMIT
 	if _rate_limiter is None and respect_file_rate_limit and FILES_RATE_LIMIT > 0:
 		_rate_limiter = {'start_time': time.monotonic(), 'count': 0, 'limit': FILES_RATE_LIMIT}
@@ -14131,8 +14131,9 @@ def _same_contents(first, second, second_open=None):
 # one a landing). Measured on Linux NFS (an EL8 v4.1 loopback mounted actimeo=0, a rerun's copy check of 100,000 landings
 # in 10,000 directories: 2.4 times fewer GETATTRs, 2 to 2.4 times faster), and on macOS (26.6.2, the 9.97 design check:
 # the same server calls either way with default options, but by directory 2.3 to 3.0 times faster on an SMB mount with
-# 10,000 directories of one file each, 3 times on NFSv3 noac with 50 directories of 1,000 files, and at most 0.17 s slower
-# for 10,000 directories where all is cached; macOS names the two smbfs and nfs). The others are listed because their
+# 10,000 directories of one file each, 3 times on NFSv3 noac with 50 directories of 1,000 files, 12% slower on NFSv3 noac
+# with 10,000 directories of one file (8.25 s by path, 9.20 s by directory, one pair), and at most 0.17 s slower for 10,000
+# directories where all is cached; macOS names the two smbfs and nfs). The others are listed because their
 # clients ask the server along a path walk in the same way, not measured. On a local filesystem the opens cost more than
 # the path walks they save (about 10 to 25% slower, Docker; 2.3 times on a macOS APFS, each open and close about 20 us), so
 # there a landing is looked at by its path, as in 9.86.

@@ -225,18 +225,26 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 
 ### A pool job's error lines show when its job returns
 - **Kind:** known limitation.
-- **What the operator sees:** in a pooled run (a copy's, a listing's or a removal's jobs), a job hands its error lines back with its result and hpcp prints them then: seconds after the failure among small files, later where a large file follows the failed one in the same job. A job that never returns (a stop with Ctrl-C, a worker killed or out of memory, one hung on a dead mount) shows none of the lines it held. 9.95 printed each line as it happened. The progress line itself stays live, the error list and the exit status are as in 9.95, and a rerun meets the same files again; with `-s` every line prints at once.
+- **What the operator sees:** in a pooled run (a copy's, a listing's or a removal's jobs), a job hands its error lines back with its result and hpcp prints them then: seconds after the failure among small files, later where a large file follows the failed one in the same job. A job that never returns (a worker killed or out of memory, one hung on a dead mount) shows none of the lines it held; one stopped with Ctrl-C or SIGTERM writes them as its worker ends (since 9.97). 9.95 printed each line as it happened. The progress line itself stays live, the error list and the exit status are as in 9.95, and a rerun meets the same files again; with `-s` every line prints at once.
 - **Why:** only the process that draws the progress line knows whether it is open, so a worker printing its own lines is how 9.94 and 9.95 put them on the frame or after an empty line (the blank lines 9.96 removed). Sending each line at once needs a second channel from every worker beside the results, which a killed worker can leave half written.
 - **Revisit when:** an operator misses a line that a stopped or killed run held, or the jobs get such a channel for another reason.
 - **Approved:** 2026-11-17, the user's pick "Known limitation (Recommended)" (relayed by chief). The user asked, 2026-11-16, "It NEEDS to print interm outputs when it is removing in command line": the progress line does; only the error lines wait for their job.
 
 ### macOS: a `-co` rewrite in place gives the old file the source's xattrs
 - **Kind:** deferred (9.98).
-- **What the operator sees:** on macOS, `hpcp x -d out/ -co` over an existing `out/x` (written in place, the default) leaves `out/x` with the source's xattrs in place of its own (a Finder tag of the old file goes, one of the source comes), where Linux keeps the old file's (ran on macOS 26.6.2, 2026-11-23, 9.96 and 9.97 alike). The ACL, owner, mode and times stay, as `-co` promises; a rewrite beside (`-wb`) carries the old file's xattrs and ACL since 9.97.
+- **What the operator sees:** on macOS, `hpcp x -d out/ -co` over an existing `out/x` (written in place, the default) leaves `out/x` with the source's xattrs in place of its own (a Finder tag of the old file goes, one of the source comes), where Linux keeps the old file's (ran on macOS 26.6.2, 2026-11-23, 9.96 and 9.97 alike). The ACL, owner, mode and times stay, as `-co` promises; a rewrite beside (`-wb`) carries none either (the next entry).
 - **Why:** macOS's `cp` copies a file's xattrs by default and replaces the destination's (`cp -f x out/x` ran so; `cp -fX` keeps them), where GNU `cp -f` touches none.
 - **Plan (9.98):** decide what `-co` keeps on macOS: `cp -X` under `-co` keeps the old file's names in place and gives a first copy none of the source's, as Linux does, but would also drop `com.apple.quarantine` from a first copy of a downloaded file (Gatekeeper then does not check it): keep that mark (copy it after `cp -X`, or leave `-X` out of a first copy), and test both on the Mac.
 - **Revisit when:** 9.98.
 - **Noted:** 2026-11-23, found by the 9.97 builder while checking the `-co` beside carry on the Mac; a deferral, not asked.
+
+### macOS: a `-co` rewrite beside carries no xattrs or ACL
+- **Kind:** deferred (9.98).
+- **What the operator sees:** on macOS, `hpcp x -d out/ -co -wb` over an existing `out/x` (and a `-co` rewrite that goes beside for another reason) gives the new file none of the old file's xattrs or ACL, and leaves it the xattrs the source had that macOS's `cp` copied; Linux carries the old file's (ran on macOS 26.6.2, 2026-11-23, 9.96 and 9.97 alike: the new file's xattrs `[]`, ACL `[]`). Owner, group, mode and times are carried, as `-co` promises.
+- **Why:** Python has no `os.listxattr` on macOS, so `_co_carry` carries nothing there. 9.97's first build carried them through libc (7da83e6) and its final review took it out again for two wrong results, each run on the Mac: the old file was read by its full path, so a directory on the way swapped for a link at that moment gave the new file another file's xattrs and an ACL "everyone allow read,write" (9.96: none); and the resource fork (`com.apple.ResourceFork`, a stream of the content) was mixed with the source's (`OLD-FORKORK`: the old fork written over the source's at position 0) or removed where the old file had none.
+- **Plan (9.98):** one design for this entry and the one above (what `-co` keeps on macOS): decide which names belong to the content (the resource fork, `com.apple.quarantine`, probably `com.apple.TextEncoding`) and which to the file (Finder tags, the ACL); read the old file through a descriptor, never by its full path (opened by name in the held directory with `O_NOFOLLOW|O_NONBLOCK`, its identity checked against the look; `_mac_listxattr`, `_mac_getxattr` and `_mac_acl_text` already take one); the resource fork follows the content, written truncated (`_mac_setxattr` writes at position 0 without truncating, so a rerun's settle, `_sync_xattrs` since 9.90, that sets a differing fork value may leave an old tail too: from reading, not run); a name that cannot be read is a refusal, as on Linux (the first build stopped at it with a partial set), and an ACL call that answers ENOTSUP, EPERM or EINVAL (SMB, NFS) is skipped as the copy path skips it. The two Mac runs above are the tests.
+- **Revisit when:** 9.98.
+- **Noted:** 2026-11-23, 9.97's final review (F2, F3) and its second opinions (code-4); a deferral, not asked.
 
 ### macOS: a running program at a landing is written in place
 - **Kind:** deferred (9.98).
@@ -253,6 +261,54 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - **Plan (9.98):** accept the directory's own group where a new file takes it: on macOS and the BSDs always, on Linux in a set-group-ID directory; test it on the Mac under `/tmp`.
 - **Revisit when:** 9.98.
 - **Noted:** 2026-11-23, found by the 9.97 macOS test-suite work; a deferral, not asked.
+
+### The space warning starts with a line end where no line is open
+- **Kind:** deferred (9.98).
+- **What the operator sees:** `hpcp big -d /small/out/ > log 2>&1` where the destination is too small (one 3 MiB file to a 1 MiB tmpfs, ran 2026-11-17 on 9.96 and 2026-11-23 on 9.97): an empty line between `Processing 1 files with 32 workers` and `Space warning: ...`, with no frame open. The warning itself, its place before `cp`, the exit status and the files copied are right.
+- **Why:** a pool task writes the warning at once, before `cp` (a warning that waits for its job's result comes after the copy it is about: 9.97's first build), and a worker cannot know whether the parent's line is open, so it takes the line start for an open one (`_line_start`) whatever the mark says.
+- **Plan (9.98):** the parent's mark in a cell of the space share the workers already have (`_SPACE_WARNED`), written where the parent sets or clears `_BAR_DRAWN` and read by the worker under the share's lock before it writes; if that proves more parts than one empty line in a log is worth, ask the user for a known limitation.
+- **Revisit when:** 9.98.
+- **Noted:** 2026-11-17, 9.96's final review; moved back from 9.97 on 2026-11-23 by 9.97's final review (F1); a deferral, not asked.
+
+### A pool job's notes and warnings show when its job returns
+- **Kind:** deferred (9.98).
+- **What the operator sees:** in a pooled run, besides its error lines (the approved known limitation above), a job's `Note:` lines (a link below a destination that became a directory; a refusal's note, once a run), its `Trying to copy ... without sparse` line and its warnings (`Warning: cannot remove temporary file ...`, `Warning: cannot keep the FAT attributes ...`) come with its result, as the error lines do; 9.96 wrote them from the worker at once (onto a frame in a combined log). The space warning is not among them: it is written at once. A job stopped with Ctrl-C or SIGTERM writes them as its worker ends; one that never returns (a killed worker) shows none.
+- **Why:** only the process that draws the progress line knows whether it is open, so the lines that report what has happened go through it (9.97). None is progress; the one line whose value is its time, the space warning, is written at once.
+- **Plan (9.98):** ask the user whether these lines belong under the known limitation above (they report what has happened, as the error lines do); if not, write them at once with the parent's mark shared with the workers (the space warning's entry above), after a check that a frame drawn at the same moment cannot land on them.
+- **Revisit when:** 9.98.
+- **Noted:** 2026-11-23, 9.97's final review (F4); a deferral, not asked; the user approved the known limitation for error lines only.
+
+### A stdout that fails while a pool task's lines print turns the task into a crash
+- **Kind:** deferred (9.98).
+- **What the operator sees:** from reading only (9.97's second opinion code-1, not run): a stdout that fails while the parent prints a task's lines (a full disk under `> log`; a closed pipe is dropped on the command line) with a frame open raises out of `_line`'s `_end_line()`, which `_settled` takes for the task's crash: `Copy process crashed: OSError`, and the job's sizes and symlinks are left out of the run's totals though its files were copied.
+- **Why:** `_settled` prints the lines inside the `try` whose `except Exception` makes the crash, and `_line`'s stdout branch ends the open line outside its own `try`, where its stderr branch (`_error_line`) guards its writes.
+- **Plan (9.98):** print the lines after the `try`, and guard `_line`'s stdout branch as `_error_line` is guarded; a test with a stdout that raises.
+- **Revisit when:** 9.98.
+- **Noted:** 2026-11-23, 9.97's final review (code-1, C1-2); a deferral, not asked.
+
+### A patch apply or build gives the target of a link where the patch has a directory the directory's mode, owner and xattrs
+- **Kind:** deferred (9.98).
+- **What the operator sees:** from reading, with the first step run (9.97's second opinion code-5, C5-3; the same in 9.96): in a patch apply or build, where the destination holds a link to a directory at a name the patch has a directory for, `_make_dest_directory` returns the link's path (ran: the link stays a link, nothing is reported), and `_start_directory` then sets the source directory's mode, owner, group and xattrs on the link's target before the `Directory sync error` that follows (a root run changes the owner). `hpcp SRC -d DST` is not affected: it replaces such a link by a directory.
+- **Why:** with no named destination (`NAMED_DESTS` empty, as in a patch apply) the door does not replace the link, and `_make_dest_directory` names a regular file in the way and returns `None`, but not a link to a directory.
+- **Plan (9.98):** name the entry and return `None` for a link there as for a regular file (`_make_dest_directory`, as its first lines do); a test with a link to a directory in a patch apply's destination.
+- **Revisit when:** 9.98.
+- **Noted:** 2026-11-23, 9.97's second opinions (code-5); a deferral, not asked.
+
+### The symlink bar's rate divides by zero where the clock has not moved
+- **Kind:** deferred (9.98).
+- **What the operator sees:** from reading only (9.97's second opinion code-2, not run; older than 9.97): `create_sym_links` computes its `F/s` as the count over the seconds since it started; on Windows, whose monotonic clock ticked every 15.6 ms before Python 3.13, the first link made inside one tick gives `division by zero`, and the run reports `Create symlink general error` for a link that was made.
+- **Why:** the rate is taken at each link with no guard for an elapsed time of zero.
+- **Plan (9.98):** take the larger of the elapsed time and one clock tick (or draw no rate at the first frame); a test with a clock that does not move.
+- **Revisit when:** 9.98.
+- **Noted:** 2026-11-23, 9.97's second opinions (code-2); a deferral, not asked.
+
+### A `-pfl` listing's line keeps the counts of a worker killed outright
+- **Kind:** deferred (9.98).
+- **What the operator sees:** from reading only (9.97's second opinion code-3, not run): a listing job that raises takes the counts it published off the line (9.97), but a worker killed without a Python exception (SIGKILL, the kernel's out-of-memory kill) skips that, so what it had counted stays on the line while the run fails (the pool is marked broken). The line is the live display only; the lists and the exit status come from the results.
+- **Why:** the rollback runs in the job's `except`, which a killed process never reaches.
+- **Plan (9.98):** the parent zeroes the dead worker's row when it marks the pool broken (`_POOL_BROKEN`); a test that kills a listing worker.
+- **Revisit when:** 9.98.
+- **Noted:** 2026-11-23, 9.97's second opinions (code-3); a deferral, not asked.
 
 ### With -wb, a rewrite does not keep a per-file layout, chattr flags or the project id
 - **Kind:** known limitation.
