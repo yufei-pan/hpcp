@@ -202,13 +202,14 @@ def test_997_a_link_bar_s_error_starts_a_line_of_its_own(tmp_path):
 @posix_only
 @not_root
 def test_997_a_link_that_cannot_be_made_says_so_off_the_bar(tmp_path):
-	# A link whose directory takes no new name (0555): 'Could not create symbolic link ...' (9.96: written straight to stderr,
+	# Links whose directory takes no new name (0555): 'Could not create symbolic link ...' (9.96: written straight to stderr,
 	# onto the bar's frame in a combined log) and 'Failed to create symbolic link: All destinations failed', each on a line of
-	# its own after the first link's frame.
-	_write(tmp_path / 'src' / 'a' / 'target')
-	os.symlink('target', str(tmp_path / 'src' / 'a' / 'l1'))
-	_write(tmp_path / 'src' / 'b' / 'target')
-	os.symlink('target', str(tmp_path / 'src' / 'b' / 'l2'))
+	# its own. Ten links that can be made and five that cannot, in the order the copy hands them over: a frame comes before
+	# at least one failure (all five first: 1 in 3,003).
+	for directory, count in (('a', 10), ('b', 5)):
+		_write(tmp_path / 'src' / directory / 'target')
+		for index in range(count):
+			os.symlink('target', str(tmp_path / 'src' / directory / ('l%d' % index)))
 	_write(tmp_path / 'dst' / 'src' / 'b' / 'target')
 	os.chmod(str(tmp_path / 'dst' / 'src' / 'b'), 0o555)
 	try:
@@ -216,9 +217,12 @@ def test_997_a_link_that_cannot_be_made_says_so_off_the_bar(tmp_path):
 	finally:
 		os.chmod(str(tmp_path / 'dst' / 'src' / 'b'), 0o755)
 	shown = output.split('Error occurred:')[0]
-	assert rc != 0 and os.path.islink(str(tmp_path / 'dst' / 'src' / 'a' / 'l1')), output[-3000:]
+	assert rc != 0 and len(os.listdir(str(tmp_path / 'dst' / 'src' / 'a'))) == 11, output[-3000:]
+	assert shown.count('Could not create symbolic link from target to ') == 5, output[-3000:]
 	_each_starts_a_line(shown, 'Could not create symbolic link from target to ')
 	_each_starts_a_line(shown, 'Failed to create symbolic link: All destinations failed')
+	# A frame before one of them (each part but the last is what came before a failure, after the one before it).
+	assert any('Symbolic Links Created' in part for part in shown.split('Could not create symbolic link')[:-1]), output[-3000:]
 
 
 def _each_starts_a_line(text, mark):
