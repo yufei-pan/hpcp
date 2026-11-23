@@ -472,7 +472,8 @@ def test_the_copy_check_by_directory_matches_a_look_by_path(tmp_path, reset_hpcp
 def test_the_copy_check_goes_by_directory_only_on_a_network_filesystem(tmp_path, reset_hpcp_globals, monkeypatch, kind):
 	# NFS measured (EL8, actimeo=0): 2.4 times fewer GETATTRs and 2 to 2.4 times faster by directory; locally the opens cost
 	# more than the path walks they save, so a local destination is looked at by path (9.86's). The type is asked once a
-	# destination (_mount_type: None off Linux, and for a mount the table does not list), never once a landing.
+	# destination (_mount_type: None off Linux, and for a mount the table does not list; macOS: _statfs_type, since 9.97), never
+	# once a landing.
 	src, out = tmp_path / 'src', tmp_path / 'out'
 	for d in range(3):
 		(src / ('d%d' % d)).mkdir(parents=True)
@@ -483,6 +484,7 @@ def test_the_copy_check_goes_by_directory_only_on_a_network_filesystem(tmp_path,
 	entries = sorted(str(path) for path in src.rglob('f*'))
 	asked = []
 	monkeypatch.setattr(hpcp, '_mount_type', lambda dev: asked.append(dev) or kind)
+	monkeypatch.setattr(hpcp, '_statfs_type', lambda path: asked.append(path) or kind)
 	by_name, relative = [], []
 	real = os.lstat
 	def counted(path, *args, **kwargs):
