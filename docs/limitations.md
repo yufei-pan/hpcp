@@ -278,6 +278,14 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - **Revisit when:** 9.98.
 - **Noted:** 2026-11-23, 9.97's final review (F4); a deferral, not asked; the user approved the known limitation for error lines only.
 
+### A job that finished just before a stop loses its lines
+- **Kind:** deferred (9.98).
+- **What the operator sees:** a pooled run stopped with Ctrl-C (or SIGTERM to the parent) loses the lines of a job that had returned a moment before, and that its loop had not yet taken: the stop is acted on as the loop waits (`_wait`), before the jobs that finished meanwhile are read. Ran 2026-11-23 (9.97 with its fix round, Docker, Python 3.14: 3,000 files whose sparse `cp` attempt fails, `-j 4`, Ctrl-C to the process group at a random 0.5 to 2.5 s): in 2 of 84 stopped runs, one job's lines were gone (80 of 1,663 `Trying to copy ... without sparse` lines; 29 of 525, traced to one finished job, 30 lines, never printed). 9.96 wrote those stdout lines from the worker at once; its error lines were lost the same way (the approved known limitation above).
+- **Why:** a pool job's lines come back with its result, and `_wait` raises the parent's recorded stop (`_check_stop`) before its caller settles the futures `_wait` has just found done.
+- **Plan (9.98):** in `_wait`, when the stop is raised, print the lines of the futures it found done first (`_settled`, guarded so that a failing print cannot hide the stop), checking the loops that settle with `report=False` (`-rm -pfl`: a stop skips the walk that reports what is left); a test that stops the parent with a done future in hand.
+- **Revisit when:** 9.98.
+- **Noted:** 2026-11-23, 9.97's last round (f997b, the probe of N1); a deferral, not asked.
+
 ### A stdout that fails while a pool task's lines print turns the task into a crash
 - **Kind:** deferred (9.98).
 - **What the operator sees:** from reading only (9.97's second opinion code-1, not run): a stdout that fails while the parent prints a task's lines (a full disk under `> log`; a closed pipe is dropped on the command line) with a frame open raises out of `_line`'s `_end_line()`, which `_settled` takes for the task's crash: `Copy process crashed: OSError`, and the job's sizes and symlinks are left out of the run's totals though its files were copied.
