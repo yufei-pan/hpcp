@@ -865,3 +865,68 @@ def test_997_a_job_that_returns_while_the_pool_ends_after_a_stop_has_its_lines_p
 			futures.append(hpcp._submit_task(executor, _a_line_after, 0.5))
 			raise KeyboardInterrupt
 	assert capsys.readouterr().out == 'LINE-OF-A-JOB\n'
+
+
+@pytest.fixture
+def a_stop_after_some_jobs_settled(monkeypatch, forked_workers, reset_hpcp_globals):
+	'''As a_stop_with_a_job_done, but each job's extra line is its own (a uuid), and the stop is recorded the second time a
+	wait finds jobs done, so that the jobs the first wait found were read, and their lines printed, by their loop. Returns the
+	number of jobs each wait that found some found done.'''
+	import uuid
+	found = []
+	real_run_task, real_wait = hpcp._run_task, concurrent.futures.wait
+	def run_task(settings, func, *args, **kwargs):
+		result, errors, crash, lines = real_run_task(settings, func, *args, **kwargs)
+		return result, errors, crash, lines + [('out', 'LINE-OF-A-JOB %s\n' % uuid.uuid4())]
+	run_task.__module__, run_task.__qualname__ = 'hpcp', '_run_task'  # a task is pickled by its name
+	def wait(futures, **kwargs):
+		result = real_wait(futures, **kwargs)
+		if result.done:
+			found.append(len(result.done))
+			if len(found) == 2:
+				hpcp._STOPPED, hpcp._STOPPED_PID = signal.SIGINT, os.getpid()
+		return result
+	for name, value in (('_MAIN_PID', os.getpid()), ('_STOPPED', None), ('_STOPPED_PID', None), ('_STOP_ACTED', False),
+			('_ABANDONED', False), ('_LEFT', []), ('_run_task', run_task)):
+		monkeypatch.setattr(hpcp, name, value)
+	monkeypatch.setattr(concurrent.futures, 'wait', wait)
+	return found
+
+
+@posix_only
+@pytest.mark.skipif(sys.platform == 'darwin', reason='forks the pool; macOS starts workers with spawn (fork there can crash a child)')
+@pytest.mark.parametrize('kind', ['removal', 'copy', 'listing'])
+def test_997_a_job_a_loop_took_before_the_stop_is_not_printed_again(kind, tmp_path, capsys, a_stop_after_some_jobs_settled):
+	# The pool's exit prints the lines of the jobs done that no loop has taken (_pool.unread); a job a wait handed to its loop
+	# leaves that list (_wait), or the stop prints its lines a second time. Every job's line here is its own (a uuid).
+	loops = {'removal': _removal(True), 'copy': _copy_list, 'listing': _listing}
+	_stopped_loop(lambda: loops[kind](tmp_path))
+	lines = [line for line in capsys.readouterr().out.splitlines() if line.startswith('LINE-OF-A-JOB')]
+	assert len(a_stop_after_some_jobs_settled) >= 2, a_stop_after_some_jobs_settled
+	assert lines and len(lines) == len(set(lines)), (kind, a_stop_after_some_jobs_settled, lines)
+
+
+@posix_only
+def test_997_a_failed_job_among_the_unread_ones_is_skipped_and_the_pool_s_exit_goes_on(capsys, monkeypatch, reset_hpcp_globals):
+	# A job whose result is its worker's stop (a worker that ended on the stop sends its SystemExit back as the result: the
+	# future is done and failed) has no lines to give. The pool's exit skips it: read, its SystemExit (not an Exception) would
+	# end the exit before it passes the stop on to the workers and waits for them.
+	failed = concurrent.futures.Future()
+	failed.set_exception(SystemExit(130))
+	passed_on, real = [], hpcp._pass_stop_on
+	def pass_on(signum):
+		passed_on.append(signum)
+		real(signum)
+	monkeypatch.setattr(hpcp, '_pass_stop_on', pass_on)
+	monkeypatch.setattr(hpcp, '_ABANDONED', False)
+	monkeypatch.setattr(hpcp, '_LEFT', [])
+	raised = None
+	try:
+		with hpcp._pool(1) as pool:
+			pool.unread.update({failed, _done((None, [], None, [('out', 'LINE-OF-A-JOB\n')]))})
+			raise KeyboardInterrupt
+	except BaseException as error:
+		raised = error
+	assert type(raised) is KeyboardInterrupt, raised
+	assert passed_on and hpcp._ABANDONED, (passed_on, hpcp._ABANDONED)
+	assert capsys.readouterr().out == 'LINE-OF-A-JOB\n'
