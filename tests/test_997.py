@@ -432,7 +432,56 @@ def test_997_a_co_rewrite_beside_of_a_read_only_source_keeps_a_user_xattr(tmp_pa
 	assert sorted(os.listdir(str(tmp_path / 'out'))) == ['x']
 
 
-# ---- 5. Stops ----
+# ---- 5. macOS: the lean binding of the read calls ----
+
+darwin_only = pytest.mark.skipif(sys.platform != 'darwin', reason='macOS')
+
+
+def test_997_without_ctypes_the_mac_read_calls_say_enotsup(monkeypatch):
+	# A macOS Python without _ctypes: each read helper imported ctypes itself and raised ImportError (9.90 to 9.96), which no
+	# caller skips (a directory's finishing ended with exit 70); now ENOTSUP, which every caller skips (_XATTR_SKIPPED).
+	monkeypatch.setattr(hpcp, '_libc', lambda: None)
+	monkeypatch.setattr(hpcp, '_LIBC_FUNCTIONS', {})
+	monkeypatch.setitem(sys.modules, 'ctypes', None)  # import ctypes raises ImportError
+	for call in (lambda: hpcp._mac_listxattr('/'), lambda: hpcp._mac_getxattr(0, 'com.example'), lambda: hpcp._mac_acl_text('/')):
+		with pytest.raises(OSError) as raised:
+			call()
+		assert raised.value.errno == __import__('errno').ENOTSUP
+
+
+@darwin_only
+def test_997_macos_the_lean_reads_answer_as_the_xattr_tool_and_ls_do(tmp_path):
+	# The three read calls through libc, by path and by descriptor: a value and a list of names larger than the one buffer
+	# (asked their size and read again), a missing name (ENOATTR), an ACL and none. Guards what 9.96 gets right, through the
+	# lean binding (one buffer a thread, each call bound once).
+	import errno
+	path = str(tmp_path / 'f')
+	_write(path, 'x')
+	big = 'v' * 9000
+	subprocess.run(['xattr', '-w', 'org.example.big', big, path], check=True)
+	names = ['org.example.name%03d-%s' % (index, 'n' * 40) for index in range(120)]  # over 6 KiB of names
+	for name in names:
+		subprocess.run(['xattr', '-w', name, 'small', path], check=True)
+	fd = os.open(path, os.O_RDONLY)
+	try:
+		for target in (path, fd):
+			assert hpcp._mac_getxattr(target, 'org.example.big') == big.encode()
+			assert hpcp._mac_getxattr(target, names[7]) == b'small'
+			assert set(hpcp._mac_listxattr(target)) >= set(names) | {'org.example.big'}
+			with pytest.raises(OSError) as raised:
+				hpcp._mac_getxattr(target, 'org.example.missing')
+			assert raised.value.errno == errno.ENOATTR
+			assert hpcp._mac_acl_text(target) == ''
+		subprocess.run(['chmod', '+a', 'everyone deny delete', path], check=True)
+		try:
+			assert 'deny' in hpcp._mac_acl_text(path) and hpcp._mac_acl_text(fd) == hpcp._mac_acl_text(path)
+		finally:
+			subprocess.run(['chmod', '-N', path], check=True)
+	finally:
+		os.close(fd)
+
+
+# ---- 6. Stops ----
 
 _DD_COPY_STOPPED = '''
 import os, signal, sys

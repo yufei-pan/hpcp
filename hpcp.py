@@ -4503,47 +4503,93 @@ def _mac_xattr_target(target, follow_symlinks):
 # tag list some dozens); a larger one is asked its size and read again.
 _MAC_XATTR_BUFFER = 4096
 
+def _mac_read_fn(name):
+	"""The read call name (listxattr, flistxattr, getxattr, fgetxattr, acl_get_fd_np, acl_get_link_np, acl_to_text, acl_free)
+	bound with its C types (_libc_fn), on its first call in a process; OSError ENOTSUP where libc, or ctypes, is not there (a
+	macOS Python without _ctypes: the caller's skip, where 9.96's own import raised ImportError)."""
+	if _libc() is None:
+		raise OSError(errno.ENOTSUP, f'{name} is not available here')
+	import ctypes as c
+	path = c.c_int if name[0] == 'f' else c.c_char_p
+	if name.endswith('listxattr'):
+		types = (path, c.c_char_p, c.c_size_t, c.c_int), c.c_ssize_t
+	elif name.endswith('getxattr'):
+		types = (path, c.c_char_p, c.c_void_p, c.c_size_t, c.c_uint32, c.c_int), c.c_ssize_t
+	elif name == 'acl_get_fd_np':
+		types = (c.c_int, c.c_int), c.c_void_p
+	elif name == 'acl_get_link_np':
+		types = (c.c_char_p, c.c_int), c.c_void_p
+	elif name == 'acl_to_text':
+		types = (c.c_void_p, c.c_void_p), c.c_void_p
+	else:
+		types = (c.c_void_p,), c.c_int  # acl_free
+	return _libc_fn(name, *types)
+
+_MAC_LOCAL = threading.local()
+
+def _mac_read_buffer():
+	"""This thread's buffer of _MAC_XATTR_BUFFER bytes for the read calls, made once (the copy check's threads each have their
+	own), and ctypes. Only after a _mac_read_fn, which says ENOTSUP where ctypes is not there."""
+	try:
+		return _MAC_LOCAL.buffer
+	except AttributeError:
+		import ctypes
+		_MAC_LOCAL.buffer = buffer = (ctypes.create_string_buffer(_MAC_XATTR_BUFFER), ctypes)
+		return buffer
+
+# The three read calls (_mac_listxattr, _mac_getxattr, _mac_acl_text) run for every file and directory of a macOS rerun: lean,
+# with each call bound once a process, one buffer a thread, and errno read where a call fails. 9.90 to 9.96 imported ctypes,
+# built the C types, made a buffer and called helpers on each call: about 7.5 us a file with neither xattrs nor an ACL, where
+# the bare calls are about 3.5 (the 9.90 review, macOS 26.6.2).
+
 def _mac_listxattr(target, follow_symlinks=True):
 	"""os.listxattr for macOS (libc's listxattr/flistxattr): the names of target's xattrs, as str. One call where they fit
 	_MAC_XATTR_BUFFER."""
-	import ctypes
-	prefix, first, options = _mac_xattr_target(target, follow_symlinks)
-	kind = ctypes.c_int if prefix else ctypes.c_char_p
-	function = _libc_fn(prefix + 'listxattr', (kind, ctypes.c_char_p, ctypes.c_size_t, ctypes.c_int), ctypes.c_ssize_t)
+	if target.__class__ is int:
+		function = _LIBC_FUNCTIONS.get('flistxattr') or _mac_read_fn('flistxattr')
+		first, options = target, 0
+	else:
+		function = _LIBC_FUNCTIONS.get('listxattr') or _mac_read_fn('listxattr')
+		first, options = os.fsencode(target), 0 if follow_symlinks else _XATTR_NOFOLLOW
+	buffer, ctypes = _mac_read_buffer()
 	size = _MAC_XATTR_BUFFER
 	while True:
-		buffer = ctypes.create_string_buffer(size)
 		got = function(first, buffer, size, options)
 		if got != -1:
-			return [os.fsdecode(name) for name in buffer.raw[:got].split(b'\0') if name]
-		e = _libc_error()
-		if e.errno != errno.ERANGE:
-			raise e
-		size = function(first, None, 0, options)
+			return [os.fsdecode(name) for name in buffer[:got].split(b'\0') if name]
+		number = ctypes.get_errno()
+		if number != errno.ERANGE:
+			raise OSError(number, os.strerror(number))
+		size = function(first, None, 0, options)  # larger: its size, then read again (it may grow meanwhile)
 		if size == -1:
-			raise _libc_error()
+			number = ctypes.get_errno()
+			raise OSError(number, os.strerror(number))
+		buffer = ctypes.create_string_buffer(size)
 
 def _mac_getxattr(target, name, follow_symlinks=True):
 	"""os.getxattr for macOS: target's xattr name, its whole value (a resource fork too: position 0, its full size). One
 	call where it fits _MAC_XATTR_BUFFER."""
-	import ctypes
-	prefix, first, options = _mac_xattr_target(target, follow_symlinks)
-	kind = ctypes.c_int if prefix else ctypes.c_char_p
-	function = _libc_fn(prefix + 'getxattr', (kind, ctypes.c_char_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint32,
-		ctypes.c_int), ctypes.c_ssize_t)
+	if target.__class__ is int:
+		function = _LIBC_FUNCTIONS.get('fgetxattr') or _mac_read_fn('fgetxattr')
+		first, options = target, 0
+	else:
+		function = _LIBC_FUNCTIONS.get('getxattr') or _mac_read_fn('getxattr')
+		first, options = os.fsencode(target), 0 if follow_symlinks else _XATTR_NOFOLLOW
 	key = os.fsencode(name)
+	buffer, ctypes = _mac_read_buffer()
 	size = _MAC_XATTR_BUFFER
 	while True:
-		buffer = ctypes.create_string_buffer(size)
 		got = function(first, key, buffer, size, 0, options)
 		if got != -1:
-			return buffer.raw[:got]
-		e = _libc_error()
-		if e.errno != errno.ERANGE:
-			raise e
+			return buffer[:got]
+		number = ctypes.get_errno()
+		if number != errno.ERANGE:
+			raise OSError(number, os.strerror(number))
 		size = function(first, key, None, 0, 0, options)  # larger: its size, then read again (it may grow meanwhile)
 		if size == -1:
-			raise _libc_error()
+			number = ctypes.get_errno()
+			raise OSError(number, os.strerror(number))
+		buffer = ctypes.create_string_buffer(size)
 
 def _mac_setxattr(target, name, value, follow_symlinks=True):
 	"""os.setxattr for macOS."""
@@ -4571,25 +4617,30 @@ else:
 _ACL_TYPE_EXTENDED = 0x00000100  # <sys/acl.h>, macOS's only ACL type
 
 def _mac_acl_text(target):
-	"""macOS: target's extended ACL as acl_to_text gives it (a descriptor, or a path not followed), '' for none."""
-	import ctypes
-	if isinstance(target, int):
-		acl = _libc_fn('acl_get_fd_np', (ctypes.c_int, ctypes.c_int), ctypes.c_void_p)(target, _ACL_TYPE_EXTENDED)
+	"""macOS: target's extended ACL as acl_to_text gives it (a descriptor, or a path not followed), '' for none. Lean, as the
+	xattr reads above."""
+	if target.__class__ is int:
+		acl = (_LIBC_FUNCTIONS.get('acl_get_fd_np') or _mac_read_fn('acl_get_fd_np'))(target, _ACL_TYPE_EXTENDED)
 	else:
-		acl = _libc_fn('acl_get_link_np', (ctypes.c_char_p, ctypes.c_int), ctypes.c_void_p)(os.fsencode(target), _ACL_TYPE_EXTENDED)
+		acl = (_LIBC_FUNCTIONS.get('acl_get_link_np') or _mac_read_fn('acl_get_link_np'))(os.fsencode(target), _ACL_TYPE_EXTENDED)
+	ctypes = _mac_read_buffer()[1]
 	if acl is None:
-		e = _libc_error()
-		if e.errno == errno.ENOENT:
+		number = ctypes.get_errno()
+		if number == errno.ENOENT:
 			return ''  # none: what nearly every file has
-		raise e
+		raise OSError(number, os.strerror(number))
+	free = _LIBC_FUNCTIONS.get('acl_free') or _mac_read_fn('acl_free')
 	try:
-		text = _libc_call('acl_to_text', (ctypes.c_void_p, ctypes.c_void_p), ctypes.c_void_p, acl, None)
+		text = (_LIBC_FUNCTIONS.get('acl_to_text') or _mac_read_fn('acl_to_text'))(acl, None)
+		if text is None:
+			number = ctypes.get_errno()
+			raise OSError(number, os.strerror(number))
 		try:
 			return ctypes.string_at(text).decode('utf-8', 'surrogateescape')
 		finally:
-			_libc_call('acl_free', (ctypes.c_void_p,), ctypes.c_int, text)
+			free(text)
 	finally:
-		_libc_call('acl_free', (ctypes.c_void_p,), ctypes.c_int, acl)
+		free(acl)
 
 def _mac_sync_acl(src, fd):
 	"""macOS: give what fd holds src's extended ACL (src a path, not followed) where its own differs (none: an empty one).
@@ -7327,11 +7378,9 @@ def _finish_directory(record, sync=False, late=False):
 			if flags is not None and hasattr(os, 'chflags'):
 				flags = _flags_to_set(flags, now.st_flags)
 				if flags != now.st_flags:
-					try:
+					if _libc() is not None:
 						_fchflags(fd, flags)  # the descriptor the mode and times went through: a -d link's directory, not the link
-					except OSError as e:
-						if e.errno != errno.ENOTSUP or _libc() is not None:
-							raise
+					else:
 						os.chflags(dest_path, flags, follow_symlinks=False)  # no libc through ctypes: by name, as 9.89
 		except OSError as e:
 			eprint(f'Directory sync error: {src_path} to {dest_path}: ' + ("its mode, set after the move's removal: " if late else '') + str(e))
