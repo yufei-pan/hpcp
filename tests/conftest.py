@@ -380,6 +380,13 @@ def skip_unless_apart(directory, *pairs):
 			pytest.skip('needs %a and %a as two names: this filesystem takes them for one (case-insensitive APFS)' % (first, second))
 
 
+def skip_unless_takes(directory, *names):
+	"""Skip where directory's filesystem refuses one of names (APFS takes only UTF-8 names)."""
+	for name in names:
+		if not takes_name(directory, name):
+			pytest.skip('needs the name %a: this filesystem refuses it (APFS takes only UTF-8 names)' % (name,))
+
+
 def levels_that_fit(directory, per_level, levels, room):
 	"""levels, or as many (each per_level bytes) as the platform's path limit takes below directory with room bytes to
 	spare (PC_PATH_MAX: 4096 bytes on Linux, 1,024 on macOS)."""
@@ -409,13 +416,6 @@ def held_target(argument):
 def descriptor_count():
 	"""How many descriptors this process holds, pipes and sockets too: Linux lists them in /proc/self/fd, macOS in /dev/fd."""
 	return len(os.listdir('/proc/self/fd' if os.path.isdir('/proc/self/fd') else '/dev/fd'))
-
-
-def skip_unless_takes(directory, *names):
-	"""Skip where directory's filesystem refuses one of names (APFS takes only UTF-8 names)."""
-	for name in names:
-		if not takes_name(directory, name):
-			pytest.skip('needs the name %a: this filesystem refuses it (APFS takes only UTF-8 names)' % (name,))
 
 
 def trailing_copy_args(tmp_tree, **kwargs):

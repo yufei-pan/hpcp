@@ -19,7 +19,7 @@ import time
 
 import pytest
 
-from conftest import descriptors_opened_since, open_descriptors
+from conftest import HELD_PREFIX as _HELD_PREFIX, descriptors_opened_since, fd_path, open_descriptors
 
 import hpcp
 
@@ -30,7 +30,6 @@ root_only = pytest.mark.skipif(not hasattr(os, 'geteuid') or os.geteuid() != 0, 
 not_root = pytest.mark.skipif(not hasattr(os, 'geteuid') or os.geteuid() == 0, reason='root writes every directory')
 
 _RUNS = itertools.count()
-_HELD_PREFIX = '/dev/fd/' if sys.platform == 'darwin' else '/proc/self/fd/'
 
 
 def write(path, text, mode=None):
@@ -75,11 +74,7 @@ def _named(target):
 	if not target.startswith(_HELD_PREFIX):
 		return target
 	number, _, name = target[len(_HELD_PREFIX):].partition('/')
-	if sys.platform == 'darwin':
-		import fcntl
-		held = os.fsdecode(fcntl.fcntl(int(number), fcntl.F_GETPATH, bytes(1024)).split(b'\0')[0])
-	else:
-		held = os.readlink(_HELD_PREFIX + number)
+	held = fd_path(int(number))
 	return os.path.join(held, name) if name else held
 
 
