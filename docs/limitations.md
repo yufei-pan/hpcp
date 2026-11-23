@@ -223,14 +223,6 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - **Revisit when:** someone hits it.
 - **Approved:** 2026-11-14, the user chose "Known limitation (Recommended)". Facts corrected 2026-11-15 by the 9.94 final review: macOS takes the held route (ran on macOS 26.6.2), "rerun without -wb" helps only under `-wb` (ran), and the link bug was 9.93's.
 
-### Tests: 9.94's mutants the suite does not catch
-- **Kind:** deferred (9.97).
-- **What the operator sees:** nothing; a developer: removing the held route's identity check before the rename, the settle's identity check at its open, the settle's `/proc`-route chmod by name, the FAT attribute SET value, the held carry's chmod or its `user.*` set, each passes test_994 (the 9.94 final review's mutants M1, M5, M13, M6, M10 and M11; M10 is caught by test_993). The same code is in 9.93, so none is 9.94's regression. Also loose exit-code asserts in two new tests and the case-only rename test's macOS branch; and, from the fix round's second opinions: the FIFO-reader guard probes three calls rather than every open (its non-empty check is met by the test's own `lstat`), "says so, once" is tested with one stop, the `-dd` test's fake partitions are not stubbed for `is_device`, the `-nds` no-promise test does not assert that nothing is copied, and three /proc cases that pass on 9.93 are not labelled as guards.
-- **Why:** 9.94 added the tests its own changes needed (the final review's F5); these guard older code.
-- **Plan (9.97):** one test each, forced at the call as test_994's are.
-- **Revisit when:** 9.97 (moved from 9.96 on 2026-11-17: 9.96 took the remove-progress follow-ups).
-- **Noted:** 2026-11-15, the 9.94 final review (F5, last paragraph); a deferral, not asked.
-
 ### A pool job's error lines show when its job returns
 - **Kind:** known limitation.
 - **What the operator sees:** in a pooled run (a copy's, a listing's or a removal's jobs), a job hands its error lines back with its result and hpcp prints them then: seconds after the failure among small files, later where a large file follows the failed one in the same job. A job that never returns (a stop with Ctrl-C, a worker killed or out of memory, one hung on a dead mount) shows none of the lines it held. 9.95 printed each line as it happened. The progress line itself stays live, the error list and the exit status are as in 9.95, and a rerun meets the same files again; with `-s` every line prints at once.
