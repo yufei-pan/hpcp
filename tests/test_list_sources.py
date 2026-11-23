@@ -4687,9 +4687,12 @@ def test_a_rename_in_case_on_a_directory_that_keeps_both_names_still_moves(tmp_p
 	monkeypatch.chdir(tmp_path)
 	write(tmp_path / 'X', 'data')
 	if os.path.lexists(tmp_path / 'x'):
-		# A case-insensitive filesystem (macOS's default APFS): X and x are one file, and the move is refused, 241, as it must
-		# be where each name is not its own (docs/limitations.md, "a case-only rename by a move is refused").
-		pytest.skip('this directory takes X and x for one name')
+		# A case-insensitive filesystem (macOS's default APFS): X and x are one file, and the move is refused, 241, nothing
+		# copied or removed, as it must be where each name is not its own (docs/limitations.md, "macOS: a case-only rename by
+		# a move is refused on a case-insensitive APFS"; 9.97: this branch skipped, asserting nothing).
+		assert _move(hpcp_mod, ['X'], ['x']) == 241
+		assert os.listdir(tmp_path) == ['X'] and (tmp_path / 'X').read_text() == 'data'
+		return
 	assert _move(hpcp_mod, ['X'], ['x']) == 0
 	assert os.listdir(tmp_path) == ['x'] and (tmp_path / 'x').read_text() == 'data'
 
