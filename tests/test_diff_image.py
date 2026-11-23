@@ -11,6 +11,8 @@ import time
 import pytest
 import re
 
+from conftest import folds_case, skip_unless_apart, skip_unless_takes, takes_name
+
 
 def test_escape_field_round_trips_special_characters(hpcp_mod):
 	samples = ['plain.txt', 'tab\tname', 'new\nline', 'cr\rname', 'back\\slash', 'colon:name',
@@ -861,7 +863,8 @@ def _build_scenario(new, base):
 	_write(base / 'd2l' / 'inner.txt', 'i')
 	os.symlink('same.txt', new / 'd2l')
 	for name in ODD_NAMES:
-		_write(new / name, name)
+		if takes_name(new, name):  # APFS refuses bad\xffbyte (EILSEQ): the round trip goes on with the rest
+			_write(new / name, name)
 
 
 def _temp_leftovers(root):
@@ -1567,6 +1570,8 @@ def test_apply_strips_inherited_default_acl(trees, hpcp_mod, tmp_path, workers):
 	_write(base / 'shared' / 'mod.txt', 'old')
 	_write(new / 'shared' / 'add.txt', 'added')
 	os.chmod(str(new / 'shared' / 'add.txt'), 0o640)
+	if not hasattr(os, 'setxattr'):
+		pytest.skip('POSIX default ACLs are Linux xattrs (system.posix_acl_default): no os.setxattr here')
 	try:
 		# On both sides, so shared/ itself is unchanged; its files were created before the ACL and carry none.
 		for directory in (new / 'shared', base / 'shared'):
@@ -2083,7 +2088,8 @@ def _restore_scenario(hpcp_mod, tmp_path):
 	the same content (a case-only rename)."""
 	target, vol = tmp_path / 'target', tmp_path / 'vol'
 	_write(target / 'EFI' / 'BOOT' / 'x.efi', 'loader')
-	os.symlink('BOOT', str(target / 'EFI' / 'Boot'))
+	if not folds_case(target):  # a case-insensitive filesystem (macOS's APFS) finds EFI/Boot itself
+		os.symlink('BOOT', str(target / 'EFI' / 'Boot'))
 	_write(vol / 'EFI' / 'Boot' / 'x.efi', 'loader')
 	state = hpcp_mod.get_entry_state
 	R = hpcp_mod.ChangeRow
@@ -2246,7 +2252,7 @@ def test_single_fs_case_only_rename_applies_whatever_the_reported_type(trees, hp
 	_clone(base, target)
 	_fake_mounts(hpcp_mod, monkeypatch, (target, fs_type))
 	summary = hpcp_mod.apply_patch_tree([str(vol)], str(target), max_workers=1)
-	if _folds_case(tmp_path):
+	if folds_case(tmp_path):
 		# A case-insensitive filesystem (macOS's default APFS): where the reported type is one hpcp takes for folding (vfat,
 		# exfat, hfsplus) the adds are added; otherwise the check finds EFI/Boot/ and its file there already (they fold to
 		# EFI/BOOT's), counts them done, the deletes take them away, and the repair step writes them again ('restored'). The
@@ -2256,16 +2262,6 @@ def test_single_fs_case_only_rename_applies_whatever_the_reported_type(trees, hp
 		assert (summary['deleted'], summary['added'], summary['modified'], summary['failed']) == (2, 2, 1, 0)
 	assert _changes(hpcp_mod, new, target) == []
 	assert sorted(os.listdir(str(target / 'EFI'))) == ['Boot', 'grub.cfg']
-
-
-def _folds_case(directory):
-	'''Whether directory's filesystem takes two names that differ only in case for one, asked by making one.'''
-	probe = os.path.join(str(directory), 'case-probe-a')
-	open(probe, 'w').close()
-	try:
-		return os.path.exists(os.path.join(str(directory), 'CASE-PROBE-A'))
-	finally:
-		os.unlink(probe)
 
 
 def _mount_entry(point, fs_type, source='none', ids=None):
@@ -2587,6 +2583,7 @@ def test_a_row_failing_after_the_restore_across_scopes_is_counted_once(trees, hp
 	(the same entry, through y -> m/x) with a directory. The restore across scopes finds y/f of another type and
 	fails its verify; the final pass must not count it again."""
 	new, base = trees
+	skip_unless_apart(new, ('F', 'f'))
 	_write(new / 'y' / 'F', 'upper')
 	_write(new / 'y' / 'f', 'lower')
 	(new / 'm' / 'x' / 'f').mkdir(parents=True)
@@ -2877,6 +2874,7 @@ def test_replacing_a_file_on_vfat_keeps_its_fat_attributes(tmp_path, hpcp_mod, r
 def _case_siblings(hpcp_mod, tmp_path, new, base):
 	"""The golden (a case-sensitive tree) holds EFI/X = NEW and EFI/x = old; the base EFI/X = old: rows M EFI/X and
 	A EFI/x. Returns the patch volume."""
+	skip_unless_apart(new, ('X', 'x'))
 	_write(new / 'EFI' / 'X', 'NEW loader')
 	_write(new / 'EFI' / 'x', 'old loader')
 	_write(base / 'EFI' / 'X', 'old loader')
@@ -4488,6 +4486,7 @@ def _strict_utf8_stdout(monkeypatch):
 def _undecodable_restore_scenario(hpcp_mod, tmp_path):
 	"""_restore_scenario with a file name that is not valid UTF-8."""
 	name = os.fsdecode(b'x\xff.efi')
+	skip_unless_takes(tmp_path, name)
 	target, vol = tmp_path / 'target', tmp_path / 'vol'
 	_write(target / 'EFI' / 'BOOT' / name, 'loader')
 	os.symlink('BOOT', str(target / 'EFI' / 'Boot'))

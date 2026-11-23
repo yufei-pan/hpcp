@@ -1,4 +1,5 @@
 import contextlib
+import errno
 import gc
 import os
 import sys
@@ -113,6 +114,15 @@ def warn_if_descriptors_cannot_be_listed():
 @pytest.fixture(scope='session', autouse=True)
 def _say_when_descriptors_cannot_be_listed():
 	warn_if_descriptors_cannot_be_listed()
+
+
+@pytest.fixture(scope='session', autouse=sys.platform == 'darwin')
+def _no_acl_left_in_the_temporary_tree(tmp_path_factory):
+	"""macOS: a copy of a list of full paths makes the directories on the way with their ACLs (the home's 'everyone deny
+	delete'), and test_darwin gives files that entry on purpose: rm -rf, and pytest's removal of old runs, cannot remove them.
+	The run's temporary tree loses its ACLs at its end."""
+	yield
+	subprocess.run(['chmod', '-R', '-N', str(tmp_path_factory.getbasetemp())], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
 @pytest.fixture(autouse=True)
@@ -328,6 +338,84 @@ def require_linux():
 def require_windows():
 	if os.name != 'nt':
 		pytest.skip('Windows-only test')
+
+
+# ---- what the test's own filesystem does (macOS's default APFS folds case and Unicode form, and takes only UTF-8 names)
+
+def same_name(directory, first, second):
+	"""Whether directory's filesystem takes first and second for one name, asked by making first and looking for second, each
+	behind a prefix of its own (so names the test made there already do not answer)."""
+	directory, prefix = os.fsencode(str(directory)), b'.same-name-probe-'
+	probe = os.path.join(directory, prefix + os.fsencode(first))
+	os.close(os.open(probe, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600))
+	try:
+		return os.path.lexists(os.path.join(directory, prefix + os.fsencode(second)))
+	finally:
+		os.unlink(probe)
+
+
+def folds_case(directory):
+	"""Whether directory's filesystem takes two names that differ only in case for one (macOS's default APFS does)."""
+	return same_name(directory, 'a', 'A')
+
+
+def takes_name(directory, name):
+	"""Whether directory's filesystem takes name (str or bytes), asked by making it: APFS refuses one that is not UTF-8
+	(EILSEQ); Linux's filesystems take any bytes but '/' and NUL."""
+	probe = os.path.join(os.fsencode(str(directory)), os.fsencode(name))
+	try:
+		os.close(os.open(probe, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600))
+	except OSError as e:
+		if e.errno == errno.EILSEQ:
+			return False
+		raise
+	os.unlink(probe)
+	return True
+
+
+def skip_unless_apart(directory, *pairs):
+	"""Skip where directory's filesystem takes a pair of names the test needs apart for one name (case or Unicode form)."""
+	for first, second in pairs:
+		if same_name(directory, first, second):
+			pytest.skip('needs %a and %a as two names: this filesystem takes them for one (case-insensitive APFS)' % (first, second))
+
+
+def skip_unless_takes(directory, *names):
+	"""Skip where directory's filesystem refuses one of names (APFS takes only UTF-8 names)."""
+	for name in names:
+		if not takes_name(directory, name):
+			pytest.skip('needs the name %a: this filesystem refuses it (APFS takes only UTF-8 names)' % (name,))
+
+
+def levels_that_fit(directory, per_level, levels, room):
+	"""levels, or as many (each per_level bytes) as the platform's path limit takes below directory with room bytes to
+	spare (PC_PATH_MAX: 4096 bytes on Linux, 1,024 on macOS)."""
+	path_max = os.pathconf(str(directory), 'PC_PATH_MAX')
+	return min(levels, (path_max - 1 - len(os.fsencode(str(directory))) - room) // per_level)
+
+
+HELD_PREFIX = '/dev/fd/' if sys.platform == 'darwin' else '/proc/self/fd/'
+
+
+def fd_path(fd):
+	"""The path this process's descriptor fd leads to: Linux's /proc/self/fd/N link, macOS's F_GETPATH (Python 3.9's)."""
+	if os.path.isdir('/proc/self/fd'):
+		return os.readlink('/proc/self/fd/%d' % fd)
+	import fcntl
+	return os.fsdecode(fcntl.fcntl(fd, fcntl.F_GETPATH, bytes(1024)).split(b'\0')[0])
+
+
+def held_target(argument):
+	"""What cp's destination argument names, asked while cp runs: the file hpcp holds for /proc/self/fd/N (macOS: /dev/fd/N),
+	else the argument itself."""
+	if argument.startswith(HELD_PREFIX) and argument[len(HELD_PREFIX):].isdigit():
+		return fd_path(int(argument[len(HELD_PREFIX):]))
+	return argument
+
+
+def descriptor_count():
+	"""How many descriptors this process holds, pipes and sockets too: Linux lists them in /proc/self/fd, macOS in /dev/fd."""
+	return len(os.listdir('/proc/self/fd' if os.path.isdir('/proc/self/fd') else '/dev/fd'))
 
 
 def trailing_copy_args(tmp_tree, **kwargs):

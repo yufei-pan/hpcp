@@ -44,6 +44,8 @@ def test_expand_user_in_expand_paths(hpcp_mod, reset_hpcp_globals, tmp_path, mon
 
 
 def test_get_mount_table_is_dict(hpcp_mod, reset_hpcp_globals, require_linux):
+	if not os.path.exists('/proc/mounts'):
+		pytest.skip("get_mount_table reads Linux's /proc/mounts (for -dd's mounts): none here")
 	table = hpcp_mod.get_mount_table()
 	assert isinstance(table, dict)
 

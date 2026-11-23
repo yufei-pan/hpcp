@@ -8,6 +8,8 @@ import sys
 
 import pytest
 
+from conftest import descriptor_count, levels_that_fit, skip_unless_takes
+
 # The test's own names need a UTF-8 filesystem encoding to be made (Python 3.6 with LANG unset has ASCII); hpcp's side of
 # such a locale is test_landings' test_a_non_ascii_name_copies_with_lang_unset.
 utf8_names = pytest.mark.skipif(sys.getfilesystemencoding().lower().replace('-', '') != 'utf8',
@@ -224,12 +226,12 @@ def test_a_directory_mounted_on_after_the_walk_is_kept_without_an_error(tmp_path
 def test_deep_destination_with_a_mount_below_it(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
 	"""Review: the mount check recursed once per path component (a deep chain hit Python's recursion limit); the
 	listing now stops at mounts itself. 600 levels: the listing's own recursion (pre-existing, also in the copy) stops
-	near 1000."""
+	near 1000. Fewer where the platform's path limit is shorter (macOS: 1,024 bytes)."""
 	src, dst = tmp_path / 'src', tmp_path / 'dst'
 	src.mkdir()
 	deep = dst
 	dst.mkdir()
-	for _ in range(600):
+	for _ in range(levels_that_fit(tmp_path, 2, 600, len('/dst/stale.txt'))):
 		deep = deep / 'a'
 		os.mkdir(str(deep))
 	(deep / 'stale.txt').write_text('stale')
@@ -409,6 +411,7 @@ def test_a_move_of_two_names_that_are_one_removes_nothing(tmp_path, kind):
 @pytest.mark.parametrize('order', ['ab', 'ba'])
 def test_a_move_of_turkish_names_that_the_mount_takes_for_one_removes_nothing(tmp_path, kind, first, second, order):
 	"""Both were exit 0 with one content gone: iso8859-9 always, codepage 850 in about half the runs."""
+	skip_unless_takes(tmp_path, first, second)
 	base = os.fsencode(str(tmp_path))
 	for source, name, content in ((b'a', first, 'A'), (b'b', second, 'B')):
 		os.makedirs(os.path.join(base, source))
@@ -430,6 +433,7 @@ def test_names_below_a_directory_that_is_not_utf8_are_still_folded_as_utf8(tmp_p
 	decomposed, are one name each to ext4 casefold, and to the net."""
 	pairs = [('Stra\u00dfe', 'STRASSE'), ('caf\u00e9', 'cafe\u0301')]
 	odd = b'\xff'
+	skip_unless_takes(tmp_path, odd)
 	base = os.fsencode(str(tmp_path))
 	for index, (first, second) in enumerate(pairs):
 		for source, name, content in ((b'a', first, 'A%d' % index), (b'b', second, 'B%d' % index)):
@@ -686,12 +690,12 @@ def test_cursor_closes_a_directory_whose_fstat_failed(tmp_path, hpcp_mod, reset_
 		if len(calls) == 3:
 			raise OSError(116, 'Stale file handle')
 		return real_fstat(fd)
-	before = len(os.listdir('/proc/self/fd'))
+	before = descriptor_count()
 	monkeypatch.setattr(hpcp_mod.os, 'fstat', fstat)
 	hpcp_mod._remove_listed_files([(str(root), hpcp_mod._path_identity(str(root)), 'sub/f')], one_filesystem=True)
 	monkeypatch.setattr(hpcp_mod.os, 'fstat', real_fstat)
 	assert len(calls) >= 3
-	assert len(os.listdir('/proc/self/fd')) == before
+	assert descriptor_count() == before
 
 
 def test_fallback_backstop_checks_every_directory_above_the_entry(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):

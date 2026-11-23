@@ -227,7 +227,7 @@ def _can_set(path, name, value):
 	try:
 		os.setxattr(path, name, value, follow_symlinks=False)
 		return True
-	except OSError:
+	except (OSError, AttributeError):  # AttributeError: no os.setxattr (macOS: Linux's xattr calls only)
 		return False
 
 

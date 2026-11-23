@@ -17,6 +17,8 @@ import time
 
 import pytest
 
+from conftest import fd_path, held_target, skip_unless_apart, takes_name
+
 HPCP = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'hpcp.py')
 
 posix_only = pytest.mark.skipif(os.name != 'posix', reason='POSIX file types, signals and permissions')
@@ -206,7 +208,7 @@ def test_a_landing_with_other_names_is_never_written_in_place(tmp_path, hpcp_mod
 	refuse = []
 	def cp(command, *args, **kwargs):
 		# cp writes the new file hpcp made beside the landing (/proc/self/fd/N, which names it), never the landing
-		target = os.readlink(command[-1]) if command[-1].startswith('/proc/self/fd/') else command[-1]
+		target = held_target(command[-1])
 		assert os.path.basename(target).startswith('.hpcp_tmp_'), command
 		if refuse:
 			raise RuntimeError('cp: cannot create regular file: Permission denied')
@@ -236,7 +238,7 @@ def test_a_refused_rename_on_the_beside_route_keeps_the_old_copy(tmp_path, hpcp_
 	real = hpcp_mod.run_command_in_multicmd_with_path_check
 	def cp(command, *args, **kwargs):
 		# the beside route's new file, held by hpcp, is named by cp's /proc/self/fd/N
-		cps.append(os.readlink(command[-1]) if command[-1].startswith('/proc/self/fd/') else command[-1])
+		cps.append(held_target(command[-1]))
 		return real(command, *args, **kwargs)
 	monkeypatch.setattr(hpcp_mod, 'run_command_in_multicmd_with_path_check', cp)
 	real_rename = os.rename
@@ -486,7 +488,7 @@ def test_a_hard_linked_landing_goes_beside_and_its_other_names_keep_the_old_cont
 	xattrs = True
 	try:
 		os.setxattr(str(tmp_path / 'out/x'), 'user.mine', b'kept')
-	except OSError:
+	except (OSError, AttributeError):  # AttributeError: no os.setxattr (macOS: Linux's xattr calls only)
 		xattrs = False
 	inode = os.stat(str(tmp_path / 'out/x')).st_ino
 	rc, output = run(['a/', '-d', 'out/'] + flags, tmp_path)
@@ -524,7 +526,13 @@ def test_a_running_executable_at_the_landing_goes_beside(tmp_path):
 	import shutil
 	os.makedirs(str(tmp_path / 'a'))
 	os.makedirs(str(tmp_path / 'out'))
-	shutil.copy2('/bin/sleep', str(tmp_path / 'out/exe'))
+	if sys.platform == 'darwin':
+		# macOS kills a copy of a platform binary (/bin/sleep) as it starts: cc builds a program that sleeps.
+		write(tmp_path / 'sleep.c', '#include <stdlib.h>\n#include <unistd.h>\nint main(int argc, char **argv) { sleep(atoi(argv[1])); return 0; }\n')
+		if subprocess.run(['cc', '-o', str(tmp_path / 'out/exe'), str(tmp_path / 'sleep.c')]).returncode:
+			pytest.skip('macOS runs no copy of /bin/sleep, and cc built no program')
+	else:
+		shutil.copy2('/bin/sleep', str(tmp_path / 'out/exe'))
 	write(tmp_path / 'a/exe', '#!/bin/sh\necho new\n')
 	os.chmod(str(tmp_path / 'a/exe'), 0o755)
 	inode = os.stat(str(tmp_path / 'out/exe')).st_ino
@@ -772,7 +780,7 @@ def test_the_skip_check_never_syncs_a_file_behind_a_link_below_the_destination(t
 	xattrs = True
 	try:
 		os.setxattr(str(tmp_path / 'elsewhere/x'), 'user.mine', b'1')
-	except OSError:
+	except (OSError, AttributeError):  # AttributeError: no os.setxattr (macOS: Linux's xattr calls only)
 		xattrs = False
 	os.makedirs(str(tmp_path / 'out'))
 	os.symlink('../elsewhere', str(tmp_path / 'out/d'))
@@ -878,8 +886,8 @@ def test_a_stale_user_xattr_goes_after_a_rewrite(tmp_path, route):
 	try:
 		os.setxattr(str(tmp_path / 'out/x'), 'user.stale', b'1')
 		os.setxattr(str(tmp_path / 'a/x'), 'user.kept', b'2')
-	except OSError:
-		pytest.skip('no user xattrs here')
+	except (OSError, AttributeError):  # AttributeError: no os.setxattr (macOS: Linux's xattr calls only)
+		pytest.skip('no Linux user xattrs here')
 	inode = os.stat(str(tmp_path / 'out/x')).st_ino
 	rc, output = run(['a/', '-d', 'out/'] + route, tmp_path)
 	assert rc == 0, output[-2000:]
@@ -970,8 +978,8 @@ def test_content_only_keeps_the_old_file_s_mode_and_xattrs(tmp_path, route):
 	try:
 		os.setxattr(str(tmp_path / 'out/x'), 'user.mine', b'kept')
 		os.setxattr(str(tmp_path / 'a/x'), 'user.source', b'not carried')
-	except OSError:
-		pytest.skip('no user xattrs here')
+	except (OSError, AttributeError):  # AttributeError: no os.setxattr (macOS: Linux's xattr calls only)
+		pytest.skip('no Linux user xattrs here')
 	if route == 'other-names':
 		os.link(str(tmp_path / 'out/x'), str(tmp_path / 'other'))
 	inode = os.stat(str(tmp_path / 'out/x')).st_ino
@@ -1007,8 +1015,8 @@ def test_content_only_carries_the_old_acl_and_drops_one_the_directory_gave(tmp_p
 	try:
 		os.setxattr(str(tmp_path / 'out/y'), 'system.posix_acl_access', access)
 		os.setxattr(str(tmp_path / 'out'), 'system.posix_acl_default', default)
-	except OSError:
-		pytest.skip('no ACLs here')
+	except (OSError, AttributeError):  # AttributeError: no os.setxattr (macOS, which has no POSIX ACLs)
+		pytest.skip('no POSIX ACLs here')
 	before = os.getxattr(str(tmp_path / 'out/y'), 'system.posix_acl_access')
 	rc, output = run(['a/', '-d', 'out/', '-co'] + route, tmp_path)
 	assert rc == 0 and read(tmp_path / 'out/x') == 'new' and read(tmp_path / 'out/y') == 'new', output[-2000:]
@@ -1089,6 +1097,7 @@ def test_content_only_drops_setuid_for_a_non_root_owner_as_the_kernel_does(tmp_p
 
 
 @posix_only
+@pytest.mark.skipif(not hasattr(os, 'listxattr'), reason="Linux's xattr calls (os.listxattr; macOS's go through ctypes: test_990.py)")
 @pytest.mark.parametrize('route', ['default', 'write-beside'])
 def test_content_only_where_an_xattr_cannot_be_carried(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch, route):
 	# trusted.*, security.ima, a filesystem's own: no new file can carry it. By default the file opens for writing and is
@@ -1112,6 +1121,7 @@ def test_content_only_where_an_xattr_cannot_be_carried(tmp_path, hpcp_mod, reset
 
 
 @posix_only
+@pytest.mark.skipif(not hasattr(os, 'listxattr'), reason="Linux's xattr calls (os.listxattr; macOS's go through ctypes: test_990.py)")
 @pytest.mark.parametrize('xattr', ['security.selinux', 'security.capability'])
 def test_content_only_carries_a_label_and_never_a_capability(tmp_path, hpcp_mod, monkeypatch, xattr):
 	write(tmp_path / 'out/x', 'old')
@@ -1123,6 +1133,7 @@ def test_content_only_carries_a_label_and_never_a_capability(tmp_path, hpcp_mod,
 
 
 @posix_only
+@pytest.mark.skipif(not hasattr(os, 'listxattr'), reason="Linux's xattr calls (os.listxattr; macOS's go through ctypes: test_990.py)")
 def test_content_only_skips_a_label_the_filesystem_gives_itself(tmp_path, hpcp_mod, monkeypatch):
 	# vfat with SELinux enforcing lists security.selinux and refuses to set it (EOPNOTSUPP): v1's prototype exited 190.
 	write(tmp_path / 'temp', 'new')
@@ -1503,6 +1514,8 @@ def test_every_slot_taken_prints_each_time(hpcp_mod, monkeypatch):
 
 @pytest.mark.skipif(not hasattr(os, 'makedev'), reason='os.makedev')
 def test_a_mount_type_is_read_from_mountinfo_s_own_fields(tmp_path, hpcp_mod, monkeypatch):
+	if os.major(os.makedev(259, 2)) != 259:
+		pytest.skip("this platform's device numbers hold no major above 255 (macOS: 8 bits); mountinfo is Linux's")
 	sample = tmp_path / 'mountinfo'
 	sample.write_bytes(b'22 1 259:2 / / rw,relatime shared:1 - xfs /dev/nvme0n1p2 rw,attr2\n'
 		b'61 22 0:52 / /mnt/with\\040space rw,nosuid shared:30 master:2 - tmpfs tmpfs rw,size=5120k\n'
@@ -1574,13 +1587,18 @@ def test_a_root_copy_onto_an_ext4_full_for_users_gets_one_needless_warning(tmp_p
 
 _SLOW_CP = '''#!/bin/sh
 # cp, slowed: write a part of each copy into a temporary name (by its name, or the held file hpcp made there, through
-# /proc/self/fd/N), say so, and wait for the go file (or 60 s) before the real cp.
+# /proc/self/fd/N), say so, and wait for the go file (or 60 s) before the real cp. macOS's /dev/fd/N is no link ($PYTHON
+# asks F_GETPATH for the name), and opens as a dup of hpcp's descriptor, whose offset a write there would move: the part
+# goes to the name there.
 case "$1 $2" in --version*|*/hpcp-held-probe-*) exec cp "$@";; esac
 for last; do :; done
-name=$(basename "$(readlink "$last" 2>/dev/null || echo "$last")")
+to=$last
+case "$last" in /dev/fd/*) to=$("$PYTHON" -c 'import fcntl, os, sys; sys.stdout.write(os.fsdecode(fcntl.fcntl(int(sys.argv[1]),
+	fcntl.F_GETPATH, bytes(1024)).split(b"\\0")[0]))' "${last#/dev/fd/}");; esac
+name=$(basename "$(readlink "$to" 2>/dev/null || echo "$to")")
 case "$name" in
 .hpcp_tmp_*)
-	head -c 100 /etc/passwd > "$last"
+	head -c 100 /etc/passwd > "$to"
 	touch "$MARKS/$name"
 	waited=0
 	while [ ! -e "$GO" ] && [ $waited -lt 600 ]; do sleep 0.1; waited=$((waited + 1)); done;;
@@ -1614,7 +1632,7 @@ def _slow_run(tmp_path, args, preexec=None, script=_SLOW_CP, env=None):
 	for name in 'abcd':
 		write(tmp_path / 'src' / name, 'new ' + name)
 		write(tmp_path / 'out' / name, 'old ' + name)
-	env = dict(os.environ, CP_PATH=str(cp), MARKS=str(marks), GO=str(tmp_path / 'go'), **(env or {}))
+	env = dict(os.environ, CP_PATH=str(cp), MARKS=str(marks), GO=str(tmp_path / 'go'), PYTHON=sys.executable, **(env or {}))
 	task = subprocess.Popen([sys.executable, HPCP, 'src/', '-d', 'out/'] + args, cwd=str(tmp_path), env=env,
 		stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True, preexec_fn=preexec)
 	return task, marks
@@ -2124,8 +2142,12 @@ def fsync_file(path, *args):
 	slow(path)
 	return real_fsync(path, *args)
 def os_fsync(fd):
-	# the beside route's new file, made and held by hpcp, is fsynced through its descriptor
-	slow(os.readlink('/proc/self/fd/%d' % fd) if os.path.isdir('/proc/self/fd') else '')
+	# the beside route's new file, made and held by hpcp, is fsynced through its descriptor (macOS: F_GETPATH names it)
+	if os.path.isdir('/proc/self/fd'):
+		slow(os.readlink('/proc/self/fd/%d' % fd))
+	else:
+		import fcntl
+		slow(os.fsdecode(fcntl.fcntl(fd, fcntl.F_GETPATH, bytes(1024)).split(b'\\0')[0]))
 	return real_os_fsync(fd)
 hpcp._fsync_file, os.fsync = fsync_file, os_fsync
 '''
@@ -2745,7 +2767,7 @@ def test_a_copy_into_its_own_inside_in_another_spelling_leaves_the_destination_o
 	monkeypatch.chdir(tmp_path)
 	write(tmp_path / 'D/f', 'f')
 	write(tmp_path / 'D/sub/f', 'sub')
-	os.makedirs(str(tmp_path / 'd/sub'))
+	os.makedirs(str(tmp_path / 'd/sub'), exist_ok=True)  # a case-insensitive filesystem (macOS's APFS) has it: D/sub
 	_spellings_are_one(hpcp_mod, monkeypatch, True)
 	for _ in range(3):
 		assert hpcp_mod.hpcp(['D/'], ['d/sub/'], single_thread=True, max_workers=1, batch=True) == 0
@@ -2755,6 +2777,7 @@ def test_a_copy_into_its_own_inside_in_another_spelling_leaves_the_destination_o
 
 @posix_only
 def test_two_real_directories_that_differ_in_case_are_copied_as_before(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	skip_unless_apart(tmp_path, ('D', 'd'))
 	monkeypatch.chdir(tmp_path)
 	write(tmp_path / 'D/f', 'f')
 	write(tmp_path / 'D/sub/f', 'sub')
@@ -2778,17 +2801,19 @@ def test_a_destination_that_may_be_inside_the_source_and_cannot_be_asked_is_refu
 
 @posix_only
 def test_a_pair_landing_within_a_few_characters_of_path_max_is_asked_and_copied(tmp_path):
-	# A landing directory of 4,066 characters: 9.84 made the probe's names at its full path, past PATH_MAX (213, "File name
-	# too long"). Relative to descriptors a name costs its own length.
+	# A landing directory of 4,066 characters (Linux; 30 short of the platform's PATH_MAX): 9.84 made the probe's names at
+	# its full path, past PATH_MAX (213, "File name too long"). Relative to descriptors a name costs its own length.
+	skip_unless_apart(tmp_path, ('X', 'x'))
 	write(tmp_path / 'a/X', 'upper')
 	write(tmp_path / 'b/x', 'lower')
 	root = str(tmp_path / 'out')
+	length = os.pathconf(str(tmp_path), 'PC_PATH_MAX') - 30
 	parts = []
-	while len(root) + 1 + sum(len(part) + 1 for part in parts) + 200 <= 4066:
+	while len(root) + 1 + sum(len(part) + 1 for part in parts) + 200 <= length:
 		parts.append('d' * 200)
-	parts.append('e' * (4066 - len(root) - sum(len(part) + 1 for part in parts) - 1))
+	parts.append('e' * (length - len(root) - sum(len(part) + 1 for part in parts) - 1))
 	deep = os.path.join(root, *parts)
-	assert len(deep) == 4066
+	assert len(deep) == length
 	os.makedirs(deep)
 	rc, output = run(['a/', 'b/', '-d', deep + '/'], tmp_path)
 	assert rc == 0 and b'File name too long' not in output, output[-2000:]
@@ -2825,7 +2850,11 @@ def test_a_non_ascii_name_copies_with_lang_unset(tmp_path):
 	def p(*parts):
 		return os.path.join(root, *parts)
 	os.makedirs(p(b's', b'd\xc3\xa9'))
-	for name, content in ((b'd\xc3\xa9/f\xc3\xafle', b'x'), (b'na\xc3\xafve', b'y'), (b'legacy\xe9', b'z')):
+	names = [(b'd\xc3\xa9/f\xc3\xafle', b'x'), (b'na\xc3\xafve', b'y')]
+	legacy = takes_name(tmp_path, b'legacy\xe9')  # APFS takes only UTF-8 names: there the rest is checked
+	if legacy:
+		names.append((b'legacy\xe9', b'z'))
+	for name, content in names:
 		with open(p(b's', name), 'wb') as f:
 			f.write(content)
 	os.makedirs(p(b'o', b'clash\xc3\xa9'))
@@ -2839,12 +2868,13 @@ def test_a_non_ascii_name_copies_with_lang_unset(tmp_path):
 		rc, output = run(['s/', '-d', 'o/'], tmp_path, env=env, unset=unset)
 		check(rc, output, 213)
 		assert b'is a directory, not copying' in output
-	for name, content in ((b'd\xc3\xa9/f\xc3\xafle', b'x'), (b'na\xc3\xafve', b'y'), (b'legacy\xe9', b'z')):
+	for name, content in names:
 		with open(p(b'o', name), 'rb') as f:
 			assert f.read() == content
-	rc, output = run(['-sfl', '-', '-d', 'o2/'], tmp_path / 's', b'd\xc3\xa9/f\xc3\xafle\nlegacy\xe9\n', env=env, unset=unset)
+	listed = b'd\xc3\xa9/f\xc3\xafle\n' + (b'legacy\xe9\n' if legacy else b'')
+	rc, output = run(['-sfl', '-', '-d', 'o2/'], tmp_path / 's', listed, env=env, unset=unset)
 	check(rc, output, 0)
-	assert sorted(os.listdir(p(b's', b'o2'))) == [b'd\xc3\xa9', b'legacy\xe9']
+	assert sorted(os.listdir(p(b's', b'o2'))) == [b'd\xc3\xa9'] + ([b'legacy\xe9'] if legacy else [])
 	os.remove(p(b's', b'clash\xc3\xa9'))
 	rc, output = run(['s/', '-d', 'o3/', '-rf', '-v'], tmp_path, env=env, unset=unset)
 	check(rc, output, 0)
@@ -3001,7 +3031,7 @@ def test_a_move_whose_landing_fails_to_reach_the_disk_removes_no_source(tmp_path
 	write(tmp_path / 'a/y', 'Y')
 	real_fsync = os.fsync
 	def fsync(fd):
-		if os.path.basename(os.readlink('/proc/self/fd/%d' % fd)) == 'y':
+		if os.path.basename(fd_path(fd)) == 'y':
 			raise OSError(errno.EIO, os.strerror(errno.EIO))
 		return real_fsync(fd)
 	monkeypatch.setattr(hpcp_mod.os, 'fsync', fsync)
@@ -3248,7 +3278,7 @@ def test_a_move_whose_link_directory_fails_to_reach_the_disk_removes_no_source(t
 	os.symlink('x', str(tmp_path / 'a/l'))
 	real_fsync = os.fsync
 	def fsync(fd):
-		if stat.S_ISDIR(os.fstat(fd).st_mode) and os.readlink('/proc/self/fd/%d' % fd) == str(tmp_path / 'out'):
+		if stat.S_ISDIR(os.fstat(fd).st_mode) and fd_path(fd) == str(tmp_path / 'out'):
 			raise OSError(errno.EIO, os.strerror(errno.EIO))
 		return real_fsync(fd)
 	monkeypatch.setattr(hpcp_mod.os, 'fsync', fsync)
