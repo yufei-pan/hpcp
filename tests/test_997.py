@@ -7,6 +7,7 @@ import signal
 import stat
 import subprocess
 import sys
+import time
 
 import pytest
 
@@ -698,3 +699,169 @@ def test_997_a_stop_between_the_run_and_its_cleanup_still_cleans_up(tmp_path):
 		start_new_session=True)
 	output = done.stdout.decode('utf-8', 'replace')
 	assert 'sent 1 cleaned 1 stopped True' in output and 'rc raised' not in output, output[-3000:]
+
+
+# ---- 8. A job that finished just before a stop ----
+
+@pytest.fixture
+def forked_workers():
+	'''Pool workers forked from this process, as before Python 3.14 (what a test patches reaches them; macOS starts workers with
+	spawn).'''
+	import multiprocessing
+	method = multiprocessing.get_start_method()
+	multiprocessing.set_start_method('fork', force=True)
+	try:
+		yield
+	finally:
+		multiprocessing.set_start_method(method, force=True)
+
+
+@pytest.fixture
+def a_stop_with_a_job_done(monkeypatch, forked_workers, reset_hpcp_globals):
+	'''Forces the window of 9.97's last finding: each task a pool runs hands back one more line (LINE-OF-A-JOB), and the first
+	time a wait finds a job done the parent's stop is recorded, as _stop records it inside a pool region (_DEFER), so that the
+	loop raises it (_check_stop) with that job read by no one. Returns the number of jobs that wait found done. A loop's test
+	then expects the KeyboardInterrupt and that many lines.'''
+	found = []
+	real_run_task, real_wait = hpcp._run_task, concurrent.futures.wait
+	def run_task(settings, func, *args, **kwargs):
+		result, errors, crash, lines = real_run_task(settings, func, *args, **kwargs)
+		return result, errors, crash, lines + [('out', 'LINE-OF-A-JOB\n')]
+	run_task.__module__, run_task.__qualname__ = 'hpcp', '_run_task'  # a task is pickled by its name
+	def wait(futures, **kwargs):
+		result = real_wait(futures, **kwargs)
+		if result.done and not found:
+			found.append(len(result.done))
+			hpcp._STOPPED, hpcp._STOPPED_PID = signal.SIGINT, os.getpid()
+		return result
+	for name, value in (('_MAIN_PID', os.getpid()), ('_STOPPED', None), ('_STOPPED_PID', None), ('_STOP_ACTED', False),
+			('_ABANDONED', False), ('_LEFT', []), ('_run_task', run_task)):
+		monkeypatch.setattr(hpcp, name, value)
+	monkeypatch.setattr(concurrent.futures, 'wait', wait)
+	return found
+
+
+def _tree(root, folders=3, files=6):
+	for folder in range(folders):
+		for number in range(files):
+			_write(root / ('d%d' % folder) / ('f%d' % number), 'x%d' % number)
+	return str(root)
+
+
+def _stopped_loop(loop):
+	'''Runs a pool loop under a_stop_with_a_job_done: the stop must end it by KeyboardInterrupt.'''
+	with pytest.raises(KeyboardInterrupt):
+		loop()
+
+
+def _listing(tmp_path):
+	hpcp.get_file_list_parallel(_tree(tmp_path / 'src'), max_workers=2)
+
+
+def _removal(report):
+	def loop(tmp_path):
+		root = _tree(tmp_path / 'src')
+		files = sorted(os.path.join(root, d, f) for d in os.listdir(root) for f in os.listdir(os.path.join(root, d)))
+		hpcp.delete_file_list_parallel(files, 2, files_per_job=2, report=report)
+	return loop
+
+
+def _copy_list(tmp_path):
+	root = _tree(tmp_path / 'src')
+	files = sorted(os.path.join(root, d, f) for d in os.listdir(root) for f in os.listdir(os.path.join(root, d)))
+	hpcp.copy_file_list_parallel(files, {}, root, [str(tmp_path / 'dst')], max_workers=2, files_per_job=2)
+
+
+def _copy_batch(tmp_path):
+	root = _tree(tmp_path / 'src')
+	files = frozenset(os.path.join(root, d, f) for d in os.listdir(root) for f in os.listdir(os.path.join(root, d)))
+	hpcp.copy_file_list_parallel_batch([(root, [str(tmp_path / 'dst')], files)], 2, files_per_job=2, total_item_count=len(files))
+
+
+def _sync_directories(tmp_path):
+	_tree(tmp_path / 'src')
+	hpcp.sync_directories_parallel_batch([(str(tmp_path / 'src') + os.sep, [str(tmp_path / 'dst') + os.sep])], 2, folder_per_job=1)
+
+
+def _finish(tmp_path):
+	# More directories than one job holds (_FINISH_PER_JOB), so the pass runs in a pool.
+	records = []
+	for number in range(hpcp._FINISH_PER_JOB * 3):
+		path = tmp_path / ('d%d' % number)
+		path.mkdir()
+		records.append(('src/d%d' % number, str(path), 0o755, 0, 0, None))
+	hpcp.finish_directories(records, 2)
+
+
+def _states(tmp_path):
+	root = _tree(tmp_path / 'src', 4, 80)
+	hpcp._states_for_paths([os.path.join(root, d, f) for d in sorted(os.listdir(root)) for f in sorted(os.listdir(os.path.join(root, d)))],
+		max_workers=2)
+
+
+def _replace(tmp_path, monkeypatch):
+	monkeypatch.setattr(hpcp, 'decode_state', lambda state: {'size': 1})
+	row = type('Row', (), {'new': 'f:1', 'path': 'x'})()
+	files = []
+	for number in range(6):
+		_write(tmp_path / 'new' / ('x%d' % number))
+		_write(tmp_path / 'live' / ('x%d' % number))
+		files.append((row, str(tmp_path / 'new' / ('x%d' % number)), str(tmp_path / 'live' / ('x%d' % number))))
+	hpcp._replace_files(files, str(tmp_path / 'live'), 2)
+
+
+def _pfl_removal(tmp_path):
+	root = tmp_path / 'src'
+	_tree(root)
+	info = os.lstat(str(root))
+	hpcp._remove_trees_parallel([(str(root), (info.st_dev, info.st_ino))], 2)
+
+
+@posix_only
+@pytest.mark.skipif(sys.platform == 'darwin', reason='forks the pool; macOS starts workers with spawn (fork there can crash a child)')
+@pytest.mark.parametrize('kind', ['listing', 'removal', 'removal-no-report', 'copy', 'copy-batch', 'directory-sync', 'finish',
+	'states', 'replace', 'pfl-removal'])
+def test_997_a_job_done_when_a_stop_is_raised_has_its_lines_printed(kind, tmp_path, capsys, monkeypatch, a_stop_with_a_job_done):
+	# A stop is acted on as the loop waits (_wait), before the jobs that finished meanwhile are read: the lines of such a job
+	# (a sparse retry's 'Error copying', a warning) were lost, and 9.96 wrote the stdout ones at once (9.97's last finding: 2 of
+	# 84 stopped runs). Every pool loop waits the same way, the -pfl removal and the removal without report, which leave a job's
+	# lines out for the walk after them (a stop skips it), included. The line is printed once per job found done, before the
+	# pool waits for its workers (a worker finishing a big file can take long).
+	loops = {'listing': _listing, 'removal': _removal(True), 'removal-no-report': _removal(False), 'copy': _copy_list,
+		'copy-batch': _copy_batch, 'directory-sync': _sync_directories, 'finish': _finish, 'states': _states,
+		'replace': lambda tmp_path: _replace(tmp_path, monkeypatch), 'pfl-removal': _pfl_removal}
+	before, real = [], hpcp._pass_stop_on
+	def pass_on(signum):
+		before.append(capsys.readouterr().out)  # what is on the screen when the pool tells its workers to end
+		real(signum)
+	monkeypatch.setattr(hpcp, '_pass_stop_on', pass_on)
+	_stopped_loop(lambda: loops[kind](tmp_path))
+	shown = [text.count('LINE-OF-A-JOB\n') for text in before]
+	assert a_stop_with_a_job_done and shown and shown[0] >= a_stop_with_a_job_done[0], (kind, a_stop_with_a_job_done, shown)
+
+
+def _a_line_after(seconds):
+	'''A job that says a line when it is done (a module-level function: a task is pickled by its name).'''
+	time.sleep(seconds)
+	hpcp._line('LINE-OF-A-JOB\n', sys.stdout)
+
+
+@posix_only
+@pytest.mark.skipif(sys.platform == 'darwin', reason='forks the pool; macOS starts workers with spawn (fork there can crash a child)')
+def test_997_a_job_that_returns_while_the_pool_ends_after_a_stop_has_its_lines_printed(capsys, monkeypatch, forked_workers, reset_hpcp_globals):
+	# The pool's exit prints the lines of the jobs done at the stop, then passes the stop on and waits for its workers, and
+	# prints again: a job that returned only then (its worker was not stopped yet) has its result in and no loop to read it.
+	# The pass-on here waits for the running job to return first, which a worker that finished a moment before the stop reached
+	# it does by itself.
+	monkeypatch.setattr(hpcp, '_ABANDONED', False)
+	monkeypatch.setattr(hpcp, '_LEFT', [])
+	real, futures = hpcp._pass_stop_on, []
+	def pass_on(signum):
+		futures[0].exception(timeout=60)
+		real(signum)
+	monkeypatch.setattr(hpcp, '_pass_stop_on', pass_on)
+	with pytest.raises(KeyboardInterrupt):
+		with hpcp._pool(1) as executor:
+			futures.append(hpcp._submit_task(executor, _a_line_after, 0.5))
+			raise KeyboardInterrupt
+	assert capsys.readouterr().out == 'LINE-OF-A-JOB\n'

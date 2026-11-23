@@ -1550,6 +1550,11 @@ def _write_task_lines():
 				sys.stdout.write(text)
 				sys.stdout.flush()
 
+def _print_lines(lines):
+	"""A task's lines (_task_lines), each where _line puts it: stderr's, stdout's, a note once a run."""
+	for stream, text in lines:
+		_line(text, None if stream == 'err' else sys.stdout, note=stream == 'note')
+
 def _settled(future, report=True):
 	"""(result, errors, crash) of a done _submit_task future, the task's lines printed here, each where _line puts it (report
 	False leaves them out: for a caller whose next step meets and reports again what the task could not do). What it failed with is the worker's, a stop
@@ -1559,8 +1564,7 @@ def _settled(future, report=True):
 	try:
 		result, errors, crash, lines = future.result()
 		if report:
-			for stream, text in lines:
-				_line(text, None if stream == 'err' else sys.stdout, note=stream == 'note')
+			_print_lines(lines)
 		return result, errors, crash
 	except Exception as e:
 		error = e
@@ -1730,6 +1734,9 @@ class _pool:
 			# The futures not done yet: each leaves by its done callback (run by the pool's manager thread, or by a cancel). No
 			# weak references: their callbacks run in the main thread, where a stop's KeyboardInterrupt is dropped.
 			self.pending = set()
+			# The futures no loop has been handed yet (_wait hands a loop the ones it found done): at a stop, the done ones among
+			# them are jobs whose lines nobody prints but the pool's exit (_print_unread).
+			self.unread = set()
 			_POOL_BROKEN = False
 			if sys.version_info < (3, 7):
 				_quiet_36_pool_shutdown()
@@ -1774,8 +1781,20 @@ class _pool:
 		finally:
 			_restore_stops(mask)
 		self.pending.add(future)
+		self.unread.add(future)
 		future.add_done_callback(self.pending.discard)
 		return future
+
+	def _print_unread(self):
+		"""The lines of each job that is done and that no loop has taken: a job that returned a moment before a stop is read by
+		nobody once the loop raises it, and its lines (a sparse retry's 'Error copying', a warning, an error line) come back only
+		with its result. Whatever its loop reports (a stop skips the step that meets again what a job could not do); a job that
+		failed or was cancelled has none to give."""
+		for future in [future for future in self.unread if future.done()]:
+			self.unread.discard(future)
+			with contextlib.suppress(Exception):
+				if not future.cancelled() and future.exception(timeout=0) is None:
+					_print_lines(future.result()[3])
 
 	def _states(self):
 		"""{pid: in a task} for the workers that took a slot."""
@@ -1831,8 +1850,13 @@ class _pool:
 						_wait(set(self.pending), self)
 			# A stop ends each worker: idle ones at once, busy ones (after a stop or a broken pool) by their cleanup. SIGTERM for
 			# a broken pool or a failure.
+			if stopped:
+				self._print_unread()
 			_pass_stop_on(_STOPPED or signal.SIGTERM)
 			self._wait_for_workers()
+			if stopped:
+				# A job that returned meanwhile, as its worker ended: its result is in, its loop is gone.
+				self._print_unread()
 			# From 3.9 the manager thread is told to end, before main()'s finalizers close the queues it may still close itself.
 			# Not before: 3.6's shutdown puts a wakeup into the result queue under a lock a killed worker may hold, and 3.7's and
 			# 3.8's close the manager thread's pipes and call queue under it (a traceback from that thread).
@@ -1901,9 +1925,11 @@ def _wait(futures, pool, timeout=1):
 	"""The one wait of every pool loop: the futures done within timeout seconds (1: most loops refresh the progress bar each
 	second; -rm's and the listing's -pfl loops ask for the time their progress line is due), then the parent's stop acted on
 	(_check_stop), then the pool watched (_pool.watch). So a stop is acted on within 1 s in every loop, and a pool stuck on
-	a dead worker ends the run."""
+	a dead worker ends the run. The jobs it returns are the loop's to read from then on (_pool.unread): the stop is raised
+	first, so that the pool's exit (_pool._print_unread) prints the lines of those it found done."""
 	done, _ = concurrent.futures.wait(futures, timeout=timeout, return_when=concurrent.futures.FIRST_COMPLETED)
 	_check_stop()
+	pool.unread.difference_update(done)
 	pool.watch(done)
 	return done
 
