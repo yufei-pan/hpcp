@@ -520,6 +520,8 @@ def test_an_own_read_only_file_goes_beside(tmp_path, flags):
 
 @posix_only
 @pytest.mark.skipif(not os.path.exists('/bin/sleep'), reason='/bin/sleep')
+@pytest.mark.xfail(sys.platform == 'darwin', strict=True, reason='macOS gives no ETXTBSY: a running program at a landing is '
+	'written in place (docs/limitations.md, "macOS: a running program at a landing is written in place", deferred)')
 def test_a_running_executable_at_the_landing_goes_beside(tmp_path):
 	# A running program does not open for writing (ETXTBSY): its new copy is renamed over it, and the running process keeps its
 	# old inode, untouched.

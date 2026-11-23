@@ -238,6 +238,22 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - **Revisit when:** 9.98.
 - **Noted:** 2026-11-23, found by the 9.97 builder while checking the `-co` beside carry on the Mac; a deferral, not asked.
 
+### macOS: a running program at a landing is written in place
+- **Kind:** deferred (9.98).
+- **What the operator sees:** on macOS, `hpcp a/ -d out/` where `out/exe` is a program that is running rewrites it in place (its inode kept, the new content written under the running process), where Linux refuses the open (ETXTBSY) and goes beside, so the running process keeps its old file. Ran on macOS 26.6.2 (2026-11-23, 9.97's test-suite work): rc 0, the inode the same, and the two test programs ran on to exit 0; macOS can kill a process whose code pages change under it. Plain `cp` on macOS writes it in place too.
+- **Why:** macOS has no ETXTBSY: a running program's file opens for writing, so hpcp's rule (a file with one name that opens for writing is written in place) takes it.
+- **Plan (9.98):** measure what going beside costs for every landing with an execute bit on macOS (the only sign hpcp has without asking each process); take it where the cost is small, else ask the user whether this is a known limitation, as plain `cp`.
+- **Revisit when:** 9.98.
+- **Noted:** 2026-11-23, found by the 9.97 macOS test-suite work (`test_a_running_executable_at_the_landing_goes_beside`, marked an expected failure on macOS, strict); a deferral, not asked.
+
+### `-co` with a new file beside refuses a file of the directory's group where the runner is not in it (macOS, BSD)
+- **Kind:** deferred (9.98).
+- **What the operator sees:** on macOS, a `-co` rewrite beside (`-wb`, or a file with other names) of a file whose group is its directory's but not one of the runner's (macOS's `/tmp` is `wheel`'s) keeps the old copy: exit 190, `its owner, group or an xattr cannot be given to a new file`, although a new file there takes the directory's group anyway (BSD rule). Seen on macOS 26.6.2, 2026-11-23, a test run under `/tmp` (`test_safe_content_only_keeps_a_plain_destination_s_mode[write-beside]`); under the home it passes.
+- **Why:** `_co_carry` asks only whether the runner can give the new file that group (its own group or one of its groups), not whether the new file would take it by itself.
+- **Plan (9.98):** accept the directory's own group where a new file takes it: on macOS and the BSDs always, on Linux in a set-group-ID directory; test it on the Mac under `/tmp`.
+- **Revisit when:** 9.98.
+- **Noted:** 2026-11-23, found by the 9.97 macOS test-suite work; a deferral, not asked.
+
 ### With -wb, a rewrite does not keep a per-file layout, chattr flags or the project id
 - **Kind:** known limitation.
 - **What the operator sees:** with `-wb` (and on the default's beside cases), the new file takes its directory's default Lustre or GPFS layout, not the one set on the old file (`lfs setstripe`), and no `chattr` flags or project id of the old file. A default in-place rewrite keeps all of them.
