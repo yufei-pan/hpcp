@@ -1345,9 +1345,10 @@ def test_the_space_warning_of_a_pooled_copy_comes_before_its_cp(tmp_path):
 		rc, output = _logged_run(tmp_path, [str(tmp_path / 'src') + '/', '-d', out + '/', '-j', '4'], pause=2)
 		live, _ = _warnings(output, out)
 		assert len(live) == 1 and b'so it may not fit' in live[0], output[-3000:]
-		started = [line for line in output.split(b'\n') if line.startswith(b'CP-STARTED') and b'src/big' in line]
-		assert len(started) == 1, output[-3000:]
-		assert output.index(live[0]) < output.index(started[0]), output[-3000:]
+		# big's cp starts twice (the sparse attempt, then ENOSPC's retry); the first start, wherever it lands: the wrapper's line
+		# often follows an open progress frame, so it does not always start a line.
+		started = re.search(rb'CP-STARTED [^\n]*/src/big ', output)
+		assert started is not None and output.index(live[0]) < started.start(), output[-3000:]
 
 
 @posix_only
