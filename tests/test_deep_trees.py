@@ -4,7 +4,29 @@ import sys
 
 import pytest
 
+from conftest import descriptor_count, levels_that_fit
+
 DEPTH = 1500
+
+
+@pytest.fixture
+def depth(tmp_path):
+	"""DEPTH levels of 'a', or as many as the platform's path limit takes (macOS: 1,024 bytes, where 1500 levels of 'a/' do
+	not fit), with room for the tree's root name (16 bytes) and the name at the bottom (hpcp's temporary name there is
+	.hpcp_tmp_ and 16 hex digits, 26: 32). Where that is fewer than Python's recursion limit
+	(1000 frames) allows, the limit is lowered for the test to the frames in use and half the depth, so a walk that recursed
+	once per level fails here too."""
+	levels = levels_that_fit(tmp_path, 2, DEPTH, 16 + 32)
+	limit = sys.getrecursionlimit()
+	if levels < limit:
+		frame, frames = sys._getframe(), 0
+		while frame is not None:
+			frame, frames = frame.f_back, frames + 1
+		sys.setrecursionlimit(frames + levels // 2)
+	try:
+		yield levels
+	finally:
+		sys.setrecursionlimit(limit)
 
 
 @pytest.fixture(autouse=True)
@@ -18,7 +40,7 @@ def _remove_deep_trees(tmp_path, hpcp_mod):
 			hpcp_mod._rmtree(path)
 
 
-def _deep(root, depth=DEPTH, name='a'):
+def _deep(root, depth, name='a'):
 	"""root/a/a/.../a (depth levels, made one at a time: os.makedirs recurses per missing level), a file at the bottom
 	and one halfway. Returns the bottom directory."""
 	os.makedirs(str(root), exist_ok=True)
@@ -34,7 +56,7 @@ def _deep(root, depth=DEPTH, name='a'):
 	return path
 
 
-def _relative_bottom(depth=DEPTH, name='a'):
+def _relative_bottom(depth, name='a'):
 	return os.path.join(*([name] * depth), 'bottom.txt')
 
 
@@ -43,29 +65,29 @@ def _failures(hpcp_mod):
 
 
 @pytest.mark.parametrize('parallel', [False, True])
-def test_a_deep_tree_is_listed(tmp_path, hpcp_mod, reset_hpcp_globals, parallel):
+def test_a_deep_tree_is_listed(tmp_path, hpcp_mod, reset_hpcp_globals, parallel, depth):
 	"""get_file_list_serial recursed once per directory level: about 1000 levels raised RecursionError (a copy too)."""
-	bottom = _deep(tmp_path / 'src')
+	bottom = _deep(tmp_path / 'src', depth)
 	files, links, size, folders = hpcp_mod.get_file_list(str(tmp_path / 'src'), max_workers=2, parallel_file_listing=parallel)
 	assert os.path.join(bottom, 'bottom.txt') in files
-	assert len(folders) == DEPTH + 1
+	assert len(folders) == depth + 1
 	assert _failures(hpcp_mod) == []
 
 
 @pytest.mark.parametrize('opts', [dict(single_thread=True), dict(single_thread=False, max_workers=2),
 	dict(single_thread=True, no_directory_sync=True)], ids=['serial', 'parallel', 'no-directory-sync'])
-def test_a_deep_tree_is_copied(tmp_path, hpcp_mod, reset_hpcp_globals, require_linux, opts):
-	_deep(tmp_path / 'src')
+def test_a_deep_tree_is_copied(tmp_path, hpcp_mod, reset_hpcp_globals, require_linux, opts, depth):
+	_deep(tmp_path / 'src', depth)
 	rc = hpcp_mod.hpcp([str(tmp_path / 'src') + os.sep], dest_paths=[str(tmp_path / 'dst') + os.sep], batch=True, **opts)
 	assert rc == 0
-	with open(os.path.join(str(tmp_path / 'dst'), _relative_bottom())) as f:
+	with open(os.path.join(str(tmp_path / 'dst'), _relative_bottom(depth))) as f:
 		assert f.read() == 'bottom'
 
 
-def test_a_deep_tree_is_cleaned_by_remove_extra(tmp_path, hpcp_mod, reset_hpcp_globals, require_linux, monkeypatch):
+def test_a_deep_tree_is_cleaned_by_remove_extra(tmp_path, hpcp_mod, reset_hpcp_globals, require_linux, monkeypatch, depth):
 	(tmp_path / 'src').mkdir()
 	(tmp_path / 'src' / 'keep.txt').write_text('keep')
-	bottom = _deep(tmp_path / 'dst')
+	bottom = _deep(tmp_path / 'dst', depth)
 	monkeypatch.setattr(sys.stdin, 'isatty', lambda: True)
 	monkeypatch.setattr('builtins.input', lambda: 'y')
 	rc = hpcp_mod.hpcp([str(tmp_path / 'src') + os.sep], dest_paths=[str(tmp_path / 'dst') + os.sep], remove_extra=True,
@@ -78,29 +100,29 @@ def test_a_deep_tree_is_cleaned_by_remove_extra(tmp_path, hpcp_mod, reset_hpcp_g
 
 @pytest.mark.parametrize('opts', [dict(single_thread=True), dict(single_thread=False, max_workers=2, parallel_file_listing=True)],
 	ids=['serial', 'parallel-listing'])
-def test_a_deep_tree_is_removed_and_moved(tmp_path, hpcp_mod, reset_hpcp_globals, require_linux, opts):
-	_deep(tmp_path / 'gone')
+def test_a_deep_tree_is_removed_and_moved(tmp_path, hpcp_mod, reset_hpcp_globals, require_linux, opts, depth):
+	_deep(tmp_path / 'gone', depth)
 	hpcp_mod.process_remove([str(tmp_path / 'gone')], remove_force=True, **opts)
 	assert not (tmp_path / 'gone').exists()
-	_deep(tmp_path / 'moved')
+	_deep(tmp_path / 'moved', depth)
 	rc = hpcp_mod.hpcp([str(tmp_path / 'moved') + os.sep], dest_paths=[str(tmp_path / 'to') + os.sep], remove_force=True,
 		batch=True, **{key: value for key, value in opts.items() if key != 'parallel_file_listing'})
 	assert rc == 0
 	assert not (tmp_path / 'moved').exists()
-	with open(os.path.join(str(tmp_path / 'to'), _relative_bottom())) as f:
+	with open(os.path.join(str(tmp_path / 'to'), _relative_bottom(depth))) as f:
 		assert f.read() == 'bottom'
 	assert _failures(hpcp_mod) == []
 
 
-def test_a_deep_tree_is_mapped_for_a_diff(tmp_path, hpcp_mod, reset_hpcp_globals):
-	_deep(tmp_path / 'new')
+def test_a_deep_tree_is_mapped_for_a_diff(tmp_path, hpcp_mod, reset_hpcp_globals, depth):
+	_deep(tmp_path / 'new', depth)
 	entries = hpcp_mod.build_entry_map(str(tmp_path / 'new'), max_workers=1)
-	assert '/'.join(['a'] * DEPTH) + '/bottom.txt' in entries
+	assert '/'.join(['a'] * depth) + '/bottom.txt' in entries
 
 
-def test_iterative_makedirs_makes_every_missing_level(tmp_path, hpcp_mod, monkeypatch):
+def test_iterative_makedirs_makes_every_missing_level(tmp_path, hpcp_mod, monkeypatch, depth):
 	"""os.makedirs recurses once per missing level; _makedirs does not, and keeps the contract hpcp's callers use."""
-	path = os.path.join(str(tmp_path), *(['a'] * DEPTH))
+	path = os.path.join(str(tmp_path), *(['a'] * depth))
 	hpcp_mod._makedirs(path)
 	assert os.path.isdir(path)
 	# An existing path is fine only with exist_ok, and only when it is a directory.
@@ -163,16 +185,17 @@ _LOW_LIMIT_REMOVALS = """if 1:
 """
 
 
-def test_a_deep_tree_is_removed_under_a_low_open_files_limit(tmp_path, hpcp_mod, require_linux):
+def test_a_deep_tree_is_removed_under_a_low_open_files_limit(tmp_path, hpcp_mod, require_linux, depth):
 	"""Review: the descriptor walks hold one descriptor per level, so a tree deeper than the soft open-files limit (a
 	common default is 1024; macOS's is 256) failed with EMFILE. hpcp raises its soft limit to the hard one at import."""
 	resource = pytest.importorskip('resource')
-	if resource.getrlimit(resource.RLIMIT_NOFILE)[1] < 4 * DEPTH:
-		pytest.skip('the hard open-files limit is below what a %d-level removal holds' % DEPTH)
+	if resource.getrlimit(resource.RLIMIT_NOFILE)[1] < 4 * depth:
+		pytest.skip('the hard open-files limit is below what a %d-level removal holds' % depth)
+	assert depth > 256  # deeper than the soft limit the run starts with
 	for name in ('rmtree', 'plain', 'move-src'):
-		_deep(tmp_path / name)
+		_deep(tmp_path / name, depth)
 	(tmp_path / 'src').mkdir()
-	_deep(tmp_path / 'dst')
+	_deep(tmp_path / 'dst', depth)
 	result = subprocess.run(['sh', '-c', 'ulimit -Sn 256 && exec "$0" -c "$1" "$2" "$3"', sys.executable, _LOW_LIMIT_REMOVALS,
 		os.path.dirname(os.path.abspath(hpcp_mod.__file__)), str(tmp_path)], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
 		universal_newlines=True)
@@ -287,12 +310,12 @@ def _count_opens(monkeypatch, hpcp_mod):
 	return opens
 
 
-def test_remove_extra_dirs_of_a_deep_tree_opens_each_level_about_once(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+def test_remove_extra_dirs_of_a_deep_tree_opens_each_level_about_once(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch, depth):
 	"""Re-review: the cursor opened every released directory again from the root: 540257 opens for a 1500-level -rme
 	directory pass (9.75: about 1500). Every level stays held now."""
 	(tmp_path / 'src').mkdir()
 	(tmp_path / 'dst').mkdir()
-	_deep(tmp_path / 'dst' / 'x', name='d')
+	_deep(tmp_path / 'dst' / 'x', depth, name='d')
 	for path in ('middle.txt', 'bottom.txt'):
 		pass
 	for dirpath, dirnames, filenames in hpcp_mod._walk(str(tmp_path / 'dst')):
@@ -301,7 +324,7 @@ def test_remove_extra_dirs_of_a_deep_tree_opens_each_level_about_once(tmp_path, 
 	opens = _count_opens(monkeypatch, hpcp_mod)
 	hpcp_mod.remove_extra_dirs([str(tmp_path / 'src') + os.sep], [str(tmp_path / 'dst') + os.sep])
 	assert os.listdir(str(tmp_path / 'dst')) == []
-	assert len(opens) <= 4 * DEPTH
+	assert len(opens) <= 4 * depth
 
 
 def test_a_move_of_a_deep_chain_with_a_file_per_level_opens_each_level_about_once(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
@@ -309,7 +332,8 @@ def test_a_move_of_a_deep_chain_with_a_file_per_level_opens_each_level_about_onc
 	path = str(root)
 	os.mkdir(path)
 	files = []
-	for level in range(800):
+	levels = levels_that_fit(tmp_path, len('/l000'), 800, len('/chain/z'))  # a removal: no temporary name
+	for level in range(levels):
 		path = os.path.join(path, 'l%03d' % level)
 		os.mkdir(path)
 		# 'z' sorts after the next level's name: the deeper paths come first, so the cursor climbs one level per file.
@@ -318,7 +342,7 @@ def test_a_move_of_a_deep_chain_with_a_file_per_level_opens_each_level_about_onc
 	opens = _count_opens(monkeypatch, hpcp_mod)
 	hpcp_mod.remove_moved_sources([str(root)], files, {}, single_thread=True, remove_force=True, root_ids=hpcp_mod._source_identities([str(root)]))
 	assert not root.exists()
-	assert len(opens) <= 4 * 800
+	assert len(opens) <= 4 * levels
 
 
 def test_a_held_directory_mounted_on_meanwhile_is_not_entered(tmp_path, hpcp_mod, reset_hpcp_globals):
@@ -382,7 +406,7 @@ def test_rmtree_resolves_the_path_as_the_kernel_does(tmp_path, hpcp_mod, monkeyp
 
 def test_a_failing_fstat_on_the_way_back_is_recorded_not_raised(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
 	root = tmp_path / 'tree'
-	_deep(root, depth=60)
+	_deep(root, 60)
 	real_fstat = os.fstat
 	calls = []
 	def fstat(fd):
@@ -390,11 +414,11 @@ def test_a_failing_fstat_on_the_way_back_is_recorded_not_raised(tmp_path, hpcp_m
 		if len(calls) == 40:
 			raise OSError(5, 'Input/output error')
 		return real_fstat(fd)
-	before = len(os.listdir('/proc/self/fd'))
+	before = descriptor_count()
 	monkeypatch.setattr(hpcp_mod.os, 'fstat', fstat)
 	removed, left, errors = hpcp_mod._remove_tree_fd(str(root), hpcp_mod._path_identity(str(root)), remove_files=True)
 	monkeypatch.setattr(hpcp_mod.os, 'fstat', real_fstat)
-	assert len(os.listdir('/proc/self/fd')) == before
+	assert descriptor_count() == before
 	assert isinstance(errors, list)
 
 

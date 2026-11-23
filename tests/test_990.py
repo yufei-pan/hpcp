@@ -258,7 +258,8 @@ def test_990_a_pin_refused_where_another_destination_takes_the_file_is_said_once
 	assert sorted(os.listdir(A)) == ['f1', 'f2'] and os.listdir(victim) == [] and os.listdir(B + '.away') == []
 	assert not hpcp.ERRORS, hpcp.ERRORS
 	notes = [line for line in out.getvalue().splitlines() if 'now leads to another directory' in line]
-	assert len(notes) == 1 and notes[0].startswith('Note: ') and 'the other destinations take its files' in notes[0], out.getvalue()
+	# (9.97: without "and the other destinations take its files", false where they cannot either.)
+	assert len(notes) == 1 and notes[0].startswith('Note: ') and 'nothing is written below it. Run hpcp again' in notes[0], out.getvalue()
 	assert 'not copying' not in notes[0], notes[0]  # the refusal's own text is for the 213 line
 
 

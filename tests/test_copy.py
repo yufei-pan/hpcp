@@ -174,8 +174,9 @@ def test_copy_file_reports_size_when_sparse_cp_fails(tmp_tree, hpcp_mod, reset_h
 	assert open(dst, 'rb').read() == open(src, 'rb').read()
 	assert size == hpcp_mod.get_file_size(dst) > 0
 	assert any('--sparse=always' in c for c in calls)
-	# a first copy goes through the held landing (/proc/self/fd/N) where cp can write there, else by name
-	assert calls[-1][-2] == src and calls[-1][-1] in (dst, '/proc/self/fd/%s' % calls[-1][-1].rpartition('/')[2])
+	# a first copy goes through the held landing (/proc/self/fd/N; macOS /dev/fd/N) where cp can write there, else by name
+	held = '/dev/fd/%s' if sys.platform == 'darwin' else '/proc/self/fd/%s'
+	assert calls[-1][-2] == src and calls[-1][-1] in (dst, held % calls[-1][-1].rpartition('/')[2])
 	assert '--sparse=always' not in calls[-1]
 
 

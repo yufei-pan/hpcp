@@ -453,7 +453,7 @@ def test_996_a_tasks_error_lines_are_printed_by_the_parent_once(capsys, monkeypa
 	monkeypatch.setattr(hpcp, '_worker_initialized', True)
 	settings = {name: getattr(hpcp, name) for name in hpcp._TASK_SETTINGS}
 	result = hpcp._run_task(settings, hpcp.eprint, 'Copy failed: a task\'s line')
-	assert capsys.readouterr().err == '' and result[3] == ['Copy failed: a task\'s line\n']
+	assert capsys.readouterr().err == '' and result[3] == [('err', 'Copy failed: a task\'s line\n')]
 	def future():
 		done = concurrent.futures.Future()
 		done.set_result(result)

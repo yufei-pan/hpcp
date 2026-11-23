@@ -119,7 +119,10 @@ def test_995_plain_rm_shows_a_line_while_it_removes(tmp_path, capsys, paced, mon
 
 def test_995_the_line_is_the_listings_with_removed_and_folders(tmp_path, capsys, monkeypatch, reset_hpcp_globals):
 	'''The directory's last 50 characters, then "iteration:N | Removed: N Folders: M" (the listing's frame has Files: Links:
-	Folders: Size: where this has Removed: Folders:). With the interval 0 every entry shows a frame, and the counts grow to the last.'''
+	Folders: Size: where this has Removed: Folders:). With the interval 0 every entry shows a frame, and the counts grow to the last.
+	(No COLUMNS: pytest-xdist sets 80 in its workers, and from the embedded multiCMD 1.68 a frame fits it, its prefix cut from
+	the start; a log's frame is 240 columns.)'''
+	monkeypatch.delenv('COLUMNS', raising=False)
 	monkeypatch.setattr(hpcp, '_LINE_INTERVAL', 0)
 	root = tmp_path / ('long-directory-name-' * 4) / 'src'
 	_tree(root, directories=3, per_directory=50)
@@ -458,7 +461,9 @@ def test_995_the_errors_after_the_last_frame_leave_no_blank_lines(locked_tree):
 
 def test_995_files_named_as_arguments_show_a_line_while_they_are_removed(tmp_path, capsys, paced, monkeypatch):
 	'''hpcp -rm dir/* names every file: no walk, so only the loop over the arguments can show the line (9.95's first version
-	drew none: 6,000 files took seconds in silence). Each frame carries the count so far and the directory of the last file.'''
+	drew none: 6,000 files took seconds in silence). Each frame carries the count so far and the directory of the last file.
+	(No COLUMNS, as above.)'''
+	monkeypatch.delenv('COLUMNS', raising=False)
 	times = []
 	real_show = hpcp._RemoveProgress.show
 	def show(self, *args, **kwargs):
