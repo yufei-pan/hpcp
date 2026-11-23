@@ -28,7 +28,7 @@ Nothing needs doing to upgrade, unless a script counts the `Note:` lines of a re
 - **Stops:** Ctrl-C while `-dd` copies a partition's files exits 130 (9.96: 181, `Partition copy error`), and a stop just before a run's cleanup no longer skips it (an image's mounts and loop devices could stay).
 - **macOS:** a destination on an SMB or NFS mount is checked by directory, as on Linux (2.3 to 3 times faster in two shapes measured, never slower by more than 0.17 s); a rerun's xattr and ACL reads cost about a third less.
 - **Pools:** on Python 3.14 with no writable temporary directory a pooled copy or `-rm -pfl` starts its workers by fork and runs (9.96: exit 70, nothing done); on Python 3.6 where workers spawn (Windows) `-F` paces `-pfl` jobs (9.96 ignored it).
-- `hpcp src -d blob/` with `blob` a file no longer prints the `maybe a mounted dir` hint; the error after it names the problem. The embedded multiCMD is 1.69 (1.67 before).
+- `hpcp src -d blob/` with `blob` a file no longer prints the `maybe a mounted dir` hint; the error after it names the problem. The embedded multiCMD is 1.70 (1.67 before).
 - **Still open** (see [docs/limitations.md](docs/limitations.md)): the `-siff` apply by path, a move's directory fsyncs by path, the rest of Linux without /proc and the read route wait on a decision; planned for 9.98: on macOS a `-co` rewrite in place gives the old file the source's xattrs.
 
 ## Upgrading to 9.96 from 9.95
@@ -354,7 +354,7 @@ On EL7 and EL8, run `python3 -m pip install --user -U pip` once before a `--user
 
 **Note**:  
 - On Python 3.7 and later `pip` also installs the hashing library [xxhash](https://github.com/Cyan4973/xxHash), which can reduce CPU usage for partial hashing and increase performance when using `-fh --full_hash`. On Python 3.6 (EL7 and EL8) it does not, because building it there needs a compiler: hpcp uses blake2b instead. To add it, upgrade pip first (`pip3 install -U pip`, then `pip3 install xxhash`): on stock pip 9.0.3 it fails there.  
-- hpcp carries [multiCMD](https://github.com/yufei-pan/multiCMD), used to issue commands and provide helper functions: its built-in copy is the full multiCMD (1.69 in 9.97). An installed multiCMD is used when it is at least as new as that copy, and the built-in one otherwise (older, missing, or one that does not import). Since 9.89 `pip` installs none for hpcp.
+- hpcp carries [multiCMD](https://github.com/yufei-pan/multiCMD), used to issue commands and provide helper functions: its built-in copy is the full multiCMD (1.70 in 9.97). An installed multiCMD is used when it is at least as new as that copy, and the built-in one otherwise (older, missing, or one that does not import). Since 9.89 `pip` installs none for hpcp.
 
 ## Disk Imaging Feature Note
 
