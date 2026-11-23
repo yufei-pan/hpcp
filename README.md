@@ -29,7 +29,7 @@ Nothing needs doing to upgrade, unless a script counts the `Note:` lines of a re
 - **macOS:** a destination on an SMB or NFS mount is checked by directory, as on Linux (2.3 to 3 times faster in two shapes measured, never slower by more than 0.17 s); a rerun's xattr and ACL reads cost about a third less.
 - **Pools:** on Python 3.14 with no writable temporary directory a pooled copy or `-rm -pfl` starts its workers by fork and runs (9.96: exit 70, nothing done); on Python 3.6 where workers spawn (Windows) `-F` paces `-pfl` jobs (9.96 ignored it).
 - `hpcp src -d blob/` with `blob` a file no longer prints the `maybe a mounted dir` hint; the error after it names the problem. The embedded multiCMD is 1.70 (1.67 before).
-- **Still open** (see [docs/limitations.md](docs/limitations.md)): the `-siff` apply by path, a move's directory fsyncs by path, the rest of Linux without /proc and the read route wait on a decision; planned for 9.98: on macOS a `-co` rewrite in place gives the old file the source's xattrs.
+- **Still open** (see [docs/limitations.md](docs/limitations.md)): the `-siff` apply by path, a move's directory fsyncs by path, the rest of Linux without /proc and the read route wait on a decision; planned for 9.98, on macOS: a `-co` rewrite in place gives the old file the source's xattrs, a running program at a landing is written in place, and a `-co` rewrite beside refuses a file of its directory's group where the runner is not in it.
 
 ## Upgrading to 9.96 from 9.95
 
