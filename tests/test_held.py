@@ -3,6 +3,7 @@ a first copy made by hpcp and written so (L1), and the beside route's new file m
 the embedded copy (E) is in test_embedded_multicmd.py.'''
 import contextlib
 import errno
+import gc
 import io
 import itertools
 import json
@@ -29,7 +30,7 @@ root_only = pytest.mark.skipif(not hasattr(os, 'geteuid') or os.geteuid() != 0, 
 not_root = pytest.mark.skipif(not hasattr(os, 'geteuid') or os.geteuid() == 0, reason='root writes every directory')
 
 _RUNS = itertools.count()
-_HELD_PREFIX = '/proc/self/fd/'
+_HELD_PREFIX = '/dev/fd/' if sys.platform == 'darwin' else '/proc/self/fd/'
 
 
 def write(path, text, mode=None):
@@ -69,12 +70,16 @@ def _copy_file(monkeypatch, src, dest):
 
 
 def _named(target):
-	'''What cp's destination argument leads to: the held file's name for /proc/self/fd/N, the landing below the held
-	directory for /proc/self/fd/D/NAME (9.88), else itself. Asked while cp runs.'''
+	'''What cp's destination argument leads to: the held file's name for /proc/self/fd/N (macOS: /dev/fd/N, asked by
+	F_GETPATH), the landing below the held directory for /proc/self/fd/D/NAME (9.88), else itself. Asked while cp runs.'''
 	if not target.startswith(_HELD_PREFIX):
 		return target
 	number, _, name = target[len(_HELD_PREFIX):].partition('/')
-	held = os.readlink(_HELD_PREFIX + number)
+	if sys.platform == 'darwin':
+		import fcntl
+		held = os.fsdecode(fcntl.fcntl(int(number), fcntl.F_GETPATH, bytes(1024)).split(b'\0')[0])
+	else:
+		held = os.readlink(_HELD_PREFIX + number)
 	return os.path.join(held, name) if name else held
 
 
@@ -381,6 +386,8 @@ def _default_acl(directory):
 	setfacl -d writes it; False where the filesystem takes none.'''
 	entries = [(0x01, 7, 0xffffffff), (0x02, 7, 1000), (0x04, 5, 0xffffffff), (0x10, 7, 0xffffffff), (0x20, 5, 0xffffffff)]
 	value = struct.pack('<I', 2) + b''.join(struct.pack('<HHI', *entry) for entry in entries)
+	if not hasattr(os, 'setxattr'):  # macOS: no POSIX ACLs, and no Linux xattr calls
+		return False
 	try:
 		os.setxattr(directory, 'system.posix_acl_default', value)
 	except OSError as e:
@@ -1297,6 +1304,10 @@ def test_w1_a_named_destination_swapped_mid_run_is_written_no_more(tmp_path, wor
 
 
 def _open_descriptors():
+	'''How many descriptors this process holds, after a garbage collection: each run's multiprocessing lock is a POSIX
+	semaphore, which holds a descriptor on macOS (PSXSEM; none on Linux) until the collector frees the run's objects, at a
+	moment of its own (f2[read] counted one more after its run there, test_989 one fewer during its copy).'''
+	gc.collect()
 	return len(os.listdir('/proc/self/fd' if os.path.isdir('/proc/self/fd') else '/dev/fd'))
 
 

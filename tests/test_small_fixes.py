@@ -5,6 +5,8 @@ import sys
 
 import pytest
 
+from conftest import takes_name
+
 HPCP = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'hpcp.py')
 posix_only = pytest.mark.skipif(os.name != 'posix', reason='POSIX paths and links')
 
@@ -106,6 +108,8 @@ def test_a_shell_word_reads_back_as_the_name(monkeypatch, name, encoding):
 def test_the_replaced_link_note_s_command_writes_through_the_link(tmp_path, locale):
 	# the Note's command, pasted into bash, copies through the link it names
 	weird = b"s p'$\xff"
+	if not takes_name(tmp_path, weird):  # APFS takes only UTF-8 names: there the bytes past ASCII are an \u00e9's
+		weird = b"s p'$\xc3\xa9"
 	root = os.fsencode(str(tmp_path))
 	src = os.path.join(root, weird)
 	os.makedirs(os.path.join(src, b'd'))

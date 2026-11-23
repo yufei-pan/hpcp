@@ -150,6 +150,10 @@ def test_content_only_setgid_inheritance():
 		os.chmod(parent, mode)
 		if not (os.stat(parent).st_mode & stat.S_ISGID):
 			pytest.skip('filesystem does not honor setgid on directories')
+		# Whether a directory made here inherits it: Linux's mkdir passes it on; BSD's and macOS's do not (the group alone).
+		os.mkdir(os.path.join(parent, 'probe'))
+		inherits = bool(os.stat(os.path.join(parent, 'probe')).st_mode & stat.S_ISGID)
+		os.rmdir(os.path.join(parent, 'probe'))
 
 		src_dir = os.path.join(tmp, 'src', 'child')
 		dst_dir = os.path.join(parent, 'child')
@@ -163,7 +167,8 @@ def test_content_only_setgid_inheritance():
 		finally:
 			hpcp.CONTENT_ONLY = False
 
-		assert os.stat(dst_dir).st_mode & stat.S_ISGID
+		# -co leaves the bit as the directory was made: inherited where mkdir passes it on, and not added where it does not.
+		assert bool(os.stat(dst_dir).st_mode & stat.S_ISGID) == inherits
 
 
 def test_default_dir_sync_still_applies_metadata():

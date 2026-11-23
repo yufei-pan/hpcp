@@ -12,6 +12,8 @@ import tempfile
 import time
 import pytest
 
+from conftest import folds_case, skip_unless_apart
+
 
 T0 = 1700000000  # whole even second (FAT keeps 2 s mtimes)
 
@@ -1673,8 +1675,9 @@ def test_case_insensitive_planning_writes_where_a_differently_spelled_name_is_de
 	_write(missing / 'EFI' / 'BOOT' / 'x.efi', 'old')
 	aliased = tmp_path / 'aliased'
 	_write(aliased / 'EFI' / 'BOOT' / 'x.efi', 'old')
-	os.makedirs(str(aliased / 'EFI' / 'Boot'))
-	os.link(str(aliased / 'EFI' / 'BOOT' / 'x.efi'), str(aliased / 'EFI' / 'Boot' / 'x.efi'))
+	if not folds_case(aliased):  # a case-insensitive filesystem (macOS's APFS) finds EFI/Boot/x.efi itself
+		os.makedirs(str(aliased / 'EFI' / 'Boot'))
+		os.link(str(aliased / 'EFI' / 'BOOT' / 'x.efi'), str(aliased / 'EFI' / 'Boot' / 'x.efi'))
 	for target in (missing, aliased):
 		rows = _spelling_rows(hpcp_mod, target, vol)
 		assert _spelling_actions(hpcp_mod, rows, target, True) == {'EFI/BOOT/x.efi': ('apply', ''), 'EFI/Boot/x.efi': ('apply', '')}
@@ -1686,6 +1689,7 @@ def test_fold_equal_names_the_filesystem_keeps_apart_are_not_treated_as_removed(
 	"""The fold may equate names the kernel keeps distinct (iocharset=utf8, exFAT upcase tables). A D row on one
 	must not make a locally modified, distinct entry on the other count as absent."""
 	hpcp_mod.HASH_SIZE = 65536
+	skip_unless_apart(tmp_path, ('BOOT', 'Boot'))
 	target, vol = tmp_path / 'target', tmp_path / 'vol'
 	_write(target / 'EFI' / 'BOOT' / 'x.efi', 'old')
 	_write(target / 'EFI' / 'Boot' / 'x.efi', 'locally modified')
@@ -1696,6 +1700,7 @@ def test_fold_equal_names_the_filesystem_keeps_apart_are_not_treated_as_removed(
 
 
 def test_spelled_on_disk_prefers_the_exact_component(tmp_path, hpcp_mod):
+	skip_unless_apart(tmp_path, ('BOOT', 'Boot'))
 	for name in ('BOOT', 'Boot', 'boot'):
 		_write(tmp_path / 'EFI' / name / 'x.efi', name)
 	for _ in range(5):
