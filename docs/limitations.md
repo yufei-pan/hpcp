@@ -223,38 +223,6 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - **Revisit when:** someone hits it.
 - **Approved:** 2026-11-14, the user chose "Known limitation (Recommended)". Facts corrected 2026-11-15 by the 9.94 final review: macOS takes the held route (ran on macOS 26.6.2), "rerun without -wb" helps only under `-wb` (ran), and the link bug was 9.93's.
 
-### A -co rewrite beside of a source without owner write keeps the old copy when the old file holds a user.* xattr
-- **Kind:** deferred (9.97).
-- **What the operator sees:** a non-root `-co` rewrite that goes beside (`-wb`, other names, not writable) of a source of mode 0444, onto a file that holds a `user.*` xattr: exit 190, `... an xattr cannot be given to the new copy (Permission denied)`, the old copy kept. With and without /proc, and in 9.93 (ran 2026-11-15).
-- **Why:** the new file has the source's mode when the carry sets the xattrs, and a `user.*` xattr needs write permission, through a descriptor too.
-- **Plan (9.97):** owner write on the new file while the carry sets the xattrs; the carry sets the old file's mode last.
-- **Revisit when:** 9.97 (moved from 9.96 on 2026-11-17: 9.96 took the remove-progress follow-ups).
-- **Noted:** 2026-11-15, the 9.94 final review (second-opinion lead lim1 1); a deferral, not asked.
-
-### `hpcp src -d blob/` with `blob` a file still prints the "may be a mounted dir" hint
-- **Kind:** deferred (9.97).
-- **What the operator sees:** with one source and a destination `blob/` that is a file, `_make_dest_directory` prints `Destination path ... maybe a mounted dir, known issue with os.path.exists` and `Continuing without creating dest folder...` (9.93 the same); what comes after names the problem. A second opinion of 2026-11-15 could not make 9.94 print it (five cases): check that it still happens before building. 9.94 took the hint out for a destination given more than one source (README).
-- **Why:** 9.94 fixed one of the two sites with the lstat rule (a name that is no directory is left to the copy, which names it); the other site, `_make_dest_directory`, was not reached.
-- **Plan (9.97):** the same lstat rule there.
-- **Revisit when:** 9.97 (moved from 9.96 on 2026-11-17: 9.96 took the remove-progress follow-ups).
-- **Noted:** 2026-11-15, the 9.94 final review (second-opinion lead code3 1); a deferral, not asked.
-
-### A stop between hpcp()'s last step and its cleanup skips the cleanup
-- **Kind:** deferred (9.97).
-- **What the operator sees:** Ctrl-C in the microseconds between the `finally:` of `hpcp()` and the start of `clean_up()` ends the run without the cleanup: mounts or loop devices of an image run can stay. 9.93 the same.
-- **Why:** `_CLEANING`, which makes a stop there only a record, is set when `clean_up()` starts.
-- **Plan (9.97):** set it first thing in that `finally:`, and have `clean_up()` hand it back as it found it.
-- **Revisit when:** 9.97 (moved from 9.96 on 2026-11-17: 9.96 took the remove-progress follow-ups).
-- **Noted:** 2026-11-15, the 9.94 final review (F7); a deferral, not asked.
-
-### macOS: a -co rewrite beside carries no xattrs or ACL (to check)
-- **Kind:** deferred (9.97).
-- **What the operator sees:** not run: on macOS, where Python has no `os.listxattr`, `_co_carry` returns nothing, so a `-co` rewrite that goes beside would give the new file none of the old file's xattrs or ACL.
-- **Why:** from reading only (the 9.94 final review's second-opinion lead lim1 6).
-- **Plan (9.97):** run it on the Mac first; if it is so, carry them through the descriptor as the rerun's settle does there.
-- **Revisit when:** 9.97 (moved from 9.96 on 2026-11-17: 9.96 took the remove-progress follow-ups).
-- **Noted:** 2026-11-15, the 9.94 final review (F7); a deferral, not asked.
-
 ### Tests: 9.94's mutants the suite does not catch
 - **Kind:** deferred (9.97).
 - **What the operator sees:** nothing; a developer: removing the held route's identity check before the rename, the settle's identity check at its open, the settle's `/proc`-route chmod by name, the FAT attribute SET value, the held carry's chmod or its `user.*` set, each passes test_994 (the 9.94 final review's mutants M1, M5, M13, M6, M10 and M11; M10 is caught by test_993). The same code is in 9.93, so none is 9.94's regression. Also loose exit-code asserts in two new tests and the case-only rename test's macOS branch; and, from the fix round's second opinions: the FIFO-reader guard probes three calls rather than every open (its non-empty check is met by the test's own `lstat`), "says so, once" is tested with one stop, the `-dd` test's fake partitions are not stubbed for `is_device`, the `-nds` no-promise test does not assert that nothing is copied, and three /proc cases that pass on 9.93 are not labelled as guards.
@@ -263,46 +231,6 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - **Revisit when:** 9.97 (moved from 9.96 on 2026-11-17: 9.96 took the remove-progress follow-ups).
 - **Noted:** 2026-11-15, the 9.94 final review (F5, last paragraph); a deferral, not asked.
 
-### A refusal's note is printed once for each worker, not once a run
-- **Kind:** deferred (9.97).
-- **What the operator sees:** under `-nds`, `hpcp src/ -d A/ -d B/ -ncd -nds` with `B/sub` a link prints its `Note: B/sub is a link ...` once in each worker process that copies a file below it (26 identical lines at `-j 32`; 94 for 20 such directories, ran 2026-11-15; 8 to 10 for 40 files in one directory when run again on 2026-11-17, the number following how many workers get a file), and in a list run (`-sfl`, 24 files) the same, once for each worker process (1, 2 and 7 lines at `-j 1`, `-j 2` and `-j 24`, ran 2026-11-17). A destination that now leads elsewhere than the run pinned (`... now leads to another directory ...`) is noted the same way, since 9.89. The exit code and the files copied are right.
-- **Why:** the note is printed where the file is copied, and each worker remembers only what it printed itself.
-- **Plan (9.97):** each task hands its notes back with its errors (since 9.96 a task's error lines come back through `_settled` already: the parent only has to print each note once a run). The pin note then drops "and the other destinations take its files", which is false where they fail too.
-- **Revisit when:** 9.97.
-- **Noted:** 2026-11-15, the 9.94 fix round's re-review; a deferral, not asked.
-
-### A stop in a `-dd` partition's copy exits 181, not 130
-- **Kind:** deferred (9.97).
-- **What the operator sees:** Ctrl-C while `-dd` copies a partition's files ends the run with `Partition copy error: Copying partition p1 failed with return code 130.` and exit 181, where a stop elsewhere exits 130; the next partition is not copied. 9.93 the same (ran 2026-11-15).
-- **Why:** the nested run's own `Keyboard Interrupt` line goes into its error list, so it returns 130 and the outer run takes that as a failed partition.
-- **Plan (9.97):** the outer run checks for a stop before it reads the nested return code, as it does after the nested cleanup since 9.94.
-- **Revisit when:** 9.97 (moved from 9.96 on 2026-11-17: 9.96 took the remove-progress follow-ups).
-- **Noted:** 2026-11-15, the 9.94 fix round's second opinion (code lead 3); a deferral, not asked.
-
-### Some lines a pool worker writes itself land on the parent's open progress line
-- **Kind:** deferred (9.97).
-- **What the operator sees:** the lines a pool worker writes straight to stdout or stderr (a discarded temporary file's note, `_copy_file`'s `Note:` and `Error copying` lines) know nothing of the parent's progress line: in a combined log (`> log 2>&1`) one can land on a frame's line (an `Error copying` line was seen on a frame in 9.95, not in three runs of 9.96; 9.96 by reading the code, 2026-11-17). The link-tracking bar is the parent's own and sets no mark, so its errors (`Failed to create symbolic link`) land on its frame the same way (`...|10.0% | 971.23 F/sFailed to create symbolic link`, ran 2026-11-17 on 9.96 and 9.95). Each is one line for a rare event.
-- **Why:** only the parent knows whether its line is open (one mark, `_BAR_DRAWN`); a pool task's error lines come back to it with the task's result (`_settled`), these writes never did. The link-tracking bar runs in the parent, in no task, but its frames do not set the mark as the copy bar's do, so its errors start no new line.
-- **Plan (9.97):** each worker's line goes back with the task's result as the error lines do (`_TASK_LINES`), and the parent prints it with the same line start. The link-tracking bar sets the mark as the copy bar does, and its errors go through `_error_line`.
-- **Revisit when:** 9.97.
-- **Noted:** 2026-11-17, 9.96's final review (second opinions code1 and docs2); a deferral, not asked.
-
-### The space warning starts with a line end where no line is open
-- **Kind:** deferred (9.97).
-- **What the operator sees:** `hpcp big -d /small/out/ > log 2>&1` where the destination is too small (one 3 MiB file to a 1 MiB tmpfs, ran 2026-11-17): an empty line between `Processing 5 files with 32 workers` and `Space warning: ...`, with no frame open. 9.95 the same. The warning itself, the exit status and the files copied are right.
-- **Why:** `_space_warning` runs in a worker, which cannot know whether the parent's line is open, and takes the line start for an open one (`_line_start`) whatever the mark says.
-- **Plan (9.97):** the same as the entry above: the warning goes back with the task's result and the parent prints it.
-- **Revisit when:** 9.97.
-- **Noted:** 2026-11-17, 9.96's final review (second opinions code1 and docs2); a deferral, not asked.
-
-### `-F` and the live counts do not reach `-pfl` jobs on Python 3.6 where the pool spawns its workers (Windows)
-- **Kind:** deferred (9.97).
-- **What the operator sees:** `hpcp -rm -rf -pfl -F 2000` on 46,000 files in 21 directories (one of 40,000 files), Python 3.6 with the spawn start method (Windows): the jobs ignore the pace (1.7 s on 9.95, 2.7 s on 9.96 where about 23 s are expected), and while the wide directory's job runs the line stays at the finished jobs' count (the listing's too: a wide folder under `-pfl` is counted when its job returns). The files are removed all the same. Not seen with fork (Python 3.6 to 3.14) or with spawn on 3.9 and 3.14 (checked 2026-11-17).
-- **Why:** Python 3.6's pool has no initializer (3.7+), so a spawned worker never gets the rate share or the live counts, which reach a forked worker by inheritance.
-- **Plan (9.97):** where the pool has no initializer, the share must reach a spawned worker another way. Shared values can not be passed as a task's arguments (Python 3.14 raises `Synchronized objects should only be shared between processes through inheritance`; Python 3.6 never completes), so the carrier is to design first: a file-backed mapping passed by name, or a Manager proxy (neither tried).
-- **Revisit when:** 9.97. Python 3.6 is end-of-life support: the fix goes in only if it adds no part to the 3.11+ path.
-- **Noted:** 2026-11-17, 9.96's final review (second opinion code4); a deferral, not asked.
-
 ### A pool job's error lines show when its job returns
 - **Kind:** known limitation.
 - **What the operator sees:** in a pooled run (a copy's, a listing's or a removal's jobs), a job hands its error lines back with its result and hpcp prints them then: seconds after the failure among small files, later where a large file follows the failed one in the same job. A job that never returns (a stop with Ctrl-C, a worker killed or out of memory, one hung on a dead mount) shows none of the lines it held. 9.95 printed each line as it happened. The progress line itself stays live, the error list and the exit status are as in 9.95, and a rerun meets the same files again; with `-s` every line prints at once.
@@ -310,53 +238,13 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - **Revisit when:** an operator misses a line that a stopped or killed run held, or the jobs get such a channel for another reason.
 - **Approved:** 2026-11-17, the user's pick "Known limitation (Recommended)" (relayed by chief). The user asked, 2026-11-16, "It NEEDS to print interm outputs when it is removing in command line": the progress line does; only the error lines wait for their job.
 
-### A pool task keeps all its error lines until it returns
-- **Kind:** deferred (9.97).
-- **What the operator sees:** a job that meets a great many failures (one copy job over a directory of unreadable files) holds every error line in `_TASK_LINES` (and each one with a `:` in its error list too) until it returns, and the parent prints them then: memory the size of the lines (the lines' timing is the known limitation above). 9.95 printed each as it happened (and kept its error list in the worker alike).
-- **Why:** 9.96's task hands its error lines back with its result so that only the parent writes to the line; no number bounds them.
-- **Plan (9.97):** measure how many lines the worst jobs meet (a tree of unreadable files), keep that many in a task with a final `... and N more` line (the error list keeps counting), and write the number's reason beside it.
-- **Revisit when:** 9.97.
-- **Noted:** 2026-11-17, 9.96's final review (second opinion code1); a deferral, not asked.
-
-### macOS: the progress frames in a log each take a line of their own
-- **Kind:** deferred (9.97).
-- **What the operator sees:** on macOS, in a log or a pipe, multiCMD writes the progress frames each on its own line, and the first after an empty line (one empty line before the first frame in the 9.96 Mac run; 9.95 the same). Linux writes them with a carriage return.
-- **Why:** not traced yet: the frames are drawn by multiCMD's `print_progress_bar` (embedded, 1.67).
-- **Plan (9.97):** find where multiCMD's frame form on macOS differs from Linux's, fix it in multiCMD and embed it.
-- **Revisit when:** 9.97.
-- **Noted:** 2026-11-17, found while checking 9.96 on the Mac; a deferral, not asked.
-
-### Under `-pfl`, a running job's symlinks show as files on the listing's line
-- **Kind:** deferred (9.97).
-- **What the operator sees:** while a `-pfl` job lists a folder of many symlinks, the listing's line counts them under `Files` (`src/wide | iteration:1 | Files: 297.00 K`), and they move to `Links` when the job returns (ran 2026-11-17, 600,000 symlinks in one folder). 9.95's job drew its own frames with `Links:`. The counts and the listing are right.
-- **Why:** a job's live cells carry two counts, the entries (files and links) and the subfolders.
-- **Plan (9.97):** three cells a worker (files, links, folders), each shown under its own label.
-- **Revisit when:** 9.97.
-- **Noted:** 2026-11-17, 9.96's fix round re-review; a deferral, not asked.
-
-### On Python 3.14 with no writable temporary directory, a pooled copy or `-rm -pfl` exits 70
-- **Kind:** deferred (9.97).
-- **What the operator sees:** `hpcp -j 2 src -d dst/` or `hpcp -rm -rf -pfl -j 2 src` on Python 3.14 where no directory takes a file (`/tmp`, `/var/tmp`, `/usr/tmp` and the working directory read-only or full; ran 2026-11-17, in a read-only container with the data on a tmpfs): exit 70 with a traceback at the pool's first worker (`No usable temporary directory found`), nothing copied or removed. 9.95 the same; Python 3.6 and 3.11, which fork their workers, work.
-- **Why:** 3.14's default start method is the fork server, which makes its socket in the temporary directory when the pool starts its first worker.
-- **Plan (9.97):** where no temporary directory takes the fork server's socket, start the pool's workers by fork, as 3.6 to 3.13 do (the case `-rm` is for, a full disk), and test it with the read-only layout above.
-- **Revisit when:** 9.97.
-- **Noted:** 2026-11-17, 9.96's fix round re-review (found while checking the live cells' guard); a deferral, not asked.
-
-### Python 3.6 with forkserver or spawn: the live counts' array is made and no worker gets it
-- **Kind:** deferred (9.97).
-- **What the operator sees:** nothing wrong on screen: a `-pfl` listing of the same tree gave the right sets and no frame showed a wrong count (ran 2026-11-17, Python 3.6 with spawn); the line shows what the jobs return. The cost is a temporary-file arena made for nothing. From reading only, on a full temporary filesystem its first touch can raise SIGBUS, which the guard around it does not catch (not run).
-- **Why:** `_new_live` returns a `multiprocessing.Array` for every start method but fork, and Python 3.6's pool has no initializer to hand it to a worker; `_new_slots` already returns nothing there.
-- **Plan (9.97):** `_new_live` returns None there too. Python 3.6 is end-of-life support: this takes a part out of the 3.6 path.
-- **Revisit when:** 9.97.
-- **Noted:** 2026-11-17, 9.96's fix round, second opinion (code1 lead 3); a deferral, not asked.
-
-### A `-pfl` listing job that raises keeps its partial counts in the listing's line
-- **Kind:** deferred (9.97).
-- **What the operator sees:** when a listing job raises an error its per-entry handlers do not catch (a `MemoryError`, say; no ordinary path to one was found), `Files` and `Folders` on the line stay overstated by what the job had listed, for the rest of that listing. The returned sets are as before: the folder's entries are left out. Not run.
-- **Why:** the job's published counts stay in its worker's cells; its last publish does not run when it raises, and the parent takes no counts from a crashed job.
-- **Plan (9.97):** when a job's result is the crash default, the parent takes what its worker had published off the sum.
-- **Revisit when:** 9.97.
-- **Noted:** 2026-11-17, 9.96's fix round, second opinion (code1 lead 2); a deferral, not asked.
+### macOS: a `-co` rewrite in place gives the old file the source's xattrs
+- **Kind:** deferred (9.98).
+- **What the operator sees:** on macOS, `hpcp x -d out/ -co` over an existing `out/x` (written in place, the default) leaves `out/x` with the source's xattrs in place of its own (a Finder tag of the old file goes, one of the source comes), where Linux keeps the old file's (ran on macOS 26.6.2, 2026-11-23, 9.96 and 9.97 alike). The ACL, owner, mode and times stay, as `-co` promises; a rewrite beside (`-wb`) carries the old file's xattrs and ACL since 9.97.
+- **Why:** macOS's `cp` copies a file's xattrs by default and replaces the destination's (`cp -f x out/x` ran so; `cp -fX` keeps them), where GNU `cp -f` touches none.
+- **Plan (9.98):** decide what `-co` keeps on macOS: `cp -X` under `-co` keeps the old file's names in place and gives a first copy none of the source's, as Linux does, but would also drop `com.apple.quarantine` from a first copy of a downloaded file (Gatekeeper then does not check it): keep that mark (copy it after `cp -X`, or leave `-X` out of a first copy), and test both on the Mac.
+- **Revisit when:** 9.98.
+- **Noted:** 2026-11-23, found by the 9.97 builder while checking the `-co` beside carry on the Mac; a deferral, not asked.
 
 ### With -wb, a rewrite does not keep a per-file layout, chattr flags or the project id
 - **Kind:** known limitation.
@@ -382,14 +270,6 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   - In a default-ACL directory the held route keeps the entries only by giving the file its owner before `cp` writes it (coreutils 9.7; 8.22 and 8.32 keep none by any route), which a non-root run cannot do for another user's file, and which charges a root run's write to the owner's or group's quota (9.87's final review, F3).
 - **Revisit when:** hpcp gets a BSD test machine, or an operator reports it.
 - **Approved:** 2026-11-09, the user picked "Known limitation (Recommended)" (the off-Linux entry). Narrowed 2026-11-10: the user chose "Fix at source for macOS", whose option said "The BSDs can't use it and stay a KL". The user did not ask for it explicitly; it remains of a deferral the 9.85 review found. Widened 2026-11-10 to the Linux cases where 9.87 gives `cp` the name, exactly as 9.86 did (a non-GNU `cp` such as BusyBox's or uutils'; no usable `/proc` or temporary directory; a non-root first copy into a default-ACL directory; a root first copy of another user's file into a default-ACL directory): the user chose "Add them to the KL (Recommended)". The group case (a root first copy of a file of another group, the same fallback): 2026-11-10, the user chose "Widen to groups (Recommended)".
-
-### On macOS the copy check looks at each landing by path, on a network mount too
-- **Kind:** deferred (9.97).
-- **What the operator sees:** on macOS the copy check (and a move's) looks at each landing by its path, whatever the destination's filesystem: on an NFS, SMB or AFP mount each part of each path can cost a round trip, as in 9.87. On Linux a destination on a network filesystem is checked by directory (each directory opened once, its names looked at relative to it).
-- **Why:** macOS has no mount table hpcp reads. An earlier 9.88 build took every macOS destination by directory: on a local APFS disk that made the check 2.3 times as slow for 10,000 directories of one file each (each open and close about 20 µs) and a rerun 12 % slower (the 9.88 A–C review, F3), and the gain on a network mount was not measured.
-- **Plan (9.97):** measure the check on a macOS NFS and SMB mount, by path and by directory; where by directory wins, ask each destination's filesystem type (`statfs`'s `f_fstypename`) and check network mounts by directory.
-- **Revisit when:** 9.97 (moved from 9.96 on 2026-11-17: 9.96 took the remove-progress follow-ups).
-- **Noted:** 2026-11-11, the main session's call on the review's F3 (a deferral, not asked). Moved to 9.90 on 2026-11-11: 9.89 took only the rerun trim and the multiCMD requirement. Moved to 9.91 on 2026-11-12 (the 9.90 builder): it is a measurement first, and the Mac's test user cannot mount NFS (`mount_nfs` needs root) and has no SMB server to mount. Moved to 9.92 on 2026-11-13: 9.91 is the name probe's fix alone. Moved to 9.93 on 2026-11-13: 9.92 is the docs pass, the quiet cleanup, the multiCMD 1.64 embed and the size check; the main session's call (a deferral, not asked). Moved to 9.94 on 2026-11-13: 9.93 is the name probe's redesign and the `-co` set-user-ID cause; the main session's call (a deferral, not asked). Moved to 9.95 on 2026-11-14: it needs a design check: the plan is a measurement first, and the Mac's test user still has no NFS or SMB mount (`mount_nfs` needs root, and no server it can reach), so either the route is built unmeasured, as Linux's NFS measurement suggests, or a server the Mac can mount is set up; the 9.94 builder's call (a deferral, not asked). Moved to 9.96 on 2026-11-16: 9.95 is the `-rm` progress fix alone; the main session's call (a deferral, not asked).
 
 ### On macOS a node copy, and on Linux without /proc an identical node's mode, go by name below the held directory
 - **Kind:** known limitation.
@@ -421,19 +301,11 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - **Revisit when:** an operator needs socket nodes carried on macOS. A bind relative to a held directory works there without its path (`pthread_fchdir_np`, or a `/.vol/DEV/INO/name` path on APFS: both ran on macOS 26.6.2), but the node's owner, mode and times still go by name, in a directory that must be made private, its ACL too.
 - **Approved:** 2026-11-13, the user chose "Skip with a note (Recommended)". The user did not ask for it; the 9.90 final review and its design check found it (the final review found security holes in the socket 9.90's builds made, and the design check found the part not needed).
 
-### macOS: a lean binding of the xattr and ACL calls
-- **Kind:** deferred (9.97).
-- **What the operator sees:** on macOS a rerun carries xattrs and ACLs (since 9.90) at about 11 µs a file or directory: a serial rerun (`-s`) of 10,000 directories of one file each is 2.47 s with it and about 2.2 s without it (−11 %). In the default pool the carry showed nothing in the review's nine rounds (3.08 s without it against 3.09 to 3.15 s with it) and +3 to +6 % paired in three of the build's four runs of 11 rounds, +13 % in the fourth, on a loaded Mac (see the pooled rerun's entry below). A leaner binding of the three read helpers (no per-call `import ctypes` or helper calls, one reused 4 KiB buffer, errno read directly) measured about 3 µs less an object, about a third of the carry (4.5 µs against 7.2 to 7.9 µs for one identical file with neither xattrs nor an ACL; the bare libc calls about 3.5 µs), and 5 to 7 % less in the serial rerun; it helps `-s` only. On a macOS Python without `_ctypes` (none known), a directory whose BSD flags differ from the source's ends the directory finishing with an `ImportError` (exit 70, or 191 in a pool). The same in 9.91.
-- **Why:** the 9.90 review measured it and kept it out of 9.90: about 70 lines rewritten for a gain only the serial shape shows, with the pooled rerun's known limitation unmoved.
-- **Plan (9.97):** each libc function is already bound once a process (`_LIBC_FUNCTIONS`, `_libc_fn`); the gain is in the per-call `import ctypes` and helper calls (`_mac_xattr_target`, `_libc_error`), one reused buffer and errno read directly (which also gives a macOS Python without `_ctypes` the ENOTSUP skip instead of an `ImportError` from the helpers' own `import ctypes`; `_finish_directory` then asks `_libc()` before `_fchflags`, as `_settle_identical` does, so a directory's BSD flags go by name there); measure it again on the Mac.
-- **Revisit when:** 9.97 (moved from 9.96 on 2026-11-17: 9.96 took the remove-progress follow-ups).
-- **Noted:** 2026-11-12, the 9.90 review's F5 and the user's pick; the main session's decision, not asked (a deferral). Moved to 9.93 on 2026-11-13: 9.92 is the docs pass, the quiet cleanup, the multiCMD 1.64 embed and the size check; the main session's call (a deferral, not asked). Moved to 9.94 on 2026-11-13: 9.93 is the name probe's redesign and the `-co` set-user-ID cause; the main session's call (a deferral, not asked). Moved to 9.95 on 2026-11-14: a build the 9.94 run did not reach (it went to the security fixes and the entries above), and it needs a measurement on the Mac; a reused buffer must also stay per thread (the copy check's threads); the 9.94 builder's call (a deferral, not asked). Moved to 9.96 on 2026-11-16: 9.95 is the `-rm` progress fix alone; the main session's call (a deferral, not asked).
-
 ### macOS: a rerun gives no xattrs or ACL to a node, and no ACL to a directory the door reached by path
 - **Kind:** known limitation.
 - **What the operator sees:** on macOS a rerun carries a changed ACL only to a file or directory hpcp holds by a descriptor, and xattrs to those too. An identical FIFO or device node (a socket is not copied on macOS) gets no xattrs and no ACL (as in 9.89; the 9.90 build gave it xattrs by the landing's full path, and its second fix round took that out: no xattr call on macOS takes a `dir_fd`, so a directory on the way swapped for a link at the right microsecond in a root run into a tree another user can write led them to the file of that name where the link led). A directory the door reached by path (past its budget, with no descriptor left, or the read route's unreadable directory) gets its xattrs by path, as its writes go there, and no ACL: the README says "a file or directory hpcp holds". Also on macOS, an identical FIFO's or device node's owner, mode and times are set by its name below the held directory (`lchown`, `lchmod` and `utimensat` without following a link): a symbolic link put at the name is never followed, but a hard link to another file of the runner's own, put there between hpcp's look and the call (macOS has no `fs.protected_hardlinks`), gets the node's mode and times, and its owner in a root run (the same in 9.89; Linux without /proc has it in "On macOS a node copy, and on Linux without /proc an identical node's mode, go by name below the held directory").
 - **Why:** an ACL is read and set through a descriptor (`acl_get_fd_np`, `acl_set_fd_np`), and every macOS xattr call for a node goes by its path. A node cannot be opened safely: opening a device node acts on the device, and an identical FIFO is not opened to reach them: an open of a FIFO for reading, `O_RDONLY` and on macOS `O_EVTONLY` alike (ran on macOS 26.6.2, 2026-11-15), lets in a writer waiting on it, and what it writes is lost when hpcp closes (9.94 as built did it, and the final review found it). A directory the door reached by path has no descriptor.
-- **Revisit when:** the read route's design check (9.97), or an operator needs a node's xattrs or ACL carried on macOS. Ideas then: the held directory by its identity (`/.vol/DEV/INO/NAME` resolves below a renamed directory on APFS, ran 2026-11-13; not on NFS, SMB or exFAT); `/dev/fd/D/NAME` does not resolve there (ENOENT, ran 2026-11-13); `acl_set_link_np` on the name is itself a full-path call.
+- **Revisit when:** an operator needs a node's xattrs or ACL carried on macOS. Ideas then: the held directory by its identity (`/.vol/DEV/INO/NAME` resolves below a renamed directory on APFS, ran 2026-11-13; not on NFS, SMB or exFAT); `/dev/fd/D/NAME` does not resolve there (ENOENT, ran 2026-11-13); `acl_set_link_np` on the name is itself a full-path call.
 - **Approved:** chief's decision, 2026-11-15 (the user made the chief session their desk on 2026-11-14 and let it decide where it judges they would pick the option nine times in ten; the question as asked is in docs/progress.md's history): "(a) Approve as a known limitation (recommended)"; widened the same day to every identical FIFO, again a chief's decision: "(a) approve the wider entry" (9.89 to 9.93's behaviour; opening the FIFO loses a waiting writer's data). The user did not ask for it; the 9.90 review's second opinion found it.
 - **Noted:** 2026-11-12, the 9.90 review's second-opinion leads; the main session's decision, not asked (a deferral). Widened 2026-11-12 (the 9.90 re-review's round-2 item D2, from its second-opinion lead lim2 #2): the node's xattrs are out of 9.90; the main session's call, not asked. Widened 2026-11-13 to the identical FIFO's owner, mode and times, which go by name (the 9.90 final review's second-opinion lead lim2 #2 and its design check); the main session's call, not asked (a deferral). Moved to 9.93 on 2026-11-13: 9.92 is the docs pass, the quiet cleanup, the multiCMD 1.64 embed and the size check; the main session's call (a deferral, not asked). Moved to 9.94 on 2026-11-13: 9.93 is the name probe's redesign and the `-co` set-user-ID cause; the main session's call (a deferral, not asked). Moved to 9.95 on 2026-11-14 (the 9.94 builder's call; a deferral, not asked): 9.94 opened an identical FIFO for reading to reach them, which the final review found lets in a waiting writer (2026-11-15), so the settle went back to 9.93's by-name route and every identical FIFO is in this entry again. Became a known limitation on 2026-11-15 (above). The first approval covered a device node, a FIFO its owner may not read (0222) and a directory the door reached by path; the second, the same day, every identical FIFO (above). Moved to 9.96 on 2026-11-16: 9.95 is the `-rm` progress fix alone; the main session's call (a deferral, not asked).
 ### On Linux without /proc an identical node's xattrs (a device node's, a socket's) and a move's owner-read chmod go by path, and a directory with no owner read stays shut
@@ -483,7 +355,7 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 ### macOS: a pooled rerun of a tree of many directories with one file each takes longer than in 9.87
 - **Kind:** known limitation.
 - **What the operator sees:** on macOS (APFS, Python 3.9.6) a rerun with nothing to copy of 10,000 directories of one file each, in the default pool, takes 4 to 6 % longer than 9.87's (paired, round by round: the 9.90 review, macOS 26.6.2, the versions taking turns, 9 rounds, medians 3.15 s against 2.98 s, and 3.09 s against 2.99 s; the build's five runs against 9.89, one of 7 rounds and four of 11: +4.2 to 7.4 %). 9.90's xattr and ACL carry showed nothing in the review's nine rounds (3.09 s against 3.08 s without it) and +3 to +6 % paired in three of the build's four runs of 11 rounds (+3.3, +4.1 and +6.2 %), +12.7 % in the fourth, on a Mac at load 10.5 (CPU +0.5 to +3.6 %). The same tree with `-s` is faster than 9.87 (2.47 s against 2.53 to 2.56 s, −2 to −4 %); the carry costs about 11 µs a file or directory there (−11 % without it). 50 directories of 1,000 files: in the pool 4.87 s against 4.71 s (medians; +2.3 % paired, CPU +1.0 %, 7 rounds), now slower than 9.87, where 9.89 was faster; with `-s` 5.37 s against 6.15 s (medians; −12.0 % paired). For the record, 9.89 was 2 to 4 % longer than 9.87 in the pool for the 10,000 directories and used about 7 % more CPU (two runs of 11 rounds on a Mac whose load rose to 17 to 27 from the runs themselves: medians 3.18 s against 3.11 s and 3.08 s against 2.95 s, CPU 17.6 s against 16.3 s and 16.4 s), and every other shape measured then was faster than 9.87 (50 directories of 1,000 files 4.90 s against 5.02 s in the pool); before 9.89 a pooled rerun of the 10,000 directories took about 6 % longer, and up to 14.5 % with `-s`.
-- **Why:** the door opens and closes each directory a process enters (about 20 µs on APFS, against about 0.5 µs on Linux); that open is the guard (a directory swapped for a link is never followed), so it cannot go, and the read route macOS needs (no `O_PATH`) holds the directories by read descriptors. 9.89 took the per-landing Python work out (the trim; the serial and two-worker reruns beat 9.87 now); what is left shows only with many workers, and its share is measured, not profiled (not the workers' start: `-V` costs 0.103 s against 0.100 s, and a pooled rerun starts 22 of them). 9.90's carry of xattrs and ACLs shows in the serial shapes; a leaner binding of its calls is deferred to 9.94 ("macOS: a lean binding of the xattr and ACL calls").
+- **Why:** the door opens and closes each directory a process enters (about 20 µs on APFS, against about 0.5 µs on Linux); that open is the guard (a directory swapped for a link is never followed), so it cannot go, and the read route macOS needs (no `O_PATH`) holds the directories by read descriptors. 9.89 took the per-landing Python work out (the trim; the serial and two-worker reruns beat 9.87 now); what is left shows only with many workers, and its share is measured, not profiled (not the workers' start: `-V` costs 0.103 s against 0.100 s, and a pooled rerun starts 22 of them). 9.90's carry of xattrs and ACLs shows in the serial shapes; 9.97 binds its three read calls leaner (about 0.6 to 0.8 µs less a call, a quarter to a third; a serial rerun of the 10,000 directories about 3 % less, paired median of 9 rounds on a loaded Mac).
 - **Revisit when:** an operator reports it.
 - **Approved:** 2026-11-11, the user chose "Approve as KL (Recommended)" on the loaded Mac's "about 3 to 8 %", and, asked again with the quiet Mac's numbers (+6 % in the pool, +14.5 % with `-s`), "Keep the approval (Recommended)". The user did not ask for it explicitly; the 9.88 final review found it (N3). Measured again after the 9.89 trim (2026-11-11, as the entry's revisit condition asked: "or the 9.89 trim of the per-landing cost ships and the Mac is measured again"): smaller in every shape, the default pool on this tree the only one still slower; the approval is kept for these numbers, not asked again. The 9.89 numbers ("For the record" above, not 9.90's) are from 187864e: the final 9.89 build drops the door's one-entry memo of its last answer (2026-11-12, the user's "Drop the memo"), which measures the same on Linux for 10,000 directories of one file, and 0.4 to 2.7 points more CPU for 50 directories of 1,000 files (three benches: the final review, the fix round and its re-review), so the Mac's pooled 50 x 1,000 margin of 2.4 % (4.90 s against 5.02 s) may be gone; the Mac was not measured again. Asked again on 2026-11-12, with 9.90's +5.6 % (xattrs and ACLs carried on a rerun) and the numbers above: the user chose "Keep it, re-approve the KL (Recommended)".
 

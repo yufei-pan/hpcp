@@ -17,6 +17,20 @@ Block-image functionality is in **beta**. Only available on Linux. Possible use 
 
 hpcp.bat available on github: simple old tk based GUI intended for basic windows functionality.
 
+## Upgrading to 9.97 from 9.96
+
+Nothing needs doing to upgrade, unless a script counts the `Note:` lines of a refusal (now once a run) or reads a pool job's own lines as they happen (the first two bullets). What changed:
+
+- **Every line a pool job prints goes through the process that draws the progress line,** which starts it on a line of its own: besides the error lines (9.96), the space warning (no empty line before it where no frame is open), a temporary file that could not be removed, a copy's `Error copying ...` and `Trying to copy ... without sparse`, and a link below a destination replaced by a directory. They show when the job returns, as its error lines do. A job keeps at most 10,000 lines, then one saying how many more it left out (the error list at the end has every error). The link-tracking bar's errors start their own line too.
+- **A refusal's note is printed once a run,** not once for each worker that met it (`-ncd -nds` with a link at a destination: as many lines as workers met it, 26 at `-j 32`). The note of a destination that now leads elsewhere no longer says "and the other destinations take its files", which was false where they could not either.
+- **A `-pfl` listing's line counts a running job's links under `Links`** (9.96: under `Files` until the job returned).
+- **`-co`:** a rewrite beside of a source without owner write (0444) onto a file holding a `user.*` xattr completes (9.93 to 9.96: exit 190, the old copy kept), and on macOS a rewrite beside gives the new file the old one's xattrs and ACL (9.96: none).
+- **Stops:** Ctrl-C while `-dd` copies a partition's files exits 130 (9.96: 181, `Partition copy error`), and a stop just before a run's cleanup no longer skips it (an image's mounts and loop devices could stay).
+- **macOS:** a destination on an SMB or NFS mount is checked by directory, as on Linux (2.3 to 3 times faster in two shapes measured, never slower by more than 0.17 s); a rerun's xattr and ACL reads cost about a third less.
+- **Pools:** on Python 3.14 with no writable temporary directory a pooled copy or `-rm -pfl` starts its workers by fork and runs (9.96: exit 70, nothing done); on Python 3.6 where workers spawn (Windows) `-F` paces `-pfl` jobs (9.96 ignored it).
+- `hpcp src -d blob/` with `blob` a file no longer prints the `maybe a mounted dir` hint; the error after it names the problem. The embedded multiCMD is 1.69 (1.67 before).
+- **Still open** (see [docs/limitations.md](docs/limitations.md)): the `-siff` apply by path, a move's directory fsyncs by path, the rest of Linux without /proc and the read route wait on a decision; planned for 9.98: on macOS a `-co` rewrite in place gives the old file the source's xattrs.
+
 ## Upgrading to 9.96 from 9.95
 
 Nothing needs doing to upgrade, unless a script reads hpcp's output through a pipe that may close early (the fourth bullet), relies on the timing of a pool job's error lines (the third), or relies on `-rme` asking even with `-rf` (the fifth). What changed:
@@ -340,7 +354,7 @@ On EL7 and EL8, run `python3 -m pip install --user -U pip` once before a `--user
 
 **Note**:  
 - On Python 3.7 and later `pip` also installs the hashing library [xxhash](https://github.com/Cyan4973/xxHash), which can reduce CPU usage for partial hashing and increase performance when using `-fh --full_hash`. On Python 3.6 (EL7 and EL8) it does not, because building it there needs a compiler: hpcp uses blake2b instead. To add it, upgrade pip first (`pip3 install -U pip`, then `pip3 install xxhash`): on stock pip 9.0.3 it fails there.  
-- hpcp carries [multiCMD](https://github.com/yufei-pan/multiCMD), used to issue commands and provide helper functions: its built-in copy is the full multiCMD (1.67 in 9.94). An installed multiCMD is used when it is at least as new as that copy, and the built-in one otherwise (older, missing, or one that does not import). Since 9.89 `pip` installs none for hpcp.
+- hpcp carries [multiCMD](https://github.com/yufei-pan/multiCMD), used to issue commands and provide helper functions: its built-in copy is the full multiCMD (1.69 in 9.97). An installed multiCMD is used when it is at least as new as that copy, and the built-in one otherwise (older, missing, or one that does not import). Since 9.89 `pip` installs none for hpcp.
 
 ## Disk Imaging Feature Note
 
