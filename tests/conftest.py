@@ -116,6 +116,15 @@ def _say_when_descriptors_cannot_be_listed():
 	warn_if_descriptors_cannot_be_listed()
 
 
+@pytest.fixture(scope='session', autouse=sys.platform == 'darwin')
+def _no_acl_left_in_the_temporary_tree(tmp_path_factory):
+	"""macOS: a copy of a list of full paths makes the directories on the way with their ACLs (the home's 'everyone deny
+	delete'), and test_darwin gives files that entry on purpose: rm -rf, and pytest's removal of old runs, cannot remove them.
+	The run's temporary tree loses its ACLs at its end."""
+	yield
+	subprocess.run(['chmod', '-R', '-N', str(tmp_path_factory.getbasetemp())], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
 @pytest.fixture(autouse=True)
 def _a_test_closes_what_it_opens():
 	"""A file, directory or terminal a test opens is closed when it ends. One that leaves them holds them for the rest of the run,
@@ -334,19 +343,20 @@ def require_windows():
 # ---- what the test's own filesystem does (macOS's default APFS folds case and Unicode form, and takes only UTF-8 names)
 
 def same_name(directory, first, second):
-	"""Whether directory's filesystem takes first and second for one name, asked by making first and looking for second."""
-	directory = os.fsencode(str(directory))
-	probe = os.path.join(directory, os.fsencode(first))
+	"""Whether directory's filesystem takes first and second for one name, asked by making first and looking for second, each
+	behind a prefix of its own (so names the test made there already do not answer)."""
+	directory, prefix = os.fsencode(str(directory)), b'.same-name-probe-'
+	probe = os.path.join(directory, prefix + os.fsencode(first))
 	os.close(os.open(probe, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600))
 	try:
-		return os.path.lexists(os.path.join(directory, os.fsencode(second)))
+		return os.path.lexists(os.path.join(directory, prefix + os.fsencode(second)))
 	finally:
 		os.unlink(probe)
 
 
 def folds_case(directory):
 	"""Whether directory's filesystem takes two names that differ only in case for one (macOS's default APFS does)."""
-	return same_name(directory, 'case-probe-a', 'CASE-PROBE-A')
+	return same_name(directory, 'a', 'A')
 
 
 def takes_name(directory, name):

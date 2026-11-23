@@ -4,6 +4,7 @@ import errno
 import io
 import os
 import pty
+import re
 import select
 import shlex
 import shutil
@@ -18,6 +19,8 @@ import time
 import unicodedata
 
 import pytest
+
+from conftest import folds_case, held_target, same_name, skip_unless_apart, skip_unless_takes, takes_name
 
 # The test's own names need a UTF-8 filesystem encoding to be made (Python 3.6 with LANG unset has ASCII); hpcp's side of
 # such a locale is test_landings' test_a_non_ascii_name_copies_with_lang_unset.
@@ -530,17 +533,19 @@ ODD_NAMES = [b'latin\xe9', b'trail ', b' lead', b'ls\xe2\x80\xa8x', b'new\nline'
 	ids=['default', 'strict', 'c-locale', 'c-locale-plain'])
 @pytest.mark.parametrize('flags', [[], ['-s'], ['-v']], ids=['parallel', 'serial', 'verbose'])
 def test_odd_names_copy_and_print_end_to_end(tmp_path, env, flags):
-	for name in ODD_NAMES:
+	names = [name for name in ODD_NAMES if takes_name(tmp_path, name)]  # APFS refuses latin\xe9: the rest go end to end
+	for name in names:
 		write(os.path.join(os.fsencode(str(tmp_path)), b's', name), name)
 	listing = _find_run(['find', 's', '-type', 'f', '-print0'], cwd=str(tmp_path), stdout=subprocess.PIPE).stdout
 	rc, output = run(['-d', 'out'] + flags, tmp_path, listing, env)
 	assert rc == 0, output[-2000:]
-	assert files(tmp_path / 'out') == {os.path.join(b's', name): name for name in ODD_NAMES}
+	assert files(tmp_path / 'out') == {os.path.join(b's', name): name for name in names}
 	assert b'Traceback' not in output
 
 
 @pytest.mark.parametrize('name', [b'latin\xe9', b'trail ', b'ls\xe2\x80\xa8x', b'cr\rname'], ids=['latin1', 'trailing-space', 'u2028', 'inner-cr'])
 def test_odd_names_work_on_newline_lists_too(tmp_path, name):
+	skip_unless_takes(tmp_path, name)
 	write(os.path.join(os.fsencode(str(tmp_path)), b's', name), name)
 	rc, output = run(['-d', 'out'], tmp_path, b's/' + name + b'\n', {'PYTHONIOENCODING': 'utf-8:strict'})
 	assert rc == 0, output[-2000:]
@@ -565,6 +570,7 @@ def test_missing_odd_name_is_reported_not_a_crash(tmp_path):
 
 
 def test_clash_with_odd_names_is_reported_not_a_crash(tmp_path):
+	skip_unless_takes(tmp_path, b'latin\xe9')
 	base = os.fsencode(str(tmp_path))
 	write(os.path.join(base, b'a', b'latin\xe9'), 'one')
 	write(os.path.join(base, b'b', b'latin\xe9'), 'two')
@@ -736,10 +742,12 @@ def test_rm_with_a_list_removes_the_listed_paths(work):
 
 def test_rm_with_a_nul_list_removes_exact_names(tmp_path):
 	base = os.fsencode(str(tmp_path))
-	write(os.path.join(base, b'latin\xe9'), 'x')
+	latin = takes_name(tmp_path, b'latin\xe9')  # APFS refuses it: there 'trail ' alone
+	if latin:
+		write(os.path.join(base, b'latin\xe9'), 'x')
 	write(os.path.join(base, b'trail '), 'x')
 	write(os.path.join(base, b'trail'), 'stays')
-	rc, output = run(['-rf', '-rm'], tmp_path, b'latin\xe9\0trail \0', {'PYTHONIOENCODING': 'utf-8:strict'})
+	rc, output = run(['-rf', '-rm'], tmp_path, (b'latin\xe9\0' if latin else b'') + b'trail \0', {'PYTHONIOENCODING': 'utf-8:strict'})
 	assert rc == 0, output[-2000:]
 	assert sorted(os.listdir(base)) == [b'trail']
 
@@ -938,6 +946,7 @@ def test_stored_list_with_hashes_compares_against_itself(work, hpcp_mod, reset_h
 
 
 def test_stored_list_holds_a_name_that_is_not_utf8(tmp_path, hpcp_mod):
+	skip_unless_takes(tmp_path, b'latin\xe9')
 	base = os.fsencode(str(tmp_path))
 	write(os.path.join(base, b's', b'latin\xe9'), 'x')
 	rc, output = run(['s/', '-fl', 'stored', '-nhfl'], tmp_path, b'', {'PYTHONIOENCODING': 'utf-8:strict'})
@@ -2582,7 +2591,8 @@ def test_real_places_look_at_each_directory_once(hpcp_mod, tmp_path, monkeypatch
 		assert places.landing(root + '/out', root + f'/out/l/f{name}') == root + f'/out/l/f{name}'
 		assert places.landing(root + '/out', root + f'/out/d/f{name}') == root + f'/out/d/f{name}'
 		assert places.place(root + f'/out/l/f{name}') == root + f'/out/d/f{name}'
-	assert scans == [] and not [path for path in stats if os.path.basename(path).startswith('f')]
+	# (by its name: macOS's temporary directory lies below /private/var/folders)
+	assert scans == [] and not [path for path in stats if re.match(r'f[0-9]+$', os.path.basename(path))]
 
 
 def test_real_places_agree_with_realpath(hpcp_mod, tmp_path):
@@ -2623,7 +2633,7 @@ def test_a_copy_onto_an_existing_tree_lists_no_directory_and_stats_no_file(hpcp_
 		hpcp_mod._get_file_list_cache.clear()
 	# 9.84 listed out and out/d, one by one, for links (the deferred serial scan); nothing below a destination is followed now.
 	assert scans == []
-	assert not [path for path in lstats if os.path.basename(str(path)).startswith('f')]
+	assert not [path for path in lstats if re.match(r'f[0-9]+$', os.path.basename(str(path)))]  # not /private/var/folders
 
 
 # ---- a link entry whose directory nobody made, and a link to a directory in the list ----
@@ -3166,14 +3176,12 @@ def test_a_source_that_cannot_be_read_leaves_a_hard_linked_destination_alone(tmp
 
 def _cp_writing_a_part(hpcp_mod, monkeypatch, fails):
 	"""A cp that dies part way through its write to each path in fails, to the file held open at one (a first copy, a
-	rewrite in place and the beside route's new file give cp /proc/self/fd/N: os.readlink names it), or to a temporary name
-	beside one, and works elsewhere."""
+	rewrite in place and the beside route's new file give cp /proc/self/fd/N, macOS /dev/fd/N: held_target names it), or to a
+	temporary name beside one, and works elsewhere."""
 	real = hpcp_mod.run_command_in_multicmd_with_path_check
 	beside = {os.path.dirname(path) for path in fails}
-	def named(path):
-		return os.readlink(path) if path.startswith('/proc/') else path
 	def cp(command, *args, **kwargs):
-		target = named(command[-1])
+		target = held_target(command[-1])
 		if target in fails or (os.path.basename(target).startswith('.hpcp_tmp_') and os.path.dirname(target) in beside):
 			with open(command[-1], 'w') as target:
 				target.write('par')
@@ -4447,6 +4455,7 @@ def test_a_move_of_such_a_clash_keeps_every_source(folding, hpcp_mod):
 
 def test_two_names_in_one_tree_clash_though_no_roots_meet(folding, hpcp_mod):
 	# A lone source on a usual destination is not even listed.
+	skip_unless_apart(folding, ('X', 'x'))
 	write(folding / 'a/X', 'upper')
 	write(folding / 'a/x', 'lower')
 	assert _copy(hpcp_mod, ['a/']) == 213
@@ -4505,8 +4514,13 @@ def test_composed_and_decomposed_names_are_one_name(folding, hpcp_mod):
 
 def test_a_destination_that_does_not_fold_keeps_both(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
 	monkeypatch.chdir(tmp_path)
+	folds = folds_case(tmp_path)
 	write(tmp_path / 'a/X', 'upper')
 	write(tmp_path / 'b/x', 'lower')
+	if folds:
+		# A case-insensitive filesystem (macOS's APFS): the real question finds one name, and the first stays.
+		assert _copy(hpcp_mod, ['a/', 'b/']) == 213 and files(tmp_path / 'out') == {b'X': b'upper'}
+		return
 	assert _copy(hpcp_mod, ['a/', 'b/']) == 0
 	assert files(tmp_path / 'out') == {b'X': b'upper', b'x': b'lower'}
 
@@ -4549,7 +4563,9 @@ def test_a_pair_is_asked_about_where_it_lands_with_its_own_names(tmp_path, hpcp_
 	write(tmp_path / 'b/s/x', '2')
 	os.makedirs(tmp_path / 'out/s')
 	asked = _asked(hpcp_mod, monkeypatch)
-	assert _copy(hpcp_mod, ['a/', 'b/']) == 0
+	# The stand-in's answer (two names) is wrong where the filesystem folds case (macOS's APFS): the check after the copy finds
+	# out/s/X and out/s/x one file, and says so (213).
+	assert _copy(hpcp_mod, ['a/', 'b/']) == (213 if folds_case(tmp_path) else 0)
 	assert asked == [(os.path.realpath(str(tmp_path / 'out/s')), ['X', 'x'])]
 
 
@@ -4568,7 +4584,8 @@ def test_one_pair_of_directories_is_asked_about_once(tmp_path, hpcp_mod, reset_h
 		write(tmp_path / 'a/D' / name, '1')
 		write(tmp_path / 'b/d' / name, '2')
 	asked = _asked(hpcp_mod, monkeypatch)
-	assert _copy(hpcp_mod, ['a/', 'b/']) == 0 and [names for _, names in asked] == [['D', 'd']]
+	# (213 where the filesystem folds case, as in test_a_pair_is_asked_about_where_it_lands_with_its_own_names)
+	assert _copy(hpcp_mod, ['a/', 'b/']) == (213 if folds_case(tmp_path) else 0) and [names for _, names in asked] == [['D', 'd']]
 
 
 def test_each_destination_is_asked_and_one_that_says_yes_is_enough(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
@@ -4589,11 +4606,17 @@ def test_three_names_are_judged_each_against_the_others(tmp_path, hpcp_mod, rese
 	write(tmp_path / 'c/strasse', '3')
 	_answering(hpcp_mod, monkeypatch, lambda directory, first, second: 'S' in first.upper() and '\u00df' not in first + second)
 	assert _copy(hpcp_mod, ['a/', 'b/', 'c/']) == 213
-	assert set(files(tmp_path / 'out')) == {'Stra\u00dfe'.encode(), b'STRASSE'}
+	if same_name(tmp_path, 'Stra\u00dfe', 'STRASSE'):
+		# The stand-in's answer (two names) is wrong where the filesystem folds \u00df as ss (macOS's APFS): the check after the
+		# copy finds out/Stra\u00dfe and out/STRASSE one file, and says so.
+		assert set(files(tmp_path / 'out')) == {'Stra\u00dfe'.encode()}
+	else:
+		assert set(files(tmp_path / 'out')) == {'Stra\u00dfe'.encode(), b'STRASSE'}
 
 
 def test_directories_only_asks_nothing_and_an_image_is_asked(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
 	# hpcp a/ -di x.img on a vfat image lost one of a/X and a/x: an image is a destination like any other.
+	skip_unless_apart(tmp_path, ('X', 'x'))
 	write(tmp_path / 'a/X', '1')
 	write(tmp_path / 'a/x', '2')
 	asked = _asked(hpcp_mod, monkeypatch, True)
@@ -4605,8 +4628,9 @@ def test_directories_only_asks_nothing_and_an_image_is_asked(tmp_path, hpcp_mod,
 
 
 def test_the_question_leaves_the_directory_as_it_was(tmp_path, hpcp_mod):
+	other = 'X' if folds_case(tmp_path) else 'x'  # what a case-insensitive filesystem (macOS's APFS) answers: one name
 	os.utime(tmp_path, (1000000000, 1000000000))
-	assert hpcp_mod._ask_names(str(tmp_path), ['X', 'x']) == ({'X': 'X', 'x': 'x'}, {})
+	assert hpcp_mod._ask_names(str(tmp_path), ['X', 'x']) == ({'X': 'X', 'x': other}, {})
 	assert os.listdir(tmp_path) == [] and os.stat(tmp_path).st_mtime == 1000000000
 
 
@@ -4695,6 +4719,7 @@ def test_a_rename_in_case_on_a_directory_that_keeps_both_names_still_moves(tmp_p
 
 
 def test_a_move_onto_a_hard_link_of_itself_in_another_case_still_works_where_the_names_differ(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
+	skip_unless_apart(tmp_path, ('X', 'x'))
 	monkeypatch.chdir(tmp_path)
 	write(tmp_path / 'X', 'data')
 	os.link(tmp_path / 'X', tmp_path / 'x')
@@ -4756,9 +4781,13 @@ print('rc', hpcp.hpcp(['a/', 'b/'], ['out/'], single_thread=True, max_workers=1,
 def test_two_names_the_locale_cannot_decode_clash_as_they_do_in_utf8(tmp_path):
 	# Python 3.6 under the C locale (EL7 with no locale set, cron), and later ones with it forced: the file system encoding is
 	# ascii, and the UTF-8 bytes of the two names are escapes that nothing folds. The move then removed both sources.
+	env = dict(os.environ, LC_ALL='C', LANG='C', PYTHONUTF8='0', PYTHONCOERCECLOCALE='0')
+	encoding = subprocess.run([sys.executable, '-c', 'import sys; print(sys.getfilesystemencoding())'], env=env, stdout=subprocess.PIPE,
+		universal_newlines=True).stdout.strip()
+	if encoding.lower().replace('-', '') == 'utf8':
+		pytest.skip('Python here holds file names in UTF-8 under the C locale too (macOS): it makes no escapes')
 	write(tmp_path / 'a' / '\u00c9', 'upper')
 	write(tmp_path / 'b' / '\u00e9', 'lower')
-	env = dict(os.environ, LC_ALL='C', LANG='C', PYTHONUTF8='0', PYTHONCOERCECLOCALE='0')
 	task = subprocess.run([sys.executable, '-c', _C_LOCALE_PAIR % os.path.dirname(HPCP), str(tmp_path)], env=env, stdin=subprocess.DEVNULL,
 		stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
 	assert b'encoding ascii' in task.stdout.lower() or b'encoding ansi_x3.4-1968' in task.stdout.lower(), task.stdout[-1000:]
@@ -4785,8 +4814,10 @@ def test_names_a_trailing_dot_apart_clash_where_the_destination_reads_them_as_on
 
 
 def _beside(directory, name, target):
-	"""name as a second spelling of the existing directory target: what a folding directory gives one name in two cases."""
-	os.symlink(target, directory / name)
+	"""name as a second spelling of the existing directory target: what a folding directory gives one name in two cases (a
+	case-insensitive filesystem, macOS's APFS, gives it itself)."""
+	if not same_name(directory, target, name):
+		os.symlink(target, directory / name)
 
 
 def test_an_overlay_through_an_existing_directory_in_another_case_clashes_and_keeps_the_first(folding, hpcp_mod, capsys):
@@ -4802,6 +4833,7 @@ def test_an_overlay_through_an_existing_directory_in_another_case_clashes_and_ke
 
 
 def test_one_tree_with_two_spellings_onto_an_existing_directory_loses_no_file_silently(folding, hpcp_mod):
+	skip_unless_apart(folding, ('D', 'd'))
 	write(folding / 'a/D/f', 'one')
 	write(folding / 'a/d/f', 'two')
 	os.makedirs(folding / 'out/D')
@@ -4848,6 +4880,7 @@ def test_a_link_in_another_case_where_the_destination_keeps_the_names_apart_is_n
 @no_permissions_as_root
 def test_a_rerun_with_both_names_there_asks_nothing_of_a_directory_it_cannot_write(tmp_path, hpcp_mod):
 	# The question needs a new directory, and the two names are there: they are two names.
+	skip_unless_apart(tmp_path, ('X', 'x'))
 	write(tmp_path / 'd/X', '1')
 	write(tmp_path / 'd/x', '2')
 	os.chmod(tmp_path / 'd', 0o555)
@@ -4861,6 +4894,7 @@ def test_a_rerun_with_both_names_there_asks_nothing_of_a_directory_it_cannot_wri
 
 def test_two_names_there_are_no_answer_the_question_is_asked_by_doing_it(tmp_path, hpcp_mod, monkeypatch):
 	# exFAT through FUSE lists one name and gives each spelling of it a number of its own, so two numbers prove nothing.
+	skip_unless_apart(tmp_path, ('X', 'x'))
 	write(tmp_path / 'X', '1')
 	write(tmp_path / 'x', '2')
 	assert _one_name(hpcp_mod, str(tmp_path), 'X', 'x') is False
@@ -4872,6 +4906,7 @@ def test_two_names_there_are_no_answer_the_question_is_asked_by_doing_it(tmp_pat
 @pytest.mark.parametrize('source,dest', [('X', 'x'), ('D', 'd'), ('D/', 'd/'), ('D/f', 'd/f'), ('D/f', 'd/')])
 def test_a_move_onto_itself_in_another_spelling_is_refused_where_each_spelling_has_its_own_number(folding, hpcp_mod, source, dest):
 	# Both spellings stat as two files (FUSE exFAT): 9.83's first fix took that for two names, and the move lost the file.
+	skip_unless_apart(folding, ('X', 'x'))
 	for name in ('X', 'x', 'D/f', 'd/f'):
 		write(folding / name, name)
 	assert _move(hpcp_mod, [source], [dest]) == 241
@@ -4914,6 +4949,7 @@ def test_rme_keeps_a_file_written_through_another_spelling_whatever_its_number(t
 
 def test_the_question_is_asked_by_doing_it_when_the_two_names_are_one_file(tmp_path, hpcp_mod):
 	# Two names, one inode (a hard link): a directory that keeps names apart can hold that, and one that folds cannot be told.
+	skip_unless_apart(tmp_path, ('X', 'x'))
 	write(tmp_path / 'X', '1')
 	os.link(tmp_path / 'X', tmp_path / 'x')
 	assert _one_name(hpcp_mod, str(tmp_path), 'X', 'x') is False
@@ -4922,6 +4958,7 @@ def test_the_question_is_asked_by_doing_it_when_the_two_names_are_one_file(tmp_p
 @no_permissions_as_root
 @pytest.mark.parametrize('flags', [[], ['-rf']], ids=['copy', 'move'])
 def test_a_rerun_of_a_pair_into_a_directory_it_cannot_write_is_not_a_clash(tmp_path, flags):
+	skip_unless_apart(tmp_path, ('X', 'x'))
 	write(tmp_path / 'a/s/X', '1')
 	write(tmp_path / 'a/s/x', '2')
 	assert run(['a/', '-d', 'out/'], tmp_path)[0] == 0
@@ -4937,6 +4974,7 @@ def test_a_rerun_of_a_pair_into_a_directory_it_cannot_write_is_not_a_clash(tmp_p
 
 def test_one_pair_in_a_tree_costs_the_files_that_pair_not_all(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
 	# Every file of the run was resolved to a landing for one pair: 26 to 37 s against 2 s for a million files.
+	skip_unless_apart(tmp_path, ('P', 'p'))
 	monkeypatch.chdir(tmp_path)
 	for number in range(60):
 		write(tmp_path / 'a/s' / ('f%d' % number), 'x')
@@ -5129,8 +5167,9 @@ def test_two_questions_at_once_in_one_directory_do_not_meet(tmp_path, hpcp_mod, 
 			inner.append(None)
 			inner[0] = _one_name(hpcp_mod, str(tmp_path), 'P', 'p')
 		return real(path, *args, **kwargs)
+	folds = folds_case(tmp_path)  # a case-insensitive filesystem (macOS's APFS) answers one name, to each question
 	monkeypatch.setattr(hpcp_mod.os, 'open', open_and_ask)
-	assert _one_name(hpcp_mod, str(tmp_path), 'X', 'x') is False and inner == [False]
+	assert _one_name(hpcp_mod, str(tmp_path), 'X', 'x') is folds and inner == [folds]
 	assert os.listdir(tmp_path) == []
 
 
@@ -5146,11 +5185,12 @@ def test_rme_keeps_and_does_not_announce_a_directory_the_source_spells_in_anothe
 
 
 def test_rme_still_removes_a_directory_that_is_another_directory_where_the_names_are_two(tmp_path, hpcp_mod, reset_hpcp_globals):
+	folds = folds_case(tmp_path)  # a case-insensitive filesystem (macOS's APFS): out/One is the source's one, and stays
 	os.makedirs(tmp_path / 'a/one')
 	os.makedirs(tmp_path / 'out/One')
 	os.makedirs(tmp_path / 'out/two/deep')
 	hpcp_mod.remove_extra_dirs([str(tmp_path / 'a') + os.sep], [str(tmp_path / 'out') + os.sep])
-	assert os.listdir(tmp_path / 'out') == []
+	assert os.listdir(tmp_path / 'out') == (['One'] if folds else [])
 
 
 needs_signal_mask = pytest.mark.skipif(not hasattr(signal, 'pthread_sigmask') or not hasattr(os, 'kill'), reason='no signal mask')
@@ -5211,6 +5251,7 @@ def test_the_question_hands_the_signals_back_when_it_is_asked_nothing_is_made_ei
 def test_names_that_are_not_utf8_meet_their_other_case_and_stay_apart_from_other_bytes(folding, hpcp_mod):
 	# A latin-1 'café' (the bytes of 'caf\xe9'): the net joins all three, and the directory says two cases of the ascii part are
 	# one name and a different byte is another.
+	skip_unless_takes(folding, b'caf\xe9')
 	for directory, name in (('a', b'caf\xe9'), ('b', b'CAF\xe9'), ('c', b'caf\xe8')):
 		write(folding / directory / os.fsdecode(name), directory)
 	assert _copy(hpcp_mod, ['a/', 'c/']) == 0
@@ -5231,7 +5272,7 @@ def test_rme_does_not_take_a_file_of_the_source_for_the_directory_in_another_cas
 def test_a_move_into_its_own_inside_in_another_spelling_is_refused(folding, hpcp_mod, source, dest):
 	# FUSE exFAT: the two spellings of D stat as two directories, so the inside of d did not look like the inside of D.
 	write(folding / 'D/f', 'one')
-	os.makedirs(folding / 'd')
+	os.makedirs(folding / 'd', exist_ok=True)  # a case-insensitive filesystem (macOS's APFS) has it: D
 	assert _move(hpcp_mod, [source], [dest]) == 241
 	assert (folding / 'D/f').read_text() == 'one'
 
@@ -5246,8 +5287,14 @@ def test_a_landing_on_another_sources_file_in_another_spelling_is_refused(foldin
 
 def test_a_landing_on_a_source_in_another_spelling_where_the_names_are_two_still_runs(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
 	monkeypatch.chdir(tmp_path)
+	folds = folds_case(tmp_path)
 	write(tmp_path / 't/sub/f', 'T')
 	write(tmp_path / 's/sub/F', 'S')
+	if folds:
+		# A case-insensitive filesystem (macOS's APFS): the names are one, and t/sub/f would land on the source s/sub/F.
+		assert hpcp_mod.hpcp(['t/', 's/sub/F'], ['s/'], single_thread=True, max_workers=1, batch=True) == 213
+		assert (tmp_path / 't/sub/f').read_text() == 'T' and (tmp_path / 's/sub/F').read_text() == 'S'
+		return
 	assert hpcp_mod.hpcp(['t/', 's/sub/F'], ['s/'], single_thread=True, max_workers=1, batch=True) == 0
 	assert (tmp_path / 's/sub/f').read_text() == 'T' and (tmp_path / 's/sub/F').read_text() == 'S'
 
@@ -5412,13 +5459,15 @@ def test_a_tree_copied_onto_itself_in_another_spelling_is_no_clash(folding, hpcp
 
 
 def test_rme_still_removes_a_file_in_another_spelling_where_the_expected_name_is_not_there(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
-	# The name the copy would have written is not there: what is there in another case is another file.
+	# The name the copy would have written is not there: what is there in another case is another file. (A case-insensitive
+	# filesystem, macOS's APFS, finds that name there: out/X is it, and stays.)
+	folds = folds_case(tmp_path)
 	write(tmp_path / 'a/x', 'new')
 	write(tmp_path / 'out/X', 'other')
 	monkeypatch.setattr(sys.stdin, 'isatty', lambda: True)
 	monkeypatch.setattr('builtins.input', lambda: 'y')
 	hpcp_mod.remove_extra_files([str(tmp_path / 'a/x')], [str(tmp_path / 'out') + '/'], 1, False, 1, single_thread=True, src_paths=[str(tmp_path / 'a') + '/'])
-	assert os.listdir(tmp_path / 'out') == []
+	assert os.listdir(tmp_path / 'out') == (['X'] if folds else [])
 
 
 def test_rme_keeps_a_directory_in_another_spelling_that_cannot_be_asked_about(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
@@ -5460,7 +5509,7 @@ def test_a_landing_on_a_source_file_through_a_destination_in_another_spelling_wi
 	# lower() picked out only the case.
 	write(folding / 't/sub/f', 'T')
 	write(folding / source / 'sub/F', 'S')
-	os.makedirs(folding / dest)
+	os.makedirs(folding / dest, exist_ok=True)  # a case- and form-insensitive filesystem (macOS's APFS) has it: the source
 	assert _move(hpcp_mod, ['t/', source + '/sub/F'], [dest + '/']) == 213
 	assert (folding / 't/sub/f').read_text() == 'T' and (folding / source / 'sub/F').read_text() == 'S'
 
@@ -5471,9 +5520,10 @@ def test_a_landing_on_a_source_file_in_another_spelling_stops_the_run_where_no_r
 	write(folding / 's/sub/F', 'S')
 	write(folding / 't/f', 'T')
 	write(folding / 'u/g', 'U')
-	os.makedirs(folding / 'S/sub')
+	folds = same_name(folding, 'S', 's')
+	os.makedirs(folding / 'S/sub', exist_ok=True)  # a case-insensitive filesystem (macOS's APFS) has it: s/sub
 	assert hpcp_mod.hpcp(['s/sub/F', 't/f', 'u/g'], ['S/sub/'], single_thread=True, max_workers=1, batch=True) == 213
-	assert os.listdir(folding / 'S/sub') == []
+	assert os.listdir(folding / 'S/sub') == (['F'] if folds else []) and (folding / 's/sub/F').read_text() == 'S'
 
 
 def test_a_landing_on_a_source_file_in_another_spelling_that_cannot_be_asked_about_is_refused(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
@@ -5494,6 +5544,7 @@ def _counting(hpcp_mod, monkeypatch):
 def test_names_that_fold_alike_are_asked_about_in_one_probe_however_many(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
 	# Names in a legacy encoding (cp1251 surnames) are not UTF-8, and the net folds every byte past ASCII alike, so names of one
 	# length meet: a pair at a time, 3,000 of them made 902,303 probes.
+	skip_unless_takes(tmp_path, b'\xc0\xe0.pdf')
 	monkeypatch.chdir(tmp_path)
 	os.makedirs(tmp_path / 'a')
 	for number in range(200):
@@ -5506,6 +5557,8 @@ def test_names_that_fold_alike_are_asked_about_in_one_probe_however_many(tmp_pat
 
 def test_rme_asks_a_question_once_however_many_directories_lie_below(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
 	# out/Data beside the source's data/ (and DATA/), with directories below: each asked the same question again (5,001 for 5,000).
+	# A case-insensitive filesystem (macOS's APFS) holds DATA and data as one: the source has one spelling there.
+	spellings = ['DATA', 'Data'] if folds_case(tmp_path) else ['DATA', 'Data', 'data']
 	os.makedirs(tmp_path / 'src/DATA')
 	for number in range(50):
 		os.makedirs(tmp_path / 'src/data' / ('d%d' % number))
@@ -5513,7 +5566,7 @@ def test_rme_asks_a_question_once_however_many_directories_lie_below(tmp_path, h
 	_fold_probes(monkeypatch)
 	asked = _counting(hpcp_mod, monkeypatch)
 	hpcp_mod.remove_extra_dirs([str(tmp_path / 'src') + os.sep], [str(tmp_path / 'out') + os.sep])
-	assert len(asked) == 1 and sorted(asked[0]) == ['DATA', 'Data', 'data'] and len(os.listdir(tmp_path / 'out/Data')) == 50
+	assert len(asked) == 1 and sorted(asked[0]) == spellings and len(os.listdir(tmp_path / 'out/Data')) == 50
 
 
 def test_a_spelling_the_run_meets_later_is_asked_about_with_the_others(tmp_path, hpcp_mod, monkeypatch):
@@ -5572,10 +5625,14 @@ def test_a_probe_name_that_cannot_be_made_says_what_fixes_that_and_not_that_the_
 	answers, why = hpcp_mod._ask_names(str(tmp_path), ['X', 'x'])
 	assert answers == {} and why['x'] == f'nothing can be made in {tmp_path} to ask it ({os.strerror(number)}): {fix} and run again', why
 	assert os.listdir(tmp_path) == []
-	# Where nothing can be made, the listing answers: names in it are names of their own.
+	# Where nothing can be made, the listing answers: names in it are names of their own. A case-insensitive filesystem
+	# (macOS's APFS) holds X alone there, and x is asked, which cannot be done: run again.
 	write(tmp_path / 'X')
 	write(tmp_path / 'x')
-	assert hpcp_mod._ask_names(str(tmp_path), ['X', 'x']) == ({'X': 'X', 'x': 'x'}, {})
+	if os.listdir(tmp_path) == ['X']:
+		assert hpcp_mod._ask_names(str(tmp_path), ['X', 'x']) == ({'X': 'X'}, {'x': why['x']})
+	else:
+		assert hpcp_mod._ask_names(str(tmp_path), ['X', 'x']) == ({'X': 'X', 'x': 'x'}, {})
 
 
 def test_a_probe_that_fails_on_the_way_leaves_nothing(tmp_path, hpcp_mod, monkeypatch):
@@ -5596,7 +5653,7 @@ def test_paths_in_different_buckets_are_never_one_place(tmp_path, hpcp_mod, monk
 	# The buckets only find the candidates: a pair same_place may take for one (or cannot tell) shares one.
 	root = os.path.realpath(str(tmp_path))
 	for name in ('d', 'D', 'e', 'E'):
-		os.makedirs(os.path.join(root, name))
+		os.makedirs(os.path.join(root, name), exist_ok=True)  # a case-insensitive filesystem (macOS's APFS) has D: d
 	paths = [os.path.join(root, d, f) for d in ('d', 'D', 'e', 'E') for f in ('x', 'X', '\u00e9', 'e\u0301', 'q', 'Q')]
 	def pair(directory, first, second):
 		if 'q' in (first.lower(), second.lower()) or {first, second} == {'e', 'E'}:
@@ -5646,7 +5703,7 @@ def test_an_overlay_through_a_link_of_names_that_do_not_fold_alike_asks_nothing_
 	write(tmp_path / 'a/D/x', 'A')
 	write(tmp_path / 'b/d/y', 'B')
 	os.makedirs(tmp_path / 'out/D')
-	os.makedirs(tmp_path / 'out/d')
+	os.makedirs(tmp_path / 'out/d', exist_ok=True)  # a case-insensitive filesystem (macOS's APFS) has it: out/D
 	os.symlink('../D/x', tmp_path / 'out/d/y')
 	asked = _asked(hpcp_mod, monkeypatch)
 	_copy(hpcp_mod, ['a/', 'b/'])
@@ -5668,6 +5725,8 @@ def test_both_paths_of_a_question_are_asked_about_together(tmp_path, hpcp_mod):
 
 def test_a_tree_onto_another_spelling_of_itself_that_is_another_directory_compares_no_pair_of_names(tmp_path, hpcp_mod, reset_hpcp_globals, monkeypatch):
 	# Each landing in A folds like every file read in a, as legacy names do: only those that may be one place are compared.
+	skip_unless_takes(tmp_path, b'\xc0\xe0.pdf')
+	skip_unless_apart(tmp_path, ('A', 'a'))
 	monkeypatch.chdir(tmp_path)
 	os.makedirs(tmp_path / 'a')
 	os.makedirs(tmp_path / 'A')
