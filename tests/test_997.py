@@ -3,6 +3,7 @@ already gets right. The lines a pool task prints go back to the parent with its 
 progress line; the in-process tests stand a task's state in (_IN_TASK, a done future) rather than wait on a pool.'''
 import concurrent.futures
 import os
+import stat
 import subprocess
 import sys
 
@@ -381,7 +382,57 @@ def test_997_python_3_6_spawned_workers_keep_the_pace(tmp_path):
 	assert float(output.split('seconds ')[-1].split()[0]) >= 2.5, output[-3000:]
 
 
-# ---- 4. Stops ----
+# ---- 4. -co ----
+
+def _user_xattrs(directory):
+	'''Whether a file in directory takes a user.* xattr (Linux; not tmpfs before 6.6, not every overlay).'''
+	probe = os.path.join(str(directory), 'xattr-probe')
+	_write(probe, '')
+	try:
+		os.setxattr(probe, 'user.hpcp-probe', b'1')
+		return True
+	except (AttributeError, OSError):
+		return False
+	finally:
+		os.unlink(probe)
+
+
+@posix_only
+@not_root
+@pytest.mark.parametrize('route', ['held', 'proc', 'read'])
+def test_997_a_co_rewrite_beside_of_a_read_only_source_keeps_a_user_xattr(tmp_path, monkeypatch, reset_hpcp_globals, route):
+	# A non-root -co -wb rewrite of a 0444 source onto a file holding a user.* xattr: the new file had the source's mode when
+	# the carry set the xattr, which needs write permission (through a descriptor too), so 9.93 to 9.96 kept the old copy (190,
+	# 'an xattr cannot be given to the new copy (Permission denied)'). Each route the carry reaches the new file by: the
+	# descriptor hpcp made it by (held), and by name (Linux with /proc: O_PATH; without, macOS: opened for reading).
+	if not _user_xattrs(tmp_path):
+		pytest.skip('no user.* xattrs here')
+	if route != 'held':
+		monkeypatch.setattr(hpcp, '_held_route', lambda: None)
+		if route == 'proc' and not hpcp._PATH_FDS:
+			pytest.skip('no O_PATH with /proc here')
+		if route == 'read':
+			monkeypatch.setattr(hpcp, '_PATH_FDS', False)
+	elif not hpcp._held_route():
+		pytest.skip('cp writes no held file here')
+	_write(tmp_path / 'x', 'new')
+	os.chmod(str(tmp_path / 'x'), 0o444)
+	_write(tmp_path / 'out' / 'x', 'old')
+	os.chmod(str(tmp_path / 'out' / 'x'), 0o644)
+	os.setxattr(str(tmp_path / 'out' / 'x'), 'user.kept', b'yes')
+	old = os.lstat(str(tmp_path / 'out' / 'x'))
+	monkeypatch.setattr(hpcp, 'CONTENT_ONLY', True)
+	monkeypatch.setattr(hpcp, 'WRITE_BESIDE', True)
+	hpcp.copy_file(str(tmp_path / 'x'), [str(tmp_path / 'out' / 'x')])
+	assert not hpcp.ERRORS, hpcp.ERRORS
+	now = os.lstat(str(tmp_path / 'out' / 'x'))
+	with open(str(tmp_path / 'out' / 'x')) as handle:
+		assert handle.read() == 'new' and now.st_ino != old.st_ino
+	assert stat.S_IMODE(now.st_mode) == 0o644 and os.getxattr(str(tmp_path / 'out' / 'x'), 'user.kept') == b'yes'
+	assert sorted(os.listdir(str(tmp_path / 'out'))) == ['x']
+
+
+# ---- 5. Stops ----
 
 _DD_COPY_STOPPED = '''
 import os, signal, sys

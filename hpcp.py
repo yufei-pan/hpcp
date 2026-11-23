@@ -4742,7 +4742,9 @@ def _carry_over(st, temp, carried, held=None, base=None, kind=stat.S_IFREG):
 	(each set, and any such name temp gained, as an ACL inherited from a default ACL, removed), owner and group, and mode, less
 	the set-ID bits a write clears (_write_clears) when the runner is not root, as a write in place leaves them. A label the
 	filesystem gives itself (setting security.selinux fails with EOPNOTSUPP: vfat, a context= mount) is skipped. Anything else
-	that fails raises. kind: the file type cp made (the source's: a FIFO or device node source is made anew by cp -a).
+	that fails raises. A runner other than root gives the new file owner write while it sets the xattrs (a user.* xattr needs
+	it), the exact mode coming last. kind: the file type cp made (the source's: a FIFO or device node source is made anew by
+	cp -a).
 	Every step goes through a descriptor, never temp's name: held, the one hpcp made temp by (_cp_beside); else one opened at
 	temp's name without following a link (on Linux with /proc an O_PATH one, reached by its /proc/self/fd name and never
 	opened for data, so a node made of a device is not acted on; elsewhere a regular file or a FIFO opened for reading). A
@@ -4765,6 +4767,7 @@ def _carry_over(st, temp, carried, held=None, base=None, kind=stat.S_IFREG):
 			raise
 	try:
 		if held is not None:
+			now = os.fstat(held)
 			xpath = cpath = mpath = held
 			xhow, chow, mhow = {}, {}, {}
 		else:
@@ -4779,6 +4782,10 @@ def _carry_over(st, temp, carried, held=None, base=None, kind=stat.S_IFREG):
 				cpath, chow = at[0], dict(at_how, follow_symlinks=False)
 				mpath, mhow = at[0], dict(at_how, **({'follow_symlinks': False} if os.chmod in os.supports_follow_symlinks else {}))
 		if hasattr(os, 'listxattr'):
+			if os.geteuid() != 0 and not now.st_mode & stat.S_IWUSR:
+				# A user.* xattr is set or removed only with write permission, through a descriptor too: the new file of a
+				# source without owner write (0444) has it until its exact mode is set below (9.94 to 9.96 kept the old copy: 190).
+				os.chmod(mpath, stat.S_IMODE(now.st_mode) | stat.S_IWUSR, **mhow)
 			try:
 				gained = os.listxattr(xpath, **xhow)
 			except OSError as e:
