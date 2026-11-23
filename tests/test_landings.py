@@ -1267,10 +1267,10 @@ def _warnings(output, where):
 
 
 _LOGGING_CP = '''#!/bin/sh
-# cp that notes each copy it starts in $LOG, then (after $PAUSE seconds, when set) runs the real cp. --version and the
+# cp that notes each copy it starts in $LOG (CP-STARTED and its arguments), then (after $PAUSE seconds, when set) runs the real cp. --version and the
 # held-file probe (cp of a temporary file named hpcp-held-probe-*) are not copies.
 case "$1 $2" in --version*|*/hpcp-held-probe-*) exec cp "$@";; esac
-echo CP-STARTED >> "$LOG"
+echo "CP-STARTED $*" >> "$LOG"
 if [ -n "$PAUSE" ]; then sleep "$PAUSE"; fi
 exec cp "$@"
 '''
@@ -1329,6 +1329,25 @@ def test_the_space_warning_comes_before_the_copy_it_is_about(tmp_path):
 		assert (b"; it fits only by reusing its old copy's room, which cp frees first, so if another writer takes that room the "
 			b'copy fails and the old copy is lost (the source is kept). hpcp copies anyway, as cp does;') in live[0]
 		assert live[0].startswith(('Space warning: %s has ' % out).encode()) and output.rstrip().endswith(b'Done.'), output[-3000:]
+
+
+@posix_only
+@small_fs
+def test_the_space_warning_of_a_pooled_copy_comes_before_its_cp(tmp_path):
+	# -j 4: a 3 MiB file that cannot fit in 1 MiB, beside small ones, with cp slowed by 2 s. The worker that is about to copy it
+	# warns first, at once: 9.97's first build handed the warning back with its job's result, after the copy it warns about
+	# (and a stop before the job returned lost it).
+	with _on_small('pooled') as out:
+		write(tmp_path / 'src' / 'big', os.urandom(3 * _MIB))
+		for name in 'abc':
+			write(tmp_path / 'src' / name, b'x')
+		_fill(out, _MIB)
+		rc, output = _logged_run(tmp_path, [str(tmp_path / 'src') + '/', '-d', out + '/', '-j', '4'], pause=2)
+		live, _ = _warnings(output, out)
+		assert len(live) == 1 and b'so it may not fit' in live[0], output[-3000:]
+		started = [line for line in output.split(b'\n') if line.startswith(b'CP-STARTED') and b'src/big' in line]
+		assert len(started) == 1, output[-3000:]
+		assert output.index(live[0]) < output.index(started[0]), output[-3000:]
 
 
 @posix_only

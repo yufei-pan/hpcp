@@ -3,6 +3,7 @@ already gets right. The lines a pool task prints go back to the parent with its 
 progress line; the in-process tests stand a task's state in (_IN_TASK, a done future) rather than wait on a pool.'''
 import concurrent.futures
 import os
+import signal
 import stat
 import subprocess
 import sys
@@ -99,21 +100,61 @@ def test_997_a_task_keeps_a_bounded_number_of_lines_and_says_how_many_it_left_ou
 
 @posix_only
 def test_997_a_worker_s_own_warnings_go_back_with_its_task(tmp_path, capsys, monkeypatch, reset_hpcp_globals):
-	# A temporary file that cannot be removed, FAT attributes that cannot be set, the space warning: 9.96 wrote each to stderr
-	# where the worker was, knowing nothing of the parent's frame.
+	# A temporary file that cannot be removed and FAT attributes that cannot be set: 9.96 wrote each to stderr where the worker
+	# was, knowing nothing of the parent's frame. (The space warning is the exception: it is written at once, below.)
 	monkeypatch.setattr(hpcp, '_IN_TASK', True)
 	hpcp._discard_temp(os.path.join(HPCP, 'not-a-directory', 'temp'))  # ENOTDIR: no FileNotFoundError
 	_write(tmp_path / 'f')
 	hpcp._set_fat_attributes(str(tmp_path / 'f'), 0x20, 'f')  # not vfat: the ioctl fails
-	monkeypatch.setattr(hpcp, '_mount_type', lambda dev: 'tmpfs')
-	monkeypatch.setattr(hpcp, '_claim_space', lambda dev: True)
-	hpcp._space_warning(str(tmp_path / 'out'), str(tmp_path / 'f'), 1, 2, 0)
 	kept = list(hpcp._TASK_LINES)
 	del hpcp._TASK_LINES[:]
 	assert capsys.readouterr() == ('', '')
-	assert [stream for stream, _ in kept] == ['err', 'err', 'err'], kept
+	assert [stream for stream, _ in kept] == ['err', 'err'], kept
 	assert kept[0][1].startswith('Warning: cannot remove temporary file ') and kept[1][1].startswith('Warning: cannot keep the FAT')
-	assert kept[2][1].startswith('Space warning: %s has ' % tmp_path) and kept[2][1].endswith('again.\n'), kept
+
+
+@posix_only
+def test_997_a_pool_task_writes_the_space_warning_at_once_not_with_its_lines(tmp_path, capsys, monkeypatch, reset_hpcp_globals):
+	# The warning is for the operator before cp writes: a task's lines wait for its job (_settled), so it came after the copy
+	# it warns about (9.97's first build; 9.96 wrote it from the worker). In the task it is on stderr when the task goes on,
+	# from the line start, and not among the lines it hands back; its text is among the errors it hands back (the run's end
+	# repeats it).
+	monkeypatch.setattr(hpcp, '_worker_initialized', True)
+	monkeypatch.setattr(hpcp, '_LINE_START', [os.getpid(), '\033[2K\r', False])
+	monkeypatch.setattr(hpcp, '_mount_type', lambda dev: 'tmpfs')
+	monkeypatch.setattr(hpcp, '_claim_space', lambda dev: True)
+	_write(tmp_path / 'f')
+	seen = []
+	def task():
+		hpcp._space_warning(str(tmp_path / 'out'), str(tmp_path / 'f'), 1, 2, 0)
+		seen.append(capsys.readouterr().err)  # before the task returns: where cp would start
+		hpcp.eprint('Copy failed: after')
+	result, errors, crash, lines = hpcp._run_task(_settings(), task)
+	assert len(seen) == 1 and seen[0].startswith('\033[2K\rSpace warning: %s has ' % tmp_path) and seen[0].endswith('again.\n'), seen
+	assert lines == [('err', 'Copy failed: after\n')] and crash is None, lines
+	assert errors[0] + '\n' == seen[0][len('\033[2K\r'):] and errors[1:] == ['Copy failed: after'], errors
+
+
+@posix_only
+def test_997_a_stop_in_a_task_writes_the_lines_the_job_kept(capsys, monkeypatch, reset_hpcp_globals):
+	# A stop ends the worker before any result carries its job's lines to the parent: a temporary file it could not remove, a
+	# sparse retry's 'Error copying' and the like were lost (9.97's first build; 9.96 wrote them as they happened). Written
+	# before the worker ends, stderr's from the line start (once), stdout's as they are.
+	ended = []
+	monkeypatch.setattr(hpcp, '_worker_initialized', True)
+	monkeypatch.setattr(hpcp, '_STOPPED', None)
+	monkeypatch.setattr(hpcp, '_STOPPED_PID', None)
+	monkeypatch.setattr(hpcp, '_LINE_START', [os.getpid(), '\033[2K\r', False])
+	monkeypatch.setattr(hpcp, '_end_by', lambda signum: ended.append((signum, capsys.readouterr())))
+	def task():
+		hpcp.eprint('Copy failed: one')
+		hpcp._line('Error copying a to b, why\n', sys.stdout)
+		hpcp._line('Warning: cannot remove temporary file t: why\n')
+		hpcp._STOPPED, hpcp._STOPPED_PID = signal.SIGTERM, os.getpid()  # what _stop records
+		raise KeyboardInterrupt
+	hpcp._run_task(_settings(), task)
+	assert ended[0][0] == signal.SIGTERM, ended
+	assert ended[0][1] == ('Error copying a to b, why\n', '\033[2K\rCopy failed: one\nWarning: cannot remove temporary file t: why\n')
 
 
 @posix_only
@@ -151,7 +192,9 @@ def test_997_a_copy_job_s_own_lines_go_back_with_its_task(tmp_path, capsys, monk
 
 @posix_only
 def test_997_the_space_warning_starts_no_empty_line_where_no_frame_is_open(tmp_path, capsys, monkeypatch, reset_hpcp_globals):
-	# hpcp big -d /small/out/ > log 2>&1: 9.96 put an empty line before the warning (its line start whatever the mark said).
+	# hpcp big -d /small/out/ -s > log 2>&1, no pool task: 9.96 put an empty line before the warning (its line start whatever
+	# the mark said). (In a pool task it is written at once, from its line start: the test below, and the empty line in a
+	# combined log, deferred to 9.98.)
 	_combined_log(monkeypatch)
 	monkeypatch.setattr(hpcp, '_mount_type', lambda dev: 'tmpfs')
 	monkeypatch.setattr(hpcp, '_claim_space', lambda dev: True)
@@ -205,9 +248,10 @@ def test_997_a_link_bar_s_error_starts_a_line_of_its_own(tmp_path):
 def test_997_a_link_that_cannot_be_made_says_so_off_the_bar(tmp_path):
 	# Links whose directory takes no new name (0555): 'Could not create symbolic link ...' (9.96: written straight to stderr,
 	# onto the bar's frame in a combined log) and 'Failed to create symbolic link: All destinations failed', each on a line of
-	# its own. Ten links that can be made and five that cannot, in the order the copy hands them over: a frame comes before
-	# at least one failure (all five first: 1 in 3,003).
-	for directory, count in (('a', 10), ('b', 5)):
+	# its own. A hundred links that can be made and five that cannot, in the order the copy hands them over: a frame comes
+	# before at least one failure (all five first: 1 in 96.6 million; with ten links it was 1 in 3,003, a red job a few hundred
+	# runs).
+	for directory, count in (('a', 100), ('b', 5)):
 		_write(tmp_path / 'src' / directory / 'target')
 		for index in range(count):
 			os.symlink('target', str(tmp_path / 'src' / directory / ('l%d' % index)))
@@ -218,7 +262,7 @@ def test_997_a_link_that_cannot_be_made_says_so_off_the_bar(tmp_path):
 	finally:
 		os.chmod(str(tmp_path / 'dst' / 'src' / 'b'), 0o755)
 	shown = output.split('Error occurred:')[0]
-	assert rc != 0 and len(os.listdir(str(tmp_path / 'dst' / 'src' / 'a'))) == 11, output[-3000:]
+	assert rc != 0 and len(os.listdir(str(tmp_path / 'dst' / 'src' / 'a'))) == 101, output[-3000:]
 	assert shown.count('Could not create symbolic link from target to ') == 5, output[-3000:]
 	_each_starts_a_line(shown, 'Could not create symbolic link from target to ')
 	_each_starts_a_line(shown, 'Failed to create symbolic link: All destinations failed')
@@ -353,6 +397,22 @@ def test_997_without_a_temporary_directory_the_fork_server_gives_way_to_fork(mon
 	assert chosen == [('fork', True)]  # a temporary directory: the fork server stays
 
 
+def test_997_the_temporary_directory_check_leaves_tempfile_s_cache_as_it_was(monkeypatch):
+	# gettempdir keeps its answer in tempfile.tempdir, which the held-file probe takes for a directory a program set, and tries
+	# alone (_temp_candidates): after main()'s check on Python 3.14 the probe had no directory to go on to where the first was
+	# full. A directory a program did set stays.
+	monkeypatch.setattr(hpcp.multiprocessing, 'get_start_method', lambda *args, **kwargs: 'forkserver')
+	def never(*args, **kwargs):
+		raise AssertionError('a temporary directory was found, and the start method changed')
+	monkeypatch.setattr(hpcp.multiprocessing, 'set_start_method', never)
+	monkeypatch.setattr(hpcp.tempfile, 'tempdir', None)
+	hpcp._fork_without_tempdir()
+	assert hpcp.tempfile.tempdir is None and len(hpcp._temp_candidates()) > 1
+	monkeypatch.setattr(hpcp.tempfile, 'tempdir', '/set/by/a/program')
+	hpcp._fork_without_tempdir()  # (gettempdir returns it untried)
+	assert hpcp.tempfile.tempdir == '/set/by/a/program'
+
+
 _PACED_36 = '''
 import multiprocessing, runpy, sys, time
 if __name__ == '__main__':
@@ -479,37 +539,6 @@ def test_997_macos_the_lean_reads_answer_as_the_xattr_tool_and_ls_do(tmp_path):
 			subprocess.run(['chmod', '-N', path], check=True)
 	finally:
 		os.close(fd)
-
-
-@darwin_only
-@pytest.mark.parametrize('route', ['held', 'read'])
-def test_997_macos_a_co_rewrite_beside_keeps_the_old_file_s_xattrs_and_acl(tmp_path, monkeypatch, reset_hpcp_globals, route):
-	# A -co rewrite beside (-wb) gives the new file the old one's owner, group and mode, and on Linux its xattrs; on macOS it
-	# gave it none of the old file's xattrs or ACL, and kept the source's xattr that cp copied (9.94 to 9.96: Python has no
-	# os.listxattr there). Through the descriptor hpcp made the new file by (held), or one opened at its name (read).
-	if route == 'read':
-		monkeypatch.setattr(hpcp, '_held_route', lambda: None)
-	_write(tmp_path / 'x', 'new')
-	subprocess.run(['xattr', '-w', 'org.example.source', 'theirs', str(tmp_path / 'x')], check=True)
-	landing = str(tmp_path / 'out' / 'x')
-	_write(landing, 'old')
-	subprocess.run(['xattr', '-w', 'org.example.tag', 'mine', landing], check=True)
-	subprocess.run(['chmod', '+a', 'everyone allow read', landing], check=True)
-	old = os.lstat(landing)
-	monkeypatch.setattr(hpcp, 'CONTENT_ONLY', True)
-	monkeypatch.setattr(hpcp, 'WRITE_BESIDE', True)
-	try:
-		hpcp.copy_file(str(tmp_path / 'x'), [landing])
-		assert not hpcp.ERRORS, hpcp.ERRORS
-		now = os.lstat(landing)
-		with open(landing) as handle:
-			assert handle.read() == 'new' and now.st_ino != old.st_ino
-		names = subprocess.run(['xattr', landing], stdout=subprocess.PIPE, universal_newlines=True, check=True).stdout.split()
-		assert 'org.example.tag' in names and 'org.example.source' not in names, names
-		acl = subprocess.run(['ls', '-led', landing], stdout=subprocess.PIPE, universal_newlines=True, check=True).stdout
-		assert 'everyone allow read' in acl, acl
-	finally:
-		subprocess.run(['chmod', '-N', landing], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
 # ---- 6. macOS: the copy check on a network mount ----

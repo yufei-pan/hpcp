@@ -443,8 +443,9 @@ SINGLE_PASS_FILE_LIMIT = 1_000_000
 # it, the line left open for the next frame to start over. A frame sets it as it is drawn; whatever ends the line clears it:
 # _end_line, an error line whose start ended stdout's line too (_error_line), a bar's frame at its total, and a bar's stop()
 # (its summary starts with a line end). Only the parent draws frames and keeps the mark: a pool task's lines (_line: its error
-# lines, the space warning, a discarded temporary file's note, _copy_file's notes) are printed by the parent when its result
-# comes (_settled). (A -v copy draws no bar, and its diagnostics are printed where they happen.)
+# lines, a discarded temporary file's note, _copy_file's notes) are printed by the parent when its result comes (_settled);
+# the space warning, which is for the operator before cp writes, is written at once (_space_warning). (A -v copy draws no bar,
+# and its diagnostics are printed where they happen.)
 _BAR_DRAWN = False
 _LINE_START = [None, '', False]  # (pid, _line_start's answer, whether stdout and stderr are one file)
 
@@ -1442,10 +1443,15 @@ def _fork_without_tempdir():
 	ended with exit 70 and a traceback, nothing done. main() asks it once, before any pool (a program that calls hpcp() keeps
 	its own start method)."""
 	if multiprocessing.get_start_method() == 'forkserver':
+		# gettempdir keeps the directory it found in tempfile.tempdir, which _temp_candidates takes for one a program set (and
+		# tries alone): put back as it was, so the held-file probe still goes on to the next directory where the first is full.
+		before = tempfile.tempdir
 		try:
 			tempfile.gettempdir()
 		except FileNotFoundError:
 			multiprocessing.set_start_method('fork', force=True)
+		finally:
+			tempfile.tempdir = before
 
 def _register_worker_start():
 	"""multiprocessing runs its after-fork hooks in each child it starts, before the child's work (a pool worker's loop):
@@ -1507,6 +1513,11 @@ def _run_task(settings, func, *args, **kwargs):
 			return None, ERRORS[error_start:], f'{type(e).__name__}: {e}', _task_lines()
 		finally:
 			_IN_TASK = False
+			if _STOPPED_PID == os.getpid():
+				# A stop came during the task, and the worker ends below with no result to carry this job's lines to the parent:
+				# written here (a temporary file it could not remove, a sparse retry's 'Error copying', the FAT attributes line),
+				# as 9.96 wrote them, as they happened.
+				_write_task_lines()
 			del ERRORS[error_start:]
 			del _TASK_LINES[:]
 			_TASK_LINES_OVER = 0
@@ -1522,6 +1533,21 @@ def _run_task(settings, func, *args, **kwargs):
 		# A stop (_stop) at the task's start or end: the worker ends as the signal asked. Let through, the pool's worker loop
 		# would take it for the task's error and keep the worker (except BaseException, Python 3.6 to 3.14).
 		_end_by(_STOPPED)
+
+def _write_task_lines():
+	"""A stopped pool worker's lines (_task_lines), written where they would have been: stderr ones, the first from the line start
+	(as the space warning's), and stdout ones as they are. Never raises: the worker is on its way out."""
+	start = _line_start()
+	for stream, text in _task_lines():
+		with contextlib.suppress(Exception):
+			if stream == 'err':
+				sys.stdout.flush()
+				sys.stderr.write(start + text)
+				sys.stderr.flush()
+				start = ''
+			else:
+				sys.stdout.write(text)
+				sys.stdout.flush()
 
 def _settled(future, report=True):
 	"""(result, errors, crash) of a done _submit_task future, the task's lines printed here, each where _line puts it (report
@@ -4763,21 +4789,7 @@ def _co_carry(target, st):
 	if euid != 0 and not (st.st_uid == euid and (st.st_gid == os.getegid() or st.st_gid in os.getgroups())):
 		return None
 	if not hasattr(os, 'listxattr'):
-		if _XATTRS is None:
-			return {}
-		# macOS: every name a program sets (_is_portable_xattr), read through libc; the system's own marks and hidden names stay
-		# as the new file has them. 9.94 to 9.96 carried none there (macOS's Python has no os.listxattr). Its ACL is carried by
-		# _carry_over.
-		listxattr, getxattr = _XATTRS[:2]
-		carried = {}
-		try:
-			for name in listxattr(target, follow_symlinks=False):
-				if _is_portable_xattr(name):
-					carried[name] = getxattr(target, name, follow_symlinks=False)
-		except OSError as e:
-			if e.errno not in _XATTR_SKIPPED:
-				return None
-		return carried
+		return {}
 	try:
 		names = os.listxattr(target, follow_symlinks=False)
 	except OSError as e:
@@ -4808,7 +4820,7 @@ def _write_clears(mode):
 		return mode & (stat.S_ISUID | stat.S_ISGID)
 	return mode & stat.S_ISUID
 
-def _carry_over(st, temp, carried, held=None, base=None, kind=stat.S_IFREG, old=None):
+def _carry_over(st, temp, carried, held=None, base=None, kind=stat.S_IFREG):
 	"""Give temp, the new file of a -co rewrite, exactly what the old file (st, carried: _co_carry) had: its carried xattrs
 	(each set, and any such name temp gained, as an ACL inherited from a default ACL, removed), owner and group, and mode, less
 	the set-ID bits a write clears (_write_clears) when the runner is not root, as a write in place leaves them. A label the
@@ -4825,8 +4837,7 @@ def _carry_over(st, temp, carried, held=None, base=None, kind=stat.S_IFREG, old=
 	the old file's owner: a link, another type or another user's file put at the name since cp made it (a user who can write
 	the directory) is refused, so no chown, chmod or xattr reaches the file a link leads to, and a root run gives no other
 	user's file this one's owner and mode. base: the door's result for temp's directory (_cp_beside), which temp's name is
-	opened in; None: temp, a path. On macOS the xattrs go through libc (_XATTRS) and only through a descriptor, and old (the
-	old file's path, not followed) gives a regular file its ACL (_mac_sync_acl), as a rerun's settle does there."""
+	opened in; None: temp, a path."""
 	name = os.path.basename(temp)
 	at, at_how = (_at(base, name), _fd_of(base)) if base is not None else ((temp,), {})
 	fd = None
@@ -4853,31 +4864,26 @@ def _carry_over(st, temp, carried, held=None, base=None, kind=stat.S_IFREG, old=
 				xpath, xhow = _io(base, name, temp) if base is not None else temp, {'follow_symlinks': False}
 				cpath, chow = at[0], dict(at_how, follow_symlinks=False)
 				mpath, mhow = at[0], dict(at_how, **({'follow_symlinks': False} if os.chmod in os.supports_follow_symlinks else {}))
-		mac = _XATTRS is not None and _XATTRS[0] is _mac_listxattr
-		if _XATTRS is not None and (not mac or (kind == stat.S_IFREG and xpath.__class__ is int)):
-			listxattr, setxattr, removexattr = (_XATTRS[0], _XATTRS[2], _XATTRS[3]) if mac else (os.listxattr, os.setxattr, os.removexattr)
+		if hasattr(os, 'listxattr'):
 			if os.geteuid() != 0 and not now.st_mode & stat.S_IWUSR:
 				# A user.* xattr is set or removed only with write permission, through a descriptor too: the new file of a
 				# source without owner write (0444) has it until its exact mode is set below (9.94 to 9.96 kept the old copy: 190).
 				os.chmod(mpath, stat.S_IMODE(now.st_mode) | stat.S_IWUSR, **mhow)
 			try:
-				gained = listxattr(xpath, **xhow)
+				gained = os.listxattr(xpath, **xhow)
 			except OSError as e:
 				if e.errno not in (errno.ENOTSUP, errno.EOPNOTSUPP):
 					raise
 				gained = []
 			for xname in gained:
-				# What cp gave the new file of its own (macOS's cp copies the source's names) and the old file lacks goes.
-				if xname not in carried and (_is_portable_xattr(xname) if mac else xname.startswith('user.') or xname in _CO_CARRIED[:2]):
-					removexattr(xpath, xname, **xhow)
+				if xname not in carried and (xname.startswith('user.') or xname in _CO_CARRIED[:2]):
+					os.removexattr(xpath, xname, **xhow)
 			for xname, value in carried.items():
 				try:
-					setxattr(xpath, xname, value, **xhow)
+					os.setxattr(xpath, xname, value, **xhow)
 				except OSError as e:
 					if not (xname == 'security.selinux' and e.errno in (errno.ENOTSUP, errno.EOPNOTSUPP)):
 						raise
-			if mac and old is not None:
-				_mac_sync_acl(old, xpath)
 		os.chown(cpath, st.st_uid, st.st_gid, **chow)
 		mode = stat.S_IMODE(st.st_mode)
 		if os.geteuid() != 0:
@@ -5501,7 +5507,8 @@ def _space_warning(target, src_path, free, need, old):
 	"""Before cp writes target, whose directory has free bytes, less than need (src_path's allocated size): one line per
 	filesystem in a run, then cp tries, as GNU cp does; nothing is refused, and the exit code is the copy's. old: the room an
 	old copy that cp frees first holds (in place), else 0. Only for _SPACE_TYPES, and not on an XFS the source is on too (cp may
-	clone it: GNU cp 9 does by default; ext and tmpfs never clone). A 'Space warning' (code 0) in ERRORS too, which a task hands back, repeated at the run's end."""
+	clone it: GNU cp 9 does by default; ext and tmpfs never clone). A 'Space warning' (code 0) in ERRORS too, which a task hands back, repeated at the run's end.
+	The line is written at once, before cp, in a pool task too (not with the task's lines, which come with its job's result)."""
 	directory = os.path.dirname(os.path.abspath(target))
 	try:
 		dev = os.stat(directory).st_dev
@@ -5518,8 +5525,16 @@ def _space_warning(target, src_path, free, need, old):
 	else:
 		lost = "a rewrite's old copy stays (-wb)" if WRITE_BESIDE else "a rewrite's old copy is lost"
 		text = f'{start}, so it may not fit; if the disk runs out the copy fails, and {lost} (the source is kept). {end}'
-	# Off the open progress line, in one write, before cp (_line): in a pool task the parent prints it with the task's lines.
-	_line(text + '\n')
+	# Before cp, off the open progress line, in one write. The parent (and -s) knows where its progress line is open: _line. A
+	# pool task does not, and its lines wait for its job to return (_settled), after the copy this one warns about (9.97's first
+	# build): it writes at once, as 9.96 did, from its line start (_line_start).
+	if _IN_TASK:
+		with contextlib.suppress(Exception):
+			sys.stdout.flush()
+			sys.stderr.write(_line_start() + text + '\n')
+			sys.stderr.flush()
+	else:
+		_line(text + '\n')
 	ERRORS.append(text)
 
 def _repeat_space_warnings():
@@ -5868,7 +5883,7 @@ def _cp_beside(command, src_path, target, st, why, space, src_st=None, base=None
 			attributes = None
 			if carried is not None:
 				what = 'its owner, group or an xattr cannot be given to the new copy (%s)'
-				_carry_over(st, temp, carried, fd, base, stat.S_IFMT((src_st or os.lstat(src_path)).st_mode), _io(base, name, target))
+				_carry_over(st, temp, carried, fd, base, stat.S_IFMT((src_st or os.lstat(src_path)).st_mode))
 				attributes = _fat_attributes(*_at(base, name), **_fd_of(base))
 			elif not CONTENT_ONLY:
 				_remove_stale_xattrs(src_path, _io(base, tname, temp) if fd is None else fd)
