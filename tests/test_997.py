@@ -158,6 +158,35 @@ def test_997_a_stop_in_a_task_writes_the_lines_the_job_kept(capsys, monkeypatch,
 
 
 @posix_only
+def test_997_a_second_stop_while_the_lines_are_written_does_not_cut_them(capsys, monkeypatch, reset_hpcp_globals):
+	# At a terminal a Ctrl-C reaches each worker twice: the terminal's, and the parent's pass-on (_pass_stop_on). The second
+	# came while the worker wrote its job's lines, outside the task (_IN_TASK was already False), so _stop ended the worker
+	# at once, partway (_end_by) and the rest of the lines were lost (the fix round's first build; 9.96 wrote them whole).
+	# The second stop lands as the writing starts (the first call _write_task_lines makes, _line_start): ignored, in the task.
+	ended = []
+	monkeypatch.setattr(hpcp, '_worker_initialized', True)
+	monkeypatch.setattr(hpcp, '_MAIN_PID', None)  # a worker: _stop takes the not-in-a-task branch once _IN_TASK is False
+	monkeypatch.setattr(hpcp, '_STOPPED', None)
+	monkeypatch.setattr(hpcp, '_STOPPED_PID', None)
+	monkeypatch.setattr(hpcp, '_LINE_START', [os.getpid(), '\033[2K\r', False])
+	monkeypatch.setattr(hpcp, '_end_by', lambda signum: ended.append((signum, capsys.readouterr())))
+	real = hpcp._line_start
+	second = []
+	def line_start():
+		if not second:
+			second.append(1)
+			hpcp._stop(signal.SIGINT, None)  # the pass-on's SIGINT, after the terminal's
+		return real()
+	monkeypatch.setattr(hpcp, '_line_start', line_start)
+	def task():
+		hpcp._line('Trying to copy from a to b without sparse\n', sys.stdout)
+		hpcp._STOPPED, hpcp._STOPPED_PID = signal.SIGINT, os.getpid()  # what the terminal's SIGINT's _stop records
+		raise KeyboardInterrupt
+	hpcp._run_task(_settings(), task)
+	assert second and ended[0][1] == ('Trying to copy from a to b without sparse\n', ''), ended
+
+
+@posix_only
 def test_997_a_copy_job_s_own_lines_go_back_with_its_task(tmp_path, capsys, monkeypatch, reset_hpcp_globals):
 	# A copy that fails at its last destination says 'Error copying ...' and 'Trying to copy ... without sparse' on stdout, a
 	# link below a destination replaced by a directory says so in a Note, and a crash that is no OSError prints its traceback:
@@ -249,8 +278,8 @@ def test_997_a_link_that_cannot_be_made_says_so_off_the_bar(tmp_path):
 	# Links whose directory takes no new name (0555): 'Could not create symbolic link ...' (9.96: written straight to stderr,
 	# onto the bar's frame in a combined log) and 'Failed to create symbolic link: All destinations failed', each on a line of
 	# its own. A hundred links that can be made and five that cannot, in the order the copy hands them over: a frame comes
-	# before at least one failure (all five first: 1 in 96.6 million; with ten links it was 1 in 3,003, a red job a few hundred
-	# runs).
+	# before at least one failure (all five first: 1 in 96.6 million; with ten links it was 1 in 3,003, a red job about once in
+	# 3,000 runs).
 	for directory, count in (('a', 100), ('b', 5)):
 		_write(tmp_path / 'src' / directory / 'target')
 		for index in range(count):

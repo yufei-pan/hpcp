@@ -1512,12 +1512,13 @@ def _run_task(settings, func, *args, **kwargs):
 		except Exception as e:
 			return None, ERRORS[error_start:], f'{type(e).__name__}: {e}', _task_lines()
 		finally:
-			_IN_TASK = False
 			if _STOPPED_PID == os.getpid():
 				# A stop came during the task, and the worker ends below with no result to carry this job's lines to the parent:
 				# written here (a temporary file it could not remove, a sparse retry's 'Error copying', the FAT attributes line),
-				# as 9.96 wrote them, as they happened.
+				# as 9.96 wrote them, as they happened. Still in the task (_IN_TASK), so the second stop a Ctrl-C brings (the
+				# terminal's, then the parent's pass-on, _pass_stop_on) is ignored by _stop and does not end the worker partway.
 				_write_task_lines()
+			_IN_TASK = False
 			del ERRORS[error_start:]
 			del _TASK_LINES[:]
 			_TASK_LINES_OVER = 0
