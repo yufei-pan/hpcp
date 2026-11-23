@@ -1716,12 +1716,10 @@ class _pool:
 					_RATE_SHARE = self.rate
 				space = _SPACE_WARNED[2] if self.space and _SPACE_WARNED is not None else None
 				initargs = (handed, space, self.rate)
-				if sys.version_info >= (3, 7):
-					self.executor = ProcessPoolExecutor(max_workers=self.max_workers, initializer=_pool_worker_start, initargs=initargs)
-				else:
-					self.executor = ProcessPoolExecutor(max_workers=self.max_workers)
-					if multiprocessing.get_start_method() != 'fork':
-						_initializer_36(self.executor, initargs)
+				kwargs = {'initializer': _pool_worker_start, 'initargs': initargs} if sys.version_info >= (3, 7) else {}
+				self.executor = ProcessPoolExecutor(max_workers=self.max_workers, **kwargs)
+				if not kwargs and multiprocessing.get_start_method() != 'fork':
+					_initializer_36(self.executor, initargs)
 				if (3, 9) <= sys.version_info < (3, 12):
 					self.executor._processes = _Workers()  # before the first submit, which hands it to the manager thread
 			finally:
@@ -4856,7 +4854,7 @@ def _carry_over(st, temp, carried, held=None, base=None, kind=stat.S_IFREG, old=
 				mpath, mhow = at[0], dict(at_how, **({'follow_symlinks': False} if os.chmod in os.supports_follow_symlinks else {}))
 		mac = _XATTRS is not None and _XATTRS[0] is _mac_listxattr
 		if _XATTRS is not None and (not mac or (kind == stat.S_IFREG and xpath.__class__ is int)):
-			listxattr, _, setxattr, removexattr = _XATTRS
+			listxattr, setxattr, removexattr = (_XATTRS[0], _XATTRS[2], _XATTRS[3]) if mac else (os.listxattr, os.setxattr, os.removexattr)
 			if os.geteuid() != 0 and not now.st_mode & stat.S_IWUSR:
 				# A user.* xattr is set or removed only with write permission, through a descriptor too: the new file of a
 				# source without owner write (0444) has it until its exact mode is set below (9.94 to 9.96 kept the old copy: 190).
